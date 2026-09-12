@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Full-Text Search — Lance</title>
+
+
+<meta name="description" content="Full-text search (FTS) with inverted BM25 indexes and N-gram search in Lance">
+
+<link rel="canonical" href="https://lance.org/quickstart/full-text-search/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab active" href="../">Getting Started</a>
+      <a class="ld-toptab" href="../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Getting Started
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Getting Started</div>
+    <a href="../">Getting Started with Lance</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../vector-search/">Vector Search</a>
+    <a class="active" href="./">Full-Text Search</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Getting Started</span>
+        <span>/</span><b>Full-Text Search</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="full-text-search-in-lance">Full-Text Search in Lance<a class="headerlink" href="#full-text-search-in-lance" title="Permanent link">&para;</a></h1>
+<p>Lance provides powerful full-text search (FTS) capabilities using an inverted index. This tutorial guides you through building and using FTS indexes to dramatically speed up text search operations while maintaining high accuracy.</p>
+<p>By the end of this tutorial, you'll be able to build and use an FTS index, understand performance differences between indexed and non-indexed searches, and learn how to tune search parameters for optimal performance.</p>
+<h2 id="install-the-python-sdk">Install the Python SDK<a class="headerlink" href="#install-the-python-sdk" title="Permanent link">&para;</a></h2>
+<p>First, install the required dependencies:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span>pylance<span class="w"> </span>pyarrow
+</span></code></pre></div>
+<h2 id="set-up-your-environment">Set Up Your Environment<a class="headerlink" href="#set-up-your-environment" title="Permanent link">&para;</a></h2>
+<p>Import the necessary libraries for working with Lance datasets:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span></code></pre></div>
+<h2 id="prepare-your-text-data">Prepare Your Text Data<a class="headerlink" href="#prepare-your-text-data" title="Permanent link">&para;</a></h2>
+<p>In this quickstart, we'll create a simple dataset with text documents:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="p">{</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        <span class="s2">"text"</span><span class="p">:</span> <span class="p">[</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>            <span class="s2">"I left my umbrella on the evening train to Boston"</span><span class="p">,</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>            <span class="s2">"This ramen recipe simmers the broth for three hours with dried mushrooms."</span><span class="p">,</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>            <span class="s2">"This train is scheduled to leave for Edinburgh at 9:30 in the morning"</span><span class="p">,</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>        <span class="p">],</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    <span class="p">}</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="p">)</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># Write to a new Lance dataset</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"/tmp/fts.lance"</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"overwrite"</span><span class="p">)</span>
+</span></code></pre></div>
+<p>This creates a Lance dataset with three text documents containing overlapping keywords that we'll use to demonstrate different search scenarios.</p>
+<h2 id="explore-your-dataset-schema">Explore Your Dataset Schema<a class="headerlink" href="#explore-your-dataset-schema" title="Permanent link">&para;</a></h2>
+<p>Let's examine the structure of our dataset:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"/tmp/fts.lance"</span><span class="p">)</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">schema</span><span class="p">)</span>
+</span></code></pre></div>
+<p>This prints the PyArrow schema of the dataset:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>id: int64
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>text: large_string
+</span></code></pre></div>
+<h2 id="build-the-full-text-search-index">Build the Full-Text Search Index<a class="headerlink" href="#build-the-full-text-search-index" title="Permanent link">&para;</a></h2>
+<p>Full-text search is created with an inverted scalar index on your text column. Choose the <code>INVERTED</code> index type when calling <code>create_scalar_index</code> on your Lance dataset. Lance uses the BM25 ranking algorithm for relevance scoring. Results are automatically ranked by relevance, with higher scores indicating better matches.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>The index creation process builds an efficient lookup structure that maps words to the documents containing them. This enables high-performance keyword-based search, even on large datasets.</p>
+<div class="admonition warning">
+<p class="admonition-title">Index Creation Time</p>
+</div>
+<p>Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.</p>
+<h2 id="advanced-index-configuration">Advanced Index Configuration<a class="headerlink" href="#advanced-index-configuration" title="Permanent link">&para;</a></h2>
+<p>You can customize the index creation with various parameters to optimize for your specific use case:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"text_idx"</span><span class="p">,</span>              <span class="c1"># Optional index name (if omitted, default is "text_idx")</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="n">with_position</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>          <span class="c1"># Set True to enable phrase queries (stores token positions)</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="n">base_tokenizer</span><span class="o">=</span><span class="s2">"simple"</span><span class="p">,</span>      <span class="c1"># Tokenizer: "simple", "icu", "icu/split", "whitespace", "raw", or "ngram"</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="n">language</span><span class="o">=</span><span class="s2">"English"</span><span class="p">,</span>           <span class="c1"># Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="n">max_token_length</span><span class="o">=</span><span class="mi">40</span><span class="p">,</span>          <span class="c1"># Drop tokens longer than this length</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="n">lower_case</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>              <span class="c1"># Lowercase text before tokenization</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="n">stem</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                    <span class="c1"># Stem tokens (language-dependent)</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>    <span class="n">remove_stop_words</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>       <span class="c1"># Remove stop words (language-dependent)</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>    <span class="n">custom_stop_words</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>       <span class="c1"># Optional additional stop words (only used if remove_stop_words=True)</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>    <span class="n">ascii_folding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>           <span class="c1"># Fold accents to ASCII when possible (e.g., "é" -&gt; "e")</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>    <span class="n">block_size</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>               <span class="c1"># Posting block size: 128 or 256; 256 is experimental</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="tokenizer-options">Tokenizer Options<a class="headerlink" href="#tokenizer-options" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>simple</strong>: Splits tokens on whitespace and punctuation</li>
+<li><strong>whitespace</strong>: Splits tokens only on whitespace</li>
+<li><strong>raw</strong>: No tokenization (useful for exact matching)</li>
+</ul>
+<p>Lance also supports multilingual tokenization:</p>
+<ul>
+<li><strong>icu</strong>: Unicode word segmentation with built-in ICU dictionaries</li>
+<li><strong>jieba/default</strong>: Chinese text tokenization using Jieba</li>
+<li><strong>lindera/ipadic</strong>: Japanese text tokenization using Lindera with IPAdic dictionary</li>
+<li><strong>lindera/ko-dic</strong>: Korean text tokenization using Lindera with Ko-dic dictionary</li>
+<li><strong>lindera/unidic</strong>: Japanese text tokenization using Lindera with UniDic dictionary</li>
+</ul>
+<h3 id="language-processing-features">Language Processing Features<a class="headerlink" href="#language-processing-features" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>stemming</strong>: Reduces words to their root form (e.g., "running" → "run")</li>
+<li><strong>stop words</strong>: Removes common words like "the", "and", "is"</li>
+<li><strong>ascii folding</strong>: Converts accented characters to ASCII (e.g., "é" → "e")</li>
+</ul>
+<h2 id="search-with-fts-queries">Search With FTS Queries<a class="headerlink" href="#search-with-fts-queries" title="Permanent link">&para;</a></h2>
+<p>Now you can run FTS queries using your inverted index:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1"># Open dataset</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"/tmp/fts.lance"</span><span class="p">)</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="c1"># Specify keyword phrases when calling the `to_table` method</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>    <span class="n">full_text_query</span><span class="o">=</span><span class="s2">"umbrella train"</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="p">)</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="nb">print</span><span class="p">(</span><span class="n">query_result</span><span class="p">)</span>
+</span></code></pre></div>
+<p>This query returns documents that contain either "umbrella" or "train" (or both). The search is case-insensitive and uses the inverted index for fast retrieval.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>id: [[1, 3]]
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>text: [["I left my umbrella on the evening train to Boston", "This train is scheduled to leave for Edinburgh at 9:30 in the morning"]]
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>_score: [[..., ...]]
+</span></code></pre></div>
+<h2 id="combining-full-text-search-with-metadata">Combining Full-Text Search with Metadata<a class="headerlink" href="#combining-full-text-search-with-metadata" title="Permanent link">&para;</a></h2>
+<p>It can be useful to combine FTS with metadata filtering in a single query to find more relevant results.
+You can do this by passing a filter expression to the <code>filter</code> parameter.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="p">{</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>        <span class="s2">"text"</span><span class="p">:</span> <span class="p">[</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>            <span class="s2">"I left my umbrella on the morning train to Boston"</span><span class="p">,</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>            <span class="s2">"This ramen recipe simmers the broth for three hours with dried mushrooms."</span><span class="p">,</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a>            <span class="s2">"This train is scheduled to leave for Edinburgh at 9:30 AM"</span><span class="p">,</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a>        <span class="p">],</span>
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a>        <span class="s2">"category"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"travel"</span><span class="p">,</span> <span class="s2">"food"</span><span class="p">,</span> <span class="s2">"travel"</span><span class="p">],</span>
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a>    <span class="p">}</span>
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a><span class="p">)</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a>
+</span><span id="__span-9-16"><a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a><span class="c1"># Temp write dataset</span>
+</span><span id="__span-9-17"><a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a><span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"./fts_test_with_metadata.lance"</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"overwrite"</span><span class="p">)</span>
+</span><span id="__span-9-18"><a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a>
+</span><span id="__span-9-19"><a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./fts_test_with_metadata.lance"</span><span class="p">)</span>
+</span><span id="__span-9-20"><a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a>
+</span><span id="__span-9-21"><a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a><span class="c1"># Create FTS index</span>
+</span><span id="__span-9-22"><a id="__codelineno-9-22" name="__codelineno-9-22" href="#__codelineno-9-22"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-9-23"><a id="__codelineno-9-23" name="__codelineno-9-23" href="#__codelineno-9-23"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-9-24"><a id="__codelineno-9-24" name="__codelineno-9-24" href="#__codelineno-9-24"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-9-25"><a id="__codelineno-9-25" name="__codelineno-9-25" href="#__codelineno-9-25"></a><span class="p">)</span>
+</span><span id="__span-9-26"><a id="__codelineno-9-26" name="__codelineno-9-26" href="#__codelineno-9-26"></a>
+</span><span id="__span-9-27"><a id="__codelineno-9-27" name="__codelineno-9-27" href="#__codelineno-9-27"></a><span class="c1"># Run FTS query with metadata filter</span>
+</span><span id="__span-9-28"><a id="__codelineno-9-28" name="__codelineno-9-28" href="#__codelineno-9-28"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-9-29"><a id="__codelineno-9-29" name="__codelineno-9-29" href="#__codelineno-9-29"></a>    <span class="n">full_text_query</span><span class="o">=</span><span class="s2">"three"</span><span class="p">,</span>
+</span><span id="__span-9-30"><a id="__codelineno-9-30" name="__codelineno-9-30" href="#__codelineno-9-30"></a>    <span class="nb">filter</span><span class="o">=</span><span class="s1">'category = "food"'</span><span class="p">,</span>
+</span><span id="__span-9-31"><a id="__codelineno-9-31" name="__codelineno-9-31" href="#__codelineno-9-31"></a><span class="p">)</span>
+</span><span id="__span-9-32"><a id="__codelineno-9-32" name="__codelineno-9-32" href="#__codelineno-9-32"></a>
+</span><span id="__span-9-33"><a id="__codelineno-9-33" name="__codelineno-9-33" href="#__codelineno-9-33"></a><span class="c1"># Returns</span>
+</span><span id="__span-9-34"><a id="__codelineno-9-34" name="__codelineno-9-34" href="#__codelineno-9-34"></a><span class="c1"># id: [[2]]</span>
+</span><span id="__span-9-35"><a id="__codelineno-9-35" name="__codelineno-9-35" href="#__codelineno-9-35"></a><span class="c1"># text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]</span>
+</span><span id="__span-9-36"><a id="__codelineno-9-36" name="__codelineno-9-36" href="#__codelineno-9-36"></a><span class="c1"># category: [["food"]]</span>
+</span></code></pre></div>
+<h2 id="advanced-search-features">Advanced Search Features<a class="headerlink" href="#advanced-search-features" title="Permanent link">&para;</a></h2>
+<h3 id="boolean-search-operators">Boolean Search Operators<a class="headerlink" href="#boolean-search-operators" title="Permanent link">&para;</a></h3>
+<p>You can use boolean search operators by constructing a structured query object.</p>
+<h4 id="all-terms-and">All terms: <code>AND</code><a class="headerlink" href="#all-terms-and" title="Permanent link">&para;</a></h4>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.query</span><span class="w"> </span><span class="kn">import</span> <span class="n">FullTextOperator</span><span class="p">,</span> <span class="n">MatchQuery</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="c1"># Require the terms 'umbrella AND train AND boston' to be present</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="n">and_query</span> <span class="o">=</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"umbrella train boston"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">,</span> <span class="n">operator</span><span class="o">=</span><span class="n">FullTextOperator</span><span class="o">.</span><span class="n">AND</span><span class="p">)</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">full_text_query</span><span class="o">=</span><span class="n">and_query</span><span class="p">)</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="c1"># Returns</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="c1"># text: [["I left my umbrella on the evening train to Boston"]]</span>
+</span></code></pre></div>
+<h4 id="any-terms-or">Any terms: <code>OR</code><a class="headerlink" href="#any-terms-or" title="Permanent link">&para;</a></h4>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.query</span><span class="w"> </span><span class="kn">import</span> <span class="n">FullTextOperator</span><span class="p">,</span> <span class="n">MatchQuery</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="c1"># Require the terms 'morning OR evening' to be present</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="n">or_query</span> <span class="o">=</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"morning evening"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">,</span> <span class="n">operator</span><span class="o">=</span><span class="n">FullTextOperator</span><span class="o">.</span><span class="n">OR</span><span class="p">)</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">full_text_query</span><span class="o">=</span><span class="n">or_query</span><span class="p">)</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="c1"># Returns the Boston document that mentions 'evening', and the Edinburgh document that mentions 'morning'</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="c1"># text: [["This train is scheduled to leave for Edinburgh at 9:30 in the morning", "I left my umbrella on the evening train to Boston"]]</span>
+</span></code></pre></div>
+<h4 id="mix-andor-queries-via-operators">Mix <code>AND</code>/<code>OR</code> queries via operators<a class="headerlink" href="#mix-andor-queries-via-operators" title="Permanent link">&para;</a></h4>
+<p>You can mix <code>AND</code>/<code>OR</code> queries using operators in Python:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.query</span><span class="w"> </span><span class="kn">import</span> <span class="n">FullTextOperator</span><span class="p">,</span> <span class="n">MatchQuery</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="c1"># Combine AND and OR semantics</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="c1"># Require 'train' AND ('morning' OR 'evening')</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="n">q1</span> <span class="o">=</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"morning evening"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">,</span> <span class="n">operator</span><span class="o">=</span><span class="n">FullTextOperator</span><span class="o">.</span><span class="n">OR</span><span class="p">)</span>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="n">q2</span> <span class="o">=</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"train"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">)</span>
+</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">full_text_query</span><span class="o">=</span><span class="p">(</span><span class="n">q1</span> <span class="o">&amp;</span> <span class="n">q2</span><span class="p">))</span>
+</span><span id="__span-12-8"><a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a>
+</span><span id="__span-12-9"><a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a><span class="c1"># Returns both the Boston and Edinburgh documents that mention 'train'</span>
+</span><span id="__span-12-10"><a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="c1"># text: [["I left my umbrella on the evening train to Boston", "This train is scheduled to leave for Edinburgh at 9:30 in the morning"]]</span>
+</span></code></pre></div>
+<p>To combine <code>OR</code> queries via operators, use the pattern <code>q1 | q2</code>.</p>
+<p>Every query combined with <code>AND</code> becomes a scoring <code>MUST</code> clause: all clauses must match,
+and every matching clause contributes to the final <code>_score</code>.</p>
+<h4 id="exclude-terms-not">Exclude terms: <code>NOT</code><a class="headerlink" href="#exclude-terms-not" title="Permanent link">&para;</a></h4>
+<p>Queries that exclude specific keywords are explicitly written using <code>BooleanQuery</code>/<code>Occur</code>
+as shown below.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.query</span><span class="w"> </span><span class="kn">import</span> <span class="n">MatchQuery</span><span class="p">,</span> <span class="n">BooleanQuery</span><span class="p">,</span> <span class="n">Occur</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="c1"># Require that 'umbrella' be present, but 'train' NOT be present</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="n">q</span> <span class="o">=</span> <span class="n">BooleanQuery</span><span class="p">(</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="p">[</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>        <span class="p">(</span><span class="n">Occur</span><span class="o">.</span><span class="n">MUST</span><span class="p">,</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"umbrella"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">)),</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>        <span class="p">(</span><span class="n">Occur</span><span class="o">.</span><span class="n">MUST_NOT</span><span class="p">,</span> <span class="n">MatchQuery</span><span class="p">(</span><span class="s2">"train"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">)),</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>    <span class="p">]</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="p">)</span>
+</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">full_text_query</span><span class="o">=</span><span class="n">q</span><span class="p">)</span>
+</span><span id="__span-13-11"><a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a>
+</span><span id="__span-13-12"><a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="c1"># Returns empty result, as no document matches this condition</span>
+</span><span id="__span-13-13"><a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="c1"># text: []</span>
+</span></code></pre></div>
+<h3 id="phrase-search">Phrase Search<a class="headerlink" href="#phrase-search" title="Permanent link">&para;</a></h3>
+<p>For exact phrase matching, ensure you enable <code>with_position=True</code> during index creation, which is disabled by default.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># Rebuild the index with positions enabled (required for phrase queries)</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>    <span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>    <span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>    <span class="n">with_position</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>    <span class="n">remove_stop_words</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="p">)</span>
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a><span class="c1"># Search for the exact phrase "train to boston"</span>
+</span><span id="__span-14-9"><a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a><span class="n">table</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">full_text_query</span><span class="o">=</span><span class="s2">"'train to boston'"</span><span class="p">)</span>
+</span><span id="__span-14-10"><a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a>
+</span><span id="__span-14-11"><a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a><span class="c1"># If stopwords are removed, this phrase query would return an empty result</span>
+</span><span id="__span-14-12"><a id="__codelineno-14-12" name="__codelineno-14-12" href="#__codelineno-14-12"></a><span class="c1"># text: [["I left my umbrella on the evening train to Boston"]]</span>
+</span></code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Stop Words Are Removed by Default</p>
+</div>
+<p>Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set <code>remove_stop_words=False</code> when creating the index.</p>
+<h3 id="substring-matches-with-n-gram-indexing">Substring matches with N-gram indexing<a class="headerlink" href="#substring-matches-with-n-gram-indexing" title="Permanent link">&para;</a></h3>
+<p><code>NGRAM</code> is a type of scalar index for <strong>substring / pattern-style</strong> searches over text. It is a good alternative to wildcard-style queries like <code>term*</code> / <code>*term</code> (which are not parsed by <code>full_text_query</code> in Lance).</p>
+<p>The N-gram index creates a bitmap for each N-gram in the string. By default, Lance uses trigrams. This index can be used to speed up queries using the <code>contains</code> function in filters.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"/tmp/fts.lance"</span><span class="p">)</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="c1"># Build an NGRAM index for substring search (speeds up `contains(...)` filters)</span>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="c1"># Give the index a distinct name so it won't replace your FTS index</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="n">ds</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span><span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span> <span class="n">index_type</span><span class="o">=</span><span class="s2">"NGRAM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_ngram"</span><span class="p">)</span>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a>
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="c1"># Substring search</span>
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a><span class="n">q1</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="nb">filter</span><span class="o">=</span><span class="s2">"contains(text, 'ramen')"</span><span class="p">)</span>
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a><span class="c1"># Returns the document about ramen</span>
+</span><span id="__span-15-13"><a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a><span class="c1"># text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]</span>
+</span></code></pre></div>
+<p>You can explain the query plan to confirm the N-gram index's usage as shown below:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1"># Inspect the query plan to confirm index usage</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">scanner</span><span class="p">(</span><span class="nb">filter</span><span class="o">=</span><span class="s2">"contains(text, 'train')"</span><span class="p">)</span><span class="o">.</span><span class="n">explain_plan</span><span class="p">())</span>
+</span></code></pre></div>
+<h3 id="fuzzy-search">Fuzzy Search<a class="headerlink" href="#fuzzy-search" title="Permanent link">&para;</a></h3>
+<p>Fuzzy search is supported for FTS <code>MatchQuery</code> on <code>INVERTED</code> indexes. It uses Levenshtein edit distance to match terms with typos or slight variations.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.query</span><span class="w"> </span><span class="kn">import</span> <span class="n">MatchQuery</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="c1"># Explicit edit distance (1)</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a>    <span class="n">full_text_query</span><span class="o">=</span><span class="n">MatchQuery</span><span class="p">(</span>
+</span><span id="__span-17-6"><a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a>        <span class="s2">"rammen"</span><span class="p">,</span>  <span class="c1"># Misspelled 'ramen'</span>
+</span><span id="__span-17-7"><a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a>        <span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-17-8"><a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a>        <span class="n">fuzziness</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-17-9"><a id="__codelineno-17-9" name="__codelineno-17-9" href="#__codelineno-17-9"></a>        <span class="n">max_expansions</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>  <span class="c1"># default: 50</span>
+</span><span id="__span-17-10"><a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a>    <span class="p">)</span>
+</span><span id="__span-17-11"><a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>You can also set <code>fuzziness=None</code> to use automatic fuzziness:</p>
+<ul>
+<li><code>0</code> for term length <code>&lt;= 2</code></li>
+<li><code>1</code> for term length <code>&lt;= 5</code></li>
+<li><code>2</code> for term length <code>&gt; 5</code></li>
+</ul>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>    <span class="n">full_text_query</span><span class="o">=</span><span class="n">MatchQuery</span><span class="p">(</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a>        <span class="s2">"rammen"</span><span class="p">,</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a>        <span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-18-5"><a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a>        <span class="n">fuzziness</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-18-6"><a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a>    <span class="p">)</span>
+</span><span id="__span-18-7"><a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>To enforce exact prefixes during fuzzy matching, set <code>prefix_length</code>.
+This means the first <code>N</code> characters must match exactly before fuzzy edits are allowed on the rest of the term.
+For example, with <code>prefix_length=2</code>, <code>"rammen"</code> can match terms starting with <code>"ra"</code> (like <code>"ramen"</code>), but not terms starting with other prefixes.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="n">query_result</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>    <span class="n">full_text_query</span><span class="o">=</span><span class="n">MatchQuery</span><span class="p">(</span>
+</span><span id="__span-19-3"><a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a>        <span class="s2">"rammen"</span><span class="p">,</span>
+</span><span id="__span-19-4"><a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a>        <span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-19-5"><a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>        <span class="n">fuzziness</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-19-6"><a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a>        <span class="n">prefix_length</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>  <span class="c1"># "ra" must match exactly</span>
+</span><span id="__span-19-7"><a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a>    <span class="p">)</span>
+</span><span id="__span-19-8"><a id="__codelineno-19-8" name="__codelineno-19-8" href="#__codelineno-19-8"></a><span class="p">)</span>
+</span></code></pre></div>
+<h2 id="performance-tips">Performance Tips<a class="headerlink" href="#performance-tips" title="Permanent link">&para;</a></h2>
+<h3 id="index-maintenance">Index Maintenance<a class="headerlink" href="#index-maintenance" title="Permanent link">&para;</a></h3>
+<p>When you append new rows after creating an <code>INVERTED</code> index, Lance still returns those rows in <code>full_text_query</code> results. It searches indexed fragments using the FTS index, scans unindexed fragments with flat search, and then merges the results.</p>
+<p>To keep FTS latency low as new data arrives, periodically add unindexed fragments into the existing FTS index by calling <code>ds.optimize.optimize_indices()</code>:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="c1"># Append new data</span>
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a><span class="n">new_rows</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-20-3"><a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a>    <span class="p">{</span>
+</span><span id="__span-20-4"><a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">4</span><span class="p">],</span>
+</span><span id="__span-20-5"><a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a>        <span class="s2">"text"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"The next train leaves at noon"</span><span class="p">],</span>
+</span><span id="__span-20-6"><a id="__codelineno-20-6" name="__codelineno-20-6" href="#__codelineno-20-6"></a>    <span class="p">}</span>
+</span><span id="__span-20-7"><a id="__codelineno-20-7" name="__codelineno-20-7" href="#__codelineno-20-7"></a><span class="p">)</span>
+</span><span id="__span-20-8"><a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a><span class="n">ds</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">new_rows</span><span class="p">)</span>
+</span><span id="__span-20-9"><a id="__codelineno-20-9" name="__codelineno-20-9" href="#__codelineno-20-9"></a>
+</span><span id="__span-20-10"><a id="__codelineno-20-10" name="__codelineno-20-10" href="#__codelineno-20-10"></a><span class="c1"># Incrementally update existing indices (including "text_idx")</span>
+</span><span id="__span-20-11"><a id="__codelineno-20-11" name="__codelineno-20-11" href="#__codelineno-20-11"></a><span class="n">ds</span><span class="o">.</span><span class="n">optimize</span><span class="o">.</span><span class="n">optimize_indices</span><span class="p">(</span><span class="n">index_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_idx"</span><span class="p">])</span>
+</span><span id="__span-20-12"><a id="__codelineno-20-12" name="__codelineno-20-12" href="#__codelineno-20-12"></a>
+</span><span id="__span-20-13"><a id="__codelineno-20-13" name="__codelineno-20-13" href="#__codelineno-20-13"></a><span class="c1"># Optional: monitor index coverage</span>
+</span><span id="__span-20-14"><a id="__codelineno-20-14" name="__codelineno-20-14" href="#__codelineno-20-14"></a><span class="n">stats</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">stats</span><span class="o">.</span><span class="n">index_stats</span><span class="p">(</span><span class="s2">"text_idx"</span><span class="p">)</span>
+</span><span id="__span-20-15"><a id="__codelineno-20-15" name="__codelineno-20-15" href="#__codelineno-20-15"></a><span class="nb">print</span><span class="p">(</span><span class="n">stats</span><span class="p">[</span><span class="s2">"num_unindexed_rows"</span><span class="p">],</span> <span class="n">stats</span><span class="p">[</span><span class="s2">"num_indexed_rows"</span><span class="p">])</span>
+</span></code></pre></div>
+<div class="admonition info">
+<p class="admonition-title">Info</p>
+</div>
+<p>If you used a custom index name, replace <code>"text_idx"</code> with your index name.
+If you did not set <code>name=...</code> when creating the FTS index on column <code>"text"</code>, the default index name is <code>"text_idx"</code>.</p>
+<p>If you changed tokenizer settings (such as <code>with_position</code>, <code>base_tokenizer</code>, stop words, or stemming), rebuild the index with <code>create_scalar_index(..., replace=True)</code> so the full dataset is indexed with the new configuration.</p>
+<h3 id="index-configuration-best-practices">Index Configuration Best Practices<a class="headerlink" href="#index-configuration-best-practices" title="Permanent link">&para;</a></h3>
+<ul>
+<li>
+<p>Enable <code>with_position</code> when you need phrase queries, because it stores word positions within documents. For simple term searches, disabling this option can save considerable storage space without impacting performance.</p>
+</li>
+<li>
+<p>Keep <code>lower_case=True</code> enabled for most applications to ensure case-insensitive search behavior. This provides a better user experience and matches common search expectations, though you can disable it if case sensitivity is important for your use case.</p>
+</li>
+<li>
+<p>Enable stemming (<code>stem=True</code>) when you want better recall by matching word variations (e.g., "running" matches "run"). Disable stemming if you need exact term matching or if your domain requires precise terminology.</p>
+</li>
+<li>
+<p>Consider enabling <code>remove_stop_words=True</code> for cleaner search results, especially in content-heavy applications. This removes common words like "the", "and", and "is" from the index, reducing noise and improving relevance. Keep stop words if they carry important meaning in your domain.</p>
+</li>
+</ul>
+<h3 id="query-optimization">Query Optimization<a class="headerlink" href="#query-optimization" title="Permanent link">&para;</a></h3>
+<p>Using specific, targeted search terms often yields better performance than broad, generic queries. More specific terms reduce the number of potential matches and allow the index to work more efficiently. Consider analyzing your most common search patterns and optimizing your index configuration accordingly.</p>
+<p>Combining full-text search with metadata filters can significantly reduce the search space and improve performance. Use structured data filters to narrow down results before applying text search, or vice versa. This approach is particularly effective for large datasets where you can eliminate many irrelevant documents early in the query process.</p>
+<h3 id="further-reading">Further Reading<a class="headerlink" href="#further-reading" title="Permanent link">&para;</a></h3>
+<p>For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the <a href="../../format/index/scalar/fts/">full-text index</a> specification.</p>
+<h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
+<p>Check out the <strong><a href="../../guide/read_and_write/">User Guide</a></strong> and explore the Lance API in more detail.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../vector-search/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Vector Search</div>
+        </a>
+        <a class="next" href="../../guide/read_and_write/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Read and Write</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#install-the-python-sdk">Install the Python SDK</a>
+      <a class="ld-toc__h2" href="#set-up-your-environment">Set Up Your Environment</a>
+      <a class="ld-toc__h2" href="#prepare-your-text-data">Prepare Your Text Data</a>
+      <a class="ld-toc__h2" href="#explore-your-dataset-schema">Explore Your Dataset Schema</a>
+      <a class="ld-toc__h2" href="#build-the-full-text-search-index">Build the Full-Text Search Index</a>
+      <a class="ld-toc__h2" href="#advanced-index-configuration">Advanced Index Configuration</a>
+      <a class="ld-toc__h3" href="#tokenizer-options">Tokenizer Options</a>
+      <a class="ld-toc__h3" href="#language-processing-features">Language Processing Features</a>
+      <a class="ld-toc__h2" href="#search-with-fts-queries">Search With FTS Queries</a>
+      <a class="ld-toc__h2" href="#combining-full-text-search-with-metadata">Combining Full-Text Search with Metadata</a>
+      <a class="ld-toc__h2" href="#advanced-search-features">Advanced Search Features</a>
+      <a class="ld-toc__h3" href="#boolean-search-operators">Boolean Search Operators</a>
+      <a class="ld-toc__h3" href="#phrase-search">Phrase Search</a>
+      <a class="ld-toc__h3" href="#substring-matches-with-n-gram-indexing">Substring matches with N-gram indexing</a>
+      <a class="ld-toc__h3" href="#fuzzy-search">Fuzzy Search</a>
+      <a class="ld-toc__h2" href="#performance-tips">Performance Tips</a>
+      <a class="ld-toc__h3" href="#index-maintenance">Index Maintenance</a>
+      <a class="ld-toc__h3" href="#index-configuration-best-practices">Index Configuration Best Practices</a>
+      <a class="ld-toc__h3" href="#query-optimization">Query Optimization</a>
+      <a class="ld-toc__h3" href="#further-reading">Further Reading</a>
+      <a class="ld-toc__h2" href="#next-steps">Next Steps</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../">Getting started</a>
+        <a href="../../guide/read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

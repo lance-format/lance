@@ -1,0 +1,1558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Encoding Strategy — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/file/encoding/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../">Specification</a>
+    <a class="active" href="./">Encoding Strategy</a>
+    <a href="../versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../table/">Lance Table Format</a>
+    <a href="../../table/schema/">Schema</a>
+    <a href="../../table/versioning/">Versioning</a>
+    <a href="../../table/transaction/">Transactions</a>
+    <a href="../../table/layout/">Layout</a>
+    <a href="../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>File Format</span>
+        <span>/</span><b>Encoding Strategy</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-encoding-strategy">Lance Encoding Strategy<a class="headerlink" href="#lance-encoding-strategy" title="Permanent link">&para;</a></h1>
+<p>The encoding strategy determines how array data is encoded into a disk page. The encoding strategy tends to evolve
+more quickly than the file format itself.</p>
+<h2 id="older-encoding-strategies">Older Encoding Strategies<a class="headerlink" href="#older-encoding-strategies" title="Permanent link">&para;</a></h2>
+<p>The 0.1 and 2.0 encoding strategies are no longer documented. They were significantly different from future encoding
+strategies and describing them in detail would be a distraction.</p>
+<h2 id="terminology">Terminology<a class="headerlink" href="#terminology" title="Permanent link">&para;</a></h2>
+<p>An array is a sequence of values. An array has a data type which describes the semantic interpretation of the values.
+A layout is a way to encode an array into a set of buffers and child arrays. A buffer is a contiguous sequence of
+bytes. An encoding describes how the semantic interpretation of data is mapped to the layout. An encoder converts
+data from one layout to another.</p>
+<p>Data types and layouts are orthogonal concepts. An integer array might be encoded into two completely different
+layouts which represent the same data.</p>
+<p><img alt="Multiple Encodings" src="../../../images/encoding_v_array.png" /></p>
+<h3 id="data-types">Data Types<a class="headerlink" href="#data-types" title="Permanent link">&para;</a></h3>
+<p>Lance uses a subset of Arrow's type system for data types. An Arrow data type is both a data type and an encoding.
+When writing data Lance will often normalize Arrow data types. For example, a string array and a large string array
+might end up traveling down the same path (variable width data). In fact, most types fall into two general paths. One
+for fixed-width data and one for variable-width data (where we recognize both 32-bit and 64-bit offsets).</p>
+<p>At read time, the Arrow data type is used to determine the target encoding. For example, a string array and large
+string array might both be stored in the same layout but, at read time, we will use the Arrow data type to determine
+the size of the offsets returned to the user. There is no requirement the output Arrow type matches the input Arrow
+type. For example, it is acceptable to write an array as "large string" and then read it back as "string".</p>
+<h2 id="search-cache">Search Cache<a class="headerlink" href="#search-cache" title="Permanent link">&para;</a></h2>
+<p>The search cache is a key component of the Lance file reader. Random access requires that we locate the physical
+location of the data in the file. To do so we need to know information such as the encoding used for a column,
+the location of the page, and potentially other information. This information is collectively known as the "search
+cache" and is implemented as a basic LRU cache. We define a "initialization phase" which is when we load the various indexing information into the search cache. The cost of initialization is assumed to be amortized over the lifetime
+of the reader.</p>
+<p>When performing full scans (i.e. not random access), we should be able to ignore the search cache and sometimes
+can avoid loading it entirely. We <em>do</em> want to optimize for cold scans as the initialization phase is often not
+amortized over the lifetime of the reader.</p>
+<h2 id="structural-encoding">Structural Encoding<a class="headerlink" href="#structural-encoding" title="Permanent link">&para;</a></h2>
+<p>The first step in encoding an array is to determine the structural encoding of the array. A structural encoding
+breaks the data into smaller units which can be independently decoded. Structural encodings are also responsible
+for encoding the "structure" (struct validity, list validity, list offsets, etc.) typically utilizing repetition
+levels and definition levels.</p>
+<p>Structural encoding is fairly complicated! However, the goal is to suck out all the details related to I/O
+scheduling so that compression libraries can focus on compression. This keeps our compression traits simple
+without sacrificing our ability to perform random access.</p>
+<p>There are only a few structural encodings. The structural encoding is described by the <code>PageLayout</code> message and
+is the top-level message for the encoding.</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">PageLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">layout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="c1">// A layout used for pages where the data is small</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">MiniBlockLayout</span><span class="w"> </span><span class="na">mini_block_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="c1">// A layout used for pages where all (visible) values are the same scalar value or null.</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="n">ConstantLayout</span><span class="w"> </span><span class="na">constant_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="c1">// A layout used for pages where the data is large</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="n">FullZipLayout</span><span class="w"> </span><span class="na">full_zip_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="cm">/* A layout where large binary data is encoded externally</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="cm">     * and only the descriptions are put in the page</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="cm">     */</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="n">BlobLayout</span><span class="w"> </span><span class="na">blob_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="c1">// A sparse structural layout. This variant requires file version 2.3 or later.</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">    </span><span class="n">SparseLayout</span><span class="w"> </span><span class="na">sparse_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="repetition-and-definition-levels">Repetition and Definition Levels<a class="headerlink" href="#repetition-and-definition-levels" title="Permanent link">&para;</a></h3>
+<p>Repetition and definition levels are an alternative to validity bitmaps and offset arrays for expressing struct
+and list information. They have a significant advantage in that they combine all of these buffers into a single
+buffer which allows us to avoid multiple IOPS.</p>
+<p>A more extensive explanation of repetition and definition levels can be found in the code. One particular note
+is that we use 0 to represent the "inner-most" item and Parquet uses 0 to represent the "outer-most" item. Here
+is an example:</p>
+<h4 id="definition-levels">Definition Levels<a class="headerlink" href="#definition-levels" title="Permanent link">&para;</a></h4>
+<p>Consider the following array:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>[{"middle": {"inner": 1]}}, NULL, {"middle": NULL}, {"middle": {"inner": NULL}}]
+</span></code></pre></div>
+<p>In Arrow we would have the following validity arrays:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Outer validity : 1, 0, 1, 1
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>Middle validity: 1, ?, 0, 1
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>Inner validity : 1, ?, ?, 0
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>Values         : 1, ?, ?, ?
+</span></code></pre></div>
+<p>The ? values are undefined in the Arrow format. We can convert these into definition levels as follows:</p>
+<table>
+<thead>
+<tr>
+<th>Values</th>
+<th>Definition</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>Valid at all levels</td>
+</tr>
+<tr>
+<td>?</td>
+<td>3</td>
+<td>Null at outer level</td>
+</tr>
+<tr>
+<td>?</td>
+<td>2</td>
+<td>Null at middle level</td>
+</tr>
+<tr>
+<td>?</td>
+<td>1</td>
+<td>Null at inner level</td>
+</tr>
+</tbody>
+</table>
+<h4 id="repetition-levels">Repetition Levels<a class="headerlink" href="#repetition-levels" title="Permanent link">&para;</a></h4>
+<p>Consider the following list array with 3 rows</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>[{&lt;0,1&gt;, &lt;&gt;, &lt;2&gt;}, {&lt;3&gt;}, {}], [], [{&lt;4&gt;}]
+</span></code></pre></div>
+<p>We would have three offsets arrays in Arrow:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Outer-most ([]): [0, 3, 3, 4]
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>Middle     ({}): [0, 3, 4, 4, 5]
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>Inner      (&lt;&gt;): [0, 2, 2, 3, 4, 5]
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>Values         : [0, 1, 2, 3, 4]
+</span></code></pre></div>
+<p>We can convert these into repetition levels as follows:</p>
+<table>
+<thead>
+<tr>
+<th>Values</th>
+<th>Repetition</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>3</td>
+<td>Start of outer-most list</td>
+</tr>
+<tr>
+<td>1</td>
+<td>0</td>
+<td>Continues inner-most list (no new lists)</td>
+</tr>
+<tr>
+<td>?</td>
+<td>1</td>
+<td>Start of new inner-most list (empty list)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>1</td>
+<td>Start of new inner-most list</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2</td>
+<td>Start of new middle list</td>
+</tr>
+<tr>
+<td>?</td>
+<td>2</td>
+<td>Start of new inner-most list (empty list)</td>
+</tr>
+<tr>
+<td>?</td>
+<td>3</td>
+<td>Start of new outer-most list (empty list)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>3</td>
+<td>Start of new outer-most list</td>
+</tr>
+</tbody>
+</table>
+<h3 id="mini-block-page-layout">Mini Block Page Layout<a class="headerlink" href="#mini-block-page-layout" title="Permanent link">&para;</a></h3>
+<p>The mini block page layout is the default layout for smallish types. This fits most of the classical data types
+(integers, floats, booleans, small strings, etc.) that Parquet and related formats already handle well. As is no
+surprise, the approach used is pretty similar to those formats.</p>
+<p><img alt="Mini Block Layout" src="../../../images/miniblock.png" /></p>
+<p>The data is divided into small mini-blocks. Each mini-block should contain a power-of-two number of values (except
+for the last mini-block) and should be less than 32KiB of compressed data. We have to read an entire mini-block to
+get a single value so we want to keep the mini-block size small. Mini blocks are padded to 8 byte boundaries. This
+helps to avoid alignment issues. Each mini-block starts with a small header which helps us figure out how much
+padding has been applied.</p>
+<p>The repetition and definition levels are sliced up and stored in the mini-blocks along with the compressed buffers.
+Since we need to read an entire mini-block there is no need to zip up the various buffers and they are stored
+one after the other (repetition, definition, values, ...).</p>
+<h4 id="buffer-1-mini-blocks">Buffer 1 (Mini Blocks)<a class="headerlink" href="#buffer-1-mini-blocks" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Number of buffers in the mini-block</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer 0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Size of buffer N</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer 0</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Buffer N</td>
+</tr>
+<tr>
+<td>0-7</td>
+<td>Padding to ensure 8 byte alignment</td>
+</tr>
+</tbody>
+</table>
+<p>Note: It is natural to explain this buffer first but it is actually the second buffer in the page.</p>
+<h4 id="buffer-0-mini-block-metadata">Buffer 0 (Mini Block Metadata)<a class="headerlink" href="#buffer-0-mini-block-metadata" title="Permanent link">&para;</a></h4>
+<p><img alt="Mini Block Layout" src="../../../images/miniblock_meta.png" /></p>
+<p>To enable random access we have a small metadata lookup which contains two bytes per mini-block. This lookup
+tells us how many bytes are in each mini block and how many items are in the mini block. This metadata lookup
+must be loaded at initialization time and placed in the search cache.</p>
+<table>
+<thead>
+<tr>
+<th>Bits (not bytes)</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block 0</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block 0</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block 1</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Number of 8-byte words in block N</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Log2 of number of values in block N</td>
+</tr>
+</tbody>
+</table>
+<p>For all chunks except the last, the lower 4 bits store <code>log2(num_values)</code> and <code>num_values</code> must be a power of two.
+For the last chunk, these bits are set to <code>0</code>. The protobuf stores the total number of values in the page, so readers
+can derive the final chunk size by subtracting the values from earlier chunks.</p>
+<h4 id="buffer-2-dictionary-optional">Buffer 2 (Dictionary, optional)<a class="headerlink" href="#buffer-2-dictionary-optional" title="Permanent link">&para;</a></h4>
+<p>Dictionary encoding is an encoding that can be applied at many different levels throughout a file. For example,
+it could be used as a compressive encoding or it could even be entirely external to the file. We've found the
+most convenient simple place to apply dictionary encoding is at the structural level. Since dictionary indices are
+small we always use the mini block layout for dictionary encoding. When we use dictionary encoding we store the
+dictionary in the buffer at index 2. We require the dictionary to be full loaded and decoded at initialization time.
+This means we don't have to load the dictionary during random access but it does require the dictionary be placed
+in the search cache.</p>
+<p>Dictionary values are stored as a single buffer and compressed through the block compression path. The compression
+scheme for dictionary values can be configured separately (see <code>lance-encoding:dict-values-compression</code> below).</p>
+<h4 id="buffer-2-or-3-repetition-index-optional">Buffer 2 (or 3) (Repetition Index, optional)<a class="headerlink" href="#buffer-2-or-3-repetition-index-optional" title="Permanent link">&para;</a></h4>
+<p>If there is repetition (list levels) then we need some way to translate row offsets into item offsets. The mini
+blocks always store items. During a full scan the list offsets are restored when we decode the repetition levels.
+However, to support random access, we don't have the repetition levels available. Instead we store a repetition
+index in the next available buffer (index 2 or 3 depending on whether the dictionary is present).</p>
+<p>The repetition index is a flat buffer of u64 values. We have N * D values where N is the number of mini blocks
+and D Is the desired depth of random access plus one. For example, to support 1-dimensional lookups (random access
+by rows) then D is 2. To support two-dimensional lookups (e.g. rows[50][17]) then we could set D to 3.</p>
+<p>Currently we only support 1-dimensional random access.
+Currently we do not compress the repetition index.</p>
+<p>This may change in future versions.</p>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8</td>
+<td>Number of rows in block 0</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block 0</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of rows in block 1</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block 1</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of rows in block N</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Number of partial items in block N</td>
+</tr>
+</tbody>
+</table>
+<p>The last 8 bytes of each block stores the number of "partial" items. These are items leftover after the last
+complete row. We don't require rows to be bounded by mini-blocks so we need to keep track of this. For example,
+if we have 10,000 items per row then we might have several mini-blocks with only partial items and 0 rows.</p>
+<p>At read time we can use this repetition index to translate row offsets into item offsets.</p>
+<h4 id="mini-block-compression">Mini Block Compression<a class="headerlink" href="#mini-block-compression" title="Permanent link">&para;</a></h4>
+<p>The mini block layout relies on the compression algorithm to handle the splitting of data into mini-blocks. This
+is because the number of values per block will depend on the compressibility of the data. As a result, there is
+a special trait for mini block compression.</p>
+<p>The data compression algorithm is the algorithm that decides chunk boundaries. The repetition and definition levels
+are then sliced appropriately and sent to a block compressor. This means there are no constraints on how the repetition
+and definition levels are compressed.</p>
+<p>Beyond splitting the data into mini-blocks, there are no additional constraints. We expect to fully decode mini
+blocks as opaque chunks. This means we can use any compression algorithm that we deem suitable.</p>
+<h4 id="protobuf">Protobuf<a class="headerlink" href="#protobuf" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">MiniBlockLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="cm">/* Description of the compression of repetition levels (e.g. how many bits per rep)</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="cm">   *</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="cm">   * Optional, if there is no repetition then this field is not present</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="cm">   */</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">rep_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">  </span><span class="cm">/* Description of the compression of definition levels (e.g. how many bits per def)</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="cm">   *</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="cm">   * Optional, if there is no definition then this field is not present</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="cm">   */</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">def_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">  </span><span class="c1">// Description of the compression of values</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">value_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">  </span><span class="cm">/* Description of the compression of the dictionary data</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="cm">   *</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="cm">   * Optional, if there is no dictionary then this field is not present</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="cm">   */</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">dictionary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="w">  </span><span class="c1">// Number of items in the dictionary</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_dictionary_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="w">  </span><span class="cm">/* The number of buffers in each mini-block, this is determined by the compression and does</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="cm">   * NOT include the repetition or definition buffers (the presence of these buffers can be determined</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="cm">   * by looking at the rep_compression and def_compression fields)</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="cm">   */</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_buffers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="w">  </span><span class="cm">/* The depth of the repetition index.</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="cm">   *</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="cm">   * If there is repetition then the depth must be at least 1.  If there are many layers</span>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="cm">   * of repetition then deeper repetition indices will support deeper nested random access.  For</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a><span class="cm">   * example, given 5 layers of repetition then the repetition index depth must be at least</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a><span class="cm">   * 3 to support access like `rows[50][17][3]`.</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="cm">   *</span>
+</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a><span class="cm">   * We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition</span>
+</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a><span class="cm">   * index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store</span>
+</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a><span class="cm">   * the number of "leftover items" at the end of the chunk.  Otherwise, we wouldn't have any way</span>
+</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a><span class="cm">   * to know if the final item in a chunk is valid or not.</span>
+</span><span id="__span-5-39"><a id="__codelineno-5-39" name="__codelineno-5-39" href="#__codelineno-5-39"></a><span class="cm">   */</span>
+</span><span id="__span-5-40"><a id="__codelineno-5-40" name="__codelineno-5-40" href="#__codelineno-5-40"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">repetition_index_depth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-5-41"><a id="__codelineno-5-41" name="__codelineno-5-41" href="#__codelineno-5-41"></a><span class="w">  </span><span class="cm">/* The page already records how many rows are in the page.  For mini-block we also need to know how</span>
+</span><span id="__span-5-42"><a id="__codelineno-5-42" name="__codelineno-5-42" href="#__codelineno-5-42"></a><span class="cm">   * many "items" are in the page.  A row and an item are the same thing unless the page has lists.</span>
+</span><span id="__span-5-43"><a id="__codelineno-5-43" name="__codelineno-5-43" href="#__codelineno-5-43"></a><span class="cm">   */</span>
+</span><span id="__span-5-44"><a id="__codelineno-5-44" name="__codelineno-5-44" href="#__codelineno-5-44"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-5-45"><a id="__codelineno-5-45" name="__codelineno-5-45" href="#__codelineno-5-45"></a>
+</span><span id="__span-5-46"><a id="__codelineno-5-46" name="__codelineno-5-46" href="#__codelineno-5-46"></a><span class="w">  </span><span class="c1">// Since Lance 2.2, miniblocks have larger chunk sizes (&gt;= 64KB)</span>
+</span><span id="__span-5-47"><a id="__codelineno-5-47" name="__codelineno-5-47" href="#__codelineno-5-47"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">has_large_chunk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-5-48"><a id="__codelineno-5-48" name="__codelineno-5-48" href="#__codelineno-5-48"></a>
+</span><span id="__span-5-49"><a id="__codelineno-5-49" name="__codelineno-5-49" href="#__codelineno-5-49"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The protobuf for the mini block layout describes the compression of the various buffers. It also tells us
+some information about the dictionary (if present) and the repetition index (if present).</p>
+<h3 id="full-zip-page-layout">Full Zip Page Layout<a class="headerlink" href="#full-zip-page-layout" title="Permanent link">&para;</a></h3>
+<p>The full zip page layout is a layout for larger values (e.g. vector embeddings) which are large but not so large
+that we can justify a single IOP per value. In this case we are trying to avoid storing a large amount of "chunk
+overhead" (both in terms of buffer space and the RAM space in the search cache that we would need to store the
+repetition index). As a tradeoff, we are introducing a second IOP per-range for random access reads (unless the
+data is fixed-width such as vector embeddings).</p>
+<p>We currently use 256 bytes as the cutoff for the full zip layout. At this point we would only be fitting 16 values
+in a 4KiB disk sector and so creating a mini-block descriptor for every 16 values would be too much overhead.</p>
+<p>As a further consequence, we must ensure that the compression algorithm is "transparent" so that we can index
+individual values after compression has been applied. This prevents us from using compression algorithms such
+as delta encoding. If we want to apply general compression we have to apply them on a per-value basis. The way
+we enforce this is by requiring the compression to return either a flat fixed-width or variable-width layout
+so that we know the location of each element.</p>
+<p>The repetition and definition levels, along with all compressed buffers, are all zipped together into a single
+buffer.</p>
+<h4 id="data-buffer-buffer-0">Data Buffer (Buffer 0)<a class="headerlink" href="#data-buffer-buffer-0" title="Permanent link">&para;</a></h4>
+<p><img alt="Full Zip Layout" src="../../../images/fullzip.png" /></p>
+<p>The data buffer is a single buffer that contains the repetition, definition, and value data, all zipped into a
+single buffer. The repetition and definition information are combined and byte packed. This is referred to as
+a control word. If the value is null or an empty list, then the control word is all that is serialized. If there
+is no validity or repetition information then control words are not serialized. If the value is variable-width
+then we encode the size of the value. This is either a 4-byte or 8-byte integer depending on the width used in
+the offsets returned by the compression (in future versions this will likely be encoded with some kind of
+variable-width integer encoding). Finally the value buffers themselves are appended.</p>
+<table>
+<thead>
+<tr>
+<th>Bytes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0-4</td>
+<td>Control word 0</td>
+</tr>
+<tr>
+<td>0/4/8</td>
+<td>Value 0 size</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Value 0 data</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>0-4</td>
+<td>Control word N</td>
+</tr>
+<tr>
+<td>0/4/8</td>
+<td>Value N size</td>
+</tr>
+<tr>
+<td>*</td>
+<td>Value N data</td>
+</tr>
+</tbody>
+</table>
+<p>Note: a fixed-width data type that has no validity information (e.g. non-nullable vector embeddings) is simply a
+flat buffer of data.</p>
+<h4 id="repetition-index-buffer-1">Repetition Index (Buffer 1)<a class="headerlink" href="#repetition-index-buffer-1" title="Permanent link">&para;</a></h4>
+<p><img alt="Full Zip Layout" src="../../../images/fullzip_rep.png" /></p>
+<p>If there is repetition information or the values are variable width then we need additional help to locate values
+in the disk page. The repetition index is an array of u64 values. There is one value per row and the value is an
+offset to the start of that row in the data buffer. To perform random access we require two IOPS. First we issue
+an IOP into the repetition index to determine the location and then a second IOP into the data buffer to load the
+data. Alternatively, the entire repetition index can be loaded into memory in the initialization phase though this
+can lead to high RAM usage by the search cache.</p>
+<p>The repetition index must have a fixed width (or else we would need a repetition index to read the repetition
+index!) and be transparent. As a result the compression options are limited. That being said, there is little
+value (in terms of performance) in compressing the repetition index. It is never read in its entirety as it is
+not needed for full scans. Currently the repetition index is always compressed with simple (non-chunked) byte
+packing into 1,2,4, or 8 byte values.</p>
+<h4 id="protobuf_1">Protobuf<a class="headerlink" href="#protobuf_1" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">FullZipLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="c1">// The number of bits of repetition info (0 if there is no repetition)</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_rep</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span><span class="c1">// The number of bits of definition info (0 if there is no definition)</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_def</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span><span class="cm">/* The number of bits of value info</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="cm">   *</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="cm">   * Note: we use bits here (and not bytes) for consistency with other encodings.  However, in practice,</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="cm">   * there is never a reason to use a bits per value that is not a multiple of 8.  The complexity is not</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="cm">   * worth the small savings in space since this encoding is typically used with large values already.</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="cm">   */</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">details</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="w">    </span><span class="c1">// If this is a fixed width block then we need to have a fixed number of bits per value</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_per_value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="w">    </span><span class="c1">// If this is a variable width block then we need to have a fixed number of bits per offset</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">bits_per_offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a><span class="w">  </span><span class="c1">// The number of items in the page</span>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a><span class="w">  </span><span class="c1">// The number of visible items in the page</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_visible_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a><span class="w">  </span><span class="c1">// Description of the compression of values</span>
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">value_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-6-24"><a id="__codelineno-6-24" name="__codelineno-6-24" href="#__codelineno-6-24"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-6-25"><a id="__codelineno-6-25" name="__codelineno-6-25" href="#__codelineno-6-25"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-6-26"><a id="__codelineno-6-26" name="__codelineno-6-26" href="#__codelineno-6-26"></a>
+</span><span id="__span-6-27"><a id="__codelineno-6-27" name="__codelineno-6-27" href="#__codelineno-6-27"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The protobuf for the full zip layout describes the compression of the data buffer. It also tells us the
+size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
+have per offset (for variable-width data).</p>
+<h3 id="sparse-page-layout">Sparse Page Layout<a class="headerlink" href="#sparse-page-layout" title="Permanent link">&para;</a></h3>
+<p>Sparse pages require Lance 2.3. They represent flat or nested Arrow structure directly as slot-domain mappings instead
+of dense repetition and definition events. Writers emit this layout only in files declared as 2.3 or above. The layout is
+identified only by <code>PageLayout</code>; field metadata does not identify the layout of an existing page.</p>
+<p>A domain is a layer-local integer coordinate space <code>[0, num_slots)</code>, and a slot is one element in that space. The
+outer-most domain contains the page's top-level rows. Each layer maps its parent domain to the next layer's parent
+domain, and the terminal child domain contains the leaf value slots stored in value chunks.</p>
+<p>Structural layers are ordered from outer-most to inner-most:</p>
+<ul>
+<li>validity maps a nullable item or struct slot to valid or null</li>
+<li>list maps non-empty parent slots to variable-size child ranges</li>
+<li>fixed-size-list maps each parent slot to a child range of a fixed dimension</li>
+</ul>
+<p>The layer list may be empty for a flat, non-nullable leaf page. In that case the scheduling domain and
+<code>num_visible_items</code> must be equal. The explicit writer currently emits its normalized all-valid layer even when a flat
+page could use this shorter wire representation.</p>
+<p>A list slot that is valid and absent from <code>non_empty_positions</code> is an empty list. Maps use the same structural contract
+as lists. The terminal child-domain size equals <code>SparseLayout.num_visible_items</code>.</p>
+<p><code>SparseLayout.num_visible_items</code> is the number of leaf value slots encoded in value chunks. Null leaf slots count
+because they still occupy positions in Arrow's leaf value buffer; a nullable primitive with 100 slots, including 30
+nulls, has 100 visible items. <code>SparseLayout.num_items</code> is the number of entries in the equivalent dense repetition and
+definition stream. It equals <code>num_visible_items</code> plus one structural placeholder for every list slot without children.
+The first layer's <code>num_slots</code> is the logical top-level row count used for projection.</p>
+<p>Position sets have four semantic representations: <code>empty</code>, <code>all</code>, one non-empty <code>range</code>, or an <code>explicit</code>
+delta-compressed <code>u64</code> buffer. Count sets are <code>empty</code>, one positive <code>constant</code> value, or an <code>explicit</code> compressed <code>u64</code>
+buffer. Every layer has a <code>SparseValiditySet</code> whose meaning is explicit:</p>
+<ul>
+<li><code>SPARSE_VALIDITY_NULL_POSITIONS</code>: stored positions are null and all other positions are valid</li>
+<li><code>SPARSE_VALIDITY_VALID_POSITIONS</code>: stored positions are valid and all other positions are null</li>
+</ul>
+<p>The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
+semantics after normalization.</p>
+<h4 id="writer-selection">Writer Selection<a class="headerlink" href="#writer-selection" title="Permanent link">&para;</a></h4>
+<p>Writers may emit this layout only for Lance 2.3+ fields. A field can request it explicitly with
+<code>lance-encoding:structural-encoding=sparse</code>; the same request is an input error for earlier file versions. Without an
+explicit structural encoding, the Lance 2.3 writer selects sparse only when the dense mini-block repetition/definition
+budget would split the page or one top-level row exceeds that budget, and only when the value path is supported by the
+sparse writer. Explicit <code>miniblock</code>, <code>fullzip</code>, and <code>sparse</code> requests are not changed by this automatic policy. Lance
+2.2 and earlier writers never select sparse.</p>
+<p>Unsupported sparse value paths, including dictionary values and variable-width packed structs, retain their dense
+behavior. Writers normalize Arrow validity and list structure once. Within-budget dense pages do not build sparse
+position/count plans. All-valid layers use null positions plus <code>empty</code>; all-null layers use valid positions plus
+<code>empty</code>. Other layers choose the validity polarity with the lower semantic encoded cost, with ties using null
+positions. Field metadata controls writer selection only: readers always use <code>PageLayout</code> to determine the layout of
+an encoded page and must not use field metadata for that decision.</p>
+<p>Pages without a value payload keep the existing canonical <code>ConstantLayout</code>: structural-only types such as an empty
+struct, and leaf pages whose visible values are all null, do not emit <code>SparseLayout</code>. An explicitly sparse page with
+at least one non-null visible value does emit <code>SparseLayout</code>, even when all non-null values are equal. This boundary
+avoids introducing a second structural-only representation without evidence that it improves the existing constant
+encoding.</p>
+<h4 id="buffers-and-selective-reads">Buffers and Selective Reads<a class="headerlink" href="#buffers-and-selective-reads" title="Permanent link">&para;</a></h4>
+<p>A sparse page contains the following physical buffers:</p>
+<table>
+<thead>
+<tr>
+<th>Buffer</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>Value chunk metadata, one 8-byte entry per chunk</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Mini-block compressed value chunks without repetition or definition levels</td>
+</tr>
+<tr>
+<td>2+</td>
+<td>One buffer for each explicit position or count set, in structural-layer field order</td>
+</tr>
+</tbody>
+</table>
+<p>Each value chunk metadata entry stores <code>(chunk_size / 8) - 1</code> as little-endian <code>u32</code>, followed by its visible value
+count as little-endian <code>u32</code>. Chunk sizes must be positive multiples of 8 and fit this representation. The sum of
+chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must equal <code>num_visible_items</code>. A value chunk
+contains at most 32,768 visible values. <code>num_buffers</code> describes the number of value buffers inside every chunk and
+excludes the structural buffers.</p>
+<p>General-compressed sparse buffers use the existing length-prefixed LZ4 or Zstd representation and must not contain
+another general-compression wrapper. SparseLayout does not impose additional size or descriptor-complexity limits on
+otherwise representable buffers.</p>
+<p>Readers normalize structural metadata once, project requested top-level ranges through each layer, and read only value
+chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
+the structural plan without reading buffer 1.</p>
+<h4 id="caching-and-point-reads">Caching and Point Reads<a class="headerlink" href="#caching-and-point-reads" title="Permanent link">&para;</a></h4>
+<p>Reader initialization loads buffer 0 and every explicit structural buffer, then validates and normalizes them into a
+cached page plan. The cached state contains parsed value-chunk descriptors and prefix offsets, decoded semantic
+position/count sets, validity, and the ordered structural layers. It does not contain value payload bytes from buffer
+1. The plan is cached per field and page and reused by later scans, range reads, and takes.</p>
+<p>After that plan is cached, reading one primitive leaf value reads only the value chunk that contains it. A cold read
+first loads the structural metadata and then the intersecting value chunk. Reading one top-level list or
+fixed-size-list value may intersect multiple leaf chunks and reads each intersecting chunk. A selection whose projected
+structure contains no leaf slots reads no value chunk.</p>
+<h4 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h4>
+<p>Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:</p>
+<ul>
+<li>physical buffer count, chunk-count bounds, and every checked offset/size range</li>
+<li>first-layer row domain, adjacent parent/child domain chaining, and terminal visible-value domain</li>
+<li>semantic set cardinality, explicit position ordering and bounds, and validity meaning</li>
+<li>exact <code>num_items</code></li>
+<li>list non-empty positions being valid, count cardinality, positive counts, and child-count sum</li>
+<li>fixed-size-list dimension and checked child-domain multiplication</li>
+<li>value chunk byte/value sums, size representation and alignment, general-compression headers, descriptor buffer
+  count, and complete chunk consumption</li>
+</ul>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="c1">// Description of the compression of values.</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">value_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">  </span><span class="c1">// Number of value buffers in each mini-block chunk. This does not include structural buffers.</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_buffers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">  </span><span class="cm">/* Number of entries in the equivalent dense repetition / definition stream. This equals</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="cm">   * num_visible_items plus one structural placeholder for every list slot without children.</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="cm">   * Null leaf slots count as visible items because they still occupy positions in Arrow's</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="cm">   * leaf value buffer. For example, a nullable primitive with 100 slots, 30 of them null,</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="cm">   * has num_items = num_visible_items = 100.</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="cm">   */</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">  </span><span class="c1">// Number of leaf value slots encoded in the value chunks, including null leaf slots.</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_visible_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="w">  </span><span class="c1">// If true, chunk-local value buffer sizes use u32. Otherwise they use u16.</span>
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">has_large_chunk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="w">  </span><span class="cm">/* Structural layers ordered from outer-most to inner-most. This may be empty for a flat,</span>
+</span><span id="__span-7-18"><a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a><span class="cm">   * non-nullable leaf page whose scheduling domain equals num_visible_items.</span>
+</span><span id="__span-7-19"><a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a><span class="cm">   */</span>
+</span><span id="__span-7-20"><a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">SparseStructuralLayer</span><span class="w"> </span><span class="na">structural_layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-7-21"><a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a>
+</span><span id="__span-7-22"><a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseStructuralLayer</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="c1">// Exactly one layer kind is required.</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">layer</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">    </span><span class="n">SparseValidityLayer</span><span class="w"> </span><span class="na">validity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span><span class="n">SparseListLayer</span><span class="w"> </span><span class="na">list</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">    </span><span class="n">SparseFixedSizeListLayer</span><span class="w"> </span><span class="na">fixed_size_list</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseValidityLayer</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="c1">// Number of nullable item or struct slots in this layer's parent and child domain.</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_slots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">  </span><span class="c1">// Validity for the slots in this layer.</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">  </span><span class="n">SparseValiditySet</span><span class="w"> </span><span class="na">validity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseListLayer</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="c1">// Number of list, large-list, or map slots in this layer's parent domain.</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_slots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">  </span><span class="c1">// Number of slots in this layer's child domain.</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_child_slots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="w">  </span><span class="c1">// Non-empty parent slots. Valid parent slots absent from this set are empty lists.</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="w">  </span><span class="n">SparsePositionSet</span><span class="w"> </span><span class="na">non_empty_positions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="w">  </span><span class="c1">// Positive child counts corresponding one-for-one with non_empty_positions.</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="w">  </span><span class="n">SparseCountSet</span><span class="w"> </span><span class="na">counts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="w">  </span><span class="c1">// Validity for the parent slots in this layer.</span>
+</span><span id="__span-10-11"><a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="w">  </span><span class="n">SparseValiditySet</span><span class="w"> </span><span class="na">validity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-10-12"><a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a>
+</span><span id="__span-10-13"><a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseFixedSizeListLayer</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span><span class="c1">// Number of fixed-size-list slots in this layer's parent domain.</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_slots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span><span class="c1">// Number of children per parent slot. The child domain has num_slots * dimension slots.</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">dimension</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="w">  </span><span class="c1">// Validity for the parent slots in this layer.</span>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="w">  </span><span class="n">SparseValiditySet</span><span class="w"> </span><span class="na">validity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseValiditySet</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">Meaning</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="na">SPARSE_VALIDITY_UNSPECIFIED</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="c1">// Stored positions are null; all other positions are valid.</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="w">    </span><span class="na">SPARSE_VALIDITY_NULL_POSITIONS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="w">    </span><span class="c1">// Stored positions are valid; all other positions are null.</span>
+</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="w">    </span><span class="na">SPARSE_VALIDITY_VALID_POSITIONS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-12-8"><a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-12-9"><a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a>
+</span><span id="__span-12-10"><a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="w">  </span><span class="n">Meaning</span><span class="w"> </span><span class="na">meaning</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-12-11"><a id="__codelineno-12-11" name="__codelineno-12-11" href="#__codelineno-12-11"></a><span class="w">  </span><span class="n">SparsePositionSet</span><span class="w"> </span><span class="na">positions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-12-12"><a id="__codelineno-12-12" name="__codelineno-12-12" href="#__codelineno-12-12"></a>
+</span><span id="__span-12-13"><a id="__codelineno-12-13" name="__codelineno-12-13" href="#__codelineno-12-13"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparsePositionSet</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">positions</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">    </span><span class="c1">// Delta-compressed u64 positions. Cardinality is num_positions.</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">explicit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="c1">// One contiguous, non-empty range.</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="w">    </span><span class="n">SparsePositionRange</span><span class="w"> </span><span class="na">range</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="w">    </span><span class="c1">// Every position in the domain.</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="w">    </span><span class="n">SparsePositionAll</span><span class="w"> </span><span class="na">all</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="w">    </span><span class="c1">// No positions in the domain.</span>
+</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="w">    </span><span class="n">SparsePositionEmpty</span><span class="w"> </span><span class="na">empty</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-13-11"><a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-13-12"><a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="w">  </span><span class="c1">// Semantic cardinality of this set.</span>
+</span><span id="__span-13-13"><a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_positions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-13-14"><a id="__codelineno-13-14" name="__codelineno-13-14" href="#__codelineno-13-14"></a>
+</span><span id="__span-13-15"><a id="__codelineno-13-15" name="__codelineno-13-15" href="#__codelineno-13-15"></a><span class="p">}</span>
+</span></code></pre></div>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">SparseCountSet</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">counts</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">    </span><span class="c1">// Compressed u64 child counts. Cardinality comes from the containing position set.</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">explicit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="w">    </span><span class="c1">// One positive child count shared by every non-empty list slot.</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="w">    </span><span class="n">SparseCountConstant</span><span class="w"> </span><span class="na">constant</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="w">    </span><span class="c1">// No counts; valid only when there are no non-empty list slots.</span>
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a><span class="w">    </span><span class="n">SparseCountEmpty</span><span class="w"> </span><span class="na">empty</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-14-9"><a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-14-10"><a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a>
+</span><span id="__span-14-11"><a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="constant-page-layout">Constant Page Layout<a class="headerlink" href="#constant-page-layout" title="Permanent link">&para;</a></h3>
+<p>This layout is used when all (visible) values in the page are the same scalar value.</p>
+<p>The all-null case is represented by a constant page without an inline scalar value. Surprisingly, this does not
+mean there is no data. If there are any levels of struct or list then we need to store the rep/def levels so that
+we can distinguish between null structs, null lists, empty lists, and null values.</p>
+<h4 id="repetition-and-definition-levels-buffers-0-and-1">Repetition and Definition Levels (Buffers 0 and 1)<a class="headerlink" href="#repetition-and-definition-levels-buffers-0-and-1" title="Permanent link">&para;</a></h4>
+<p>Note: We currently store rep levels in the first buffer with a flat layout of 16-bit values and def levels
+in the second buffer with a flat layout of 16-bit values. This will likely change in future versions.</p>
+<h4 id="protobuf_2">Protobuf<a class="headerlink" href="#protobuf_2" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">ConstantLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="w">  </span><span class="c1">// The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="w">  </span><span class="cm">/* Inline fixed-width scalar value bytes.</span>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="cm">   *</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="cm">   * This MUST only be used for types where a single non-null element is represented by a single</span>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="cm">   * fixed-width Arrow value buffer (i.e. no offsets buffer, no child data).</span>
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="cm">   *</span>
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a><span class="cm">   * Constraints:</span>
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a><span class="cm">   * - MUST be absent for an all-null page</span>
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a><span class="cm">   * - MUST be &lt;= 32 bytes if present</span>
+</span><span id="__span-15-13"><a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a><span class="cm">   */</span>
+</span><span id="__span-15-14"><a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-15-15"><a id="__codelineno-15-15" name="__codelineno-15-15" href="#__codelineno-15-15"></a>
+</span><span id="__span-15-16"><a id="__codelineno-15-16" name="__codelineno-15-16" href="#__codelineno-15-16"></a><span class="w">  </span><span class="cm">/* Optional compression algorithm used for the repetition buffer.</span>
+</span><span id="__span-15-17"><a id="__codelineno-15-17" name="__codelineno-15-17" href="#__codelineno-15-17"></a><span class="cm">   * If absent, repetition levels are stored as raw u16 values.</span>
+</span><span id="__span-15-18"><a id="__codelineno-15-18" name="__codelineno-15-18" href="#__codelineno-15-18"></a><span class="cm">   */</span>
+</span><span id="__span-15-19"><a id="__codelineno-15-19" name="__codelineno-15-19" href="#__codelineno-15-19"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">rep_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-15-20"><a id="__codelineno-15-20" name="__codelineno-15-20" href="#__codelineno-15-20"></a><span class="w">  </span><span class="cm">/* Optional compression algorithm used for the definition buffer.</span>
+</span><span id="__span-15-21"><a id="__codelineno-15-21" name="__codelineno-15-21" href="#__codelineno-15-21"></a><span class="cm">   * If absent, definition levels are stored as raw u16 values.</span>
+</span><span id="__span-15-22"><a id="__codelineno-15-22" name="__codelineno-15-22" href="#__codelineno-15-22"></a><span class="cm">   */</span>
+</span><span id="__span-15-23"><a id="__codelineno-15-23" name="__codelineno-15-23" href="#__codelineno-15-23"></a><span class="w">  </span><span class="n">CompressiveEncoding</span><span class="w"> </span><span class="na">def_compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-15-24"><a id="__codelineno-15-24" name="__codelineno-15-24" href="#__codelineno-15-24"></a><span class="w">  </span><span class="c1">// Number of values in repetition buffer after decompression.</span>
+</span><span id="__span-15-25"><a id="__codelineno-15-25" name="__codelineno-15-25" href="#__codelineno-15-25"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_rep_values</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-15-26"><a id="__codelineno-15-26" name="__codelineno-15-26" href="#__codelineno-15-26"></a><span class="w">  </span><span class="c1">// Number of values in definition buffer after decompression.</span>
+</span><span id="__span-15-27"><a id="__codelineno-15-27" name="__codelineno-15-27" href="#__codelineno-15-27"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_def_values</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-15-28"><a id="__codelineno-15-28" name="__codelineno-15-28" href="#__codelineno-15-28"></a>
+</span><span id="__span-15-29"><a id="__codelineno-15-29" name="__codelineno-15-29" href="#__codelineno-15-29"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>All we need to know is the meaning of each rep/def level and (when present) the inline scalar value bytes.</p>
+<h3 id="blob-page-layout">Blob Page Layout<a class="headerlink" href="#blob-page-layout" title="Permanent link">&para;</a></h3>
+<p>The blob page layout is a layout for large binary values where we would only have a few values per disk page.
+The actual data is stored out-of-line in external buffers. The disk page stores a "description" which is a
+struct array of two fields: <code>position</code> and <code>size</code>. The <code>position</code> is the absolute file offset of the blob and
+the <code>size</code> is the size (in bytes) of the blob. The inner page layout describes how the descriptions are encoded.</p>
+<p>The validity information (definition levels) is smuggled into the descriptions. If the size and position are
+both zero then the value is empty. Otherwise, if the size is zero and the position is non-zero then the
+value is null and the position is the definition level.</p>
+<p>This layout is only recommended when you can justify a single IOP per value. For example, when values are 1MiB
+or larger.</p>
+<p>This layout has no buffers of its own and merely wraps an inner layout.</p>
+<h4 id="protobuf_3">Protobuf<a class="headerlink" href="#protobuf_3" title="Permanent link">&para;</a></h4>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">BlobLayout</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="w">  </span><span class="c1">// The inner layout used to store the descriptions</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="w">  </span><span class="n">PageLayout</span><span class="w"> </span><span class="na">inner_layout</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="w">  </span><span class="cm">/* The meaning of each repdef layer, used to interpret repdef buffers correctly</span>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="cm">   *</span>
+</span><span id="__span-16-6"><a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a><span class="cm">   * The inner layout's repdef layers will always be 1 all valid item layer</span>
+</span><span id="__span-16-7"><a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a><span class="cm">   */</span>
+</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RepDefLayer</span><span class="w"> </span><span class="na">layers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-16-9"><a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>
+</span><span id="__span-16-10"><a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Since we smuggle the validity into the descriptions we don't need to store it in the inner layout and so the
+rep/def meaning is stored in the blob layout and the rep/def meaning in the inner layout will be 1 all valid item
+layer.</p>
+<h2 id="semi-structural-transformations">Semi-Structural Transformations<a class="headerlink" href="#semi-structural-transformations" title="Permanent link">&para;</a></h2>
+<p>There are some data transformations that are applied to the data before (or during) the structural encoding process.
+These are described here.</p>
+<h3 id="dictionary-encoding">Dictionary Encoding<a class="headerlink" href="#dictionary-encoding" title="Permanent link">&para;</a></h3>
+<p>Dictionary encoding is a technique that can be applied to any kind of array. It is useful when there are not very
+many unique values in the array. First, a "dictionary" of unique values is created. Then we create a second array
+of indices into the dictionary.</p>
+<p>Dictionary encoding is also known as "categorical encoding" in other contexts.</p>
+<p>Dictionary encoding could be treated as simply another compression technique but, when applied, it would be an
+opaque compression technique which would limit its usability (e.g. in a full zip context). As a result, we apply
+it before any structural encoding takes place. This allows us to place the dictionary in the search cache for
+random access.</p>
+<h3 id="struct-packing">Struct Packing<a class="headerlink" href="#struct-packing" title="Permanent link">&para;</a></h3>
+<p>Struct packing is an alternative representation to apply to struct values. Instead of storing that struct in a
+columnar fashion it will be stored in a row-major fashion. This will reduce the number of IOPS needed for random
+access but will prevent the ability to read a single field at a time. This is useful when all fields in the struct
+are always accessed together.</p>
+<p>Packed struct is always opt-in (see section on configuration below).</p>
+<p>In Lance 2.1, packed struct is limited to fixed-width children (<code>PackedStruct</code>).
+Starting with Lance 2.2, variable-width children are also supported via <code>VariablePackedStruct</code>.</p>
+<h3 id="fixed-size-list">Fixed Size List<a class="headerlink" href="#fixed-size-list" title="Permanent link">&para;</a></h3>
+<p>Fixed size lists are an Arrow data type that needs specialized handling at the structural level. If the underlying
+data type is primitive then the fixed size list will be primitive (e.g. a tensor). If the underlying data type
+is structural (struct/list) then the fixed size list is structural and should be treated the same as a
+variable-size list.</p>
+<p>We don't want compression libraries to need to worry about the intricacies of fixed-size lists. As a result we
+flatten the list as part of structural encoding. This complicates random access as we must translate between
+rows (an entire fixed size list) and items (a single item in the list).</p>
+<p>If the items in a fixed size list are nullable then we do not treat that validity array as a repetition or
+definition level. Instead, we store the validity as a separate buffer. For example, when encoding nullable fixed
+size lists with mini-block encoding the validity buffer is another buffer in the mini-block. When encoding
+nullable fixed size lists with full-zip encoding the validity buffer is zipped together with the values.</p>
+<p>The good news is that fixed size lists are entirely a structural encoding concern. Compression techniques are
+free to pretend that the fixed-size list data type does not exist.</p>
+<h2 id="compression">Compression<a class="headerlink" href="#compression" title="Permanent link">&para;</a></h2>
+<p>Once a structural encoding is chosen we must determine how to compress the data. There are various buffers that
+might be compressed (e.g. data, repetition, definition, dictionary, etc.). The available compression algorithms
+are also constrained by the structural encoding chosen. For example, when using the full zip layout we require
+transparent compression. As a result, each encoding technique may or may not be usable in a given scenario. In
+addition, the same technique may be applied in a different way depending on the encoding chosen.</p>
+<p>In implementation terms we have a trait for each compression constraint. The techniques then implement the traits
+that they can be applied to. To start with, here is a summary of compression techniques which are implemented in
+at least one scenario and a list of which traits the technique implements. A ❓ is used to indicate that the
+technique should be usable in that context but we do not yet do so while a ❌ indicates that the technique is
+not usable because it is not transparent. Note, even though a technique is not transparent it can still be applied
+on a per-value basis. We use ☑️ to mark a technique that is applied on a per-value basis:</p>
+<table>
+<thead>
+<tr>
+<th>Compression</th>
+<th>Used in Block Context</th>
+<th>Used in Full Zip Context</th>
+<th>Used in Mini-Block Context</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Flat</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Variable</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Constant</td>
+<td>✅ (2.1)</td>
+<td>❓</td>
+<td>❓</td>
+</tr>
+<tr>
+<td>Bitpacking</td>
+<td>✅ (2.1)</td>
+<td>❓</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Fsst</td>
+<td>❓</td>
+<td>✅ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>Rle</td>
+<td>✅ (2.2)</td>
+<td>❌</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>ByteStreamSplit</td>
+<td>❓</td>
+<td>❌</td>
+<td>✅ (2.1)</td>
+</tr>
+<tr>
+<td>General</td>
+<td>✅ (2.2)</td>
+<td>☑️ (2.1)</td>
+<td>✅ (2.1)</td>
+</tr>
+</tbody>
+</table>
+<p>In the following sections we will describe each technique in a bit more detail and explain how it is utilized
+in various contexts.</p>
+<h3 id="flat">Flat<a class="headerlink" href="#flat" title="Permanent link">&para;</a></h3>
+<p>Flat compression is the uncompressed representation of fixed-width data. There is a single buffer of data
+with a fixed number of bits per value.</p>
+<p>When applied in a mini-block context we find the largest power of 2 number of values that will be less than
+8,186 bytes and use that as the block size.</p>
+<h3 id="variable">Variable<a class="headerlink" href="#variable" title="Permanent link">&para;</a></h3>
+<p>Variable compression is the uncompressed representation of variable-width data. There is a buffer of values and
+a buffer of offsets.</p>
+<p>When applied in a mini-block context each block may have a different number of values. We walk through the values
+until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
+we have passed.</p>
+<h3 id="constant">Constant<a class="headerlink" href="#constant" title="Permanent link">&para;</a></h3>
+<p>Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.</p>
+<p>This will likely change in future versions.</p>
+<h3 id="bitpacking">Bitpacking<a class="headerlink" href="#bitpacking" title="Permanent link">&para;</a></h3>
+<p>Bitpacking is a compression technique that removes the unused bits from a set of values. For example, if we have
+a u32 array and the maximum value is 5000 then we only need 13 bits to store each value.</p>
+<p>When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
+width inline in the block itself.</p>
+<p>Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
+off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
+so we would have to remove at least 8 bits per value.</p>
+<h3 id="fsst">Fsst<a class="headerlink" href="#fsst" title="Permanent link">&para;</a></h3>
+<p>Fsst is a fast and transparent compression algorithm for variable-width data. It is the primary compression
+algorithm that we apply to variable-width data.</p>
+<p>Currently we use a single FSST symbol table per disk page and store that symbol table in the protobuf description.
+This is for historical reasons and is not ideal and will likely change in future versions.</p>
+<p>When FSST is applied in a mini-block context we simply compress the data and let the underlying compressor (always
+<code>Variable</code> at the moment) handle the chunking.</p>
+<h3 id="run-length-encoding-rle">Run Length Encoding (RLE)<a class="headerlink" href="#run-length-encoding-rle" title="Permanent link">&para;</a></h3>
+<p>Run length encoding is a compression technique that compresses large runs of identical values into an array
+of values and an array of run lengths. This is currently used in the mini-block context. To determine if we
+should apply run-length encoding we look at the number of runs divided by the number of values. If the ratio is
+below a threshold (by default 0.5) then we apply run-length encoding.</p>
+<h3 id="byte-stream-split-bss">Byte Stream Split (BSS)<a class="headerlink" href="#byte-stream-split-bss" title="Permanent link">&para;</a></h3>
+<p>Byte stream split is a compression technique that splits multi-byte values by byte position, creating separate streams
+for each byte position across all values. This is a rudimentary and simple form of translating floating point values
+into a more compressible format because it tends to cluster the mantissa bits together which are often consistent
+across a column of floating point values. It does not actually make the data smaller by itself. As a result, BSS is
+only applied if general compression is also applied on the column.</p>
+<p>We currently determine whether or not to apply BSS by looking at an entropy statistics. There is a configurable
+sensitivity parameter. A sensitivity of 0.0 means never apply BSS and a sensitivity of 1.0 means always apply BSS.</p>
+<h3 id="general">General<a class="headerlink" href="#general" title="Permanent link">&para;</a></h3>
+<p>General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
+etc. These techniques are typically back-referencing compressors which replace values with a "back reference" to
+a spot where we already saw the value.</p>
+<p>When applied in a mini-block context we run general compression after all other compression and compress the entire
+mini-block.</p>
+<p>When applied in a full zip context we run general compression on each value.</p>
+<p>The only time general compression is automatically applied is in a full-zip context when we have values that are at
+least 32KiB large. This is because general compression can be CPU intensive.</p>
+<p>However, general compression is highly effective and we allow it to be opted into in other contexts via configuration.</p>
+<h2 id="compression-configuration">Compression Configuration<a class="headerlink" href="#compression-configuration" title="Permanent link">&para;</a></h2>
+<p>The following section lists the available configuration options. These can be set programmatically through writer
+options. However, they can also be set in the field metadata in the schema.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Values</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance-encoding:compression</code></td>
+<td><code>lz4</code>, <code>zstd</code>, <code>none</code>, ...</td>
+<td><code>none</code></td>
+<td>Opt-in to general compression. The value indicates the scheme.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:compression-level</code></td>
+<td>Integers (range is scheme dependent)</td>
+<td>Varies by scheme</td>
+<td>Higher indicates more work should be done to compress the data.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:rle-threshold</code></td>
+<td><code>0.0-1.0</code></td>
+<td><code>0.5</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:bss</code></td>
+<td><code>off</code>, <code>on</code>, <code>auto</code></td>
+<td><code>auto</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:dict-divisor</code></td>
+<td>Integers greater than 1</td>
+<td><code>2</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:dict-size-ratio</code></td>
+<td><code>0.0-1.0</code></td>
+<td><code>0.8</code></td>
+<td>See below</td>
+</tr>
+<tr>
+<td><code>lance-encoding:dict-values-compression</code></td>
+<td><code>lz4</code>, <code>zstd</code>, <code>none</code></td>
+<td><code>lz4</code></td>
+<td>Select general compression scheme for dictionary values</td>
+</tr>
+<tr>
+<td><code>lance-encoding:dict-values-compression-level</code></td>
+<td>Integers (scheme dependent)</td>
+<td>Varies by scheme</td>
+<td>Compression level for dictionary values general compression</td>
+</tr>
+<tr>
+<td><code>lance-encoding:general</code></td>
+<td><code>off</code>, <code>on</code></td>
+<td><code>off</code></td>
+<td>Whether to apply general compression.</td>
+</tr>
+<tr>
+<td><code>lance-encoding:packed</code></td>
+<td>Any string</td>
+<td>Not set</td>
+<td>Whether to apply packed struct encoding (see above).</td>
+</tr>
+<tr>
+<td><code>lance-encoding:structural-encoding</code></td>
+<td><code>miniblock</code>, <code>fullzip</code>, <code>sparse</code></td>
+<td>Not set</td>
+<td>Force a structural encoding; <code>sparse</code> requires Lance 2.3.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="configuration-details">Configuration Details<a class="headerlink" href="#configuration-details" title="Permanent link">&para;</a></h3>
+<h4 id="compression-scheme">Compression Scheme<a class="headerlink" href="#compression-scheme" title="Permanent link">&para;</a></h4>
+<p>The <code>lance-encoding:compression</code> setting enables general-purpose compression algorithms to be applied. Available schemes:</p>
+<ul>
+<li><strong><code>lz4</code></strong>: Fast compression with good compression ratios. Default compression level is fast mode.</li>
+<li><strong><code>zstd</code></strong>: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.</li>
+<li><strong><code>none</code></strong>: No general compression applied (default).</li>
+<li><strong><code>fsst</code></strong>: Fast Static Symbol Table compression for string data.</li>
+</ul>
+<p>General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
+data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
+(≥32KiB), compression is automatically applied per-value.</p>
+<h4 id="compression-level">Compression Level<a class="headerlink" href="#compression-level" title="Permanent link">&para;</a></h4>
+<p>The compression level is scheme dependent. Currently the following schemes support the following levels:</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Crate Used</th>
+<th>Levels</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zstd</code></td>
+<td><a href="https://crates.io/crates/zstd"><code>zstd</code></a></td>
+<td><code>0-22</code></td>
+<td><code>crate dependent</code> (3 as of this writing)</td>
+</tr>
+<tr>
+<td><code>lz4</code></td>
+<td><a href="https://crates.io/crates/lz4"><code>lz4</code></a></td>
+<td>N/A</td>
+<td>The LZ4 crate has two modes (fast and high compression) and currently this is not exposed to configuration. The LZ4 crate wraps a C library and the default is dependent on the C library. The default as of this writing is fast</td>
+</tr>
+</tbody>
+</table>
+<p>Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
+is typically less affected by the compression level.</p>
+<h4 id="run-length-encoding-rle-threshold">Run Length Encoding (RLE) Threshold<a class="headerlink" href="#run-length-encoding-rle-threshold" title="Permanent link">&para;</a></h4>
+<p>The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
+calculated by dividing the number of runs by the number of values. If the ratio is less than the threshold then
+we apply run-length encoding. The default is 0.5 which means we apply run-length encoding if the number of runs
+is less than half the number of values.</p>
+<p><strong>Key points:</strong>
+- RLE is automatically selected when data has sufficient repetition (run_count / num_values &lt; threshold)
+- Supported types: All fixed-width primitives (u8, i8, u16, i16, u32, i32, f32, u64, i64, f64)
+- Maximum chunk size: 2048 values per mini-block
+- Setting threshold to <code>0.0</code> effectively disables RLE
+- Setting threshold to <code>1.0</code> makes RLE very aggressive (used whenever any runs exist)</p>
+<p>RLE is particularly effective for:
+- Sorted or partially sorted data
+- Columns with many repeated values (status codes, categories, etc.)
+- Low-cardinality columns</p>
+<h4 id="byte-stream-split-bss_1">Byte Stream Split (BSS)<a class="headerlink" href="#byte-stream-split-bss_1" title="Permanent link">&para;</a></h4>
+<p>The configuration variable for BSS is a simple enum. A value of <code>off</code> means to never apply BSS, a value of <code>on</code>
+means to always apply BSS, and a value of <code>auto</code> means to apply BSS based on an entropy calculation (see code for
+details).</p>
+<p><strong>Important:</strong> BSS is only applied when the <code>lance-encoding:compression</code> variable is also set (to a non-<code>none</code> value).
+BSS is a data transformation that makes floating-point data more compressible; it does not reduce size on its own.</p>
+<p><strong>Key points:</strong>
+- Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
+- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- <code>auto</code> mode: Uses entropy analysis with 0.5 sensitivity threshold
+- <code>on</code> mode: Always applies BSS for supported types
+- <code>off</code> mode: Never applies BSS</p>
+<p>BSS works by splitting multi-byte values by byte position, creating separate byte streams. This clusters similar
+bits together (especially mantissa bits in floating-point numbers), which general compression algorithms can then
+compress more effectively.</p>
+<p>BSS is particularly effective for:
+- Floating-point measurements with similar ranges
+- Time-series data with consistent precision
+- Scientific data with correlated mantissa patterns</p>
+<h4 id="dictionary-encoding-controls">Dictionary Encoding Controls<a class="headerlink" href="#dictionary-encoding-controls" title="Permanent link">&para;</a></h4>
+<p>Dictionary encoding is gated by a few heuristics.
+The decision is made on the leaf value page, so nested types can still benefit.
+For example, <code>List&lt;u32&gt;</code> can use dictionary encoding for its <code>u32</code> values.</p>
+<p>Two field-level metadata keys control when dictionary encoding is attempted:</p>
+<ul>
+<li><code>lance-encoding:dict-divisor</code> (default <code>2</code>): the encoder computes a unique-value budget as <code>num_values / divisor</code></li>
+<li><code>lance-encoding:dict-size-ratio</code> (default <code>0.8</code>): the estimated dictionary-encoded representation must stay below this ratio of the raw page size</li>
+</ul>
+<p>There are additional global guards available as environment variables:</p>
+<ul>
+<li><code>LANCE_ENCODING_DICT_TOO_SMALL</code> (minimum page size before trying dictionary encoding, default <code>100</code> values)</li>
+<li><code>LANCE_ENCODING_DICT_DIVISOR</code> (fallback divisor when field metadata is not set, default <code>2</code>)</li>
+<li><code>LANCE_ENCODING_DICT_MAX_CARDINALITY</code> (upper cap for dictionary entries, default <code>100000</code>)</li>
+<li><code>LANCE_ENCODING_DICT_SIZE_RATIO</code> (fallback ratio when field metadata is not set, default <code>0.8</code>)</li>
+</ul>
+<p>Dictionary encoding is effective when values repeat frequently and the number of distinct values stays low.</p>
+<h4 id="dictionary-values-compression">Dictionary Values Compression<a class="headerlink" href="#dictionary-values-compression" title="Permanent link">&para;</a></h4>
+<p>Dictionary values are compressed through the block-compression path and have their own configuration:</p>
+<ul>
+<li><code>lance-encoding:dict-values-compression</code>: <code>lz4</code>, <code>zstd</code>, <code>none</code></li>
+<li><code>lance-encoding:dict-values-compression-level</code>: optional scheme-specific level</li>
+</ul>
+<p>Environment-variable fallbacks:</p>
+<ul>
+<li><code>LANCE_ENCODING_DICT_VALUES_COMPRESSION</code></li>
+<li><code>LANCE_ENCODING_DICT_VALUES_COMPRESSION_LEVEL</code></li>
+</ul>
+<p>Priority order is:</p>
+<ol>
+<li>Field metadata (<code>dict-values-*</code>)</li>
+<li>Environment variables (<code>LANCE_ENCODING_DICT_VALUES_*</code>)</li>
+<li>Default (<code>lz4</code>)</li>
+</ol>
+<p><code>none</code> disables general (opaque) compression for dictionary values. For fixed-width dictionary values, structural
+encodings such as RLE or bitpacking may still be selected when beneficial.</p>
+<h4 id="packed-struct-encoding">Packed Struct Encoding<a class="headerlink" href="#packed-struct-encoding" title="Permanent link">&para;</a></h4>
+<p>Packed struct encoding is a semi-structural transformation described above. When enabled, struct values are stored
+in row-major format rather than the default columnar format. This reduces the number of I/O operations needed for
+random access but prevents reading individual fields independently.</p>
+<p>This is always opt-in and should only be used when all struct fields are typically accessed together.</p>
+<h4 id="mini-block-size-tuning">Mini-Block Size Tuning<a class="headerlink" href="#mini-block-size-tuning" title="Permanent link">&para;</a></h4>
+<p>Each mini-block contains at most 4096 values by default. Because an entire mini-block must be fetched to
+read any value within it, workloads that read only a small contiguous slice of each mini-block may experience
+read amplification.</p>
+<p>The default is appropriate for the vast majority of deployments. Local disks and typical cloud object storage
+(where the client and bucket are in the same region) have more than enough bandwidth that the overhead from
+the default mini-block size is negligible. You should only consider changing this setting if you have
+confirmed — through profiling — that mini-block read amplification is saturating your available bandwidth
+(for example, accessing a remote object store over a constrained network link).</p>
+<p>The maximum number of values per mini-block can be tuned via an environment variable:</p>
+<ul>
+<li><code>LANCE_MINIBLOCK_MAX_VALUES</code> (default <code>4096</code>, maximum <code>32768</code>): upper bound on the number of values in a single mini-block chunk.</li>
+</ul>
+<p>Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
+cost of more mini-blocks and slightly more metadata overhead. Increasing it can reduce metadata overhead and
+improve throughput for highly compressible data, but it may increase random-read amplification.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Specification</div>
+        </a>
+        <a class="next" href="../versioning/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Versioning</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#older-encoding-strategies">Older Encoding Strategies</a>
+      <a class="ld-toc__h2" href="#terminology">Terminology</a>
+      <a class="ld-toc__h3" href="#data-types">Data Types</a>
+      <a class="ld-toc__h2" href="#search-cache">Search Cache</a>
+      <a class="ld-toc__h2" href="#structural-encoding">Structural Encoding</a>
+      <a class="ld-toc__h3" href="#repetition-and-definition-levels">Repetition and Definition Levels</a>
+      <a class="ld-toc__h3" href="#mini-block-page-layout">Mini Block Page Layout</a>
+      <a class="ld-toc__h3" href="#full-zip-page-layout">Full Zip Page Layout</a>
+      <a class="ld-toc__h3" href="#sparse-page-layout">Sparse Page Layout</a>
+      <a class="ld-toc__h3" href="#constant-page-layout">Constant Page Layout</a>
+      <a class="ld-toc__h3" href="#blob-page-layout">Blob Page Layout</a>
+      <a class="ld-toc__h2" href="#semi-structural-transformations">Semi-Structural Transformations</a>
+      <a class="ld-toc__h3" href="#dictionary-encoding">Dictionary Encoding</a>
+      <a class="ld-toc__h3" href="#struct-packing">Struct Packing</a>
+      <a class="ld-toc__h3" href="#fixed-size-list">Fixed Size List</a>
+      <a class="ld-toc__h2" href="#compression">Compression</a>
+      <a class="ld-toc__h3" href="#flat">Flat</a>
+      <a class="ld-toc__h3" href="#variable">Variable</a>
+      <a class="ld-toc__h3" href="#constant">Constant</a>
+      <a class="ld-toc__h3" href="#bitpacking">Bitpacking</a>
+      <a class="ld-toc__h3" href="#fsst">Fsst</a>
+      <a class="ld-toc__h3" href="#run-length-encoding-rle">Run Length Encoding (RLE)</a>
+      <a class="ld-toc__h3" href="#byte-stream-split-bss">Byte Stream Split (BSS)</a>
+      <a class="ld-toc__h3" href="#general">General</a>
+      <a class="ld-toc__h2" href="#compression-configuration">Compression Configuration</a>
+      <a class="ld-toc__h3" href="#configuration-details">Configuration Details</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../">File format</a>
+        <a href="../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

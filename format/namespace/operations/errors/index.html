@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Errors — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/namespace/operations/errors/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../../index/scalar/btree/">BTree</a>
+    <a href="../../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../../index/scalar/label_list/">Label List</a>
+    <a href="../../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../../index/scalar/ngram/">N-gram</a>
+    <a href="../../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../">Overview</a>
+    <a href="../../object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../">Overview</a>
+    <a class="active" href="./">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../models/">Operation Models</a>
+    <a href="../models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../models/BooleanQuery/">BooleanQuery</a>
+    <a href="../models/BoostQuery/">BoostQuery</a>
+    <a href="../models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../models/CommitTableResult/">CommitTableResult</a>
+    <a href="../models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../models/DropTableRequest/">DropTableRequest</a>
+    <a href="../models/DropTableResponse/">DropTableResponse</a>
+    <a href="../models/ErrorResponse/">ErrorResponse</a>
+    <a href="../models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../models/FragmentStats/">FragmentStats</a>
+    <a href="../models/FragmentSummary/">FragmentSummary</a>
+    <a href="../models/FtsQuery/">FtsQuery</a>
+    <a href="../models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../models/Identity/">Identity</a>
+    <a href="../models/IndexContent/">IndexContent</a>
+    <a href="../models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../models/JsonArrowField/">JsonArrowField</a>
+    <a href="../models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../models/MatchQuery/">MatchQuery</a>
+    <a href="../models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../models/PartitionField/">PartitionField</a>
+    <a href="../models/PartitionSpec/">PartitionSpec</a>
+    <a href="../models/PartitionTransform/">PartitionTransform</a>
+    <a href="../models/PhraseQuery/">PhraseQuery</a>
+    <a href="../models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../models/TableBasicStats/">TableBasicStats</a>
+    <a href="../models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../models/TableVersion/">TableVersion</a>
+    <a href="../models/TagContents/">TagContents</a>
+    <a href="../models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../supported-catalogs/">Overview</a>
+    <a href="../../supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Namespace Client Spec</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><b>Errors</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="error-handling">Error Handling<a class="headerlink" href="#error-handling" title="Permanent link">&para;</a></h1>
+<p>All Lance Namespace operations use a standardized error model for
+consistent error handling across different implementations and languages.</p>
+<h2 id="error-codes">Error Codes<a class="headerlink" href="#error-codes" title="Permanent link">&para;</a></h2>
+<p>Error codes are globally unique integers that identify the specific error type.
+These codes are consistent across all Lance Namespace implementations (Python, Java, Rust, REST).</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>Unsupported</td>
+<td>Operation not supported by this backend</td>
+</tr>
+<tr>
+<td>1</td>
+<td>NamespaceNotFound</td>
+<td>The specified namespace does not exist</td>
+</tr>
+<tr>
+<td>2</td>
+<td>NamespaceAlreadyExists</td>
+<td>A namespace with this name already exists</td>
+</tr>
+<tr>
+<td>3</td>
+<td>NamespaceNotEmpty</td>
+<td>Namespace contains tables or child namespaces</td>
+</tr>
+<tr>
+<td>4</td>
+<td>TableNotFound</td>
+<td>The specified table does not exist</td>
+</tr>
+<tr>
+<td>5</td>
+<td>TableAlreadyExists</td>
+<td>A table with this name already exists</td>
+</tr>
+<tr>
+<td>6</td>
+<td>TableIndexNotFound</td>
+<td>The specified table index does not exist</td>
+</tr>
+<tr>
+<td>7</td>
+<td>TableIndexAlreadyExists</td>
+<td>A table index with this name already exists</td>
+</tr>
+<tr>
+<td>8</td>
+<td>TableTagNotFound</td>
+<td>The specified table tag does not exist</td>
+</tr>
+<tr>
+<td>9</td>
+<td>TableTagAlreadyExists</td>
+<td>A table tag with this name already exists</td>
+</tr>
+<tr>
+<td>10</td>
+<td>TransactionNotFound</td>
+<td>The specified transaction does not exist</td>
+</tr>
+<tr>
+<td>11</td>
+<td>TableVersionNotFound</td>
+<td>The specified table version does not exist</td>
+</tr>
+<tr>
+<td>12</td>
+<td>TableColumnNotFound</td>
+<td>The specified table column does not exist</td>
+</tr>
+<tr>
+<td>13</td>
+<td>InvalidInput</td>
+<td>Malformed request or invalid parameters</td>
+</tr>
+<tr>
+<td>14</td>
+<td>ConcurrentModification</td>
+<td>Optimistic concurrency conflict</td>
+</tr>
+<tr>
+<td>15</td>
+<td>PermissionDenied</td>
+<td>User lacks permission for this operation</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Unauthenticated</td>
+<td>Authentication credentials are missing or invalid</td>
+</tr>
+<tr>
+<td>17</td>
+<td>ServiceUnavailable</td>
+<td>Service is temporarily unavailable</td>
+</tr>
+<tr>
+<td>18</td>
+<td>Internal</td>
+<td>Unexpected server/implementation error</td>
+</tr>
+<tr>
+<td>19</td>
+<td>InvalidTableState</td>
+<td>Table is in an invalid state for the operation</td>
+</tr>
+<tr>
+<td>20</td>
+<td>TableSchemaValidationError</td>
+<td>Table schema validation failed</td>
+</tr>
+<tr>
+<td>21</td>
+<td>Throttling</td>
+<td>Request rate limit exceeded</td>
+</tr>
+</tbody>
+</table>
+<h2 id="per-operation-errors">Per-Operation Errors<a class="headerlink" href="#per-operation-errors" title="Permanent link">&para;</a></h2>
+<p>Each operation can return a specific set of errors.
+The following sections document which errors are expected for each operation category.</p>
+<h3 id="common-errors">Common Errors<a class="headerlink" href="#common-errors" title="Permanent link">&para;</a></h3>
+<p>All operations may return the following errors:</p>
+<ul>
+<li><strong>0 (Unsupported)</strong>: The operation is not supported by this backend</li>
+<li><strong>13 (InvalidInput)</strong>: The request contains invalid parameters</li>
+<li><strong>15 (PermissionDenied)</strong>: The user lacks permission for this operation</li>
+<li><strong>16 (Unauthenticated)</strong>: Authentication credentials are missing or invalid</li>
+<li><strong>17 (ServiceUnavailable)</strong>: The service is temporarily unavailable</li>
+<li><strong>18 (Internal)</strong>: An unexpected internal error occurred</li>
+<li><strong>21 (Throttling)</strong>: Request rate limit exceeded</li>
+</ul>
+<h3 id="namespace-metadata-operations">Namespace Metadata Operations<a class="headerlink" href="#namespace-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CreateNamespace</td>
+<td>2 (NamespaceAlreadyExists)</td>
+</tr>
+<tr>
+<td>ListNamespaces</td>
+<td>1 (NamespaceNotFound)</td>
+</tr>
+<tr>
+<td>DescribeNamespace</td>
+<td>1 (NamespaceNotFound)</td>
+</tr>
+<tr>
+<td>DropNamespace</td>
+<td>1 (NamespaceNotFound), 3 (NamespaceNotEmpty)</td>
+</tr>
+<tr>
+<td>NamespaceExists</td>
+<td>1 (NamespaceNotFound)</td>
+</tr>
+<tr>
+<td>ListTables</td>
+<td>1 (NamespaceNotFound)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="table-metadata-operations">Table Metadata Operations<a class="headerlink" href="#table-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ListAllTables</td>
+<td>-</td>
+</tr>
+<tr>
+<td>RegisterTable</td>
+<td>1 (NamespaceNotFound), 5 (TableAlreadyExists), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>DescribeTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 11 (TableVersionNotFound)</td>
+</tr>
+<tr>
+<td>TableExists</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>DropTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>DeregisterTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>RestoreTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 11 (TableVersionNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>RenameTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 5 (TableAlreadyExists), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>GetTableStats</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>AlterTableAlterColumns</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 12 (TableColumnNotFound), 14 (ConcurrentModification), 20 (TableSchemaValidationError)</td>
+</tr>
+<tr>
+<td>AlterTableDropColumns</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 12 (TableColumnNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>UpdateTableSchemaMetadata</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="table-data-operations">Table Data Operations<a class="headerlink" href="#table-data-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>InsertIntoTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification), 19 (InvalidTableState), 20 (TableSchemaValidationError)</td>
+</tr>
+<tr>
+<td>MergeInsertIntoTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 12 (TableColumnNotFound), 14 (ConcurrentModification), 19 (InvalidTableState)</td>
+</tr>
+<tr>
+<td>UpdateTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 12 (TableColumnNotFound), 14 (ConcurrentModification), 19 (InvalidTableState)</td>
+</tr>
+<tr>
+<td>DeleteFromTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification), 19 (InvalidTableState)</td>
+</tr>
+<tr>
+<td>QueryTable</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 11 (TableVersionNotFound), 12 (TableColumnNotFound)</td>
+</tr>
+<tr>
+<td>CountTableRows</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 11 (TableVersionNotFound)</td>
+</tr>
+<tr>
+<td>CreateTable</td>
+<td>1 (NamespaceNotFound), 5 (TableAlreadyExists), 14 (ConcurrentModification), 20 (TableSchemaValidationError)</td>
+</tr>
+<tr>
+<td>ExplainTableQueryPlan</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>AnalyzeTableQueryPlan</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>AlterTableAddColumns</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification), 20 (TableSchemaValidationError)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="index-metadata-operations">Index Metadata Operations<a class="headerlink" href="#index-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CreateTableIndex</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 7 (TableIndexAlreadyExists), 12 (TableColumnNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>CreateTableScalarIndex</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 7 (TableIndexAlreadyExists), 12 (TableColumnNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>ListTableIndices</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>DescribeTableIndexStats</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 6 (TableIndexNotFound)</td>
+</tr>
+<tr>
+<td>DropTableIndex</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 6 (TableIndexNotFound)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tag-metadata-operations">Tag Metadata Operations<a class="headerlink" href="#tag-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ListTableTags</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>GetTableTagVersion</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 8 (TableTagNotFound)</td>
+</tr>
+<tr>
+<td>CreateTableTag</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 9 (TableTagAlreadyExists), 11 (TableVersionNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>DeleteTableTag</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 8 (TableTagNotFound)</td>
+</tr>
+<tr>
+<td>UpdateTableTag</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 8 (TableTagNotFound), 11 (TableVersionNotFound), 14 (ConcurrentModification)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="table-version-metadata-operations">Table Version Metadata Operations<a class="headerlink" href="#table-version-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ListTableVersions</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+<tr>
+<td>DescribeTableVersion</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 11 (TableVersionNotFound)</td>
+</tr>
+<tr>
+<td>CreateTableVersion</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>BatchCreateTableVersions</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound), 14 (ConcurrentModification)</td>
+</tr>
+<tr>
+<td>BatchDeleteTableVersions</td>
+<td>1 (NamespaceNotFound), 4 (TableNotFound)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="transaction-metadata-operations">Transaction Metadata Operations<a class="headerlink" href="#transaction-metadata-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Additional Errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DescribeTransaction</td>
+<td>10 (TransactionNotFound)</td>
+</tr>
+<tr>
+<td>AlterTransaction</td>
+<td>10 (TransactionNotFound), 14 (ConcurrentModification)</td>
+</tr>
+</tbody>
+</table>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Overview</div>
+        </a>
+        <a class="next" href="../models/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Operation Models</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#error-codes">Error Codes</a>
+      <a class="ld-toc__h2" href="#per-operation-errors">Per-Operation Errors</a>
+      <a class="ld-toc__h3" href="#common-errors">Common Errors</a>
+      <a class="ld-toc__h3" href="#namespace-metadata-operations">Namespace Metadata Operations</a>
+      <a class="ld-toc__h3" href="#table-metadata-operations">Table Metadata Operations</a>
+      <a class="ld-toc__h3" href="#table-data-operations">Table Data Operations</a>
+      <a class="ld-toc__h3" href="#index-metadata-operations">Index Metadata Operations</a>
+      <a class="ld-toc__h3" href="#tag-metadata-operations">Tag Metadata Operations</a>
+      <a class="ld-toc__h3" href="#table-version-metadata-operations">Table Version Metadata Operations</a>
+      <a class="ld-toc__h3" href="#transaction-metadata-operations">Transaction Metadata Operations</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>CREATE INDEX — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/spark/operations/ddl/create-index/">
+<link rel="icon" href="../../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../../.." aria-label="Lance">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../../">Overview</a>
+    <a href="../../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../../pytorch/">PyTorch</a>
+    <a href="../../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../../duckdb/">Overview</a>
+    <a href="../../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../../huggingface/">Home</a>
+    <a href="../../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../">Welcome</a>
+    <a href="../../../install/">Install</a>
+    <a href="../../../config/">Config</a>
+    <a href="../../../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../create-namespace/">CREATE NAMESPACE</a>
+    <a href="../drop-namespace/">DROP NAMESPACE</a>
+    <a href="../show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../create-table/">CREATE TABLE</a>
+    <a href="../show-tables/">SHOW TABLES</a>
+    <a href="../describe-table/">DESCRIBE TABLE</a>
+    <a href="../alter-table/">ALTER TABLE</a>
+    <a href="../show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../drop-table/">DROP TABLE</a>
+    <a class="active" href="./">CREATE INDEX</a>
+    <a href="../show-indexes/">SHOW INDEXES</a>
+    <a href="../create-branch/">CREATE BRANCH</a>
+    <a href="../drop-branch/">DROP BRANCH</a>
+    <a href="../show-branches/">SHOW BRANCHES</a>
+    <a href="../create-tag/">CREATE TAG</a>
+    <a href="../drop-tag/">DROP TAG</a>
+    <a href="../show-tags/">SHOW TAGS</a>
+    <a href="../optimize/">OPTIMIZE</a>
+    <a href="../vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../dql/select/">SELECT</a>
+    <a href="../../dql/fts/">Full-Text Search</a>
+    <a href="../../dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../dql/search/">SEARCH</a>
+    <a href="../../dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../dml/insert-into/">INSERT INTO</a>
+    <a href="../../dml/update/">UPDATE SET</a>
+    <a href="../../dml/delete/">DELETE FROM</a>
+    <a href="../../dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../../ray/">Welcome</a>
+    <a href="../../../../ray/read/">Read</a>
+    <a href="../../../../ray/write/">Write</a>
+    <a href="../../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../../ray/compaction/">Compaction</a>
+    <a href="../../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../../trino/">Welcome</a>
+    <a href="../../../../trino/install/">Install</a>
+    <a href="../../../../trino/config/">Config</a>
+    <a href="../../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../../../context/guide/storage/">Storage backends</a>
+    <a href="../../../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Apache Spark</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><span>DDL</span>
+        <span>/</span><b>CREATE INDEX</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="create-index">CREATE INDEX<a class="headerlink" href="#create-index" title="Permanent link">&para;</a></h1>
+<p>Creates a scalar index on a Lance table to accelerate queries.</p>
+<div class="admonition warning">
+<p class="admonition-title">Spark Extension Required</p>
+<p>This feature requires the Lance Spark SQL extension to be enabled. See <a href="../../../config/#spark-sql-extensions">Spark SQL Extensions</a> for configuration details.</p>
+</div>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The <code>CREATE INDEX</code> command builds an index on one or more columns of a Lance table. Indexing can improve the performance of queries that filter on the indexed columns. Depending on the index method, Lance Spark either uses a fragment-parallel build path or a driver-coordinated commit flow after parallel executor builds.</p>
+<h2 id="basic-usage">Basic Usage<a class="headerlink" href="#basic-usage" title="Permanent link">&para;</a></h2>
+<p>The command uses the <code>ALTER TABLE</code> syntax to add an index.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:1"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">user_id_idx</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">btree</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h2 id="index-methods">Index Methods<a class="headerlink" href="#index-methods" title="Permanent link">&para;</a></h2>
+<p>The following index methods are supported:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zonemap</code></td>
+<td>Lightweight min/max index for fragment pruning on a scalar column.</td>
+</tr>
+<tr>
+<td><code>btree</code></td>
+<td>B-tree index for efficient range queries and point lookups on ordered values.</td>
+</tr>
+<tr>
+<td><code>bitmap</code></td>
+<td>Bitmap index for low-cardinality values.</td>
+</tr>
+<tr>
+<td><code>label_list</code></td>
+<td>Label membership index for array/list columns.</td>
+</tr>
+<tr>
+<td><code>ngram</code></td>
+<td>N-gram index for string values.</td>
+</tr>
+<tr>
+<td><code>bloomfilter</code></td>
+<td>Bloom filter index for approximate membership pruning.</td>
+</tr>
+<tr>
+<td><code>rtree</code></td>
+<td>R-tree index for GeoArrow geometry columns.</td>
+</tr>
+<tr>
+<td><code>fts</code></td>
+<td>Full-text search (inverted) index for text search on string columns.</td>
+</tr>
+<tr>
+<td><code>inverted</code></td>
+<td>Alias for <code>fts</code>; creates the same full-text inverted index.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="options">Options<a class="headerlink" href="#options" title="Permanent link">&para;</a></h2>
+<p>The <code>CREATE INDEX</code> command supports options via the <code>WITH</code> clause to control index creation. These options are specific to the chosen index method.</p>
+<p>Option names are case-insensitive: <code>WITH (TRAIN = false)</code> and <code>WITH (train = false)</code> are the same option.</p>
+<h3 id="common-options">Common Options<a class="headerlink" href="#common-options" title="Permanent link">&para;</a></h3>
+<p>These options apply to all index methods:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>train</code></td>
+<td>Boolean</td>
+<td>When <code>false</code>, defer index training: register an empty index covering no rows without scanning any data, to be populated later. Default <code>true</code>. See <a href="#deferred-index-creation">Deferred Index Creation</a>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="distributed-index-options">Distributed Index Options<a class="headerlink" href="#distributed-index-options" title="Permanent link">&para;</a></h3>
+<p>The distributed build used by <code>zonemap</code>, <code>bitmap</code>, <code>label_list</code>, <code>ngram</code>, <code>bloomfilter</code>,
+<code>rtree</code>, <code>fts</code> (or <code>inverted</code>), and <code>btree</code> with <code>build_mode = 'fragment'</code> supports:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>num_segments</code></td>
+<td>Integer</td>
+<td>Number of parallel build tasks, and so of index segments created (clamped to fragment count when larger). Each task takes a contiguous run of fragments, and the runs are chosen so the heaviest task is as light as any contiguous split allows. Defaults to <code>min(fragment_count, spark.default.parallelism)</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>Contiguous coverage matters beyond parallelism: <a href="../optimize/">OPTIMIZE</a> can only group fragments
+that the identical set of index segments covers. Interleaved segments leave it nothing to coalesce at
+all, while contiguous ones let it coalesce within each segment's run. A segment boundary is still a
+boundary, so <code>num_segments</code> also bounds how far compaction can get.</p>
+<h3 id="zonemap-options">ZoneMap Options<a class="headerlink" href="#zonemap-options" title="Permanent link">&para;</a></h3>
+<p>For the <code>zonemap</code> method, the following options are supported:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rows_per_zone</code></td>
+<td>Long</td>
+<td>The approximate number of rows per zonemap zone.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="btree-options">BTree Options<a class="headerlink" href="#btree-options" title="Permanent link">&para;</a></h3>
+<p>For the <code>btree</code> method, the following options are supported:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zone_size</code></td>
+<td>Long</td>
+<td>The number of rows per zone in the B-tree index.</td>
+</tr>
+<tr>
+<td><code>build_mode</code></td>
+<td>String</td>
+<td>Index building mode: 'fragment' builds indexes in parallel by fragment; 'range' sorts data by indexed columns first, then partitions and builds indexes in parallel by partition. Default is 'fragment'.</td>
+</tr>
+<tr>
+<td><code>rows_per_range</code></td>
+<td>Long</td>
+<td>The number of rows per range when built using range mode. Default is 1000000.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="fts-inverted-options">FTS / Inverted Options<a class="headerlink" href="#fts-inverted-options" title="Permanent link">&para;</a></h3>
+<p>For the <code>fts</code> method (or its <code>inverted</code> alias), the following options are required:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>base_tokenizer</code></td>
+<td>String</td>
+<td>Tokenizer type: "simple" (whitespace/punctuation) or "ngram".</td>
+</tr>
+<tr>
+<td><code>language</code></td>
+<td>String</td>
+<td>Language for text processing (e.g., "English").</td>
+</tr>
+<tr>
+<td><code>max_token_length</code></td>
+<td>Integer</td>
+<td>Maximum token length (e.g., 40).</td>
+</tr>
+<tr>
+<td><code>lower_case</code></td>
+<td>Boolean</td>
+<td>Convert text to lowercase.</td>
+</tr>
+<tr>
+<td><code>stem</code></td>
+<td>Boolean</td>
+<td>Enable stemming to reduce words to root form.</td>
+</tr>
+<tr>
+<td><code>remove_stop_words</code></td>
+<td>Boolean</td>
+<td>Remove common stop words from index.</td>
+</tr>
+<tr>
+<td><code>ascii_folding</code></td>
+<td>Boolean</td>
+<td>Normalize accented characters (e.g., 'é' to 'e').</td>
+</tr>
+<tr>
+<td><code>with_position</code></td>
+<td>Boolean</td>
+<td>Enable phrase queries. Increases index size.</td>
+</tr>
+</tbody>
+</table>
+<p>For advanced tokenizer configuration, refer to the <a href="https://lance.org/format/index/scalar/fts/#tokenizers">Lance FTS documentation</a>.</p>
+<div class="admonition tip">
+<p class="admonition-title">Querying FTS Indexes</p>
+<p>Once an FTS index is created, query it using the <code>lance_match</code>, <code>lance_match_phrase</code>, and <code>lance_multi_match</code> SQL functions. See <a href="../../dql/fts/">Full-Text Search</a> for function signatures, options, and examples.</p>
+</div>
+<h3 id="fts-format-version">FTS Format Version<a class="headerlink" href="#fts-format-version" title="Permanent link">&para;</a></h3>
+<p>Lance FTS index format v2 is selected by the Lance runtime environment variable <code>LANCE_FTS_FORMAT_VERSION=2</code>. Configure it on both the Spark driver and executors before creating the index.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:1"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">spark-submit</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">LANCE_FTS_FORMAT_VERSION</span><span class="o">=</span><span class="m">2</span><span class="w"> </span>spark-submit<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span>--conf<span class="w"> </span>spark.executorEnv.LANCE_FTS_FORMAT_VERSION<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span>...
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>Spark SQL currently does not expose a per-index <code>fts_version</code> option. Use <code>USING fts</code> (or <code>USING inverted</code>) with the normal FTS options shown above; Spark records the index details and version returned by Lance.</p>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="basic-index-creation">Basic Index Creation<a class="headerlink" href="#basic-index-creation" title="Permanent link">&para;</a></h3>
+<p>Create a simple B-tree index on a single column:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="3:1"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">btree</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="indexing-multiple-columns">Indexing Multiple Columns<a class="headerlink" href="#indexing-multiple-columns" title="Permanent link">&para;</a></h3>
+<p>Scalar indexes currently support exactly one indexed column. Create separate indexes when you
+need to accelerate filters on multiple columns.</p>
+<h3 id="lightweight-fragment-pruning">Lightweight Fragment Pruning<a class="headerlink" href="#lightweight-fragment-pruning" title="Permanent link">&para;</a></h3>
+<p>Create a zonemap index when you want lightweight min/max-based fragment pruning:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="4:1"><input checked="checked" id="__tabbed_4_1" name="__tabbed_4" type="radio" /><div class="tabbed-labels"><label for="__tabbed_4_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id_zonemap</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="indexing-with-options">Indexing with Options<a class="headerlink" href="#indexing-with-options" title="Permanent link">&para;</a></h3>
+<p>Create an index and specify the <code>zone_size</code> for the B-tree:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="5:1"><input checked="checked" id="__tabbed_5_1" name="__tabbed_5" type="radio" /><div class="tabbed-labels"><label for="__tabbed_5_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id_zoned</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">btree</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">zone_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2048</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="zonemap-with-options">Zonemap with Options<a class="headerlink" href="#zonemap-with-options" title="Permanent link">&para;</a></h3>
+<p>Create a zonemap index and specify the approximate number of rows per zone:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="6:1"><input checked="checked" id="__tabbed_6_1" name="__tabbed_6" type="radio" /><div class="tabbed-labels"><label for="__tabbed_6_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id_zonemap</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">rows_per_zone</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2048</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="bitmap">Bitmap<a class="headerlink" href="#bitmap" title="Permanent link">&para;</a></h3>
+<p>Use <code>bitmap</code> for columns with a relatively small number of distinct values.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="7:1"><input checked="checked" id="__tabbed_7_1" name="__tabbed_7" type="radio" /><div class="tabbed-labels"><label for="__tabbed_7_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">events</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_status_bitmap</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">    </span><span class="k">USING</span><span class="w"> </span><span class="n">bitmap</span><span class="w"> </span><span class="p">(</span><span class="n">status</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="label-list">Label List<a class="headerlink" href="#label-list" title="Permanent link">&para;</a></h3>
+<p>Use <code>label_list</code> for membership filtering on an array/list column. The list item type must be
+non-nested.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="8:1"><input checked="checked" id="__tabbed_8_1" name="__tabbed_8" type="radio" /><div class="tabbed-labels"><label for="__tabbed_8_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">events</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_labels</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span><span class="k">USING</span><span class="w"> </span><span class="n">label_list</span><span class="w"> </span><span class="p">(</span><span class="n">labels</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="ngram">NGram<a class="headerlink" href="#ngram" title="Permanent link">&para;</a></h3>
+<p>Use <code>ngram</code> to build a fixed trigram index on a string column.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="9:1"><input checked="checked" id="__tabbed_9_1" name="__tabbed_9" type="radio" /><div class="tabbed-labels"><label for="__tabbed_9_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_content_ngram</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">    </span><span class="k">USING</span><span class="w"> </span><span class="n">ngram</span><span class="w"> </span><span class="p">(</span><span class="n">content</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="bloom-filter">Bloom Filter<a class="headerlink" href="#bloom-filter" title="Permanent link">&para;</a></h3>
+<p>Use <code>bloomfilter</code> for membership pruning when a compact probabilistic index is appropriate.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>number_of_items</code></td>
+<td>Long</td>
+<td>Expected number of values per Bloom filter block. Default <code>8192</code>.</td>
+</tr>
+<tr>
+<td><code>probability</code></td>
+<td>Double</td>
+<td>Target false-positive probability. Default <code>0.00057</code> (approximately one false positive in 1,754 probes).</td>
+</tr>
+</tbody>
+</table>
+<div class="tabbed-set tabbed-alternate" data-tabs="10:1"><input checked="checked" id="__tabbed_10_1" name="__tabbed_10" type="radio" /><div class="tabbed-labels"><label for="__tabbed_10_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">events</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id_bloom</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">    </span><span class="k">USING</span><span class="w"> </span><span class="n">bloomfilter</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">        </span><span class="n">number_of_items</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16384</span><span class="p">,</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">        </span><span class="n">probability</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">001</span><span class="p">,</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">        </span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="w">    </span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="rtree">RTree<a class="headerlink" href="#rtree" title="Permanent link">&para;</a></h3>
+<p>Use <code>rtree</code> for spatial filtering on a supported GeoArrow geometry column. For example, a point
+can be represented by a struct carrying <code>ARROW:extension:name=geoarrow.point</code> metadata.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>page_size</code></td>
+<td>Integer</td>
+<td>Maximum number of entries per R-tree page. Minimum <code>2</code>; default <code>4096</code>.</td>
+</tr>
+</tbody>
+</table>
+<div class="tabbed-set tabbed-alternate" data-tabs="11:1"><input checked="checked" id="__tabbed_11_1" name="__tabbed_11" type="radio" /><div class="tabbed-labels"><label for="__tabbed_11_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">places</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_geometry</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">    </span><span class="k">USING</span><span class="w"> </span><span class="n">rtree</span><span class="w"> </span><span class="p">(</span><span class="n">geometry</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">page_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span><span class="w"> </span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>Lance validates each method's column type and parameters during index creation.</p>
+<h3 id="full-text-search-index">Full-Text Search Index<a class="headerlink" href="#full-text-search-index" title="Permanent link">&para;</a></h3>
+<p>Create an FTS index on a text column:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="12:1"><input checked="checked" id="__tabbed_12_1" name="__tabbed_12" type="radio" /><div class="tabbed-labels"><label for="__tabbed_12_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">doc_fts</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">fts</span><span class="w"> </span><span class="p">(</span><span class="n">content</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">    </span><span class="n">base_tokenizer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'simple'</span><span class="p">,</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">    </span><span class="k">language</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'English'</span><span class="p">,</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">    </span><span class="n">max_token_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">40</span><span class="p">,</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">    </span><span class="n">lower_case</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">,</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="w">    </span><span class="n">stem</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">,</span>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="w">    </span><span class="n">remove_stop_words</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">,</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="w">    </span><span class="n">ascii_folding</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">,</span>
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">    </span><span class="n">with_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">,</span>
+</span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">    </span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span>
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>Query the indexed column with the <a href="../../dql/search/">SEARCH</a> table function.</p>
+<h3 id="deferred-index-creation">Deferred Index Creation<a class="headerlink" href="#deferred-index-creation" title="Permanent link">&para;</a></h3>
+<p>Register an index without scanning any data by setting <code>train = false</code>. This commits an empty index
+(covering no rows) instantly on the driver — useful when you want the index to exist immediately and
+fill it in later, or when you intend to build it incrementally:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="13:1"><input checked="checked" id="__tabbed_13_1" name="__tabbed_13" type="radio" /><div class="tabbed-labels"><label for="__tabbed_13_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">train</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>A deferred index returns <code>fragments_indexed = 0</code> and is treated as fully unindexed: queries fall back
+to scanning the data until it is populated. There are two ways to populate it:</p>
+<ul>
+<li>
+<p><strong>Full distributed build (recommended):</strong> re-run <code>CREATE INDEX</code> with the same name. This uses the
+  normal distributed build across Spark tasks and atomically replaces the empty index:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">);</span>
+</span></code></pre></div>
+</li>
+<li>
+<p><strong>Incremental build through the SDK:</strong> when only some fragments are unindexed (for example after
+  appending data to an already-built index), <code>Dataset.optimizeIndices</code> indexes just the unindexed
+  fragments. This currently runs on a single node:</p>
+<div class="language-java highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="n">dataset</span><span class="p">.</span><span class="na">optimizeIndices</span><span class="p">(</span><span class="n">OptimizeOptions</span><span class="p">.</span><span class="na">builder</span><span class="p">().</span><span class="na">build</span><span class="p">());</span>
+</span></code></pre></div>
+</li>
+</ul>
+<p><code>train = false</code> is supported for all index methods. Because deferred index creation does not build
+index data, <code>num_segments</code> cannot be combined with <code>train = false</code> — pass it on the eager build
+that populates the index instead.</p>
+<p>Creating a scalar index on an empty table also registers an empty index with zero fragment
+coverage. The index is immediately visible through <code>SHOW INDEXES</code>. After data is appended, populate
+it by re-running <code>CREATE INDEX</code> or calling <code>Dataset.optimizeIndices</code>.</p>
+<h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
+<p>The <code>CREATE INDEX</code> command returns the following information about the operation:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fragments_indexed</code></td>
+<td>Long</td>
+<td>The number of fragments that were indexed.</td>
+</tr>
+<tr>
+<td><code>index_name</code></td>
+<td>String</td>
+<td>The name of the created index.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="when-to-use-an-index">When to Use an Index<a class="headerlink" href="#when-to-use-an-index" title="Permanent link">&para;</a></h2>
+<p>Consider creating an index when:</p>
+<ul>
+<li>You frequently filter a large table on a specific column.</li>
+<li>You want lightweight fragment pruning based on per-zone min/max statistics.</li>
+<li>Your queries involve point lookups or small range scans.</li>
+</ul>
+<h2 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h2>
+<p>The <code>CREATE INDEX</code> command operates as follows:</p>
+<ol>
+<li><strong>Index Build Execution</strong>: Lance Spark chooses an execution path based on the index method. <code>zonemap</code>, <code>bitmap</code>, <code>label_list</code>, <code>ngram</code>, <code>bloomfilter</code>, <code>rtree</code>, <code>fts</code> (or <code>inverted</code>), and fragment-mode <code>btree</code> split source fragments into batches and build them in parallel. Range-mode <code>btree</code> uses Spark repartitioning and sorted preprocessed data.</li>
+<li><strong>Metadata Finalization</strong>: Lance Spark merges or commits the resulting index metadata on the driver so the new logical index becomes visible atomically.</li>
+<li><strong>Transactional Commit</strong>: A new table version is committed with the new index information. The operation is atomic and ensures that concurrent reads are not affected.</li>
+</ol>
+<h2 id="notes-and-limitations">Notes and Limitations<a class="headerlink" href="#notes-and-limitations" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Index Methods</strong>: The <code>zonemap</code>, <code>bitmap</code>, <code>label_list</code>, <code>ngram</code>, <code>bloomfilter</code>, <code>rtree</code>, <code>btree</code>, and <code>fts</code> (or <code>inverted</code>) methods are supported for index creation.</li>
+<li><strong>Indexed Column Count</strong>: All supported index methods currently support exactly one indexed column.</li>
+<li><strong>Index Replacement</strong>: If you create an index with the same name as an existing one, the old index will be replaced by the new one.</li>
+<li><strong>Deferred Training</strong>: With <code>train = false</code> the index is registered empty and is populated later, either by re-running <code>CREATE INDEX</code> (a full distributed build that replaces the empty index) or, for incremental coverage of newly appended fragments, by <code>Dataset.optimizeIndices</code> in the SDK. The SQL <code>OPTIMIZE</code> command compacts fragments and does not train deferred indexes.</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../drop-table/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">DROP TABLE</div>
+        </a>
+        <a class="next" href="../show-indexes/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">SHOW INDEXES</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#basic-usage">Basic Usage</a>
+      <a class="ld-toc__h2" href="#index-methods">Index Methods</a>
+      <a class="ld-toc__h2" href="#options">Options</a>
+      <a class="ld-toc__h3" href="#common-options">Common Options</a>
+      <a class="ld-toc__h3" href="#distributed-index-options">Distributed Index Options</a>
+      <a class="ld-toc__h3" href="#zonemap-options">ZoneMap Options</a>
+      <a class="ld-toc__h3" href="#btree-options">BTree Options</a>
+      <a class="ld-toc__h3" href="#fts-inverted-options">FTS / Inverted Options</a>
+      <a class="ld-toc__h3" href="#fts-format-version">FTS Format Version</a>
+      <a class="ld-toc__h2" href="#examples">Examples</a>
+      <a class="ld-toc__h3" href="#basic-index-creation">Basic Index Creation</a>
+      <a class="ld-toc__h3" href="#indexing-multiple-columns">Indexing Multiple Columns</a>
+      <a class="ld-toc__h3" href="#lightweight-fragment-pruning">Lightweight Fragment Pruning</a>
+      <a class="ld-toc__h3" href="#indexing-with-options">Indexing with Options</a>
+      <a class="ld-toc__h3" href="#zonemap-with-options">Zonemap with Options</a>
+      <a class="ld-toc__h3" href="#bitmap">Bitmap</a>
+      <a class="ld-toc__h3" href="#label-list">Label List</a>
+      <a class="ld-toc__h3" href="#ngram">NGram</a>
+      <a class="ld-toc__h3" href="#bloom-filter">Bloom Filter</a>
+      <a class="ld-toc__h3" href="#rtree">RTree</a>
+      <a class="ld-toc__h3" href="#full-text-search-index">Full-Text Search Index</a>
+      <a class="ld-toc__h3" href="#deferred-index-creation">Deferred Index Creation</a>
+      <a class="ld-toc__h2" href="#output">Output</a>
+      <a class="ld-toc__h2" href="#when-to-use-an-index">When to Use an Index</a>
+      <a class="ld-toc__h2" href="#how-it-works">How It Works</a>
+      <a class="ld-toc__h2" href="#notes-and-limitations">Notes and Limitations</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../../format/">Specification</a>
+        <a href="../../../../../format/file/">File format</a>
+        <a href="../../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../../quickstart/">Getting started</a>
+        <a href="../../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../../..";</script>
+<script src="../../../../../assets/site.js" defer></script>
+</body>
+</html>

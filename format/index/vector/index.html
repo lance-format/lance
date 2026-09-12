@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Vector Indices — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/index/vector/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../table/">Lance Table Format</a>
+    <a href="../../table/schema/">Schema</a>
+    <a href="../../table/versioning/">Versioning</a>
+    <a href="../../table/transaction/">Transactions</a>
+    <a href="../../table/layout/">Layout</a>
+    <a href="../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../scalar/btree/">BTree</a>
+    <a href="../scalar/bitmap/">Bitmap</a>
+    <a href="../scalar/label_list/">Label List</a>
+    <a href="../scalar/zonemap/">Zone Map</a>
+    <a href="../scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../scalar/fts/">Full Text Search</a>
+    <a href="../scalar/ngram/">N-gram</a>
+    <a href="../scalar/fmindex/">FM-Index</a>
+    <a href="../scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a class="active" href="./">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../system/frag_reuse/">Fragment Reuse</a>
+    <a href="../system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Index Formats</span>
+        <span>/</span><span>Vector Indices</span>
+        <span>/</span><b>Vector Indices</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="vector-indices">Vector Indices<a class="headerlink" href="#vector-indices" title="Permanent link">&para;</a></h1>
+<p>Lance provides a powerful and extensible secondary index system for efficient vector similarity search.
+All vector indices are stored as regular Lance files, making them portable and easy to manage.
+It is designed for efficient similarity search across large-scale vector datasets.</p>
+<h2 id="concepts">Concepts<a class="headerlink" href="#concepts" title="Permanent link">&para;</a></h2>
+<p>Lance splits each vector index into 3 parts - clustering, sub-index and quantization.</p>
+<h3 id="clustering">Clustering<a class="headerlink" href="#clustering" title="Permanent link">&para;</a></h3>
+<p>Clustering divides all the vectors into different disjoint clusters (a.k.a. partitions).
+Lance currently supports using Inverted File (IVF) as the primary clustering mechanism.
+IVF partitions the vectors into clusters using the k-means clustering algorithm.
+Each cluster contains vectors that are similar to the cluster centroid.
+During search, only the most relevant clusters are examined, dramatically reducing search time.
+IVF can be combined with any sub-index type and quantization method.</p>
+<h3 id="sub-index">Sub-Index<a class="headerlink" href="#sub-index" title="Permanent link">&para;</a></h3>
+<p>The sub-index determines how vectors are organized for search. Lance currently supports:</p>
+<ul>
+<li><strong>FLAT</strong>: Exact search with no approximation - scans all vectors</li>
+<li><strong>HNSW</strong>: Hierarchical Navigable Small World graphs for fast approximate search</li>
+</ul>
+<h3 id="quantization">Quantization<a class="headerlink" href="#quantization" title="Permanent link">&para;</a></h3>
+<p>The quantization method determines how vectors are stored and compressed. Lance currently supports:</p>
+<ul>
+<li><strong>Product Quantization (PQ)</strong>: Compresses vectors by splitting them into smaller sub-vectors and quantizing each independently</li>
+<li><strong>Scalar Quantization (SQ)</strong>: Applies scalar quantization to each dimension of the vector independently</li>
+<li><strong>RabitQ (RQ)</strong>: Uses random rotation and binary quantization for extreme compression</li>
+<li><strong>FLAT</strong>: No quantization, keeps original vectors for exact search</li>
+</ul>
+<h3 id="common-combinations">Common Combinations<a class="headerlink" href="#common-combinations" title="Permanent link">&para;</a></h3>
+<p>When we refer to an index type, it is typically <code>{clustering}_{sub_index}_{quantization}</code>.
+If sub-index is just <code>FLAT</code>, we usually omit it and just refer to it by <code>{clustering}_{quantization}</code>.
+Here are the commonly used combinations:</p>
+<table>
+<thead>
+<tr>
+<th>Index Type</th>
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>IVF_PQ</strong></td>
+<td>Inverted File with Product Quantization</td>
+<td>Combines IVF clustering with PQ compression for efficient storage and search</td>
+</tr>
+<tr>
+<td><strong>IVF_HNSW_SQ</strong></td>
+<td>Inverted File with HNSW and Scalar Quantization</td>
+<td>Uses IVF for coarse clustering and HNSW for fine-grained search with scalar quantization</td>
+</tr>
+<tr>
+<td><strong>IVF_SQ</strong></td>
+<td>Inverted File with Scalar Quantization</td>
+<td>Combines IVF clustering with scalar quantization for balanced compression</td>
+</tr>
+<tr>
+<td><strong>IVF_RQ</strong></td>
+<td>Inverted File with RabitQ</td>
+<td>Combines IVF clustering with RabitQ for extreme compression using binary quantization</td>
+</tr>
+<tr>
+<td><strong>IVF_FLAT</strong></td>
+<td>Inverted File without quantization</td>
+<td>Uses IVF clustering with exact vector storage for precise search within clusters</td>
+</tr>
+</tbody>
+</table>
+<h3 id="versioning">Versioning<a class="headerlink" href="#versioning" title="Permanent link">&para;</a></h3>
+<p>The Lance vector index format has gone through 3 versions so far.
+This document currently only records version 3 which is the latest version.
+The specific version of the vector index is recorded in the <code>index_version</code> field of the generic <a href="../#loading-an-index">index metadata</a>.</p>
+<h2 id="storage-layout-v3">Storage Layout (V3)<a class="headerlink" href="#storage-layout-v3" title="Permanent link">&para;</a></h2>
+<p>Each vector index is stored as 2 regular Lance files - index file and auxiliary file.</p>
+<h3 id="index-file">Index File<a class="headerlink" href="#index-file" title="Permanent link">&para;</a></h3>
+<p>The index structure file containing the search graph/structure with index-specific schema.
+It is stored as a Lance file with name <code>index.idx</code> within the index directory.</p>
+<h4 id="arrow-schema">Arrow Schema<a class="headerlink" href="#arrow-schema" title="Permanent link">&para;</a></h4>
+<p>The index file stores the search structure with graph or flat organization.
+The Arrow schema of the Lance file varies depending on the sub-index type used.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>All partitions are stored in the same file, and partitions must be written in order.</p>
+</div>
+<h5 id="flat">FLAT<a class="headerlink" href="#flat" title="Permanent link">&para;</a></h5>
+<p>FLAT indices perform exact search with no approximation. This is essentially an empty file with a minimal schema:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>__flat_marker</code></td>
+<td>uint64</td>
+<td>false</td>
+<td>Marker field for FLAT index (no actual data)</td>
+</tr>
+</tbody>
+</table>
+<h5 id="hnsw">HNSW<a class="headerlink" href="#hnsw" title="Permanent link">&para;</a></h5>
+<p>HNSW (Hierarchical Navigable Small World) indices provide fast approximate search through a multi-level graph structure. This stores the HNSW graph with the following schema:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>__vector_id</code></td>
+<td>uint32</td>
+<td>true</td>
+<td>Vector identifier</td>
+</tr>
+<tr>
+<td><code>__neighbors</code></td>
+<td>list<uint32></td>
+<td>true</td>
+<td>Neighbor node IDs</td>
+</tr>
+<tr>
+<td><code>_distance</code></td>
+<td>list<float32></td>
+<td>true</td>
+<td>Distances to neighbors</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>HNSW consists of multiple levels, and all levels must be written in order starting from level 0.</p>
+</div>
+<h4 id="arrow-schema-metadata">Arrow Schema Metadata<a class="headerlink" href="#arrow-schema-metadata" title="Permanent link">&para;</a></h4>
+<p>The index file contains metadata in its Arrow schema metadata to describe the index configuration and structure.
+Here are the metadata keys and their corresponding values:</p>
+<h5 id="lanceindex">"lance:index"<a class="headerlink" href="#lanceindex" title="Permanent link">&para;</a></h5>
+<p>Contains basic index configuration information in JSON:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Expected Values</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>type</code></td>
+<td>String</td>
+<td>Index type (e.g., "IVF_PQ", "IVF_RQ", "IVF_HNSW", "FLAT")</td>
+</tr>
+<tr>
+<td><code>distance_type</code></td>
+<td>String</td>
+<td>Distance metric (e.g., "l2", "cosine", "dot")</td>
+</tr>
+</tbody>
+</table>
+<h5 id="lanceivf">"lance:ivf"<a class="headerlink" href="#lanceivf" title="Permanent link">&para;</a></h5>
+<p>References the IVF metadata stored in the Lance file global buffer.
+This value records the global buffer index, currently this is always "1".</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Global buffer indices in Lance files are 1-based,
+so you need to subtract 1 when accessing them through code.</p>
+</div>
+<h5 id="lanceflat">"lance:flat"<a class="headerlink" href="#lanceflat" title="Permanent link">&para;</a></h5>
+<p>Contains partition-specific metadata for the <code>FLAT</code> sub-index structure.
+This is an empty string since FLAT indices don't require additional metadata at this moment.</p>
+<h5 id="lancehnsw">"lance:hnsw"<a class="headerlink" href="#lancehnsw" title="Permanent link">&para;</a></h5>
+<p>Contains the HNSW-specific JSON metadata for each partition, including graph structure information:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Expected Values</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>entry_point</code></td>
+<td>u32</td>
+<td>Starting node for graph traversal</td>
+</tr>
+<tr>
+<td><code>params</code></td>
+<td>Object</td>
+<td>HNSW construction parameters (see below)</td>
+</tr>
+<tr>
+<td><code>level_offsets</code></td>
+<td>Array<usize></td>
+<td>Offset for each level in the graph</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>params</code> object contains the following HNSW construction parameters:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_level</code></td>
+<td>u16</td>
+<td>Maximum level of the HNSW graph</td>
+<td>7</td>
+</tr>
+<tr>
+<td><code>m</code></td>
+<td>usize</td>
+<td>Number of connections to establish while inserting new element</td>
+<td>20</td>
+</tr>
+<tr>
+<td><code>ef_construction</code></td>
+<td>usize</td>
+<td>Size of the dynamic list for candidates</td>
+<td>150</td>
+</tr>
+<tr>
+<td><code>prefetch_distance</code></td>
+<td>Option<usize></td>
+<td>Number of vectors ahead to prefetch while building</td>
+<td>Some(2)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="lance-file-global-buffer">Lance File Global Buffer<a class="headerlink" href="#lance-file-global-buffer" title="Permanent link">&para;</a></h4>
+<h5 id="ivf-metadata">IVF Metadata<a class="headerlink" href="#ivf-metadata" title="Permanent link">&para;</a></h5>
+<p>For efficiency, Lance serializes IVF metadata to protobuf format and stores it in the Lance file global buffer:</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">IVF</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="cm">/* Centroids of partitions. `dimension * num_partitions` of float32s.</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="cm">   *</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="cm">   * Deprecated, use centroids_tensor instead.</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="cm">   */</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="na">centroids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w">  </span><span class="c1">// [deprecated = true];</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">  </span><span class="c1">// File offset of each partition.</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span><span class="c1">// Number of records in the partition.</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">lengths</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="c1">// Tensor of centroids. `num_partitions * dimension` of float32s.</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">  </span><span class="n">Tensor</span><span class="w"> </span><span class="na">centroids_tensor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span><span class="c1">// KMeans loss.</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="na">loss</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="auxiliary-file">Auxiliary File<a class="headerlink" href="#auxiliary-file" title="Permanent link">&para;</a></h3>
+<p>The auxiliary file is a vector storage for quantized vectors.
+It is stored as a Lance file named <code>auxiliary.idx</code> within the index directory.</p>
+<h4 id="arrow-schema_1">Arrow Schema<a class="headerlink" href="#arrow-schema_1" title="Permanent link">&para;</a></h4>
+<p>Since the auxiliary file stores the actual (quantized) vectors,
+the Arrow schema of the Lance file varies depending on the quantization method used.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>All partitions are stored in the same file, and partitions must be written in order.</p>
+</div>
+<h5 id="flat_1">FLAT<a class="headerlink" href="#flat_1" title="Permanent link">&para;</a></h5>
+<p>No quantization applied - stores original vectors in their full precision:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_rowid</code></td>
+<td>uint64</td>
+<td>true</td>
+<td>Row identifier</td>
+</tr>
+<tr>
+<td><code>flat</code></td>
+<td>list<float32>[dimension]</td>
+<td>true</td>
+<td>Original vector values (list_size = vector dimension)</td>
+</tr>
+</tbody>
+</table>
+<h5 id="pq">PQ<a class="headerlink" href="#pq" title="Permanent link">&para;</a></h5>
+<p>Compresses vectors using product quantization for significant memory savings:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_rowid</code></td>
+<td>uint64</td>
+<td>true</td>
+<td>Row identifier</td>
+</tr>
+<tr>
+<td><code>__pq_code</code></td>
+<td>list<uint8>[num_sub_vectors * num_bits / 8]</td>
+<td>true</td>
+<td>PQ codes, packed to <code>num_bits</code> per subvector</td>
+</tr>
+</tbody>
+</table>
+<h5 id="sq">SQ<a class="headerlink" href="#sq" title="Permanent link">&para;</a></h5>
+<p>Compresses vectors using scalar quantization for moderate memory savings:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_rowid</code></td>
+<td>uint64</td>
+<td>true</td>
+<td>Row identifier</td>
+</tr>
+<tr>
+<td><code>__sq_code</code></td>
+<td>list<uint8>[dimension]</td>
+<td>true</td>
+<td>SQ codes (list_size = vector dimension)</td>
+</tr>
+</tbody>
+</table>
+<h5 id="rq">RQ<a class="headerlink" href="#rq" title="Permanent link">&para;</a></h5>
+<p>Compresses vectors using RabitQ with random rotation and binary quantization for extreme compression:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Present when</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_rowid</code></td>
+<td>uint64</td>
+<td>true</td>
+<td>always</td>
+<td>Row identifier</td>
+</tr>
+<tr>
+<td><code>_rabit_codes</code></td>
+<td>list<uint8>[ceil(code_dim / 8)]</td>
+<td>true</td>
+<td>always</td>
+<td>Binary quantized codes (1 bit per dimension, packed into bytes)</td>
+</tr>
+<tr>
+<td><code>__add_factors</code></td>
+<td>float32</td>
+<td>true</td>
+<td>always</td>
+<td>Additive correction factors for distance computation</td>
+</tr>
+<tr>
+<td><code>__scale_factors</code></td>
+<td>float32</td>
+<td>true</td>
+<td>always</td>
+<td>Scale correction factors for distance computation</td>
+</tr>
+<tr>
+<td><code>__error_factors</code></td>
+<td>float32</td>
+<td>true</td>
+<td><code>raw_query</code> estimator</td>
+<td>Error factors for raw-query lower-bound pruning</td>
+</tr>
+<tr>
+<td><code>__blocked_ex_codes</code></td>
+<td>list<uint8>[next_multiple_of(code_dim, 64) * (num_bits - 1) / 8]</td>
+<td>true</td>
+<td><code>num_bits &gt; 1</code></td>
+<td>Extra RabitQ code bits for multi-bit RQ, in the blocked layout</td>
+</tr>
+<tr>
+<td><code>__add_factors_ex</code></td>
+<td>float32</td>
+<td>true</td>
+<td><code>num_bits &gt; 1</code></td>
+<td>Additive correction factors for ex-code distance computation</td>
+</tr>
+<tr>
+<td><code>__scale_factors_ex</code></td>
+<td>float32</td>
+<td>true</td>
+<td><code>num_bits &gt; 1</code></td>
+<td>Scale correction factors for ex-code distance computation</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Indexes written before the blocked ex-code layout store the same bits in
+<code>__ex_codes</code>, sized <code>ceil(dimension * (num_bits - 1) / 8)</code>. Readers still
+accept that column and repack it at load time; writers no longer emit it.</p>
+</div>
+<h4 id="arrow-schema-metadata_1">Arrow Schema Metadata<a class="headerlink" href="#arrow-schema-metadata_1" title="Permanent link">&para;</a></h4>
+<p>The auxiliary file also contains metadata in its Arrow schema metadata for vector storage configuration.
+Here are the metadata keys and their corresponding values:</p>
+<h5 id="distance_type">"distance_type"<a class="headerlink" href="#distance_type" title="Permanent link">&para;</a></h5>
+<p>The distance metric used to compute similarity between vectors (e.g., "l2", "cosine", "dot").</p>
+<h5 id="lanceivf_1">"lance:ivf"<a class="headerlink" href="#lanceivf_1" title="Permanent link">&para;</a></h5>
+<p>Similar to the index file's "lance:ivf" but focused on vector storage layout.
+This doesn't contain the partitions' centroids.
+It's only used for tracking each partition's offset and length in the auxiliary file.</p>
+<h5 id="lancerabit">"lance:rabit"<a class="headerlink" href="#lancerabit" title="Permanent link">&para;</a></h5>
+<p>Contains RabitQ-specific metadata in JSON format (only present for RQ quantization).
+This includes the rotation matrix position, number of bits, and packing information.
+See the RQ metadata specification in the "storage_metadata" section below.</p>
+<h5 id="storage_metadata">"storage_metadata"<a class="headerlink" href="#storage_metadata" title="Permanent link">&para;</a></h5>
+<p>Contains quantizer-specific metadata as a list of JSON strings.
+Currently, the list always contains exactly 1 element with the quantizer metadata.</p>
+<p>For <strong>Product Quantization (PQ)</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>codebook_position</code></td>
+<td>usize</td>
+<td>Position of the codebook in the global buffer</td>
+</tr>
+<tr>
+<td><code>nbits</code></td>
+<td>u32</td>
+<td>Number of bits per subvector code (e.g., 8 bits = 256 codewords)</td>
+</tr>
+<tr>
+<td><code>num_sub_vectors</code></td>
+<td>usize</td>
+<td>Number of subvectors (m)</td>
+</tr>
+<tr>
+<td><code>dimension</code></td>
+<td>usize</td>
+<td>Original vector dimension</td>
+</tr>
+<tr>
+<td><code>transposed</code></td>
+<td>bool</td>
+<td>Whether the codebook is stored in transposed layout</td>
+</tr>
+</tbody>
+</table>
+<p>For <strong>Scalar Quantization (SQ)</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dim</code></td>
+<td>usize</td>
+<td>Vector dimension</td>
+</tr>
+<tr>
+<td><code>num_bits</code></td>
+<td>u16</td>
+<td>Number of bits for quantization</td>
+</tr>
+<tr>
+<td><code>bounds</code></td>
+<td>Range<f64></td>
+<td>Min/max bounds for scalar quantization</td>
+</tr>
+</tbody>
+</table>
+<p>For <strong>RabitQ (RQ)</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>JSON Key</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rotate_mat_position</code></td>
+<td>u32</td>
+<td>Position of the rotation matrix in the global buffer</td>
+</tr>
+<tr>
+<td><code>num_bits</code></td>
+<td>u8</td>
+<td>Number of bits per dimension, in the range 1..=9</td>
+</tr>
+<tr>
+<td><code>code_dim</code></td>
+<td>u32</td>
+<td>Rotated vector dimension for the 1-bit binary code</td>
+</tr>
+<tr>
+<td><code>packed</code></td>
+<td>bool</td>
+<td>Whether codes are packed for optimized computation</td>
+</tr>
+<tr>
+<td><code>query_estimator</code></td>
+<td>string</td>
+<td>Distance estimator layout: <code>residual_query</code> or <code>raw_query</code>. Missing values are read as <code>residual_query</code> for compatibility with released 1-bit IVF_RQ indexes.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="lance-file-global-buffer_1">Lance File Global Buffer<a class="headerlink" href="#lance-file-global-buffer_1" title="Permanent link">&para;</a></h4>
+<h5 id="quantization-codebook">Quantization Codebook<a class="headerlink" href="#quantization-codebook" title="Permanent link">&para;</a></h5>
+<p>For product quantization, the codebook is stored in <code>Tensor</code> format
+in the auxiliary file's global buffer for efficient access:</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Tensor</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">DataType</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="na">BFLOAT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="na">FLOAT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="na">FLOAT32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="na">FLOAT64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="na">UINT8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="na">UINT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="na">UINT32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">    </span><span class="na">UINT64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="w">  </span><span class="n">DataType</span><span class="w"> </span><span class="na">data_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">  </span><span class="c1">// Data shape, [dim1, dim2, ...]</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">shape</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="w">  </span><span class="c1">// Data buffer</span>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">  </span><span class="kt">bytes</span><span class="w"> </span><span class="na">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="p">}</span>
+</span></code></pre></div>
+<h5 id="rotation-matrix">Rotation Matrix<a class="headerlink" href="#rotation-matrix" title="Permanent link">&para;</a></h5>
+<p>For RabitQ, the rotation matrix is stored in <code>Tensor</code> format
+in the auxiliary file's global buffer. The rotation matrix is an orthogonal matrix used
+to rotate vectors before binary quantization:</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Tensor</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">DataType</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="na">BFLOAT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="na">FLOAT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="na">FLOAT32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">    </span><span class="na">FLOAT64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="na">UINT8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">    </span><span class="na">UINT16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">    </span><span class="na">UINT32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">    </span><span class="na">UINT64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">  </span><span class="n">DataType</span><span class="w"> </span><span class="na">data_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">  </span><span class="c1">// Data shape, [dim1, dim2, ...]</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">shape</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">  </span><span class="c1">// Data buffer</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">  </span><span class="kt">bytes</span><span class="w"> </span><span class="na">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The rotation matrix has shape <code>[code_dim, code_dim]</code> where <code>code_dim</code> is the rotated vector
+dimension. IVF_RQ always stores the 1-bit binary sign code in <code>_rabit_codes</code>; for <code>num_bits &gt; 1</code>,
+the remaining <code>num_bits - 1</code> ex-code bits are stored in <code>__blocked_ex_codes</code> instead of widening the
+binary code path. New IVF_RQ indexes store raw-query estimator factors. <code>num_bits=1</code> indexes only
+store the binary-code factor columns; multi-bit indexes also store separate ex-code additive and
+scale factors.</p>
+<h2 id="appendices">Appendices<a class="headerlink" href="#appendices" title="Permanent link">&para;</a></h2>
+<h3 id="appendix-1-example-ivf_pq-format">Appendix 1: Example IVF_PQ Format<a class="headerlink" href="#appendix-1-example-ivf_pq-format" title="Permanent link">&para;</a></h3>
+<p>This example shows how an <code>IVF_PQ</code> index is physically laid out. Assume vectors have dimension 128,
+PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance type is "l2".</p>
+<h4 id="index-file_1">Index File<a class="headerlink" href="#index-file_1" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Arrow Schema Metadata:</li>
+<li><code>"lance:index"</code> → <code>{ "type": "IVF_PQ", "distance_type": "l2" }</code></li>
+<li><code>"lance:ivf"</code> → "1" (references IVF metadata in the global buffer)</li>
+<li>
+<p><code>"lance:flat"</code> → <code>["", "", ...]</code> (one empty string per partition; IVF_PQ uses a FLAT sub-index inside each partition)</p>
+</li>
+<li>
+<p>Lance File Global buffer (Protobuf):</p>
+</li>
+<li><code>Ivf</code> message containing:<ul>
+<li><code>centroids_tensor</code>: shape <code>[num_partitions, 128]</code> (float32)</li>
+<li><code>offsets</code>: start offset (row) of each partition in <code>auxiliary.idx</code></li>
+<li><code>lengths</code>: number of vectors in each partition</li>
+<li><code>loss</code>: k-means loss (optional)</li>
+</ul>
+</li>
+</ul>
+<h4 id="auxiliary-file_1">Auxiliary File<a class="headerlink" href="#auxiliary-file_1" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Arrow Schema Metadata:</li>
+<li><code>"distance_type"</code> → <code>"l2"</code></li>
+<li><code>"lance:ivf"</code> → tracks per-partition <code>offsets</code> and <code>lengths</code> (no centroids here)</li>
+<li><code>"storage_metadata"</code> → <code>[ "{"pq":{"num_sub_vectors":16,"nbits":8,"dimension":128,"transposed":true}}" ]</code></li>
+<li>Lance File Global buffer:</li>
+<li><code>Tensor</code> codebook with shape <code>[256, num_sub_vectors, dim/num_sub_vectors]</code> = <code>[256, 16, 8]</code> (float32)</li>
+<li>Rows with Arrow schema:</li>
+</ul>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"_rowid"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">()),</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"__pq_code"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">list_</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">uint8</span><span class="p">(),</span> <span class="n">list_size</span><span class="o">=</span><span class="mi">16</span><span class="p">)),</span> <span class="c1"># num_sub_vectors * num_bits / 8 = 16 * 8 / 8</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">])</span>
+</span></code></pre></div>
+<h3 id="appendix-2-example-ivf_rq-format">Appendix 2: Example IVF_RQ Format<a class="headerlink" href="#appendix-2-example-ivf_rq-format" title="Permanent link">&para;</a></h3>
+<p>This example shows how an <code>IVF_RQ</code> index is physically laid out. Assume vectors have dimension 128,
+RQ uses 1 bit per dimension (<code>num_bits=1</code>), and distance type is "l2". For <code>num_bits &gt; 1</code>, the
+auxiliary schema also includes <code>__blocked_ex_codes</code>, <code>__add_factors_ex</code>, and <code>__scale_factors_ex</code>.</p>
+<h4 id="index-file_2">Index File<a class="headerlink" href="#index-file_2" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Arrow Schema Metadata:</li>
+<li><code>"lance:index"</code> → <code>{ "type": "IVF_RQ", "distance_type": "l2" }</code></li>
+<li><code>"lance:ivf"</code> → "1" (references IVF metadata in the global buffer)</li>
+<li>
+<p><code>"lance:flat"</code> → <code>["", "", ...]</code> (one empty string per partition; IVF_RQ uses a FLAT sub-index inside each partition)</p>
+</li>
+<li>
+<p>Lance File Global buffer (Protobuf):</p>
+</li>
+<li><code>Ivf</code> message containing:<ul>
+<li><code>centroids_tensor</code>: shape <code>[num_partitions, 128]</code> (float32)</li>
+<li><code>offsets</code>: start offset (row) of each partition in <code>auxiliary.idx</code></li>
+<li><code>lengths</code>: number of vectors in each partition</li>
+<li><code>loss</code>: k-means loss (optional)</li>
+</ul>
+</li>
+</ul>
+<h4 id="auxiliary-file_2">Auxiliary File<a class="headerlink" href="#auxiliary-file_2" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Arrow Schema Metadata:</li>
+<li><code>"distance_type"</code> → <code>"l2"</code></li>
+<li><code>"lance:ivf"</code> → tracks per-partition <code>offsets</code> and <code>lengths</code> (no centroids here)</li>
+<li><code>"lance:rabit"</code> → <code>"{"rotate_mat_position":1,"num_bits":1,"packed":true,"query_estimator":"raw_query"}"</code></li>
+<li>Lance File Global buffer:</li>
+<li><code>Tensor</code> rotation matrix with shape <code>[code_dim, code_dim]</code> = <code>[128, 128]</code> (float32)</li>
+<li>Rows with Arrow schema:</li>
+</ul>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"_rowid"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">()),</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"_rabit_codes"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">list_</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">uint8</span><span class="p">(),</span> <span class="n">list_size</span><span class="o">=</span><span class="mi">16</span><span class="p">)),</span> <span class="c1"># ceil(code_dim / 8) = ceil(128 / 8)</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"__add_factors"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">float32</span><span class="p">()),</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"__scale_factors"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">float32</span><span class="p">()),</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"__error_factors"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">float32</span><span class="p">()),</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">])</span>
+</span></code></pre></div>
+<h3 id="appendix-3-accessing-index-file-with-python">Appendix 3: Accessing Index File with Python<a class="headerlink" href="#appendix-3-accessing-index-file-with-python" title="Permanent link">&para;</a></h3>
+<p>The following example demonstrates how to read and parse different components in the Lance index files using Python:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># Open the index file</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">index_reader</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceFileReader</span><span class="o">.</span><span class="n">read_file</span><span class="p">(</span><span class="s2">"path/to/index.idx"</span><span class="p">)</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="c1"># Access schema metadata</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">schema_metadata</span> <span class="o">=</span> <span class="n">index_reader</span><span class="o">.</span><span class="n">metadata</span><span class="p">()</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">metadata</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="c1"># Get the IVF metadata reference from schema</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="n">ivf_ref</span> <span class="o">=</span> <span class="n">schema_metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">b</span><span class="s2">"lance:ivf"</span><span class="p">)</span>  <span class="c1"># Returns b"1" for global buffer index</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="c1"># Read the global buffer containing IVF metadata</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="k">if</span> <span class="n">ivf_ref</span><span class="p">:</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>    <span class="n">buffer_index</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">ivf_ref</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>  <span class="c1"># Global buffer indices are 1-based</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>    <span class="n">ivf_buffer</span> <span class="o">=</span> <span class="n">index_reader</span><span class="o">.</span><span class="n">global_buffer</span><span class="p">(</span><span class="n">buffer_index</span><span class="p">)</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>    <span class="c1"># Parse the protobuf message (requires lance protobuf definitions)</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a>    <span class="c1"># ivf_metadata = parse_ivf_protobuf(ivf_buffer)</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="c1"># For auxiliary file with PQ codebook</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="n">aux_reader</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceFileReader</span><span class="o">.</span><span class="n">read_file</span><span class="p">(</span><span class="s2">"path/to/auxiliary.idx"</span><span class="p">)</span>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="c1"># Get storage metadata</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="n">storage_metadata</span> <span class="o">=</span> <span class="n">aux_reader</span><span class="o">.</span><span class="n">metadata</span><span class="p">()</span><span class="o">.</span><span class="n">schema</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">b</span><span class="s2">"storage_metadata"</span><span class="p">)</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="k">if</span> <span class="n">storage_metadata</span><span class="p">:</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>    <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a>    <span class="n">pq_metadata</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">storage_metadata</span><span class="o">.</span><span class="n">decode</span><span class="p">())[</span><span class="mi">0</span><span class="p">]</span>  <span class="c1"># First element of the list</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a>    <span class="n">pq_params</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">pq_metadata</span><span class="p">)</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a>    <span class="c1"># Access the codebook from global buffer</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a>    <span class="n">codebook_position</span> <span class="o">=</span> <span class="n">pq_params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"codebook_position"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a>    <span class="k">if</span> <span class="n">codebook_position</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a>        <span class="n">codebook_buffer</span> <span class="o">=</span> <span class="n">aux_reader</span><span class="o">.</span><span class="n">global_buffer</span><span class="p">(</span><span class="n">codebook_position</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a>        <span class="c1"># Parse the tensor protobuf</span>
+</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a>        <span class="c1"># codebook_tensor = parse_tensor_protobuf(codebook_buffer)</span>
+</span></code></pre></div>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../scalar/rtree/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">RTree</div>
+        </a>
+        <a class="next" href="../system/frag_reuse/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Fragment Reuse</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#concepts">Concepts</a>
+      <a class="ld-toc__h3" href="#clustering">Clustering</a>
+      <a class="ld-toc__h3" href="#sub-index">Sub-Index</a>
+      <a class="ld-toc__h3" href="#quantization">Quantization</a>
+      <a class="ld-toc__h3" href="#common-combinations">Common Combinations</a>
+      <a class="ld-toc__h3" href="#versioning">Versioning</a>
+      <a class="ld-toc__h2" href="#storage-layout-v3">Storage Layout (V3)</a>
+      <a class="ld-toc__h3" href="#index-file">Index File</a>
+      <a class="ld-toc__h3" href="#auxiliary-file">Auxiliary File</a>
+      <a class="ld-toc__h2" href="#appendices">Appendices</a>
+      <a class="ld-toc__h3" href="#appendix-1-example-ivf_pq-format">Appendix 1: Example IVF_PQ Format</a>
+      <a class="ld-toc__h3" href="#appendix-2-example-ivf_rq-format">Appendix 2: Example IVF_RQ Format</a>
+      <a class="ld-toc__h3" href="#appendix-3-accessing-index-file-with-python">Appendix 3: Accessing Index File with Python</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

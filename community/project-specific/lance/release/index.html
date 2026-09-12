@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Release — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/community/project-specific/lance/release/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab active" href="../../../">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Community
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Community</div>
+    <a href="../../../">Lance Community Governance</a>
+    <a href="../../../maintainers/">Maintainers</a>
+    <a href="../../../pmc/">PMC</a>
+    <a href="../../../communication/">Communication</a>
+    <a href="../../../voting/">Voting</a>
+    <a href="../../../contributing/">Contributing</a>
+    <a href="../../../release/">Release</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Project Specific Guidelines</div>
+    <a href="../../">Project Specific Guidelines</a>
+    <a href="../../namespace/">Lance Namespace</a>
+    <a href="../../namespace-impls/">Lance Namespace Impls</a>
+    <a href="../../ray/">Lance Ray</a>
+    <a href="../../spark/">Lance Spark</a>
+    <a href="../../trino/">Lance Trino</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance</div>
+    <a href="../general/">General</a>
+    <a class="active" href="./">Release</a>
+    <a href="../rust/">Rust</a>
+    <a href="../python/">Python</a>
+    <a href="../docs/">Docs</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Community</span>
+        <span>/</span><span>Project Specific Guidelines</span>
+        <span>/</span><span>Lance</span>
+        <span>/</span><b>Release</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="release-process">Release Process<a class="headerlink" href="#release-process" title="Permanent link">&para;</a></h1>
+<p>Lance maintains a linear commit history with a controlled release process.</p>
+<ul>
+<li>All pull requests are merged into the <code>main</code> branch first.</li>
+<li>Beta releases (or preview releases) are created on-demand from the <code>main</code> branch.</li>
+<li>Stable releases (non-prereleases) are created only after a voting process and come from a release branch <code>release/vX.Y</code>. These are typically created once every two weeks.</li>
+<li>Release Candidates (RC) are created from release branches prior to voting.</li>
+<li>Minor releases can be cut from either main branch or an existing release branch (when main is targeting a major release).</li>
+<li>Patch releases are created by committing fixes directly to the release branch, voting on a new RC, and releasing.</li>
+<li>All changes (features, fixes) must be committed to main first, then cherry-picked to release branches as needed.</li>
+</ul>
+<pre class="mermaid"><code>gitGraph
+    commit
+    branch feature
+    checkout feature
+    commit
+    checkout main
+    merge feature
+    branch bugfix
+    checkout bugfix
+    commit id: "bugfix"
+    checkout main
+    branch "release/v1.4"
+    checkout "release/v1.4"
+    commit tag: "1.4.0-rc.1"
+    commit tag: "1.4.0"
+    checkout main
+    merge bugfix
+    commit id: "merged"
+    checkout "release/v1.4"
+    cherry-pick id: "merged"
+    commit tag: "1.4.1-rc.1"
+    commit tag: "1.4.1"
+    checkout main
+    commit tag: "2.0.0-beta.1" id: "breaking"
+    checkout "release/v1.4"
+    cherry-pick id: "breaking" tag: "1.5.0-rc.1"
+    branch "release/v1.5"
+    checkout "release/v1.5"
+    commit tag: "1.5.0"
+</code></pre>
+<h2 id="version-semantics">Version Semantics<a class="headerlink" href="#version-semantics" title="Permanent link">&para;</a></h2>
+<p>Lance uses version numbers inspired by semantic versioning, but with flexibility for practical release management. Specifically, minor releases can be cut from existing release branches when the main branch is targeting a major release.</p>
+<h3 id="version-format">Version Format<a class="headerlink" href="#version-format" title="Permanent link">&para;</a></h3>
+<p>Lance uses version numbers with prerelease identifiers:
+- <strong>Stable</strong>: <code>X.Y.Z</code> (e.g., <code>1.3.0</code>)
+- <strong>Beta</strong>: <code>X.Y.Z-beta.N</code> (e.g., <code>1.3.0-beta.1</code>, <code>1.3.0-beta.2</code>)
+- <strong>RC</strong>: <code>X.Y.Z-rc.N</code> (e.g., <code>1.3.0-rc.1</code>, <code>1.3.0-rc.2</code>)</p>
+<h3 id="beta-version-states">Beta Version States<a class="headerlink" href="#beta-version-states" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>beta.0</strong>: Unreleased version (exists on branch but not published)</li>
+<li>Created after cutting an RC to mark the next unreleased version</li>
+<li>Indicates no preview has been published yet</li>
+<li><strong>beta.1+</strong>: Published preview releases</li>
+<li>Created when publishing beta preview artifacts</li>
+</ul>
+<h3 id="publishing-channels">Publishing Channels<a class="headerlink" href="#publishing-channels" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Language</th>
+<th>Stable release</th>
+<th>RC release</th>
+<th>Beta release</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Rust</strong></td>
+<td>crates.io</td>
+<td>Not published (use git tag)</td>
+<td>Not published (use git tag)</td>
+</tr>
+<tr>
+<td><strong>Python</strong></td>
+<td>PyPI</td>
+<td>fury.io</td>
+<td>fury.io</td>
+</tr>
+<tr>
+<td><strong>Java</strong></td>
+<td>Maven Central</td>
+<td>Maven Central</td>
+<td>Maven Central</td>
+</tr>
+<tr>
+<td><strong>Protobuf</strong></td>
+<td>Buf Schema Registry</td>
+<td>Buf Schema Registry</td>
+<td>Buf Schema Registry</td>
+</tr>
+</tbody>
+</table>
+<h3 id="github-releases-and-release-notes">GitHub Releases and Release Notes<a class="headerlink" href="#github-releases-and-release-notes" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Release Type</th>
+<th>GitHub Release Type</th>
+<th>Start Commit (exclusive)</th>
+<th>End Commit (inclusive)</th>
+<th>Explanation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Stable (Major/Minor from main)</strong></td>
+<td>Release</td>
+<td><code>release-root/X.Y.0-beta.N</code></td>
+<td><code>vX.Y.0</code></td>
+<td>All changes from main + RC fixes</td>
+</tr>
+<tr>
+<td><strong>Stable (Minor from release)</strong></td>
+<td>Release</td>
+<td><code>vX.(Y-1).Z</code> (last stable)</td>
+<td><code>vX.Y.0</code></td>
+<td>Changes since last stable on source release branch</td>
+</tr>
+<tr>
+<td><strong>Stable (Patch)</strong></td>
+<td>Release</td>
+<td><code>vX.Y.(Z-1)</code></td>
+<td><code>vX.Y.Z</code></td>
+<td>Only changes in this patch release</td>
+</tr>
+<tr>
+<td><strong>RC (Major/Minor from main)</strong></td>
+<td>Pre-Release</td>
+<td><code>release-root/X.Y.0-beta.N</code></td>
+<td><code>vX.Y.0-rc.N</code></td>
+<td>All changes for the release</td>
+</tr>
+<tr>
+<td><strong>RC (Minor from release)</strong></td>
+<td>Pre-Release</td>
+<td><code>vX.(Y-1).Z</code> (last stable)</td>
+<td><code>vX.Y.0-rc.N</code></td>
+<td>Changes since last stable on source release branch</td>
+</tr>
+<tr>
+<td><strong>RC (Patch)</strong></td>
+<td>Pre-Release</td>
+<td><code>vX.Y.(Z-1)</code></td>
+<td><code>vX.Y.Z-rc.N</code></td>
+<td>Only changes in this patch release</td>
+</tr>
+<tr>
+<td><strong>RC (Iterations)</strong></td>
+<td>Pre-Release</td>
+<td>Same as initial RC</td>
+<td><code>vX.Y.Z-rc.N</code></td>
+<td>Same comparison as initial RC (not against previous RC)</td>
+</tr>
+<tr>
+<td><strong>Beta (Main branch)</strong></td>
+<td>Pre-Release</td>
+<td><code>release-root/X.Y.Z-beta.N</code></td>
+<td><code>vX.Y.Z-beta.N</code></td>
+<td>Changes since last stable release RC cut in main branch</td>
+</tr>
+<tr>
+<td><strong>Beta (Release branch)</strong></td>
+<td>Pre-Release</td>
+<td><code>vX.Y.(Z-1)</code></td>
+<td><code>vX.Y.Z-beta.N</code></td>
+<td>Changes since last stable release</td>
+</tr>
+</tbody>
+</table>
+<h2 id="branching-strategy">Branching Strategy<a class="headerlink" href="#branching-strategy" title="Permanent link">&para;</a></h2>
+<h3 id="main-branch">Main Branch<a class="headerlink" href="#main-branch" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Always contains the latest development work</li>
+<li>Version format: <code>X.Y.Z-beta.N</code></li>
+<li>After RC creation, bumped to next minor version with <code>-beta.0</code> (unreleased)</li>
+<li>Beta previews published by bumping to <code>-beta.1+</code></li>
+</ul>
+<h3 id="release-branches">Release Branches<a class="headerlink" href="#release-branches" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Format: <code>release/v{major}.{minor}</code> (e.g., <code>release/v1.3</code>)</li>
+<li>Created when cutting initial RC for major/minor release</li>
+<li>Can be created from:<ul>
+<li><strong>Main branch</strong>: Standard flow for major/minor releases</li>
+<li><strong>Existing release branch</strong>: For minor releases when main is targeting a major release</li>
+</ul>
+</li>
+<li>Maintained for patch releases</li>
+<li>Version progression: <code>rc.1</code> → <code>rc.2</code> → stable → <code>beta.0</code> → <code>rc.1</code> (for patches)</li>
+</ul>
+<h3 id="commit-flow">Commit Flow<a class="headerlink" href="#commit-flow" title="Permanent link">&para;</a></h3>
+<p>All changes must be committed to the main branch first:</p>
+<ol>
+<li><strong>Features and fixes</strong>: Merge PR to main</li>
+<li><strong>Release branch needs</strong>: Cherry-pick from main to release branch</li>
+<li><strong>Never commit directly to release branch</strong> without the change existing in main first</li>
+</ol>
+<p>This ensures main always has the complete history and release branches only contain subsets of main's changes.</p>
+<h2 id="version-flow">Version Flow<a class="headerlink" href="#version-flow" title="Permanent link">&para;</a></h2>
+<h3 id="standard-flow-majorminor-from-main">Standard Flow (Major/Minor from Main)<a class="headerlink" href="#standard-flow-majorminor-from-main" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>%%{init: {'theme':'base', 'themeVariables': { 'fontSize':'14px'}}}%%
+flowchart LR
+    subgraph main["Main Branch"]
+        direction LR
+        M0["1.3.0-beta.2&lt;br/&gt;📍 release-root/1.4.0-beta.N&lt;br/&gt;📍 release-root/2.0.0-beta.N"] --&gt; M1["1.4.0-beta.0"]
+        M1 --&gt; M2["1.4.0-beta.1&lt;br/&gt;🏷️ v1.4.0-beta.1"]
+        M2 --&gt; M3["2.0.0-beta.1&lt;br/&gt;🏷️ v2.0.0-beta.1"]
+    end
+
+    subgraph release["Release Branch: release/v1.3"]
+        direction LR
+        R1["1.3.0-rc.1&lt;br/&gt;🏷️ v1.3.0-rc.1"] --&gt; R2["1.3.0&lt;br/&gt;🏷️ v1.3.0"]
+        R2 --&gt; R3["1.3.1-beta.0"]
+        R3 --&gt; R4["1.3.1-rc.1&lt;br/&gt;🏷️ v1.3.1-rc.1"]
+        R4 --&gt; R5["1.3.1&lt;br/&gt;🏷️ v1.3.1"]
+        R5 --&gt; R6["1.3.2-beta.0"]
+    end
+
+    M0 -.-&gt;|"create RC&lt;br/&gt;(no breaking changes)"| R1</code></pre>
+<p><strong>Flow explanation:</strong></p>
+<ul>
+<li><strong>Main branch</strong>: Commit M0 at <code>1.3.0-beta.2</code> has <code>release-root/1.4.0-beta.N</code> (created when cutting v1.3.0-rc.1, pointing to this commit) and <code>release-root/2.0.0-beta.N</code> (created when breaking changes bumped major version, pointing to same commit) → M1 bumps to <code>1.4.0-beta.0</code> (unreleased) → M2 publishes <code>1.4.0-beta.1</code> (preview, tagged) → M3 publishes <code>2.0.0-beta.1</code> after detecting breaking changes (tagged)</li>
+<li><strong>Release branch</strong> <code>release/v1.3</code> created from M0, starts at <code>1.3.0-rc.1</code> (tagged) → <code>1.3.0</code> (stable, tagged) → <code>1.3.1-beta.0</code> → <code>1.3.1-rc.1</code> (tagged) → <code>1.3.1</code> (stable, tagged) → <code>1.3.2-beta.0</code></li>
+<li><strong>Tags</strong>: 🏷️ = version tag (points to tagged commit), 📍 = release-root tag (points to commit before RC was created, used for breaking change detection)</li>
+<li><strong>Breaking changes</strong>: Both <code>release-root/1.4.0-beta.N</code> and <code>release-root/2.0.0-beta.N</code> point to M0 (same commit), showing that 2.0.0 is a major version bump from the 1.3.0-rc.1 baseline</li>
+</ul>
+<p><strong>Note</strong>: All commits are linear on their respective branches. <code>beta.0</code> = unreleased, <code>beta.1+</code> = published previews.</p>
+<h3 id="minor-release-from-release-branch-when-main-is-major">Minor Release from Release Branch (When Main is Major)<a class="headerlink" href="#minor-release-from-release-branch-when-main-is-major" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>%%{init: {'theme':'base', 'themeVariables': { 'fontSize':'14px'}}}%%
+flowchart LR
+    subgraph main["Main Branch (at 2.0.0)"]
+        direction LR
+        M1["2.0.0-beta.0"] --&gt; M2["2.0.0-beta.1&lt;br/&gt;🏷️ v2.0.0-beta.1"]
+    end
+
+    subgraph release13["Release Branch: release/v1.3"]
+        direction LR
+        R1["1.3.0&lt;br/&gt;🏷️ v1.3.0"] --&gt; R2["1.3.1-beta.0"]
+        R2 --&gt; R3["1.3.1&lt;br/&gt;🏷️ v1.3.1"]
+    end
+
+    subgraph release14["Release Branch: release/v1.4"]
+        direction LR
+        S1["1.4.0-rc.1&lt;br/&gt;🏷️ v1.4.0-rc.1"] --&gt; S2["1.4.0&lt;br/&gt;🏷️ v1.4.0"]
+        S2 --&gt; S3["1.4.1-beta.0"]
+    end
+
+    R3 -.-&gt;|"create minor release&lt;br/&gt;(main is at 2.x)"| S1</code></pre>
+<p><strong>Flow explanation:</strong></p>
+<ul>
+<li><strong>Main branch</strong> is at <code>2.0.0-beta.N</code> (major version)</li>
+<li><strong>release/v1.3</strong> has released <code>1.3.1</code> and needs a new minor release with features</li>
+<li><strong>release/v1.4</strong> is created from <code>release/v1.3</code> (not from main) because main is at a different major version</li>
+<li>Release notes for <code>v1.4.0</code> compare against <code>v1.3.1</code> (latest stable on source branch)</li>
+<li>Main branch is NOT modified (already at 2.x)</li>
+</ul>
+<h2 id="workflows">Workflows<a class="headerlink" href="#workflows" title="Permanent link">&para;</a></h2>
+<h3 id="user-facing-workflows">User-Facing Workflows<a class="headerlink" href="#user-facing-workflows" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>publish-beta.yml</strong> - Publish beta preview releases from any branch</li>
+<li><strong>create-release-branch.yml</strong> - Create release branch with initial RC for new major/minor version<ul>
+<li>From main: Standard flow for major/minor releases</li>
+<li>From release branch: For minor releases when main is targeting a major release</li>
+</ul>
+</li>
+<li><strong>create-rc.yml</strong> - Create RC on existing release branch (for new patch release RC or iterations of an existing RC)</li>
+<li><strong>approve-rc.yml</strong> - Approve any RC to stable (works for all release types)</li>
+</ol>
+<h2 id="create-a-beta-preview-release">Create a Beta / Preview Release<a class="headerlink" href="#create-a-beta-preview-release" title="Permanent link">&para;</a></h2>
+<p><strong>Purpose</strong>: Publish preview releases for testing before creating release candidates.</p>
+<p><strong>Steps</strong>:
+1. Trigger <strong>"Publish Beta"</strong> workflow
+2. Set <strong>branch</strong>: <code>main</code> (or any release branch)
+3. Set <strong>dry_run</strong>: <code>true</code> (test first)
+4. Review results, then run with <strong>dry_run</strong>: <code>false</code></p>
+<p><strong>Result</strong>: Creates a beta tag (e.g., <code>v1.4.0-beta.1</code>) and publishes preview artifacts to fury.io, Maven Central, and Buf Schema Registry.</p>
+<p><strong>Release Notes</strong>: For the first beta (beta.1), release notes include all changes since the release-root tag. For subsequent betas (beta.2+), release notes only include incremental changes since the previous beta.</p>
+<details>
+<summary>How beta versioning works</summary>
+
+**For main branch**: Automatically checks for breaking changes and bumps version:
+- **No breaking changes**: Increments beta (e.g., `1.4.0-beta.0` → `1.4.0-beta.1`)
+- **Breaking changes found**: Bumps major and resets beta (e.g., `1.4.0-beta.1` → `2.0.0-beta.1`)
+- **Already bumped**: Just increments beta (e.g., `2.0.0-beta.1` → `2.0.0-beta.2`)
+
+**For release branches**: Bumps beta number (`beta.N` → `beta.N+1`)
+
+**Use cases**:
+- Testing features before RC
+- Regular preview releases for early adopters
+- Automatic breaking change detection
+</details>
+
+<h2 id="breaking-change-detection">Breaking Change Detection<a class="headerlink" href="#breaking-change-detection" title="Permanent link">&para;</a></h2>
+<p><strong>How it works</strong>: Mark PRs with the <code>breaking-change</code> label in GitHub. The workflow automatically detects these and bumps the major version when publishing beta releases from main.</p>
+<p><strong>What counts as breaking</strong>:
+- Upgrading pinned dependencies in public API (DataFusion, Arrow)
+- Changing signatures of public functions/methods
+- Removing public functions/methods
+- Changing public data structures
+- <strong>Exception</strong>: Experimental APIs (marked as such in docs) are not considered breaking</p>
+<details>
+<summary>Technical details: Release root tags and version bumping</summary>
+
+### Release Root Tag
+
+Release root tags mark the base commits for breaking change detection. The tag naming reflects the **beta version series on main**, while the tag points to the **RC commit being compared against**.
+
+**Tag Format**: `release-root/{major}.{minor}.{patch}-beta.N`
+- The tag name indicates which beta version series uses this base
+- The tag points to the commit on main branch before the RC was created (the comparison base)
+- The tag message stores the base RC version (e.g., "Base: 1.3.0-rc.1") - this is what we compare against to detect major version bumps
+- The base RC version in the message stays constant even when multiple release-root tags point to the same commit
+
+**When created**:
+1. **When creating a major/minor RC**: After bumping main to the next version
+   - Example: After cutting v1.3.0-rc.1, create `release-root/1.4.0-beta.N` pointing to the commit before the RC branch was created
+2. **When breaking changes bump major version**: When major version is bumped during beta publish
+   - Example: When bumping 1.4.0-beta.5 → 2.0.0-beta.1, create `release-root/2.0.0-beta.N` pointing to the SAME commit with the SAME base RC version
+
+**Key properties**:
+
+- **Multiple tags, same commit**: `release-root/1.4.0-beta.N` and `release-root/2.0.0-beta.N` point to the same commit on main (the commit before the RC branch was created)
+- **Major version bumped once**: Both tags store same base RC version (1.3.0-rc.1), so we know 2.x is already a major bump from 1.3.0
+- **No additional bumps**: When at 2.0.0-beta.1, we detect breaking changes but see major already bumped (2 > 1), so just increment beta
+- **Beta reset on major bump**: When bumping major version, beta number resets to 1 (e.g., 1.4.0-beta.5 → 2.0.0-beta.1)
+
+### Minor Release Root Tag
+
+When a minor release is created from an existing release branch (not from main), a `minor-release-root` tag is created to track the comparison base for release notes.
+
+**Tag Format**: `minor-release-root/{major}.{minor}.0`
+
+- Created when using `create-release-branch` workflow with `source_release_branch` parameter
+- Tag message contains the source stable tag (e.g., `v1.3.1`)
+- Used by `determine_previous_tag` to find the correct comparison base
+
+**Example**: When creating `release/v1.4` from `release/v1.3` (where latest stable is v1.3.1):
+
+- Creates `minor-release-root/1.4.0` with message `v1.3.1`
+- Release notes for v1.4.0-rc.N and v1.4.0 will compare against v1.3.1
+
+### Detection Process
+
+Breaking change detection happens **on every beta publish from main branch**:
+
+1. **Find release-root tag**: Look for `release-root/{current_version}-beta.N`
+   - If NOT found → Bump minor only (no comparison base exists, skip breaking change detection)
+2. **Extract base RC version**: Read from tag message (e.g., "Base: 1.3.0-rc.1" → base major is `1`)
+3. **Compare**: Check for breaking changes since the commit pointed to by the release-root tag
+4. **Determine action**:
+   - If breaking changes AND current_major == base_major → bump to next major
+   - If breaking changes AND current_major > base_major → no bump (already bumped)
+   - If no breaking changes → no major bump
+
+### Examples
+
+Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-beta.N` (Base: 1.3.0-rc.1):
+- `1.4.0-beta.0` + no breaking → `1.4.0-beta.1`
+- `1.4.0-beta.1` + breaking → `2.0.0-beta.1`
+  - Creates `release-root/2.0.0-beta.N` pointing to same commit, message still "Base: 1.3.0-rc.1"
+  - Base major from tag message is 1, current major is 1, so bump to 2
+- `2.0.0-beta.1` + breaking → `2.0.0-beta.2`
+  - Base major is 1, current major is 2 (already bumped), so just increment beta
+- `2.0.0-beta.2` + no breaking → `2.0.0-beta.3`
+
+**Key insight**: Multiple beta version series can share the same release-root commit, with major version bumped only once when first detected.
+</details>
+
+<h2 id="create-a-major-minor-release-from-main">Create a Major / Minor Release (from Main)<a class="headerlink" href="#create-a-major-minor-release-from-main" title="Permanent link">&para;</a></h2>
+<p><strong>Purpose</strong>: Create a new major or minor release from the main branch.</p>
+<p><strong>Steps</strong>:</p>
+<ol>
+<li>Ensure CI on main is green</li>
+<li>Trigger <strong>"Create Release Branch"</strong> workflow with <strong>dry_run</strong>: <code>true</code></li>
+<li>Review the RC version and changes</li>
+<li>Run with <strong>dry_run</strong>: <code>false</code> to create release branch and RC</li>
+<li>Test RC artifacts (published to fury.io, Maven Central)</li>
+<li>Vote in the GitHub Discussion thread (created automatically)</li>
+<li><strong>If issues found</strong>: Fix on release branch, run <strong>"Create RC"</strong> workflow to create <code>rc.2</code>, <code>rc.3</code>, etc.</li>
+<li><strong>If approved</strong>: Trigger <strong>"Approve RC"</strong> workflow with <strong>rc_tag</strong> (e.g., <code>v1.3.0-rc.2</code>)</li>
+</ol>
+<p><strong>Result</strong>:</p>
+<ul>
+<li>Creates release branch (e.g., <code>release/v1.3</code>) with RC tag (e.g., <code>v1.3.0-rc.1</code>)</li>
+<li>Bumps main to next minor (e.g., <code>1.4.0-beta.0</code>)</li>
+<li>After approval: Creates stable tag (e.g., <code>v1.3.0</code>) and publishes to PyPI, crates.io, Maven Central</li>
+</ul>
+<details>
+<summary>What happens under the hood</summary>
+
+**Create Release Branch workflow**:
+
+- Reads current version from main (e.g., `1.3.0-beta.2`)
+- Checks for breaking changes since release-root tag
+- If breaking changes: Creates RC with bumped major (e.g., `2.0.0-rc.1`), bumps main to `2.1.0-beta.0`
+- If no breaking changes: Creates RC with current version (e.g., `1.3.0-rc.1`), bumps main to `1.4.0-beta.0`
+- Creates `release/v{major}.{minor}` branch from main HEAD
+- Creates GitHub Discussion for voting
+
+**Approve RC workflow**:
+
+- Bumps version from `rc.N` to stable
+- Generates release notes comparing against `release-root/{version}-beta.N` tag
+- Creates GitHub Release and publishes stable artifacts
+- Auto-bumps release branch to next patch `beta.0` (e.g., `1.3.0` → `1.3.1-beta.0`)
+- Main branch is NOT affected (already bumped in step 1)
+</details>
+
+<h2 id="create-a-minor-release-from-release-branch">Create a Minor Release (from Release Branch)<a class="headerlink" href="#create-a-minor-release-from-release-branch" title="Permanent link">&para;</a></h2>
+<p><strong>Purpose</strong>: Create a new minor release from an existing release branch when main is targeting a major release.</p>
+<p><strong>When to use</strong>: When main branch has breaking changes and is targeting a major version (e.g., <code>2.0.0</code>), but you need to release new features for users who aren't ready to upgrade to the new major version.</p>
+<p><strong>Prerequisites</strong>:</p>
+<ul>
+<li>Main branch must be at a major version (e.g., <code>2.0.0-beta.N</code> where patch = 0 and minor = 0)</li>
+<li>Source release branch must exist (e.g., <code>release/v1.3</code>)</li>
+<li>Features to release must already be committed to main, then cherry-picked to the source release branch</li>
+</ul>
+<p><strong>Steps</strong>:</p>
+<ol>
+<li>Cherry-pick desired features from main to the source release branch</li>
+<li>Trigger <strong>"Create Release Branch"</strong> workflow with:<ul>
+<li><strong>source_release_branch</strong>: e.g., <code>release/v1.3</code></li>
+<li><strong>dry_run</strong>: <code>true</code></li>
+</ul>
+</li>
+<li>Review the minor RC version (e.g., <code>1.4.0-rc.1</code>)</li>
+<li>Run with <strong>dry_run</strong>: <code>false</code> to create new release branch and RC</li>
+<li>Test RC artifacts and vote in the GitHub Discussion</li>
+<li><strong>If issues found</strong>: Fix and run <strong>"Create RC"</strong> workflow</li>
+<li><strong>If approved</strong>: Trigger <strong>"Approve RC"</strong> workflow</li>
+</ol>
+<p><strong>Result</strong>:</p>
+<ul>
+<li>Creates new release branch (e.g., <code>release/v1.4</code>) from source branch</li>
+<li>Creates RC tag (e.g., <code>v1.4.0-rc.1</code>)</li>
+<li>Main branch is NOT modified (already at major version)</li>
+<li>Release notes compare against latest stable on source branch (e.g., <code>v1.3.1</code>)</li>
+<li>After approval: Creates stable tag and publishes artifacts</li>
+</ul>
+<details>
+<summary>What happens under the hood</summary>
+
+**Create Release Branch workflow (with source_release_branch)**:
+
+- Validates main is at major version (`X.0.0-beta.N` where patch = 0)
+- Checks out source release branch (e.g., `release/v1.3`)
+- Reads current version from source branch
+- Increments minor version (e.g., `1.3.1-beta.0` → `1.4.0-rc.1`)
+- Creates new release branch (e.g., `release/v1.4`) from source branch HEAD
+- Finds latest stable tag on source branch for release notes comparison
+- Does NOT modify main branch
+- Creates GitHub Discussion for voting
+
+**Key differences from main branch flow**:
+
+- No breaking change detection (assumes features are already validated)
+- No release-root tag created (not needed for this flow)
+- Main branch version unchanged
+- Release notes compare against source branch's latest stable release
+</details>
+
+<h2 id="create-a-patch-bugfix-release">Create a Patch / Bugfix Release<a class="headerlink" href="#create-a-patch-bugfix-release" title="Permanent link">&para;</a></h2>
+<p><strong>Purpose</strong>: Release critical bug fixes for an existing release.</p>
+<p><strong>Steps</strong>:</p>
+<ol>
+<li>Commit the fix to main branch first (all changes must go to main first)</li>
+<li>Cherry-pick the fix to the release branch (e.g., <code>release/v1.3</code>)</li>
+<li>Trigger <strong>"Create RC"</strong> workflow with <strong>release_branch</strong> (e.g., <code>release/v1.3</code>) and <strong>dry_run</strong>: <code>true</code></li>
+<li>Review the patch RC version</li>
+<li>Run with <strong>dry_run</strong>: <code>false</code> to create the patch RC</li>
+<li>Test RC artifacts and vote in the GitHub Discussion</li>
+<li><strong>If issues found</strong>: Fix and run <strong>"Create RC"</strong> again to create <code>rc.2</code>, <code>rc.3</code>, etc.</li>
+<li><strong>If approved</strong>: Trigger <strong>"Approve RC"</strong> workflow with <strong>rc_tag</strong> (e.g., <code>v1.3.1-rc.1</code>)</li>
+</ol>
+<p><strong>Result</strong>:</p>
+<ul>
+<li>Creates patch RC tag (e.g., <code>v1.3.1-rc.1</code>) on release branch</li>
+<li>After approval: Creates stable tag (e.g., <code>v1.3.1</code>) and publishes to PyPI, crates.io, Maven Central</li>
+<li>Auto-bumps release branch to next patch <code>beta.0</code> (e.g., <code>1.3.2-beta.0</code>)</li>
+<li>Main branch is NOT affected</li>
+</ul>
+<details>
+<summary>Important notes</summary>
+
+- **Commit to main first**: All fixes must be committed to main before cherry-picking to release branches
+- **Breaking changes not allowed**: Patch releases should not introduce breaking changes
+- **Beta versions**: Release branches stay at `X.Y.Z-beta.N` between releases (auto-bumped after stable)
+- **Release notes**: Compares against previous stable tag (e.g., `v1.3.0`)
+- **Allowed changes**: Correctness bugs, security fixes, major performance regressions, unintentional breaking change reverts
+</details>
+
+<h2 id="example-workflows">Example Workflows<a class="headerlink" href="#example-workflows" title="Permanent link">&para;</a></h2>
+<h3 id="beta-preview-release">Beta Preview Release<a class="headerlink" href="#beta-preview-release" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># 1. Main at 1.4.0-beta.0 (unreleased after RC cut for v1.3.0)</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="c1"># 2. Want to publish preview for testing</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span>Result:
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span>detected
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.4.0-beta.1
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.4.0-beta.1
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>to<span class="w"> </span>v1.4.0-beta.1
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts<span class="w"> </span>to<span class="w"> </span>fury.io
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="c1"># 3. More changes, publish again (with breaking changes)</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span>Result:
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">    </span>-<span class="w"> </span>Breaking<span class="w"> </span>changes<span class="w"> </span>detected,<span class="w"> </span>current<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span>base<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>to<span class="w"> </span><span class="m">2</span>.0.0-beta.1<span class="w"> </span><span class="o">(</span>beta<span class="w"> </span>resets<span class="w"> </span>on<span class="w"> </span>major<span class="w"> </span>bump<span class="o">)</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>→<span class="w"> </span>same<span class="w"> </span>commit,<span class="w"> </span>message<span class="w"> </span><span class="s2">"Base: 1.3.0-rc.1"</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v2.0.0-beta.1
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>to<span class="w"> </span>v2.0.0-beta.1
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts<span class="w"> </span>to<span class="w"> </span>fury.io
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="c1"># 4. More changes, publish again (still has breaking changes)</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="w">  </span>Result:
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="w">    </span>-<span class="w"> </span>Breaking<span class="w"> </span>changes<span class="w"> </span>detected,<span class="w"> </span>but<span class="w"> </span>current<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">2</span><span class="o">)</span><span class="w"> </span>&gt;<span class="w"> </span>base<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>major<span class="w"> </span>bump<span class="w"> </span>needed<span class="w"> </span><span class="o">(</span>already<span class="w"> </span>bumped<span class="o">)</span>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>to<span class="w"> </span><span class="m">2</span>.0.0-beta.2
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v2.0.0-beta.2
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>to<span class="w"> </span>v2.0.0-beta.2
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts<span class="w"> </span>to<span class="w"> </span>fury.io
+</span></code></pre></div>
+<h3 id="standard-majorminor-release">Standard Major/Minor Release<a class="headerlink" href="#standard-majorminor-release" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># 1. Main is at 1.3.0-beta.2</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="c1"># 2. Create release branch (version auto-determined from main)</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>Workflow:<span class="w"> </span>Create<span class="w"> </span>Release<span class="w"> </span>Branch
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>Result:
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span>-<span class="w"> </span>Checks<span class="w"> </span><span class="k">for</span><span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span>since<span class="w"> </span>release-root/1.3.0-beta.N
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span>detected
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>release/v1.3<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.3.0-rc.1
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.0-rc.1
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/1.3.0-beta.N<span class="w"> </span>to<span class="w"> </span>v1.3.0-rc.1
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>main<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.4.0-beta.0<span class="w"> </span><span class="o">(</span>unreleased<span class="o">)</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>→<span class="w"> </span>points<span class="w"> </span>to<span class="w"> </span>commit<span class="w"> </span>before<span class="w"> </span>RC<span class="w"> </span>branch,<span class="w"> </span>message<span class="w"> </span><span class="s2">"Base: 1.3.0-rc.1"</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">    </span>-<span class="w"> </span>GitHub<span class="w"> </span>Discussion<span class="w"> </span>created
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="c1"># 3. Vote on RC</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">  </span>-<span class="w"> </span>Navigate<span class="w"> </span>to<span class="w"> </span>Discussion<span class="w"> </span>thread
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">  </span>-<span class="w"> </span>Test<span class="w"> </span>RC<span class="w"> </span>artifacts
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">  </span>-<span class="w"> </span>Vote<span class="w"> </span>with<span class="w"> </span>+1,<span class="w"> </span><span class="m">0</span>,<span class="w"> </span>-1
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="c1"># 4. Approve RC</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>Workflow:<span class="w"> </span>Approve<span class="w"> </span>RC
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="w">  </span>rc_tag:<span class="w"> </span>v1.3.0-rc.1
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="w">  </span>Result:
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="w">    </span>-<span class="w"> </span>release/v1.3<span class="w"> </span>@<span class="w"> </span><span class="m">1</span>.3.0<span class="w"> </span><span class="o">(</span>stable<span class="o">)</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.0
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="w">    </span>-<span class="w"> </span>Generated<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>comparing<span class="w"> </span>v1.3.0<span class="w"> </span>vs<span class="w"> </span>release-root/1.3.0-beta.N
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Release<span class="w"> </span><span class="o">(</span>not<span class="w"> </span>pre-release<span class="o">)</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="w">    </span>-<span class="w"> </span>Stable<span class="w"> </span>artifacts<span class="w"> </span>published
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a><span class="w">    </span>-<span class="w"> </span>Release<span class="w"> </span>branch<span class="w"> </span>auto-bumped<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.3.1-beta.0
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>unchanged<span class="w"> </span><span class="o">(</span>already<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.4.0-beta.0<span class="o">)</span>
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a>
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a><span class="c1"># 5. Later: Publish first beta after RC (no breaking changes)</span>
+</span><span id="__span-1-32"><a id="__codelineno-1-32" name="__codelineno-1-32" href="#__codelineno-1-32"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-1-33"><a id="__codelineno-1-33" name="__codelineno-1-33" href="#__codelineno-1-33"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-1-34"><a id="__codelineno-1-34" name="__codelineno-1-34" href="#__codelineno-1-34"></a><span class="w">  </span>Result:
+</span><span id="__span-1-35"><a id="__codelineno-1-35" name="__codelineno-1-35" href="#__codelineno-1-35"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-1-36"><a id="__codelineno-1-36" name="__codelineno-1-36" href="#__codelineno-1-36"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-1-37"><a id="__codelineno-1-37" name="__codelineno-1-37" href="#__codelineno-1-37"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span>detected
+</span><span id="__span-1-38"><a id="__codelineno-1-38" name="__codelineno-1-38" href="#__codelineno-1-38"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>from<span class="w"> </span><span class="m">1</span>.4.0-beta.0<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.4.0-beta.1
+</span><span id="__span-1-39"><a id="__codelineno-1-39" name="__codelineno-1-39" href="#__codelineno-1-39"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.4.0-beta.1
+</span><span id="__span-1-40"><a id="__codelineno-1-40" name="__codelineno-1-40" href="#__codelineno-1-40"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>to<span class="w"> </span>v1.4.0-beta.1
+</span><span id="__span-1-41"><a id="__codelineno-1-41" name="__codelineno-1-41" href="#__codelineno-1-41"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts<span class="w"> </span>to<span class="w"> </span>fury.io
+</span><span id="__span-1-42"><a id="__codelineno-1-42" name="__codelineno-1-42" href="#__codelineno-1-42"></a>
+</span><span id="__span-1-43"><a id="__codelineno-1-43" name="__codelineno-1-43" href="#__codelineno-1-43"></a><span class="c1"># 6. More changes, publish second beta (breaking changes introduced!)</span>
+</span><span id="__span-1-44"><a id="__codelineno-1-44" name="__codelineno-1-44" href="#__codelineno-1-44"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-1-45"><a id="__codelineno-1-45" name="__codelineno-1-45" href="#__codelineno-1-45"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-1-46"><a id="__codelineno-1-46" name="__codelineno-1-46" href="#__codelineno-1-46"></a><span class="w">  </span>Result:
+</span><span id="__span-1-47"><a id="__codelineno-1-47" name="__codelineno-1-47" href="#__codelineno-1-47"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/1.4.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-1-48"><a id="__codelineno-1-48" name="__codelineno-1-48" href="#__codelineno-1-48"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-1-49"><a id="__codelineno-1-49" name="__codelineno-1-49" href="#__codelineno-1-49"></a><span class="w">    </span>-<span class="w"> </span>Breaking<span class="w"> </span>changes<span class="w"> </span>detected,<span class="w"> </span>current<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span>base<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span>
+</span><span id="__span-1-50"><a id="__codelineno-1-50" name="__codelineno-1-50" href="#__codelineno-1-50"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>from<span class="w"> </span><span class="m">1</span>.4.0-beta.1<span class="w"> </span>to<span class="w"> </span><span class="m">2</span>.0.0-beta.1<span class="w"> </span><span class="o">(</span>beta<span class="w"> </span>resets<span class="w"> </span>on<span class="w"> </span>major<span class="w"> </span>bump<span class="o">)</span>
+</span><span id="__span-1-51"><a id="__codelineno-1-51" name="__codelineno-1-51" href="#__codelineno-1-51"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>→<span class="w"> </span>same<span class="w"> </span>commit,<span class="w"> </span>message<span class="w"> </span><span class="s2">"Base: 1.3.0-rc.1"</span>
+</span><span id="__span-1-52"><a id="__codelineno-1-52" name="__codelineno-1-52" href="#__codelineno-1-52"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v2.0.0-beta.1
+</span><span id="__span-1-53"><a id="__codelineno-1-53" name="__codelineno-1-53" href="#__codelineno-1-53"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>to<span class="w"> </span>v2.0.0-beta.1
+</span><span id="__span-1-54"><a id="__codelineno-1-54" name="__codelineno-1-54" href="#__codelineno-1-54"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts<span class="w"> </span>to<span class="w"> </span>fury.io
+</span><span id="__span-1-55"><a id="__codelineno-1-55" name="__codelineno-1-55" href="#__codelineno-1-55"></a>
+</span><span id="__span-1-56"><a id="__codelineno-1-56" name="__codelineno-1-56" href="#__codelineno-1-56"></a><span class="c1"># 7. More changes, publish third beta (still has breaking changes)</span>
+</span><span id="__span-1-57"><a id="__codelineno-1-57" name="__codelineno-1-57" href="#__codelineno-1-57"></a>Workflow:<span class="w"> </span>Publish<span class="w"> </span>Beta
+</span><span id="__span-1-58"><a id="__codelineno-1-58" name="__codelineno-1-58" href="#__codelineno-1-58"></a><span class="w">  </span>branch:<span class="w"> </span>main
+</span><span id="__span-1-59"><a id="__codelineno-1-59" name="__codelineno-1-59" href="#__codelineno-1-59"></a><span class="w">  </span>Result:
+</span><span id="__span-1-60"><a id="__codelineno-1-60" name="__codelineno-1-60" href="#__codelineno-1-60"></a><span class="w">    </span>-<span class="w"> </span>Looks<span class="w"> </span><span class="k">for</span><span class="w"> </span>release-root/2.0.0-beta.N<span class="w"> </span>→<span class="w"> </span>found
+</span><span id="__span-1-61"><a id="__codelineno-1-61" name="__codelineno-1-61" href="#__codelineno-1-61"></a><span class="w">    </span>-<span class="w"> </span>Extracts<span class="w"> </span>base:<span class="w"> </span><span class="m">1</span>.3.0-rc.1<span class="w"> </span><span class="o">(</span>major:<span class="w"> </span><span class="m">1</span><span class="o">)</span><span class="w"> </span>from<span class="w"> </span>tag<span class="w"> </span>message
+</span><span id="__span-1-62"><a id="__codelineno-1-62" name="__codelineno-1-62" href="#__codelineno-1-62"></a><span class="w">    </span>-<span class="w"> </span>Breaking<span class="w"> </span>changes<span class="w"> </span>detected,<span class="w"> </span>but<span class="w"> </span>current<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">2</span><span class="o">)</span><span class="w"> </span>&gt;<span class="w"> </span>base<span class="w"> </span>major<span class="w"> </span><span class="o">(</span><span class="m">1</span><span class="o">)</span>
+</span><span id="__span-1-63"><a id="__codelineno-1-63" name="__codelineno-1-63" href="#__codelineno-1-63"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>major<span class="w"> </span>bump<span class="w"> </span>needed<span class="w"> </span><span class="o">(</span>already<span class="w"> </span>bumped<span class="w"> </span>from<span class="w"> </span>base<span class="o">)</span>
+</span><span id="__span-1-64"><a id="__codelineno-1-64" name="__codelineno-1-64" href="#__codelineno-1-64"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>to<span class="w"> </span><span class="m">2</span>.0.0-beta.2
+</span><span id="__span-1-65"><a id="__codelineno-1-65" name="__codelineno-1-65" href="#__codelineno-1-65"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v2.0.0-beta.2
+</span><span id="__span-1-66"><a id="__codelineno-1-66" name="__codelineno-1-66" href="#__codelineno-1-66"></a><span class="w">    </span>-<span class="w"> </span>Published<span class="w"> </span>artifacts
+</span><span id="__span-1-67"><a id="__codelineno-1-67" name="__codelineno-1-67" href="#__codelineno-1-67"></a>
+</span><span id="__span-1-68"><a id="__codelineno-1-68" name="__codelineno-1-68" href="#__codelineno-1-68"></a><span class="c1"># 8. Eventually: Cut RC for v2.0.0</span>
+</span><span id="__span-1-69"><a id="__codelineno-1-69" name="__codelineno-1-69" href="#__codelineno-1-69"></a>Workflow:<span class="w"> </span>Create<span class="w"> </span>Release<span class="w"> </span>Branch
+</span><span id="__span-1-70"><a id="__codelineno-1-70" name="__codelineno-1-70" href="#__codelineno-1-70"></a><span class="w">  </span>Result:
+</span><span id="__span-1-71"><a id="__codelineno-1-71" name="__codelineno-1-71" href="#__codelineno-1-71"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>at<span class="w"> </span><span class="m">2</span>.0.0-beta.2
+</span><span id="__span-1-72"><a id="__codelineno-1-72" name="__codelineno-1-72" href="#__codelineno-1-72"></a><span class="w">    </span>-<span class="w"> </span>Checks<span class="w"> </span><span class="k">for</span><span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span>since<span class="w"> </span>release-root/2.0.0-beta.N
+</span><span id="__span-1-73"><a id="__codelineno-1-73" name="__codelineno-1-73" href="#__codelineno-1-73"></a><span class="w">    </span>-<span class="w"> </span>No<span class="w"> </span>additional<span class="w"> </span>breaking<span class="w"> </span>changes<span class="w"> </span><span class="o">(</span>major<span class="w"> </span>already<span class="w"> </span>bumped<span class="o">)</span>
+</span><span id="__span-1-74"><a id="__codelineno-1-74" name="__codelineno-1-74" href="#__codelineno-1-74"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>release/v2.0<span class="w"> </span>at<span class="w"> </span><span class="m">2</span>.0.0-rc.1
+</span><span id="__span-1-75"><a id="__codelineno-1-75" name="__codelineno-1-75" href="#__codelineno-1-75"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v2.0.0-rc.1
+</span><span id="__span-1-76"><a id="__codelineno-1-76" name="__codelineno-1-76" href="#__codelineno-1-76"></a><span class="w">    </span>-<span class="w"> </span>Bumped<span class="w"> </span>main<span class="w"> </span>to<span class="w"> </span><span class="m">2</span>.1.0-beta.0
+</span><span id="__span-1-77"><a id="__codelineno-1-77" name="__codelineno-1-77" href="#__codelineno-1-77"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>release-root/2.1.0-beta.N<span class="w"> </span>→<span class="w"> </span>points<span class="w"> </span>to<span class="w"> </span>commit<span class="w"> </span>before<span class="w"> </span>RC<span class="w"> </span>branch,<span class="w"> </span>message<span class="w"> </span><span class="s2">"Base: 2.0.0-rc.1"</span>
+</span></code></pre></div>
+<h3 id="patch-release">Patch Release<a class="headerlink" href="#patch-release" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># 1. Start with release/v1.3 @ 1.3.1-beta.0 (auto-bumped after previous stable release)</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="c1"># 2. Critical bug found in 1.3.0</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="c1"># 3. Fix committed to main first, then cherry-picked to release/v1.3</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># 4. Create patch RC</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>Workflow:<span class="w"> </span>Create<span class="w"> </span>RC
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span>release_branch:<span class="w"> </span>release/v1.3
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span>Result:
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">    </span>-<span class="w"> </span>Branch<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.3.1-beta.0
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span><span class="m">1</span>.3.1-rc.1
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.1-rc.1
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>v1.3.0<span class="w"> </span>to<span class="w"> </span>v1.3.1-rc.1
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span>-<span class="w"> </span>GitHub<span class="w"> </span>Discussion<span class="w"> </span>created
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="c1"># 5. Vote passes</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="c1"># 6. Approve patch RC</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>Workflow:<span class="w"> </span>Approve<span class="w"> </span>RC
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">  </span>rc_tag:<span class="w"> </span>v1.3.1-rc.1
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">  </span>Result:
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">    </span>-<span class="w"> </span>release/v1.3<span class="w"> </span>@<span class="w"> </span><span class="m">1</span>.3.1
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.1
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="w">    </span>-<span class="w"> </span>Generated<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>comparing<span class="w"> </span>v1.3.1<span class="w"> </span>vs<span class="w"> </span>v1.3.0
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Release<span class="w"> </span><span class="o">(</span>not<span class="w"> </span>pre-release<span class="o">)</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="w">    </span>-<span class="w"> </span>Stable<span class="w"> </span>artifacts<span class="w"> </span>published
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="w">    </span>-<span class="w"> </span>Auto-bumped<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.3.2-beta.0<span class="w"> </span><span class="o">(</span>ready<span class="w"> </span><span class="k">for</span><span class="w"> </span>next<span class="w"> </span>patch<span class="o">)</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>unchanged
+</span></code></pre></div>
+<h3 id="minor-release-from-release-branch">Minor Release from Release Branch<a class="headerlink" href="#minor-release-from-release-branch" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># Scenario: Main is at 2.0.0-beta.N (major version), need to release v1.4.0 with new features</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="c1"># 1. Main is at 2.0.0-beta.1 (breaking changes introduced)</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1"># 2. release/v1.3 is at 1.3.1-beta.0 (after releasing v1.3.1)</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="c1"># 3. Cherry-pick desired features from main to release/v1.3</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="c1"># 4. Create minor release branch from release/v1.3</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>Workflow:<span class="w"> </span>Create<span class="w"> </span>Release<span class="w"> </span>Branch
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">  </span>source_release_branch:<span class="w"> </span>release/v1.3
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">  </span>Result:
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="w">    </span>-<span class="w"> </span>Validates<span class="w"> </span>main<span class="w"> </span>is<span class="w"> </span>at<span class="w"> </span>major<span class="w"> </span>version<span class="w"> </span><span class="o">(</span><span class="m">2</span>.0.0-beta.1<span class="o">)</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">    </span>-<span class="w"> </span>Source<span class="w"> </span>branch<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.3.1-beta.0
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>release/v1.4<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.4.0-rc.1
+</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.4.0-rc.1
+</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="w">    </span>-<span class="w"> </span>Found<span class="w"> </span>latest<span class="w"> </span>stable:<span class="w"> </span>v1.3.1
+</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>v1.3.1<span class="w"> </span>to<span class="w"> </span>v1.4.0-rc.1
+</span><span id="__span-3-17"><a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>NOT<span class="w"> </span>modified<span class="w"> </span><span class="o">(</span>stays<span class="w"> </span>at<span class="w"> </span><span class="m">2</span>.0.0-beta.1<span class="o">)</span>
+</span><span id="__span-3-18"><a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="w">    </span>-<span class="w"> </span>GitHub<span class="w"> </span>Discussion<span class="w"> </span>created
+</span><span id="__span-3-19"><a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>
+</span><span id="__span-3-20"><a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="c1"># 5. Vote on RC (3-day voting for minor release)</span>
+</span><span id="__span-3-21"><a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="w">  </span>-<span class="w"> </span>Navigate<span class="w"> </span>to<span class="w"> </span>Discussion<span class="w"> </span>thread
+</span><span id="__span-3-22"><a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="w">  </span>-<span class="w"> </span>Test<span class="w"> </span>RC<span class="w"> </span>artifacts
+</span><span id="__span-3-23"><a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a><span class="w">  </span>-<span class="w"> </span>Vote<span class="w"> </span>with<span class="w"> </span>+1,<span class="w"> </span><span class="m">0</span>,<span class="w"> </span>-1
+</span><span id="__span-3-24"><a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a>
+</span><span id="__span-3-25"><a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a><span class="c1"># 6. Approve RC</span>
+</span><span id="__span-3-26"><a id="__codelineno-3-26" name="__codelineno-3-26" href="#__codelineno-3-26"></a>Workflow:<span class="w"> </span>Approve<span class="w"> </span>RC
+</span><span id="__span-3-27"><a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a><span class="w">  </span>rc_tag:<span class="w"> </span>v1.4.0-rc.1
+</span><span id="__span-3-28"><a id="__codelineno-3-28" name="__codelineno-3-28" href="#__codelineno-3-28"></a><span class="w">  </span>Result:
+</span><span id="__span-3-29"><a id="__codelineno-3-29" name="__codelineno-3-29" href="#__codelineno-3-29"></a><span class="w">    </span>-<span class="w"> </span>release/v1.4<span class="w"> </span>@<span class="w"> </span><span class="m">1</span>.4.0
+</span><span id="__span-3-30"><a id="__codelineno-3-30" name="__codelineno-3-30" href="#__codelineno-3-30"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.4.0
+</span><span id="__span-3-31"><a id="__codelineno-3-31" name="__codelineno-3-31" href="#__codelineno-3-31"></a><span class="w">    </span>-<span class="w"> </span>Generated<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>comparing<span class="w"> </span>v1.4.0<span class="w"> </span>vs<span class="w"> </span>v1.3.1
+</span><span id="__span-3-32"><a id="__codelineno-3-32" name="__codelineno-3-32" href="#__codelineno-3-32"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Release<span class="w"> </span><span class="o">(</span>not<span class="w"> </span>pre-release<span class="o">)</span>
+</span><span id="__span-3-33"><a id="__codelineno-3-33" name="__codelineno-3-33" href="#__codelineno-3-33"></a><span class="w">    </span>-<span class="w"> </span>Stable<span class="w"> </span>artifacts<span class="w"> </span>published
+</span><span id="__span-3-34"><a id="__codelineno-3-34" name="__codelineno-3-34" href="#__codelineno-3-34"></a><span class="w">    </span>-<span class="w"> </span>Release<span class="w"> </span>branch<span class="w"> </span>auto-bumped<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.4.1-beta.0
+</span><span id="__span-3-35"><a id="__codelineno-3-35" name="__codelineno-3-35" href="#__codelineno-3-35"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>unchanged<span class="w"> </span><span class="o">(</span>stays<span class="w"> </span>at<span class="w"> </span><span class="m">2</span>.0.0-beta.1<span class="o">)</span>
+</span><span id="__span-3-36"><a id="__codelineno-3-36" name="__codelineno-3-36" href="#__codelineno-3-36"></a>
+</span><span id="__span-3-37"><a id="__codelineno-3-37" name="__codelineno-3-37" href="#__codelineno-3-37"></a><span class="c1"># 7. Future: Can continue with patches on release/v1.4 or create release/v1.5 from it</span>
+</span></code></pre></div>
+<h3 id="rc-iteration-due-to-issues">RC Iteration Due to Issues<a class="headerlink" href="#rc-iteration-due-to-issues" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># 1. Create initial RC</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>RC:<span class="w"> </span>v1.3.0-rc.1<span class="w"> </span>on<span class="w"> </span>release/v1.3
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="c1"># 2. Issue found during testing</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="c1"># 3. Fix committed to release/v1.3 branch</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="c1"># 4. Create new RC</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>Workflow:<span class="w"> </span>Create<span class="w"> </span>RC
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">  </span>release_branch:<span class="w"> </span>release/v1.3
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">  </span>Result:
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">    </span>-<span class="w"> </span>Branch<span class="w"> </span>at<span class="w"> </span><span class="m">1</span>.3.0-rc.1
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="w">    </span>-<span class="w"> </span>Auto-incremented<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.3.0-rc.2
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.0-rc.2
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Pre-Release<span class="w"> </span>with<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>from<span class="w"> </span>release-root/1.3.0-beta.N<span class="w"> </span>to<span class="w"> </span>v1.3.0-rc.2<span class="w"> </span><span class="o">(</span>same<span class="w"> </span>comparison<span class="w"> </span>as<span class="w"> </span>rc.1,<span class="w"> </span>showing<span class="w"> </span>all<span class="w"> </span>changes<span class="o">)</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="w">    </span>-<span class="w"> </span>GitHub<span class="w"> </span>Discussion<span class="w"> </span>created
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="c1"># 5. Vote passes</span>
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="c1"># 6. Approve rc.2</span>
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>Workflow:<span class="w"> </span>Approve<span class="w"> </span>RC
+</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a><span class="w">  </span>rc_tag:<span class="w"> </span>v1.3.0-rc.2
+</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="w">  </span>Result:
+</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a><span class="w">    </span>-<span class="w"> </span>release/v1.3<span class="w"> </span>@<span class="w"> </span><span class="m">1</span>.3.0
+</span><span id="__span-4-22"><a id="__codelineno-4-22" name="__codelineno-4-22" href="#__codelineno-4-22"></a><span class="w">    </span>-<span class="w"> </span>Tagged<span class="w"> </span>v1.3.0
+</span><span id="__span-4-23"><a id="__codelineno-4-23" name="__codelineno-4-23" href="#__codelineno-4-23"></a><span class="w">    </span>-<span class="w"> </span>Generated<span class="w"> </span>release<span class="w"> </span>notes<span class="w"> </span>comparing<span class="w"> </span>v1.3.0<span class="w"> </span>vs<span class="w"> </span>release-root/1.3.0-beta.N<span class="w"> </span><span class="o">(</span>includes<span class="w"> </span>fixes<span class="w"> </span>from<span class="w"> </span>rc.1<span class="w"> </span>and<span class="w"> </span>rc.2<span class="o">)</span>
+</span><span id="__span-4-24"><a id="__codelineno-4-24" name="__codelineno-4-24" href="#__codelineno-4-24"></a><span class="w">    </span>-<span class="w"> </span>Created<span class="w"> </span>GitHub<span class="w"> </span>Release<span class="w"> </span><span class="o">(</span>not<span class="w"> </span>pre-release<span class="o">)</span>
+</span><span id="__span-4-25"><a id="__codelineno-4-25" name="__codelineno-4-25" href="#__codelineno-4-25"></a><span class="w">    </span>-<span class="w"> </span>Stable<span class="w"> </span>artifacts<span class="w"> </span>published
+</span><span id="__span-4-26"><a id="__codelineno-4-26" name="__codelineno-4-26" href="#__codelineno-4-26"></a><span class="w">    </span>-<span class="w"> </span>Release<span class="w"> </span>branch<span class="w"> </span>auto-bumped<span class="w"> </span>to<span class="w"> </span><span class="m">1</span>.3.1-beta.0
+</span><span id="__span-4-27"><a id="__codelineno-4-27" name="__codelineno-4-27" href="#__codelineno-4-27"></a><span class="w">    </span>-<span class="w"> </span>Main<span class="w"> </span>unchanged
+</span></code></pre></div>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../general/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">General</div>
+        </a>
+        <a class="next" href="../rust/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Rust</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#version-semantics">Version Semantics</a>
+      <a class="ld-toc__h3" href="#version-format">Version Format</a>
+      <a class="ld-toc__h3" href="#beta-version-states">Beta Version States</a>
+      <a class="ld-toc__h3" href="#publishing-channels">Publishing Channels</a>
+      <a class="ld-toc__h3" href="#github-releases-and-release-notes">GitHub Releases and Release Notes</a>
+      <a class="ld-toc__h2" href="#branching-strategy">Branching Strategy</a>
+      <a class="ld-toc__h3" href="#main-branch">Main Branch</a>
+      <a class="ld-toc__h3" href="#release-branches">Release Branches</a>
+      <a class="ld-toc__h3" href="#commit-flow">Commit Flow</a>
+      <a class="ld-toc__h2" href="#version-flow">Version Flow</a>
+      <a class="ld-toc__h3" href="#standard-flow-majorminor-from-main">Standard Flow (Major/Minor from Main)</a>
+      <a class="ld-toc__h3" href="#minor-release-from-release-branch-when-main-is-major">Minor Release from Release Branch (When Main is Major)</a>
+      <a class="ld-toc__h2" href="#workflows">Workflows</a>
+      <a class="ld-toc__h3" href="#user-facing-workflows">User-Facing Workflows</a>
+      <a class="ld-toc__h2" href="#create-a-beta-preview-release">Create a Beta / Preview Release</a>
+      <a class="ld-toc__h2" href="#breaking-change-detection">Breaking Change Detection</a>
+      <a class="ld-toc__h2" href="#create-a-major-minor-release-from-main">Create a Major / Minor Release (from Main)</a>
+      <a class="ld-toc__h2" href="#create-a-minor-release-from-release-branch">Create a Minor Release (from Release Branch)</a>
+      <a class="ld-toc__h2" href="#create-a-patch-bugfix-release">Create a Patch / Bugfix Release</a>
+      <a class="ld-toc__h2" href="#example-workflows">Example Workflows</a>
+      <a class="ld-toc__h3" href="#beta-preview-release">Beta Preview Release</a>
+      <a class="ld-toc__h3" href="#standard-majorminor-release">Standard Major/Minor Release</a>
+      <a class="ld-toc__h3" href="#patch-release">Patch Release</a>
+      <a class="ld-toc__h3" href="#minor-release-from-release-branch">Minor Release from Release Branch</a>
+      <a class="ld-toc__h3" href="#rc-iteration-due-to-issues">RC Iteration Due to Issues</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>General — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/community/project-specific/lance/general/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab active" href="../../../">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Community
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Community</div>
+    <a href="../../../">Lance Community Governance</a>
+    <a href="../../../maintainers/">Maintainers</a>
+    <a href="../../../pmc/">PMC</a>
+    <a href="../../../communication/">Communication</a>
+    <a href="../../../voting/">Voting</a>
+    <a href="../../../contributing/">Contributing</a>
+    <a href="../../../release/">Release</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Project Specific Guidelines</div>
+    <a href="../../">Project Specific Guidelines</a>
+    <a href="../../namespace/">Lance Namespace</a>
+    <a href="../../namespace-impls/">Lance Namespace Impls</a>
+    <a href="../../ray/">Lance Ray</a>
+    <a href="../../spark/">Lance Spark</a>
+    <a href="../../trino/">Lance Trino</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance</div>
+    <a class="active" href="./">General</a>
+    <a href="../release/">Release</a>
+    <a href="../rust/">Rust</a>
+    <a href="../python/">Python</a>
+    <a href="../docs/">Docs</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Community</span>
+        <span>/</span><span>Project Specific Guidelines</span>
+        <span>/</span><span>Lance</span>
+        <span>/</span><b>General</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="guide-for-new-contributors">Guide for New Contributors<a class="headerlink" href="#guide-for-new-contributors" title="Permanent link">&para;</a></h1>
+<p>This is a guide for new contributors to the Lance project.
+Even if you have no previous experience with python, rust, and open source, you can still make a non-trivial
+impact by helping us improve documentation, examples, and more.
+For experienced developers, the issues you can work on run the gamut from warm-ups to serious challenges in python and rust.</p>
+<p>If you have any questions, please join our <a href="https://discord.gg/zMM32dvNtd">Discord</a> for real-time support. Your feedback is always welcome!</p>
+<h2 id="getting-started">Getting Started<a class="headerlink" href="#getting-started" title="Permanent link">&para;</a></h2>
+<ol>
+<li>Join our Discord and say hi</li>
+<li>Setup your development environment</li>
+<li>Pick an issue to work on. See <a href="https://github.com/lance-format/lance/contribute">https://github.com/lance-format/lance/contribute</a> for good first issues.</li>
+<li>Have fun!</li>
+</ol>
+<h2 id="development-environment">Development Environment<a class="headerlink" href="#development-environment" title="Permanent link">&para;</a></h2>
+<p>Currently Lance is implemented in Rust and comes with a Python wrapper. So you'll want to make sure you setup both.</p>
+<ol>
+<li>Install Rust: <a href="https://www.rust-lang.org/tools/install">https://www.rust-lang.org/tools/install</a></li>
+<li>Install Python 3.10+: <a href="https://www.python.org/downloads/">https://www.python.org/downloads/</a></li>
+<li>Install protocol buffers: <a href="https://grpc.io/docs/protoc-installation/">https://grpc.io/docs/protoc-installation/</a> (make sure you have version 3.20 or higher)</li>
+<li>Install commit hooks:
+    a. Install pre-commit: <a href="https://pre-commit.com/#install">https://pre-commit.com/#install</a>
+    b. Run <code>pre-commit install</code> in the root of the repo</li>
+</ol>
+<h2 id="building-for-legacy-x86_64-hosts-pre-haswell">Building for legacy x86_64 hosts (pre-Haswell)<a class="headerlink" href="#building-for-legacy-x86_64-hosts-pre-haswell" title="Permanent link">&para;</a></h2>
+<p>The default workspace build targets <code>haswell</code> (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">RUSTFLAGS</span><span class="o">=</span><span class="s2">"-C target-cpu=x86-64-v2"</span><span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>--release
+</span></code></pre></div>
+<p>Runtime SIMD dispatch in <code>lance-linalg::distance</code> will then pick the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use <code>lance.simd_info()</code> to verify which tier was selected.</p>
+<h2 id="sample-workflow">Sample Workflow<a class="headerlink" href="#sample-workflow" title="Permanent link">&para;</a></h2>
+<ol>
+<li>Fork the repo</li>
+<li>Pick <a href="https://github.com/lance-format/lance/issues">Github issue</a></li>
+<li>Create a branch for the issue</li>
+<li>Make your changes</li>
+<li>Create a pull request from your fork to lance-format/lance</li>
+<li>Get feedback and iterate</li>
+<li>Merge!</li>
+<li>Go back to step 2</li>
+</ol>
+<h2 id="example-notebooks">Example Notebooks<a class="headerlink" href="#example-notebooks" title="Permanent link">&para;</a></h2>
+<p>Example notebooks are under <code>examples</code>.
+These are standalone notebooks you should be able to download and run.</p>
+<h2 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h2>
+<p>Our Rust benchmarks are run multiple times a day and the history can be found <a href="https://github.com/lancedb/lance-benchmark-results">here</a>.</p>
+<p>Separately, we have vector index benchmarks that test against the sift1m dataset, as well as benchmarks for tpch.
+These live under <code>benchmarks</code>.</p>
+<h2 id="reviewing-issues-and-pull-requests">Reviewing issues and pull requests<a class="headerlink" href="#reviewing-issues-and-pull-requests" title="Permanent link">&para;</a></h2>
+<p>Please consider the following when reviewing code contributions.</p>
+<h3 id="rust-api-design">Rust API design<a class="headerlink" href="#rust-api-design" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Design public APIs so they can be evolved easily in the future without breaking
+  changes. Often this means using builder patterns or options structs instead of
+  long argument lists.</li>
+<li>For public APIs, prefer inputs that use <code>Into&lt;T&gt;</code> or <code>AsRef&lt;T&gt;</code> traits to allow
+  more flexible inputs. For example, use <code>name: Into&lt;String&gt;</code> instead of <code>name: String</code>,
+  so we don't have to write <code>func("my_string".to_string())</code>.</li>
+</ul>
+<h3 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Ensure all new public APIs have documentation and examples.</li>
+<li>Ensure that all bugfixes and features have corresponding tests. <strong>We do not merge
+  code without tests.</strong></li>
+</ul>
+<h3 id="important-labels">Important Labels<a class="headerlink" href="#important-labels" title="Permanent link">&para;</a></h3>
+<p>There are two important labels to apply to relevant issues and PRs:</p>
+<ol>
+<li><code>breaking-change</code>: Any PR that introduces a breaking change to the public API
+  (Rust or Python) must be labelled as such. This is used to determine how to
+  bump the version number when releasing. You can still add this label even
+  after merging a PR.</li>
+<li><code>critical-fix</code>: Any PR that fixes a critical bug (e.g., security issue, data
+  corruption, crash) should be labelled as such. These are bugs that users might
+  have without realizing. Fixes that aren't critical include bugs that return
+  an error message. These labels are used to determine whether a patch release
+  is needed.</li>
+</ol>
+<h2 id="code-of-conduct">Code of Conduct<a class="headerlink" href="#code-of-conduct" title="Permanent link">&para;</a></h2>
+<p>We follow the Code of Conduct of <a href="https://www.python.org/psf/conduct/">Python Foundation</a> and
+<a href="https://www.rust-lang.org/policies/code-of-conduct">Rust Foundation</a>.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Project Specific Guidelines</div>
+        </a>
+        <a class="next" href="../release/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Release</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#getting-started">Getting Started</a>
+      <a class="ld-toc__h2" href="#development-environment">Development Environment</a>
+      <a class="ld-toc__h2" href="#building-for-legacy-x86_64-hosts-pre-haswell">Building for legacy x86_64 hosts (pre-Haswell)</a>
+      <a class="ld-toc__h2" href="#sample-workflow">Sample Workflow</a>
+      <a class="ld-toc__h2" href="#example-notebooks">Example Notebooks</a>
+      <a class="ld-toc__h2" href="#benchmarks">Benchmarks</a>
+      <a class="ld-toc__h2" href="#reviewing-issues-and-pull-requests">Reviewing issues and pull requests</a>
+      <a class="ld-toc__h3" href="#rust-api-design">Rust API design</a>
+      <a class="ld-toc__h3" href="#testing">Testing</a>
+      <a class="ld-toc__h3" href="#important-labels">Important Labels</a>
+      <a class="ld-toc__h2" href="#code-of-conduct">Code of Conduct</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

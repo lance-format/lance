@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Full-Text Search — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/spark/operations/dql/fts/">
+<link rel="icon" href="../../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../../.." aria-label="Lance">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../../">Overview</a>
+    <a href="../../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../../pytorch/">PyTorch</a>
+    <a href="../../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../../duckdb/">Overview</a>
+    <a href="../../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../../huggingface/">Home</a>
+    <a href="../../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../">Welcome</a>
+    <a href="../../../install/">Install</a>
+    <a href="../../../config/">Config</a>
+    <a href="../../../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../ddl/create-table/">CREATE TABLE</a>
+    <a href="../../ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../ddl/drop-table/">DROP TABLE</a>
+    <a href="../../ddl/create-index/">CREATE INDEX</a>
+    <a href="../../ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../ddl/create-tag/">CREATE TAG</a>
+    <a href="../../ddl/drop-tag/">DROP TAG</a>
+    <a href="../../ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../ddl/optimize/">OPTIMIZE</a>
+    <a href="../../ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../select/">SELECT</a>
+    <a class="active" href="./">Full-Text Search</a>
+    <a href="../vector-search/">VECTOR_SEARCH</a>
+    <a href="../search/">SEARCH</a>
+    <a href="../hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../dml/insert-into/">INSERT INTO</a>
+    <a href="../../dml/update/">UPDATE SET</a>
+    <a href="../../dml/delete/">DELETE FROM</a>
+    <a href="../../dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../../ray/">Welcome</a>
+    <a href="../../../../ray/read/">Read</a>
+    <a href="../../../../ray/write/">Write</a>
+    <a href="../../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../../ray/compaction/">Compaction</a>
+    <a href="../../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../../trino/">Welcome</a>
+    <a href="../../../../trino/install/">Install</a>
+    <a href="../../../../trino/config/">Config</a>
+    <a href="../../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../../../context/guide/storage/">Storage backends</a>
+    <a href="../../../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Apache Spark</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><span>DQL</span>
+        <span>/</span><b>Full-Text Search</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="full-text-search">Full-Text Search<a class="headerlink" href="#full-text-search" title="Permanent link">&para;</a></h1>
+<p>Query Lance tables using full-text search (FTS) with the <code>lance_match</code>, <code>lance_match_phrase</code>, and <code>lance_multi_match</code> SQL functions. These functions push FTS predicates down to the Lance inverted index for efficient text search.</p>
+<div class="admonition warning">
+<p class="admonition-title">Prerequisites</p>
+<ul>
+<li>The Lance Spark SQL extension must be enabled. See <a href="../../../config/#spark-sql-extensions">Spark SQL Extensions</a>.</li>
+<li>The Lance catalog must be the session's default catalog (<code>spark.sql.defaultCatalog</code>). Spark resolves unqualified function names against the default catalog; if it points elsewhere, calls to <code>lance_match</code>, <code>lance_match_phrase</code>, and <code>lance_multi_match</code> fail with a "function not found" error.</li>
+<li>An FTS index must exist on the target column(s). See <a href="../../ddl/create-index/#fts-options">CREATE INDEX — FTS Options</a>.</li>
+<li><code>lance_match_phrase</code> requires the FTS index to be built with <code>with_position = true</code>.</li>
+</ul>
+</div>
+<h2 id="lance_match">lance_match<a class="headerlink" href="#lance_match" title="Permanent link">&para;</a></h2>
+<p>Keyword search against a single FTS-indexed column.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">lance_match</span><span class="p">(</span><span class="k">column</span><span class="p">,</span><span class="w"> </span><span class="n">query</span><span class="p">)</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">lance_match</span><span class="p">(</span><span class="k">column</span><span class="p">,</span><span class="w"> </span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="s1">'key=value,...'</span><span class="p">)</span>
+</span></code></pre></div>
+<p><strong>Arguments:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Position</th>
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>column</td>
+<td>String</td>
+<td>Column name with an FTS index.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>query</td>
+<td>String</td>
+<td>Search query text.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>options</td>
+<td>String</td>
+<td>Optional comma-separated key=value options.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Options:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Constraints</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fuzziness</code></td>
+<td>Integer</td>
+<td>not set (auto)</td>
+<td>≥ 0</td>
+<td>Edit distance for fuzzy matching. When omitted, the engine determines fuzziness by token length.</td>
+</tr>
+<tr>
+<td><code>operator</code></td>
+<td>String</td>
+<td><code>OR</code></td>
+<td><code>AND</code> or <code>OR</code></td>
+<td>Whether all terms must match (<code>AND</code>) or any term (<code>OR</code>).</td>
+</tr>
+<tr>
+<td><code>boost</code></td>
+<td>Float</td>
+<td><code>1.0</code></td>
+<td>any number</td>
+<td>Scoring multiplier (affects ranking, not row selection).</td>
+</tr>
+<tr>
+<td><code>prefix_length</code></td>
+<td>Integer</td>
+<td><code>0</code></td>
+<td>≥ 0</td>
+<td>Number of leading characters that must match exactly for fuzzy.</td>
+</tr>
+<tr>
+<td><code>max_expansions</code></td>
+<td>Integer</td>
+<td><code>50</code></td>
+<td>≥ 1</td>
+<td>Maximum fuzzy term expansions.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Examples:</strong></p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">-- Basic keyword search</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_match</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="s1">'machine learning'</span><span class="p">);</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">-- Fuzzy search with AND operator</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_match</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="s1">'machin lerning'</span><span class="p">,</span><span class="w"> </span><span class="s1">'fuzziness=1,operator=AND'</span><span class="p">);</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1">-- Boosted search with prefix length</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_match</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="s1">'spark'</span><span class="p">,</span><span class="w"> </span><span class="s1">'boost=2.0,prefix_length=2'</span><span class="p">);</span>
+</span></code></pre></div>
+<h2 id="lance_match_phrase">lance_match_phrase<a class="headerlink" href="#lance_match_phrase" title="Permanent link">&para;</a></h2>
+<p>Phrase search against a single FTS-indexed column. Returns rows where the query terms appear consecutively (or within a <code>slop</code> distance).</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The FTS index must be built with <code>with_position = true</code> for phrase queries.</p>
+</div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">lance_match_phrase</span><span class="p">(</span><span class="k">column</span><span class="p">,</span><span class="w"> </span><span class="n">query</span><span class="p">)</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">lance_match_phrase</span><span class="p">(</span><span class="k">column</span><span class="p">,</span><span class="w"> </span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="n">slop</span><span class="p">)</span>
+</span></code></pre></div>
+<p><strong>Arguments:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Position</th>
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>column</td>
+<td>String</td>
+<td>Column name with a positional FTS index.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>query</td>
+<td>String</td>
+<td>Phrase to search for.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>slop</td>
+<td>Integer</td>
+<td>Optional. Max positional distance between terms (default: 0 = exact). Must be ≥ 0.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Examples:</strong></p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">-- Exact phrase match</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_match_phrase</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="s1">'machine learning'</span><span class="p">);</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1">-- Phrase match allowing 2 words between terms</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_match_phrase</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="s1">'deep networks'</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">);</span>
+</span></code></pre></div>
+<h2 id="lance_multi_match">lance_multi_match<a class="headerlink" href="#lance_multi_match" title="Permanent link">&para;</a></h2>
+<p>Search across multiple FTS-indexed columns with a single query. A row matches if <strong>any</strong> column matches (OR, default) or <strong>all</strong> columns match (AND).</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">lance_multi_match</span><span class="p">(</span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">lance_multi_match</span><span class="p">(</span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="s1">'operator=AND|OR'</span><span class="p">,</span><span class="w"> </span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span>
+</span></code></pre></div>
+<p><strong>Arguments:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Position</th>
+<th>Name</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>query</td>
+<td>String</td>
+<td>Search query text.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>options</td>
+<td>String</td>
+<td>Optional. <code>'operator=AND'</code> or <code>'operator=OR'</code>. If omitted, default is OR.</td>
+</tr>
+<tr>
+<td>2+</td>
+<td>columns</td>
+<td>String</td>
+<td>Two or more column names, each with an FTS index.</td>
+</tr>
+</tbody>
+</table>
+<p>When the second argument is a string literal containing <code>=</code> with a recognized option key, it is treated as an options string. Otherwise it is treated as the first column name.</p>
+<p><strong>Examples:</strong></p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1">-- Search across title and body (OR — row matches if either column matches)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_multi_match</span><span class="p">(</span><span class="s1">'machine learning'</span><span class="p">,</span><span class="w"> </span><span class="n">title</span><span class="p">,</span><span class="w"> </span><span class="n">body</span><span class="p">);</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="c1">-- AND operator — row must match in all columns</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">documents</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">lance_multi_match</span><span class="p">(</span><span class="s1">'machine learning'</span><span class="p">,</span><span class="w"> </span><span class="s1">'operator=AND'</span><span class="p">,</span><span class="w"> </span><span class="n">title</span><span class="p">,</span><span class="w"> </span><span class="n">body</span><span class="p">);</span>
+</span></code></pre></div>
+<h2 id="known-limitations">Known Limitations<a class="headerlink" href="#known-limitations" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>No global relevance ordering.</strong> FTS predicates act as WHERE filters and return all matching rows. There is no <code>lance_score()</code> function or relevance-based <code>ORDER BY</code> — rows are returned in storage order. In particular, <code>SELECT * FROM t WHERE lance_match(...) LIMIT N</code> returns N matching rows determined by Spark task scheduling, not by BM25 rank — it is not a "top-N by relevance" query.</li>
+<li><strong>Column names must match the schema exactly.</strong> Column references are resolved at planning time; aliases or expressions are not supported.</li>
+<li><strong><code>lance_match_phrase</code> requires positional index.</strong> The FTS index must be built with <code>with_position = true</code>. Without it, phrase queries will fail.</li>
+<li><strong>WHERE-filter uses full BM25 scoring (no WAND early stopping).</strong> Every row matching the query is evaluated — <code>wand_factor</code> is not exposed because SQL WHERE semantics require returning all matching rows.</li>
+<li><strong>One FTS predicate per query.</strong> Only a single FTS function call is allowed per <code>WHERE</code> clause. For multi-column search, use <code>lance_multi_match</code> instead of combining multiple <code>lance_match</code> calls with OR.</li>
+<li><strong>FTS predicates cannot appear inside OR.</strong> <code>WHERE lance_match(a, 'x') OR other_condition</code> is not supported — OR semantics cannot be preserved when pushing a single FTS query to the scanner.</li>
+<li><strong>On namespaces that serve queries server-side, row queries currently ignore the FTS predicate.</strong> For a namespace whose <code>queryTable</code> is used (<code>dir</code>, and REST implementations that do not parse a structured full-text query), the connector sends the predicate as a structured query, which such implementations skip — so <code>SELECT * FROM t WHERE lance_match(...)</code> returns every row. A <code>COUNT(*)</code> that pushes down (the FTS predicate is the only filter, or all other filters push down too) is not routed server-side and does apply the predicate, so on those namespaces such a count and a row query over the same predicate can disagree. A <code>COUNT(*)</code> whose other filters cannot push down is routed server-side like a row query, and is unfiltered there as well. Catalog-only namespaces (Glue, Hive, Iceberg) are unaffected: they fall back to the local per-fragment scan, which applies the predicate on every path.</li>
+</ul>
+<h2 id="cost-model">Cost Model<a class="headerlink" href="#cost-model" title="Permanent link">&para;</a></h2>
+<p>Each Spark task scans one fragment and independently opens all committed FTS index segments to build a global BM25 scorer. Total segment-open cost per query is proportional to <code>N_fragments × M_index_segments</code>. For example, a 500-fragment dataset with 20 index segments causes 10,000 segment opens per query. Running <code>OPTIMIZE</code> periodically compacts data fragments, reducing the fragment count and therefore the total number of segment opens — this is the primary user-facing mitigation for latency-sensitive workloads.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../select/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">SELECT</div>
+        </a>
+        <a class="next" href="../vector-search/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">VECTOR_SEARCH</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#lance_match">lance_match</a>
+      <a class="ld-toc__h2" href="#lance_match_phrase">lance_match_phrase</a>
+      <a class="ld-toc__h2" href="#lance_multi_match">lance_multi_match</a>
+      <a class="ld-toc__h2" href="#known-limitations">Known Limitations</a>
+      <a class="ld-toc__h2" href="#cost-model">Cost Model</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../../format/">Specification</a>
+        <a href="../../../../../format/file/">File format</a>
+        <a href="../../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../../quickstart/">Getting started</a>
+        <a href="../../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../../..";</script>
+<script src="../../../../../assets/site.js" defer></script>
+</body>
+</html>

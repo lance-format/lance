@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Transactions — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/transaction/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a href="../schema/">Schema</a>
+    <a href="../versioning/">Versioning</a>
+    <a class="active" href="./">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a href="../row_id_lineage/">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a href="../mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Transactions</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="transaction-specification">Transaction Specification<a class="headerlink" href="#transaction-specification" title="Permanent link">&para;</a></h1>
+<h2 id="transaction-overview">Transaction Overview<a class="headerlink" href="#transaction-overview" title="Permanent link">&para;</a></h2>
+<p>Lance implements Multi-Version Concurrency Control (MVCC) to provide ACID transaction guarantees for concurrent readers and writers.
+Each commit creates a new immutable table version through atomic storage operations.
+All table versions form a serializable history, enabling features such as time travel and schema evolution.</p>
+<p>Transactions are the fundamental unit of change in Lance.
+A transaction describes a set of modifications to be applied atomically to create a new table version.
+The transaction model supports concurrent writes through optimistic concurrency control with automatic conflict resolution.</p>
+<h2 id="commit-protocol">Commit Protocol<a class="headerlink" href="#commit-protocol" title="Permanent link">&para;</a></h2>
+<h3 id="storage-primitives">Storage Primitives<a class="headerlink" href="#storage-primitives" title="Permanent link">&para;</a></h3>
+<p>Lance commits rely on atomic write operations provided by the underlying object store:</p>
+<ul>
+<li><strong>rename-if-not-exists</strong>: Atomically rename a file only if the target does not exist</li>
+<li><strong>put-if-not-exists</strong>: Atomically write a file only if it does not already exist (also known as PUT-IF-NONE-MATCH or conditional PUT)</li>
+</ul>
+<p>These primitives guarantee that exactly one writer succeeds when multiple writers attempt to create the same manifest file concurrently.</p>
+<h3 id="manifest-naming-schemes">Manifest Naming Schemes<a class="headerlink" href="#manifest-naming-schemes" title="Permanent link">&para;</a></h3>
+<p>Lance supports two manifest naming schemes:</p>
+<ul>
+<li><strong>V1</strong>: <code>{version}.manifest</code> - Monotonically increasing version numbers (e.g., <code>1.manifest</code>, <code>2.manifest</code>)</li>
+<li><strong>V2</strong>: <code>{u64::MAX - version:020}.manifest</code> - Reverse-sorted lexicographic ordering (e.g., <code>18446744073709551614.manifest</code> for version 1)</li>
+</ul>
+<p>The V2 scheme enables efficient discovery of the latest version through lexicographic object listing.</p>
+<h3 id="transaction-files">Transaction Files<a class="headerlink" href="#transaction-files" title="Permanent link">&para;</a></h3>
+<p>Transaction files store the serialized transaction protobuf message for each commit attempt.
+These files serve two purposes:</p>
+<ol>
+<li>Enable manifest reconstruction during commit retries when concurrent transactions have been committed</li>
+<li>Support conflict detection by describing the operation performed</li>
+</ol>
+<h3 id="commit-algorithm">Commit Algorithm<a class="headerlink" href="#commit-algorithm" title="Permanent link">&para;</a></h3>
+<p>The commit process attempts to atomically write a new manifest file using the storage primitives described above.
+When concurrent writers conflict, the system loads transaction files to detect conflicts and attempts to rebase the transaction if possible.
+If the atomic commit fails, the process retries with updated transaction state.
+For detailed conflict detection and resolution mechanisms, see the <a href="#conflict-resolution">Conflict Resolution</a> section.</p>
+<h2 id="transaction-types">Transaction Types<a class="headerlink" href="#transaction-types" title="Permanent link">&para;</a></h2>
+<p>The authoritative specification for transaction types is defined in <a href="https://github.com/lancedb/lance/blob/main/protos/transaction.proto"><code>protos/transaction.proto</code></a>.</p>
+<p>Each transaction contains a <code>read_version</code> field indicating the table version from which the transaction was built,
+a <code>uuid</code> field uniquely identifying the transaction, and an <code>operation</code> field specifying one of the following transaction types:</p>
+<p>In the following section, we will describe each transaction type and its compatibility with other transaction types. This
+compatibility is not always bi-directional. We are describing it from the perspective of the operation being committed. For example, we say that an Append is not compatible with an Overwrite which means that if we are trying to commit an Append, and an
+Overwrite has already been committed (since we started the Append), then the Append will fail. On the other hand, when describing the
+Overwrite operation, we say that it does not conflict with Append. This is because, if we are trying to commit an Overwrite, and an
+Append operation has occurred in the meantime, we still allow the Overwrite to proceed.</p>
+<h3 id="append">Append<a class="headerlink" href="#append" title="Permanent link">&para;</a></h3>
+<p>Adds new fragments to the table without modifying existing data.
+Fragment IDs are not assigned at transaction creation time; they are assigned during manifest construction.</p>
+<details>
+<summary>Append protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Append</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="cm">/* The new fragments to append.</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="cm">   *</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="cm">   * Fragment IDs are not yet assigned.</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="cm">   */</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="append-compatibility">Append Compatibility<a class="headerlink" href="#append-compatibility" title="Permanent link">&para;</a></h4>
+<p>The append operation is one of the most common operations and is designed to be compatible with most other operations, even
+itself. This is to ensure that multiple writers can append without worry about conflicts. These are the operations
+that conflict with append:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+</ul>
+<h3 id="delete">Delete<a class="headerlink" href="#delete" title="Permanent link">&para;</a></h3>
+<p>Marks rows as deleted using deletion vectors.
+May update fragments (adding deletion vectors) or delete entire fragments.
+The <code>predicate</code> field stores the deletion condition, enabling conflict detection with concurrent transactions.</p>
+<details>
+<summary>Delete protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Delete</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="cm">/* The fragments to update</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="cm">   *</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="cm">   * The fragment IDs will match existing fragments in the dataset.</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="cm">   */</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">updated_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="c1">// The fragments to delete entirely.</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">deleted_fragment_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span><span class="cm">/* The predicate that was evaluated</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="cm">   *</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="cm">   * This may be used to determine whether the delete would have affected</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="cm">   * files written by a concurrent transaction.</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="cm">   */</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">predicate</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="delete-compatibility">Delete Compatibility<a class="headerlink" href="#delete-compatibility" title="Permanent link">&para;</a></h4>
+<p>Delete modifies an existing fragment, so there may be conflicts with other operations on overlapping fragments.
+Generally these conflicts are rebaseable or retryable.</p>
+<p>These are the operations that conflict with delete:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+</ul>
+<p>These operations conflict with delete but can be retried:</p>
+<ul>
+<li>Merge (only if there are overlapping fragments)</li>
+<li>Rewrite (only if there are overlapping fragments)</li>
+<li>DataReplacement (only if there are overlapping fragments)</li>
+</ul>
+<p>These operations conflict with delete but can potentially be rebased. The deletion
+masks from the two operations will be merged. However, if both operations modified
+the same rows, then the conflict becomes a retryable conflict.</p>
+<ul>
+<li>Delete</li>
+<li>Update</li>
+</ul>
+<h3 id="overwrite">Overwrite<a class="headerlink" href="#overwrite" title="Permanent link">&para;</a></h3>
+<p>Creates or completely overwrites the table with new data, schema, and configuration.</p>
+<details>
+<summary>Overwrite protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Overwrite</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="cm">/* The new fragments</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="cm">   *</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="cm">   * Fragment IDs are not yet assigned.</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="cm">   */</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="c1">// The new schema</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">lance.file.Field</span><span class="w"> </span><span class="na">schema</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">  </span><span class="c1">// Schema metadata.</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">schema_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="c1">// Key-value pairs to merge with existing config.</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">config_upsert_values</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">  </span><span class="c1">// The base paths to be added for the initial dataset creation</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">BasePath</span><span class="w"> </span><span class="na">initial_bases</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="overwrite-compatibility">Overwrite Compatibility<a class="headerlink" href="#overwrite-compatibility" title="Permanent link">&para;</a></h4>
+<p>An overwrite operation completely overwrites the table. Generally, we do not care what has happened since
+the read version.</p>
+<p>However, the overwrite does not necessarily rewrite the table config. As a result, we consider the following
+to be retryable conflicts:</p>
+<ul>
+<li>UpdateConfig (only if the two operations modify the same config key)</li>
+<li>Overwrite (always)</li>
+<li>UpdateMemWalState (always)</li>
+</ul>
+<h3 id="createindex">CreateIndex<a class="headerlink" href="#createindex" title="Permanent link">&para;</a></h3>
+<p>Adds, replaces, or removes secondary indices (vector indices, scalar indices, full-text search indices).</p>
+<details>
+<summary>CreateIndex protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">CreateIndex</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexMetadata</span><span class="w"> </span><span class="na">new_indices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexMetadata</span><span class="w"> </span><span class="na">removed_indices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="createindex-compatibility">CreateIndex Compatibility<a class="headerlink" href="#createindex-compatibility" title="Permanent link">&para;</a></h4>
+<p>Indexes record which fragments are covered by the index and we don't require all fragments be covered. As a result, it
+is typically ok for an index to be created concurrently with the addition of new fragments. These new fragments will simply
+be unindexed.</p>
+<p>Updates and deletes are also compatible with index creation. This is because it is ok for an index to refer to deleted rows.
+Those results will be filtered out after the index search. If an update occurs then the old value will be filtered out and the
+new value will be considered part of the unindexed set.</p>
+<p>If two CreateIndex operations are committed concurrently then it is allowed. If the indexes have different names this is no
+problem. If the indexes have the same name then the second operation will win and replace the first.</p>
+<p>These operations conflict with index creation:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+</ul>
+<p>Data replacement operations will conflict with index creation if the column being replaced is being indexed. Rewrite operations
+will conflict with index creation if the rewritten fragments are covered by the index. This is because an index refers to row
+addresses and the rewrite operation changes the row addresses. However, if a fragment reuse index is being used, or if the stable
+row ids feature is enable, then the rewrite operation is compatible with index creation. As a result, these are the operations
+that are retryable conflicts with index creation:</p>
+<ul>
+<li>Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)</li>
+<li>DataReplacement (only if overlapping fragments and the column being replaced is being indexed)</li>
+</ul>
+<p>Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
+between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
+As a result, these are the operations that are rebaseable conflicts with index creation:</p>
+<ul>
+<li>CreateIndex (only if both operations are modifying the same singleton index)</li>
+</ul>
+<h3 id="rewrite">Rewrite<a class="headerlink" href="#rewrite" title="Permanent link">&para;</a></h3>
+<p>Reorganizes data without semantic modification.
+This includes operations such as compaction, defragmentation, and re-ordering.
+Rewrite operations change row addresses, requiring index updates.
+New fragment IDs must be reserved via <code>ReserveFragments</code> before executing a <code>Rewrite</code> transaction.</p>
+<details>
+<summary>Rewrite protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Rewrite</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="cm">/* The old fragments that are being replaced</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="cm">   *</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="cm">   * DEPRECATED: use groups instead.</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="cm">   *</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="cm">   * These should all have existing fragment IDs.</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="cm">   */</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">old_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">  </span><span class="cm">/* The new fragments</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="cm">   *</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="cm">   * DEPRECATED: use groups instead.</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="cm">   *</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="cm">   * These fragments IDs are not yet assigned.</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="cm">   */</span>
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">new_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a>
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="w">  </span><span class="cm">/* During a rewrite an index may be rewritten.  We only serialize the UUID</span>
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a><span class="cm">   * since a rewrite should not change the other index parameters.</span>
+</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a><span class="cm">   */</span>
+</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">RewrittenIndex</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a><span class="w">    </span><span class="c1">// The id of the index that will be replaced</span>
+</span><span id="__span-4-22"><a id="__codelineno-4-22" name="__codelineno-4-22" href="#__codelineno-4-22"></a><span class="w">    </span><span class="n">UUID</span><span class="w"> </span><span class="na">old_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-23"><a id="__codelineno-4-23" name="__codelineno-4-23" href="#__codelineno-4-23"></a><span class="w">    </span><span class="c1">// the id of the new index</span>
+</span><span id="__span-4-24"><a id="__codelineno-4-24" name="__codelineno-4-24" href="#__codelineno-4-24"></a><span class="w">    </span><span class="n">UUID</span><span class="w"> </span><span class="na">new_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-4-25"><a id="__codelineno-4-25" name="__codelineno-4-25" href="#__codelineno-4-25"></a><span class="w">    </span><span class="c1">// the new index details</span>
+</span><span id="__span-4-26"><a id="__codelineno-4-26" name="__codelineno-4-26" href="#__codelineno-4-26"></a><span class="w">    </span><span class="n">google.protobuf.Any</span><span class="w"> </span><span class="na">new_index_details</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-4-27"><a id="__codelineno-4-27" name="__codelineno-4-27" href="#__codelineno-4-27"></a><span class="w">    </span><span class="c1">// the version of the new index</span>
+</span><span id="__span-4-28"><a id="__codelineno-4-28" name="__codelineno-4-28" href="#__codelineno-4-28"></a><span class="w">    </span><span class="kt">uint32</span><span class="w"> </span><span class="na">new_index_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-4-29"><a id="__codelineno-4-29" name="__codelineno-4-29" href="#__codelineno-4-29"></a><span class="w">    </span><span class="cm">/* Files in the new index with their sizes.</span>
+</span><span id="__span-4-30"><a id="__codelineno-4-30" name="__codelineno-4-30" href="#__codelineno-4-30"></a><span class="cm">     * Empty if file sizes are not available (e.g. older writers).</span>
+</span><span id="__span-4-31"><a id="__codelineno-4-31" name="__codelineno-4-31" href="#__codelineno-4-31"></a><span class="cm">     */</span>
+</span><span id="__span-4-32"><a id="__codelineno-4-32" name="__codelineno-4-32" href="#__codelineno-4-32"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexFile</span><span class="w"> </span><span class="na">new_index_files</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-4-33"><a id="__codelineno-4-33" name="__codelineno-4-33" href="#__codelineno-4-33"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-4-34"><a id="__codelineno-4-34" name="__codelineno-4-34" href="#__codelineno-4-34"></a>
+</span><span id="__span-4-35"><a id="__codelineno-4-35" name="__codelineno-4-35" href="#__codelineno-4-35"></a><span class="w">  </span><span class="c1">// A group of rewrite files that are all part of the same rewrite.</span>
+</span><span id="__span-4-36"><a id="__codelineno-4-36" name="__codelineno-4-36" href="#__codelineno-4-36"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">RewriteGroup</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-37"><a id="__codelineno-4-37" name="__codelineno-4-37" href="#__codelineno-4-37"></a><span class="w">    </span><span class="cm">/* The old fragment that is being replaced</span>
+</span><span id="__span-4-38"><a id="__codelineno-4-38" name="__codelineno-4-38" href="#__codelineno-4-38"></a><span class="cm">     *</span>
+</span><span id="__span-4-39"><a id="__codelineno-4-39" name="__codelineno-4-39" href="#__codelineno-4-39"></a><span class="cm">     * This should have an existing fragment ID.</span>
+</span><span id="__span-4-40"><a id="__codelineno-4-40" name="__codelineno-4-40" href="#__codelineno-4-40"></a><span class="cm">     */</span>
+</span><span id="__span-4-41"><a id="__codelineno-4-41" name="__codelineno-4-41" href="#__codelineno-4-41"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">old_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-42"><a id="__codelineno-4-42" name="__codelineno-4-42" href="#__codelineno-4-42"></a><span class="w">    </span><span class="cm">/* The new fragment</span>
+</span><span id="__span-4-43"><a id="__codelineno-4-43" name="__codelineno-4-43" href="#__codelineno-4-43"></a><span class="cm">     *</span>
+</span><span id="__span-4-44"><a id="__codelineno-4-44" name="__codelineno-4-44" href="#__codelineno-4-44"></a><span class="cm">     * The ID should have been reserved by an earlier</span>
+</span><span id="__span-4-45"><a id="__codelineno-4-45" name="__codelineno-4-45" href="#__codelineno-4-45"></a><span class="cm">     * reserve operation</span>
+</span><span id="__span-4-46"><a id="__codelineno-4-46" name="__codelineno-4-46" href="#__codelineno-4-46"></a><span class="cm">     */</span>
+</span><span id="__span-4-47"><a id="__codelineno-4-47" name="__codelineno-4-47" href="#__codelineno-4-47"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">new_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-4-48"><a id="__codelineno-4-48" name="__codelineno-4-48" href="#__codelineno-4-48"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-4-49"><a id="__codelineno-4-49" name="__codelineno-4-49" href="#__codelineno-4-49"></a>
+</span><span id="__span-4-50"><a id="__codelineno-4-50" name="__codelineno-4-50" href="#__codelineno-4-50"></a><span class="w">  </span><span class="c1">// Groups of files that have been rewritten</span>
+</span><span id="__span-4-51"><a id="__codelineno-4-51" name="__codelineno-4-51" href="#__codelineno-4-51"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RewriteGroup</span><span class="w"> </span><span class="na">groups</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-4-52"><a id="__codelineno-4-52" name="__codelineno-4-52" href="#__codelineno-4-52"></a><span class="w">  </span><span class="c1">// Indices that have been rewritten</span>
+</span><span id="__span-4-53"><a id="__codelineno-4-53" name="__codelineno-4-53" href="#__codelineno-4-53"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">RewrittenIndex</span><span class="w"> </span><span class="na">rewritten_indices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-4-54"><a id="__codelineno-4-54" name="__codelineno-4-54" href="#__codelineno-4-54"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="rewrite-compatibility">Rewrite Compatibility<a class="headerlink" href="#rewrite-compatibility" title="Permanent link">&para;</a></h4>
+<p>Rewrite operations do not change data but they can materialize deletions and they do replace fragments. As a result,
+they can potentially conflict with other operations that modify the fragments being rewritten.</p>
+<p>These are the operations that conflict with rewrite:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+</ul>
+<p>Rewrite is not compatible with CreateIndex by default because the operation will change the row addresses that the CreateIndex
+refers to. However, a fragment reuse index or the stable row ids feature can allow these operations to be compatible.</p>
+<p>Several operations modify existing fragments. As a result, they can potentially conflict with Rewrite if they modify
+the same fragments. However, Merge is <a href="#overly-general-operation">overly general</a> and so no conflict detection is possible.
+As a result, here are the operations that are retryable conflicts with Rewrite:</p>
+<ul>
+<li>Merge (always)</li>
+<li>DataReplacement (only if overlapping fragments)</li>
+<li>Delete (only if overlapping fragments)</li>
+<li>Update (only if overlapping fragments)</li>
+<li>Rewrite (if overlapping fragments or both carry a fragment reuse index)</li>
+<li>CreateIndex (overlapping fragments and no fragment reuse index or stable row ids)</li>
+</ul>
+<p>There is one case where a Rewrite will rebase. This is when the Rewrite operation has a fragment reuse index and there is
+a CreateIndex operation that is writing the fragment reuse index. In this case the Rewrite will rebase and update its
+fragment reuse index to include the conflicting fragment reuse index.</p>
+<p>As a result, these are the operations that are rebaseable conflicts with Rewrite:</p>
+<ul>
+<li>CreateIndex (if the CreateIndex is writing the fragment reuse index and the Rewrite is carrying a fragment reuse index)</li>
+</ul>
+<h3 id="merge">Merge<a class="headerlink" href="#merge" title="Permanent link">&para;</a></h3>
+<p>Adds new columns to the table, modifying the schema.
+All fragments must be updated to include the new columns.</p>
+<details>
+<summary>Merge protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Merge</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="cm">/* The updated fragments</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="cm">   *</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="cm">   * These should all have existing fragment IDs.</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="cm">   */</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">  </span><span class="c1">// The new schema</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">lance.file.Field</span><span class="w"> </span><span class="na">schema</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">  </span><span class="c1">// Schema metadata.</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">schema_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">  </span><span class="cm">/* Set when this merge makes no nullability-affecting schema change: it</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="cm">   * introduces no field that data staged against an earlier schema could</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="cm">   * not safely omit. Without the assertion (including transactions written</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="cm">   * before this field existed) the merge conservatively conflicts with</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="cm">   * concurrent value-writes, which can only cause a retry.</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="cm">   */</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">preserves_nullability</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="overly-general-operation">Overly General Operation<a class="headerlink" href="#overly-general-operation" title="Permanent link">&para;</a></h4>
+<p>The Merge operation is a very generic operation. The set of fragments provided in the operation will be the final set of
+fragments in the resulting dataset. As a result, it has a high potential for conflicts with other operations. If possible,
+more restrictive operations such as Rewrite, DataReplacement, or Append should be preferred over Merge.</p>
+<h4 id="merge-compatibility">Merge Compatibility<a class="headerlink" href="#merge-compatibility" title="Permanent link">&para;</a></h4>
+<p>As mentioned above, Merge is a very generic operation, as a result it has a high potential for conflicts with other operations.
+The following operations conflict with Merge:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+<li>Project</li>
+</ul>
+<p>These operations are retryable conflicts with Merge:</p>
+<ul>
+<li>Update (always)</li>
+<li>Append (always)</li>
+<li>Delete (always)</li>
+<li>Merge (always)</li>
+<li>Rewrite (always)</li>
+<li>DataReplacement (always)</li>
+</ul>
+<h3 id="project">Project<a class="headerlink" href="#project" title="Permanent link">&para;</a></h3>
+<p>Removes columns from the table, modifying the schema.
+This is a metadata-only operation; data files are not modified.</p>
+<details>
+<summary>Project protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Project</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="c1">// The new schema</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">lance.file.Field</span><span class="w"> </span><span class="na">schema</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span><span class="cm">/* Set when this projection makes no nullability-affecting schema change,</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="cm">   * as a rename or a drop does not. Without the assertion (including</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="cm">   * transactions written before this field existed) the projection</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="cm">   * conservatively conflicts with concurrent value-writes, which can only</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="cm">   * cause a retry. A nullability tightening must not set this.</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="cm">   */</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">preserves_nullability</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="project-compatibility">Project Compatibility<a class="headerlink" href="#project-compatibility" title="Permanent link">&para;</a></h4>
+<p>Since project only modifies the schema, it is compatible with most other operations. However, it is not compatible with Merge
+because the Merge operation modifies the schema (can potentially add columns) and the logic to rebase those changes does not
+currently exist (project is cheap and easy enough to retry).</p>
+<p>These are the operations that conflict with Project:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+</ul>
+<p>The following operations are retryable conflicts with Project:</p>
+<ul>
+<li>Project (always)</li>
+<li>Merge (always)</li>
+</ul>
+<h3 id="restore">Restore<a class="headerlink" href="#restore" title="Permanent link">&para;</a></h3>
+<p>Reverts the table to a previous version.</p>
+<details>
+<summary>Restore protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Restore</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="c1">// The version to restore to</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="restore-compatibility">Restore Compatibility<a class="headerlink" href="#restore-compatibility" title="Permanent link">&para;</a></h4>
+<p>The Restore operation reverts the table to a previous version. It's generally assumed this trumps any
+other operation. Here are the operations that conflict with Restore:</p>
+<ul>
+<li>UpdateMemWalState</li>
+</ul>
+<h3 id="reservefragments">ReserveFragments<a class="headerlink" href="#reservefragments" title="Permanent link">&para;</a></h3>
+<p>Pre-allocates fragment IDs for use in future <code>Rewrite</code> operations.
+This allows rewrite operations to reference fragment IDs before the rewrite transaction is committed.</p>
+<details>
+<summary>ReserveFragments protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">ReserveFragments</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="reservefragments-compatibility">ReserveFragments Compatibility<a class="headerlink" href="#reservefragments-compatibility" title="Permanent link">&para;</a></h4>
+<p>The ReserveFragments operation is fairly trivial. The only thing it changes is the max fragment id. So this
+only conflicts with operations that modify the max fragment id. Here are the operations that conflict with ReserveFragments:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+</ul>
+<h3 id="clone">Clone<a class="headerlink" href="#clone" title="Permanent link">&para;</a></h3>
+<p>Creates a shallow or deep copy of the table.
+Shallow clones are metadata-only copies that reference original data files through <code>base_paths</code>.
+Deep clones are full copies using object storage native copy operations (e.g., S3 CopyObject).</p>
+<details>
+<summary>Clone protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Clone</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="cm">/* - true:  Performs a metadata-only clone (copies manifest without data files).</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="cm">   *          The cloned dataset references original data through `base_paths`,</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="cm">   *          suitable for experimental scenarios or rapid metadata migration.</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="cm">   * - false: Performs a full deep clone using the underlying object storage's native</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="cm">   *          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="cm">   *          bulk copy operations to bypass download/upload bottlenecks, achieving</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="cm">   *          near-linear speedup for large datasets (typically 3-10x faster than</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="cm">   *          manual file transfers). The operation maintains atomicity and data</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="cm">   *          integrity guarantees provided by the storage backend.</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="cm">   */</span>
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">is_shallow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a><span class="w">  </span><span class="cm">/* the reference name in the source dataset</span>
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a><span class="cm">   * in most cases it should be the branch or tag name in the source dataset</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a><span class="cm">   */</span>
+</span><span id="__span-9-16"><a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">ref_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-9-17"><a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a><span class="w">  </span><span class="c1">// the version of the source dataset for cloning</span>
+</span><span id="__span-9-18"><a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">ref_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-9-19"><a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a><span class="w">  </span><span class="c1">// the absolute base path of the source dataset for cloning</span>
+</span><span id="__span-9-20"><a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">ref_path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-9-21"><a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a><span class="w">  </span><span class="c1">// if the target dataset is a branch, this is the branch name of the target dataset</span>
+</span><span id="__span-9-22"><a id="__codelineno-9-22" name="__codelineno-9-22" href="#__codelineno-9-22"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">branch_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-9-23"><a id="__codelineno-9-23" name="__codelineno-9-23" href="#__codelineno-9-23"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="clone-compatibility">Clone Compatibility<a class="headerlink" href="#clone-compatibility" title="Permanent link">&para;</a></h4>
+<p>The Clone operation can only be the first operation in a dataset. If there is an existing dataset, then the Clone operation will fail.
+As a result, there is no such thing as a conflict with Clone.</p>
+<h3 id="update">Update<a class="headerlink" href="#update" title="Permanent link">&para;</a></h3>
+<p>Modifies row values without adding or removing rows.
+Supports two execution modes: REWRITE_ROWS deletes rows in current fragments and rewrites them in new fragments, which is optimal when the majority of columns are modified or only a small number of rows are affected; REWRITE_COLUMNS fully rewrites affected columns within fragments by tombstoning old column versions, which is optimal when most rows are affected but only a subset of columns are modified.</p>
+<details>
+<summary>Update protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Update</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="cm">/* The fragments that have been removed. These are fragments where all rows</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="cm">   * have been updated and moved to a new fragment.</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="cm">   */</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">removed_fragment_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="w">  </span><span class="c1">// The fragments that have been updated.</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">updated_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="w">  </span><span class="c1">// The new fragments where updated rows have been moved to.</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">new_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="w">  </span><span class="c1">// The ids of the fields that have been modified.</span>
+</span><span id="__span-10-11"><a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">fields_modified</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-10-12"><a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a><span class="w">  </span><span class="c1">/// SSTables to mark as compacted after this transaction.</span>
+</span><span id="__span-10-13"><a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">CompactedSsTable</span><span class="w"> </span><span class="na">compacted_sstables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-10-14"><a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a><span class="w">  </span><span class="cm">/* The fields that used to judge whether to preserve the new frag's id into</span>
+</span><span id="__span-10-15"><a id="__codelineno-10-15" name="__codelineno-10-15" href="#__codelineno-10-15"></a><span class="cm">   * the frag bitmap of the specified indices.</span>
+</span><span id="__span-10-16"><a id="__codelineno-10-16" name="__codelineno-10-16" href="#__codelineno-10-16"></a><span class="cm">   */</span>
+</span><span id="__span-10-17"><a id="__codelineno-10-17" name="__codelineno-10-17" href="#__codelineno-10-17"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">fields_for_preserving_frag_bitmap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-10-18"><a id="__codelineno-10-18" name="__codelineno-10-18" href="#__codelineno-10-18"></a><span class="w">  </span><span class="c1">// The mode of update</span>
+</span><span id="__span-10-19"><a id="__codelineno-10-19" name="__codelineno-10-19" href="#__codelineno-10-19"></a><span class="w">  </span><span class="n">UpdateMode</span><span class="w"> </span><span class="na">update_mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-10-20"><a id="__codelineno-10-20" name="__codelineno-10-20" href="#__codelineno-10-20"></a><span class="w">  </span><span class="cm">/* Filter for checking existence of keys in newly inserted rows, used for conflict detection.</span>
+</span><span id="__span-10-21"><a id="__codelineno-10-21" name="__codelineno-10-21" href="#__codelineno-10-21"></a><span class="cm">   * Only tracks keys from INSERT operations during merge insert, not updates.</span>
+</span><span id="__span-10-22"><a id="__codelineno-10-22" name="__codelineno-10-22" href="#__codelineno-10-22"></a><span class="cm">   */</span>
+</span><span id="__span-10-23"><a id="__codelineno-10-23" name="__codelineno-10-23" href="#__codelineno-10-23"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="n">KeyExistenceFilter</span><span class="w"> </span><span class="na">inserted_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-10-24"><a id="__codelineno-10-24" name="__codelineno-10-24" href="#__codelineno-10-24"></a><span class="w">  </span><span class="cm">/* Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).</span>
+</span><span id="__span-10-25"><a id="__codelineno-10-25" name="__codelineno-10-25" href="#__codelineno-10-25"></a><span class="cm">   * Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.</span>
+</span><span id="__span-10-26"><a id="__codelineno-10-26" name="__codelineno-10-26" href="#__codelineno-10-26"></a><span class="cm">   */</span>
+</span><span id="__span-10-27"><a id="__codelineno-10-27" name="__codelineno-10-27" href="#__codelineno-10-27"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">uint64</span><span class="p">,</span><span class="w"> </span><span class="n">UInt32List</span><span class="p">&gt;</span><span class="w"> </span><span class="na">updated_fragment_offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-10-28"><a id="__codelineno-10-28" name="__codelineno-10-28" href="#__codelineno-10-28"></a><span class="w">  </span><span class="cm">/* Per-fragment matched offsets as portable RoaringBitmap bytes (replaces field 9).</span>
+</span><span id="__span-10-29"><a id="__codelineno-10-29" name="__codelineno-10-29" href="#__codelineno-10-29"></a><span class="cm">   * Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for</span>
+</span><span id="__span-10-30"><a id="__codelineno-10-30" name="__codelineno-10-30" href="#__codelineno-10-30"></a><span class="cm">   * manifests written before this change.</span>
+</span><span id="__span-10-31"><a id="__codelineno-10-31" name="__codelineno-10-31" href="#__codelineno-10-31"></a><span class="cm">   */</span>
+</span><span id="__span-10-32"><a id="__codelineno-10-32" name="__codelineno-10-32" href="#__codelineno-10-32"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">uint64</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">updated_fragment_offset_bitmaps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-10-33"><a id="__codelineno-10-33" name="__codelineno-10-33" href="#__codelineno-10-33"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="update-compatibility">Update Compatibility<a class="headerlink" href="#update-compatibility" title="Permanent link">&para;</a></h4>
+<p>Here are the operations that conflict with Update:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+</ul>
+<p>An update operation is both a delete and an append operation. Like a Delete operation, it will modify fragments to change
+the deletion mask. As a result, there will be a retryable conflict with other operations that modify the same fragments.
+Here are the operations that are retryable conflicts with Update:</p>
+<ul>
+<li>Rewrite (only if overlapping fragments)</li>
+<li>DataReplacement (only if overlapping fragments)</li>
+<li>Merge (always)</li>
+</ul>
+<p>Similar to Delete, the Update operation can rebase other modifications to the deletion mask. Here are the operations that
+are rebaseable conflicts with Update:</p>
+<ul>
+<li>Delete</li>
+<li>Update</li>
+</ul>
+<h3 id="updateconfig">UpdateConfig<a class="headerlink" href="#updateconfig" title="Permanent link">&para;</a></h3>
+<p>Modifies table configuration, table metadata, schema metadata, or field metadata without changing data.</p>
+<details>
+<summary>UpdateConfig protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">UpdateConfig</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span><span class="n">UpdateMap</span><span class="w"> </span><span class="na">config_updates</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">  </span><span class="n">UpdateMap</span><span class="w"> </span><span class="na">table_metadata_updates</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span><span class="n">UpdateMap</span><span class="w"> </span><span class="na">schema_metadata_updates</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">int32</span><span class="p">,</span><span class="w"> </span><span class="n">UpdateMap</span><span class="p">&gt;</span><span class="w"> </span><span class="na">field_metadata_updates</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="w">  </span><span class="c1">// Deprecated -------------------------------</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">upsert_values</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">delete_keys</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">schema_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">uint32</span><span class="p">,</span><span class="w"> </span><span class="n">FieldMetadataUpdate</span><span class="p">&gt;</span><span class="w"> </span><span class="na">field_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-11-12"><a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>
+</span><span id="__span-11-13"><a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">FieldMetadataUpdate</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-11-14"><a id="__codelineno-11-14" name="__codelineno-11-14" href="#__codelineno-11-14"></a><span class="w">    </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-11-15"><a id="__codelineno-11-15" name="__codelineno-11-15" href="#__codelineno-11-15"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-11-16"><a id="__codelineno-11-16" name="__codelineno-11-16" href="#__codelineno-11-16"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="updateconfig-compatibility">UpdateConfig Compatibility<a class="headerlink" href="#updateconfig-compatibility" title="Permanent link">&para;</a></h4>
+<p>An UpdateConfig operation only modifies table config and tends to be compatible with other operations. Here
+are the operations that conflict with UpdateConfig:</p>
+<ul>
+<li>Overwrite</li>
+<li>UpdateConfig (only if the two operations modify the same config)</li>
+</ul>
+<h3 id="datareplacement">DataReplacement<a class="headerlink" href="#datareplacement" title="Permanent link">&para;</a></h3>
+<p>Replaces data in specific column regions with new data files.</p>
+<details>
+<summary>DataReplacement protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataReplacement</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataReplacementGroup</span><span class="w"> </span><span class="na">replacements</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="datareplacement-compatibility">DataReplacement Compatibility<a class="headerlink" href="#datareplacement-compatibility" title="Permanent link">&para;</a></h4>
+<p>A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
+or Update operations. It rewrites a column file positionally against the fragments it targets, so a concurrent operation only
+conflicts when it removes one of those fragments or invalidates the rows the column file covers. Here are the operations that
+conflict with DataReplacement (non-retryable):</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+<li>Delete (only if it removes a target fragment outright)</li>
+<li>Update (only if it removes a target fragment outright)</li>
+</ul>
+<p>The following operations are retryable conflicts with DataReplacement:</p>
+<ul>
+<li>DataReplacement (only if same field and overlapping fragments)</li>
+<li>CreateIndex (only if the field being replaced is being indexed)</li>
+<li>Rewrite (only if overlapping fragments)</li>
+<li>Update (only if it rewrites rows out of a target fragment, or rewrites one of the replaced fields in place)</li>
+<li>Merge (always)</li>
+</ul>
+<p>A concurrent Delete or Update that only adds a deletion vector to a target fragment (without removing it) is compatible: the
+positional column file stays aligned and the rebase preserves the deletion vector.</p>
+<h3 id="dataoverlay">DataOverlay<a class="headerlink" href="#dataoverlay" title="Permanent link">&para;</a></h3>
+<p>Attaches <a href="../data_overlay_file/">overlay files</a> to fragments, supplying new values
+for a subset of <code>(row offset, field)</code> cells without rewriting the fragments' base
+data files. The overlays are appended to each fragment's existing <code>overlays</code> list,
+so overlays written by concurrent commits are preserved. Each overlay's
+<code>committed_version</code> is stamped to the new dataset version at commit time (and
+re-stamped on retry), like the created-at / last-updated-at version sequences.</p>
+<details>
+<summary>DataOverlay protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataOverlay</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataOverlayGroup</span><span class="w"> </span><span class="na">groups</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="p">}</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataOverlayGroup</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">fragment_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="w">  </span><span class="cm">/* Each DataOverlayFile.committed_version is left 0 by the writer and stamped</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="cm">   * to the new dataset version at commit time (re-stamped on retry), in the</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="cm">   * same way as the created-at / last-updated-at version sequences. The fields</span>
+</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="cm">   * touched are read from each overlay's `data_file.fields`.</span>
+</span><span id="__span-13-11"><a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a><span class="cm">   */</span>
+</span><span id="__span-13-12"><a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataOverlayFile</span><span class="w"> </span><span class="na">overlays</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-13-13"><a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="dataoverlay-compatibility">DataOverlay Compatibility<a class="headerlink" href="#dataoverlay-compatibility" title="Permanent link">&para;</a></h4>
+<p>A DataOverlay operation only changes cells within existing fragments and preserves
+physical row addresses, so — like DataReplacement — it is intentionally permissive.
+Because overlays stack and the higher <code>committed_version</code> wins each covered cell,
+independent backfills never conflict, and a concurrent Delete simply makes the
+overlay value for a deleted offset inert. Here are the operations that conflict
+with DataOverlay:</p>
+<ul>
+<li>Overwrite</li>
+<li>Restore</li>
+<li>UpdateMemWalState</li>
+</ul>
+<p>The following operations are retryable conflicts with DataOverlay:</p>
+<ul>
+<li>Rewrite (only if overlapping fragments) — row-rewriting compaction or an
+  overlay→base fold changes physical row addresses or consumes the overlays, so
+  the overlay's offsets are no longer valid; the writer must re-read the new
+  fragment, recompute, and retry.</li>
+<li>Merge (always).</li>
+<li>A row-moving Update that touches an overlaid fragment — a delete-and-reinsert
+  update (any update that is not a <code>REWRITE_COLUMNS</code> column rewrite) relocates the
+  updated rows into new fragments, so the overlay's physical offsets no longer
+  address them; the writer must re-read and retry.</li>
+</ul>
+<p>DataOverlay is compatible with another DataOverlay (any fields), Append, Delete, a
+<code>REWRITE_COLUMNS</code> column rewrite, and DataReplacement, because all of these
+preserve physical row addresses: overlay offsets stay valid, the overlay is newer
+and wins its covered cells, and the version gate excludes those cells from any
+rebuilt index.</p>
+<p>When a DataReplacement or a <code>REWRITE_COLUMNS</code> update writes new base values for a
+field, it supersedes any older overlay on that field: the writer tombstones the
+overlay's entry for the rewritten field — replacing the field id with the obsolete
+sentinel, as with obsolete base columns — so the fresh base values are not silently
+shadowed. Overlay entries for other fields are preserved, and an overlay left with
+no live fields is dropped.</p>
+<h3 id="updatememwalstate">UpdateMemWalState<a class="headerlink" href="#updatememwalstate" title="Permanent link">&para;</a></h3>
+<p>Updates the state of MemWal indices (write-ahead log based indices).</p>
+<details>
+<summary>UpdateMemWalState protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">UpdateMemWalState</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="w">  </span><span class="c1">// SSTables being marked as compacted.</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">CompactedSsTable</span><span class="w"> </span><span class="na">compacted_sstables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="updatebases">UpdateBases<a class="headerlink" href="#updatebases" title="Permanent link">&para;</a></h3>
+<p>Adds new base paths to the table, enabling reference to data files in additional locations.</p>
+<details>
+<summary>UpdateBases protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">UpdateBases</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="w">  </span><span class="c1">// The new base paths to add to the manifest.</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">BasePath</span><span class="w"> </span><span class="na">new_bases</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="updatebases-compatibility">UpdateBases Compatibility<a class="headerlink" href="#updatebases-compatibility" title="Permanent link">&para;</a></h4>
+<p>An UpdateBases operation only modifies the base paths. As a result, it only conflicts with other
+UpdateBases operations and even then only conflicts if the two operations have base paths with the
+same id, name, or path.</p>
+<h2 id="conflict-resolution">Conflict Resolution<a class="headerlink" href="#conflict-resolution" title="Permanent link">&para;</a></h2>
+<h3 id="terminology">Terminology<a class="headerlink" href="#terminology" title="Permanent link">&para;</a></h3>
+<p>When concurrent transactions attempt to commit against the same read version, Lance employs conflict resolution to determine whether the transactions can coexist.
+Three outcomes are possible:</p>
+<ul>
+<li>
+<p><strong>Rebasable</strong>: The transaction can be modified to incorporate concurrent changes while preserving its semantic intent.
+  The transaction is transformed to account for the concurrent modification, then the commit is retried automatically within the commit layer.</p>
+</li>
+<li>
+<p><strong>Retryable</strong>: The transaction cannot be rebased, but the operation can be re-executed at the application level with updated data.
+  The implementation returns a retryable conflict error, signaling that the application should re-read the data and retry the operation.
+  The retried operation is expected to produce semantically equivalent results.</p>
+</li>
+<li>
+<p><strong>Incompatible</strong>: The transactions conflict in a fundamental way where retrying would violate the operation's assumptions or produce semantically different results than expected.
+  The commit fails with a non-retryable error.
+  Callers should proceed with extreme caution if they decide to retry, as the transaction may produce different output than originally intended.</p>
+</li>
+</ul>
+<h3 id="rebase-mechanism">Rebase Mechanism<a class="headerlink" href="#rebase-mechanism" title="Permanent link">&para;</a></h3>
+<p>The <code>TransactionRebase</code> structure tracks the state necessary to rebase a transaction against concurrent commits:</p>
+<ol>
+<li><strong>Fragment tracking</strong>: Maintains a map of fragments as they existed at the transaction's read version, marking which require rewriting</li>
+<li><strong>Modification detection</strong>: Tracks the set of fragment IDs that have been modified or deleted</li>
+<li><strong>Affected rows</strong>: For Delete and Update operations, stores the specific rows affected by the operation for fine-grained conflict detection</li>
+<li><strong>Fragment reuse indices</strong>: Accumulates fragment reuse index metadata from concurrent Rewrite operations</li>
+</ol>
+<p>When a concurrent transaction is detected, the rebase process:</p>
+<ol>
+<li>Compares fragment modifications to determine if there is overlap</li>
+<li>For Delete/Update operations, compares <code>affected_rows</code> to detect whether the same rows were modified</li>
+<li>Merges deletion vectors when both transactions delete rows from the same fragment</li>
+<li>Accumulates fragment reuse index updates when concurrent Rewrites change fragment IDs</li>
+<li>Modifies the transaction if rebasable, or returns a retryable/incompatible conflict error</li>
+</ol>
+<h3 id="conflict-scenarios">Conflict Scenarios<a class="headerlink" href="#conflict-scenarios" title="Permanent link">&para;</a></h3>
+<h4 id="rebasable-conflict-example">Rebasable Conflict Example<a class="headerlink" href="#rebasable-conflict-example" title="Permanent link">&para;</a></h4>
+<p>The following diagram illustrates a rebasable conflict where two Delete operations modify different rows in the same fragment:</p>
+<pre class="mermaid"><code>gitGraph
+    commit id: "v1"
+    commit id: "v2"
+    branch writer-a
+    branch writer-b
+    checkout writer-a
+    commit id: "Delete rows 100-199" tag: "read_version=2"
+    checkout writer-b
+    commit id: "Delete rows 500-599" tag: "read_version=2"
+    checkout main
+    merge writer-a tag: "v3"
+    checkout writer-b
+    commit id: "Rebase: merge deletion vectors" type: HIGHLIGHT
+    checkout main
+    merge writer-b tag: "v4"</code></pre>
+<p>In this scenario:</p>
+<ul>
+<li>Writer A deletes rows 100-199 and successfully commits version 3</li>
+<li>Writer B attempts to commit but detects version 3 exists</li>
+<li>Writer B's transaction is rebasable because it only modified deletion vectors (not data files) and <code>affected_rows</code> do not overlap</li>
+<li>Writer B rebases by merging Writer A's deletion vector with its own, write it to storage</li>
+<li>Writer B successfully commits version 4</li>
+</ul>
+<h4 id="retryable-conflict-example">Retryable Conflict Example<a class="headerlink" href="#retryable-conflict-example" title="Permanent link">&para;</a></h4>
+<p>The following diagram illustrates a retryable conflict where an Update operation encounters a concurrent Rewrite (compaction) that prevents automatic rebasing:</p>
+<pre class="mermaid"><code>gitGraph
+    commit id: "v1"
+    commit id: "v2"
+    branch writer-a
+    branch writer-b
+    checkout writer-a
+    commit id: "Compact fragments 1-5" tag: "read_version=2"
+    checkout writer-b
+    commit id: "Update rows in fragment 3" tag: "read_version=2"
+    checkout main
+    merge writer-a tag: "v3: fragments compacted"
+    checkout writer-b
+    commit id: "Detect conflict: cannot rebase" type: REVERSE</code></pre>
+<p>In this scenario:</p>
+<ul>
+<li>Writer A compacts fragments 1-5 into a single fragment and successfully commits version 3</li>
+<li>Writer B attempts to update rows in fragment 3 but detects version 3 exists</li>
+<li>Writer B's Update transaction is retryable but not rebasable: fragment 3 no longer exists after compaction</li>
+<li>The commit layer returns a retryable conflict error</li>
+<li>The application must re-execute the Update operation against version 3, locating the rows in the new compacted fragment</li>
+</ul>
+<h4 id="incompatible-conflict-example">Incompatible Conflict Example<a class="headerlink" href="#incompatible-conflict-example" title="Permanent link">&para;</a></h4>
+<p>The following diagram illustrates an incompatible conflict where a Delete operation encounters a concurrent Restore that fundamentally invalidates the operation:</p>
+<pre class="mermaid"><code>gitGraph
+    commit id: "v1"
+    commit id: "v2"
+    commit id: "v3"
+    branch writer-a
+    branch writer-b
+    checkout writer-a
+    commit id: "Restore to v1" tag: "read_version=3"
+    checkout writer-b
+    commit id: "Delete rows added in v2-v3" tag: "read_version=3"
+    checkout main
+    merge writer-a tag: "v4: restored to v1"
+    checkout writer-b
+    commit id: "Detect conflict: incompatible" type: REVERSE</code></pre>
+<p>In this scenario:</p>
+<ul>
+<li>Writer A restores the table to version 1 and successfully commits version 4</li>
+<li>Writer B attempts to delete rows that were added between versions 2 and 3</li>
+<li>Writer B's Delete transaction is incompatible: the table has been restored to version 1, and the rows it intended to delete no longer exist</li>
+<li>The commit fails with a non-retryable error</li>
+<li>If the caller retries the deletion operation against version 4, it would either delete nothing (if those rows don't exist in v1) or delete different rows (if similar row IDs exist in v1), producing semantically different results than originally intended</li>
+</ul>
+<h2 id="external-manifest-store">External Manifest Store<a class="headerlink" href="#external-manifest-store" title="Permanent link">&para;</a></h2>
+<p>If the backing object store does not support atomic operations (rename-if-not-exists or put-if-not-exists), an external manifest store can be used to enable concurrent writers.</p>
+<p>An external manifest store is a key-value store that supports put-if-not-exists operations.
+It is the concurrency coordinator and fast version index: its conditional write selects one
+immutable staging manifest for each version. The canonical manifest bytes in object storage
+remain authoritative, so the external store supplements but does not replace them.
+A reader unaware of the external manifest store can still read the table, but may observe a version up to one commit behind the true latest version.</p>
+<h3 id="commit-process-with-external-store">Commit Process with External Store<a class="headerlink" href="#commit-process-with-external-store" title="Permanent link">&para;</a></h3>
+<p>The commit process follows a four-step protocol:</p>
+<p><img alt="External Store Commit Process" src="../../../images/external_store_commit.gif" /></p>
+<ol>
+<li><strong>Stage manifest</strong>: <code>PUT_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid}</code></li>
+<li>Write the new manifest to object storage under a unique path determined by a new UUID</li>
+<li>
+<p>This staged manifest is not yet visible to readers</p>
+</li>
+<li>
+<p><strong>Reserve version in external store</strong>: <code>PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}</code></p>
+</li>
+<li>Atomically reserve the version for this staged manifest using put-if-not-exists</li>
+<li>The reservation selects one immutable staging object; it is not yet the canonical commit</li>
+<li>
+<p>If this operation fails due to conflict, another writer reserved this version</p>
+</li>
+<li>
+<p><strong>Finalize in object store</strong>: <code>COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest</code></p>
+</li>
+<li>Copy the staged manifest to the final path</li>
+<li>Successful materialization at this deterministic path is the commit point</li>
+<li>
+<p>This makes the manifest discoverable by readers unaware of the external store</p>
+</li>
+<li>
+<p><strong>Update external store pointer</strong>: <code>PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest</code></p>
+</li>
+<li>Update the external store to point to the finalized manifest path</li>
+<li>After copying, read the canonical object's current metadata. Return its ETag to the caller as
+     an opaque physical-generation observation so runtime caches do not collapse a newly committed
+     Dataset into an older cached Dataset at the same URI and version</li>
+<li>Do not persist that ETag in the external store. Concurrent finalizers can copy the same selected
+     immutable bytes into different physical generations, and COPY plus external-store publication
+     is not atomic. Every helper therefore publishes the same stable path-and-size tuple</li>
+<li>Completes the synchronization between external store and object storage</li>
+</ol>
+<p><strong>Fault Tolerance:</strong></p>
+<p>If the writer fails after step 2 but before step 3, the external store contains a pending
+reservation. Readers that use the external store detect this state and retry materialization.
+If step 3 succeeds but step 4 fails, the canonical object remains committed; readers use it and
+may repair the external index. Staging deletion is garbage collection and does not affect the
+commit outcome.</p>
+<p><strong>Rolling Upgrade:</strong></p>
+<p>Roll this behavior out normally across the fleet. New readers ignore legacy stored
+ETags, and legacy readers already accept finalized rows without an ETag, so mixed-version rows
+remain compatible. While both legacy finalizers and legacy readers remain, the pre-existing race
+can still republish a stale ETag that a legacy reader rejects. Full protection takes effect when
+the rolling upgrade converges; no row migration or quiesced cutover is required.</p>
+<h3 id="reader-process-with-external-store">Reader Process with External Store<a class="headerlink" href="#reader-process-with-external-store" title="Permanent link">&para;</a></h3>
+<p>The reader follows a validation and synchronization protocol:</p>
+<p><img alt="External Store Reader Process" src="../../../images/external_store_reader.gif" /></p>
+<ol>
+<li><strong>Query external store</strong>: <code>GET_EXTERNAL_STORE base_uri, version</code> → <code>path</code></li>
+<li>Retrieve the manifest path for the requested version</li>
+<li>If the path does not end with a UUID, validate the canonical object's size. Ignore any legacy
+     stored ETag because it is neither content identity nor dataset-incarnation identity; the
+     validation HEAD still returns the current canonical ETag to the caller</li>
+<li>
+<p>If the path ends with a UUID, synchronization is required</p>
+</li>
+<li>
+<p><strong>Synchronize to object store</strong>: <code>COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest</code></p>
+</li>
+<li>Attempt to finalize the staged manifest</li>
+<li>
+<p>This operation is idempotent</p>
+</li>
+<li>
+<p><strong>Update external store</strong>: <code>PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest</code></p>
+</li>
+<li>Best-effort record the finalized path and size without an ETag while returning the observed
+     destination ETag to the current caller</li>
+<li>
+<p>If this index repair fails, retain staging so a future reader can retry it</p>
+</li>
+<li>
+<p><strong>Return finalized path</strong>: Return <code>{dataset}/_versions/{version}.manifest</code></p>
+</li>
+<li>Return once canonical materialization succeeds, even if index repair or staging cleanup fails</li>
+<li>If canonical materialization cannot be established, or an observed size differs, return an error</li>
+</ol>
+<p>This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../versioning/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Versioning</div>
+        </a>
+        <a class="next" href="../layout/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Layout</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#transaction-overview">Transaction Overview</a>
+      <a class="ld-toc__h2" href="#commit-protocol">Commit Protocol</a>
+      <a class="ld-toc__h3" href="#storage-primitives">Storage Primitives</a>
+      <a class="ld-toc__h3" href="#manifest-naming-schemes">Manifest Naming Schemes</a>
+      <a class="ld-toc__h3" href="#transaction-files">Transaction Files</a>
+      <a class="ld-toc__h3" href="#commit-algorithm">Commit Algorithm</a>
+      <a class="ld-toc__h2" href="#transaction-types">Transaction Types</a>
+      <a class="ld-toc__h3" href="#append">Append</a>
+      <a class="ld-toc__h3" href="#delete">Delete</a>
+      <a class="ld-toc__h3" href="#overwrite">Overwrite</a>
+      <a class="ld-toc__h3" href="#createindex">CreateIndex</a>
+      <a class="ld-toc__h3" href="#rewrite">Rewrite</a>
+      <a class="ld-toc__h3" href="#merge">Merge</a>
+      <a class="ld-toc__h3" href="#project">Project</a>
+      <a class="ld-toc__h3" href="#restore">Restore</a>
+      <a class="ld-toc__h3" href="#reservefragments">ReserveFragments</a>
+      <a class="ld-toc__h3" href="#clone">Clone</a>
+      <a class="ld-toc__h3" href="#update">Update</a>
+      <a class="ld-toc__h3" href="#updateconfig">UpdateConfig</a>
+      <a class="ld-toc__h3" href="#datareplacement">DataReplacement</a>
+      <a class="ld-toc__h3" href="#dataoverlay">DataOverlay</a>
+      <a class="ld-toc__h3" href="#updatememwalstate">UpdateMemWalState</a>
+      <a class="ld-toc__h3" href="#updatebases">UpdateBases</a>
+      <a class="ld-toc__h2" href="#conflict-resolution">Conflict Resolution</a>
+      <a class="ld-toc__h3" href="#terminology">Terminology</a>
+      <a class="ld-toc__h3" href="#rebase-mechanism">Rebase Mechanism</a>
+      <a class="ld-toc__h3" href="#conflict-scenarios">Conflict Scenarios</a>
+      <a class="ld-toc__h2" href="#external-manifest-store">External Manifest Store</a>
+      <a class="ld-toc__h3" href="#commit-process-with-external-store">Commit Process with External Store</a>
+      <a class="ld-toc__h3" href="#reader-process-with-external-store">Reader Process with External Store</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

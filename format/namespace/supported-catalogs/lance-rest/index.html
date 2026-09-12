@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Lance REST Catalog — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/namespace/supported-catalogs/lance-rest/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../../index/scalar/btree/">BTree</a>
+    <a href="../../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../../index/scalar/label_list/">Label List</a>
+    <a href="../../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../../index/scalar/ngram/">N-gram</a>
+    <a href="../../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../">Overview</a>
+    <a href="../../object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../operations/">Overview</a>
+    <a href="../../operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../operations/models/">Operation Models</a>
+    <a href="../../operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../operations/models/Identity/">Identity</a>
+    <a href="../../operations/models/IndexContent/">IndexContent</a>
+    <a href="../../operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../operations/models/PartitionField/">PartitionField</a>
+    <a href="../../operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../operations/models/TableVersion/">TableVersion</a>
+    <a href="../../operations/models/TagContents/">TagContents</a>
+    <a href="../../operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../">Overview</a>
+    <a href="../lance-dir/">Lance Directory Catalog</a>
+    <a class="active" href="./">Lance REST Catalog</a>
+    <a href="../gravitino/">Apache Gravitino</a>
+    <a href="../hive2/">Apache Hive MetaStore V2</a>
+    <a href="../hive3/">Apache Hive MetaStore V3</a>
+    <a href="../iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../polaris/">Apache Polaris</a>
+    <a href="../glue/">AWS Glue</a>
+    <a href="../biglake/">Google BigLake</a>
+    <a href="../dataproc/">Google Dataproc</a>
+    <a href="../onelake/">Microsoft OneLake</a>
+    <a href="../unity/">Unity Catalog</a>
+    <a href="../template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Namespace Client Spec</span>
+        <span>/</span><span>Supported Catalogs</span>
+        <span>/</span><b>Lance REST Catalog</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-rest-catalog">Lance REST Catalog<a class="headerlink" href="#lance-rest-catalog" title="Permanent link">&para;</a></h1>
+<p>This document describes how the Lance REST Catalog implements the Lance Namespace Client operations.</p>
+<h2 id="background">Background<a class="headerlink" href="#background" title="Permanent link">&para;</a></h2>
+<p>The Lance REST Catalog provides access to Lance tables via a REST API. For details on the API design, endpoints, and data models, see the <a href="../../../catalog/rest/">Lance REST Catalog</a> specification.</p>
+<h2 id="implementation-configuration-properties">Implementation Configuration Properties<a class="headerlink" href="#implementation-configuration-properties" title="Permanent link">&para;</a></h2>
+<p>The Lance REST Catalog implementation accepts the following configuration properties:</p>
+<p>The <strong>uri</strong> property is required and specifies the URI endpoint for the REST API, for example <code>https://api.example.com/lance</code>.</p>
+<p>The <strong>delimiter</strong> property specifies the delimiter used to parse object string identifiers in REST routes. Defaults to <code>$</code>. Other examples include <code>::</code> or <code>__delim__</code>.</p>
+<p>Properties with the <strong>headers.</strong> prefix are passed as HTTP headers with every request to the REST server after removing the prefix. For example, <code>headers.Authorization</code> becomes the <code>Authorization</code> header. Common configurations include <code>headers.Authorization</code> for authentication tokens, <code>headers.X-API-Key</code> for API key authentication, and <code>headers.X-Request-ID</code> for request tracking.</p>
+<h2 id="object-mapping">Object Mapping<a class="headerlink" href="#object-mapping" title="Permanent link">&para;</a></h2>
+<h3 id="namespace">Namespace<a class="headerlink" href="#namespace" title="Permanent link">&para;</a></h3>
+<p>The <strong>root namespace</strong> is represented by the delimiter character itself in REST routes (e.g., <code>$</code>). All REST API calls are made relative to the base URI.</p>
+<p>A <strong>child namespace</strong> is managed by the REST server and accessed via namespace routes. The server is responsible for storing and organizing namespace metadata.</p>
+<p>The <strong>namespace identifier</strong> is a list of strings representing the namespace path. For example, a namespace <code>["prod", "analytics"]</code> is serialized to <code>prod$analytics</code> in the REST route path using the configured delimiter (default <code>$</code>).</p>
+<p><strong>Namespace properties</strong> are managed by the REST server and accessed via the DescribeNamespace operation.</p>
+<h3 id="table">Table<a class="headerlink" href="#table" title="Permanent link">&para;</a></h3>
+<p>A <strong>table</strong> is managed by the REST server. The server handles table storage, versioning, and metadata management.</p>
+<p>The <strong>table identifier</strong> is a list of strings representing the namespace path followed by the table name. For example, a table <code>["prod", "analytics", "users"]</code> represents a table named <code>users</code> in namespace <code>["prod", "analytics"]</code>. This is serialized to <code>prod$analytics$users</code> in the REST route path using the configured delimiter.</p>
+<p>The <strong>table location</strong> is managed by the REST server and returned in the DescribeTable response. This location points to where the Lance table data is stored (e.g., an S3 path).</p>
+<p><strong>Table properties</strong> are managed by the REST server and accessed via table operations.</p>
+<h2 id="lance-table-identification">Lance Table Identification<a class="headerlink" href="#lance-table-identification" title="Permanent link">&para;</a></h2>
+<p>In a REST Catalog, the server is responsible for managing Lance tables. The client identifies tables by their string identifier and delegates all table operations to the server.</p>
+<p>The server implementation must ensure that:</p>
+<ul>
+<li>Tables are stored as valid Lance table directories on the underlying storage</li>
+<li>The <code>location</code> field in DescribeTable response points to the Lance table root directory</li>
+<li>Table properties include any Lance-specific metadata required by the Lance SDK</li>
+</ul>
+<h2 id="basic-operations">Basic Operations<a class="headerlink" href="#basic-operations" title="Permanent link">&para;</a></h2>
+<h3 id="createnamespace">CreateNamespace<a class="headerlink" href="#createnamespace" title="Permanent link">&para;</a></h3>
+<p>Creates a new namespace.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>POST /v1/namespace/{id}/create
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body contains optional namespace properties:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Production analytics namespace"</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the namespace identifier from the route path <code>{id}</code></li>
+<li>Validate the request body format</li>
+<li>Check if the parent namespace exists (for nested namespaces)</li>
+<li>Check if a namespace with this identifier already exists</li>
+<li>Create the namespace in the server's storage</li>
+<li>Return the created namespace details</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"analytics"</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Production analytics namespace"</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the request body is malformed, return HTTP <code>400 Bad Request</code> with error code <code>13</code> (InvalidInput).</p>
+<p>If a namespace with the same identifier already exists, return HTTP <code>409 Conflict</code> with error code <code>2</code> (NamespaceAlreadyExists).</p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="listnamespaces">ListNamespaces<a class="headerlink" href="#listnamespaces" title="Permanent link">&para;</a></h3>
+<p>Lists child namespaces within a parent namespace.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>GET /v1/namespace/{id}/list?page_token=xxx&amp;limit=100
+</span></code></pre></div>
+<p>The <code>page_token</code> and <code>limit</code> query parameters support pagination.</p>
+<p>The implementation:</p>
+<ol>
+<li>Parse the parent namespace identifier from the route path <code>{id}</code></li>
+<li>Validate the parent namespace exists</li>
+<li>Query the server's storage for child namespaces</li>
+<li>Apply pagination using <code>page_token</code> and <code>limit</code></li>
+<li>Return the list of namespace names</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">"namespaces"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"analytics"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ml"</span><span class="p">,</span><span class="w"> </span><span class="s2">"reporting"</span><span class="p">],</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nt">"next_page_token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"abc123"</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The <code>next_page_token</code> field is only present if there are more results.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="describenamespace">DescribeNamespace<a class="headerlink" href="#describenamespace" title="Permanent link">&para;</a></h3>
+<p>Returns namespace metadata.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>POST /v1/namespace/{id}/describe
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body is empty:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the namespace identifier from the route path <code>{id}</code></li>
+<li>Look up the namespace in the server's storage</li>
+<li>Return the namespace name and properties</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="p">{</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"analytics"</span><span class="p">,</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">    </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Production analytics namespace"</span><span class="p">,</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">    </span><span class="nt">"created_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2024-01-15T10:30:00Z"</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="dropnamespace">DropNamespace<a class="headerlink" href="#dropnamespace" title="Permanent link">&para;</a></h3>
+<p>Removes a namespace.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>POST /v1/namespace/{id}/drop
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body is empty:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the namespace identifier from the route path <code>{id}</code></li>
+<li>Check that the namespace exists</li>
+<li>Check that the namespace is empty (no child namespaces or tables)</li>
+<li>Delete the namespace from the server's storage</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the namespace contains tables or child namespaces, return HTTP <code>409 Conflict</code> with error code <code>3</code> (NamespaceNotEmpty).</p>
+<h3 id="declaretable">DeclareTable<a class="headerlink" href="#declaretable" title="Permanent link">&para;</a></h3>
+<p>Declares a new Lance table, reserving the table name and location without creating actual data files.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>POST /v1/table/{id}/declare
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body contains an optional location:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="p">{</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the table identifier from the route path <code>{id}</code></li>
+<li>Extract the parent namespace from the identifier</li>
+<li>Validate the parent namespace exists</li>
+<li>Check if a table with this identifier already exists</li>
+<li>Determine the table location (use provided location or generate one)</li>
+<li>Reserve the table in the server's storage</li>
+<li>Register the table in the namespace</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="p">{</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span><span class="p">,</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">  </span><span class="nt">"storage_options"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="nt">"aws_access_key_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"..."</span><span class="p">,</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="nt">"aws_secret_access_key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"..."</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If a table with the same identifier already exists, return HTTP <code>409 Conflict</code> with error code <code>5</code> (TableAlreadyExists).</p>
+<p>If there is a concurrent creation attempt, return HTTP <code>409 Conflict</code> with error code <code>14</code> (ConcurrentModification).</p>
+<h3 id="listtables">ListTables<a class="headerlink" href="#listtables" title="Permanent link">&para;</a></h3>
+<p>Lists tables within a namespace.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>GET /v1/namespace/{id}/table/list?page_token=xxx&amp;limit=100
+</span></code></pre></div>
+<p>The <code>page_token</code> and <code>limit</code> query parameters support pagination.</p>
+<p>The implementation:</p>
+<ol>
+<li>Parse the namespace identifier from the route path <code>{id}</code></li>
+<li>Validate the namespace exists</li>
+<li>Query the server's storage for tables in the namespace</li>
+<li>Apply pagination using <code>page_token</code> and <code>limit</code></li>
+<li>Return the list of table names</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="p">{</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="w">  </span><span class="nt">"tables"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"users"</span><span class="p">,</span><span class="w"> </span><span class="s2">"orders"</span><span class="p">,</span><span class="w"> </span><span class="s2">"products"</span><span class="p">],</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">  </span><span class="nt">"next_page_token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"def456"</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The <code>next_page_token</code> field is only present if there are more results.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="describetable">DescribeTable<a class="headerlink" href="#describetable" title="Permanent link">&para;</a></h3>
+<p>Returns table metadata including schema and version.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>POST /v1/table/{id}/describe
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body can optionally specify a version:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="p">{</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the table identifier from the route path <code>{id}</code></li>
+<li>Extract the parent namespace from the identifier</li>
+<li>Validate the parent namespace exists</li>
+<li>Look up the table in the server's storage</li>
+<li>If <code>version</code> is specified, retrieve that specific version's metadata</li>
+<li>Return the table metadata</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="p">{</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"users"</span><span class="p">,</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span><span class="p">,</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="w">  </span><span class="nt">"schema"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-18-5"><a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a><span class="w">    </span><span class="nt">"fields"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-18-6"><a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="w">      </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"id"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"int64"</span><span class="p">},</span><span class="w"> </span><span class="nt">"nullable"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">},</span>
+</span><span id="__span-18-7"><a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="w">      </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"name"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="p">},</span><span class="w"> </span><span class="nt">"nullable"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}</span>
+</span><span id="__span-18-8"><a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a><span class="w">    </span><span class="p">]</span>
+</span><span id="__span-18-9"><a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a><span class="w">  </span><span class="p">},</span>
+</span><span id="__span-18-10"><a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span>
+</span><span id="__span-18-11"><a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If the specified version does not exist, return HTTP <code>404 Not Found</code> with error code <code>11</code> (TableVersionNotFound).</p>
+<h3 id="deregistertable">DeregisterTable<a class="headerlink" href="#deregistertable" title="Permanent link">&para;</a></h3>
+<p>Deregisters a table from the catalog while preserving its data on storage. The table metadata is removed from the catalog but the table files remain at their storage location.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>POST /v1/table/{id}/deregister
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body is empty:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the table identifier from the route path <code>{id}</code></li>
+<li>Extract the parent namespace from the identifier</li>
+<li>Validate the parent namespace exists</li>
+<li>Look up the table in the server's storage</li>
+<li>Remove the table registration from the catalog</li>
+<li>Return the table location and properties for reference</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="p">{</span>
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span><span class="p">,</span>
+</span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a><span class="w">  </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-21-4"><a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a><span class="w">    </span><span class="nt">"created_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2024-01-15T10:30:00Z"</span>
+</span><span id="__span-21-5"><a id="__codelineno-21-5" name="__codelineno-21-5" href="#__codelineno-21-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-21-6"><a id="__codelineno-21-6" name="__codelineno-21-6" href="#__codelineno-21-6"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<h2 id="additional-operations">Additional Operations<a class="headerlink" href="#additional-operations" title="Permanent link">&para;</a></h2>
+<p>The REST Catalog supports all operations defined in the <a href="../../operations/">Lance Namespace Client spec</a>. Each operation follows the same HTTP request/response pattern as the basic operations above.</p>
+<h3 id="droptable">DropTable<a class="headerlink" href="#droptable" title="Permanent link">&para;</a></h3>
+<p>Removes a table and its data.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a>POST /v1/table/{id}/drop
+</span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<p>The request body is empty:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-23-1"><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p>The implementation:</p>
+<ol>
+<li>Parse the table identifier from the route path <code>{id}</code></li>
+<li>Extract the parent namespace from the identifier</li>
+<li>Validate the parent namespace exists</li>
+<li>Look up the table in the server's storage</li>
+<li>Delete the table data from storage</li>
+<li>Remove the table registration from the catalog</li>
+</ol>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-24-1"><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a><span class="p">{}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If there is a storage permission error, return HTTP <code>403 Forbidden</code> with error code <code>15</code> (PermissionDenied).</p>
+<p>If there is an unexpected server error, return HTTP <code>500 Internal Server Error</code> with error code <code>18</code> (Internal).</p>
+<h3 id="registertable">RegisterTable<a class="headerlink" href="#registertable" title="Permanent link">&para;</a></h3>
+<p>Registers an existing Lance table at a given location.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-25-1"><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a>POST /v1/table/{id}/register
+</span><span id="__span-25-2"><a id="__codelineno-25-2" name="__codelineno-25-2" href="#__codelineno-25-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-26-1"><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="p">{</span>
+</span><span id="__span-26-2"><a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span>
+</span><span id="__span-26-3"><a id="__codelineno-26-3" name="__codelineno-26-3" href="#__codelineno-26-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<p>If a table with the same identifier already exists, return HTTP <code>409 Conflict</code> with error code <code>5</code> (TableAlreadyExists).</p>
+<p>If the location does not contain a valid Lance table, return HTTP <code>400 Bad Request</code> with error code <code>13</code> (InvalidInput).</p>
+<h3 id="renametable">RenameTable<a class="headerlink" href="#renametable" title="Permanent link">&para;</a></h3>
+<p>Renames a table, optionally moving it to a different namespace.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-27-1"><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a>POST /v1/table/{id}/rename
+</span><span id="__span-27-2"><a id="__codelineno-27-2" name="__codelineno-27-2" href="#__codelineno-27-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-28-1"><a id="__codelineno-28-1" name="__codelineno-28-1" href="#__codelineno-28-1"></a><span class="p">{</span>
+</span><span id="__span-28-2"><a id="__codelineno-28-2" name="__codelineno-28-2" href="#__codelineno-28-2"></a><span class="w">  </span><span class="nt">"new_id"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"new_namespace"</span><span class="p">,</span><span class="w"> </span><span class="s2">"new_table_name"</span><span class="p">]</span>
+</span><span id="__span-28-3"><a id="__codelineno-28-3" name="__codelineno-28-3" href="#__codelineno-28-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the source table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If a table with the new identifier already exists, return HTTP <code>409 Conflict</code> with error code <code>5</code> (TableAlreadyExists).</p>
+<p>If the target namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="createtableversion">CreateTableVersion<a class="headerlink" href="#createtableversion" title="Permanent link">&para;</a></h3>
+<p>Creates a new version entry for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-29-1"><a id="__codelineno-29-1" name="__codelineno-29-1" href="#__codelineno-29-1"></a>POST /v1/table/{id}/version/create
+</span><span id="__span-29-2"><a id="__codelineno-29-2" name="__codelineno-29-2" href="#__codelineno-29-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-30-1"><a id="__codelineno-30-1" name="__codelineno-30-1" href="#__codelineno-30-1"></a><span class="p">{</span>
+</span><span id="__span-30-2"><a id="__codelineno-30-2" name="__codelineno-30-2" href="#__codelineno-30-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-30-3"><a id="__codelineno-30-3" name="__codelineno-30-3" href="#__codelineno-30-3"></a><span class="w">  </span><span class="nt">"manifest_path"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance/_versions/staging-uuid.manifest"</span><span class="p">,</span>
+</span><span id="__span-30-4"><a id="__codelineno-30-4" name="__codelineno-30-4" href="#__codelineno-30-4"></a><span class="w">  </span><span class="nt">"naming_scheme"</span><span class="p">:</span><span class="w"> </span><span class="s2">"V2"</span>
+</span><span id="__span-30-5"><a id="__codelineno-30-5" name="__codelineno-30-5" href="#__codelineno-30-5"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If the version already exists, return HTTP <code>409 Conflict</code> with error code <code>12</code> (TableVersionAlreadyExists).</p>
+<h3 id="listtableversions">ListTableVersions<a class="headerlink" href="#listtableversions" title="Permanent link">&para;</a></h3>
+<p>Lists version entries for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-31-1"><a id="__codelineno-31-1" name="__codelineno-31-1" href="#__codelineno-31-1"></a>GET /v1/table/{id}/version/list?descending=true&amp;limit=100
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<h3 id="describetableversion">DescribeTableVersion<a class="headerlink" href="#describetableversion" title="Permanent link">&para;</a></h3>
+<p>Retrieves details for a specific table version.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-32-1"><a id="__codelineno-32-1" name="__codelineno-32-1" href="#__codelineno-32-1"></a>POST /v1/table/{id}/version/describe
+</span><span id="__span-32-2"><a id="__codelineno-32-2" name="__codelineno-32-2" href="#__codelineno-32-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-33-1"><a id="__codelineno-33-1" name="__codelineno-33-1" href="#__codelineno-33-1"></a><span class="p">{</span>
+</span><span id="__span-33-2"><a id="__codelineno-33-2" name="__codelineno-33-2" href="#__codelineno-33-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+</span><span id="__span-33-3"><a id="__codelineno-33-3" name="__codelineno-33-3" href="#__codelineno-33-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If the version does not exist, return HTTP <code>404 Not Found</code> with error code <code>11</code> (TableVersionNotFound).</p>
+<h3 id="batchcreatetableversions">BatchCreateTableVersions<a class="headerlink" href="#batchcreatetableversions" title="Permanent link">&para;</a></h3>
+<p>Atomically creates version entries for multiple tables.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-34-1"><a id="__codelineno-34-1" name="__codelineno-34-1" href="#__codelineno-34-1"></a>POST /v1/table/version/batch-create
+</span><span id="__span-34-2"><a id="__codelineno-34-2" name="__codelineno-34-2" href="#__codelineno-34-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-35-1"><a id="__codelineno-35-1" name="__codelineno-35-1" href="#__codelineno-35-1"></a><span class="p">{</span>
+</span><span id="__span-35-2"><a id="__codelineno-35-2" name="__codelineno-35-2" href="#__codelineno-35-2"></a><span class="w">  </span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-35-3"><a id="__codelineno-35-3" name="__codelineno-35-3" href="#__codelineno-35-3"></a><span class="w">    </span><span class="p">{</span>
+</span><span id="__span-35-4"><a id="__codelineno-35-4" name="__codelineno-35-4" href="#__codelineno-35-4"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"namespace"</span><span class="p">,</span><span class="w"> </span><span class="s2">"table1"</span><span class="p">],</span>
+</span><span id="__span-35-5"><a id="__codelineno-35-5" name="__codelineno-35-5" href="#__codelineno-35-5"></a><span class="w">      </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-35-6"><a id="__codelineno-35-6" name="__codelineno-35-6" href="#__codelineno-35-6"></a><span class="w">      </span><span class="nt">"manifest_path"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/table1.lance/_versions/staging-uuid.manifest"</span>
+</span><span id="__span-35-7"><a id="__codelineno-35-7" name="__codelineno-35-7" href="#__codelineno-35-7"></a><span class="w">    </span><span class="p">},</span>
+</span><span id="__span-35-8"><a id="__codelineno-35-8" name="__codelineno-35-8" href="#__codelineno-35-8"></a><span class="w">    </span><span class="p">{</span>
+</span><span id="__span-35-9"><a id="__codelineno-35-9" name="__codelineno-35-9" href="#__codelineno-35-9"></a><span class="w">      </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"namespace"</span><span class="p">,</span><span class="w"> </span><span class="s2">"table2"</span><span class="p">],</span>
+</span><span id="__span-35-10"><a id="__codelineno-35-10" name="__codelineno-35-10" href="#__codelineno-35-10"></a><span class="w">      </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+</span><span id="__span-35-11"><a id="__codelineno-35-11" name="__codelineno-35-11" href="#__codelineno-35-11"></a><span class="w">      </span><span class="nt">"manifest_path"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/table2.lance/_versions/staging-uuid.manifest"</span>
+</span><span id="__span-35-12"><a id="__codelineno-35-12" name="__codelineno-35-12" href="#__codelineno-35-12"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-35-13"><a id="__codelineno-35-13" name="__codelineno-35-13" href="#__codelineno-35-13"></a><span class="w">  </span><span class="p">]</span>
+</span><span id="__span-35-14"><a id="__codelineno-35-14" name="__codelineno-35-14" href="#__codelineno-35-14"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If any table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If any version already exists, return HTTP <code>409 Conflict</code> with error code <code>12</code> (TableVersionAlreadyExists).</p>
+<h3 id="batchdeletetableversions">BatchDeleteTableVersions<a class="headerlink" href="#batchdeletetableversions" title="Permanent link">&para;</a></h3>
+<p>Deletes multiple version entries for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-36-1"><a id="__codelineno-36-1" name="__codelineno-36-1" href="#__codelineno-36-1"></a>POST /v1/table/{id}/version/batch-delete
+</span><span id="__span-36-2"><a id="__codelineno-36-2" name="__codelineno-36-2" href="#__codelineno-36-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-37-1"><a id="__codelineno-37-1" name="__codelineno-37-1" href="#__codelineno-37-1"></a><span class="p">{</span>
+</span><span id="__span-37-2"><a id="__codelineno-37-2" name="__codelineno-37-2" href="#__codelineno-37-2"></a><span class="w">  </span><span class="nt">"versions"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">]</span>
+</span><span id="__span-37-3"><a id="__codelineno-37-3" name="__codelineno-37-3" href="#__codelineno-37-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return HTTP <code>404 Not Found</code> with error code <code>4</code> (TableNotFound).</p>
+<p>If any specified version does not exist and <code>ignore_missing</code> is false, return HTTP <code>404 Not Found</code> with error code <code>11</code> (TableVersionNotFound).</p>
+<h3 id="namespaceexists">NamespaceExists<a class="headerlink" href="#namespaceexists" title="Permanent link">&para;</a></h3>
+<p>Checks if a namespace exists.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-38-1"><a id="__codelineno-38-1" name="__codelineno-38-1" href="#__codelineno-38-1"></a>POST /v1/namespace/{id}/exists
+</span></code></pre></div>
+<h3 id="tableexists">TableExists<a class="headerlink" href="#tableexists" title="Permanent link">&para;</a></h3>
+<p>Checks if a table exists.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-39-1"><a id="__codelineno-39-1" name="__codelineno-39-1" href="#__codelineno-39-1"></a>POST /v1/table/{id}/exists
+</span></code></pre></div>
+<h3 id="listalltables">ListAllTables<a class="headerlink" href="#listalltables" title="Permanent link">&para;</a></h3>
+<p>Lists all tables across all namespaces.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-40-1"><a id="__codelineno-40-1" name="__codelineno-40-1" href="#__codelineno-40-1"></a>GET /v1/table/list?page_token=xxx&amp;limit=100
+</span></code></pre></div>
+<h3 id="restoretable">RestoreTable<a class="headerlink" href="#restoretable" title="Permanent link">&para;</a></h3>
+<p>Restores a table to a previous version.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-41-1"><a id="__codelineno-41-1" name="__codelineno-41-1" href="#__codelineno-41-1"></a>POST /v1/table/{id}/restore
+</span><span id="__span-41-2"><a id="__codelineno-41-2" name="__codelineno-41-2" href="#__codelineno-41-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-42-1"><a id="__codelineno-42-1" name="__codelineno-42-1" href="#__codelineno-42-1"></a><span class="p">{</span>
+</span><span id="__span-42-2"><a id="__codelineno-42-2" name="__codelineno-42-2" href="#__codelineno-42-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span>
+</span><span id="__span-42-3"><a id="__codelineno-42-3" name="__codelineno-42-3" href="#__codelineno-42-3"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="createtable">CreateTable<a class="headerlink" href="#createtable" title="Permanent link">&para;</a></h3>
+<p>Creates a new table with initial data.</p>
+<p>For REST namespace, <code>CreateTableRequest</code> fields are passed as follows:</p>
+<ul>
+<li><code>id</code>: path parameter</li>
+<li><code>mode</code>: query parameter</li>
+<li><code>properties</code>: a single JSON-encoded query parameter such as
+  <code>properties={"user":"alice","team":"eng"}</code>; these are business logic properties managed
+  by the namespace implementation outside Lance context</li>
+<li><code>storage_options</code>: a single JSON-encoded query parameter such as
+  <code>storage_options={"aws_region":"us-east-1","timeout":"30s"}</code>; these configure write-time
+  overrides for data and metadata written during table creation</li>
+</ul>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-43-1"><a id="__codelineno-43-1" name="__codelineno-43-1" href="#__codelineno-43-1"></a>POST /v1/table/{id}/create
+</span><span id="__span-43-2"><a id="__codelineno-43-2" name="__codelineno-43-2" href="#__codelineno-43-2"></a>Content-Type: application/vnd.apache.arrow.stream
+</span></code></pre></div>
+<p><strong>Response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-44-1"><a id="__codelineno-44-1" name="__codelineno-44-1" href="#__codelineno-44-1"></a><span class="p">{</span>
+</span><span id="__span-44-2"><a id="__codelineno-44-2" name="__codelineno-44-2" href="#__codelineno-44-2"></a><span class="w">  </span><span class="nt">"location"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s3://bucket/data/users.lance"</span><span class="p">,</span>
+</span><span id="__span-44-3"><a id="__codelineno-44-3" name="__codelineno-44-3" href="#__codelineno-44-3"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-44-4"><a id="__codelineno-44-4" name="__codelineno-44-4" href="#__codelineno-44-4"></a><span class="w">  </span><span class="nt">"storage_options"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-44-5"><a id="__codelineno-44-5" name="__codelineno-44-5" href="#__codelineno-44-5"></a><span class="w">    </span><span class="nt">"aws_region"</span><span class="p">:</span><span class="w"> </span><span class="s2">"us-east-1"</span>
+</span><span id="__span-44-6"><a id="__codelineno-44-6" name="__codelineno-44-6" href="#__codelineno-44-6"></a><span class="w">  </span><span class="p">},</span>
+</span><span id="__span-44-7"><a id="__codelineno-44-7" name="__codelineno-44-7" href="#__codelineno-44-7"></a><span class="w">  </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-44-8"><a id="__codelineno-44-8" name="__codelineno-44-8" href="#__codelineno-44-8"></a><span class="w">    </span><span class="nt">"user"</span><span class="p">:</span><span class="w"> </span><span class="s2">"alice"</span>
+</span><span id="__span-44-9"><a id="__codelineno-44-9" name="__codelineno-44-9" href="#__codelineno-44-9"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-44-10"><a id="__codelineno-44-10" name="__codelineno-44-10" href="#__codelineno-44-10"></a><span class="p">}</span>
+</span></code></pre></div>
+<h3 id="gettablestats">GetTableStats<a class="headerlink" href="#gettablestats" title="Permanent link">&para;</a></h3>
+<p>Returns statistics for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-45-1"><a id="__codelineno-45-1" name="__codelineno-45-1" href="#__codelineno-45-1"></a>POST /v1/table/{id}/stats
+</span></code></pre></div>
+<h3 id="updatetableschemametadata">UpdateTableSchemaMetadata<a class="headerlink" href="#updatetableschemametadata" title="Permanent link">&para;</a></h3>
+<p>Updates schema-level metadata for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-46-1"><a id="__codelineno-46-1" name="__codelineno-46-1" href="#__codelineno-46-1"></a>POST /v1/table/{id}/schema/metadata
+</span><span id="__span-46-2"><a id="__codelineno-46-2" name="__codelineno-46-2" href="#__codelineno-46-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="altertableaddcolumns">AlterTableAddColumns<a class="headerlink" href="#altertableaddcolumns" title="Permanent link">&para;</a></h3>
+<p>Adds new columns to a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-47-1"><a id="__codelineno-47-1" name="__codelineno-47-1" href="#__codelineno-47-1"></a>POST /v1/table/{id}/add_columns
+</span><span id="__span-47-2"><a id="__codelineno-47-2" name="__codelineno-47-2" href="#__codelineno-47-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="altertablealtercolumns">AlterTableAlterColumns<a class="headerlink" href="#altertablealtercolumns" title="Permanent link">&para;</a></h3>
+<p>Modifies existing columns in a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-48-1"><a id="__codelineno-48-1" name="__codelineno-48-1" href="#__codelineno-48-1"></a>POST /v1/table/{id}/alter_columns
+</span><span id="__span-48-2"><a id="__codelineno-48-2" name="__codelineno-48-2" href="#__codelineno-48-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="altertablebackfillcolumns">AlterTableBackfillColumns<a class="headerlink" href="#altertablebackfillcolumns" title="Permanent link">&para;</a></h3>
+<p>Triggers an async backfill job for a computed column.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-49-1"><a id="__codelineno-49-1" name="__codelineno-49-1" href="#__codelineno-49-1"></a>POST /v1/table/{id}/backfill_column
+</span><span id="__span-49-2"><a id="__codelineno-49-2" name="__codelineno-49-2" href="#__codelineno-49-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="altertabledropcolumns">AlterTableDropColumns<a class="headerlink" href="#altertabledropcolumns" title="Permanent link">&para;</a></h3>
+<p>Removes columns from a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-50-1"><a id="__codelineno-50-1" name="__codelineno-50-1" href="#__codelineno-50-1"></a>POST /v1/table/{id}/drop_columns
+</span><span id="__span-50-2"><a id="__codelineno-50-2" name="__codelineno-50-2" href="#__codelineno-50-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="refreshmaterializedview">RefreshMaterializedView<a class="headerlink" href="#refreshmaterializedview" title="Permanent link">&para;</a></h3>
+<p>Triggers an async materialized view refresh.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-51-1"><a id="__codelineno-51-1" name="__codelineno-51-1" href="#__codelineno-51-1"></a>POST /v1/table/{id}/refresh
+</span><span id="__span-51-2"><a id="__codelineno-51-2" name="__codelineno-51-2" href="#__codelineno-51-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="insertintotable">InsertIntoTable<a class="headerlink" href="#insertintotable" title="Permanent link">&para;</a></h3>
+<p>Inserts data into a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-52-1"><a id="__codelineno-52-1" name="__codelineno-52-1" href="#__codelineno-52-1"></a>POST /v1/table/{id}/insert
+</span><span id="__span-52-2"><a id="__codelineno-52-2" name="__codelineno-52-2" href="#__codelineno-52-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="mergeinsertintotable">MergeInsertIntoTable<a class="headerlink" href="#mergeinsertintotable" title="Permanent link">&para;</a></h3>
+<p>Performs a merge insert (upsert) operation.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-53-1"><a id="__codelineno-53-1" name="__codelineno-53-1" href="#__codelineno-53-1"></a>POST /v1/table/{id}/merge-insert
+</span><span id="__span-53-2"><a id="__codelineno-53-2" name="__codelineno-53-2" href="#__codelineno-53-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="updatetable">UpdateTable<a class="headerlink" href="#updatetable" title="Permanent link">&para;</a></h3>
+<p>Updates rows in a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-54-1"><a id="__codelineno-54-1" name="__codelineno-54-1" href="#__codelineno-54-1"></a>POST /v1/table/{id}/update
+</span><span id="__span-54-2"><a id="__codelineno-54-2" name="__codelineno-54-2" href="#__codelineno-54-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="deletefromtable">DeleteFromTable<a class="headerlink" href="#deletefromtable" title="Permanent link">&para;</a></h3>
+<p>Deletes rows from a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-55-1"><a id="__codelineno-55-1" name="__codelineno-55-1" href="#__codelineno-55-1"></a>POST /v1/table/{id}/delete
+</span><span id="__span-55-2"><a id="__codelineno-55-2" name="__codelineno-55-2" href="#__codelineno-55-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="querytable">QueryTable<a class="headerlink" href="#querytable" title="Permanent link">&para;</a></h3>
+<p>Queries data from a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-56-1"><a id="__codelineno-56-1" name="__codelineno-56-1" href="#__codelineno-56-1"></a>POST /v1/table/{id}/query
+</span><span id="__span-56-2"><a id="__codelineno-56-2" name="__codelineno-56-2" href="#__codelineno-56-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="counttablerows">CountTableRows<a class="headerlink" href="#counttablerows" title="Permanent link">&para;</a></h3>
+<p>Counts rows in a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-57-1"><a id="__codelineno-57-1" name="__codelineno-57-1" href="#__codelineno-57-1"></a>POST /v1/table/{id}/count
+</span><span id="__span-57-2"><a id="__codelineno-57-2" name="__codelineno-57-2" href="#__codelineno-57-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="explaintablequeryplan">ExplainTableQueryPlan<a class="headerlink" href="#explaintablequeryplan" title="Permanent link">&para;</a></h3>
+<p>Returns the query execution plan.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-58-1"><a id="__codelineno-58-1" name="__codelineno-58-1" href="#__codelineno-58-1"></a>POST /v1/table/{id}/query/explain
+</span><span id="__span-58-2"><a id="__codelineno-58-2" name="__codelineno-58-2" href="#__codelineno-58-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="analyzetablequeryplan">AnalyzeTableQueryPlan<a class="headerlink" href="#analyzetablequeryplan" title="Permanent link">&para;</a></h3>
+<p>Analyzes the query execution plan with statistics.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-59-1"><a id="__codelineno-59-1" name="__codelineno-59-1" href="#__codelineno-59-1"></a>POST /v1/table/{id}/query/analyze
+</span><span id="__span-59-2"><a id="__codelineno-59-2" name="__codelineno-59-2" href="#__codelineno-59-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="createtableindex">CreateTableIndex<a class="headerlink" href="#createtableindex" title="Permanent link">&para;</a></h3>
+<p>Creates a vector index on a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-60-1"><a id="__codelineno-60-1" name="__codelineno-60-1" href="#__codelineno-60-1"></a>POST /v1/table/{id}/index/create
+</span><span id="__span-60-2"><a id="__codelineno-60-2" name="__codelineno-60-2" href="#__codelineno-60-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="createtablescalarindex">CreateTableScalarIndex<a class="headerlink" href="#createtablescalarindex" title="Permanent link">&para;</a></h3>
+<p>Creates a scalar index on a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-61-1"><a id="__codelineno-61-1" name="__codelineno-61-1" href="#__codelineno-61-1"></a>POST /v1/table/{id}/index/create-scalar
+</span><span id="__span-61-2"><a id="__codelineno-61-2" name="__codelineno-61-2" href="#__codelineno-61-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="listtableindices">ListTableIndices<a class="headerlink" href="#listtableindices" title="Permanent link">&para;</a></h3>
+<p>Lists all indices on a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-62-1"><a id="__codelineno-62-1" name="__codelineno-62-1" href="#__codelineno-62-1"></a>GET /v1/table/{id}/index/list
+</span></code></pre></div>
+<h3 id="describetableindexstats">DescribeTableIndexStats<a class="headerlink" href="#describetableindexstats" title="Permanent link">&para;</a></h3>
+<p>Returns statistics for a table index.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-63-1"><a id="__codelineno-63-1" name="__codelineno-63-1" href="#__codelineno-63-1"></a>POST /v1/table/{id}/index/{index_name}/stats
+</span></code></pre></div>
+<h3 id="droptableindex">DropTableIndex<a class="headerlink" href="#droptableindex" title="Permanent link">&para;</a></h3>
+<p>Removes an index from a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-64-1"><a id="__codelineno-64-1" name="__codelineno-64-1" href="#__codelineno-64-1"></a>POST /v1/table/{id}/index/{index_name}/drop
+</span></code></pre></div>
+<h3 id="listtabletags">ListTableTags<a class="headerlink" href="#listtabletags" title="Permanent link">&para;</a></h3>
+<p>Lists all tags for a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-65-1"><a id="__codelineno-65-1" name="__codelineno-65-1" href="#__codelineno-65-1"></a>GET /v1/table/{id}/tag/list
+</span></code></pre></div>
+<h3 id="gettabletagversion">GetTableTagVersion<a class="headerlink" href="#gettabletagversion" title="Permanent link">&para;</a></h3>
+<p>Gets the version associated with a tag.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-66-1"><a id="__codelineno-66-1" name="__codelineno-66-1" href="#__codelineno-66-1"></a>POST /v1/table/{id}/tag/{tag_name}/describe
+</span></code></pre></div>
+<h3 id="createtabletag">CreateTableTag<a class="headerlink" href="#createtabletag" title="Permanent link">&para;</a></h3>
+<p>Creates a new tag for a table version.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-67-1"><a id="__codelineno-67-1" name="__codelineno-67-1" href="#__codelineno-67-1"></a>POST /v1/table/{id}/tag/create
+</span><span id="__span-67-2"><a id="__codelineno-67-2" name="__codelineno-67-2" href="#__codelineno-67-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="deletetabletag">DeleteTableTag<a class="headerlink" href="#deletetabletag" title="Permanent link">&para;</a></h3>
+<p>Deletes a tag from a table.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-68-1"><a id="__codelineno-68-1" name="__codelineno-68-1" href="#__codelineno-68-1"></a>POST /v1/table/{id}/tag/{tag_name}/delete
+</span></code></pre></div>
+<h3 id="updatetabletag">UpdateTableTag<a class="headerlink" href="#updatetabletag" title="Permanent link">&para;</a></h3>
+<p>Updates a tag to point to a different version.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-69-1"><a id="__codelineno-69-1" name="__codelineno-69-1" href="#__codelineno-69-1"></a>POST /v1/table/{id}/tag/{tag_name}/update
+</span><span id="__span-69-2"><a id="__codelineno-69-2" name="__codelineno-69-2" href="#__codelineno-69-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h3 id="describetransaction">DescribeTransaction<a class="headerlink" href="#describetransaction" title="Permanent link">&para;</a></h3>
+<p>Returns details about a transaction.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-70-1"><a id="__codelineno-70-1" name="__codelineno-70-1" href="#__codelineno-70-1"></a>POST /v1/transaction/{id}/describe
+</span></code></pre></div>
+<h3 id="altertransaction">AlterTransaction<a class="headerlink" href="#altertransaction" title="Permanent link">&para;</a></h3>
+<p>Modifies a transaction's state.</p>
+<p><strong>HTTP Request:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-71-1"><a id="__codelineno-71-1" name="__codelineno-71-1" href="#__codelineno-71-1"></a>POST /v1/transaction/{id}/alter
+</span><span id="__span-71-2"><a id="__codelineno-71-2" name="__codelineno-71-2" href="#__codelineno-71-2"></a>Content-Type: application/json
+</span></code></pre></div>
+<h2 id="error-response-format">Error Response Format<a class="headerlink" href="#error-response-format" title="Permanent link">&para;</a></h2>
+<p>All error responses follow the JSON error response model based on <a href="https://datatracker.ietf.org/doc/html/rfc7807">RFC-7807</a>.</p>
+<p>The response body contains an <a href="../../operations/models/ErrorResponse/">ErrorResponse</a> with a <code>code</code> field containing the Lance Namespace error code. See <a href="../../operations/errors/">Error Handling</a> for the complete list of error codes.</p>
+<p><strong>Example error response:</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-72-1"><a id="__codelineno-72-1" name="__codelineno-72-1" href="#__codelineno-72-1"></a><span class="p">{</span>
+</span><span id="__span-72-2"><a id="__codelineno-72-2" name="__codelineno-72-2" href="#__codelineno-72-2"></a><span class="w">  </span><span class="nt">"error"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Table 'users' not found in namespace 'production'"</span><span class="p">,</span>
+</span><span id="__span-72-3"><a id="__codelineno-72-3" name="__codelineno-72-3" href="#__codelineno-72-3"></a><span class="w">  </span><span class="nt">"code"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-72-4"><a id="__codelineno-72-4" name="__codelineno-72-4" href="#__codelineno-72-4"></a><span class="w">  </span><span class="nt">"detail"</span><span class="p">:</span><span class="w"> </span><span class="s2">"java.lang.RuntimeException: Table not found\n\tat com.example.TableService.describe(TableService.java:42)\n\tat ..."</span><span class="p">,</span>
+</span><span id="__span-72-5"><a id="__codelineno-72-5" name="__codelineno-72-5" href="#__codelineno-72-5"></a><span class="w">  </span><span class="nt">"instance"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/v1/table/production$users/describe"</span>
+</span><span id="__span-72-6"><a id="__codelineno-72-6" name="__codelineno-72-6" href="#__codelineno-72-6"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The <code>detail</code> field contains detailed error information such as stack traces for debugging purposes.</p>
+<h2 id="error-code-to-http-status-mapping">Error Code to HTTP Status Mapping<a class="headerlink" href="#error-code-to-http-status-mapping" title="Permanent link">&para;</a></h2>
+<p>REST Catalog implementations must map Lance error codes to HTTP status codes as follows:</p>
+<ul>
+<li>Error code <code>0</code> (Unsupported) maps to HTTP <code>406 Not Acceptable</code></li>
+<li>Error codes <code>1</code>, <code>4</code>, <code>6</code>, <code>8</code>, <code>10</code>, <code>11</code>, <code>12</code> (not found errors) map to HTTP <code>404 Not Found</code></li>
+<li>Error codes <code>2</code>, <code>3</code>, <code>5</code>, <code>7</code>, <code>9</code>, <code>14</code>, <code>19</code> (conflict errors) map to HTTP <code>409 Conflict</code></li>
+<li>Error codes <code>13</code>, <code>20</code> (input validation errors) map to HTTP <code>400 Bad Request</code></li>
+<li>Error code <code>15</code> (PermissionDenied) maps to HTTP <code>403 Forbidden</code></li>
+<li>Error code <code>16</code> (Unauthenticated) maps to HTTP <code>401 Unauthorized</code></li>
+<li>Error code <code>17</code> (ServiceUnavailable) maps to HTTP <code>503 Service Unavailable</code></li>
+<li>Error code <code>18</code> (Internal) maps to HTTP <code>500 Internal Server Error</code></li>
+<li>Error code <code>21</code> (Throttling) maps to HTTP <code>429 Too Many Requests</code></li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../lance-dir/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Lance Directory Catalog</div>
+        </a>
+        <a class="next" href="../gravitino/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Apache Gravitino</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#background">Background</a>
+      <a class="ld-toc__h2" href="#implementation-configuration-properties">Implementation Configuration Properties</a>
+      <a class="ld-toc__h2" href="#object-mapping">Object Mapping</a>
+      <a class="ld-toc__h3" href="#namespace">Namespace</a>
+      <a class="ld-toc__h3" href="#table">Table</a>
+      <a class="ld-toc__h2" href="#lance-table-identification">Lance Table Identification</a>
+      <a class="ld-toc__h2" href="#basic-operations">Basic Operations</a>
+      <a class="ld-toc__h3" href="#createnamespace">CreateNamespace</a>
+      <a class="ld-toc__h3" href="#listnamespaces">ListNamespaces</a>
+      <a class="ld-toc__h3" href="#describenamespace">DescribeNamespace</a>
+      <a class="ld-toc__h3" href="#dropnamespace">DropNamespace</a>
+      <a class="ld-toc__h3" href="#declaretable">DeclareTable</a>
+      <a class="ld-toc__h3" href="#listtables">ListTables</a>
+      <a class="ld-toc__h3" href="#describetable">DescribeTable</a>
+      <a class="ld-toc__h3" href="#deregistertable">DeregisterTable</a>
+      <a class="ld-toc__h2" href="#additional-operations">Additional Operations</a>
+      <a class="ld-toc__h3" href="#droptable">DropTable</a>
+      <a class="ld-toc__h3" href="#registertable">RegisterTable</a>
+      <a class="ld-toc__h3" href="#renametable">RenameTable</a>
+      <a class="ld-toc__h3" href="#createtableversion">CreateTableVersion</a>
+      <a class="ld-toc__h3" href="#listtableversions">ListTableVersions</a>
+      <a class="ld-toc__h3" href="#describetableversion">DescribeTableVersion</a>
+      <a class="ld-toc__h3" href="#batchcreatetableversions">BatchCreateTableVersions</a>
+      <a class="ld-toc__h3" href="#batchdeletetableversions">BatchDeleteTableVersions</a>
+      <a class="ld-toc__h3" href="#namespaceexists">NamespaceExists</a>
+      <a class="ld-toc__h3" href="#tableexists">TableExists</a>
+      <a class="ld-toc__h3" href="#listalltables">ListAllTables</a>
+      <a class="ld-toc__h3" href="#restoretable">RestoreTable</a>
+      <a class="ld-toc__h3" href="#createtable">CreateTable</a>
+      <a class="ld-toc__h3" href="#gettablestats">GetTableStats</a>
+      <a class="ld-toc__h3" href="#updatetableschemametadata">UpdateTableSchemaMetadata</a>
+      <a class="ld-toc__h3" href="#altertableaddcolumns">AlterTableAddColumns</a>
+      <a class="ld-toc__h3" href="#altertablealtercolumns">AlterTableAlterColumns</a>
+      <a class="ld-toc__h3" href="#altertablebackfillcolumns">AlterTableBackfillColumns</a>
+      <a class="ld-toc__h3" href="#altertabledropcolumns">AlterTableDropColumns</a>
+      <a class="ld-toc__h3" href="#refreshmaterializedview">RefreshMaterializedView</a>
+      <a class="ld-toc__h3" href="#insertintotable">InsertIntoTable</a>
+      <a class="ld-toc__h3" href="#mergeinsertintotable">MergeInsertIntoTable</a>
+      <a class="ld-toc__h3" href="#updatetable">UpdateTable</a>
+      <a class="ld-toc__h3" href="#deletefromtable">DeleteFromTable</a>
+      <a class="ld-toc__h3" href="#querytable">QueryTable</a>
+      <a class="ld-toc__h3" href="#counttablerows">CountTableRows</a>
+      <a class="ld-toc__h3" href="#explaintablequeryplan">ExplainTableQueryPlan</a>
+      <a class="ld-toc__h3" href="#analyzetablequeryplan">AnalyzeTableQueryPlan</a>
+      <a class="ld-toc__h3" href="#createtableindex">CreateTableIndex</a>
+      <a class="ld-toc__h3" href="#createtablescalarindex">CreateTableScalarIndex</a>
+      <a class="ld-toc__h3" href="#listtableindices">ListTableIndices</a>
+      <a class="ld-toc__h3" href="#describetableindexstats">DescribeTableIndexStats</a>
+      <a class="ld-toc__h3" href="#droptableindex">DropTableIndex</a>
+      <a class="ld-toc__h3" href="#listtabletags">ListTableTags</a>
+      <a class="ld-toc__h3" href="#gettabletagversion">GetTableTagVersion</a>
+      <a class="ld-toc__h3" href="#createtabletag">CreateTableTag</a>
+      <a class="ld-toc__h3" href="#deletetabletag">DeleteTableTag</a>
+      <a class="ld-toc__h3" href="#updatetabletag">UpdateTableTag</a>
+      <a class="ld-toc__h3" href="#describetransaction">DescribeTransaction</a>
+      <a class="ld-toc__h3" href="#altertransaction">AlterTransaction</a>
+      <a class="ld-toc__h2" href="#error-response-format">Error Response Format</a>
+      <a class="ld-toc__h2" href="#error-code-to-http-status-mapping">Error Code to HTTP Status Mapping</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>
