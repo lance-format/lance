@@ -903,7 +903,7 @@ class LanceFragment(pa.dataset.Fragment):
         """
         Update existing columns in this fragment.
 
-        This operation performs a left-outer-hash-join with the right table (new data)
+        This operation performs a left-outer join with the right table (new data)
         on the column specified by left_on and right_on. For every row in the current
         fragment, the updated column value is:
 
@@ -994,6 +994,7 @@ class LanceFragment(pa.dataset.Fragment):
         - The columns to update must already exist in the fragment
         - The join column (left_on/right_on) will not be updated
         - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - Large update inputs may use temporary spill storage
         - This is a low-level API; for most use cases, use Dataset.update() instead
         """
         if right_on is None:

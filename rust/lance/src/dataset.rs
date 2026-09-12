@@ -111,6 +111,7 @@ pub mod transaction {
     };
 }
 pub mod udtf;
+mod update_join;
 pub mod updater;
 mod utils;
 pub(crate) mod versions;

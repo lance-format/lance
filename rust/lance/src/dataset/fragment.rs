@@ -13,10 +13,9 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Array, RecordBatch, RecordBatchOptions, RecordBatchReader, StructArray, UInt32Array,
-    UInt64Array, new_null_array,
+    RecordBatch, RecordBatchOptions, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+    new_null_array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
@@ -27,7 +26,6 @@ use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{
     BlobHandling, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
@@ -75,7 +73,6 @@ use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
-use crate::dataset::utils::SchemaAdapter;
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -2069,174 +2066,14 @@ impl FileFragment {
         left_on: &str,
         right_on: &str,
     ) -> Result<FragmentUpdateColumnsResult> {
-        if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the left side fragment",
-                left_on
-            )));
-        };
-        let right_stream = Box::new(right_stream);
-        let right_schema = right_stream.schema();
-        if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(format!(
-                "Column {} does not exist in the right side fragment",
-                right_on
-            )));
-        };
-        let write_schema = right_schema.as_ref().without_column(right_on);
-        for field in write_schema.fields() {
-            if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
-                return Err(Error::invalid_input(format!(
-                    "Column {} is a reversed metadata column and cannot be updated",
-                    field.name()
-                )));
-            }
-            if self.schema().field(field.name()).is_none() {
-                return Err(Error::invalid_input(format!(
-                    "Column {} in right side fragment does not exist in left side fragment",
-                    field.name()
-                )));
-            }
-        }
-
-        let write_schema = self.schema().project_by_schema(
-            &write_schema,
-            OnMissing::Error,
-            OnTypeMismatch::Error,
-        )?;
-        // Prepare the read projection: align with the write_schema's columns and append the left_on column.
-        let mut read_columns: Vec<String> =
-            write_schema.fields.iter().map(|f| f.name.clone()).collect();
-        read_columns.push(left_on.to_string());
-        // Physical positions for matched rows are taken from `_rowaddr` (fragment id + row offset).
-        // The updater scans live rows in physical order; `_rowaddr` encodes the slot index used by row-level version metadata.
-        if !read_columns.iter().any(|n| n.as_str() == ROW_ADDR) {
-            read_columns.push(ROW_ADDR.to_string());
-        }
-        let selected_field_ids = read_columns
-            .iter()
-            .filter_map(|column| self.schema().field(column))
-            .map(|field| field.id)
-            .collect::<Vec<_>>();
-        let descriptor_blob_ids = self
-            .schema()
-            .project_by_ids(&selected_field_ids, true)
-            .fields_pre_order()
-            .filter(|field| field.is_blob_v2())
-            .filter_map(|field| u32::try_from(field.id).ok())
-            .collect::<HashSet<_>>();
-        let has_blob_v2 = !descriptor_blob_ids.is_empty();
-        let blob_handling = has_blob_v2.then(|| {
-            let materialized_blob_ids = self
-                .schema()
-                .fields_pre_order()
-                .filter(|field| field.is_blob())
-                .filter_map(|field| u32::try_from(field.id).ok())
-                .filter(|field_id| !descriptor_blob_ids.contains(field_id))
-                .collect();
-            BlobHandling::SomeBlobsBinary(materialized_blob_ids)
-        });
-        let mut updater = self
-            .updater(
-                Some(&read_columns),
-                Some((write_schema.clone(), self.schema().clone())),
-                None,
-                blob_handling,
-            )
-            .await?;
-        if has_blob_v2 {
-            updater.allow_external_blob_outside_bases();
-        }
-        let external_base_resolver = if has_blob_v2 {
-            super::write::blob_v2_external_base_resolver(
-                Some(self.dataset()),
-                &WriteParams::default(),
-                &write_schema,
-            )
-            .await?
-        } else {
-            None
-        };
-        // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
-        // Convert the right stream from its logical form (Arrow JSON, view types)
-        // to the physical form stored on disk so it matches the fragment's left batch.
-        let right_stream =
-            SchemaAdapter::new(right_schema.clone()).to_physical_reader(right_stream);
-        let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
-        let mut matched_offsets = RoaringBitmap::new();
-        let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
-            Error::invalid_input(format!(
-                "Fragment id {} does not fit RowAddress fragment id",
-                self.metadata.id
-            ))
-        })?;
-        while let Some(batch) = updater.next().await? {
-            let batch = if has_blob_v2 {
-                crate::dataset::optimize::transform_blob_v2_batch(
-                    &self.dataset,
-                    self.schema(),
-                    batch.clone(),
-                    true,
-                )
-                .await?
-            } else {
-                batch.clone()
-            };
-            let index_column = batch[left_on].clone();
-            let matched = joiner.matched_join_rows(index_column.clone())?;
-            if let Some(addr_col) = batch.column_by_name(ROW_ADDR) {
-                let addrs = as_primitive_array::<UInt64Type>(addr_col.as_ref());
-                for (row_idx, &is_matched) in matched.iter().enumerate().take(batch.num_rows()) {
-                    if !is_matched || addrs.is_null(row_idx) {
-                        continue;
-                    }
-                    let addr = RowAddress::from(addrs.value(row_idx));
-                    if addr.fragment_id() == frag_id_u32 {
-                        matched_offsets.insert(addr.row_offset());
-                    }
-                }
-            }
-            let updated_batch = joiner
-                .collect_with_fallback(&batch, index_column, self.dataset())
-                .await?;
-            if let Some(resolver) = external_base_resolver.as_deref() {
-                super::blob::validate_external_blob_references(resolver, &updated_batch, &matched)
-                    .await?;
-            }
-            updater.update(updated_batch).await?;
-        }
-
-        let mut updated_fragment = updater.finish().await?;
-        // Mark fields in updated data files as obsolete ("tombstone").
-        let updated_fields = updated_fragment.files.last().unwrap().fields.clone();
-        for data_file in &mut updated_fragment.files.iter_mut().rev().skip(1) {
-            let new_fields: Arc<[i32]> = data_file
-                .fields
-                .iter()
-                .map(|field| {
-                    if updated_fields.contains(field) {
-                        -2 // Tombstone
-                    } else {
-                        *field
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into();
-            data_file.fields = new_fields;
-        }
-        // Remove data files that have become entirely tombstoned.
-        updated_fragment
-            .files
-            .retain(|data_file| data_file.fields.iter().any(|&field| field != -2));
-        let updated_fields = updated_fields
-            .iter()
-            .filter_map(|&i| u32::try_from(i).ok())
-            .collect();
-        Ok(FragmentUpdateColumnsResult {
-            fragment: updated_fragment,
-            fields_modified: updated_fields,
-            matched_offsets,
-        })
+        super::update_join::update_columns_with_options(
+            self,
+            Box::new(right_stream),
+            left_on,
+            right_on,
+            Default::default(),
+        )
+        .await
     }
 
     /// Append new columns to the fragment
@@ -3598,6 +3435,7 @@ impl FragmentReader {
 mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
     };
