@@ -20,6 +20,7 @@ import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionTask;
 import org.lance.compaction.RewriteResult;
+import org.lance.compaction.SourceBudgetMode;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -58,17 +60,22 @@ public class CompactionTest {
             CompactionOptions.builder()
                 .withTargetRowsPerFragment(100)
                 .withNumThreads(1)
-                .withMaxSourceRows(1000)
+                .withMaxSourceRows(1)
                 .withMaxSourceBytes(10L * 1024 * 1024)
+                .withSourceBudgetMode(SourceBudgetMode.SOFT)
                 .build();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
 
-        // The source budgets are loose, so the plan is unaffected and the
-        // options must survive the JNI round trip.
-        assertEquals(Optional.of(1000L), compactionPlan.getCompactionOptions().getMaxSourceRows());
+        // The row budget is smaller than the indivisible task, but soft mode
+        // admits that first task so compaction can make progress. The options
+        // must also survive the JNI round trip.
+        assertEquals(Optional.of(1L), compactionPlan.getCompactionOptions().getMaxSourceRows());
         assertEquals(
             Optional.of(10L * 1024 * 1024),
             compactionPlan.getCompactionOptions().getMaxSourceBytes());
+        assertEquals(
+            Optional.of(SourceBudgetMode.SOFT.getValue()),
+            compactionPlan.getCompactionOptions().getSourceBudgetMode());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -233,6 +240,23 @@ public class CompactionTest {
           + "lR0LlOCLAgAAeHAAAAAAAAAEAHBwc3IAEWphdmEubGFuZy5Cb29sZWFuzSBygNWc+u4CAAFaAAV2YWx1ZXhwAXBwcHB0"
           + "AA90cnlfYmluYXJ5X2NvcHlwc3EAfgADAAAAAAAAAAR4";
 
+  /**
+   * A serialized CompactionOptions produced by the class immediately before sourceBudgetMode was
+   * added. Unlike {@link #PRE_SOURCE_BUDGET_OPTIONS_BASE64}, this stream contains all three source
+   * budgets and excludedFragmentIds, then ends.
+   */
+  private static final String PRE_SOURCE_BUDGET_MODE_OPTIONS_BASE64 =
+      "rO0ABXNyACZvcmcubGFuY2UuY29tcGFjdGlvbi5Db21wYWN0aW9uT3B0aW9ucys6bRwua1fWAwAOTAAJYmF0Y2hTaXpldAAUTGph"
+          + "dmEvdXRpbC9PcHRpb25hbDtMABhiaW5hcnlDb3B5UmVhZEJhdGNoQnl0ZXNxAH4AAUwADmNvbXBhY3Rpb25Nb2RlcQB+AAFMAA9k"
+          + "ZWZlckluZGV4UmVtYXBxAH4AAUwAE2V4Y2x1ZGVkRnJhZ21lbnRJZHN0ABBMamF2YS91dGlsL0xpc3Q7TAAUbWF0ZXJpYWxpemVE"
+          + "ZWxldGlvbnNxAH4AAUwAHW1hdGVyaWFsaXplRGVsZXRpb25zVGhyZXNob2xkcQB+AAFMAA9tYXhCeXRlc1BlckZpbGVxAH4AAUwA"
+          + "D21heFJvd3NQZXJHcm91cHEAfgABTAAObWF4U291cmNlQnl0ZXNxAH4AAUwAEm1heFNvdXJjZUZyYWdtZW50c3EAfgABTAANbWF4"
+          + "U291cmNlUm93c3EAfgABTAAKbnVtVGhyZWFkc3EAfgABTAAVdGFyZ2V0Um93c1BlckZyYWdtZW50cQB+AAF4cHNyAA5qYXZhLmxh"
+          + "bmcuTG9uZzuL5JDMjyPfAgABSgAFdmFsdWV4cgAQamF2YS5sYW5nLk51bWJlcoaslR0LlOCLAgAAeHAAAAAAAAAEAHBwc3IAEWph"
+          + "dmEubGFuZy5Cb29sZWFuzSBygNWc+u4CAAFaAAV2YWx1ZXhwAXBwcHB0AA90cnlfYmluYXJ5X2NvcHlwc3EAfgAEAAAAAAAAAARz"
+          + "cQB+AAQAAAAAAAAABXNxAH4ABAAAAAAAAAAGc3IAEWphdmEudXRpbC5Db2xsU2VyV46rtjobqBEDAAFJAAN0YWd4cAAAAAF3BAAA"
+          + "AAJzcQB+AAQAAAAAAAAAB3NxAH4ABAAAAAAAAAAIeHg=";
+
   @Test
   public void testDeserializeOptionsFromOlderVersion() throws Exception {
     byte[] serialized = Base64.getDecoder().decode(PRE_SOURCE_BUDGET_OPTIONS_BASE64);
@@ -249,6 +273,21 @@ public class CompactionTest {
     assertEquals(Optional.empty(), options.getMaxSourceRows());
     assertEquals(Optional.empty(), options.getMaxSourceBytes());
     assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
+    assertEquals(Optional.empty(), options.getSourceBudgetMode());
+  }
+
+  @Test
+  public void testDeserializeOptionsFromBeforeSourceBudgetMode() throws Exception {
+    byte[] serialized = Base64.getDecoder().decode(PRE_SOURCE_BUDGET_MODE_OPTIONS_BASE64);
+    CompactionOptions options;
+    try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(serialized))) {
+      options = (CompactionOptions) in.readObject();
+    }
+    assertEquals(Optional.of(4L), options.getMaxSourceFragments());
+    assertEquals(Optional.of(5L), options.getMaxSourceRows());
+    assertEquals(Optional.of(6L), options.getMaxSourceBytes());
+    assertEquals(List.of(7L, 8L), options.getExcludedFragmentIds());
+    assertEquals(Optional.empty(), options.getSourceBudgetMode());
   }
 
   private static <T> T serializeAndDeserialize(T object)

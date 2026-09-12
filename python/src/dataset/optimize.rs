@@ -16,7 +16,7 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        RewriteResult, SourceBudgetMode, commit_compaction, compact_files, plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -81,6 +81,13 @@ fn parse_compaction_options(
             }
             "max_source_bytes" => {
                 opts.max_source_bytes = value.extract()?;
+            }
+            "source_budget_mode" => {
+                let mode_str: Option<String> = value.extract()?;
+                if let Some(mode_str) = mode_str {
+                    opts.source_budget_mode = SourceBudgetMode::try_from(mode_str.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                }
             }
             "excluded_fragment_ids" => {
                 opts.excluded_fragment_ids =

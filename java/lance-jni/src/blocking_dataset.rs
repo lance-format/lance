@@ -3596,6 +3596,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let source_budget_mode = env
+        .call_method(
+            &java_options,
+            "getSourceBudgetMode",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3613,6 +3621,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        Some(&source_budget_mode),
         config,
     )
 }

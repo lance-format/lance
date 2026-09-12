@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions};
+use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -194,6 +194,7 @@ pub fn build_compaction_options(
     max_source_rows: &JObject,                 // Optional<Long>
     max_source_bytes: &JObject,                // Optional<Long>
     excluded_fragment_ids: &JObject,           // List<Long>
+    source_budget_mode: Option<&JObject>,      // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -256,6 +257,12 @@ pub fn build_compaction_options(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(source_budget_mode) = source_budget_mode
+        && let Some(source_budget_mode_val) = env.get_string_opt(source_budget_mode)?
+    {
+        compaction_options.source_budget_mode =
+            SourceBudgetMode::try_from(source_budget_mode_val.as_str())?;
+    }
 
     Ok(compaction_options)
 }

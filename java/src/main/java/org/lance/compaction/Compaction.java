@@ -49,7 +49,8 @@ public class Compaction {
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
-          compactionOptions.getExcludedFragmentIds());
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getSourceBudgetMode());
     }
   }
 
@@ -153,5 +154,6 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<String> sourceBudgetMode);
 }
