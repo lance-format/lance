@@ -121,16 +121,32 @@ pub struct ScalarIndexExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
+    /// Hint passed to the index search so it can stop once it has found this many
+    /// matches. `None` means search all matches.
+    ///
+    /// This is only an optimization. A downstream `GlobalLimitExec` still applies the
+    /// exact limit, so the index only needs to return at least this many rows.
+    limit: Option<usize>,
 }
 
 impl DisplayAs for ScalarIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ScalarIndexQuery: query={}", self.expr)
+                write!(f, "ScalarIndexQuery: query={}", self.expr)?;
+                // Surfacing the pushed limit keeps the early-stop visible in EXPLAIN, which
+                // is otherwise invisible to both users and tests.
+                if let Some(limit) = self.limit {
+                    write!(f, ", limit={}", limit)?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "ScalarIndexQuery\nquery={}", self.expr)
+                write!(f, "ScalarIndexQuery\nquery={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, "\nlimit={}", limit)?;
+                }
+                Ok(())
             }
         }
     }
@@ -154,7 +170,18 @@ impl ScalarIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
+            limit: None,
         }
+    }
+
+    /// Push a `limit` hint into the index search so it can stop early.
+    ///
+    /// Only set this when returning any `limit` matching rows is safe, such as an
+    /// unordered scan whose results are not filtered further. Correctness still relies on
+    /// a downstream limit operator.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -207,12 +234,14 @@ impl ScalarIndexExec {
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
+        limit: Option<usize>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            expr.evaluate(dataset.as_ref(), &metrics).await?
+            expr.evaluate_limited(dataset.as_ref(), &metrics, limit)
+                .await?
         };
         let fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
@@ -260,6 +289,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.dataset.clone(),
             self.metrics.clone(),
             self.result_format,
+            self.limit,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
@@ -802,16 +832,30 @@ pub struct MaterializeIndexExec {
     overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// Hint passed to the index search so it can stop once it has found this many
+    /// matches. `None` means materialize all matches.
+    ///
+    /// This is only an optimization. A downstream `GlobalLimitExec` still applies the
+    /// exact limit, so the index only needs to return at least this many rows.
+    limit: Option<usize>,
 }
 
 impl DisplayAs for MaterializeIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MaterializeIndex: query={}", self.expr)
+                write!(f, "MaterializeIndex: query={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, ", limit={}", limit)?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "MaterializeIndex\nquery={}", self.expr)
+                write!(f, "MaterializeIndex\nquery={}", self.expr)?;
+                if let Some(limit) = self.limit {
+                    write!(f, "\nlimit={}", limit)?;
+                }
+                Ok(())
             }
         }
     }
@@ -856,6 +900,33 @@ impl Iterator for FragIdIter<'_> {
     }
 }
 
+/// Pick the row-address mask `MaterializeIndexExec` should materialize.
+///
+/// The `upper` mask is the candidate set: for `Exact` it is the answer, and for `AtMost`
+/// or refined results it is a superset that `LanceFilterExec` prunes downstream, because
+/// the full filter reruns on the materialized batches.
+///
+/// `AtLeast` carries an unbounded `upper`, so it cannot serve as a candidate set.
+/// Materializing its `lower` mask instead is sound ONLY when this node asked for a partial
+/// answer, which is exactly the pushed-limit case: the B-tree stops early, every row in
+/// `lower` is a confirmed match, and a downstream `GlobalLimitExec` still enforces the
+/// exact limit.
+///
+/// A lower bound can also arrive for reasons unrelated to any limit. `bloomfilter.rs` and
+/// the multi-segment combination in `scalar_logical.rs` both produce `AtLeast` on their
+/// own, and there the unconfirmed rows between `lower` and `upper` still need the full
+/// recheck. Treating `lower` as the answer would silently drop them, so with no pushed
+/// limit this keeps the preexisting behavior rather than guessing.
+fn candidate_mask_for(result: IndexExprResult, limit: Option<usize>) -> Result<RowAddrMask> {
+    if result.is_at_least() && !result.is_exact() {
+        if limit.is_none() {
+            todo!("Support AtLeast in MaterializeIndexExec")
+        }
+        return Ok(result.lower);
+    }
+    Ok(result.upper)
+}
+
 impl MaterializeIndexExec {
     pub fn new(
         dataset: Arc<Dataset>,
@@ -875,7 +946,19 @@ impl MaterializeIndexExec {
             overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            limit: None,
         }
+    }
+
+    /// Push a `limit` hint into the index search so it can stop early.
+    ///
+    /// Only set this when returning any `limit` matching rows is safe, such as an
+    /// unordered scan whose results are not filtered further and whose rows are not
+    /// dropped after the search by deletions or an overlay block. Correctness still
+    /// relies on a downstream limit operator.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Block specific row addresses (see the `overlay_block` field) from the index result.
@@ -891,8 +974,9 @@ impl MaterializeIndexExec {
         fragments: Arc<Vec<Fragment>>,
         overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
+        limit: Option<usize>,
     ) -> Result<RecordBatch> {
-        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
+        let expr_result = expr.evaluate_limited(dataset.as_ref(), metrics.as_ref(), limit);
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -909,19 +993,14 @@ impl MaterializeIndexExec {
         // gets pruned downstream by `LanceFilterExec` (the full filter
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
-        // reach the user). `AtLeast` carries an unbounded upper, so the
-        // candidate set is the whole row space — not actionable here.
-        let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
-            if result.is_at_least() && !result.is_exact() {
-                todo!("Support AtLeast in MaterializeIndexExec")
-            }
-            Ok(result.upper)
-        };
+        // reach the user).
+        let candidate_mask =
+            |result: IndexExprResult| -> Result<RowAddrMask> { candidate_mask_for(result, limit) };
         let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
-            take_upper(expr_result)? & (*prefilter).clone()
+            candidate_mask(expr_result)? & (*prefilter).clone()
         } else {
-            take_upper(expr_result.await?)?
+            candidate_mask(expr_result.await?)?
         };
         if let Some(block) = overlay_block {
             mask = mask & block;
@@ -1059,6 +1138,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.fragments.clone(),
             self.overlay_block.clone(),
             metrics,
+            self.limit,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
@@ -1093,6 +1173,47 @@ impl ExecutionPlan for MaterializeIndexExec {
 #[cfg(test)]
 mod tests {
     use std::{ops::Bound, sync::Arc};
+
+    use super::{IndexExprResult, RowAddrMask, candidate_mask_for};
+
+    fn mask_of(addrs: [u64; 2]) -> RowAddrMask {
+        RowAddrMask::AllowList(RowAddrTreeMap::from_iter(addrs))
+    }
+
+    /// A pushed limit is the only thing that makes a lower bound a sufficient answer, so
+    /// `AtLeast` may collapse to its `lower` mask only when this node asked for one.
+    #[test]
+    fn test_candidate_mask_uses_lower_only_for_a_pushed_limit() {
+        let result = IndexExprResult::at_least(mask_of([1, 2]));
+        let expected = result.lower.clone();
+        let picked = candidate_mask_for(result, Some(10)).unwrap();
+        assert_eq!(
+            picked, expected,
+            "a limited AtLeast must materialize its confirmed lower bound"
+        );
+    }
+
+    /// Anything that is not a bare lower bound keeps using `upper` as the candidate set,
+    /// which `LanceFilterExec` prunes downstream.
+    #[test]
+    fn test_candidate_mask_uses_upper_for_exact_results() {
+        let result = IndexExprResult::exact(mask_of([3, 4]));
+        let expected = result.upper.clone();
+        assert_eq!(candidate_mask_for(result, None).unwrap(), expected);
+        let result = IndexExprResult::exact(mask_of([3, 4]));
+        let expected = result.upper.clone();
+        assert_eq!(candidate_mask_for(result, Some(10)).unwrap(), expected);
+    }
+
+    /// Regression: `AtLeast` also arrives from sources that have nothing to do with a
+    /// limit, such as `bloomfilter.rs` and the multi-segment combination in
+    /// `scalar_logical.rs`. Collapsing those to `lower` would silently drop the
+    /// unconfirmed rows that still require a recheck, so this path must not do it.
+    #[test]
+    #[should_panic(expected = "Support AtLeast in MaterializeIndexExec")]
+    fn test_candidate_mask_refuses_lower_without_a_pushed_limit() {
+        let _ = candidate_mask_for(IndexExprResult::at_least(mask_of([1, 2])), None);
+    }
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;

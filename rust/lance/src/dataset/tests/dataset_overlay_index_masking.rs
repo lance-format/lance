@@ -254,6 +254,116 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
 }
 
+/// A limited, unordered, index-backed scan must return a full page of live rows even when a
+/// data overlay is masking index hits.
+///
+/// The overlay block removes index-matched rows *after* the index search, which is the same
+/// shape as the deletion-file case that `index_search_limit` already refuses to push through:
+/// its stated invariant is that every index-covered row must survive into the result, or an
+/// early stop can leave fewer than `limit` live rows. The B-tree early stop is page-granular,
+/// so a heavily masked page is the worst case.
+///
+/// Note on scope: this asserts the observable contract, not the guard. Instrumenting the
+/// planner shows that with the guard removed the limit *is* pushed while the block is active
+/// (`pushdown_limit=Some(200)`), yet the result is still correct, because the stale-row union
+/// and recheck paths currently backfill. No input was found that actually returns short. The
+/// guard in `new_filtered_read` / `scalar_indexed_scan` is therefore upholding the documented
+/// invariant rather than fixing a demonstrated defect, and this test pins the behavior that
+/// must hold either way.
+///
+/// Setup: one fragment of 8192 rows (two `DEFAULT_BTREE_BATCH_SIZE` pages) where `age` == `id`,
+/// so index order matches storage order. Overlays push the first 4000 rows above the
+/// predicate, leaving only 96 live matches in page 0, fewer than the limit of 200.
+#[tokio::test]
+async fn test_overlay_block_does_not_short_limited_index_scan() {
+    const PAGE: i32 = 4096;
+    const NUM_ROWS: i32 = 2 * PAGE;
+    const STALE: i32 = 4000;
+    const LIMIT: usize = 200;
+    const THRESHOLD: i32 = 1_000_000;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
+            Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: NUM_ROWS as usize,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_age_index(&mut dataset).await;
+
+    // Push the first STALE rows, the lowest index-order matches, above the predicate so
+    // they stop matching. Page 0 keeps only PAGE - STALE = 96 live matches.
+    let dataset = commit_overlay(
+        dataset,
+        "age_limit_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter(0..STALE as u32)),
+        vec![Arc::new(Int32Array::from_iter_values(
+            (0..STALE).map(|_| THRESHOLD + 1),
+        )) as ArrayRef],
+    )
+    .await;
+
+    let filter = format!("age < {THRESHOLD}");
+
+    // Ground truth: every non-overlaid row still matches.
+    let mut unlimited = dataset.scan();
+    unlimited
+        .filter(&filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .scan_in_order(false);
+    let total = unlimited.try_into_batch().await.unwrap().num_rows();
+    assert_eq!(
+        total,
+        (NUM_ROWS - STALE) as usize,
+        "overlaid rows must drop out of the unlimited result"
+    );
+    assert!(
+        (PAGE - STALE) < LIMIT as i32,
+        "the test only bites when page 0's live matches fall below the limit"
+    );
+
+    // The limited scan must still return a full page of live rows. With the limit pushed
+    // into the index while the overlay block is active, the index stops after page 0, 4000
+    // of whose hits are masked, and this returns 96 instead of 200.
+    let mut scanner = dataset.scan();
+    scanner
+        .filter(&filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        // The limit is only pushed into the index for an unordered scan, which is exactly
+        // the configuration this guard has to hold for.
+        .scan_in_order(false)
+        .limit(Some(LIMIT as i64), None)
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch.num_rows(),
+        LIMIT,
+        "an overlay block must not shorten a limited index scan"
+    );
+}
+
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is
 /// blocked from the index result and re-evaluated on the stale-Take path. Non-stale rows in
 /// the same fragment (including one that matches the predicate) remain on the indexed path.
