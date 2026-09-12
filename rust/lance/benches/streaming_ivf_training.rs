@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The streaming IVF training path still nests async frames past the default
+// recursion limit of 128 when the Linux io_uring reader types are in the
+// obligation graph (the failure does not reproduce on non-Linux hosts). Every
+// other bench now fits the default; see issue #8416.
 #![recursion_limit = "256"]
 
 use std::sync::Arc;

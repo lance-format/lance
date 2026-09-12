@@ -14,6 +14,8 @@ use lance_core::FenceReason;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
+mod future_depth;
+
 fn durable_writer_config(shard_id: Uuid) -> ShardWriterConfig {
     ShardWriterConfig {
         shard_id,
