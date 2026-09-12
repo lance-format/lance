@@ -19,11 +19,12 @@ use rayon::ThreadPoolBuilder;
 use lance_core::ROW_ID_FIELD;
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
+    graph::VisitedGenerator,
     hnsw::builder::{HNSW, HnswBuildParams, HnswQueryParams},
     pq::{PQBuildParams, ProductQuantizer},
     quantizer::Quantization,
     sq::{ScalarQuantizer, builder::SQBuildParams},
-    storage::StorageBuilder,
+    storage::{StorageBuilder, VectorStore},
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
@@ -352,6 +353,68 @@ fn bench_hnsw_pq(c: &mut Criterion) {
     });
 }
 
+/// Measure how the look-ahead prefetch distance affects flat-storage search
+/// latency across vector sizes (issue #8275).
+///
+/// `search_basic` hardcodes its bottom-level prefetch distance, so this bench
+/// drives `search_inner` directly to vary it. All distances share one graph
+/// and one query set per dimension; only the prefetch distance changes.
+/// Queries rotate through 64 stored vectors so the per-iteration working set
+/// stays larger than the last-level cache and vector reads miss like they do
+/// on a real index.
+fn bench_hnsw_prefetch(c: &mut Criterion) {
+    const TOTAL: usize = 300_000;
+    const SEED: [u8; 32] = [42; 32];
+    const K: usize = 100;
+    const NUM_QUERIES: usize = 64;
+
+    for dimension in [128usize, 768] {
+        let data = generate_random_array_with_seed::<Float32Type>(TOTAL * dimension, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(data, dimension as i32).unwrap();
+        let vectors = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+
+        let hnsw = HNSW::index_vectors(vectors.as_ref(), HnswBuildParams::default()).unwrap();
+
+        let queries: Vec<_> = (0..NUM_QUERIES)
+            .map(|i| fsl.value(i * (TOTAL / NUM_QUERIES)))
+            .collect();
+        let params = HnswQueryParams {
+            ef: 300,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+
+        for prefetch_distance in [None, Some(1), Some(2), Some(4), Some(8)] {
+            let name = format!(
+                "search_hnsw_prefetch({TOTAL}x{dimension},{})",
+                prefetch_distance.map_or("off".to_string(), |d| d.to_string())
+            );
+            let mut visited_generator = VisitedGenerator::new(vectors.len());
+            let mut next_query = 0;
+            c.bench_function(&name, |b| {
+                b.iter(|| {
+                    let query = queries[next_query % NUM_QUERIES].clone();
+                    next_query += 1;
+                    let result = hnsw
+                        .search_inner(
+                            query,
+                            K,
+                            &params,
+                            None,
+                            &mut visited_generator,
+                            vectors.as_ref(),
+                            prefetch_distance,
+                        )
+                        .unwrap();
+                    assert_eq!(result.len(), K);
+                })
+            });
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -359,7 +422,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq);
+    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_prefetch);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -368,6 +431,6 @@ criterion_group!(
     config = Criterion::default()
         .measurement_time(Duration::from_secs(10))
         .sample_size(10);
-    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq);
+    targets = bench_hnsw, bench_hnsw_load, bench_hnsw_sq, bench_hnsw_pq, bench_hnsw_prefetch);
 
 criterion_main!(benches);
