@@ -775,7 +775,7 @@ fn inner_create_lookup_planner(
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
     let collector = LsmDataSourceCollector::new(dataset, snapshots);
-    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone());
+    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?;
 
     let blocking = BlockingLsmPointLookupPlanner {
         planner,

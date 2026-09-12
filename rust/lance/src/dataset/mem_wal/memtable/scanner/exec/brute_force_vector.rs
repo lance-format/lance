@@ -34,6 +34,7 @@ use lance_linalg::distance::DistanceType;
 use super::super::builder::VectorQuery;
 use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::write::BatchStore;
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
@@ -373,9 +374,15 @@ impl MemTableBruteForceVectorExec {
 
                 columns.push(Arc::new(Float32Array::from(distances)));
 
+                let source_schema = stored.data.schema();
                 let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
+                    let mut projected: Vec<_> = take_projected_columns(
+                        &columns,
+                        source_schema.fields(),
+                        proj_indices,
+                        self.output_schema.as_ref(),
+                        row_positions.len(),
+                    )?;
                     // Distance was just pushed onto `columns`; keep it last.
                     projected.push(columns.last().unwrap().clone());
                     projected

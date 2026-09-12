@@ -884,6 +884,7 @@ async fn run_lance(
     }
     let planner = Arc::new(
         LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
+            .unwrap()
             .with_session(dataset.session())
             .with_sstable_cache(sstable_cache),
     );

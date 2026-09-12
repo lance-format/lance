@@ -28,6 +28,7 @@ use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 use super::super::builder::{FtsQuery, FtsQueryType};
 use super::newest_pk_positions;
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -471,14 +472,30 @@ impl FtsIndexExec {
         }
 
         // Add score column
+        let n_hits = all_scores.len();
         final_columns.push(Arc::new(Float32Array::from(all_scores)));
 
         // Apply projection if needed
         let mut projected_columns = if let Some(ref proj_indices) = self.projection {
-            let mut projected: Vec<_> = proj_indices
-                .iter()
-                .map(|&i| final_columns[i].clone())
-                .collect();
+            // Source shape comes from the memtable's own batches; `final_columns`
+            // holds one entry per source column, concatenated across hits.
+            let source_fields = self
+                .batch_store
+                .get(0)
+                .map(|stored| stored.data.schema().fields().clone());
+            let mut projected: Vec<_> = match source_fields {
+                Some(fields) => take_projected_columns(
+                    &final_columns,
+                    &fields,
+                    proj_indices,
+                    self.output_schema.as_ref(),
+                    n_hits,
+                )?,
+                None => proj_indices
+                    .iter()
+                    .map(|&i| final_columns[i].clone())
+                    .collect(),
+            };
             if self.with_doc_index {
                 projected.push(final_columns[final_columns.len() - 2].clone());
             }

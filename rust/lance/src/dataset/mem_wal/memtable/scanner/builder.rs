@@ -13,6 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::TryStreamExt;
+use lance_core::datatypes::{Schema as LanceSchema, parse_field_path};
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
@@ -929,21 +930,10 @@ impl MemTableScanner {
     ///
     /// If `with_row_id` is true, adds `_rowid` column at the end.
     /// If `with_row_address` is true, adds `_rowaddr` column at the end.
-    pub fn output_schema(&self) -> SchemaRef {
+    pub fn output_schema(&self) -> Result<SchemaRef> {
         use super::exec::ROW_ADDRESS_COLUMN;
 
-        let mut fields: Vec<Field> = if let Some(ref projection) = self.projection {
-            projection
-                .iter()
-                .filter_map(|name| self.schema.field_with_name(name).ok().cloned())
-                .collect()
-        } else {
-            self.schema
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect()
-        };
+        let mut fields: Vec<Field> = self.projected_data_fields()?;
 
         // Add _rowid column if requested
         if self.with_row_id {
@@ -955,25 +945,36 @@ impl MemTableScanner {
             fields.push(Field::new(ROW_ADDRESS_COLUMN, DataType::UInt64, true));
         }
 
-        Arc::new(arrow_schema::Schema::new(fields))
+        Ok(Arc::new(arrow_schema::Schema::new(fields)))
     }
 
     /// Get the base output schema after projection, WITHOUT special columns like _rowid.
     /// This is used by index execs that add their own special columns.
-    fn base_output_schema(&self) -> SchemaRef {
-        let fields: Vec<Field> = if let Some(ref projection) = self.projection {
-            projection
-                .iter()
-                .filter_map(|name| self.schema.field_with_name(name).ok().cloned())
-                .collect()
-        } else {
-            self.schema
+    fn base_output_schema(&self) -> Result<SchemaRef> {
+        Ok(Arc::new(arrow_schema::Schema::new(
+            self.projected_data_fields()?,
+        )))
+    }
+
+    /// Data columns this scan emits, with nested paths narrowed to the leaves
+    /// they select — a projected `meta.a` yields `meta: Struct<a>`.
+    ///
+    /// An unresolvable column is an error here, matching
+    /// [`Self::compute_projection_indices`]; both used to disagree, one
+    /// silently dropping what the other rejected.
+    fn projected_data_fields(&self) -> Result<Vec<Field>> {
+        let Some(ref projection) = self.projection else {
+            return Ok(self
+                .schema
                 .fields()
                 .iter()
                 .map(|f| f.as_ref().clone())
-                .collect()
+                .collect());
         };
-        Arc::new(arrow_schema::Schema::new(fields))
+        let lance_schema = LanceSchema::try_from(self.schema.as_ref())?;
+        let projected = lance_schema.project(projection)?;
+        let arrow = arrow_schema::Schema::from(&projected);
+        Ok(arrow.fields().iter().map(|f| f.as_ref().clone()).collect())
     }
 
     /// Create the execution plan based on the query configuration.
@@ -1025,7 +1026,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.readable_count,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             self.schema.clone(),
             self.with_row_id,
             self.with_row_address,
@@ -1087,7 +1088,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.readable_count,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             pk_indices,
             self.with_row_id,
             self.with_row_address,
@@ -1117,7 +1118,7 @@ impl MemTableScanner {
             predicate.clone(),
             max_readable,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             self.with_row_id,
             self.with_row_address,
         )?;
@@ -1149,7 +1150,7 @@ impl MemTableScanner {
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
-        let base_schema = self.base_output_schema();
+        let base_schema = self.base_output_schema()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
             validate_pk_types(&self.schema, pk_columns)?;
@@ -1227,7 +1228,7 @@ impl MemTableScanner {
             query.clone(),
             max_readable,
             projection_indices,
-            self.base_output_schema(),
+            self.base_output_schema()?,
             self.with_row_id,
         )?
         .with_filter(filter_predicate)
@@ -1242,7 +1243,7 @@ impl MemTableScanner {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let mut fields: Vec<Field> = self
-            .base_output_schema()
+            .base_output_schema()?
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
@@ -1277,23 +1278,30 @@ impl MemTableScanner {
     }
 
     /// Compute column indices for projection.
+    /// Top-level column indices this scan must materialize.
+    ///
+    /// A nested path contributes its *parent* index — the memtable batch stores
+    /// whole columns, so `meta.a` is served by taking `meta` and narrowing it
+    /// to [`Self::projected_data_fields`] downstream. Sibling leaves of one
+    /// parent therefore collapse to a single index.
     fn compute_projection_indices(&self) -> Result<Option<Vec<usize>>> {
-        if let Some(ref columns) = self.projection {
-            let indices: Result<Vec<usize>> = columns
-                .iter()
-                .map(|name| {
-                    self.schema
-                        .column_with_name(name)
-                        .map(|(idx, _)| idx)
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!("Column '{}' not found in schema", name))
-                        })
-                })
-                .collect();
-            Ok(Some(indices?))
-        } else {
-            Ok(None)
+        let Some(ref columns) = self.projection else {
+            return Ok(None);
+        };
+        let mut indices: Vec<usize> = Vec::with_capacity(columns.len());
+        for name in columns {
+            let top = parse_field_path(name)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::invalid_input(format!("empty projection name: {}", name)))?;
+            let (idx, _) = self.schema.column_with_name(&top).ok_or_else(|| {
+                Error::invalid_input(format!("Column '{}' not found in schema", name))
+            })?;
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
         }
+        Ok(Some(indices))
     }
 
     /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
@@ -1607,6 +1615,76 @@ mod tests {
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.schema().field(0).name(), "id");
+    }
+
+    /// `meta: Struct<a, b>` beside a flat column, for nested projection.
+    fn nested_test_schema() -> SchemaRef {
+        use arrow_schema::Fields;
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "meta",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int64, true),
+                    Field::new("b", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn projecting_a_struct_leaf_narrows_the_memtable_output() {
+        use arrow_array::{Int64Array, StructArray};
+        use arrow_schema::Fields;
+
+        let schema = nested_test_schema();
+        let meta_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StructArray::new(
+                    meta_fields,
+                    vec![
+                        Arc::new(Int64Array::from(vec![10, 20])),
+                        Arc::new(StringArray::from(vec!["x", "y"])),
+                    ],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        batch_store.append(batch.clone()).unwrap();
+        // Publishing through the index store is what makes the batch readable.
+        let index_store = IndexStore::new();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(index_store);
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        scanner.project(&["meta.a"]).unwrap();
+        let result = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 1);
+        let field = result.schema().field(0).clone();
+        assert_eq!(field.name(), "meta");
+        let DataType::Struct(children) = field.data_type() else {
+            panic!("meta is not a struct: {:?}", field.data_type());
+        };
+        let names: Vec<&str> = children.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "sibling `b` must not survive the projection"
+        );
     }
 
     /// The index fast path is chosen from the filter the caller set, which has not
@@ -2339,7 +2417,7 @@ mod tests {
         scanner.with_row_id();
 
         // Verify output schema includes _rowid
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "name");
@@ -2375,7 +2453,7 @@ mod tests {
         scanner.project(&["id", "_rowid"]).unwrap();
 
         // Verify output schema
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "_rowid");
@@ -2422,13 +2500,13 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
 
         // Without with_row_id, schema should not include _rowid
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert!(output_schema.field_with_name("_rowid").is_err());
 
         // With with_row_id, schema should include _rowid
         scanner.with_row_id();
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert!(output_schema.field_with_name("_rowid").is_ok());
     }
@@ -2451,7 +2529,7 @@ mod tests {
         assert_eq!(scanner.projection, Some(vec!["id".to_string()]));
 
         // Output schema should include _rowid at the end
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "_rowid");
@@ -2534,13 +2612,13 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
 
         // Without with_row_address, schema should not include _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert!(output_schema.field_with_name("_rowaddr").is_err());
 
         // With with_row_address, schema should include _rowaddr
         scanner.with_row_address();
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert!(output_schema.field_with_name("_rowaddr").is_ok());
     }
@@ -2556,7 +2634,7 @@ mod tests {
         scanner.with_row_address();
 
         // Verify output schema includes _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "name");
@@ -2615,7 +2693,7 @@ mod tests {
         scanner.with_row_address();
 
         // Verify output schema includes both _rowid and _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 4);
         assert_eq!(output_schema.field(2).name(), "_rowid");
         assert_eq!(output_schema.field(3).name(), "_rowaddr");
