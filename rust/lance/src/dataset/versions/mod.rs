@@ -622,12 +622,14 @@ fn is_upcast_downcast_impl(
     }
 }
 
-pub fn validate_nulls(
-    version: ConcreteFileVersion,
-    datatype: &DataType,
-    has_nulls: bool,
-) -> Result<()> {
-    let supported = match version {
+/// Return whether `version` can store physical nulls for `datatype`.
+///
+/// The V1 arm is a whitelist rather than a general capability model: it enumerates the
+/// types the legacy writer was known to handle when [`validate_nulls`] was added for
+/// the hash-join path. Treat a `false` there as "not known to be supported", and
+/// prefer to widen it only alongside a legacy round-trip test.
+pub fn supports_nulls(version: ConcreteFileVersion, datatype: &DataType) -> bool {
+    match version {
         ConcreteFileVersion::V1 => matches!(
             datatype,
             DataType::Utf8
@@ -639,8 +641,15 @@ pub fn validate_nulls(
         ),
         ConcreteFileVersion::V2_0 => !matches!(datatype, DataType::Struct(..)),
         ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => true,
-    };
-    if has_nulls && !supported {
+    }
+}
+
+pub fn validate_nulls(
+    version: ConcreteFileVersion,
+    datatype: &DataType,
+    has_nulls: bool,
+) -> Result<()> {
+    if has_nulls && !supports_nulls(version, datatype) {
         return Err(Error::invalid_input(format!(
             "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
             datatype, version
