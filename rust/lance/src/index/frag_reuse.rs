@@ -3353,6 +3353,101 @@ mod tests {
             assert_eq!(reopened.manifest.version, occupied_version);
         }
 
+        /// The target preflight only lets a definitive "no dataset here"
+        /// resolution permit the clone: any other resolver failure (storage,
+        /// auth, corrupt listing) aborts before anything is written, instead
+        /// of treating an uninspectable target as absent.
+        #[tokio::test]
+        async fn clone_preflight_propagates_resolver_errors() {
+            use lance_table::io::commit::{
+                CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+                RenameCommitHandler,
+            };
+
+            /// Delegates everything except latest-location resolution, which
+            /// fails with a non-NotFound error for the poisoned target path.
+            #[derive(Debug)]
+            struct FailingResolver {
+                inner: RenameCommitHandler,
+                fail_suffix: &'static str,
+            }
+
+            #[async_trait::async_trait]
+            impl CommitHandler for FailingResolver {
+                async fn resolve_latest_location(
+                    &self,
+                    base_path: &Path,
+                    object_store: &ObjectStore,
+                ) -> lance_core::Result<ManifestLocation> {
+                    if base_path.as_ref().ends_with(self.fail_suffix) {
+                        return Err(Error::io("injected resolver outage"));
+                    }
+                    self.inner
+                        .resolve_latest_location(base_path, object_store)
+                        .await
+                }
+
+                async fn commit(
+                    &self,
+                    manifest: &mut Manifest,
+                    indices: Option<Vec<IndexMetadata>>,
+                    base_path: &Path,
+                    object_store: &ObjectStore,
+                    manifest_writer: ManifestWriter,
+                    naming_scheme: ManifestNamingScheme,
+                    transaction: Option<lance_table::format::Transaction>,
+                ) -> std::result::Result<ManifestLocation, CommitError> {
+                    self.inner
+                        .commit(
+                            manifest,
+                            indices,
+                            base_path,
+                            object_store,
+                            manifest_writer,
+                            naming_scheme,
+                            transaction,
+                        )
+                        .await
+                }
+            }
+
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/flaky-target", clone_dir.as_str());
+            // Build the tagged source normally, then reopen it with the
+            // failing resolver installed as its commit handler.
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let version = dataset.manifest.version;
+            drop(dataset);
+            let mut dataset =
+                crate::dataset::builder::DatasetBuilder::from_uri(source_dir.as_str())
+                    .with_read_params(crate::dataset::ReadParams {
+                        commit_handler: Some(Arc::new(FailingResolver {
+                            inner: RenameCommitHandler,
+                            fail_suffix: "flaky-target",
+                        })),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+            let error = dataset
+                .shallow_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert!(
+                error.to_string().contains("injected resolver outage"),
+                "{error}"
+            );
+            // The clone did not proceed: nothing was written to the target.
+            assert!(!std::path::Path::new(clone_uri.as_str()).exists());
+        }
+
         /// A clone commit that conclusively fails must delete the details
         /// file it staged in the target, alongside its transaction file.
         /// Driven through the internal commit path: the public

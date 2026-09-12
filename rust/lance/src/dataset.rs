@@ -3270,16 +3270,27 @@ impl Dataset {
         // stages its relocated FRI details in the target's `_indices/`
         // ahead of the manifest commit, which must not pollute a live
         // dataset. The check goes through the same store and commit handler
-        // the commit below writes through.
+        // the commit below writes through. Only a definitive "no dataset
+        // here" permits the clone: any other resolver failure (storage,
+        // auth, corrupt manifest listing) propagates instead of letting the
+        // clone write into a target it failed to inspect.
         let target_base =
             ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
-        if self
+        match self
             .commit_handler
             .resolve_latest_location(&target_base, &self.object_store)
             .await
-            .is_ok()
         {
-            return Err(Error::dataset_already_exists(target_path.to_string()));
+            Ok(_) => {
+                return Err(Error::dataset_already_exists(target_path.to_string()));
+            }
+            // The codebase-wide "dataset absent" pair: the built-in resolver
+            // reports an empty `_versions/` listing as `NotFound`, while
+            // handlers with an external source of truth use
+            // `DatasetNotFound` (the same discrimination the write path's
+            // destination probe applies).
+            Err(Error::NotFound { .. } | Error::DatasetNotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
 
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
