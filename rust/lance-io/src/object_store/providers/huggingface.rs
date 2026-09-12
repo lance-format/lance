@@ -9,6 +9,7 @@ use object_store::path::Path;
 use opendal::{Operator, services::Huggingface};
 use url::Url;
 
+use super::sanitized_authority;
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::parse_hf_repo_id;
@@ -235,7 +236,15 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
         let repo_id = parse_hf_repo_id(url)?;
-        Ok(format!("{}${}@{}", url.scheme(), url.authority(), repo_id))
+        // `sanitized_authority`, not `Url::authority()`: the latter keeps any
+        // embedded `userinfo@`, which would leak credentials into the cache key
+        // and the registry's cache-key debug logs.
+        Ok(format!(
+            "{}${}@{}",
+            url.scheme(),
+            sanitized_authority(url),
+            repo_id
+        ))
     }
 }
 
@@ -403,6 +412,26 @@ mod tests {
         let url = Url::parse("hf://datasets/acme/repo/path").unwrap();
         let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
         assert_eq!(prefix, "hf$datasets@acme/repo");
+    }
+
+    /// URL-embedded credentials (`userinfo@`) must never reach the cache-key
+    /// prefix — it is emitted via `Debug` and the registry's cache-key debug
+    /// logs. A URL that differs from the plain form only in `userinfo` must
+    /// collapse to the same prefix.
+    #[test]
+    fn calculate_prefix_strips_userinfo() {
+        let provider = HuggingfaceStoreProvider;
+        let with_creds = Url::parse("hf://user:s3cret@datasets/acme/repo/path").unwrap();
+        let prefix = provider
+            .calculate_object_store_prefix(&with_creds, None)
+            .unwrap();
+        assert_eq!(prefix, "hf$datasets@acme/repo");
+        // Defense in depth: the secret literally cannot appear in the key.
+        assert!(
+            !prefix.contains("s3cret"),
+            "prefix leaked the token: {prefix}"
+        );
+        assert!(!prefix.contains("user"), "prefix leaked userinfo: {prefix}");
     }
 
     #[test]

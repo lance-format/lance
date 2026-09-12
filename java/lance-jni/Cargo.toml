@@ -61,6 +61,14 @@ roaring = "0.11.4"
 prost-types = "0.14.1"
 chrono = "0.4.41"
 
+[dev-dependencies]
+# Test-only: parameterizes the `parse_disable_value` classification cases in
+# src/blocking_dataset.rs. Matches the version the top-level workspace pins.
+rstest = "0.26.1"
+# Test-only: temp dir for the default-open registry integration test in
+# src/blocking_dataset.rs. Matches the version the top-level workspace pins.
+tempfile = "3"
+
 [profile.dev]
 debug = "line-tables-only"
 incremental = false

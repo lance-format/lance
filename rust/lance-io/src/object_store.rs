@@ -1781,7 +1781,14 @@ impl ObjectStore {
                 .calculate_object_store_prefix(&location, storage_options)
                 .unwrap(),
             None => {
-                let store_prefix = format!("{}${}", location.scheme(), location.authority());
+                // `sanitized_authority`, not `Url::authority()`: strip any
+                // `userinfo@` so credentials don't leak into the prefix (which
+                // is warn-logged below) for unknown-scheme URLs.
+                let store_prefix = format!(
+                    "{}${}",
+                    location.scheme(),
+                    providers::sanitized_authority(&location)
+                );
                 log::warn!(
                     "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
                     store_prefix

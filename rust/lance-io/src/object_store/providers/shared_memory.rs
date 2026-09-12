@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use super::sanitized_authority;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, providers::memory::MemoryStoreProvider,
 };
@@ -13,11 +14,15 @@ use lance_core::error::Result;
 use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
-/// Process-global pool of in-memory backends keyed by URL authority.
+/// Process-global pool of in-memory backends keyed by sanitized URL authority.
 ///
 /// Different authorities map to different backends (act as "buckets"); same
 /// authority across any caller in the process resolves to the same `Arc<InMemory>`.
-/// The pool grows for the lifetime of the process — entries are never evicted.
+/// The key uses [`sanitized_authority`] (host[:port], userinfo stripped) so it
+/// agrees with the registry cache-key prefix in `calculate_object_store_prefix`
+/// — userinfo never distinguishes a backend, just as it never distinguishes a
+/// cache entry. The pool grows for the lifetime of the process — entries are
+/// never evicted.
 static SHARED_BACKENDS: LazyLock<Mutex<HashMap<String, Arc<InMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -25,7 +30,7 @@ fn shared_backend_for(url: &Url) -> Arc<InMemory> {
     SHARED_BACKENDS
         .lock()
         .expect("SHARED_BACKENDS mutex poisoned")
-        .entry(url.authority().to_string())
+        .entry(sanitized_authority(url))
         .or_insert_with(|| Arc::new(InMemory::new()))
         .clone()
 }
@@ -67,7 +72,10 @@ impl ObjectStoreProvider for SharedMemoryStoreProvider {
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        Ok(format!("shared-memory${}", url.authority()))
+        // `sanitized_authority`, not `Url::authority()`: the prefix is the
+        // registry cache key (logged via Debug / the cache-key debug lines), so
+        // any embedded `userinfo@` must be stripped. Matches `shared_backend_for`.
+        Ok(format!("shared-memory${}", sanitized_authority(url)))
     }
 }
 
@@ -145,5 +153,42 @@ mod tests {
             .unwrap();
         assert_ne!(a, b);
         assert_eq!(a, "shared-memory$x");
+    }
+
+    /// URL-embedded credentials must never reach the cache-key prefix — it is
+    /// the registry cache key, logged via the cache-key debug lines. A URL
+    /// differing only in `userinfo` collapses to the same prefix.
+    #[test]
+    fn calculate_prefix_strips_userinfo() {
+        let provider = SharedMemoryStoreProvider::default();
+        let prefix = provider
+            .calculate_object_store_prefix(
+                &Url::parse("shared-memory://user:s3cret@bucket/p").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(prefix, "shared-memory$bucket");
+        assert!(
+            !prefix.contains("s3cret"),
+            "prefix leaked the secret: {prefix}"
+        );
+        assert!(!prefix.contains("user"), "prefix leaked userinfo: {prefix}");
+    }
+
+    /// `shared_backend_for` keys on the sanitized authority too, so two URLs
+    /// differing only in `userinfo` resolve to the *same* backend bytes —
+    /// keeping backend routing consistent with the cache-key prefix.
+    #[tokio::test]
+    async fn userinfo_does_not_isolate_backend() {
+        let (writer, _) = store_for("shared-memory://creds-bucket/").await;
+        writer
+            .inner
+            .put(&Path::from("f"), PutPayload::from_static(b"v"))
+            .await
+            .unwrap();
+
+        let (reader, _) = store_for("shared-memory://user:pw@creds-bucket/").await;
+        let bytes = reader.inner.get(&Path::from("f")).await.unwrap();
+        assert_eq!(bytes.bytes().await.unwrap(), Bytes::from_static(b"v"));
     }
 }
