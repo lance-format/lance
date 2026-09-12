@@ -2415,6 +2415,15 @@ pub fn build_control_word_iterator<'a>(
     };
     let def_mask = if max_def == 0 { 0 } else { get_mask(def_width) };
     let total_width = rep_width + def_width;
+    // A levels array can be non-empty while the corresponding max level is 0:
+    // e.g. a page holding only valid rows after a page split has all zero
+    // definition levels.  With a zero total width the decoder reads a NIL
+    // layout (zero bytes per control word), so the writer must also emit the
+    // NIL writer instead of a Unary/Binary writer that would write one
+    // all-zero byte per word.
+    if total_width == 0 {
+        return ControlWordIterator::Nilary(NilaryControlWordIterator { len, idx: 0 });
+    }
     match (rep, def) {
         (Some(rep), Some(def)) => {
             let iter = rep.iter().copied().zip(def.iter().copied());
@@ -3653,6 +3662,102 @@ mod tests {
 
         // No rep, no def, no bytes
         check(&[], &[], Vec::default(), 0, 0, 0);
+    }
+
+    #[test]
+    fn test_control_words_def_only_all_zero_levels() {
+        // A page split can produce a page whose rows are all valid, so its
+        // definition levels are all zero and the max value in the (non-empty)
+        // buffer is 0.  The decoder reads a zero-bit layout as NIL (zero bytes
+        // per control word), so the writer must emit the NIL iterator too:
+        // zero bytes per word, no writes, one new-row/visible item per level.
+        // Writing one all-zero byte per word (the pre-fix Unary behavior)
+        // would disagree with the decoder and corrupt the stream.
+        let def = [0_u16; 5];
+
+        let mut iter = super::build_control_word_iterator(
+            None,
+            0,
+            Some(&def),
+            /*max_def=*/ 0,
+            /*max_visible_def=*/ u16::MAX,
+            def.len(),
+        );
+        assert_eq!(iter.bytes_per_word(), 0);
+        assert_eq!(iter.bits_rep(), 0);
+        assert_eq!(iter.bits_def(), 0);
+
+        let mut cw_vec = Vec::new();
+        for _ in 0..def.len() {
+            let word_desc = iter.append_next(&mut cw_vec).unwrap();
+            assert!(word_desc.is_new_row);
+            assert!(word_desc.is_visible);
+        }
+        assert!(iter.append_next(&mut cw_vec).is_none());
+        // The NIL layout writes nothing, matching what ControlWordParser::new(0, 0)
+        // reads back (Self::NIL parses nothing).
+        assert!(cw_vec.is_empty());
+
+        // The parser side of the same layout must also be NIL: zero bits on
+        // both levels parse zero bytes and yield nothing.
+        let parser = super::ControlWordParser::new(0, 0);
+        let mut rep_out = Vec::new();
+        let mut def_out = Vec::new();
+        parser.parse(&[], &mut rep_out, &mut def_out);
+        assert!(rep_out.is_empty());
+        assert!(def_out.is_empty());
+    }
+
+    #[test]
+    fn test_control_words_rep_only_all_zero_levels() {
+        // Same NIL-layout requirement as the definition-only case, for the
+        // repetition-only branches.  Repetition levels are normally never all
+        // zero (the first entry of every list row is the schema max rep), so
+        // this is a defensive check that the writer matches the decoder if a
+        // zero-width rep buffer is ever produced.
+        let rep = [0_u16; 5];
+        let mut iter = super::build_control_word_iterator(
+            Some(&rep),
+            /*max_rep=*/ 0,
+            None,
+            0,
+            /*max_visible_def=*/ u16::MAX,
+            rep.len(),
+        );
+        assert_eq!(iter.bytes_per_word(), 0);
+        let mut cw_vec = Vec::new();
+        for _ in 0..rep.len() {
+            assert!(iter.append_next(&mut cw_vec).unwrap().is_new_row);
+        }
+        assert!(iter.append_next(&mut cw_vec).is_none());
+        assert!(cw_vec.is_empty());
+    }
+
+    #[test]
+    fn test_control_words_both_levels_all_zero() {
+        // Both levels non-empty but all zero: the Binary writer would emit one
+        // zero byte per word while the decoder reads a NIL layout (zero bytes
+        // per word).  The unified zero-width early return avoids that
+        // write/read asymmetry.
+        let rep = [0_u16; 5];
+        let def = [0_u16; 5];
+        let mut iter = super::build_control_word_iterator(
+            Some(&rep),
+            /*max_rep=*/ 0,
+            Some(&def),
+            /*max_def=*/ 0,
+            /*max_visible_def=*/ u16::MAX,
+            rep.len(),
+        );
+        assert_eq!(iter.bytes_per_word(), 0);
+        assert_eq!(iter.bits_rep(), 0);
+        assert_eq!(iter.bits_def(), 0);
+        let mut cw_vec = Vec::new();
+        for _ in 0..rep.len() {
+            assert!(iter.append_next(&mut cw_vec).unwrap().is_new_row);
+        }
+        assert!(iter.append_next(&mut cw_vec).is_none());
+        assert!(cw_vec.is_empty());
     }
 
     #[test]
