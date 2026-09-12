@@ -1198,18 +1198,16 @@ def test_create_ivf_rq_index():
     assert stats["indices"][0]["sub_index"]["num_bits"] == 5
     assert stats["indices"][0]["sub_index"]["packed"] is True
 
-    with pytest.raises(
-        NotImplementedError,
-        match="Creating empty vector indices with train=False is not yet implemented",
-    ):
-        ds.delete("id>=0")
-        ds = ds.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            num_partitions=4,
-            num_bits=1,
-            replace=True,
-        )
+    ds.delete("id>=0")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+        replace=True,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["num_indexed_rows"] == 0
 
     zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
     tbl = pa.Table.from_pydict(

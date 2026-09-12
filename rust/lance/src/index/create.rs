@@ -572,8 +572,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 if train {
                     ext.create_index(self.dataset, column, &index_id, self.params)
                         .await?;
-                } else {
-                    todo!("create empty vector index when train=false");
                 }
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());

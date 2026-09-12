@@ -2629,6 +2629,32 @@ async fn collect_regular_indices_statistics(
         }
 
         let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+
+        // Empty indices (definition-only with no files) cannot be opened for stats.
+        // Emit a placeholder entry so the index still appears in `index_stats`, with
+        // num_rows = 0 to signal there is no indexed data yet.
+        let is_empty = meta
+            .fragment_bitmap
+            .as_ref()
+            .map(|bm| bm.is_empty())
+            .unwrap_or(false);
+        if is_empty {
+            let index_type = if index_details_wrapper.is_vector() {
+                "Vector".to_string()
+            } else {
+                index_details_wrapper
+                    .get_plugin()
+                    .map(|p| p.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".to_string())
+            };
+            indices_stats.push(serde_json::json!({
+                "index_type": index_type,
+                "uuid": meta.uuid.to_string(),
+                "num_rows": 0,
+            }));
+            continue;
+        }
+
         if let Ok(plugin) = index_details_wrapper.get_plugin()
             && let Some(stats) = plugin
                 .load_statistics(index_store.clone(), index_details.as_ref())
@@ -2958,12 +2984,13 @@ impl DatasetIndexInternalExt for Dataset {
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
-        // Check if this is a vector index by looking at the files list
-        let is_vector_index = if let Some(files) = &index_meta.files {
-            // If we have file metadata, check if INDEX_FILE_NAME is in the list
+        // Check if this is a vector index. First check index_details metadata (reliable
+        // for empty/definition-only indices), then fall back to file-based detection.
+        let is_vector_index = if let Some(details) = &index_meta.index_details {
+            scalar::IndexDetails(details.clone()).is_vector()
+        } else if let Some(files) = &index_meta.files {
             files.iter().any(|f| f.path == INDEX_FILE_NAME)
         } else {
-            // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
             let index_file = index_dir
                 .clone()
