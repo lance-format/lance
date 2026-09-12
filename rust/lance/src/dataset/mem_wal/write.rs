@@ -4927,6 +4927,51 @@ mod tests {
         );
     }
 
+    /// A struct column is matched whole, by the id on the column itself.
+    ///
+    /// Ids are carried for top-level fields, which is the granularity conform
+    /// works at: a column is taken or it is not. A change inside the struct
+    /// changes the column's type, and is handled as a type change.
+    #[test]
+    fn test_conform_matches_a_struct_column_by_its_own_id() {
+        fn with_id(field: ArrowField, id: i32) -> ArrowField {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.with_metadata(metadata)
+        }
+
+        let child = Arc::new(ArrowField::new("inner", DataType::Int32, true));
+        let struct_type = DataType::Struct(vec![child.clone()].into());
+        let values: ArrayRef = Arc::new(arrow_array::StructArray::from(vec![(
+            child,
+            Arc::new(Int32Array::from(vec![42])) as ArrayRef,
+        )]));
+
+        let entry = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                with_id(Field::new("id", DataType::Int32, false), 0),
+                with_id(Field::new("before", struct_type.clone(), true), 1),
+            ])),
+            vec![Arc::new(Int32Array::from(vec![1])), values],
+        )
+        .unwrap();
+
+        // The column was renamed; its type, and so its children, are unchanged.
+        let storage = schema_with_tombstone(&ArrowSchema::new(vec![
+            with_id(Field::new("id", DataType::Int32, false), 0),
+            with_id(Field::new("after", struct_type, true), 1),
+        ]));
+
+        let out = conform_to_storage_schema(entry, &storage, &["id".to_string()]).unwrap();
+        let after = out.column_by_name("after").expect("renamed struct column");
+        assert_eq!(
+            after.null_count(),
+            0,
+            "the struct column should carry values"
+        );
+        assert_eq!(out.schema(), storage);
+    }
+
     /// A field id outlives a rename, so matching on it keeps the column's rows
     /// where matching on the name would null them.
     #[test]
