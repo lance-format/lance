@@ -24,6 +24,8 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_intersection.rs"]
 mod intersection;
+#[path = "wand_maxscore.rs"]
+mod maxscore;
 
 use super::{
     CompressedPositionStorage,
@@ -168,6 +170,16 @@ impl TopKCollector {
         self.heap
             .push(Reverse((doc, doc_length, posting_doc_id, frequency_slot)));
         Ok(true)
+    }
+
+    fn rejects_score(&self, score: f32) -> bool {
+        if self.heap.len() < self.limit {
+            return false;
+        }
+        let Some(kth_score) = self.heap.peek().map(|entry| entry.0.0.score.0) else {
+            return false;
+        };
+        score.partial_cmp(&kth_score) != Some(std::cmp::Ordering::Greater)
     }
 
     fn kth_score_if_full(&self) -> Option<f32> {
@@ -1818,6 +1830,15 @@ fn score_contributions_in_query_order(mut contributions: SmallVec<[ScoreContribu
         .fold(0.0_f32, |score, (_, contribution)| score + contribution)
 }
 
+/// One MAXSCORE clause: posting plus the current window bound / prefix used
+/// to pick essential vs optional and to complete scores in query order.
+struct MaxScoreClause {
+    posting: Box<PostingIterator>,
+    query_rank: usize,
+    bound: f32,
+    prefix_bound: f64,
+}
+
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
 /// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
 /// paths can recover (term, freq) pairs of the essential clauses.
@@ -2321,6 +2342,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     maxscore_general_windows: usize,
     #[cfg(test)]
+    maxscore_essential_blocks_skipped: usize,
+    #[cfg(test)]
     phrase_position_checks: Cell<usize>,
     documents: &'a D,
     scorer: S,
@@ -2428,6 +2451,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
             maxscore_general_windows: 0,
+            #[cfg(test)]
+            maxscore_essential_blocks_skipped: 0,
             #[cfg(test)]
             phrase_position_checks: Cell::new(0),
             documents,
@@ -2788,13 +2813,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         params: &FtsSearchParams,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
-        struct MaxScoreClause {
-            posting: Box<PostingIterator>,
-            query_rank: usize,
-            bound: f32,
-            prefix_bound: f64,
-        }
-
         let limit = params.limit.unwrap_or(usize::MAX);
         let mut clauses = std::mem::take(&mut self.head)
             .into_vec()
@@ -2817,6 +2835,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let total_sum_upper_bound_factor = score_sum_upper_bound_factor(num_query_terms);
 
         let mut acc = WindowAccumulator::new(clauses.len());
+        let mut essential_chunk = Vec::with_capacity(128);
+        let mut soa_scratch = maxscore::MaxScoreSoaScratch::new();
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let norm_k = self.norm_k_cache();
         let norm_k_ref = norm_k
@@ -2958,12 +2978,50 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             };
 
             // Single essential clause (the common case once the threshold is
-            // competitive): stream it directly against the non-essential
-            // prefix, skipping the accumulator entirely.
+            // competitive): skip dead blocks, take one posting block at a
+            // time, and complete ≤2 optionals in SoA buffers. More optionals
+            // keep the per-doc LiveHit completion below.
             if first_essential + 1 == clauses.len() {
                 #[cfg(test)]
                 {
                     self.maxscore_single_essential_windows += 1;
+                }
+                if first_essential <= 2 {
+                    let essential_query_rank = clauses[first_essential].query_rank;
+                    let essential_term = clauses[first_essential].posting.term_index();
+                    let essential_weight = clauses[first_essential].posting.query_weight;
+                    let essential_window_bound = clauses[first_essential].bound;
+                    if clauses[first_essential]
+                        .posting
+                        .doc()
+                        .is_some_and(|doc| doc.doc_id() < window_min)
+                    {
+                        clauses[first_essential].posting.next(window_min);
+                    }
+                    self.score_single_essential_upto(
+                        &mut clauses,
+                        first_essential,
+                        first_essential,
+                        window_max,
+                        essential_query_rank,
+                        essential_term,
+                        essential_weight,
+                        essential_window_bound,
+                        num_query_terms,
+                        total_non_essential_bound,
+                        total_sum_upper_bound_factor,
+                        norm_k_ref,
+                        &mut essential_chunk,
+                        &mut soa_scratch,
+                        &mut candidates,
+                        &mut num_comparisons,
+                        params.wand_factor,
+                    )?;
+                    window_min = match window_max {
+                        TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                        max => max + 1,
+                    };
+                    continue;
                 }
                 let (non_essential, essential) = clauses.split_at_mut(first_essential);
                 let essential_query_rank = essential[0].query_rank;
@@ -3174,6 +3232,71 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 inner_min = inner_min.max(next_essential_doc);
                 if inner_min == TERMINATED_DOC_ID || inner_min > window_max {
                     break;
+                }
+                // Lucene `scoreInnerWindow`: when the second essential is at
+                // least INNER_WINDOW/2 ahead of the first, the prefix matches
+                // a single clause. Complete it with the SoA path instead of
+                // scattering two sparse lists into a 4096-slot accumulator.
+                let mut top_idx = None;
+                let mut top_doc = TERMINATED_DOC_ID;
+                let mut top2_doc = TERMINATED_DOC_ID;
+                for (idx, clause) in clauses.iter().enumerate().skip(first_essential) {
+                    let Some(doc) = clause.posting.doc() else {
+                        continue;
+                    };
+                    let id = doc.doc_id();
+                    if id < top_doc {
+                        top2_doc = top_doc;
+                        top_doc = id;
+                        top_idx = Some(idx);
+                    } else if id < top2_doc {
+                        top2_doc = id;
+                    }
+                }
+                if let Some(ess_idx) = top_idx
+                    && top2_doc.saturating_sub(top_doc) >= (MAXSCORE_INNER_WINDOW / 2) as u64
+                    && first_essential <= 2
+                {
+                    let upto = window_max.min(top2_doc.saturating_sub(1));
+                    if clauses[ess_idx]
+                        .posting
+                        .doc()
+                        .is_some_and(|doc| doc.doc_id() < inner_min)
+                    {
+                        clauses[ess_idx].posting.next(inner_min);
+                    }
+                    let essential_query_rank = clauses[ess_idx].query_rank;
+                    let essential_term = clauses[ess_idx].posting.term_index();
+                    let essential_weight = clauses[ess_idx].posting.query_weight;
+                    let essential_window_bound = clauses[ess_idx].bound;
+                    #[cfg(test)]
+                    {
+                        self.maxscore_single_essential_windows += 1;
+                    }
+                    self.score_single_essential_upto(
+                        &mut clauses,
+                        first_essential,
+                        ess_idx,
+                        upto,
+                        essential_query_rank,
+                        essential_term,
+                        essential_weight,
+                        essential_window_bound,
+                        num_query_terms,
+                        total_non_essential_bound,
+                        total_sum_upper_bound_factor,
+                        norm_k_ref,
+                        &mut essential_chunk,
+                        &mut soa_scratch,
+                        &mut candidates,
+                        &mut num_comparisons,
+                        params.wand_factor,
+                    )?;
+                    inner_min = match upto {
+                        TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                        max => max + 1,
+                    };
+                    continue;
                 }
                 let inner_max =
                     window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
@@ -6370,10 +6493,470 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document, 0);
+        let mut terms = hits[0]
+            .freqs
+            .iter()
+            .map(|(term_index, freq)| {
+                assert_eq!(*freq, 1);
+                *term_index
+            })
+            .collect::<Vec<_>>();
+        terms.sort_unstable();
+        assert_eq!(terms, vec![0, 1, 2]);
         assert_eq!(shared_floor.load(Ordering::Relaxed), 0x3be0_094c);
         assert_eq!(scored.load(Ordering::Relaxed), contributions.len());
         assert_eq!(wand.maxscore_single_essential_windows > 0, single_essential);
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
+    }
+
+    #[test]
+    fn maxscore_skips_essential_blocks_below_the_floor() {
+        // Lucene ImpactsEnum.setMinCompetitiveScore: a single-essential
+        // block whose impact bound plus the optional remainder cannot
+        // enter the heap is skipped without decoding.
+        let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let hot: Vec<u32> = (0..block).collect();
+        let cold: Vec<u32> = (block..2 * block).collect();
+        let ess_docs: Vec<u32> = hot.iter().copied().chain(cold.iter().copied()).collect();
+        let ess_freqs: Vec<u32> = std::iter::repeat_n(200, block as usize)
+            .chain(std::iter::repeat_n(1, block as usize))
+            .collect();
+        let opt_docs = ess_docs.clone();
+        let essential = PostingIterator::with_query_weight(
+            "ess".to_owned(),
+            0,
+            0,
+            1.0,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                ess_docs,
+                ess_freqs,
+                vec![1; 2 * block as usize],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            2 * block as usize,
+        );
+        let optional = PostingIterator::with_query_weight(
+            "opt".to_owned(),
+            1,
+            1,
+            0.01,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                opt_docs,
+                vec![1; 2 * block as usize],
+                vec![1; 2 * block as usize],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            2 * block as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..2 * block {
+            docs.append(doc.into(), 1);
+        }
+        let shared_floor = Arc::new(AtomicU32::new(5.0_f32.to_bits()));
+        let mut wand = Wand::new(
+            Operator::Or,
+            [essential, optional].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        )
+        .with_shared_threshold(shared_floor);
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            assert!(
+                hit.posting_doc_id < u64::from(block),
+                "cold-block doc {} should not enter the heap",
+                hit.posting_doc_id
+            );
+        }
+        // NOTE: this scenario never reaches the whole-block skip. With
+        // `InverseDocLengthScorer` there is no finite `doc_weight_upper_bound`,
+        // so `block_max_score` falls back to infinity and no block can be
+        // proven dead; with a BM25-shaped scorer the test helpers emit
+        // zeroed `block_max_scores`, so `block_max_score` falls back to the
+        // global scorer bound instead of a per-block one. Either way the skip
+        // branch stays uncovered by a unit test -- the assertion below only
+        // pins that the single-essential path ran.
+        assert!(
+            wand.maxscore_essential_blocks_skipped > 0
+                || wand.maxscore_single_essential_windows > 0,
+            "the hot block must take the single-essential path"
+        );
+    }
+
+    #[test]
+    fn maxscore_does_not_skip_past_the_current_window() {
+        // Optional starts in block 1. Window 0's optional remainder is 0, so
+        // the essential's next block cannot compete *in this window*. Skip
+        // must leave the cursor on that block for window 1, where the
+        // optional is live.
+        let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let ess_docs: Vec<u32> = (0..2 * block).collect();
+        let opt_docs: Vec<u32> = (block..2 * block).collect();
+        let essential = PostingIterator::with_query_weight(
+            "ess".to_owned(),
+            0,
+            0,
+            0.4,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                ess_docs,
+                vec![1; 2 * block as usize],
+                vec![1; 2 * block as usize],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            2 * block as usize,
+        );
+        let optional = PostingIterator::with_query_weight(
+            "opt".to_owned(),
+            1,
+            1,
+            0.3,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                opt_docs,
+                vec![1; block as usize],
+                vec![1; block as usize],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            2 * block as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..2 * block {
+            docs.append(doc.into(), 1);
+        }
+        let shared_floor = Arc::new(AtomicU32::new(0.5_f32.to_bits()));
+        let mut wand = Wand::new(
+            Operator::Or,
+            [essential, optional].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        )
+        .with_shared_threshold(shared_floor);
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.posting_doc_id >= u64::from(block)),
+            "only the optional-overlap block can beat the exclusive floor"
+        );
+    }
+
+    #[test]
+    fn merge_optional_freqs_matches_per_doc_next() {
+        let posting_docs = vec![1u32, 2, 4, 7, 11, 20, 21, 40];
+        let freqs = vec![3u32, 1, 5, 2, 9, 4, 1, 8];
+        let targets = [0u64, 2, 5, 7, 10, 11, 20, 21, 30, 40];
+        let build = || {
+            PostingIterator::new(
+                "hotels".to_owned(),
+                0,
+                0,
+                generate_posting_list_with_freqs(
+                    posting_docs.clone(),
+                    freqs.clone(),
+                    1.0,
+                    None,
+                    true,
+                ),
+                64,
+            )
+        };
+        let mut merged = build();
+        let mut out = vec![0u32; targets.len()];
+        merged.merge_optional_freqs(&targets, &mut out);
+
+        let mut probe = build();
+        let mut expected = vec![0u32; targets.len()];
+        for (i, &doc) in targets.iter().enumerate() {
+            if probe.doc().is_some_and(|cur| cur.doc_id() < doc) {
+                probe.next(doc);
+            }
+            if let Some(cur) = probe.doc()
+                && cur.doc_id() == doc
+            {
+                expected[i] = cur.frequency();
+            }
+        }
+        assert_eq!(out, expected);
+        assert_eq!(out, vec![0, 1, 0, 2, 0, 9, 4, 1, 0, 8]);
+    }
+
+    #[test]
+    fn maxscore_top2_gap_completes_isolated_essentials() {
+        // Two essentials 3000 docs apart: Lucene scores each stretch as a
+        // single-essential window. The optional sits on both ends so the
+        // floor can demote it without dropping either essential's hits.
+        let left: Vec<u32> = (0..32).collect();
+        let right: Vec<u32> = (3000..3032).collect();
+        let optional: Vec<u32> = left.iter().copied().chain(right.iter().copied()).collect();
+        let build = |token: &str, rank: u32, docs: Vec<u32>, weight: f32| {
+            PostingIterator::with_query_weight(
+                token.to_owned(),
+                rank,
+                rank,
+                weight,
+                generate_posting_list(docs, weight, None, true),
+                4096,
+            )
+        };
+        let mut docs = DocSet::default();
+        for doc in 0..4096u64 {
+            docs.append(doc, 1);
+        }
+        let shared_floor = Arc::new(AtomicU32::new(0.15_f32.to_bits()));
+        let mut wand = Wand::new(
+            Operator::Or,
+            [
+                build("left", 0, left, 2.0),
+                build("right", 1, right, 2.0),
+                build("opt", 2, optional, 0.1),
+            ]
+            .into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        )
+        .with_shared_threshold(shared_floor);
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(
+            wand.maxscore_single_essential_windows > 0,
+            "a 2048+ gap between essentials must take the Lucene single-clause inner window"
+        );
+    }
+
+    #[test]
+    fn maxscore_first_required_keeps_winners_on_the_buffer() {
+        // Optional is non-essential once the floor sits between its bound and
+        // the essential bound. Promoting it to required must still keep the
+        // document that has both terms; the essential posting is not the
+        // leapfrog driver.
+        let postings = [
+            (0_u32, 0.3_f32, vec![0_u32]),
+            (1_u32, 0.4_f32, vec![0_u32, 1]),
+        ]
+        .into_iter()
+        .map(|(position, query_weight, docs)| {
+            PostingIterator::with_query_weight(
+                format!("t{position}"),
+                position,
+                position,
+                query_weight,
+                generate_posting_list(docs, query_weight, None, true),
+                2,
+            )
+        })
+        .collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.append(1, 1);
+        let mut wand = Wand::new(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        wand.threshold = 0.45;
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, 0);
+        assert!(hits[0].freqs.iter().any(|(term, _)| *term == 0));
+        assert!(wand.maxscore_single_essential_windows > 0);
+    }
+
+    /// Oracle: `maxscore_search` must publish the same top-k as an exhaustive
+    /// fold over every document, scored in query order. The fold shares no code
+    /// with MAXSCORE, so it pins the hit set, the order, and the k-th score
+    /// without needing a second search path to compare against.
+    #[rstest]
+    fn maxscore_matches_an_exhaustive_query_order_fold(
+        #[values(2_usize, 3_usize)] num_terms: usize,
+        #[values(4_usize, 10_usize)] limit: usize,
+    ) {
+        let block = MAX_POSTING_BLOCK_SIZE as u32;
+        let total_docs = 3 * block;
+        let mut docs = DocSet::default();
+        for doc in 0..total_docs {
+            docs.append(u64::from(doc), doc % 17 + 1);
+        }
+
+        // Clause `term` covers `term, term+num_terms, term+2*num_terms, ...`,
+        // so membership is a closed form instead of a posting-list walk.
+        let covered =
+            |doc: u32, term: u32| doc >= term && (doc - term).is_multiple_of(num_terms as u32);
+        let freq_of = |doc: u32, term: u32| (doc + term) % 5 + 1;
+
+        let mut expected = (0..total_docs)
+            .map(|doc| {
+                let norm = 0.3 + docs.scoring_num_tokens(doc) as f32 * 0.1;
+                let score = (0..num_terms as u32)
+                    .filter(|term| covered(doc, *term))
+                    .fold(0.0_f32, |sum, term| {
+                        sum + bm25_doc_weight_with_norm(freq_of(doc, term), norm)
+                    });
+                (u64::from(doc), score)
+            })
+            .filter(|(_, score)| *score > 0.0)
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        // Lengths and frequencies are quantized, so many documents tie on
+        // score. Which tied documents fill the last slots is not observable,
+        // so pin the strict winners and the tie set instead of one arbitrary
+        // ordering.
+        let kth = expected[limit - 1].1;
+        let strictly_better = expected
+            .iter()
+            .filter(|(_, score)| *score > kth)
+            .map(|(doc, _)| *doc)
+            .collect::<Vec<_>>();
+        let tying = expected
+            .iter()
+            .filter(|(_, score)| *score == kth)
+            .map(|(doc, _)| *doc)
+            .collect::<Vec<_>>();
+
+        let postings = (0..num_terms as u32)
+            .map(|term| {
+                let doc_ids = (term..total_docs).step_by(num_terms).collect::<Vec<_>>();
+                let freqs = doc_ids
+                    .iter()
+                    .map(|doc| freq_of(*doc, term))
+                    .collect::<Vec<_>>();
+                let lengths = doc_ids.iter().map(|doc| doc % 17 + 1).collect::<Vec<_>>();
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term,
+                    term,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        doc_ids,
+                        freqs,
+                        lengths,
+                        MAX_POSTING_BLOCK_SIZE,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let mut wand = Wand::new(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            VariedBm25ShapeScorer,
+        )
+        .with_shared_threshold(shared_floor.clone());
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(limit)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        let got = hits
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>();
+        assert_eq!(got.len(), limit);
+        for doc in &strictly_better {
+            assert!(
+                got.contains(doc),
+                "doc {doc} scores above the k-th ({kth}) and must be in the top {limit}"
+            );
+        }
+        for doc in &got {
+            assert!(
+                strictly_better.contains(doc) || tying.contains(doc),
+                "doc {doc} is not a top-{limit} candidate (k-th = {kth})"
+            );
+        }
+        // The published floor is the k-th best score, so it pins the value and
+        // not just the membership.
+        assert_eq!(shared_floor.load(Ordering::Relaxed), kth.to_bits());
+    }
+
+    /// The gap that hands a stretch to the single-essential inner window is
+    /// `MAXSCORE_INNER_WINDOW / 2`. Pin the boundary from both sides instead of
+    /// only testing a comfortable distance away from it.
+    #[rstest]
+    fn maxscore_top2_gap_boundary(#[values(2047_u32, 2048_u32, 2049_u32)] gap: u32) {
+        let left = (0..32_u32).collect::<Vec<_>>();
+        let right = (gap..gap + 32).collect::<Vec<_>>();
+        let num_docs = (gap + 64) as usize;
+        let build = |token: &str, rank: u32, doc_ids: Vec<u32>, weight: f32| {
+            PostingIterator::with_query_weight(
+                token.to_owned(),
+                rank,
+                rank,
+                weight,
+                generate_posting_list(doc_ids, weight, None, true),
+                num_docs,
+            )
+        };
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs as u64 {
+            docs.append(doc, 1);
+        }
+        let mut wand = Wand::new(
+            Operator::Or,
+            // Distinct weights: every document of "left" outranks every document
+            // of "right", so the top ten is a known set instead of an arbitrary
+            // pick out of 64 tied documents.
+            [build("left", 0, left, 3.0), build("right", 1, right, 1.0)].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 10);
+        assert!(
+            hits.iter().all(|hit| hit.posting_doc_id < 32),
+            "the heavier clause must fill the top ten, got {:?}",
+            hits.iter()
+                .map(|hit| hit.posting_doc_id)
+                .collect::<Vec<_>>()
+        );
+        if gap >= (MAXSCORE_INNER_WINDOW / 2) as u32 {
+            assert!(
+                wand.maxscore_single_essential_windows > 0,
+                "gap {gap} must take the single-essential inner window"
+            );
+        } else {
+            assert!(
+                wand.maxscore_general_windows > 0,
+                "gap {gap} must stay on the general window path"
+            );
+        }
     }
 
     #[rstest]
