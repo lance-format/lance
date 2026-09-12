@@ -24,6 +24,7 @@ extend-exclude = [
     "notebooks/*.ipynb",
     "*_THIRD_PARTY_LICENSES.*",
     "rust/lance-file/test_data/exact_versions/*.lance",
+    "kotoba/fixtures/*.lance",
     "rust/lance-tokenizer/src/stop_word_filter/stopwords.rs",
 ]
 # If a line ends with # or // and has spellchecker:disable-line, ignore it

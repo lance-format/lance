@@ -1,0 +1,32 @@
+;; SPDX-License-Identifier: Apache-2.0
+;; SPDX-FileCopyrightText: Copyright The Lance Authors
+;;
+;; Honest v1: Lance magic + version header only. Not a reader.
+;; Target: kotoba 0.7.2 / wasm32-kotoba-v1 / i64-v1. No FFI. No IEEE floats.
+;; Arity stays at or below the i64-v1 ABI limit of 5.
+;;
+;; Vendored fixture tail (fixtures/tiny.lance, last 8 bytes, little-endian):
+;;   00 00 01 00 4c 41 4e 43
+;;   u16 major=0 | u16 minor=1 | magic LANC
+;;
+;; main packs those parsed fields as:
+;;   magic_ok * 1000000 + major * 1000 + minor
+
+(ns lance.header
+  (:export [u16-le lance-magic? pack-header main]))
+
+(defn u16-le [b0 b1]
+  (+ b0 (* b1 256)))
+
+(defn lance-magic? [b0 b1 b2 b3]
+  (if (and (= b0 76) (= b1 65) (= b2 78) (= b3 67)) 1 0))
+
+(defn pack-header [major minor magic-ok]
+  (+ (* 1000000 magic-ok)
+     (* 1000 major)
+     minor))
+
+(defn main []
+  (if (= (lance-magic? 76 65 78 67) 1)
+    (pack-header (u16-le 0 0) (u16-le 1 0) 1)
+    0))
