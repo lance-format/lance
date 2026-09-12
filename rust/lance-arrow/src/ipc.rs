@@ -55,11 +55,22 @@ pub fn read_len_prefixed_bytes(reader: &mut dyn Read) -> Result<Vec<u8>, ArrowEr
     reader
         .read_exact(&mut len_buf)
         .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-    let len = u64::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    reader
-        .read_exact(&mut buf)
+    let len = u64::from_le_bytes(len_buf);
+    // The length is untrusted, so grow the buffer from the bytes the reader
+    // actually yields instead of reserving for the declared size: a corrupt
+    // prefix would otherwise request a capacity that panics before a single
+    // byte is consumed.
+    let mut buf = Vec::new();
+    let read = (&mut *reader)
+        .take(len)
+        .read_to_end(&mut buf)
         .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+    if read as u64 != len {
+        return Err(ArrowError::IoError(
+            format!("length-prefixed bytes: declared {len} bytes, found {read}"),
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated data"),
+        ));
+    }
     Ok(buf)
 }
 
@@ -491,6 +502,95 @@ mod tests {
     use arrow_array::{ArrayRef, record_batch};
 
     use super::*;
+
+    /// `read_len_prefixed_bytes` and [`read_len_prefixed_bytes_at`] are documented
+    /// as a pair over one wire format, so the same bytes must reach the same
+    /// verdict. A declared length larger than the payload is the case that used to
+    /// diverge: the `Read` side reserved for it before consuming anything.
+    #[test]
+    fn test_len_prefixed_readers_agree_on_truncated_payloads() {
+        for (declared, available) in [(u64::MAX, 0), (1 << 40, 0), (8, 7), (1, 0)] {
+            let mut encoded = declared.to_le_bytes().to_vec();
+            encoded.extend(std::iter::repeat_n(0xABu8, available));
+
+            let stream_err = read_len_prefixed_bytes(&mut std::io::Cursor::new(encoded.clone()))
+                .expect_err(&format!("declared {declared}, available {available}"));
+            let mut offset = 0;
+            let at_err = read_len_prefixed_bytes_at(&Bytes::from(encoded), &mut offset)
+                .expect_err(&format!("declared {declared}, available {available}"));
+
+            for err in [&stream_err, &at_err] {
+                assert!(
+                    matches!(err, ArrowError::IoError(..)),
+                    "declared {declared}: expected an IoError, got {err:?}"
+                );
+            }
+            assert!(
+                stream_err.to_string().contains("length-prefixed bytes"),
+                "declared {declared}: unexpected message {stream_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_len_prefixed_bytes_roundtrip() {
+        for size in [0usize, 1, 64, 4096] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+            let mut buf = Vec::new();
+            write_len_prefixed_bytes(&mut buf, &payload).unwrap();
+            assert_eq!(buf.len(), 8 + size, "size {size}");
+
+            assert_eq!(
+                read_len_prefixed_bytes(&mut std::io::Cursor::new(buf.clone())).unwrap(),
+                payload,
+                "size {size}"
+            );
+
+            let mut offset = 0;
+            assert_eq!(
+                read_len_prefixed_bytes_at(&Bytes::from(buf), &mut offset).unwrap(),
+                payload,
+                "size {size}"
+            );
+            assert_eq!(offset, 8 + size, "size {size}");
+        }
+    }
+
+    /// Trailing bytes belong to whatever follows, so neither reader may consume them.
+    #[test]
+    fn test_len_prefixed_bytes_stops_at_the_declared_length() {
+        let mut buf = Vec::new();
+        write_len_prefixed_bytes(&mut buf, b"lance").unwrap();
+        buf.extend_from_slice(b"trailing");
+
+        assert_eq!(
+            read_len_prefixed_bytes(&mut std::io::Cursor::new(buf.clone())).unwrap(),
+            b"lance"
+        );
+        let mut offset = 0;
+        assert_eq!(
+            read_len_prefixed_bytes_at(&Bytes::from(buf), &mut offset).unwrap(),
+            b"lance".as_slice()
+        );
+        assert_eq!(offset, 8 + 5);
+    }
+
+    #[test]
+    fn test_len_prefixed_bytes_rejects_a_truncated_length_field() {
+        for available in [0usize, 7] {
+            let encoded = vec![0xFFu8; available];
+            assert!(
+                read_len_prefixed_bytes(&mut std::io::Cursor::new(encoded.clone())).is_err(),
+                "available {available}"
+            );
+            let mut offset = 0;
+            assert!(
+                read_len_prefixed_bytes_at(&Bytes::from(encoded), &mut offset).is_err(),
+                "available {available}"
+            );
+        }
+    }
 
     #[test]
     fn test_ipc_roundtrip() {
