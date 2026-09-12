@@ -2855,13 +2855,33 @@ impl Scanner {
             .union_columns(filter_columns, OnMissing::Error)?
             .into_schema();
 
+        let mut late_ids = HashSet::new();
+        for field in self.dataset.schema().fields.iter() {
+            self.collect_late_field_ids(field, false, &mut late_ids);
+        }
+
         // Start with the desired fields
         Ok(desired_projection
             .clone()
             // Subtract columns that are expensive
-            .subtract_predicate(|f| !self.is_early_field(f))
+            .subtract_predicate(|f| late_ids.contains(&f.id))
             // Add back columns that we need for filtering
             .union_schema(&filter_schema))
+    }
+
+    // Collects the ids of the fields that should be materialized late (see calc_eager_projection).
+    //
+    // `forced` is true when a non-struct ancestor is late, in which case this field and all of
+    // its descendants are late regardless of their own width.
+    fn collect_late_field_ids(&self, field: &Field, forced: bool, late_ids: &mut HashSet<i32>) {
+        let is_late = forced || !self.is_early_field(field);
+        if is_late {
+            late_ids.insert(field.id);
+        }
+        let force_children = forced || (is_late && !field.logical_type.is_struct());
+        for child in field.children.iter() {
+            self.collect_late_field_ids(child, force_children, late_ids);
+        }
     }
 
     fn validate_options(&self) -> Result<()> {
@@ -13370,6 +13390,55 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .materialization_style(MaterializationStyle::AllLate);
         let err = scan.create_plan().await.unwrap_err();
         assert!(err.to_string().contains("with_deleted_rows"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_late_materialize_list_as_unit() {
+        // A list's `item` child is narrow, so deciding per field kept it eager and pulled the
+        // whole list back in.  A list must be deferred together with its children.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("count", DataType::Int32, true),
+            ArrowField::new(
+                "tokens",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]);
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("toks", array::rand_list(&DataType::Int32, false))
+            .col("st", array::rand_struct(struct_fields))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Arc::new(Dataset::write(data, "memory://test", None).await.unwrap());
+        let scanner = dataset.scan();
+        let planner = Planner::new(Arc::new(dataset.schema().into()));
+        let eager = |filter: &str, project: [&str; 1]| {
+            let filter_plan =
+                ExprFilterPlan::new_refine_only(planner.parse_filter(filter).unwrap());
+            let desired = dataset
+                .empty_projection()
+                .union_columns(project, OnMissing::Error)
+                .unwrap();
+            scanner
+                .calc_eager_projection(&filter_plan, &desired)
+                .unwrap()
+                .to_bare_schema()
+        };
+
+        // Top-level list: only the narrow filter column is read eagerly
+        let schema = eager("i > 5", ["toks"]);
+        assert!(schema.field("i").is_some(), "{schema:?}");
+        assert!(schema.field("toks").is_none(), "{schema:?}");
+
+        // List nested in a struct: the narrow sibling is still read eagerly
+        let schema = eager("st.count IS NOT NULL", ["st.tokens"]);
+        let eager_children = schema.field("st").map(|st| {
+            st.children
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(eager_children, Some(vec!["count"]), "{schema:?}");
     }
 
     #[rstest]
