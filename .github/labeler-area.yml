@@ -44,7 +44,7 @@ A-format:
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
-          - "protos/transaction.proto"
+          - "protos/transaction/*.proto"
           - "docs/src/format/**"
 
 # Drives the format-spec vote gate (.github/workflows/format-vote-gate.yml):
@@ -62,7 +62,7 @@ format-change:
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
-          - "protos/transaction.proto"
+          - "protos/transaction/*.proto"
           - "docs/src/format/**"
 
 # Lockfiles are intentionally not excluded: a pure dependency bump gets both

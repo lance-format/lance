@@ -19,7 +19,9 @@ fn main() -> Result<()> {
     prost_build.compile_protos(
         &[
             "./protos/table.proto",
-            "./protos/transaction.proto",
+            "./protos/transaction/common.proto",
+            "./protos/transaction/actions.proto",
+            "./protos/transaction/transaction.proto",
             "./protos/rowids.proto",
         ],
         &["./protos"],

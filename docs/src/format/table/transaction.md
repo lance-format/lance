@@ -47,7 +47,7 @@ For detailed conflict detection and resolution mechanisms, see the [Conflict Res
 
 ## Transaction Types
 
-The authoritative specification for transaction types is defined in [`protos/transaction.proto`](https://github.com/lancedb/lance/blob/main/protos/transaction.proto).
+The authoritative specification for transaction types is defined in [`protos/transaction/`](https://github.com/lancedb/lance/tree/main/protos/transaction).
 
 Each transaction contains a `read_version` field indicating the table version from which the transaction was built,
 a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types:
