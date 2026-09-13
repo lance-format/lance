@@ -1165,6 +1165,8 @@ if TYPE_CHECKING:
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        data_cache_bytes: Optional[int] = None,
+        max_page_bytes: Optional[int] = None,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
@@ -1192,6 +1194,8 @@ if TYPE_CHECKING:
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        data_cache_bytes: Optional[int] = None,
+        max_page_bytes: Optional[int] = None,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
@@ -1219,6 +1223,8 @@ def write_fragments(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: Optional[int] = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
@@ -1268,6 +1274,13 @@ def write_fragments(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     progress : FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
@@ -1410,6 +1423,8 @@ def write_fragments(
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
+        data_cache_bytes=data_cache_bytes,
+        max_page_bytes=max_page_bytes,
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,

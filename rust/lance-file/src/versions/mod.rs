@@ -325,6 +325,18 @@ pub async fn open_self_described_reader(
     FileReader::try_open_for_dispatch(scheduler, None, decoder_plugins, cache, options).await
 }
 
+fn validate_current_writer_options(
+    version: ConcreteFileVersion,
+    options: &FileWriterOptions,
+) -> Result<()> {
+    if version != ConcreteFileVersion::V1 && options.max_page_bytes == Some(0) {
+        return Err(Error::invalid_input(
+            "max_page_bytes must be greater than 0, got 0",
+        ));
+    }
+    Ok(())
+}
+
 /// Create a current-format writer for an exact file version.
 ///
 /// V1 uses [`v1::writer::FileWriter`] directly because its manifest provider is
@@ -335,6 +347,7 @@ pub fn create_writer(
     schema: Schema,
     options: FileWriterOptions,
 ) -> Result<FileWriter> {
+    validate_current_writer_options(version, &options)?;
     match version {
         ConcreteFileVersion::V1 => Err(Error::not_supported(
             "Lance v1 files must be created with versions::v1::writer::FileWriter".to_string(),
@@ -360,6 +373,7 @@ pub fn create_lazy_writer(
     object_writer: Box<dyn Writer>,
     options: FileWriterOptions,
 ) -> Result<FileWriter> {
+    validate_current_writer_options(version, &options)?;
     match version {
         ConcreteFileVersion::V1 => Err(Error::not_supported(
             "legacy v1 files require an explicit schema and manifest provider".to_string(),

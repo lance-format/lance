@@ -12,7 +12,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_file::version::stable_file_version;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
@@ -101,6 +101,12 @@ impl<'a> FragmentCreateBuilder<'a> {
     pub fn write_params(mut self, params: &'a WriteParams) -> Self {
         self.write_params = Some(params);
         self
+    }
+
+    pub(crate) fn file_writer_options(&self) -> FileWriterOptions {
+        self.write_params
+            .and_then(|params| params.file_writer_options.clone())
+            .unwrap_or_default()
     }
 
     /// Write a fragment.

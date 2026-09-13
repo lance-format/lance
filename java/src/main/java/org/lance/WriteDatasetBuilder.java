@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.model.DeclareTableRequest;
 import org.lance.namespace.model.DeclareTableResponse;
@@ -76,6 +77,7 @@ public class WriteDatasetBuilder {
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
   private Optional<Long> maxBytesPerFile = Optional.empty();
+  private FileWriteOptions fileWriteOptions = FileWriteOptions.builder().build();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
@@ -291,6 +293,17 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets options for configuring the current-format file writer.
+   *
+   * @param fileWriteOptions file writer options
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder fileWriteOptions(FileWriteOptions fileWriteOptions) {
+    this.fileWriteOptions = fileWriteOptions;
+    return this;
+  }
+
+  /**
    * Sets whether to enable stable row IDs.
    *
    * @param enableStableRowIds Whether to enable stable row IDs
@@ -474,7 +487,8 @@ public class WriteDatasetBuilder {
         new WriteParams.Builder()
             .withMode(mode)
             .withStorageOptions(mergedStorageOptions)
-            .withBaseStoreParams(baseStoreParams);
+            .withBaseStoreParams(baseStoreParams)
+            .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -512,7 +526,8 @@ public class WriteDatasetBuilder {
         new WriteParams.Builder()
             .withMode(mode)
             .withStorageOptions(storageOptions)
-            .withBaseStoreParams(baseStoreParams);
+            .withBaseStoreParams(baseStoreParams)
+            .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
