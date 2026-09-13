@@ -188,7 +188,7 @@ impl AutoProbeConfig {
             _ => 2,
         };
         // Profiles depend only on metric and k; every index uses the same values.
-        let (default_margin, minimum, cap) = match metric {
+        let (default_margin, default_minimum, cap) = match metric {
             DistanceType::L2 => (
                 [0.2175, 0.265, 0.33][bucket],
                 [5, 6, 11][bucket],
@@ -207,7 +207,7 @@ impl AutoProbeConfig {
             _ => return Ok(Some(Self::default())),
         };
         let config = Self {
-            min_initial_nprobes: minimum,
+            min_initial_nprobes: default_minimum,
             margin: default_margin,
             max_initial_nprobes: Some(cap),
         };
