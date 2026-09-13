@@ -3,28 +3,27 @@
 
 //! Copy-on-write `__manifest` directory-catalog commit benchmark (S3 capable).
 //!
-//! Measures how fast the directory catalog commits `__manifest` mutations as the
-//! manifest scales, with the inline scalar indices on or off.
+//! Measures in-memory directory catalog reads, loads, and `__manifest` mutations as
+//! the manifest scales.
 //!
 //! Modes:
-//!   seed-large — bootstrap a `__manifest` with N rows (direct dataset write + one
-//!                CoW rewrite to build indices)
+//!   seed-large — bootstrap a `__manifest` with N rows in one dataset write
 //!   run        — coordinator: spawn `--concurrency` worker processes committing for
 //!                either a fixed op count (continuous) or a fixed duration (steady TPS)
 //!   worker     — (internal) a single committing process spawned by `run`
 //!
 //! Examples:
-//!   # Bootstrap 100k rows with inline indices
+//!   # Bootstrap 100k rows in one write
 //!   manifest_bench seed-large --root s3://bucket/bench/p --count 100000 \
-//!     --inline-optimization true --storage-option aws_region=us-east-1
+//!     --storage-option aws_region=us-east-1
 //!
 //!   # Continuous: 100 commits, single process
 //!   manifest_bench run --root s3://bucket/bench/p --operation write-create-namespace \
-//!     --concurrency 1 --operations 100 --initial-entries 100000 --inline-optimization true
+//!     --concurrency 1 --operations 100 --initial-entries 100000
 //!
 //!   # Concurrent steady TPS: 50 processes committing for 30s
 //!   manifest_bench run --root s3://bucket/bench/p --operation write-create-namespace \
-//!     --concurrency 50 --duration-secs 30 --initial-entries 100000 --inline-optimization true
+//!     --concurrency 50 --duration-secs 30 --initial-entries 100000
 
 // A CLI benchmark tool: workers emit JSON latency records on stdout and progress on
 // stderr, so stdout/stderr printing is intentional here.
@@ -195,9 +194,7 @@ async fn build_namespace(
 }
 
 // ──────────────────── seed-large mode ────────────────────
-// Bootstrap a `__manifest` with N rows by writing the Lance dataset directly (fast,
-// O(N) once), then trigger a single CoW rewrite via the namespace so the on-disk state
-// matches what the catalog produces (single fragment + inline indices when enabled).
+// Bootstrap a `__manifest` with N rows in one direct dataset write.
 
 const SEED_LARGE_BATCH_SIZE: usize = 50_000;
 
@@ -252,7 +249,7 @@ fn generate_manifest_batch(start_idx: usize, batch_size: usize, total_count: usi
 async fn seed_large(
     root: &str,
     count: usize,
-    inline_optimization: bool,
+    _inline_optimization: bool,
     storage_options: &HashMap<String, String>,
 ) {
     let manifest_uri = format!("{}/{}", root, "__manifest");
@@ -292,24 +289,6 @@ async fn seed_large(
         .expect("Failed to write manifest dataset");
     eprintln!("  wrote Lance dataset");
 
-    // Trigger one CoW rewrite so the manifest is in steady catalog form (single
-    // fragment; inline indices when enabled). For the no-index variant the first real
-    // commit performs this rewrite instead.
-    if inline_optimization {
-        eprintln!("  triggering initial CoW rewrite to build indices...");
-        let start = Instant::now();
-        let ns = build_namespace(root, true, storage_options).await;
-        let mut req = CreateNamespaceRequest::new();
-        req.id = Some(vec!["__seed_trigger__".to_string()]);
-        ns.create_namespace(req)
-            .await
-            .expect("Failed to trigger CoW rewrite");
-        eprintln!(
-            "  CoW rewrite with index build took {:.1}s",
-            start.elapsed().as_secs_f64()
-        );
-    }
-
     let ns_count = count / 3;
     eprintln!(
         "Seed-large complete: {} rows ({} namespaces, {} tables)",
@@ -333,7 +312,9 @@ async fn worker(
     inline_optimization: bool,
     storage_options: &HashMap<String, String>,
 ) {
+    let startup = Instant::now();
     let ns = build_namespace(root, inline_optimization, storage_options).await;
+    let startup_elapsed = startup.elapsed();
     let ipc_data = Bytes::from(create_test_ipc_data());
 
     if operation.starts_with("warm-read") {
@@ -352,6 +333,16 @@ async fn worker(
         let _ = op_idx;
         println!("{}", serde_json::to_string(&record).unwrap());
     };
+
+    if operation == "startup" {
+        let record = LatencyRecord {
+            operation: operation.to_string(),
+            latency_ms: startup_elapsed.as_secs_f64() * 1000.0,
+            error: false,
+        };
+        println!("{}", serde_json::to_string(&record).unwrap());
+        return;
+    }
 
     if duration_secs > 0 {
         // Steady-TPS mode: commit continuously until the deadline.
@@ -636,11 +627,7 @@ async fn main() {
     }
 
     if variant.is_empty() {
-        variant = if inline_optimization {
-            "inline_index".to_string()
-        } else {
-            "no_index".to_string()
-        };
+        variant = "in_memory".to_string();
     }
 
     match mode {
