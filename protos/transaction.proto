@@ -407,6 +407,89 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  /* A condition that must hold for the commit to proceed.
+   *
+   * A precondition declares a set of cells — the cartesian product of the
+   * declared fields and row addresses — whose contents must be identical
+   * to what they held at the transaction's read_version when the
+   * transaction commits. If a concurrent transaction changed any declared
+   * cell, the commit is rejected instead of rebased over the change,
+   * because values computed from the old cell contents would be stale.
+   *
+   * "Unchanged" is defined conservatively and evaluated against the state
+   * at the read_version, not the latest version:
+   *
+   * - Field validity: every declared field must still exist in the schema
+   *   with the same data type and nullability it had at the read_version.
+   *   A concurrent operation that removes the field (e.g. Project) or
+   *   alters its type violates the precondition, even if the fragment
+   *   data files carrying it are unchanged.
+   * - Manifest structure: a declared cell counts as changed if its
+   *   fragment was removed, if the fragment's data files were replaced, or
+   *   if an overlay affecting the cell was added, modified, removed, or
+   *   narrowed. A change to the deletion vector does not count as a change:
+   *   a deleted row is masked, so any staged value on it is invisible to
+   *   readers and does not need to be recomputed.
+   *
+   * Implementations may over-reject (declare a cell changed when its
+   * contents were in fact preserved, e.g. at fragment granularity), but
+   * must never under-reject (declare a cell unchanged when its contents
+   * changed or its field no longer exists).
+   */
+  message Precondition {
+    /* The ids of the fields (columns) whose cells must be unchanged.
+     * Entries must be valid, non-negative schema field ids that exist in
+     * the schema at the read_version. An empty list declares no cells; it
+     * is degenerate and producers should not emit it.
+     */
+    repeated int32 field_ids = 1;
+
+    /* The rows that must be unchanged: one entry per fragment. An empty
+     * list declares no cells; it is degenerate and producers should not
+     * emit it.
+     *
+     * Entries are physical row addresses valid at the read_version: a
+     * concurrent rewrite (compaction) that relocates the declared rows
+     * counts as a change. Stable row id based preconditions are reserved
+     * for a future revision.
+     */
+    repeated RowSelection rows = 2;
+
+    /* A per-fragment selection of row addresses. */
+    message RowSelection {
+      /* The fragment the selection applies to. Entries must not repeat
+       * the same fragment within one precondition.
+       */
+      uint32 fragment_id = 1;
+
+      /* Which rows of the fragment are selected. */
+      oneof coverage {
+        /* The entire fragment is selected. Must be true when set. */
+        bool full = 2;
+
+        /* The selected row offsets within the fragment, in the Roaring
+         * Bitmap portable serialization. Consumers must reject bitmaps
+         * that are not valid portable-serialized Roaring bitmaps.
+         */
+        bytes bitmap = 3;
+      }
+    }
+  }
+
+  /* Conditions that must hold on the manifest a transaction lands on.
+   *
+   * The entries are conjunctive: every precondition must hold. If any
+   * precondition is violated, the commit fails and may be retried by the
+   * caller after recomputing against a newer read_version; it is never
+   * silently rebased over the changed cells.
+   *
+   * Absent or empty means no conditions: the transaction commits normally.
+   * Producers must write valid encodings; consumers must reject invalid
+   * encodings (undecodable rows, negative field ids) as corrupt
+   * transactions.
+   */
+  repeated Precondition preconditions = 5;
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
