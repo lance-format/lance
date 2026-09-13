@@ -24,7 +24,7 @@ use std::{
     collections::BinaryHeap,
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -34,6 +34,10 @@ use crate::scalar::RowIdRemapper;
 use crate::{
     pb,
     vector::{
+        bq::dist_table_quant::{
+            DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
+        },
+        bq::storage::SEGMENT_NUM_CODES,
         ivf::storage::{IVF_METADATA_KEY, IvfModel},
         quantizer::Quantization,
     },
@@ -280,6 +284,32 @@ pub struct DistanceCalculatorOptions {
     pub approx_mode: ApproxMode,
 }
 
+/// A FastScan lookup table quantized from a query's f32 distance table,
+/// together with the map that turns kernel sums back into distances.
+#[derive(Debug)]
+pub struct QuantizedDistTable {
+    pub table: Vec<u8>,
+    pub dequant: DistTableDequant,
+    /// Number of 16-entry segments in the source f32 table. The accurate LUT is
+    /// widened during transfer, so its byte length no longer reports this.
+    pub num_tables: usize,
+}
+
+/// Per-query state derived from a raw query vector for RaBitQ residual
+/// quantization.
+///
+/// This is an internal cross-crate plumbing type, hidden from the public docs:
+/// `lance-index` builds it (`IvfRqIndex::prepare_raw_query_context`) and `lance`
+/// holds/forwards it as an opaque handle — neither side exposes the fields to
+/// downstream users, and no downstream crate can meaningfully construct it via
+/// a struct literal (the fields are RaBitQ internals). It is `pub` only so the
+/// type can cross the `lance-index` → `lance` crate boundary. Its private
+/// `normal_lut`/`accurate_lut` fields are lazily-built per-query FastScan
+/// lookup tables (read through [`RabitRawQueryContext::normal_lut`] /
+/// [`RabitRawQueryContext::accurate_lut`]), which is why construction goes
+/// through [`RabitRawQueryContext::new`] rather than a struct literal.
+#[doc(hidden)]
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct RabitRawQueryContext {
     pub code_dim: usize,
@@ -291,6 +321,67 @@ pub struct RabitRawQueryContext {
     /// read `rotated_query` directly).
     pub ex_query: Vec<f32>,
     pub sum_q: f32,
+    /// FastScan LUTs derived from `dist_table`. In the raw-query estimator the
+    /// distance table does not depend on the partition centroid, so quantizing
+    /// it is per-query work that every probed partition would otherwise repeat.
+    /// Built on first use because a query only ever exercises one of the two.
+    normal_lut: OnceLock<QuantizedDistTable>,
+    accurate_lut: OnceLock<QuantizedDistTable>,
+}
+
+impl RabitRawQueryContext {
+    pub fn new(
+        code_dim: usize,
+        ex_bits: u8,
+        rotated_query: Vec<f32>,
+        dist_table: Vec<f32>,
+        ex_query: Vec<f32>,
+        sum_q: f32,
+    ) -> Self {
+        Self {
+            code_dim,
+            ex_bits,
+            rotated_query,
+            dist_table,
+            ex_query,
+            sum_q,
+            normal_lut: OnceLock::new(),
+            accurate_lut: OnceLock::new(),
+        }
+    }
+
+    /// The `u8` FastScan LUT used by the fast and normal approx modes.
+    pub fn normal_lut(&self) -> &QuantizedDistTable {
+        self.normal_lut.get_or_init(|| {
+            let mut table = Vec::new();
+            let dequant = quantize_dist_table_into(&self.dist_table, &mut table);
+            QuantizedDistTable {
+                table,
+                dequant,
+                num_tables: self.num_tables(),
+            }
+        })
+    }
+
+    fn num_tables(&self) -> usize {
+        self.dist_table.len() / SEGMENT_NUM_CODES
+    }
+
+    /// The widened LUT used by the accurate approx mode, already transferred
+    /// into the byte layout its kernel reads.
+    pub fn accurate_lut(&self) -> &QuantizedDistTable {
+        self.accurate_lut.get_or_init(|| {
+            let mut u16_table = Vec::new();
+            let dequant = quantize_dist_table_u16_into(&self.dist_table, &mut u16_table);
+            let mut table = Vec::new();
+            lance_linalg::simd::dist_table::transfer_4bit_dist_table_u16(&u16_table, &mut table);
+            QuantizedDistTable {
+                table,
+                dequant,
+                num_tables: self.num_tables(),
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy)]

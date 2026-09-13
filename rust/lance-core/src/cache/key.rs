@@ -118,13 +118,26 @@ impl fmt::Debug for InternalCacheKey {
 }
 
 /// Pre-derived namespace key shared by entries in one logical cache scope.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheNamespace([u8; 32]);
 
 impl CacheNamespace {
     /// Construct the stable root namespace.
     pub fn root() -> Self {
         Self(blake3::derive_key(NAMESPACE_CONTEXT, b""))
+    }
+
+    /// An [`InternalCacheKey`] tagged with the namespace it was derived under.
+    ///
+    /// Hot paths can compute a key once and replay it on later lookups, but a
+    /// digest is only meaningful inside the namespace that produced it. Keeping
+    /// the two together lets the cache reject a foreign digest instead of
+    /// silently reading another namespace's entry.
+    pub fn tag(self, key: InternalCacheKey) -> PrecomputedCacheKey {
+        PrecomputedCacheKey {
+            namespace: self,
+            key,
+        }
     }
 
     /// Derive a child namespace from one framed hierarchy segment.
@@ -134,6 +147,23 @@ impl CacheNamespace {
         hasher.update(&KEY_FORMAT_VERSION.to_le_bytes());
         write_framed(&mut hasher, segment.as_bytes());
         Self(hasher.finalize().into())
+    }
+}
+
+/// A cache key digest together with the namespace it is valid in.
+///
+/// Produced by `LanceCache::physical_key` / `WeakLanceCache::physical_key` and
+/// replayed through [`CacheKey::precomputed_physical_key`](super::CacheKey::precomputed_physical_key).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrecomputedCacheKey {
+    namespace: CacheNamespace,
+    key: InternalCacheKey,
+}
+
+impl PrecomputedCacheKey {
+    /// The digest, if this key was derived under `namespace`.
+    pub fn resolve(&self, namespace: &CacheNamespace) -> Option<InternalCacheKey> {
+        (self.namespace == *namespace).then_some(self.key)
     }
 }
 
