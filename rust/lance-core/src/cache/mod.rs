@@ -60,7 +60,10 @@ pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
-pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
+pub use key::{
+    CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder,
+    PrecomputedCacheKey,
+};
 pub use moka::MokaCacheBackend;
 pub use quick::{QuickCacheBackend, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
@@ -135,6 +138,17 @@ pub trait CacheKey {
     /// paths override this with typed, allocation-free field encoding.
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.key().as_ref());
+    }
+
+    /// Optional already-computed physical key for hot in-memory paths.
+    ///
+    /// When it was derived under the namespace performing the lookup,
+    /// [`LanceCache`] replays the digest instead of running
+    /// [`KeyBuilder`] / BLAKE3. Produce one via
+    /// [`WeakLanceCache::physical_key`] and reuse it; a digest from any other
+    /// namespace is ignored and the key is hashed normally.
+    fn precomputed_physical_key(&self) -> Option<PrecomputedCacheKey> {
+        None
     }
 
     /// Optional codec for serializing/deserializing this key's value type.
@@ -546,6 +560,12 @@ impl LanceCache {
     }
 
     fn sized_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
+        if let Some(key) = cache_key
+            .precomputed_physical_key()
+            .and_then(|key| key.resolve(&self.namespace))
+        {
+            return key;
+        }
         let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
         cache_key.write_key(&mut builder);
         builder.finish()
@@ -555,6 +575,11 @@ impl LanceCache {
         let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
         cache_key.write_key(&mut builder);
         builder.finish()
+    }
+
+    /// Compute the canonical physical key without touching the cache backend.
+    pub fn physical_key<K: CacheKey>(&self, cache_key: &K) -> PrecomputedCacheKey {
+        self.namespace.tag(self.sized_key(cache_key))
     }
 }
 
@@ -583,6 +608,21 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Compute the canonical physical key without touching the cache backend.
+    ///
+    /// Safe even when the underlying [`LanceCache`] has been dropped: only the
+    /// namespace bytes on this weak handle are needed.
+    pub fn physical_key<K: CacheKey>(&self, cache_key: &K) -> PrecomputedCacheKey {
+        if let Some(key) = cache_key.precomputed_physical_key()
+            && key.resolve(&self.namespace).is_some()
+        {
+            return key;
+        }
+        let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
+        cache_key.write_key(&mut builder);
+        self.namespace.tag(builder.finish())
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -776,6 +816,81 @@ mod tests {
         fn write_key(&self, builder: &mut KeyBuilder) {
             builder.write_u64(self.id);
         }
+    }
+
+    #[derive(Clone)]
+    struct PrecomputedTestKey {
+        id: u64,
+        physical: Option<PrecomputedCacheKey>,
+    }
+
+    impl CacheKey for PrecomputedTestKey {
+        type ValueType = Vec<u32>;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.id.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "test.PrecomputedVecU32"
+        }
+
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("test.precomputed-vec-u32-key", 1)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_u64(self.id);
+        }
+
+        fn precomputed_physical_key(&self) -> Option<PrecomputedCacheKey> {
+            self.physical
+        }
+    }
+
+    #[tokio::test]
+    async fn precomputed_physical_key_matches_builder_digest_and_hits_cache() {
+        let cache = LanceCache::with_capacity(1 << 20);
+        let logical = PrecomputedTestKey {
+            id: 7,
+            physical: None,
+        };
+        let physical = cache.physical_key(&logical);
+        cache
+            .insert_with_key(&logical, Arc::new(vec![1, 2, 3]))
+            .await;
+
+        let reused = PrecomputedTestKey {
+            id: 7,
+            physical: Some(physical),
+        };
+        assert_eq!(cache.physical_key(&reused), physical);
+        let hit = cache.get_with_key(&reused).await.expect("cache hit");
+        assert_eq!(hit.as_ref(), &vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn precomputed_physical_key_from_another_namespace_is_ignored() {
+        let cache = LanceCache::with_capacity(1 << 20);
+        let left = cache.with_key_prefix("left");
+        let right = cache.with_key_prefix("right");
+
+        let logical = PrecomputedTestKey {
+            id: 7,
+            physical: None,
+        };
+        left.insert_with_key(&logical, Arc::new(vec![1, 2, 3]))
+            .await;
+        right.insert_with_key(&logical, Arc::new(vec![4, 5])).await;
+
+        // A digest derived under `left` must not redirect a `right` lookup.
+        let foreign = PrecomputedTestKey {
+            id: 7,
+            physical: Some(left.physical_key(&logical)),
+        };
+        assert_eq!(right.physical_key(&foreign), right.physical_key(&logical));
+        let hit = right.get_with_key(&foreign).await.expect("cache hit");
+        assert_eq!(hit.as_ref(), &vec![4, 5]);
     }
 
     struct SharedTestValue {
