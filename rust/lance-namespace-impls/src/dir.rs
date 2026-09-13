@@ -386,10 +386,10 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
-    /// Enable or disable replacement index maintenance for the __manifest table.
+    /// Retained for compatibility with configurations that controlled replacement indices.
     ///
-    /// When enabled (default), copy-on-write manifest rewrites build replacement indices
-    /// for fast reads. When disabled, rewrites only replace data files.
+    /// The manifest is now queried from an in-memory snapshot, so replacement indices are
+    /// no longer built and this setting has no effect.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -414,7 +414,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `inline_optimization_enabled`: Legacy no-op retained for compatibility
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -512,7 +512,6 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
-        // Extract inline_optimization_enabled (default: true)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
             .and_then(|v| str_to_bool(v))
