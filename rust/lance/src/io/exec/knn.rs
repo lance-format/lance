@@ -3228,7 +3228,7 @@ mod tests {
     #[rstest]
     #[case::l2("l2", true)]
     #[case::cosine("cosine", true)]
-    #[case::dot("dot", false)]
+    #[case::dot("dot", true)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
