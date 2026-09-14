@@ -573,7 +573,10 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        *f = (*updated).clone();
+                        // A Delete only changes deletion files. Keep the current
+                        // fragment so a rebase cannot undo a concurrent Project
+                        // that pruned data files from the staged post-image.
+                        f.deletion_file = updated.deletion_file.clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -1730,11 +1733,26 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_build_manifest_replaces_and_removes_fragments() {
-        let manifest = sample_manifest_with_fragments(0..5);
+    fn test_delete_build_manifest_updates_deletion_file_and_removes_fragments() {
+        let mut manifest = sample_manifest_with_fragments(0..5);
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        Arc::make_mut(&mut manifest.fragments)[2].files = vec![projected_file.clone()];
 
-        let mut updated2 = Fragment::new(2);
-        updated2.physical_rows = Some(42);
+        // Model a delete staged before a projection removed field 1's file.
+        let mut updated2 = manifest.fragments[2].clone();
+        updated2.files.push(DataFile::new_legacy_from_fields(
+            "dropped.lance",
+            vec![1],
+            None,
+        ));
+        let deletion_file = crate::format::DeletionFile {
+            read_version: manifest.version,
+            id: 0,
+            file_type: crate::format::DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        updated2.deletion_file = Some(deletion_file.clone());
 
         let transaction = Transaction::new(
             manifest.version,
@@ -1752,12 +1770,14 @@ mod tests {
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![0, 2, 4]);
-        let rows: Vec<Option<usize>> = new_manifest
+        let fragment2 = new_manifest
             .fragments
             .iter()
-            .map(|f| f.physical_rows)
-            .collect();
-        assert_eq!(rows, vec![None, Some(42), None]);
+            .find(|fragment| fragment.id == 2)
+            .unwrap();
+        assert_eq!(fragment2.files, vec![projected_file]);
+        assert_eq!(fragment2.deletion_file, Some(deletion_file));
+        assert_eq!(new_manifest.max_field_id(), 0);
     }
 
     #[test]
