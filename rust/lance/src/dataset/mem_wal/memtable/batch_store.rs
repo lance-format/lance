@@ -103,7 +103,7 @@ impl StoredBatch {
     /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
     /// zero-copy slices and are counted at full capacity for each slice — an
     /// over-count in the safe direction.
-    fn estimate_array_size(data: &ArrayData) -> usize {
+    pub(crate) fn estimate_array_size(data: &ArrayData) -> usize {
         match data.get_slice_memory_size() {
             Ok(size) => size + Self::view_data_buffers_size(data),
             // Fall back to the full-buffer sum for layouts the slice-aware call

@@ -630,8 +630,17 @@ impl ZoneMapIndex {
         let mut zones = Vec::with_capacity(num_zones);
 
         for i in 0..num_zones {
-            let min = ScalarValue::try_from_array(min_col, i)?;
-            let max = ScalarValue::try_from_array(max_col, i)?;
+            let (min, max) = if data_type.is_nested() {
+                (
+                    ScalarValue::try_new_null(&data_type)?,
+                    ScalarValue::try_new_null(&data_type)?,
+                )
+            } else {
+                (
+                    ScalarValue::try_from_array(min_col, i)?,
+                    ScalarValue::try_from_array(max_col, i)?,
+                )
+            };
             let null_count = null_count_col.value(i);
             let nan_count = nan_count_col.value(i);
             zones.push(ZoneMapStatistics {
@@ -1137,15 +1146,22 @@ impl ZoneMapIndexBuilder {
 
     fn zonemap_stats_as_batch(&self) -> Result<RecordBatch> {
         // Flush self.maps as a RecordBatch
-        let mins = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
+        let (mins, maxs) = if self.maps.is_empty() {
+            let bounds = new_empty_array(&self.items_type);
+            (bounds.clone(), bounds)
+        } else if matches!(self.items_type, DataType::Struct(_)) {
+            // Scalar index files use v2.0, which cannot encode struct validity. Nested
+            // bounds are never consulted, so persist a valid placeholder and restore the
+            // typed-null sentinel when loading the index.
+            let placeholder = ScalarValue::new_default(&self.items_type)?;
+            let bounds =
+                ScalarValue::iter_to_array(std::iter::repeat_n(placeholder, self.maps.len()))?;
+            (bounds.clone(), bounds)
         } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?
-        };
-        let maxs = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
-        } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?
+            (
+                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?,
+                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?,
+            )
         };
         let null_counts =
             UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.null_count));
@@ -4890,8 +4906,8 @@ mod tests {
         assert_eq!(index.zones.len(), 1);
         assert_eq!(index.zones[0].null_count, 0, "no null struct rows");
         assert_eq!(index.zones[0].nan_count, 0);
-        // min/max are typed null ScalarValues (exact representation varies by DataFusion version)
-        // but IsNull correctly returns false and Equals is conservative
+        assert!(index.zones[0].min.is_null());
+        assert!(index.zones[0].max.is_null());
 
         // IsNull: no null rows → zone is pruned
         assert!(

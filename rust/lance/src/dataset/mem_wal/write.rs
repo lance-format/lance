@@ -121,8 +121,9 @@ pub struct ShardWriterConfig {
 
     /// Maximum number of rows in a MemTable.
     ///
-    /// Used to pre-allocate the in-memory HNSW graph and vector storage
-    /// capacity. When the memtable reaches capacity, it will be flushed.
+    /// Sizes the in-memory index pre-allocation. The memtable seals before a
+    /// write that would carry it past this, and a single write larger than the
+    /// cap is rejected.
     /// Default: 100,000 rows
     pub max_memtable_rows: usize,
 
@@ -562,6 +563,43 @@ impl TaskExecutor {
         };
 
         let handle = tokio::spawn(async move { dispatcher.run().await });
+        self.tasks.write().unwrap().push((name, handle));
+        Ok(())
+    }
+
+    /// Register periodic work that is **not** driven by a message.
+    ///
+    /// Runs `work` on its own task every `every`. Use it for work only the tick
+    /// performs: a ticker registered through [`MessageHandler::tickers`] shares
+    /// the handler's message loop, where a mailbox that never empties can keep
+    /// it from running.
+    ///
+    /// Cancellation and shutdown match [`Self::add_handler`]: the task observes
+    /// the same token and is joined by [`Self::shutdown_all`].
+    pub fn add_periodic<F, Fut>(&self, name: String, every: Duration, mut work: F) -> Result<()>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let cancellation_token = self.cancellation_token.clone();
+        let task_name = name.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = interval_at(tokio::time::Instant::now() + every, every);
+            // Same reason as the dispatcher: `Burst` would replay every tick
+            // missed while `work` ran, which for a slow `work` means the timer
+            // is permanently ready and the cancellation arm never wins.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        debug!("Periodic task '{}' received cancellation", task_name);
+                        return Ok(());
+                    }
+                    _ = interval.tick() => work().await,
+                }
+            }
+        });
         self.tasks.write().unwrap().push((name, handle));
         Ok(())
     }
@@ -1203,7 +1241,7 @@ struct ResidentMemTables {
     /// resident by a *failed* flush, which are the ones most worth metering.
     frozen: Vec<InMemoryMemTableRef>,
     /// Sealed memtables whose flush *did* commit, lingering out
-    /// `frozen_memtable_grace` before `SweepExpired` drops them.
+    /// `frozen_memtable_grace` before [`sweep_expired_frozen`] drops them.
     ///
     /// Held apart from `frozen` rather than dropped from the view: no flush can
     /// reclaim these, so metering the flush valve on them would throttle against
@@ -1225,7 +1263,7 @@ struct ResidentMemTables {
 /// Re-derive a shard's resident-memtable set from its writer state.
 ///
 /// Call under the write lock after any change to that set: `open`,
-/// `freeze_memtable`, a flush commit, and `SweepExpired` — which changes it by
+/// `freeze_memtable`, a flush commit, and [`sweep_expired_frozen`] — which changes it by
 /// evicting grace-expired generations that are still counted until it runs.
 ///
 /// Cheap: two `Arc` clones per live memtable, no byte walk — the totals are
@@ -1263,7 +1301,8 @@ struct WriterState {
     /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
     /// Pushed in `freeze_memtable`; stamped `flushed_at_ms` by `flush_memtable`
     /// on commit success only (retained un-stamped on failure until a later
-    /// flush or WAL replay on reopen); swept after the grace by `SweepExpired`.
+    /// flush or WAL replay on reopen); swept after the grace by
+    /// [`sweep_expired_frozen`].
     frozen_memtables: VecDeque<FrozenMemTable>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
@@ -1354,6 +1393,7 @@ async fn replay_memtable_from_wal(
     wal_flusher: &WalFlusher,
     index_configs: &[MemIndexConfig],
     max_memtable_size: usize,
+    max_memtable_rows: usize,
     max_resident_bytes: usize,
 ) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
@@ -1395,27 +1435,21 @@ async fn replay_memtable_from_wal(
                         .map(|b| ensure_tombstone_column(b, &storage_schema))
                         .collect::<Result<Vec<_>>>()?;
 
-                    // Seal + flush at the entry boundary on the *same* criteria the
-                    // live path uses (`maybe_trigger_memtable_flush`): the memtable
-                    // is at or over `max_memtable_size` bytes, or this whole entry
-                    // won't fit the batch store. The byte trigger is the one that
-                    // matters beyond avoiding overflow — it is what keeps a memtable
-                    // under `max_memtable_rows`, and therefore keeps the in-memory
-                    // HNSW index (sized to `max_memtable_rows`) from exhausting its
-                    // capacity when the final active memtable is indexed.
-                    //
-                    // Rotate at the entry boundary so no entry is split across two
+                    // Seal + flush on the same criteria the live path uses, measured
+                    // against this whole entry, so no entry is split across two
                     // memtables and each sealed one covers a clean range of complete
-                    // entries. Never rotate an empty memtable — if a single entry
-                    // has more batches than a memtable can hold, a fresh one would
-                    // overflow too, the same hard limit the live put path has, left
-                    // to the insert below to surface.
+                    // entries. An empty memtable is never rotated: a fresh one holds
+                    // an oversized entry no better, left to the insert below to
+                    // surface.
+                    let entry_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                     if !active.batch_store().is_empty()
                         && memtable_reached_flush_threshold(
                             &active,
                             max_memtable_size,
+                            max_memtable_rows,
                             max_resident_bytes,
                             batches.len(),
+                            entry_rows,
                         )
                     {
                         let store = active.batch_store();
@@ -1483,13 +1517,13 @@ async fn replay_memtable_from_wal(
 /// flushed.
 ///
 /// The single source of truth for the flush trigger, shared by the live put path
-/// (`maybe_trigger_memtable_flush`, checking post-insert with `incoming_batches =
-/// 1` — "is there room for the next batch") and by replay (checking pre-insert
-/// with the next WAL entry's batch count). Keeping one predicate is what stops the
-/// two from drifting — e.g. someone adding a third criterion to one and not the
-/// other, which is the exact class of bug this whole change set is about.
+/// (`maybe_trigger_memtable_flush`) and by replay so the two cannot drift.
 ///
-/// Three arms, each answering a different question:
+/// `incoming_batches` / `incoming_rows` are what is about to be inserted.
+/// Pre-insert callers pass the real counts; post-insert callers pass `(1, 1)`,
+/// asking whether there is room for one more batch.
+///
+/// Four arms, each answering a different question:
 ///
 /// - **Row window** against `max_memtable_size`. The knob an operator sizes: it
 ///   measures what a flush actually writes, so a generation stays a predictable
@@ -1504,16 +1538,23 @@ async fn replay_memtable_from_wal(
 ///   succeed. This is the drain path that makes the ceiling live rather than a
 ///   trap.
 /// - **Batch-store capacity**, room for `incoming_batches` more.
+/// - **Row count** against `max_memtable_rows`, room for `incoming_rows` more.
+///   A hard capacity rather than a target: the in-memory indexes are
+///   pre-allocated to exactly this many rows, so an overshoot fails the index
+///   apply. The live path checks this arm pre-insert as well.
 fn memtable_reached_flush_threshold(
     memtable: &MemTable,
     max_memtable_size: usize,
+    max_memtable_rows: usize,
     max_resident_bytes: usize,
     incoming_batches: usize,
+    incoming_rows: usize,
 ) -> bool {
     let store = memtable.batch_store();
     store.row_bytes() >= max_memtable_size
         || memtable_resident_bytes(memtable) >= max_resident_bytes
         || store.remaining_capacity() < incoming_batches
+        || store.total_rows().saturating_add(incoming_rows) > max_memtable_rows
 }
 
 /// What this memtable holds in memory: the heap its batches pin plus its
@@ -1779,7 +1820,8 @@ impl SharedWriterState {
         // dispatches below. `state.memtable` was already replaced, so a failed
         // send that returned here without this push would drop the table and its
         // accepted rows would silently vanish from every scan. Keep it queryable
-        // past its manifest commit too (swept after the grace by `SweepExpired`);
+        // past its manifest commit too (swept after the grace by
+        // `sweep_expired_frozen`);
         // Arc refcount, not a copy — the flush task holds it alive anyway.
         state.frozen_memtables.push_back(FrozenMemTable {
             memtable: frozen_memtable.clone(),
@@ -1842,19 +1884,32 @@ impl SharedWriterState {
 
     /// Check if memtable flush is needed and trigger if so.
     ///
+    /// `incoming_batches` / `incoming_rows`: see [`memtable_reached_flush_threshold`].
+    ///
     /// Takes `&mut WriterState` directly since caller already holds the lock.
-    fn maybe_trigger_memtable_flush(&self, state: &mut WriterState) -> Result<()> {
+    fn maybe_trigger_memtable_flush(
+        &self,
+        state: &mut WriterState,
+        incoming_batches: usize,
+        incoming_rows: usize,
+    ) -> Result<()> {
         if state.flush_requested {
             return Ok(());
         }
 
-        // Checked post-insert: flush if there is no longer room for even one more
-        // batch (or the byte threshold is crossed). Same predicate replay uses.
+        // An empty memtable has nothing to seal, and freezing one would spin: its
+        // indexes alone can sit above the ceiling.
+        if state.memtable.batch_count() == 0 {
+            return Ok(());
+        }
+
         let should_flush = memtable_reached_flush_threshold(
             &state.memtable,
             self.config.max_memtable_size,
+            self.config.max_memtable_rows,
             self.config.max_unflushed_memtable_bytes,
-            1,
+            incoming_batches,
+            incoming_rows,
         );
 
         if should_flush {
@@ -2320,6 +2375,7 @@ impl ShardWriter {
             &wal_flusher,
             index_configs,
             config.max_memtable_size,
+            config.max_memtable_rows,
             config.max_unflushed_memtable_bytes,
         )
         .await?;
@@ -2437,6 +2493,25 @@ impl ShardWriter {
             Box::new(memtable_handler),
             memtable_flush_rx,
         )?;
+
+        // On its own task: only this sweep reclaims a frozen memtable's bytes,
+        // and a ticker on the flush handler can be starved by its mailbox. See
+        // `TaskExecutor::add_periodic`.
+        //
+        // Zero grace evicts on flush commit, so there is nothing to sweep.
+        if !config.frozen_memtable_grace.is_zero() {
+            // Sweep often enough that eviction lags the grace by at most ~1/3,
+            // so a generation lives no more than ~grace * 4/3 past its commit.
+            let tick = (config.frozen_memtable_grace / 3).max(Duration::from_millis(100));
+            let sweep_state = state.clone();
+            let sweep_memory = memory.clone();
+            let grace = config.frozen_memtable_grace;
+            task_executor.add_periodic("memtable_grace_sweeper".to_string(), tick, move || {
+                let state = sweep_state.clone();
+                let memory = sweep_memory.clone();
+                async move { sweep_expired_frozen(&state, &memory, grace).await }
+            })?;
+        }
 
         // The index-apply task. Its own channel and its own dispatcher: the
         // dispatcher awaits `handle()` inline, so sharing the WAL flusher's
@@ -2786,6 +2861,21 @@ impl ShardWriter {
         // poisoned writer can't drift further from the durable WAL.
         self.wal_flusher.check_poisoned()?;
 
+        // A write lands whole in one memtable, so one larger than the cap fits
+        // nowhere — a fresh memtable overflows the same way. Deletes arrive here
+        // as tombstone rows and are bounded the same way.
+        let incoming_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if incoming_rows > self.config.max_memtable_rows {
+            return Err(Error::invalid_input(format!(
+                "write of {incoming_rows} rows across {} batches exceeds \
+                 max_memtable_rows={}: a write is never split across memtables, and the \
+                 in-memory indexes are sized to that cap. Split the write, or raise \
+                 max_memtable_rows",
+                batches.len(),
+                self.config.max_memtable_rows,
+            )));
+        }
+
         // The seal check runs inside the lock immediately after an insert, but the
         // index apply that follows it runs *outside* — and replay hands back a
         // memtable whose indexes were built after its last check too. Either way
@@ -2799,12 +2889,7 @@ impl ShardWriter {
             >= self.config.max_unflushed_memtable_bytes
         {
             let mut state = state_lock.write().await;
-            // Nothing to seal in an empty memtable, and freezing one would spin:
-            // an injected controller skips the open-time reservation check, so a
-            // fresh memtable can sit above this ceiling on its indexes alone.
-            if state.memtable.batch_count() > 0 {
-                writer_state.maybe_trigger_memtable_flush(&mut state)?;
-            }
+            writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1)?;
         }
 
         // Apply backpressure if needed (before acquiring main lock)
@@ -2817,6 +2902,10 @@ impl ShardWriter {
         // Acquire write lock for entire operation (atomic approach)
         let (batch_positions, durable_watcher, batch_store, indexes) = {
             let mut state = state_lock.write().await;
+
+            // 0. Seal first if this put would not fit: the row cap is a hard
+            //    index capacity, so an overshoot cannot be undone afterwards.
+            writer_state.maybe_trigger_memtable_flush(&mut state, batches.len(), incoming_rows)?;
 
             // 1. Insert all batches into memtable atomically
             let results = state.memtable.insert_batches_only(batches).await?;
@@ -2854,7 +2943,7 @@ impl ShardWriter {
             writer_state.maybe_trigger_wal_flush(&mut state);
 
             // 6. Check if memtable flush is needed (may freeze and rotate)
-            if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state) {
+            if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1) {
                 warn!("Failed to trigger memtable flush: {}", e);
             }
 
@@ -3916,7 +4005,8 @@ struct MemTableFlushHandler {
     stats: SharedWriteStats,
     observer: Option<Arc<dyn WalObserver>>,
     /// How long a frozen memtable lingers in memory after its flush commits
-    /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
+    /// before [`sweep_expired_frozen`] evicts it. See
+    /// `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
 }
 
@@ -3945,41 +4035,37 @@ impl MemTableFlushHandler {
             grace,
         }
     }
+}
 
-    /// Evict frozen memtables whose post-flush grace has elapsed. Un-stamped
-    /// (not-yet-flushed) entries are always kept.
-    async fn sweep_expired_frozen(&self) {
-        let now = now_millis();
-        let grace_ms = self.grace.as_millis() as u64;
-        let mut state = self.state.write().await;
-        let before = state.frozen_memtables.len();
-        state
-            .frozen_memtables
-            .retain(|frozen| match frozen.flushed_at_ms {
-                Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
-                None => true,
-            });
-        // Eviction is the only thing that reclaims a grace-retained generation,
-        // so this is where its bytes leave the memory view.
-        if state.frozen_memtables.len() != before {
-            publish_memory(&self.memory, &state);
-        }
+/// Evict frozen memtables whose post-flush grace has elapsed. Un-stamped
+/// (not-yet-flushed) entries are always kept.
+///
+/// A free function so the sweeper task can call it without owning the flush
+/// handler — see [`TaskExecutor::add_periodic`] for why it must not run there.
+async fn sweep_expired_frozen(
+    state: &Arc<RwLock<WriterState>>,
+    memory: &Arc<ArcSwap<ResidentMemTables>>,
+    grace: Duration,
+) {
+    let now = now_millis();
+    let grace_ms = grace.as_millis() as u64;
+    let mut state = state.write().await;
+    let before = state.frozen_memtables.len();
+    state
+        .frozen_memtables
+        .retain(|frozen| match frozen.flushed_at_ms {
+            Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
+            None => true,
+        });
+    // Eviction is the only thing that reclaims a grace-retained generation,
+    // so this is where its bytes leave the memory view.
+    if state.frozen_memtables.len() != before {
+        publish_memory(memory, &state);
     }
 }
 
 #[async_trait]
 impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
-    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableFlush>)> {
-        // Zero grace evicts on commit, so no sweeper is needed.
-        if self.grace.is_zero() {
-            return vec![];
-        }
-        // Sweep often enough that eviction lags the grace by at most ~1/3, so a
-        // generation lives no more than ~grace * 4/3 past its flush commit.
-        let tick = (self.grace / 3).max(Duration::from_millis(100));
-        vec![(tick, Box::new(|| TriggerMemTableFlush::SweepExpired))]
-    }
-
     async fn handle(&mut self, message: TriggerMemTableFlush) -> Result<()> {
         match message {
             TriggerMemTableFlush::Flush { memtable, done } => {
@@ -3992,7 +4078,6 @@ impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
                     result?;
                 }
             }
-            TriggerMemTableFlush::SweepExpired => self.sweep_expired_frozen().await,
         }
         Ok(())
     }
@@ -4119,7 +4204,7 @@ impl MemTableFlushHandler {
             // Retire the frozen handle on commit success, keyed by generation
             // (non-FIFO completion is fine). Zero grace evicts here; otherwise
             // stamp the grace clock so it lingers for multi-part as-of reads
-            // until `SweepExpired`. On failure leave it un-stamped: rows stay in
+            // until the grace sweep. On failure leave it un-stamped: rows stay in
             // the read union until a later flush or WAL replay, else a transient
             // error reopens the hole.
             if flush_result.is_ok() {
@@ -5736,6 +5821,110 @@ mod tests {
     /// lingers for `frozen_memtable_grace`. A long grace therefore leaves count
     /// non-zero with bytes back at zero — and pins that the two surfaces are
     /// answering different questions, not disagreeing about one.
+    /// A saturated handler starves its own ticker; `add_periodic` does not.
+    ///
+    /// `TaskDispatcher` biases a handler's mailbox ahead of its ticker, and the
+    /// `select!` is not evaluated while `handle()` awaits, so a mailbox that
+    /// never empties leaves the ticker no instant to win. Both halves are
+    /// asserted so the distinction holds.
+    #[tokio::test(start_paused = true)]
+    async fn test_saturated_handler_starves_its_ticker_but_not_a_periodic_task() {
+        #[derive(Debug)]
+        enum Msg {
+            Work,
+            Tick,
+        }
+
+        #[derive(Debug)]
+        struct SlowHandler {
+            worked: Arc<AtomicUsize>,
+            ticked: Arc<AtomicUsize>,
+            work: Duration,
+            tick: Duration,
+        }
+
+        #[async_trait]
+        impl MessageHandler<Msg> for SlowHandler {
+            fn tickers(&mut self) -> Vec<(Duration, MessageFactory<Msg>)> {
+                vec![(self.tick, Box::new(|| Msg::Tick))]
+            }
+
+            async fn handle(&mut self, message: Msg) -> Result<()> {
+                match message {
+                    Msg::Work => {
+                        self.worked.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(self.work).await;
+                    }
+                    Msg::Tick => {
+                        self.ticked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        // One unit of work outlasts the tick interval: that is what starves a
+        // ticker sharing the handler's loop.
+        let work = Duration::from_millis(100);
+        let tick = Duration::from_millis(10);
+        let run = Duration::from_millis(1000);
+        let expected_ticks = (run.as_millis() / tick.as_millis()) as usize;
+
+        let executor = TaskExecutor::new();
+        let worked = Arc::new(AtomicUsize::new(0));
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let swept = Arc::new(AtomicUsize::new(0));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        executor
+            .add_handler(
+                "slow".to_string(),
+                Box::new(SlowHandler {
+                    worked: worked.clone(),
+                    ticked: ticked.clone(),
+                    work,
+                    tick,
+                }),
+                rx,
+            )
+            .unwrap();
+
+        // The same cadence, on its own task rather than the handler's loop.
+        let swept_by_task = swept.clone();
+        executor
+            .add_periodic("sweeper".to_string(), tick, move || {
+                let swept = swept_by_task.clone();
+                async move {
+                    swept.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+
+        // Enough queued work that the mailbox never empties during the run.
+        for _ in 0..(run.as_millis() / work.as_millis()) + 2 {
+            tx.send(Msg::Work).unwrap();
+        }
+        tokio::time::sleep(run).await;
+
+        let (worked, ticked, swept) = (
+            worked.load(Ordering::Relaxed),
+            ticked.load(Ordering::Relaxed),
+            swept.load(Ordering::Relaxed),
+        );
+        assert!(worked > 0, "the handler must have been busy");
+        assert!(
+            ticked * 10 < expected_ticks,
+            "a ticker sharing a saturated handler's loop should be starved, but \
+             it ran {ticked} of ~{expected_ticks}"
+        );
+        assert!(
+            swept * 2 >= expected_ticks,
+            "periodic task ran {swept} of ~{expected_ticks}"
+        );
+
+        executor.shutdown_all().await.ok();
+    }
+
     #[tokio::test]
     async fn test_memtable_stats_frozen_count_outlives_frozen_bytes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -6398,8 +6587,8 @@ mod tests {
     /// other did not, so they disagreed by a fixed offset on every memtable.
     ///
     /// Only that arm is shared. `memtable_reached_flush_threshold` also seals on
-    /// resident bytes, which `should_flush` knows nothing about, so the ceiling
-    /// below is held out of range to compare like with like.
+    /// resident bytes and row count, which `should_flush` knows nothing about, so
+    /// both are held out of range below to compare like with like.
     #[tokio::test]
     async fn test_both_seal_predicates_share_one_byte_arm() {
         let schema = create_test_schema();
@@ -6418,8 +6607,8 @@ mod tests {
         // would be comparing something other than the row arm.
 
         // `incoming_batches` of 1 against a capacity of 64 keeps the batch-count
-        // arm out of it, and `usize::MAX` keeps the resident arm out, so only the
-        // row-window arms are being compared.
+        // arm out of it, and the two `usize::MAX` limits keep the row-count and
+        // resident arms out, so only the row-window arms are being compared.
         for (bytes, expected) in [(at, true), (at + 1, false)] {
             assert_eq!(
                 memtable.should_flush(bytes),
@@ -6427,7 +6616,7 @@ mod tests {
                 "should_flush at {bytes}"
             );
             assert_eq!(
-                memtable_reached_flush_threshold(&memtable, bytes, usize::MAX, 1),
+                memtable_reached_flush_threshold(&memtable, bytes, usize::MAX, usize::MAX, 1, 1),
                 expected,
                 "the two seal predicates disagree at {bytes}; a bloom-sized offset \
                  between them makes every memtable seal early on one path"
@@ -7472,6 +7661,94 @@ mod tests {
                 .unwrap();
         assert_eq!(total_rows(&writer_c, &base_uri, shard_id).await as i32, N);
         writer_c.close().await.unwrap();
+    }
+
+    /// The same rotation, driven by `max_memtable_rows` instead of the batch cap.
+    ///
+    /// Replay builds the final memtable's indexes itself, so a WAL holding more
+    /// rows than one memtable's capacity has to rotate for `open()` to succeed.
+    #[tokio::test]
+    async fn test_replay_rotates_when_wal_exceeds_the_row_cap() {
+        use lance_arrow::FixedSizeListArrayExt;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let dim = 8;
+        let schema = hnsw_schema(dim);
+        let shard_id = Uuid::new_v4();
+        let cap = 8;
+
+        let vector_batch = |start: i32, rows: usize| {
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(
+                    (0..rows * dim as usize)
+                        .map(|v| v as f32 * 0.01)
+                        .collect::<Vec<_>>(),
+                ),
+                dim,
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(
+                        (start..start + rows as i32).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Writer A's row cap is far above what it writes, so all 32 rows land in
+        // one memtable and dropping it without close leaves them all in the WAL.
+        let writer_a_config = ShardWriterConfig {
+            max_memtable_rows: 10_000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        // Writer B caps a memtable at 8 rows — and sizes its HNSW graph to match.
+        let config = ShardWriterConfig {
+            max_memtable_rows: cap,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                writer_a_config,
+                schema.clone(),
+                hnsw_configs(),
+            )
+            .await
+            .unwrap();
+            for round in 0..8i32 {
+                writer_a
+                    .put(vec![vector_batch(round * 4, 4)])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Replay has 32 rows to place into memtables capped at 8.
+        let writer_b =
+            ShardWriter::open(store, base_path, base_uri, config, schema, hnsw_configs())
+                .await
+                .expect("a WAL holding more rows than the cap must still reopen");
+
+        let manifest = writer_b.manifest().await.unwrap().unwrap();
+        assert!(
+            !manifest.sstables.is_empty(),
+            "replay must have sealed and flushed the memtables it filled"
+        );
+        let stats = writer_b.memtable_stats().await.unwrap();
+        assert!(
+            stats.row_count <= cap,
+            "replay left {} rows in a memtable capped at {cap}",
+            stats.row_count
+        );
+
+        writer_b.close().await.unwrap();
     }
 
     /// Replay-on-open recovers durable WAL entries that were never flushed
@@ -8751,7 +9028,7 @@ mod tests {
     /// On a successful flush commit the sealed generation's rows land in the
     /// manifest immediately, but the in-memory handle is NOT dropped — it
     /// lingers for `frozen_memtable_grace` (so in-flight as-of reads keep
-    /// batch-resolved membership), then is swept by the `SweepExpired` ticker.
+    /// batch-resolved membership), then is swept by the grace sweep.
     #[tokio::test]
     async fn test_frozen_retained_during_grace_then_swept() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -9102,13 +9379,187 @@ mod tests {
 
         // Row arm way out of range; only the resident arm can fire.
         assert!(
-            memtable_reached_flush_threshold(&memtable, usize::MAX, resident, 1),
+            memtable_reached_flush_threshold(&memtable, usize::MAX, usize::MAX, resident, 1, 1),
             "resident bytes at the ceiling must seal"
         );
         assert!(
-            !memtable_reached_flush_threshold(&memtable, usize::MAX, resident + 1, 1),
+            !memtable_reached_flush_threshold(
+                &memtable,
+                usize::MAX,
+                usize::MAX,
+                resident + 1,
+                1,
+                1
+            ),
             "and must not seal below it"
         );
+    }
+
+    /// The row arm answers for the rows about to arrive, not the rows already
+    /// inserted: the cap is a hard index capacity.
+    #[tokio::test]
+    async fn test_row_arm_seals_on_max_memtable_rows() {
+        let schema = create_test_schema();
+        let mut memtable =
+            MemTable::with_capacity(schema.clone(), 1, vec![], CacheConfig::default(), 64).unwrap();
+        memtable
+            .insert(create_test_batch(&schema, 0, 50))
+            .await
+            .unwrap();
+
+        // Byte and resident arms out of range; only the row arm can fire.
+        let row_arm = |cap, incoming| {
+            memtable_reached_flush_threshold(&memtable, usize::MAX, cap, usize::MAX, 1, incoming)
+        };
+        assert!(!row_arm(50, 0), "50 rows under a cap of 50 must not seal");
+        assert!(row_arm(50, 1), "no room for one more row must seal");
+        assert!(
+            !row_arm(60, 10),
+            "a put that exactly fills the cap must not seal"
+        );
+        assert!(
+            row_arm(60, 11),
+            "a put that would overflow the cap must seal"
+        );
+    }
+
+    /// A memtable stays within `max_memtable_rows` with the byte and batch arms
+    /// far out of reach, so only the row arm can seal it.
+    #[tokio::test]
+    async fn test_put_seals_on_max_memtable_rows() {
+        let (store, base_path, base_uri, _t) = create_local_store().await;
+        let schema = create_test_schema();
+        let cap = 64;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            max_memtable_rows: cap,
+            // Both far out of reach, so only the row arm can seal.
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_batches: 8_000,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        for round in 0..10i32 {
+            writer
+                .put(vec![create_test_batch(&schema, round * 10, 10)])
+                .await
+                .unwrap();
+            let stats = writer.memtable_stats().await.unwrap();
+            assert!(
+                stats.row_count <= cap,
+                "the active memtable holds {} rows, past the cap of {cap}",
+                stats.row_count
+            );
+        }
+
+        assert!(
+            writer.memtable_stats().await.unwrap().generation > 1,
+            "100 rows under a cap of {cap} must have rotated at least once"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// A put is never split across memtables, so one larger than the cap is
+    /// rejected as invalid input rather than overflowing a fresh memtable.
+    #[tokio::test]
+    async fn test_put_rejects_more_rows_than_a_memtable_holds() {
+        let (store, base_path, base_uri, _t) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            max_memtable_rows: 8,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        // Split across two batches: the cap is on the put, not on one batch.
+        let err = writer
+            .put(vec![
+                create_test_batch(&schema, 0, 5),
+                create_test_batch(&schema, 5, 4),
+            ])
+            .await
+            .expect_err("a put of 9 rows under a cap of 8 must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an oversized put is caller error, not a writer fault: {err}"
+        );
+        assert!(
+            err.to_string().contains("max_memtable_rows=8"),
+            "the error must name the knob and its value, got: {err}"
+        );
+
+        // Exactly the cap still goes through, and the writer is unharmed.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 8)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+    }
+
+    /// An HNSW graph is sized to `max_memtable_rows`, so a shard that writes past
+    /// the cap has to keep sealing for the graph to never see a row it cannot
+    /// hold.
+    #[tokio::test]
+    async fn test_hnsw_index_survives_a_shard_that_outgrows_the_row_cap() {
+        use lance_arrow::FixedSizeListArrayExt;
+
+        let (store, base_path, base_uri, _t) = create_local_store().await;
+        let dim = 8;
+        let schema = hnsw_schema(dim);
+        let cap = 64;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            max_memtable_rows: cap,
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_batches: 8_000,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            hnsw_configs(),
+        )
+        .await
+        .unwrap();
+
+        for round in 0..20i32 {
+            let ids: Vec<i32> = (0..10).map(|v| v + round * 10).collect();
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(
+                    (0..10 * dim as usize)
+                        .map(|v| v as f32 * 0.01)
+                        .collect::<Vec<_>>(),
+                ),
+                dim,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(vectors)],
+            )
+            .unwrap();
+            writer
+                .put(vec![batch])
+                .await
+                .unwrap_or_else(|e| panic!("put {round} was refused: {e}"));
+        }
+
+        // The index apply runs outside the put, so a poisoned writer surfaces here
+        // even when every put returned Ok.
+        writer.close().await.unwrap();
     }
 
     /// The post-insert seal check runs inside the writer lock; the index apply

@@ -512,7 +512,7 @@ unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32])
     }
 }
 
-/// AVX2 popcount using lookup table (Harley-Seal / PSHUFB method).
+/// AVX2 popcount using a PSHUFB nibble lookup table.
 ///
 /// The chunk loop reaches only the first `targets.len() / 4 * 4` slots through a
 /// raw pointer, 4 x u32 per chunk with no bounds check; the trailing slots go

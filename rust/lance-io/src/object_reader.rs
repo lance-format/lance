@@ -71,6 +71,7 @@ pub struct CloudObjectReader {
     size: OnceCell<usize>,
 
     block_size: usize,
+    io_parallelism: usize,
     download_retry_count: usize,
 }
 
@@ -95,8 +96,20 @@ impl CloudObjectReader {
             path,
             size: OnceCell::new_with(known_size),
             block_size,
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
+    }
+
+    /// Override the I/O parallelism this reader advertises.
+    ///
+    /// `ObjectStore::open` / `open_with_size` pass their normalized effective
+    /// parallelism (`LANCE_IO_THREADS` override applied, at least 1) so
+    /// consumers that size concurrency windows off the reader honor the
+    /// configured request limit instead of the hardcoded cloud default.
+    pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
+        self.io_parallelism = io_parallelism;
+        self
     }
 }
 
@@ -170,7 +183,7 @@ impl Reader for CloudObjectReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        DEFAULT_CLOUD_IO_PARALLELISM
+        self.io_parallelism
     }
 
     /// Object/File Size.

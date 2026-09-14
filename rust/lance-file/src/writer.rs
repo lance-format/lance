@@ -174,7 +174,7 @@ impl FileWriter {
     }
 
     /// Append a buffer whose page or column metadata is supplied externally.
-    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         match self {
             Self::V2_0(writer) => writer.write_external_buffer(bytes).await,
             Self::V2_1(writer) => writer.write_external_buffer(bytes).await,
@@ -196,7 +196,7 @@ impl FileWriter {
     }
 
     /// Prepare a writer from encoded columns whose buffers were produced externally.
-    pub(crate) fn initialize_with_external_columns(
+    pub fn initialize_with_external_columns(
         &mut self,
         schema: Schema,
         columns: &[Arc<ColumnInfo>],

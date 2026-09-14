@@ -1874,7 +1874,12 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
-    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
         let state = BitmapIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
@@ -2325,7 +2330,10 @@ mod tests {
 
         let plugin = BitmapIndexPlugin;
         let index_arc: Arc<dyn ScalarIndex> = index.clone() as Arc<dyn ScalarIndex>;
-        plugin.put_in_cache(&cache, index_arc).await.unwrap();
+        plugin
+            .put_in_cache(store.clone(), &cache, index_arc)
+            .await
+            .unwrap();
 
         // get_from_cache must return Some, and the BitmapIndexState's OnceLock
         // must have been populated by put_in_cache so no parse_lookup_batch occurs.

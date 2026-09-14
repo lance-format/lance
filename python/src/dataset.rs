@@ -423,6 +423,15 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn data_storage_version<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        version: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.builder
+            .data_storage_version(version.parse().infer_error()?);
+        Ok(slf)
+    }
+
     pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
         slf.builder.use_index(use_index);
         Ok(slf)
@@ -586,6 +595,25 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    /// [`Self::analyze_plan`] for fully-materialized data.
+    ///
+    /// Routed to the same in-memory table `execute_batches` uses, so the reported
+    /// plan is the one such a source actually runs.
+    pub fn analyze_plan_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        rt().block_on(None, job.analyze_plan_batches(batches))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -812,6 +840,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
@@ -829,6 +858,9 @@ impl Dataset {
         }
         if let Some(v) = delete_rate_limit {
             builder = builder.delete_rate_limit(v)?;
+        }
+        if let Some(v) = versions {
+            builder = builder.versions(v)?;
         }
         Ok(builder.build())
     }
@@ -1971,13 +2003,14 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None, data_storage_version=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1992,6 +2025,10 @@ impl Dataset {
 
         if let Some(timeout) = retry_timeout {
             builder = builder.retry_timeout(timeout);
+        }
+
+        if let Some(version) = data_storage_version {
+            builder = builder.data_storage_version(version.parse().infer_error()?);
         }
 
         for (key, value) in updates {
@@ -2159,6 +2196,38 @@ impl Dataset {
         })
     }
 
+    /// Deep clone the selected version into a new dataset.
+    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    fn deep_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        reference: Option<Bound<PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
+        let mut new_self = self.ds.as_ref().clone();
+        let reference = self.transform_ref(reference)?;
+        let ds = rt()
+            .block_on(
+                Some(py),
+                new_self.deep_clone(&target_path, reference, store_params),
+            )?
+            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?
@@ -2177,7 +2246,7 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2185,6 +2254,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
@@ -2195,6 +2265,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds.cleanup_with_policy(policy).await
@@ -2205,7 +2276,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2213,6 +2284,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
     ) -> PyResult<CleanupExplanation> {
@@ -2225,6 +2297,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds
@@ -2474,6 +2547,9 @@ impl Dataset {
         if let Some(kwargs) = kwargs {
             if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
                 options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+            if let Some(retrain) = kwargs.get_item("retrain")? {
+                options.retrain = retrain.extract()?;
             }
             if let Some(index_names) = kwargs.get_item("index_names")? {
                 options.index_names = Some(

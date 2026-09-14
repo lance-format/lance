@@ -41,7 +41,9 @@ pub struct LanceIndexStore {
     scheduler: Arc<ScanScheduler>,
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
-    file_sizes: HashMap<String, u64>,
+    // Partition priority views share this immutable map. Cloning all file names
+    // for every partition would make request rebinding quadratic in partitions.
+    file_sizes: Arc<HashMap<String, u64>>,
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
@@ -89,7 +91,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: HashMap::new(),
+            file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -100,7 +102,7 @@ impl LanceIndexStore {
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = file_sizes;
+        self.file_sizes = Arc::new(file_sizes);
         self
     }
 
@@ -404,6 +406,13 @@ impl IndexStore for LanceIndexStore {
 
     fn clone_arc(&self) -> Arc<dyn IndexStore> {
         Arc::new(self.clone())
+    }
+
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
     }
 
     fn io_parallelism(&self) -> usize {

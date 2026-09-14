@@ -2,20 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use crate::index::DatasetIndexExt;
 use lance_core::Error;
 use lance_index::frag_reuse::{
-    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
+    CompactFragReuseIndex, FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
     FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
-use roaring::{RoaringBitmap, RoaringTreemap};
-use std::collections::HashMap;
-use std::io::Cursor;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -45,21 +42,9 @@ pub async fn load_frag_reuse_index_details(
             Ok(Arc::new(FragReuseIndexDetails::try_from(content.clone())?))
         }
         Some(Content::External(external_file)) => {
-            let file_path = dataset
-                .indices_dir()
-                .join(index.uuid.to_string())
-                .join(external_file.path.clone());
-
             // the file content will be cached in the index cache later
             // so we do not put it to the file cache
-            let range = external_file.offset as usize
-                ..(external_file.offset as usize + external_file.size as usize);
-            let data = dataset
-                .object_store
-                .open(&file_path)
-                .await?
-                .get_range(range)
-                .await?;
+            let data = read_fri_external_file(dataset, index, external_file).await?;
 
             let pb_sequence = InlineContent::decode(data)?;
             Ok(Arc::new(FragReuseIndexDetails::try_from(pb_sequence)?))
@@ -67,29 +52,40 @@ pub async fn load_frag_reuse_index_details(
     }
 }
 
+/// Resolve an FRI entry's external details bytes, honoring the entry's base:
+/// a shallow-cloned entry's `details.binpb` lives in the SOURCE dataset, so
+/// the path and store come from the entry's `base_id` (like every other
+/// base-aware index file) instead of the current dataset root.
+async fn read_fri_external_file(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<bytes::Bytes> {
+    let end = file
+        .offset
+        .checked_add(file.size)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::corrupt_file_named("FRI details", "external FRI range overflow"))?;
+    let path = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string())
+        .join(file.path.as_str());
+    dataset
+        .object_store_for_index(index)
+        .await?
+        .open(&path)
+        .await?
+        .get_range(file.offset as usize..end)
+        .await
+        .map_err(Error::from)
+}
+
 /// open fragment reuse index based on its metadata details
 pub(crate) async fn open_frag_reuse_index(
     uuid: Uuid,
     details: &FragReuseIndexDetails,
-) -> lance_core::Result<FragReuseIndex> {
-    let mut row_id_maps: Vec<HashMap<u64, Option<u64>>> =
-        Vec::with_capacity(details.versions.len());
-    for version in &details.versions {
-        let mut row_id_map = HashMap::<u64, Option<u64>>::new();
-        for group in version.groups.iter() {
-            let cursor = Cursor::new(&group.changed_row_addrs);
-            let changed_row_addrs = RoaringTreemap::deserialize_from(cursor).unwrap();
-            let group_row_id_map = transpose_row_ids_from_digest(
-                changed_row_addrs,
-                &group.old_frags,
-                &group.new_frags,
-            );
-            row_id_map.extend(group_row_id_map);
-        }
-        row_id_maps.push(row_id_map);
-    }
-
-    Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
+) -> lance_core::Result<CompactFragReuseIndex> {
+    CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
 pub(crate) async fn build_new_frag_reuse_index(

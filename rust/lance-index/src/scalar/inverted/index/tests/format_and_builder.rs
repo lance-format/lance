@@ -4,6 +4,242 @@
 use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
 
+#[derive(Debug)]
+struct ControlledPostingReads {
+    started: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+    gates: Vec<tokio::sync::Semaphore>,
+    completed: std::sync::Mutex<Vec<usize>>,
+    changed: tokio::sync::Notify,
+}
+
+impl ControlledPostingReads {
+    fn new(token_count: usize) -> Self {
+        Self {
+            started: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            gates: (0..token_count)
+                .map(|_| tokio::sync::Semaphore::new(0))
+                .collect(),
+            completed: std::sync::Mutex::new(Vec::with_capacity(token_count)),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_for_started(&self, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.started.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for controlled posting reads to start");
+    }
+
+    async fn release_and_wait(&self, token_id: usize, expected_completed: usize) {
+        self.gates[token_id].add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self
+                    .completed
+                    .lock()
+                    .expect("controlled posting completion lock poisoned")
+                    .len()
+                    >= expected_completed
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for controlled posting read to complete");
+    }
+}
+
+struct ControlledPostingReader {
+    inner: Arc<dyn IndexReader>,
+    control: Arc<ControlledPostingReads>,
+    fail_token: Option<usize>,
+}
+
+#[async_trait]
+impl IndexReader for ControlledPostingReader {
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+        self.inner.read_record_batch(n, batch_size).await
+    }
+
+    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+        self.inner.read_global_buffer(index).await
+    }
+
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let is_singleton_position_read = range.end == range.start + 1
+            && projection.is_some_and(|columns| {
+                columns.contains(&POSTING_COL) && columns.contains(&POSITION_COL)
+            });
+        if !is_singleton_position_read {
+            return self.inner.read_range(range, projection).await;
+        }
+
+        let token_id = range.start;
+        self.control
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let active = self
+            .control
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.control
+            .max_active
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        self.control.changed.notify_waiters();
+
+        let permit = self.control.gates[token_id]
+            .acquire()
+            .await
+            .map_err(|err| Error::internal(format!("controlled posting gate closed: {err}")))?;
+        permit.forget();
+        let result = if self.fail_token == Some(token_id) {
+            Err(Error::io(format!(
+                "injected singleton posting read failure for token {token_id}"
+            )))
+        } else {
+            self.inner.read_range(range, projection).await
+        };
+
+        self.control
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.control
+            .completed
+            .lock()
+            .expect("controlled posting completion lock poisoned")
+            .push(token_id);
+        self.control.changed.notify_waiters();
+        result
+    }
+
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        self.inner.num_batches(batch_size).await
+    }
+
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        self.inner.schema()
+    }
+
+    fn file_size_bytes(&self) -> Option<u64> {
+        self.inner.file_size_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct ControlledMergeStore {
+    inner: Arc<dyn IndexStore>,
+    posting_file: String,
+    io_parallelism: usize,
+    control: Arc<ControlledPostingReads>,
+    fail_token: Option<usize>,
+}
+
+impl DeepSizeOf for ControlledMergeStore {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+#[async_trait]
+impl IndexStore for ControlledMergeStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            posting_file: self.posting_file.clone(),
+            io_parallelism: self.io_parallelism,
+            control: self.control.clone(),
+            fail_token: self.fail_token,
+        })
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.io_parallelism
+    }
+
+    async fn new_index_file(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+        self.inner.new_index_file(name, schema).await
+    }
+
+    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        let reader = self.inner.open_index_file(name).await?;
+        if name == self.posting_file {
+            Ok(Arc::new(ControlledPostingReader {
+                inner: reader,
+                control: self.control.clone(),
+                fail_token: self.fail_token,
+            }))
+        } else {
+            Ok(reader)
+        }
+    }
+
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_priority(io_priority),
+            posting_file: self.posting_file.clone(),
+            io_parallelism: self.io_parallelism,
+            control: self.control.clone(),
+            fail_token: self.fail_token,
+        })
+    }
+
+    async fn copy_index_file(
+        &self,
+        name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.copy_index_file(name, dest_store).await
+    }
+
+    async fn rename_index_file(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.rename_index_file(name, new_name).await
+    }
+
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        self.inner.delete_index_file(name).await
+    }
+
+    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+        self.inner.list_files_with_sizes().await
+    }
+}
+
 #[test]
 fn address_read_concurrency_respects_payload_budget() {
     assert_eq!(address_read_concurrency(64, 0), 64);
@@ -350,6 +586,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
 
 #[rstest::rstest]
 #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE, 514, 7)]
+#[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE, 8, 4)]
 #[case::v3(InvertedListFormatVersion::V3, 256, 6, 4)]
 #[tokio::test]
 async fn test_into_builder_chunks_postings_by_list_children(
@@ -424,7 +661,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
             .all(|posting| posting.len() == NUM_DOCS && posting.has_positions())
     );
 
-    // Rewriting the chunk-built builder verifies that V3 positions survived
+    // Rewriting the chunk-built builder verifies that positions survived
     // conversion and that impact data can be regenerated from every posting.
     let dest_dir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
@@ -462,6 +699,173 @@ async fn test_into_builder_chunks_postings_by_list_children(
     assert_eq!(actual.len(), NUM_DOCS);
     assert_eq!(actual[0], (0, 2, vec![0, 10]));
     assert_eq!(actual[NUM_DOCS - 1], (256, 2, vec![0, 10]));
+}
+
+#[tokio::test]
+async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
+    const NUM_TOKENS: usize = 10;
+    const NUM_DOCS: usize = 3;
+    const EXPECTED_CONCURRENCY: usize = 8;
+
+    let source_dir = TempObjDir::default();
+    let source_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        source_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut source = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+        LEGACY_BLOCK_SIZE,
+    );
+    for token_id in 0..NUM_TOKENS {
+        source.tokens.add(format!("token_{token_id}"));
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+            LEGACY_BLOCK_SIZE,
+        );
+        for doc_id in 0..NUM_DOCS {
+            posting.add(
+                doc_id as u32,
+                PositionRecorder::Position(vec![token_id as u32, token_id as u32 + 100].into()),
+            );
+        }
+        source.posting_lists.push(posting);
+    }
+    for doc_id in 0..NUM_DOCS {
+        source
+            .docs
+            .append(1_000 + doc_id as u64, (NUM_TOKENS * 2) as u32);
+    }
+    source.write(source_store.as_ref()).await.unwrap();
+
+    let control = Arc::new(ControlledPostingReads::new(NUM_TOKENS));
+    let controlled_store: Arc<dyn IndexStore> = Arc::new(ControlledMergeStore {
+        inner: source_store.clone(),
+        posting_file: posting_file_path(0),
+        io_parallelism: 64,
+        control: control.clone(),
+        fail_token: None,
+    });
+    let source_partition = InvertedPartition::load(
+        controlled_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+
+    let merge_task = tokio::spawn(async move {
+        source_partition
+            .into_builder_with_chunk_limits(NUM_TOKENS, u64::MAX)
+            .await
+    });
+    control.wait_for_started(EXPECTED_CONCURRENCY).await;
+    assert_eq!(
+        control.active.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY
+    );
+    assert_eq!(
+        control.max_active.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY,
+        "store I/O parallelism must be capped"
+    );
+
+    let mut completed_count = 0;
+    for token_id in (1..EXPECTED_CONCURRENCY).rev() {
+        completed_count += 1;
+        control.release_and_wait(token_id, completed_count).await;
+    }
+    assert_eq!(
+        control.started.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY,
+        "completed chunks behind token 0 must remain inside the bounded ordered window"
+    );
+    completed_count += 1;
+    control.release_and_wait(0, completed_count).await;
+    control.wait_for_started(NUM_TOKENS).await;
+    for token_id in (EXPECTED_CONCURRENCY..NUM_TOKENS).rev() {
+        completed_count += 1;
+        control.release_and_wait(token_id, completed_count).await;
+    }
+
+    let (merged, chunk_count) = tokio::time::timeout(std::time::Duration::from_secs(5), merge_task)
+        .await
+        .expect("timed out waiting for controlled V1 position merge")
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk_count, NUM_TOKENS);
+    assert!(
+        control.max_active.load(std::sync::atomic::Ordering::SeqCst) <= EXPECTED_CONCURRENCY,
+        "singleton posting reads exceeded the bounded concurrency cap"
+    );
+    assert_eq!(
+        *control
+            .completed
+            .lock()
+            .expect("controlled posting completion lock poisoned"),
+        vec![7, 6, 5, 4, 3, 2, 1, 0, 9, 8],
+        "test reads must complete out of token order"
+    );
+    assert_eq!(merged.posting_lists.len(), NUM_TOKENS);
+    for (token_id, posting) in merged.posting_lists.iter().enumerate() {
+        let entries = posting.iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), NUM_DOCS);
+        for (expected_doc_id, (doc_id, frequency, positions)) in entries.into_iter().enumerate() {
+            assert_eq!(frequency, 2);
+            assert_eq!(doc_id as usize, expected_doc_id);
+            assert_eq!(
+                positions.unwrap(),
+                vec![token_id as u32, token_id as u32 + 100],
+                "posting positions must remain aligned with token order"
+            );
+        }
+    }
+
+    let error_control = Arc::new(ControlledPostingReads::new(NUM_TOKENS));
+    let error_store: Arc<dyn IndexStore> = Arc::new(ControlledMergeStore {
+        inner: source_store,
+        posting_file: posting_file_path(0),
+        io_parallelism: 64,
+        control: error_control.clone(),
+        fail_token: Some(1),
+    });
+    let error_partition = InvertedPartition::load(
+        error_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+    let error_task = tokio::spawn(async move {
+        error_partition
+            .into_builder_with_chunk_limits(NUM_TOKENS, u64::MAX)
+            .await
+    });
+    error_control.wait_for_started(EXPECTED_CONCURRENCY).await;
+    for (completed_count, token_id) in (0..EXPECTED_CONCURRENCY).rev().enumerate() {
+        error_control
+            .release_and_wait(token_id, completed_count + 1)
+            .await;
+    }
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), error_task)
+        .await
+        .expect("timed out waiting for injected V1 position merge failure")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, Error::IO { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("injected singleton posting read failure for token 1")
+    );
 }
 
 #[tokio::test]

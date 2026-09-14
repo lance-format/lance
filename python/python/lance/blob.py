@@ -41,8 +41,10 @@ class Blob:
 
     A blob can be represented as:
     - inline bytes
-    - an external URI with position and size, if position and size are not set,
-      use the full uri.
+    - an external URI, optionally with a non-empty range
+
+    Every blob must use exactly one representation. Use ``None`` for a null
+    blob and :meth:`empty` for a valid empty blob.
     """
 
     data: Optional[bytes] = None
@@ -65,6 +67,10 @@ class Blob:
             raise ValueError(
                 "Blob cannot have both inline data and external slice metadata"
             )
+        if self.data is None and self.uri is None:
+            raise ValueError("Blob must set `data` or `uri`; use None for a null blob")
+        if self.size == 0:
+            raise ValueError("External blob range size must be greater than zero")
 
     @staticmethod
     def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
@@ -90,7 +96,13 @@ class BlobType(pa.ExtensionType):
     A PyArrow extension type for Lance blob columns.
 
     This is the "logical" type users write. Lance will store it in a compact
-    descriptor format, and reads will return descriptors by default.
+    descriptor format, and reads will return descriptors by default. Its storage
+    type defaults to ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?,
+    size: UInt64?>``. Arrow deserialization also preserves the accepted minimal
+    ``Struct<data: LargeBinary?, uri: Utf8?>`` storage type. ``position`` and
+    ``size`` select a range within an external ``uri`` and must either both be set
+    or both be null. When set, ``size`` must be greater than zero. Every non-null
+    value must set exactly one of ``data`` and ``uri``.
     """
 
     def __init__(self) -> None:
@@ -107,11 +119,47 @@ class BlobType(pa.ExtensionType):
     def __arrow_ext_serialize__(self) -> bytes:
         return b""
 
+    @staticmethod
+    def _validate_storage_type(storage_type: pa.DataType) -> None:
+        if not pa.types.is_struct(storage_type):
+            raise TypeError("BlobType storage type must be a struct")
+
+        fields = list(storage_type)
+        if len(fields) not in (2, 4):
+            raise TypeError(
+                "BlobType storage struct must contain either data/uri or "
+                "data/uri/position/size"
+            )
+
+        expected_fields = [
+            ("data", pa.large_binary()),
+            ("uri", pa.utf8()),
+            ("position", pa.uint64()),
+            ("size", pa.uint64()),
+        ]
+        for index, field in enumerate(fields):
+            expected_name, expected_type = expected_fields[index]
+            if field.name != expected_name or field.type != expected_type:
+                raise TypeError(
+                    "BlobType storage field "
+                    f"{index} must be {expected_name}: {expected_type}, got "
+                    f"{field.name}: {field.type}"
+                )
+            if index < 2 and not field.nullable:
+                raise TypeError(f"BlobType storage field {field.name} must be nullable")
+
+    @classmethod
+    def _from_storage_type(cls, storage_type: pa.DataType) -> "BlobType":
+        cls._validate_storage_type(storage_type)
+        instance = cls.__new__(cls)
+        pa.ExtensionType.__init__(instance, storage_type, "lance.blob.v2")
+        return instance
+
     @classmethod
     def __arrow_ext_deserialize__(
         cls, storage_type: pa.DataType, serialized: bytes
     ) -> "BlobType":
-        return BlobType()
+        return cls._from_storage_type(storage_type)
 
     def __arrow_ext_class__(self):
         return BlobArray
@@ -238,6 +286,13 @@ def blob_field(
 ) -> pa.Field:
     """
     Construct an Arrow field for a Lance blob column.
+
+    The returned field uses the complete logical blob shape
+    ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>``.
+    Every non-null value must set exactly one of ``data`` and ``uri``. External
+    ranges must set both ``position`` and a positive ``size``. Lance preserves
+    this logical schema across create, append, and merge-insert writes while
+    storing compact descriptors internally.
 
     Parameters
     ----------

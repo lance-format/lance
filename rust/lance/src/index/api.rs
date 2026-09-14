@@ -280,10 +280,11 @@ pub trait DatasetIndexExt {
 
     /// Read the indices of this Dataset version that this build can use.
     ///
-    /// An index whose format version is newer than this build supports is
-    /// omitted: it is still in the manifest and still belongs to the dataset,
-    /// but nothing here can decode it. Code deciding what the *next* manifest
-    /// should say must not use this list - it would drop what it omits.
+    /// An index whose declared type has no reader in this build, or whose format
+    /// version is newer than this build supports, is omitted: it is still in the
+    /// manifest and still belongs to the dataset, but nothing here can decode
+    /// it. Code deciding what the *next* manifest should say must not use this
+    /// list - it would drop what it omits.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
