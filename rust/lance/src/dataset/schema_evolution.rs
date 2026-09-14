@@ -1178,9 +1178,12 @@ mod test {
     }
 
     use crate::dataset::WriteParams;
+    use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
+        ArrayRef, BinaryArray, Int32Array, LargeStringArray, ListArray, RecordBatchIterator,
+        StringArray, StructArray,
     };
+    use arrow_buffer::OffsetBuffer;
 
     use super::*;
     use arrow_schema::Fields as ArrowFields;
@@ -1455,6 +1458,736 @@ mod test {
             &Int32Array::from_iter_values(0..100)
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_rejects_zero_batch_size() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await?;
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                Some(0),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("batch size must be greater than zero")
+        );
+        Ok(())
+    }
+
+    /// A leading deleted run longer than the batch size: the blanks it owes are deferred
+    /// past several zero-row batches and then drained in bounded chunks.
+    ///
+    /// This is also the only test where deferred blanks and a restored batch are written
+    /// in the same `Updater::update` call, so it is what pins their order. Swapping the
+    /// two writes would put `payload` at physical rows 0..4 while `i` still lives at
+    /// 20..24, and the assertions below would fail. The unit tests in `updater.rs` drive
+    /// `restore` and the drain separately and cannot see that.
+    #[tokio::test]
+    async fn test_add_columns_chunks_nested_and_variable_width_blanks() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..25))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 30,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("i < 20").await?;
+
+        let child = Arc::new(ArrowField::new("item", DataType::Int32, false));
+        let lists = ListArray::try_new(
+            child.clone(),
+            OffsetBuffer::from_lengths([2; 5]),
+            Arc::new(Int32Array::from_iter_values(0..10)),
+            None,
+        )?;
+        let payload = BinaryArray::from(vec![
+            &b"a"[..],
+            &b"bb"[..],
+            &b"ccc"[..],
+            &b"dddd"[..],
+            &b"eeeee"[..],
+        ]);
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("j", DataType::List(child), false),
+            ArrowField::new("payload", DataType::Binary, false),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(lists.clone()), Arc::new(payload.clone())],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                Some(5),
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(20..25)
+        );
+        assert_eq!(data.column_by_name("j").unwrap().as_ref(), &lists);
+        assert_eq!(data.column_by_name("payload").unwrap().as_ref(), &payload);
+        Ok(())
+    }
+
+    /// A JSON column reaches the writer as text and is re-encoded on the way in, so the
+    /// blanks restored for its deleted rows have to survive that encoding. They do only
+    /// because `jsonb` reads an empty value as the `null` document; this pins the whole
+    /// path end to end so a stricter encoder cannot break `add_columns` silently.
+    #[tokio::test]
+    async fn test_add_columns_json_blanks_survive_encoding() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..6))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("i % 2 = 1").await?;
+
+        let documents = (0..3)
+            .map(|i| format!(r#"{{"n": {i}}}"#))
+            .collect::<Vec<_>>();
+        let json_field = ArrowField::new("j", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let new_schema = Arc::new(ArrowSchema::new(vec![json_field]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(StringArray::from(documents.clone()))],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                None,
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        let read_back = data
+            .column_by_name("j")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.unwrap().to_string())
+            .collect::<Vec<_>>();
+        // JSONB round trips as canonical text, so compare parsed shape, not spacing.
+        assert_eq!(
+            read_back
+                .iter()
+                .map(|value| value.replace(' ', ""))
+                .collect::<Vec<_>>(),
+            documents
+                .iter()
+                .map(|value| value.replace(' ', ""))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// Types that could not receive a physical null before this change, now driven through
+    /// a real writer rather than only through `add_blanks`: a nullable map, a nullable
+    /// variable-width struct child, and (in a blob v1 column) a nullable `LargeBinary`
+    /// carrying the legacy blob marker. Map columns are only writable from V2_2 on --
+    /// V2_1 rejects them outright and V2_0 has no encoding -- so the map arm of
+    /// `blank_plan` is unreachable through a writer before then.
+    #[rstest]
+    #[case::v2_2(LanceFileVersion::V2_2)]
+    #[case::v2_3(LanceFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_add_columns_null_blank_types_round_trip(
+        #[case] version: LanceFileVersion,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..6))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("id % 2 = 1").await?;
+
+        let entry_fields = ArrowFields::from(vec![
+            ArrowField::new("keys", DataType::Int32, false),
+            ArrowField::new("values", DataType::Int32, true),
+        ]);
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+            None,
+        );
+        let entries_field = Arc::new(ArrowField::new(
+            "entries",
+            DataType::Struct(entry_fields),
+            false,
+        ));
+        let maps = arrow_array::MapArray::try_new(
+            entries_field.clone(),
+            OffsetBuffer::from_lengths([1, 1, 1]),
+            entries,
+            None,
+            false,
+        )?;
+
+        let struct_children =
+            ArrowFields::from(vec![ArrowField::new("payload", DataType::Binary, true)]);
+        let nested = StructArray::new(
+            struct_children.clone(),
+            vec![Arc::new(BinaryArray::from(vec![
+                &b"aa"[..],
+                &b"bb"[..],
+                &b"cc"[..],
+            ]))],
+            None,
+        );
+
+        let blob_v1_field = ArrowField::new("blob1", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let blobs =
+            arrow_array::LargeBinaryArray::from(vec![&b"one"[..], &b"two"[..], &b"three"[..]]);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("m", DataType::Map(entries_field, false), true),
+            ArrowField::new("s", DataType::Struct(struct_children), true),
+            blob_v1_field,
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![
+                Arc::new(maps.clone()),
+                Arc::new(nested.clone()),
+                Arc::new(blobs.clone()),
+            ],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                Some(1),
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            data.column_by_name("id").unwrap().as_ref(),
+            &Int32Array::from(vec![0, 2, 4])
+        );
+        assert_eq!(data.column_by_name("m").unwrap().as_ref(), &maps);
+        assert_eq!(data.column_by_name("s").unwrap().as_ref(), &nested);
+        // A blob v1 column scans as a `{position, size}` descriptor rather than the bytes,
+        // so assert the recorded lengths of the live rows.
+        let descriptors = data.column_by_name("blob1").unwrap().as_struct();
+        assert_eq!(
+            descriptors
+                .column_by_name("size")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values(),
+            &[3, 3, 5]
+        );
+        assert_eq!(descriptors.null_count(), 0);
+        Ok(())
+    }
+
+    /// View types take the same null / empty blanks as their non-view counterparts, and
+    /// nothing else in the suite drives one through a writer.
+    #[tokio::test]
+    async fn test_add_columns_view_type_blanks_round_trip() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..6))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("id % 2 = 1").await?;
+
+        let strings = arrow_array::StringViewArray::from(vec!["alpha", "beta", "gamma"]);
+        let bytes = arrow_array::BinaryViewArray::from(vec![&b"aa"[..], &b"bb"[..], &b"cc"[..]]);
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            // Nullable takes a null blank, non-nullable an empty one.
+            ArrowField::new("sv", DataType::Utf8View, true),
+            ArrowField::new("bv", DataType::BinaryView, false),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(strings.clone()), Arc::new(bytes.clone())],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                Some(1),
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        // Lance narrows view types to their non-view counterparts on write, so compare
+        // values rather than array types.
+        assert_eq!(
+            data.column_by_name("sv").unwrap().as_ref(),
+            &StringArray::from(vec!["alpha", "beta", "gamma"])
+        );
+        assert_eq!(
+            data.column_by_name("bv").unwrap().as_ref(),
+            &BinaryArray::from(vec![&b"aa"[..], &b"bb"[..], &b"cc"[..]])
+        );
+        Ok(())
+    }
+
+    /// The payload-amplification case that motivated the whole change, for the one shape
+    /// that cannot take a null blank. A non-nullable blob v2 column gets the empty inline
+    /// descriptor, so its blanks add no sidecar bytes; copying row zero would have written
+    /// one packed sidecar copy per deleted row.
+    #[tokio::test]
+    async fn test_non_nullable_blob_blanks_add_no_sidecar_bytes() -> Result<()> {
+        const PAYLOAD: usize = 128 * 1024;
+        const LIVE_ROWS: usize = 5;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(
+                0..2 * LIVE_ROWS as i32,
+            ))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        // Half the rows are deleted, so half the physical rows need blanks.
+        dataset.delete("id % 2 = 1").await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", false)]));
+        let mapper_schema = output_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            let mut builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                builder.push_bytes(vec![7u8; PAYLOAD])?;
+            }
+            Ok(RecordBatch::try_new(
+                mapper_schema.clone(),
+                vec![builder.finish()?],
+            )?)
+        };
+        dataset
+            .add_columns(
+                NewColumnTransform::BatchUDF(BatchUDF {
+                    mapper: Box::new(mapper),
+                    output_schema,
+                    result_checkpoint: None,
+                }),
+                None,
+                Some(1),
+            )
+            .await?;
+        dataset.validate().await?;
+
+        // `data_file_paths_in` yields names relative to the data directory.
+        let data_dir = StdPath::new(test_uri).join("data");
+        let files = data_file_paths_in(test_uri);
+        assert!(!files.is_empty(), "no data files were written");
+        let total_bytes: u64 = files
+            .iter()
+            .map(|name| {
+                std::fs::metadata(data_dir.join(name))
+                    .unwrap_or_else(|error| panic!("missing data file {name}: {error}"))
+                    .len()
+            })
+            .sum();
+        let live_payload = (LIVE_ROWS * PAYLOAD) as u64;
+        // Bound both sides: the upper bound is the point of the test, and the lower bound
+        // keeps it from passing on a listing that never found the sidecar at all.
+        assert!(
+            total_bytes >= live_payload,
+            "the live blobs are missing: only {total_bytes} bytes on disk"
+        );
+        // Copying row zero into each blank would have doubled this.
+        assert!(
+            total_bytes < live_payload * 3 / 2,
+            "blanks amplified the blob payload: {total_bytes} bytes on disk for \
+             {live_payload} bytes of live blobs"
+        );
+        Ok(())
+    }
+
+    /// The trailing counterpart of [`test_add_columns_chunks_nested_and_variable_width_blanks`].
+    ///
+    /// A deleted run at the end of a fragment is no longer absorbed wholesale into the
+    /// last output batch; it is capped at the updater's batch size and paid off by the
+    /// zero-row batches the reader emits for the fully deleted ranges that follow. That
+    /// hand-off is only exercised through the real reader, so it needs its own test.
+    #[tokio::test]
+    async fn test_add_columns_chunks_trailing_deleted_run() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..25))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 30,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        // Physical rows 5..25 are deleted, so four of the five read batches have no
+        // live row at all.
+        dataset.delete("i >= 5").await?;
+
+        let payload = BinaryArray::from(vec![
+            &b"a"[..],
+            &b"bb"[..],
+            &b"ccc"[..],
+            &b"dddd"[..],
+            &b"eeeee"[..],
+        ]);
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(new_schema.clone(), vec![Arc::new(payload.clone())])?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                Some(5),
+            )
+            .await?;
+
+        // validate() is what checks that the new data file has as many physical rows
+        // as the fragment claims, which is the whole point of restoring blanks.
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(0..5)
+        );
+        assert_eq!(data.column_by_name("payload").unwrap().as_ref(), &payload);
+        Ok(())
+    }
+
+    /// Blanks in a legacy file are built by the same planner as everywhere else, and a
+    /// nullable string column there now gets a physical null rather than a copy of row
+    /// zero. Legacy files are a frozen compatibility surface, so pin the round trip:
+    /// write, delete, add columns, read the live rows back.
+    #[tokio::test]
+    async fn test_add_columns_legacy_blanks_round_trip() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..50))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 10,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        // Interior deletions only: a legacy fragment cannot defer blanks, so every
+        // row group has to keep at least one live row.
+        dataset.delete("i % 10 = 3 OR i % 10 = 7").await?;
+
+        let live = (0..50)
+            .filter(|i| i % 10 != 3 && i % 10 != 7)
+            .collect::<Vec<i32>>();
+        // Every type `supports_nulls` whitelists for V1 that actually reaches the
+        // null-blank path: Utf8, LargeUtf8, Binary and List. `b` is the same Binary type
+        // on the empty-value path, which nullability rather than type selects. The
+        // whitelist also names FixedSizeBinary and FixedSizeList, but both are fixed
+        // width, so they plan as `Take` and never produce a null blank.
+        let strings = StringArray::from_iter_values(live.iter().map(|i| format!("s{i}")));
+        let large_strings =
+            LargeStringArray::from_iter_values(live.iter().map(|i| format!("l{i}")));
+        let nullable_binary = BinaryArray::from_iter_values(live.iter().map(|i| i.to_le_bytes()));
+        let non_nullable = BinaryArray::from_iter_values(live.iter().map(|i| i.to_be_bytes()));
+        // The child has to be nullable: a legacy file cannot round-trip a non-nullable
+        // list child, independently of blanks. Adding `List(non-null Int32)` to a Legacy
+        // dataset with no deletions at all fails the same way, in the v1 reader's schema
+        // check, so that is a pre-existing legacy limitation and not this test's subject.
+        let list_child = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let lists = ListArray::try_new(
+            list_child.clone(),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2, live.len())),
+            Arc::new(Int32Array::from_iter_values(0..2 * live.len() as i32)),
+            None,
+        )?;
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Utf8, true),
+            ArrowField::new("ls", DataType::LargeUtf8, true),
+            ArrowField::new("nb", DataType::Binary, true),
+            ArrowField::new("b", DataType::Binary, false),
+            ArrowField::new("l", DataType::List(list_child), true),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![
+                Arc::new(strings.clone()),
+                Arc::new(large_strings.clone()),
+                Arc::new(nullable_binary.clone()),
+                Arc::new(non_nullable.clone()),
+                Arc::new(lists.clone()),
+            ],
+        )?;
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(new_batch)],
+                    new_schema,
+                ))),
+                None,
+                None,
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(live)
+        );
+        assert_eq!(data.column_by_name("s").unwrap().as_ref(), &strings);
+        assert_eq!(data.column_by_name("ls").unwrap().as_ref(), &large_strings);
+        assert_eq!(
+            data.column_by_name("nb").unwrap().as_ref(),
+            &nullable_binary
+        );
+        assert_eq!(data.column_by_name("b").unwrap().as_ref(), &non_nullable);
+        assert_eq!(data.column_by_name("l").unwrap().as_ref(), &lists);
+        Ok(())
+    }
+
+    /// A blob column is written through a description column plus sidecar storage, and
+    /// its blank is a null descriptor rather than a copy of row zero. Pin that a fragment
+    /// with deleted rows still produces readable blobs, across all three size classes
+    /// (inline, packed, dedicated).
+    ///
+    /// The non-nullable case cannot take a null blank: nulling both children would make
+    /// the preprocessor emit a null descriptor, which the column cannot hold. It gets the
+    /// empty inline descriptor instead -- `data` present and zero length, `uri` absent --
+    /// which costs no sidecar bytes either. `test_non_nullable_blob_blanks_add_no_sidecar_bytes`
+    /// is what pins that cost; this test pins the round trip.
+    #[rstest]
+    #[case::nullable(true)]
+    #[case::non_nullable(false)]
+    #[tokio::test]
+    async fn test_add_columns_blob_blanks_round_trip(#[case] nullable: bool) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..6))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        // Alternating deletions with a batch size of one means every other read batch
+        // has no live row, so each blank has to come from the retained source.
+        dataset.delete("id % 2 = 1").await?;
+
+        const SIZES: [usize; 3] = [8, 128 * 1024, 5 * 1024 * 1024];
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", nullable)]));
+        let mapper_schema = output_schema.clone();
+        let next_row = Arc::new(Mutex::new(0usize));
+        let mapper = move |batch: &RecordBatch| {
+            let mut builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            let mut next_row = next_row.lock().unwrap();
+            for _ in 0..batch.num_rows() {
+                builder.push_bytes(vec![7u8; SIZES[*next_row % SIZES.len()]])?;
+                *next_row += 1;
+            }
+            Ok(RecordBatch::try_new(
+                mapper_schema.clone(),
+                vec![builder.finish()?],
+            )?)
+        };
+        dataset
+            .add_columns(
+                NewColumnTransform::BatchUDF(BatchUDF {
+                    mapper: Box::new(mapper),
+                    output_schema,
+                    result_checkpoint: None,
+                }),
+                None,
+                Some(1),
+            )
+            .await?;
+
+        dataset.validate().await?;
+        let data = dataset.scan().with_row_id().try_into_batch().await?;
+        assert_eq!(
+            data.column_by_name("id").unwrap().as_ref(),
+            &Int32Array::from(vec![0, 2, 4])
+        );
+        let row_ids = data
+            .column_by_name(lance_core::ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .to_vec();
+
+        let blobs = Arc::new(dataset).take_blobs(&row_ids, "blob").await?;
+        let mut sizes = Vec::with_capacity(blobs.len());
+        for blob in &blobs {
+            let blob = blob.as_ref().expect("live rows must have a blob");
+            assert_eq!(blob.read().await?.len() as u64, blob.size());
+            sizes.push(blob.size() as usize);
+        }
+        assert_eq!(sizes, SIZES.to_vec());
         Ok(())
     }
 
