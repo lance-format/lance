@@ -750,14 +750,14 @@ async fn build_index_configs(
             .into_iter()
             .next();
 
-        // An index the maintained set names and the dataset no longer has:
+        // An index the maintained set names and the dataset does not have:
         // dropped outright, or carried away with the column it covered. The set
-        // is fixed when the write spec is installed and cannot be edited
-        // afterwards, so refusing here refuses the claim -- and a table whose
-        // claim cannot be built serves no reads at all, for a condition that
-        // costs only the fresh tier's copy of one index.
+        // is fixed at `initialize_mem_wal` and cannot be edited afterwards, so
+        // refusing here refuses the claim -- and a table whose claim cannot be
+        // built serves no reads at all, for a condition that costs only the
+        // fresh tier's copy of one index.
         //
-        // Serve without it instead. The base index is gone for everyone; the
+        // Serve without it. The base index is gone for everyone; the
         // fresh tier simply has nothing to keep in step with.
         let Some(index_meta) = index_meta else {
             if on_missing == OnMissingIndex::Reject {
