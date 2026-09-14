@@ -3695,7 +3695,8 @@ mod tests {
     #[rstest]
     #[case::l2("l2", true)]
     #[case::cosine("cosine", true)]
-    #[case::dot("dot", true)]
+    #[case::dot("dot", false)]
+    #[case::fixed_dot("fixed_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
@@ -3723,7 +3724,7 @@ mod tests {
         };
         if scenario == "bounded" {
             query.maximum_nprobes = Some(2);
-        } else if scenario == "fixed" {
+        } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
         }
         if scenario == "refine" {
@@ -3742,7 +3743,7 @@ mod tests {
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
                 "cosine" => DistanceType::Cosine,
-                "dot" => DistanceType::Dot,
+                "dot" | "fixed_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
@@ -3775,7 +3776,7 @@ mod tests {
         } else {
             assert_eq!(
                 result.unwrap(),
-                if scenario == "fixed" {
+                if matches!(scenario, "fixed" | "fixed_dot") {
                     AutoProbePolicy::Fixed
                 } else {
                     AutoProbePolicy::Legacy
