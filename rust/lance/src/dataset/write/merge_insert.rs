@@ -584,8 +584,8 @@ struct MergeInsertParams {
     // When the source is a one-shot stream and `conflict_retries > 0`, the source
     // is spilled (memory, then disk) so it can be replayed on each retry. Set to
     // false to fail fast on contention instead of buffering the stream. Has no
-    // effect on re-scannable sources (materialized batches, files), which never
-    // spill.
+    // effect on re-scannable sources; arbitrary providers may still use bounded
+    // replay within an indexed attempt to preserve one logical snapshot.
     spill_for_retry: bool,
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
@@ -898,8 +898,8 @@ impl MergeInsertBuilder {
     ///
     /// This has no effect on re-scannable sources (materialized batches via
     /// [`MergeInsertJob::execute_batches`], or a [`TableProvider`] via
-    /// [`MergeInsertJob::execute_provider`]), which are replayed directly and never
-    /// spill.
+    /// [`MergeInsertJob::execute_provider`]). Arbitrary providers may still use
+    /// bounded replay within an indexed attempt to preserve one logical snapshot.
     ///
     /// Default is true.
     ///
@@ -1151,6 +1151,27 @@ enum SchemaComparison {
     Subschema,
 }
 
+/// How repeated scans of a merge source relate to one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceProviderMode {
+    /// The provider can be scanned only once.
+    OneShot,
+    /// Every scan reads the same materialized rows.
+    StableSnapshot,
+    /// The provider can be scanned repeatedly, but each scan may observe different rows.
+    Rescannable,
+}
+
+impl SourceProviderMode {
+    fn supports_retries(self) -> bool {
+        !matches!(self, Self::OneShot)
+    }
+
+    fn has_stable_snapshot(self) -> bool {
+        matches!(self, Self::StableSnapshot)
+    }
+}
+
 /// Wrap a one-shot stream in a non-replayable [`StreamingTable`] provider.
 ///
 /// The provider can only be scanned once (its single partition hands out the
@@ -1259,12 +1280,11 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
     }
 }
 
-/// Presents all source partitions as one deterministic, replayable stream.
+/// Presents all partitions from one source scan as a deterministic stream.
 ///
-/// The indexed join scans the source twice. Genuine table providers can serve
-/// both scans directly, so this adapter avoids copying their rows into another
-/// replay spill. FirstSeen sources also receive a temporary encounter ordinal
-/// before either scan can reorder them.
+/// The indexed join snapshots this stream when the provider does not guarantee
+/// that repeated scans observe the same rows. FirstSeen sources also receive a
+/// temporary encounter ordinal before either consumer can reorder them.
 #[derive(Debug)]
 struct SequentialSourcePartitionStream {
     input: Arc<dyn ExecutionPlan>,
@@ -1294,8 +1314,7 @@ impl SequentialSourcePartitionStream {
     }
 
     /// Obtain one provider scan and normalize its partitions into a single,
-    /// deterministic stream. Call this once per consumer so re-scannable
-    /// providers retain `TableProvider::scan()` as their replay boundary.
+    /// deterministic stream.
     async fn from_provider_scan(
         provider: &Arc<dyn TableProvider>,
         context: &SessionContext,
@@ -1473,7 +1492,7 @@ impl MergeInsertJob {
     async fn create_indexed_scan_joined_stream(
         &self,
         source_provider: Arc<dyn TableProvider>,
-        source_is_replayable: bool,
+        source_mode: SourceProviderMode,
         indexed_keys: Vec<(String, IndexMetadata)>,
         source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
@@ -1511,10 +1530,10 @@ impl MergeInsertJob {
             .as_ref()
             .map(|name| Field::new(name, DataType::UInt64, false));
 
-        // A genuine provider is re-scanned independently for the index probe
-        // and final join. A one-shot provider is scanned exactly once, then its
-        // normalized stream is replayed for those two consumers.
-        let (source_input, index_input) = if source_is_replayable {
+        // Materialized providers guarantee that repeated scans observe the same
+        // rows. Arbitrary providers do not, so normalize one scan per attempt
+        // into a bounded replay before the index probe and final join diverge.
+        let (source_input, index_input) = if source_mode.has_stable_snapshot() {
             let source_scan = SequentialSourcePartitionStream::from_provider_scan(
                 &source_provider,
                 session_ctx,
@@ -1866,7 +1885,7 @@ impl MergeInsertJob {
     async fn create_joined_stream(
         &self,
         source_provider: Arc<dyn TableProvider>,
-        source_is_replayable: bool,
+        source_mode: SourceProviderMode,
         source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
         if self.params.use_index
@@ -1884,7 +1903,7 @@ impl MergeInsertJob {
                 return self
                     .create_indexed_scan_joined_stream(
                         source_provider,
-                        source_is_replayable,
+                        source_mode,
                         indexed_keys,
                         source_projection,
                     )
@@ -2489,32 +2508,35 @@ impl MergeInsertJob {
     /// A stream can only be read once, so when `conflict_retries > 0` the stream is
     /// spilled (in memory, then to disk) so it can be replayed on each retry. See
     /// [`MergeInsertBuilder::spill_for_retry`] to fail fast instead, and
-    /// [`Self::execute_batches`] / [`Self::execute_provider`] for re-scannable
-    /// sources that never spill.
+    /// [`Self::execute_batches`] / [`Self::execute_provider`] for sources that can
+    /// be scanned again on each retry.
     pub async fn execute(
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let (provider, replayable) = self.stream_source_to_provider(source).await?;
-        self.execute_inner(provider, replayable).await
+        let (provider, source_mode) = self.stream_source_to_provider(source).await?;
+        self.execute_inner(provider, source_mode).await
     }
 
     /// Executes the merge insert job from a re-scannable [`TableProvider`].
     ///
     /// This is the canonical entry point: [`Self::execute`] and
     /// [`Self::execute_batches`] are thin wrappers that build a provider and call
-    /// this method. Because a provider can be scanned repeatedly, retries re-read
-    /// the source directly and never spill to disk. The provider's reported
-    /// statistics (e.g. from a [`MemTable`] or file source) also let DataFusion
-    /// optimize the merge join.
+    /// this method. Retries re-read the provider directly. Within each indexed
+    /// attempt, one scan is captured in a bounded replay so the index probe and
+    /// final join cannot observe different source snapshots. The provider's
+    /// reported statistics (e.g. from a [`MemTable`] or file source) also let
+    /// DataFusion optimize non-indexed merge joins.
     ///
     /// [`MemTable`]: datafusion::datasource::MemTable
     pub async fn execute_provider(
         self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        // A genuine TableProvider is re-scannable by contract, so retries are safe.
-        self.execute_inner(provider, true).await
+        // TableProvider supports repeated scans, but does not guarantee that
+        // separate scans observe the same rows.
+        self.execute_inner(provider, SourceProviderMode::Rescannable)
+            .await
     }
 
     /// Executes the merge insert job from materialized record batches.
@@ -2528,7 +2550,8 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_inner(provider, true).await
+        self.execute_inner(provider, SourceProviderMode::StableSnapshot)
+            .await
     }
 
     /// Like [`Self::execute_batches`] but returns the uncommitted transaction.
@@ -2539,7 +2562,8 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_uncommitted_impl(provider, true).await
+        self.execute_uncommitted_impl(provider, SourceProviderMode::StableSnapshot)
+            .await
     }
 
     /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
@@ -2580,7 +2604,7 @@ impl MergeInsertJob {
     async fn stream_source_to_provider(
         &self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Arc<dyn TableProvider>, bool)> {
+    ) -> Result<(Arc<dyn TableProvider>, SourceProviderMode)> {
         if self.params.conflict_retries > 0 && self.params.spill_for_retry {
             // Allow buffering up to 100MB in memory before spilling to disk.
             let disk_manager = self
@@ -2594,26 +2618,25 @@ impl MergeInsertJob {
                 disk_manager,
             )
             .await?;
-            Ok((provider, true))
+            Ok((provider, SourceProviderMode::StableSnapshot))
         } else {
-            Ok((one_shot_provider(source)?, false))
+            Ok((one_shot_provider(source)?, SourceProviderMode::OneShot))
         }
     }
 
     /// Run the retry loop against a provider, re-scanning it on each attempt.
     ///
-    /// `replayable` indicates whether the provider can be scanned more than once.
-    /// When it cannot (a one-shot stream that was not spilled), retries are
-    /// disabled so we never scan it twice; the operation runs once and surfaces any
-    /// commit conflict directly.
+    /// `source_mode` indicates whether the provider can be scanned more than once
+    /// and whether those scans share one materialized snapshot. One-shot sources
+    /// disable retries; arbitrary providers are re-scanned once per attempt.
     async fn execute_inner(
         self,
         provider: Arc<dyn TableProvider>,
-        replayable: bool,
+        source_mode: SourceProviderMode,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
-            max_retries: if replayable {
+            max_retries: if source_mode.supports_retries() {
                 self.params.conflict_retries
             } else {
                 0
@@ -2624,7 +2647,7 @@ impl MergeInsertJob {
         let wrapper = MergeInsertJobWithProvider {
             job: self,
             provider,
-            replayable,
+            source_mode,
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -2639,7 +2662,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(one_shot_provider(stream)?, false)
+        self.execute_uncommitted_impl(one_shot_provider(stream)?, SourceProviderMode::OneShot)
             .await
     }
 
@@ -3113,7 +3136,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
-        source_is_replayable: bool,
+        source_mode: SourceProviderMode,
     ) -> Result<UncommittedMergeInsert> {
         // Resolve the write mode before the path fork. The v2 plan resolves it
         // again in `create_plan`, but the legacy path below does not go through
@@ -3163,7 +3186,7 @@ impl MergeInsertJob {
         };
         let source_schema = source_projection.clone().unwrap_or(source_schema);
         let joined = self
-            .create_joined_stream(provider, source_is_replayable, source_projection)
+            .create_joined_stream(provider, source_mode, source_projection)
             .await?;
         let merger = Merger::try_new(
             self.params.clone(),
@@ -3637,7 +3660,7 @@ pub struct UncommittedMergeInsert {
 struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
     provider: Arc<dyn TableProvider>,
-    replayable: bool,
+    source_mode: SourceProviderMode,
     attempt_count: Arc<AtomicU32>,
 }
 
@@ -3646,7 +3669,7 @@ impl Clone for MergeInsertJobWithProvider {
         Self {
             job: self.job.clone_for_retry(),
             provider: self.provider.clone(),
-            replayable: self.replayable,
+            source_mode: self.source_mode,
             attempt_count: self.attempt_count.clone(),
         }
     }
@@ -3663,7 +3686,7 @@ impl RetryExecutor for MergeInsertJobWithProvider {
         // Re-scan the provider on each retry attempt.
         self.job
             .clone_for_retry()
-            .execute_uncommitted_impl(self.provider.clone(), self.replayable)
+            .execute_uncommitted_impl(self.provider.clone(), self.source_mode)
             .await
     }
 
@@ -4211,6 +4234,7 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Barrier, Notify};
 
     // Used to validate that futures returned are Send.
@@ -4218,17 +4242,18 @@ mod tests {
         t
     }
 
-    /// Returns a fresh one-shot physical plan for every provider scan. This
-    /// catches callers that incorrectly execute one scan plan more than once.
+    /// Returns rows only from its first scan, simulating a provider whose
+    /// snapshot changes between scans.
     #[derive(Debug)]
-    struct FreshOneShotPlanProvider {
-        batch: RecordBatch,
+    struct ChangingScanProvider {
+        first_batch: RecordBatch,
+        scan_count: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl TableProvider for FreshOneShotPlanProvider {
+    impl TableProvider for ChangingScanProvider {
         fn schema(&self) -> Arc<Schema> {
-            self.batch.schema()
+            self.first_batch.schema()
         }
 
         fn table_type(&self) -> datafusion::logical_expr::TableType {
@@ -4242,10 +4267,16 @@ mod tests {
             filters: &[Expr],
             limit: Option<usize>,
         ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-            let schema = self.batch.schema();
+            let schema = self.first_batch.schema();
+            let scan_number = self.scan_count.fetch_add(1, Ordering::SeqCst);
+            let batch = if scan_number == 0 {
+                self.first_batch.clone()
+            } else {
+                RecordBatch::new_empty(schema.clone())
+            };
             let stream = Box::pin(RecordBatchStreamAdapter::new(
                 schema.clone(),
-                futures::stream::iter([Ok(self.batch.clone())]),
+                futures::stream::iter([Ok(batch)]),
             ));
             let partition = Arc::new(OneShotPartitionStream::new(stream));
             let provider = StreamingTable::try_new(schema, vec![partition])?;
@@ -6005,12 +6036,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_indexed_merge_rescans_provider_instead_of_reexecuting_plan() {
-        let initial =
-            record_batch!(("id", UInt32, [0, 1, 2]), ("value", UInt32, [0, 0, 0])).unwrap();
+    async fn test_indexed_merge_provider_scans_must_share_a_snapshot() {
+        let test_dir = TempStrDir::default();
+        let initial = record_batch!(("id", UInt32, [2]), ("value", UInt32, [20])).unwrap();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
-            "memory://",
+            test_dir.as_str(),
             None,
         )
         .await
@@ -6026,30 +6057,40 @@ mod tests {
             .await
             .unwrap();
         let dataset = Arc::new(dataset);
-        let source = record_batch!(("id", UInt32, [1]), ("value", UInt32, [10])).unwrap();
-        let provider: Arc<dyn TableProvider> = Arc::new(FreshOneShotPlanProvider { batch: source });
+        let source = record_batch!(("id", UInt32, [2]), ("value", UInt32, [200])).unwrap();
+        let scan_count = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn TableProvider> = Arc::new(ChangingScanProvider {
+            first_batch: source,
+            scan_count: scan_count.clone(),
+        });
 
         let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
             .try_build()
             .unwrap()
             .execute_provider(provider)
             .await
             .unwrap();
 
+        assert_eq!(scan_count.load(Ordering::SeqCst), 1);
         assert_eq!(stats.num_updated_rows, 1);
-        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(stats.num_inserted_rows, 0);
+        drop(dataset);
+
+        let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
         let ids = batch["id"].as_primitive::<UInt32Type>();
         let values = batch["value"].as_primitive::<UInt32Type>();
-        let rows = ids
+        let mut rows = ids
             .values()
             .iter()
             .zip(values.values())
             .map(|(id, value)| (*id, *value))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(rows, HashMap::from([(0, 0), (1, 10), (2, 0)]));
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(2, 200)]);
     }
 
     #[tokio::test]
