@@ -1422,12 +1422,18 @@ pub struct HnswQueryParams {
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
+        Self::from_query(query, query.dist_q_c)
+    }
+}
+
+impl HnswQueryParams {
+    pub(crate) fn from_query(query: &Query, dist_q_c: f32) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or(k + k / 2),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-            dist_q_c: query.dist_q_c,
+            dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
         }
     }
@@ -1436,6 +1442,10 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn query_params(query: &Query, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn load(data: RecordBatch) -> Result<Self>
     where

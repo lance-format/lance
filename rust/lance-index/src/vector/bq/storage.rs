@@ -392,14 +392,14 @@ impl RabitQuantizationMetadata {
         }
 
         let sum_q = rotated_query.iter().copied().sum();
-        Ok(RabitRawQueryContext {
+        Ok(RabitRawQueryContext::new(
             code_dim,
             ex_bits,
             rotated_query,
             dist_table,
             ex_query,
             sum_q,
-        })
+        ))
     }
 }
 
@@ -596,6 +596,7 @@ impl RabitQuantizationStorage {
             query_factor,
             query_error,
             approx_mode,
+            raw_query,
         } = parts;
         let ex_code_len = self
             .ex_codes
@@ -636,6 +637,7 @@ impl RabitQuantizationStorage {
             query_error,
             approx_mode,
         )
+        .with_raw_query_context(raw_query)
     }
 
     fn rotate_query_vector(&self, code_dim: usize, qr: &dyn Array) -> Vec<f32> {
@@ -809,6 +811,9 @@ struct RabitDistCalculatorParts<'a> {
     query_factor: f32,
     query_error: f32,
     approx_mode: ApproxMode,
+    /// Set when `dist_table` is borrowed from a per-query raw-query context,
+    /// which also memoizes the FastScan LUT quantized from it.
+    raw_query: Option<&'a RabitRawQueryContext>,
 }
 
 /// Loop-invariant inputs of the raw-query multi-bit top-k scans: the row
@@ -863,6 +868,8 @@ pub struct RabitDistCalculator<'a> {
     query_factor: f32,
     query_error: f32,
     approx_mode: ApproxMode,
+    /// Per-query context that owns `dist_table` and memoizes its FastScan LUT.
+    raw_query: Option<&'a RabitRawQueryContext>,
 
     sum_q: f32,
     sqrt_d: f32,
@@ -910,9 +917,17 @@ impl<'a> RabitDistCalculator<'a> {
             query_factor,
             query_error,
             approx_mode,
+            raw_query: None,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
+    }
+
+    /// Attach the per-query context that `dist_table` was borrowed from, so the
+    /// FastScan LUT is quantized once per query instead of once per partition.
+    pub fn with_raw_query_context(mut self, raw_query: Option<&'a RabitRawQueryContext>) -> Self {
+        self.raw_query = raw_query;
+        self
     }
 
     /// `sum_d query[d] * ex_code[d]` for the candidate's packed ex codes.
@@ -969,7 +984,22 @@ impl<'a> RabitDistCalculator<'a> {
             );
         }
 
-        let (qmin, qmax) = match quantize_dist_table_into(&self.dist_table, quantized_dists_table) {
+        // The raw-query estimator's dist table is centroid-independent, so its
+        // LUT is memoized on the query context; otherwise quantize into the
+        // caller's scratch.
+        let memo = self.raw_query.map(|raw_query| raw_query.normal_lut());
+        let (dist_table, num_tables, dequant) = match memo {
+            Some(lut) => (lut.table.as_slice(), lut.num_tables, lut.dequant),
+            None => {
+                let dequant = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
+                (
+                    quantized_dists_table.as_slice(),
+                    quantized_dists_table.len() / SEGMENT_NUM_CODES,
+                    dequant,
+                )
+            }
+        };
+        let (qmin, qmax) = match dequant {
             DistTableDequant::Affine { qmin, qmax } => (qmin, qmax),
             DistTableDequant::Exact => {
                 // The affine reconstruction would be non-finite; compute every
@@ -994,7 +1024,7 @@ impl<'a> RabitDistCalculator<'a> {
                     simd_len,
                     code_len,
                     self.codes,
-                    quantized_dists_table,
+                    dist_table,
                     &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
                 );
                 // The kernel initialized every SIMD output slot.
@@ -1008,7 +1038,7 @@ impl<'a> RabitDistCalculator<'a> {
                     simd_len,
                     code_len,
                     self.codes,
-                    quantized_dists_table,
+                    dist_table,
                     &mut quantized_dists.spare_capacity_mut()[..simd_len],
                 );
                 // The kernel initialized every SIMD output slot.
@@ -1017,7 +1047,6 @@ impl<'a> RabitDistCalculator<'a> {
         }
 
         let range = (qmax - qmin) / 255.0;
-        let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
         dists.reserve(n);
@@ -1064,17 +1093,31 @@ impl<'a> RabitDistCalculator<'a> {
         hacc_dist_table: &mut Vec<u8>,
         quantized_dists: &mut Vec<u32>,
     ) -> usize {
-        let (qmin, qmax) =
-            match quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table) {
-                DistTableDequant::Affine { qmin, qmax } => (qmin, qmax),
-                DistTableDequant::Exact => {
-                    // See binary_distances_with_scratch: non-finite affine
-                    // scale falls back to exact per-row distances.
-                    self.fill_exact_binary_distances(n, code_len, dists);
-                    return 0;
-                }
-            };
-        simd::dist_table::transfer_4bit_dist_table_u16(quantized_dist_table, hacc_dist_table);
+        // See binary_distances_with_scratch: the raw-query LUT is per-query.
+        let memo = self.raw_query.map(|raw_query| raw_query.accurate_lut());
+        let (dequant, num_tables) = match memo {
+            Some(lut) => (lut.dequant, lut.num_tables),
+            None => {
+                let dequant = quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table);
+                simd::dist_table::transfer_4bit_dist_table_u16(
+                    quantized_dist_table,
+                    hacc_dist_table,
+                );
+                (dequant, quantized_dist_table.len() / SEGMENT_NUM_CODES)
+            }
+        };
+        let (qmin, qmax) = match dequant {
+            DistTableDequant::Affine { qmin, qmax } => (qmin, qmax),
+            DistTableDequant::Exact => {
+                // Non-finite affine scale falls back to exact per-row distances.
+                self.fill_exact_binary_distances(n, code_len, dists);
+                return 0;
+            }
+        };
+        let hacc_dist_table = match memo {
+            Some(lut) => lut.table.as_slice(),
+            None => hacc_dist_table.as_slice(),
+        };
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
@@ -1094,7 +1137,6 @@ impl<'a> RabitDistCalculator<'a> {
         }
 
         let range = (qmax - qmin) / u16::MAX as f32;
-        let num_tables = quantized_dist_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
         dists.clear();
         dists.reserve(n);
@@ -2135,6 +2177,7 @@ impl VectorStore for RabitQuantizationStorage {
             query_factor,
             query_error,
             approx_mode: ApproxMode::Normal,
+            raw_query: None,
         })
     }
 
@@ -2177,6 +2220,7 @@ impl VectorStore for RabitQuantizationStorage {
                 query_factor,
                 query_error,
                 approx_mode: options.approx_mode,
+                raw_query: Some(raw_query),
             });
         }
 
@@ -2252,6 +2296,7 @@ impl VectorStore for RabitQuantizationStorage {
             query_factor,
             query_error,
             approx_mode: options.approx_mode,
+            raw_query: None,
         })
     }
 
