@@ -47,6 +47,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity};
 use tracing::instrument;
@@ -58,7 +59,10 @@ use super::exec::PkBlockFilterExec;
 use super::projection::{project_to_canonical, validate_projection_names};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
-use crate::index::scalar::inverted::{indexed_fts_document_granularities, resolve_fts_field};
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::index::scalar::inverted::{
+    indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
+};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -267,6 +271,96 @@ fn active_source_can_execute_fts(
     }
 }
 
+/// Build a throwaway [`IndexStore`] carrying an inverted index on `column`,
+/// populated from the memtable's visible prefix.
+///
+/// The active memtable indexes only the columns in the write spec's maintained
+/// set, and that set is fixed when the spec is installed — an FTS index created
+/// afterwards can never join it. Without this, the arm for such a column is
+/// `empty_plan()`: the query succeeds, the plan says it consulted the memtable,
+/// and every matching row still in memory is missing from the answer.
+///
+/// Indexing at query time costs a tokenize pass over the visible rows, which is
+/// what any brute-force scoring would cost anyway — and going through a real
+/// index means every query shape works here exactly as it does on a maintained
+/// column, compound trees included, rather than a hand-written subset.
+///
+/// Returns `None` when the memtable has no visible rows, so an empty memtable
+/// pays nothing.
+fn transient_fts_index_store(
+    batch_store: &Arc<BatchStore>,
+    source: &IndexStore,
+    schema: &SchemaRef,
+    column: &str,
+    document_granularity: DocumentGranularity,
+    pk_columns: &[String],
+    index_params: Option<&InvertedIndexParams>,
+) -> Result<Option<Arc<IndexStore>>> {
+    let visible_batches = source.visible_count();
+    if visible_batches == 0 {
+        return Ok(None);
+    }
+
+    let field_id = schema.index_of(column).map_err(|_| {
+        Error::invalid_input(format!(
+            "FTS query column '{column}' is not in the MemWAL schema"
+        ))
+    })? as i32;
+
+    // PK columns first: `enable_pk_index` refuses to run once a search index
+    // holds rows, and the FTS exec needs the PK index to drop superseded
+    // postings before it applies the query limit.
+    let mut store = IndexStore::new();
+    if !pk_columns.is_empty() {
+        let resolved = pk_columns
+            .iter()
+            .map(|name| {
+                schema
+                    .index_of(name)
+                    .map(|idx| (name.clone(), idx as i32))
+                    .map_err(|_| {
+                        Error::invalid_input(format!(
+                            "primary-key column '{name}' is not in the MemWAL schema"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        store.enable_pk_index(&resolved);
+    }
+    // Inherit the persisted index's analyzer and positional settings. They are
+    // part of the query contract: a phrase query needs positions, and a
+    // stemming or n-gram tokenizer changes which terms a document produces, so
+    // defaults here would have the active rows disagree with base and SSTable
+    // rows about what matches — silently, by returning fewer rows. Defaults are
+    // right only when no persisted index covers the column, where there is no
+    // contract to match.
+    let params = index_params
+        .cloned()
+        .unwrap_or_default()
+        .document_granularity(document_granularity);
+    store.add_fts_with_params(
+        format!("__transient_fts_{column}"),
+        field_id,
+        column.to_string(),
+        params,
+    )?;
+
+    // Exactly the prefix the real store publishes. A bare `IndexStore` carries
+    // no durability cursors, so its own `visible_count` is its indexed prefix —
+    // indexing this many batches makes the two agree.
+    for position in 0..visible_batches {
+        let Some(stored) = batch_store.get(position) else {
+            break;
+        };
+        store.insert_with_batch_position(
+            &stored.data,
+            stored.row_offset,
+            Some(stored.batch_position),
+        )?;
+    }
+    Ok(Some(Arc::new(store)))
+}
+
 /// Plans local-scoring FTS queries over LSM data.
 pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
@@ -381,9 +475,18 @@ impl LsmFtsSearchPlanner {
         let requested = requested_query_document_granularity(&query.query)?;
         let mut available = Vec::new();
         let mut source_granularities = Vec::with_capacity(sources.len());
+        // The analyzer/positional contract each granularity's persisted index
+        // was built with. Which one applies is only known once the query's
+        // granularity is resolved below — row and list-element indexes may
+        // coexist on a column with different settings, so choosing early would
+        // rebuild the transient arm against the wrong one.
+        let mut index_params: Vec<(DocumentGranularity, InvertedIndexParams)> = Vec::new();
         for source in &sources {
             let granularities = match source {
                 LsmDataSource::BaseTable { dataset } => {
+                    if index_params.is_empty() {
+                        index_params = indexed_fts_index_params(dataset, column).await?;
+                    }
                     indexed_fts_document_granularities(dataset, column)
                         .await?
                         .into_iter()
@@ -399,6 +502,9 @@ impl LsmFtsSearchPlanner {
                         self.warmer.as_ref(),
                     )
                     .await?;
+                    if index_params.is_empty() {
+                        index_params = indexed_fts_index_params(&dataset, column).await?;
+                    }
                     indexed_fts_document_granularities(&dataset, column)
                         .await?
                         .into_iter()
@@ -419,6 +525,13 @@ impl LsmFtsSearchPlanner {
             document_granularity,
             &source_granularities,
         )?;
+        // Now that the granularity is settled, take the settings of the index
+        // the query actually selects — `load_segments` picks the persisted index
+        // the same way.
+        let index_params = index_params
+            .into_iter()
+            .find(|(granularity, _)| *granularity == document_granularity)
+            .map(|(_, params)| params);
         let schema = lance_core::datatypes::Schema::try_from(self.base_schema.as_ref())?;
         resolve_fts_field(&schema, column, document_granularity)?;
         set_query_document_granularity(&mut query.query, document_granularity);
@@ -486,7 +599,14 @@ impl LsmFtsSearchPlanner {
             .collect();
         let built =
             futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
-                Box::pin(self.build_source_plan(source, column, &query, *fetch_limit, projection))
+                Box::pin(self.build_source_plan(
+                    source,
+                    column,
+                    &query,
+                    *fetch_limit,
+                    projection,
+                    index_params.as_ref(),
+                ))
             }))
             .await?;
 
@@ -562,6 +682,7 @@ impl LsmFtsSearchPlanner {
         Ok(merged_sorted)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_source_plan(
         &self,
         source: &LsmDataSource,
@@ -569,6 +690,7 @@ impl LsmFtsSearchPlanner {
         query: &FullTextSearchQuery,
         limit: Option<usize>,
         projection: Option<&[String]>,
+        index_params: Option<&InvertedIndexParams>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -625,13 +747,36 @@ impl LsmFtsSearchPlanner {
                 ..
             } => {
                 let document_granularity = query_document_granularity(query)?;
-                if !active_source_can_execute_fts(source, column, document_granularity) {
-                    return self
-                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity));
-                }
+                // A column outside the write spec's maintained set has no
+                // in-memory inverted index, so the memtable cannot be searched
+                // through `index_store`. Build one over the visible prefix for
+                // this query rather than contributing nothing: an empty arm is a
+                // silently short answer, since those rows are present and do
+                // match. `None` means there is nothing to index.
+                let index_store =
+                    if active_source_can_execute_fts(source, column, document_granularity) {
+                        index_store.clone()
+                    } else {
+                        match transient_fts_index_store(
+                            batch_store,
+                            index_store,
+                            schema,
+                            column,
+                            document_granularity,
+                            &self.pk_columns,
+                            index_params,
+                        )? {
+                            Some(store) => store,
+                            None => {
+                                return self.empty_plan(
+                                    &self.canonical_fts_schema(projection, document_granularity),
+                                );
+                            }
+                        }
+                    };
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                    MemTableScanner::new(batch_store.clone(), index_store, schema.clone());
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
@@ -1834,8 +1979,12 @@ mod tests {
         assert_eq!(ids, vec![1]);
     }
 
+    /// An active memtable with no FTS index on the column is now indexed for
+    /// the query rather than skipped, so a boolean query reaches it. This
+    /// memtable's row carries none of the query's terms, so the answer is
+    /// unchanged — what changed is that it was actually searched.
     #[tokio::test]
-    async fn boolean_query_ignores_active_memtable_without_relevant_fts_index() {
+    async fn boolean_query_searches_active_memtable_without_a_maintained_fts_index() {
         use crate::index::DatasetIndexExt;
         use lance_index::IndexType;
         use lance_index::scalar::inverted::query::{
@@ -1896,7 +2045,7 @@ mod tests {
         let plan = planner
             .plan_search("text", query, Some(10), Some(&["id".to_string()]))
             .await
-            .expect("irrelevant active memtable must not reject base-supported boolean query");
+            .expect("an unmaintained column must be indexed for the query, not skipped");
         let ctx = datafusion::prelude::SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -2068,8 +2217,383 @@ mod tests {
         );
     }
 
+    /// An FTS index the write spec does not maintain used to make the active
+    /// memtable contribute nothing — `empty_plan()`, not an error — so the query
+    /// returned a base-only answer under a plan that said it consulted the
+    /// memtable. Index the visible prefix for the query instead.
+    #[tokio::test]
+    async fn unmaintained_column_is_indexed_for_the_query() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(&schema, &[1, 2], &["lance rocks", "unrelated"])],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // PK index maintained, FTS index not — the shape you get when the FTS
+        // index is built after `set_lsm_write_spec`.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let active_batch = make_batch(&schema, &[10, 11], &["lance in memtable", "no match here"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        assert!(
+            indexes
+                .fts_document_granularities_by_column("text")
+                .is_empty(),
+            "precondition: the memtable maintains no FTS index on the column"
+        );
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+            "lance".to_string(),
+        )));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 10],
+            "id=10 lives only in the memtable and matches 'lance'; without a \
+             transient index the arm contributes nothing and only id=1 comes back"
+        );
+    }
+
+    /// The transient index has to inherit the persisted index's analyzer and
+    /// positional settings, not defaults. Positions are the sharpest case:
+    /// `InvertedIndexParams::default()` has `with_position = false`, so a phrase
+    /// that matches in base silently matches nothing in the active prefix —
+    /// fewer rows, no error. Tokenizer settings diverge the same way.
+    #[tokio::test]
+    async fn transient_index_inherits_persisted_index_params() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::PhraseQuery;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(&schema, &[1, 2], &["lance rocks", "unrelated"])],
+        )
+        .await;
+        // Built *with* positions, so phrase is a supported query on this table.
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default().with_position(true),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let active_batch = make_batch(&schema, &[10], &["lance rocks in memtable"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(PhraseQuery::new(
+            "lance rocks".to_string(),
+        )));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 10],
+            "id=10 carries the phrase in the memtable; a default-params transient \
+             index has no positions and drops it"
+        );
+    }
+
+    /// Row and list-element indexes may coexist on one column with *different*
+    /// settings, and the query selects between them by its resolved
+    /// granularity. Taking whichever index came first would rebuild the
+    /// transient arm against the wrong contract — here the row index has no
+    /// positions, so a list-element phrase query would analyze the active rows
+    /// positionlessly and silently match nothing.
+    #[tokio::test]
+    async fn transient_index_uses_params_for_selected_granularity() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::InvertedIndexParams;
+        use lance_index::scalar::inverted::query::PhraseQuery;
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", list_type, true),
+        ]));
+
+        let mut base_tags = ListBuilder::new(StringBuilder::new());
+        base_tags.values().append_value("lance rocks");
+        base_tags.append(true);
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(base_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(base_batch)], schema.clone()),
+            &base_uri,
+            None,
+        )
+        .await
+        .unwrap();
+        // Row index first, without positions; list-element index second, with.
+        // Order matters: a first-match lookup picks the positionless one.
+        base_ds
+            .create_index(
+                &["tags"],
+                IndexType::Inverted,
+                Some("tags_row_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        base_ds
+            .create_index(
+                &["tags"],
+                IndexType::Inverted,
+                Some("tags_element_fts".to_string()),
+                &InvertedIndexParams::default()
+                    .with_position(true)
+                    .document_granularity(DocumentGranularity::ListElement),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // Precondition: both granularities really do coexist, with different
+        // positional settings, or this test proves nothing.
+        let params = indexed_fts_index_params(&base_ds, "tags").await.unwrap();
+        let row = params
+            .iter()
+            .find(|(g, _)| *g == DocumentGranularity::Row)
+            .expect("row index");
+        let element = params
+            .iter()
+            .find(|(g, _)| *g == DocumentGranularity::ListElement)
+            .expect("list-element index");
+        assert!(!row.1.has_positions(), "row index must lack positions");
+        assert!(
+            element.1.has_positions(),
+            "element index must have positions"
+        );
+
+        // Active memtable with no maintained FTS index on the column.
+        let mut active_tags = ListBuilder::new(StringBuilder::new());
+        active_tags.values().append_value("lance rocks");
+        active_tags.append(true);
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(active_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
+            PhraseQuery::new("lance rocks".to_string())
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ));
+        let plan = planner
+            .plan_search("tags", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids,
+            vec![1, 10],
+            "id=10 is in the memtable; rebuilding against the row index's \
+             positionless settings drops it"
+        );
+    }
+
+    /// An empty memtable pays nothing: there is nothing to index, so the arm
+    /// stays empty rather than building a tokenizer pool over no rows.""""""
+    #[tokio::test]
+    async fn empty_memtable_builds_no_transient_index() {
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let indexes = Arc::new(indexes);
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+            "lance".to_string(),
+        )));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    }
+
     /// The base arm must apply the filter as a true *prefilter*, not a
-    /// post-filter on the BM25 top-k.""" With `k = 1` and the higher-scoring base
+    /// post-filter on the BM25 top-k."""""" With `k = 1` and the higher-scoring base
     /// doc failing the predicate, a post-filter would return zero rows; a
     /// prefilter restricts BM25 to matching rows and returns the lower-scoring
     /// match. Regression for a missing `scanner.prefilter(true)` on the base arm.
