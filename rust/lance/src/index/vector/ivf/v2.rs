@@ -26,10 +26,10 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::stream::FuturesUnordered;
+use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -129,7 +129,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
-/// streaming and global-top-k search paths.
+/// streaming search path.
 ///
 /// The streaming path deliberately avoids per-partition CPU-task fan-out (a measured
 /// 14-30% latency win, see #6475). Searching a batch of partitions per `spawn_cpu`
@@ -141,10 +141,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
 ///
 /// This is a tunable knob: larger batches amortize dispatch overhead further and keep
 /// more work on a single CPU thread, at the cost of more prepared partitions held in
-/// memory at once. A prepared partition pins its whole quantized storage, so this
-/// (together with the prepare parallelism) is what bounds a query's resident
-/// partition memory independently of `nprobes`; see
-/// [`PreparedPartitionTracker`]. The batch is an upper bound: the search loop greedily drains
+/// memory at once. The batch is an upper bound: the search loop greedily drains
 /// whatever is already prepared rather than waiting for a full batch, so a slow
 /// producer yields small batches (matching the old search-as-it-arrives latency) and
 /// only a fast producer fills whole ones. Override with the
@@ -165,6 +162,42 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     );
     batch_size
 });
+
+/// Prepared partition storage (bytes) handed to a single `spawn_cpu` dispatch on the
+/// global-top-k search path.
+///
+/// That path scores every probed partition into one heap, so it streams prepared
+/// partitions through scoring in chunks; the chunk is what bounds resident partition
+/// memory (together with the prepare window) independently of `nprobes`, see
+/// [`PreparedPartitionTracker`]. Chunking by bytes rather than by partition count
+/// keeps both the memory bound and the dispatch overhead predictable whatever the
+/// partition size: a dispatch costs two thread hops (~100µs), so on a warm cache
+/// the 16-partition streaming batch would spend ~40% of a 1024-probe query on
+/// dispatch overhead for ~800 KiB partitions, while a fixed large partition count
+/// would pin GiBs for the multi-MiB partitions of a billion-row RQ index. 64 MiB is
+/// a few milliseconds of scoring per dispatch across those sizes. Override with the
+/// `LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES` environment variable.
+pub(crate) const DEFAULT_GLOBAL_TOPK_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let chunk_bytes = std::env::var("LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        })
+        .unwrap_or(DEFAULT_GLOBAL_TOPK_CHUNK_BYTES);
+    assert!(
+        chunk_bytes > 0,
+        "LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES must be greater than 0, got {chunk_bytes}"
+    );
+    chunk_bytes
+});
+
+/// Upper bound on partitions per global-top-k scoring chunk, so that tiny partitions
+/// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
+/// expressible as a partition count: at most the prepare window plus two chunks.
+pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
@@ -1253,6 +1286,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(batch)
     }
 
+    /// Pull prepared partitions off `prepared` until their pinned storage reaches
+    /// `chunk_bytes` or the chunk holds [`GLOBAL_TOPK_CHUNK_MAX_PARTITIONS`],
+    /// always taking at least one. `None` once the stream is exhausted; a failed
+    /// prepare ends the chunk (and the search) immediately.
+    async fn next_scoring_chunk<St>(
+        prepared: &mut St,
+        chunk_bytes: usize,
+    ) -> Option<Result<Vec<PreparedPartitionSearch<S, Q>>>>
+    where
+        St: Stream<Item = Result<PreparedPartitionSearch<S, Q>>> + Unpin,
+    {
+        let mut chunk = Vec::new();
+        let mut bytes = 0;
+        while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
+            match prepared.next().await {
+                Some(Ok(prepared)) => {
+                    bytes += prepared.part_entry.deep_size_of();
+                    chunk.push(prepared);
+                }
+                Some(Err(err)) => return Some(Err(err)),
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(Ok(chunk))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
         use_query_residual: bool,
@@ -2222,11 +2285,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // makes peak memory scale with `nprobes` (a 4096-probe query over a
             // large RQ index pinned hundreds of GiB per index segment). Chunking
             // bounds resident partitions to the prepare window plus two chunks:
-            // one being accumulated by `chunks` while another is scored.
+            // one being assembled by `next_scoring_chunk` while another is scored.
             // `buffered` preserves the probe order, so the heap accumulates
             // partitions in the same order as before (which decides which of
             // several rows tied at the k-th distance the capped heap keeps).
-            let mut prepared_chunks = stream::iter(start_idx..end_idx)
+            let mut prepared = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -2248,7 +2311,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     }
                 })
                 .buffered(prepare_parallelism)
-                .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+                .fuse();
+            let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
             let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
@@ -2259,9 +2323,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // the waiting (#7642). The heap is threaded through each dispatch so
             // scoring stays sequential, and a scored chunk is dropped before the
             // next one is scored.
-            let mut pending = prepared_chunks.next().await;
+            let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
             while let Some(chunk) = pending {
-                let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+                let chunk = chunk?;
                 let search_metrics = metrics.clone();
                 let scratch_pool = self.scratch_pool.clone();
                 let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
@@ -2280,7 +2344,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     })?;
                     Ok(heap)
                 });
-                let (scored, next) = futures::join!(score, prepared_chunks.next());
+                let (scored, next) =
+                    futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
                 heap = scored?;
                 pending = next;
             }
@@ -6618,11 +6683,13 @@ mod tests {
         const ROWS_PER_PARTITION: usize = 16;
 
         // Resident partitions are bounded by the prepare window plus two scoring
-        // chunks (one being scored, one being assembled). Size the index so that
-        // the old collect-everything behavior would clearly exceed the bound.
+        // chunks (one being scored, one being assembled). The partitions here are
+        // far smaller than the chunk byte budget, so the partition cap is what
+        // ends a chunk. Size the index so that the old collect-everything
+        // behavior would clearly exceed the bound.
         let in_flight_bound =
-            get_num_compute_intensive_cpus().max(1) + 2 * *super::STREAMING_SEARCH_BATCH_SIZE;
-        let num_partitions = (2 * in_flight_bound).max(64);
+            get_num_compute_intensive_cpus().max(1) + 2 * super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS;
+        let num_partitions = 2 * in_flight_bound;
 
         let test_dir = TempStrDir::default();
         let (batch, schema) = make_seeded_vector_batch(num_partitions * ROWS_PER_PARTITION);
