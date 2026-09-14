@@ -46,6 +46,11 @@ message VectorQueryProto {
    * indexes, such as IVF_RQ. Other index types ignore this setting.
    */
   VectorApproxMode approx_mode = 14;
+  /* Candidate beam size for persisted HNSW routing over IVF centroids. Absent,
+   * or an index without a centroid graph, keeps exact routing. When present,
+   * it must be at least the effective maximum_nprobes.
+   */
+  optional uint32 centroid_ef = 15;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

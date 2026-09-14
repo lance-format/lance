@@ -30,6 +30,7 @@ public class IvfBuildParams {
   private final int shufflePartitionConcurrency;
   private final boolean useResidual;
   private final float[] centroids;
+  private final HnswBuildParams centroidHnsw;
 
   private IvfBuildParams(Builder builder) {
     this.numPartitions = builder.numPartitions;
@@ -39,6 +40,7 @@ public class IvfBuildParams {
     this.shufflePartitionConcurrency = builder.shufflePartitionConcurrency;
     this.useResidual = builder.useResidual;
     this.centroids = builder.centroids;
+    this.centroidHnsw = builder.centroidHnsw;
   }
 
   public static class Builder {
@@ -49,6 +51,19 @@ public class IvfBuildParams {
     private int shufflePartitionConcurrency = 2;
     private boolean useResidual = true;
     private float[] centroids = null;
+    private HnswBuildParams centroidHnsw = null;
+
+    /**
+     * Persist an HNSW router over final Float32/L2 centroids. Null (default) disables construction.
+     * Set centroidEf separately on queries to use the stored graph.
+     *
+     * @param params existing HNSW construction parameters
+     * @return this builder
+     */
+    public Builder setCentroidHnsw(HnswBuildParams params) {
+      this.centroidHnsw = params;
+      return this;
+    }
 
     /**
      * Parameters for building an IVF index. Train IVF centroids for the given vector column. This
@@ -174,6 +189,11 @@ public class IvfBuildParams {
     return centroids;
   }
 
+  /** Returns centroid graph construction parameters, or null when disabled. */
+  public HnswBuildParams getCentroidHnsw() {
+    return centroidHnsw;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -184,6 +204,7 @@ public class IvfBuildParams {
         .add("shufflePartitionConcurrency", shufflePartitionConcurrency)
         .add("useResidual", useResidual)
         .add("hasCentroids", centroids != null)
+        .add("centroidHnsw", centroidHnsw)
         .toString();
   }
 }

@@ -63,6 +63,7 @@ public class JNITest {
                 .setK(10)
                 .setNprobes(20)
                 .setEf(30)
+                .setCentroidEf(30)
                 .setRefineFactor(40)
                 .setDistanceType(DistanceType.L2)
                 .setUseIndex(true)
@@ -99,6 +100,7 @@ public class JNITest {
             .setNumPartitions(20)
             .setMaxIters(100)
             .setSampleRate(512)
+            .setCentroidHnsw(new HnswBuildParams.Builder().setM(8).build())
             .build();
     PQBuildParams pq =
         new PQBuildParams.Builder()
@@ -111,7 +113,7 @@ public class JNITest {
 
     JniTestHelper.parseIndexParams(
         IndexParams.builder()
-            .setVectorIndexParams(VectorIndexParams.withIvfPqParams(DistanceType.Cosine, ivf, pq))
+            .setVectorIndexParams(VectorIndexParams.withIvfPqParams(DistanceType.L2, ivf, pq))
             .build());
   }
 
