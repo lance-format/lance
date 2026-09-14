@@ -7054,6 +7054,19 @@ def test_shallow_clone(tmp_path: Path):
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
 
 
+def test_deep_clone(tmp_path: Path):
+    source_dir = tmp_path / "deep_src"
+    destination_dir = tmp_path / "deep_clone"
+    expected = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    source = lance.write_dataset(expected, source_dir)
+
+    cloned = source.deep_clone(destination_dir, source.version)
+
+    assert cloned.to_table() == expected
+    assert lance.dataset(destination_dir).to_table() == expected
+    assert list(destination_dir.glob("data/*.lance"))
+
+
 def test_branches(tmp_path: Path):
     # Step 1: create branch1 from main → append to branch1 → create branch2 from tag
     base_dir = tmp_path / "test_branches"

@@ -5139,6 +5139,47 @@ class LanceDataset(pa.dataset.Dataset):
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
 
+    def deep_clone(
+        self,
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Deep clone the specified version into a new dataset at target_path.
+
+        This operation copies the data, deletion, and index files referenced by
+        the selected version before committing the destination dataset.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the destination dataset. If omitted,
+            the source dataset's storage options are used.
+
+        Returns
+        -------
+        LanceDataset
+            The deep-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        if storage_options is None:
+            storage_options = self._storage_options
+        self._ds.deep_clone(target_uri, reference, storage_options)
+
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
     def migrate_manifest_paths_v2(self):
         """
         Migrate the manifest paths to the new format.
