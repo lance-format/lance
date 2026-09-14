@@ -18,7 +18,20 @@ from .compat_decorator import (
     UpgradeDowngradeTest,
     compat_test,
 )
-from .util import build_basic_types, build_large
+from .util import build_basic_types, build_large, safe_data_storage_version
+
+
+@pytest.mark.parametrize(
+    ("lance_version", "expected_storage_version"),
+    [
+        ("0.36.0", "2.0"),
+        ("0.38.0", "2.1"),
+        ("0.39.0", "2.1"),
+        ("11.0.0", "2.1"),
+    ],
+)
+def test_safe_data_storage_version(lance_version, expected_storage_version):
+    assert safe_data_storage_version(lance_version) == expected_storage_version
 
 
 # We start testing against the first release where 2.1 was stable. Before that

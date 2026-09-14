@@ -10,7 +10,7 @@ use lance_core::{Error, Result, datatypes::Field, utils::bit::pad_bytes};
 
 use crate::{
     buffer::LanceBuffer,
-    compression::CompressionStrategy,
+    compression::{CompressionStrategy, compress_required_block},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::PageEncoding,
     encoder::EncodedPage,
@@ -593,8 +593,7 @@ fn encode_u64_values(
     });
     block.compute_stat();
     let field = Field::new_arrow("", arrow_schema::DataType::UInt64, false)?;
-    let (compressor, encoding) = compression_strategy.create_block_compressor(&field, &block)?;
-    Ok((compressor.compress(block)?, encoding))
+    compress_required_block(compression_strategy, &field, block)
 }
 
 fn positions_to_deltas(positions: &[u64], label: &str) -> Result<Vec<u64>> {

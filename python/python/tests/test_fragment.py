@@ -323,7 +323,7 @@ def test_mixed_fragment_versions(tmp_path):
 
     # Attempt to commit
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
-    with pytest.raises(OSError, match="All data files must have the same version"):
+    with pytest.raises(OSError, match="Dataset snapshot mixes V1 and V2 data files"):
         lance.LanceDataset.commit(ds.uri, operation)
 
 
@@ -833,6 +833,54 @@ def test_fragment_update_columns_partial_update(tmp_path):
     assert result["city"] == ["NYC", "LA", "SF"]  # Unchanged
 
 
+def test_fragment_update_columns_with_offsets_rewrite_columns(tmp_path):
+    """update_columns(with_offsets=True) returns matched row offsets that a
+    rewrite_columns commit uses to refresh row version metadata for the
+    matched rows only."""
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "value": [i * 10 for i in range(8)],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_with_offsets"
+    dataset = lance.write_dataset(
+        data, dataset_uri, max_rows_per_file=4, enable_stable_row_ids=True
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    # Update two rows of the second fragment, joining on a user column.
+    fragment = dataset.get_fragments()[1]
+    update_data = pa.table({"id": [5, 7], "value": [500, 700]})
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, left_on="id", with_offsets=True
+    )
+    # Portable RoaringBitmap serialization of {1, 3}: ids 5 and 7 sit at those
+    # physical offsets within the second fragment.
+    assert matched_offsets == (
+        b"\x3a\x30\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00"
+        b"\x10\x00\x00\x00\x01\x00\x03\x00"
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={updated_fragment.id: matched_offsets},
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["id", "value", "_row_last_updated_at_version"]
+    ).sort_by("id")
+    assert result["value"].to_pylist() == [0, 10, 20, 30, 40, 500, 60, 700]
+    # Only the matched rows carry the commit's version.
+    versions = result["_row_last_updated_at_version"].to_pylist()
+    assert versions == [1, 1, 1, 1, 1, 2, 1, 2]
+
+
 def test_fragment_update_columns_no_match(tmp_path):
     """Test update when no rows match the join condition."""
     # Create initial dataset
@@ -857,7 +905,10 @@ def test_fragment_update_columns_no_match(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, with_offsets=True
+    )
+    assert matched_offsets == b"\x3a\x30\x00\x00\x00\x00\x00\x00"
 
     # Commit the changes
 
@@ -1317,3 +1368,182 @@ def test_fragment_validate_after_delete(tmp_path: Path):
     # A fragment carrying a deletion vector still validates.
     for fragment in dataset.get_fragments():
         fragment.validate()
+
+
+def _dataset_with_scalar_index(tmp_path: Path) -> LanceDataset:
+    dataset = write_dataset(
+        pa.table({"val": range(10000), "other": range(10000)}),
+        tmp_path,
+        max_rows_per_file=5000,
+    )
+    dataset.create_scalar_index("val", index_type="BTREE")
+    return dataset
+
+
+def test_fragment_scanner_use_scalar_index_disables_index_query(tmp_path: Path):
+    # A filtered fragment scan on an indexed column plans a dataset-wide
+    # ScalarIndexQuery (and caches its index pages) unless the scan opts out.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    default_plan = fragment.scanner(filter=filt, with_row_id=True).explain_plan(True)
+    assert "ScalarIndexQuery" in default_plan
+
+    opted_out_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=False
+    ).explain_plan(True)
+    assert "ScalarIndexQuery" not in opted_out_plan
+
+
+@pytest.mark.parametrize("use_scalar_index", [None, True, False])
+def test_fragment_scanner_matches_dataset_scanner(tmp_path: Path, use_scalar_index):
+    # The fragment scanner must build the same plan as the dataset scanner
+    # restricted to that single fragment.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    frag_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=use_scalar_index
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment],
+        filter=filt,
+        with_row_id=True,
+        use_scalar_index=use_scalar_index,
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
+def _fragment_with_deletions(tmp_path: Path) -> LanceFragment:
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    return dataset.get_fragments()[0]
+
+
+def test_fragment_scanner_include_deleted_rows(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    assert fragment.physical_rows == 10
+    assert fragment.num_deletions == 3
+
+    # By default the deleted rows are omitted.
+    default = fragment.to_table(with_row_id=True)
+    assert default.num_rows == 7
+    assert default["a"].to_pylist() == list(range(3, 10))
+
+    # With include_deleted_rows the deleted rows are surfaced with a null _rowid.
+    included = fragment.scanner(with_row_id=True, include_deleted_rows=True).to_table()
+    assert included.num_rows == fragment.physical_rows
+    assert included["a"].to_pylist() == list(range(10))
+    assert included["_rowid"].null_count == fragment.num_deletions
+
+
+def test_fragment_scanner_include_deleted_rows_requires_row_id(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    with pytest.raises(ValueError, match="with_row_id"):
+        fragment.scanner(include_deleted_rows=True).to_table()
+
+
+def test_fragment_scanner_include_deleted_rows_matches_dataset_scanner(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    fragment = dataset.get_fragments()[0]
+
+    frag_plan = fragment.scanner(
+        with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment], with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
+@pytest.mark.parametrize(
+    ("late_materialization", "is_late"),
+    [
+        pytest.param(None, False, id="default"),
+        pytest.param(True, True, id="all_late"),
+        pytest.param(False, False, id="all_early"),
+        pytest.param(["values"], True, id="late_column"),
+        pytest.param(["filter"], False, id="early_column"),
+    ],
+)
+def test_fragment_scanner_late_materialization(
+    tmp_path: Path, late_materialization, is_late
+):
+    # With no index, the plan shows whether `values` is fetched late (a take over
+    # the row stream) or early (materialized in the scan projection).
+    dataset = write_dataset(
+        pa.table({"filter": range(2000), "values": range(2000)}),
+        tmp_path,
+        data_storage_version="stable",
+    )
+    fragment = dataset.get_fragments()[0]
+
+    plan = fragment.scanner(
+        filter="filter % 2 == 0", late_materialization=late_materialization
+    ).explain_plan(True)
+
+    if is_late:
+        assert "projection=[values], source=stream" in plan
+    else:
+        assert "projection=[filter, values]" in plan
+
+
+def test_fragment_scanner_rejects_invalid_late_materialization(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(10)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(
+        ValueError, match="late_materialization must be a bool or a list of strings"
+    ):
+        fragment.scanner(late_materialization=123)
+
+
+def test_fragment_scanner_io_buffer_size_forwarded(tmp_path: Path):
+    # io_buffer_size has no plan-visible marker, so assert it is accepted through
+    # both scan entry points and leaves results unchanged.
+    dataset = write_dataset(pa.table({"val": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val < 100"
+    expected = fragment.to_table(filter=filt)
+
+    assert fragment.to_table(filter=filt, io_buffer_size=4 * 1024 * 1024) == expected
+
+    batched = pa.Table.from_batches(
+        list(fragment.to_batches(filter=filt, io_buffer_size=4 * 1024 * 1024))
+    )
+    assert batched == expected
+
+
+def test_fragment_scanner_strict_batch_size(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "a % 3 == 0"
+
+    # A filtered scan emits uneven, sub-batch_size batches by default.
+    loose = [b.num_rows for b in fragment.to_batches(batch_size=100, filter=filt)]
+    assert any(n < 100 for n in loose[:-1])
+
+    # strict_batch_size coalesces to exactly batch_size (except the last batch).
+    strict = [
+        b.num_rows
+        for b in fragment.to_batches(
+            batch_size=100, filter=filt, strict_batch_size=True
+        )
+    ]
+    assert all(n == 100 for n in strict[:-1])
+    assert sum(strict) == sum(loose)
+
+
+def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
+    # A small byte budget over wide rows forces many more batches than the
+    # default, without changing the results.
+    dataset = write_dataset(pa.table({"s": ["x" * 1024] * 2000}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    default_batches = list(fragment.to_batches())
+    small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
+    assert len(small_budget) > len(default_batches)
+    assert pa.Table.from_batches(small_budget) == fragment.to_table()

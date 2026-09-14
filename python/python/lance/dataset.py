@@ -28,7 +28,6 @@ from typing import (
     Literal,
     Optional,
     Sequence,
-    Set,
     Tuple,
     TypedDict,
     Union,
@@ -41,6 +40,9 @@ from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
+# Imported at runtime, not only for the annotations below: importing it here
+# is what registers `Bitmap` as a `collections.abc.MutableSet`.
+from .bitmap import Bitmap  # noqa: TC001
 from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
@@ -643,9 +645,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         Generate the execution plan for the merge insert operation.
 
-        This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and
-        analysis purposes.
+        This reports the plan a *streaming* source of the given schema would run.
+        It takes a schema rather than data, so it cannot know how ``execute`` would
+        wrap the source; see the note under the example.
 
         Parameters
         ----------
@@ -686,6 +688,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                   ProjectionExec: expr=[..., true as __merge_source_sentinel]
                     StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
+
+        This is always the streaming shape. `explain_plan` receives a schema rather
+        than data, so it cannot know how `execute` would wrap the source, and the
+        wrapping affects the plan. Use `analyze_plan`, which receives the real
+        source, when that matters. Note that `analyze_plan` runs the merge to
+        collect metrics and may write data files, whereas `explain_plan` writes
+        nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
@@ -761,11 +770,19 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                    RepartitionExec: ...
+                  RepartitionExec: ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        StreamingTableExec: ..., metrics=[]
+                        DataSourceExec: ..., metrics=[]
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+
+        The reported plan follows how the source was passed. `new_data` above is a
+        `pa.Table`, so it is wrapped in an in-memory table that reports exact
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
+        which side of the join to collect from those statistics and from the two
+        sides' sizes, so the same merge can plan differently depending on which one
+        you hand it. Use `explain_plan` only for the streaming shape: it takes a
+        schema rather than data, so it cannot know how the source would be wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -786,6 +803,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - requests: number of storage requests made
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
+
+        # Route exactly as execute() does, so the reported plan is the one that
+        # would run. A materialized source reports exact statistics where a stream
+        # reports none, which can change which side of the join is collected.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
+
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(
@@ -2485,6 +2509,52 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
+    def slice(
+        self,
+        start: int,
+        end: int,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    ) -> pa.Table:
+        """Select a contiguous range of rows by position.
+
+        Equivalent to ``dataset.take(list(range(start, end)))``, but pushed
+        down as an offset/limit scan instead of a materialized index list.
+
+        Parameters
+        ----------
+        start : int
+            The index of the first row to include (inclusive). Must be
+            non-negative.
+        end : int
+            The index to stop before (exclusive). Must be greater than or
+            equal to ``start``.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+
+        Returns
+        -------
+        table : pyarrow.Table
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tbl = pa.table({"id": range(100)})
+        >>> dataset = lance.write_dataset(tbl, "memory://slice_dataset")
+        >>> dataset.slice(10, 20)
+        pyarrow.Table
+        id: int64
+        ----
+        id: [[10,11,12,13,14,15,16,17,18,19]]
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
+        return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
+
     def count_rows(
         self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
     ) -> int:
@@ -3027,7 +3097,7 @@ class LanceDataset(pa.dataset.Dataset):
             where = str(where)
         return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
-    def versions(self):
+    def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
         """
@@ -3199,6 +3269,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3244,8 +3315,13 @@ class LanceDataset(pa.dataset.Dataset):
             deletions run at full speed. Set this to a positive integer to avoid
             hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
             For example, ``delete_rate_limit=100`` limits to 100 operations/second.
+
+        versions: list[int], optional
+            Clean up only the specified dataset versions. The current version is
+            never removed, and tagged versions are still protected by
+            ``error_if_tagged_old_versions``.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
 
         return self._ds.cleanup_old_versions(
@@ -3254,6 +3330,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
         )
 
     def explain_cleanup_old_versions(
@@ -3264,6 +3341,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation:
@@ -3291,6 +3369,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
             issued by explain.
 
+        versions: list[int], optional
+            Explain cleanup only for the specified dataset versions.
+
         include_files: bool, default False
             If `True`, include candidate files in the explanation up to
             ``max_files`` entries. Aggregate stats always include all candidates.
@@ -3299,7 +3380,7 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum number of candidate files to include when ``include_files``
             is `True`.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
@@ -3310,6 +3391,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
             include_files,
             max_files,
         )
@@ -3646,6 +3728,7 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
@@ -3657,10 +3740,10 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default True
+        stem: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default True
+        remove_stop_words: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
         custom_stop_words: Optional[List[str]], default None
@@ -4294,7 +4377,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for `IVF_RQ`:
 
             - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
+                The number of bits for RQ (Rabit Quantization). Default is 5.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -4398,7 +4481,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_index_uncommitted(
         self,
         column: Union[str, List[str]],
-        index_type: str,
+        index_type: Union[str, IndexConfig],
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
@@ -5885,7 +5968,9 @@ class Index:
     name: str
     fields: List[int]
     dataset_version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
+    """The fragments covered by this index. A ``Set[int]``/``List[int]`` is
+    also accepted when constructing an ``Index``."""
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
@@ -5903,7 +5988,7 @@ class IndexInformation(TypedDict):
     uuid: str
     fields: List[str]
     version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
     base_id: Optional[int]
 
 
@@ -6327,11 +6412,12 @@ class LanceOperation:
         layered over the base data without rewriting the base files.
 
         The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
-        every field in ``data_file``) or a ``List[List[int]]`` for a sparse
-        overlay (one offset list per field, in the order of the file's fields).
-        Offsets are **physical** row offsets (positions in the base files,
-        counting deleted rows), like deletion vectors.
+        pass a single iterable of ints (e.g. a :class:`~lance.bitmap.Bitmap`
+        or a ``List[int]``) for a dense overlay (one offset set shared by
+        every field in ``data_file``), or a list of int iterables for a
+        sparse overlay (one offset set per field, in the order of the file's
+        fields). Offsets are **physical** row offsets (positions in the base
+        files, counting deleted rows), like deletion vectors.
 
         Attributes
         ----------
@@ -6340,12 +6426,15 @@ class LanceOperation:
             value column per covered field. The value at each covered offset is
             stored at the rank (0-based count of covered offsets below it) of
             that offset in the field's coverage.
-        offsets : Union[List[int], List[List[int]]]
-            The covered physical row offsets. A flat list is dense coverage
-            (shared by every field); a list of per-field lists is sparse
-            coverage (in field order). Each list must be strictly ascending
-            with no duplicates, since the Nth offset maps to the Nth value row
-            in ``data_file``; a non-ascending list raises ``ValueError``.
+        offsets : Iterable[int] | List[Iterable[int]]
+            The covered physical row offsets. A single int iterable is dense
+            coverage (shared by every field); a list of int iterables is
+            sparse coverage (in field order). Offsets are always resolved in
+            ascending order — the smallest covered offset maps to row 0 of
+            ``data_file``, the next-smallest to row 1, and so on — regardless
+            of the order values are given in, so a plain ``List[int]`` need
+            not be pre-sorted. A repeated offset raises ``ValueError``: it
+            would shift every later offset onto the wrong row.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.
@@ -6354,7 +6443,7 @@ class LanceOperation:
         """
 
         data_file: DataFile
-        offsets: Union[List[int], List[List[int]]]
+        offsets: Union[Iterable[int], List[Iterable[int]]]
         committed_version: Optional[int] = None
 
     @dataclass
@@ -6718,7 +6807,9 @@ class ScannerBuilder:
                 # after a lance round-trip).  We replace any top-level field
                 # whose type tree contains such a type with an int8 placeholder
                 # so that ordinal field references in the filter remain correct.
-                for field in self.ds.schema:
+                # Filters are evaluated against the stored dataset fields.  The
+                # public schema may also contain scan-time fields such as _rowid.
+                for field in self.ds._ds.schema:
                     if _needs_substrait_placeholder(field.type):
                         pos = counter
                         counter += 1
@@ -7228,7 +7319,7 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self.to_table()[:num_rows]
 
-    def count_rows(self):
+    def count_rows(self) -> int:
         """Count rows matching the scanner filter.
 
         Returns
@@ -7438,7 +7529,7 @@ class DatasetOptimizer:
         }
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs):
+    def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -7446,10 +7537,10 @@ class DatasetOptimizer:
         an expensive unindexed search on the new data.  As the amount of new
         unindexed data grows this can have an impact on search latency.
         This function will add the new data to existing indexes, restoring the
-        performance.  This function does not retrain the index, it only assigns
-        the new data to existing partitions.  This means an update is much quicker
-        than retraining the entire index but may have less accuracy (especially
-        if the new data exhibits new patterns, concepts, or trends)
+        performance. By default, this function does not retrain the index, it only
+        assigns the new data to existing partitions. This means an update is much
+        quicker than retraining the entire index but may have less accuracy
+        (especially if the new data exhibits new patterns, concepts, or trends)
 
         Parameters
         ----------
@@ -7459,7 +7550,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False, deprecated
+        retrain: bool, default False
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
@@ -7467,7 +7558,7 @@ class DatasetOptimizer:
 
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
-            This would be faster than re-create the index from scratch.
+            This rebuilds the index from the source data and may be expensive.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
@@ -7746,6 +7837,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -8005,6 +8097,7 @@ def write_dataset(
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
+        "session": session,
     }
 
     # Add namespace_client and table_id for storage options provider and managed

@@ -156,6 +156,29 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
+    /// Upper bound on heap bytes held — or already committed — by this index.
+    ///
+    /// Sized by `capacity` (the writer's `max_memtable_rows`) rather than by
+    /// rows inserted: the graph and lookup slabs are pre-allocated in full on
+    /// the first insert, so an idle vector memtable costs the same as a full
+    /// one.
+    ///
+    /// Non-zero *before* that first insert too. The allocation is settled the
+    /// moment the index exists — only `dim` is still unknown, and no term
+    /// depends on it — so reporting zero until the row that triggers it would
+    /// hide the largest allocation in a vector memtable from the admission
+    /// controller that runs just ahead of it. Until then this is the reserved
+    /// estimate; from the first insert on it is the graph's own measurement.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match self.state.get() {
+            Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),
+            None => {
+                HnswGraph::reserved_bytes(self.capacity, &build_params_of(&self.build_params))
+                    + ArrowFixedSizeListVectorStore::reserved_bytes(self.capacity, self.max_batches)
+            }
+        }
+    }
+
     fn ensure_state(&self, dim: usize) -> Result<&HnswState> {
         if let Some(state) = self.state.get() {
             if state.storage.dim() != dim {
@@ -409,25 +432,41 @@ impl HnswMemIndex {
         if state.graph.is_empty() {
             return Ok(None);
         }
+        // Bound the graph by storage, and only in that direction. A graph past
+        // storage names rows the batch has no vector for, which is the defect
+        // this fixes. Storage past the graph is left whole on purpose: those
+        // rows are unreachable by traversal either way, but `HNSW::search`
+        // brute-forces the storage domain under a narrow prefilter
+        // (`flat_search`), so dropping them would lose results this export
+        // previously returned. Closing that gap means finishing index
+        // application before export, not trimming storage to match.
         let storage_batch = state.storage.to_record_batch(total_rows)?;
-        let hnsw_batch = state.graph.to_lance_hnsw_batch()?;
+        let hnsw_batch = state
+            .graph
+            .to_lance_hnsw_batch(Some(storage_batch.num_rows()))?;
         let hnsw = HNSW::load(hnsw_batch)?;
         Ok(Some((hnsw, storage_batch)))
     }
 }
 
 fn to_lance_hnsw_params(params: &HnswBuildParams) -> Result<BuildParams> {
-    let params = BuildParams {
+    let params = build_params_of(params);
+    // Validate by constructing a tiny graph with these params. This keeps
+    // invalid builder options as boundary errors instead of delayed panics.
+    HnswGraph::try_new(1, params.clone())?;
+    Ok(params)
+}
+
+/// The same field-for-field translation without the validating build, so sizing
+/// questions can be answered off a config that has not been accepted yet.
+fn build_params_of(params: &HnswBuildParams) -> BuildParams {
+    BuildParams {
         max_level: params.max_level,
         m: params.m,
         ef_construction: params.ef_construction,
         prefetch_distance: params.prefetch_distance,
         ..BuildParams::default()
-    };
-    // Validate by constructing a tiny graph with these params. This keeps
-    // invalid builder options as boundary errors instead of delayed panics.
-    HnswGraph::try_new(1, params.clone())?;
-    Ok(params)
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +499,56 @@ mod tests {
             ),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
+    }
+
+    /// The graph is pre-allocated from `capacity`, so its footprint is settled
+    /// before any row arrives and barely moves as rows do. A memory budget that
+    /// samples only row bytes would miss all of it, and one that waited for the
+    /// first insert would miss the allocation that insert triggers.
+    #[test]
+    fn test_resident_bytes_is_preallocated_not_proportional_to_rows() {
+        let dim = 8;
+        let capacity = 4_000;
+        let index = || {
+            HnswMemIndex::with_capacity(
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                HnswBuildParams::default().num_edges(16).ef_construction(64),
+                capacity,
+                64,
+            )
+        };
+
+        let untouched = index().resident_bytes();
+
+        let sparse = index();
+        sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
+        let one_row = sparse.resident_bytes();
+
+        let full = index();
+        full.insert(&make_batch(0, capacity, dim), 0).unwrap();
+        let all_rows = full.resident_bytes();
+
+        // One row already pays for the whole graph: well over a KB per slot of
+        // capacity, and within a small factor of the fully-populated index.
+        assert!(
+            one_row > capacity * 128,
+            "one row should commit the pre-allocated graph, got {one_row} for capacity {capacity}"
+        );
+        assert!(
+            all_rows < one_row * 2,
+            "a full index ({all_rows}) should not dwarf a one-row index ({one_row})"
+        );
+
+        // The charge is visible before the row that commits it, and close
+        // enough to the real thing to admit against. The reservation walks the
+        // level ladder in expectation where the graph samples it, so allow a
+        // 25% band either way rather than demanding equality.
+        assert!(
+            untouched.abs_diff(one_row) * 4 < one_row,
+            "reserved {untouched} should track the built graph {one_row} before the first insert"
+        );
     }
 
     #[test]
@@ -578,6 +667,61 @@ mod tests {
         let query = FixedSizeListArray::try_new_from_values(inner, 4).unwrap();
         let results = index.search(&query, 5, None, u64::MAX).unwrap();
         assert!(results.is_empty());
+    }
+
+    /// Storage leading the graph must keep its rows.
+    ///
+    /// `insert_batches` appends storage before it builds and publishes the
+    /// graph, so storage can lead. Those rows are unreachable by traversal
+    /// either way, but `HNSW::search` brute-forces the storage domain under a
+    /// narrow prefilter, so trimming storage to the graph would drop results
+    /// this export used to return. The graph still may not exceed storage.
+    #[test]
+    fn to_lance_hnsw_keeps_storage_rows_the_graph_has_not_reached() {
+        let dim = 8;
+        let n = 32;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+            n * 2,
+            4,
+        );
+        index.insert(&make_batch(0, n, dim), 0).unwrap();
+
+        // Reproduce the interval: storage takes the next batch, the graph does
+        // not see it yet.
+        let state = index.state.get().expect("state is initialized");
+        let extra = make_batch(n as i32, n, dim);
+        let vectors = extra
+            .column_by_name("vector")
+            .unwrap()
+            .as_fixed_size_list_opt()
+            .unwrap()
+            .clone();
+        state
+            .storage
+            .append_batch(Arc::new(vectors), n as u64)
+            .unwrap();
+        assert!(
+            state.storage.committed_len() > state.graph.len(),
+            "the test needs storage ahead of the graph"
+        );
+
+        let Some((hnsw, storage_batch)) = index.to_lance_hnsw(None).unwrap() else {
+            panic!("expected HNSW snapshot");
+        };
+        assert_eq!(
+            storage_batch.num_rows(),
+            n * 2,
+            "storage keeps every committed row; a narrow prefilter scans them"
+        );
+        assert_eq!(hnsw.len(), n, "the graph covers only what it indexed");
+        assert!(
+            hnsw.len() <= storage_batch.num_rows(),
+            "the graph must never name a row storage has no vector for"
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::{Dataset, InsertBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
 use lance::session::Session;
+use lance_core::utils::parse::str_is_truthy;
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use std::collections::HashMap;
 use std::env;
@@ -67,9 +68,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn env_bool(key: &str) -> bool {
-    env::var(key)
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env::var(key).map(|s| str_is_truthy(&s)).unwrap_or(false)
 }
 
 fn storage_label(uri: &str) -> &'static str {

@@ -80,6 +80,10 @@ pub struct MemTable {
 
     /// Primary key bloom filter for staleness detection.
     pk_bloom_filter: Sbbf,
+    /// Decoded size of the primary-key columns across every batch appended so
+    /// far. Accumulated here because [`Self::update_bloom_filter`] already has
+    /// the key columns in hand.
+    pk_bytes: usize,
     /// Primary key field IDs (for bloom filter updates).
     pk_field_ids: Vec<i32>,
 
@@ -122,6 +126,24 @@ const PK_BLOOM_FILTER_EXPECTED_ITEMS: u64 = 8192;
 /// Default false positive probability for primary key bloom filter.
 /// Consistent with lance-index scalar bloomfilter defaults (≈ 1 in 1754).
 const PK_BLOOM_FILTER_FPP: f64 = 0.00057;
+
+/// Heap one memtable's PK bloom filter holds.
+///
+/// The same for every memtable, because it is sized from two constants rather
+/// than from the rows in it — so this is a property of the build, not a
+/// measurement, and a memory view need not carry it per memtable.
+///
+/// Counted as index memory rather than row data: it is an auxiliary lookup
+/// structure, and a fixed term in the `max_memtable_size` seal trigger would
+/// make every memtable seal a constant early.
+pub fn pk_bloom_filter_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        Sbbf::with_ndv_fpp(PK_BLOOM_FILTER_EXPECTED_ITEMS, PK_BLOOM_FILTER_FPP)
+            .map(|f| f.estimated_memory_size())
+            .unwrap_or(0)
+    })
+}
 
 impl MemTable {
     /// Create a new MemTable with default capacity.
@@ -237,6 +259,7 @@ impl MemTable {
             generation,
             pk_bloom_filter,
             pk_field_ids,
+            pk_bytes: 0,
             // Initialize with an empty IndexStore so the visibility cursor has
             // a stable Arc shared between the scanner (via `indexes_arc()`)
             // and the WAL flush handler. Replaced via `set_indexes_arc` if
@@ -490,7 +513,7 @@ impl MemTable {
     ///
     /// Returns true if the batch store is full or estimated size exceeds threshold.
     pub fn should_flush(&self, max_bytes: usize) -> bool {
-        self.batch_store.is_full() || self.batch_store.estimated_bytes() >= max_bytes
+        self.batch_store.is_full() || self.batch_store.row_bytes() >= max_bytes
     }
 
     /// Get the batches in the visible prefix.
@@ -557,6 +580,12 @@ impl MemTable {
             let hash = compute_row_hash(&pk_columns, row_idx);
             bloom.insert_hash(hash);
         }
+
+        // Per column, not per row: the loop above is what costs something here.
+        self.pk_bytes += pk_columns
+            .iter()
+            .map(|column| batch_store::StoredBatch::estimate_array_size(&column.to_data()))
+            .sum::<usize>();
 
         Ok(())
     }
@@ -682,6 +711,11 @@ impl MemTable {
     }
 
     /// Get total row count.
+    /// Decoded size of the primary-key columns this memtable holds.
+    pub fn pk_bytes(&self) -> usize {
+        self.pk_bytes
+    }
+
     pub fn row_count(&self) -> usize {
         self.batch_store.total_rows()
     }
@@ -695,11 +729,6 @@ impl MemTable {
     #[allow(clippy::unused_async)]
     pub async fn batch_count_async(&self) -> usize {
         self.batch_count()
-    }
-
-    /// Get estimated size in bytes.
-    pub fn estimated_size(&self) -> usize {
-        self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
     }
 
     /// Get the bloom filter for serialization.

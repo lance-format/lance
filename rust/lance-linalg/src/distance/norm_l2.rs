@@ -439,6 +439,11 @@ pub fn norm_l2_fsl(fsl: &FixedSizeListArray) -> crate::Result<Float32Array> {
     })
 }
 
+/// Squared L2 norm of every vector in a [FixedSizeListArray].
+///
+/// Each square is accumulated in `f32` (or wider) rather than in the element
+/// type: squaring an `f16` saturates to `inf` at `|x| >= 256` and to zero at
+/// `|x| <= 1.726e-4`.
 pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
     let dim = fsl.value_length() as usize;
     match fsl.value_type() {
@@ -447,7 +452,14 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
             .as_primitive::<Float16Type>()
             .values()
             .chunks_exact(dim)
-            .map(|v| v.iter().map(|v| v * v).sum::<f16>().to_f32())
+            .map(|v| {
+                v.iter()
+                    .map(|v| {
+                        let v = v.to_f32();
+                        v * v
+                    })
+                    .sum::<f32>()
+            })
             .collect::<Vec<_>>(),
         DataType::Float32 => fsl
             .values()
@@ -472,7 +484,10 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, dimension_shard,
+        run_vector_proptest,
+    };
     use arrow_array::{Float16Array, Float64Array, UInt8Array};
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::ToPrimitive;
@@ -498,6 +513,36 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn test_l2_norm_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
+            let simd = <f32 as Normalize>::norm_l2(&data);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     proptest::proptest! {
         #[test]
         fn test_l2_norm_f16(data in prop::collection::vec(arbitrary_f16(), 4..4048)) {
@@ -506,16 +551,6 @@ mod tests {
 
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f32(data in prop::collection::vec(arbitrary_f32(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f64(data in prop::collection::vec(arbitrary_f64(), 4..4048)){
             do_norm_l2_test(&data)?;
         }
 
@@ -531,21 +566,6 @@ mod tests {
             let scalar = norm_l2_f64_scalar(&data);
             let simd = norm_l2_f64_simd(&data);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// Parity check for `norm_l2_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar L2-norm path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep this
-        /// test architecture-agnostic (the x86_64-only `norm_l2_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_l2_norm_f32_scalar_simd_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
-            let simd = <f32 as Normalize>::norm_l2(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback
@@ -704,5 +724,42 @@ mod tests {
             .unwrap();
         let err = norm_l2_fsl(&fsl).unwrap_err().to_string();
         assert!(err.contains("float16/float32/float64"), "got: {err}");
+    }
+
+    /// `norm_squared_fsl` must accumulate in a type wider than the element type.
+    /// `f16 * f16` rounds each square back to `f16`, which saturates to `inf` at
+    /// `|x| >= 256` and to zero at `|x| <= 1.726e-4`.
+    #[test]
+    fn test_norm_squared_fsl_f16_accumulates_wide() {
+        use arrow_array::Float16Array;
+        use arrow_schema::Field;
+        use std::sync::Arc;
+
+        // dim 2: row 0 overflows at the square, row 1 underflows at the square.
+        let raw = [256.0f32, 0.0, 1e-4, 1e-4];
+        let values = Float16Array::from_iter_values(raw.map(f16::from_f32));
+        let field = Arc::new(Field::new("item", DataType::Float16, true));
+        let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        let got = norm_squared_fsl(&fsl);
+        // Independent reference: square and sum the same f16 inputs in f64.
+        let expected = raw
+            .chunks(2)
+            .map(|c| {
+                c.iter()
+                    .map(|&x| {
+                        let x = f16::from_f32(x).to_f64();
+                        x * x
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+
+        for (row, (&got, &want)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                approx::relative_eq!(got as f64, want, max_relative = 1e-3),
+                "row {row}: got {got}, want {want}"
+            );
+        }
     }
 }

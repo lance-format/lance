@@ -25,6 +25,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
+use crate::dataset::mem_wal::index::MemTableVisibility;
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -422,11 +423,11 @@ impl ScalarPredicate {
 /// Provides a builder pattern similar to Lance's Scanner interface
 /// for constructing DataFusion execution plans over in-memory data.
 ///
-/// # Index Visibility Model
+/// # Readable Prefix
 ///
-/// The scanner captures `visible_count` from the `IndexStore` at
-/// construction time. This frozen visibility ensures queries only see data
-/// that has been indexed, providing consistent results.
+/// The scanner snapshots one readable prefix at construction, so every plan it
+/// builds cuts at the same bound. [`MemTableVisibility`] selects which prefix:
+/// published, or the writer's own indexed prefix.
 ///
 /// # Example
 ///
@@ -446,9 +447,9 @@ pub struct MemTableScanner {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     schema: SchemaRef,
-    /// Frozen visibility captured at scanner construction time.
-    /// This is the `visible_count` from the IndexStore.
-    visible_count: usize,
+    /// Readable prefix frozen at scanner construction. Which `IndexStore`
+    /// cursor it came from is this scanner's [`MemTableVisibility`].
+    readable_count: usize,
     projection: Option<Vec<String>>,
     filter: Option<Expr>,
     limit: Option<usize>,
@@ -471,27 +472,32 @@ pub struct MemTableScanner {
 }
 
 impl MemTableScanner {
-    /// Create a new scanner.
-    ///
-    /// Captures `visible_count` from the `IndexStore` at construction
-    /// time to ensure consistent query visibility.
+    /// Create a new scanner over the published prefix.
     ///
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing the data
-    /// * `indexes` - Index registry (carries the visibility watermark)
+    /// * `indexes` - Index registry (carries the visibility cursors)
     /// * `schema` - Schema of the data
     pub fn new(batch_store: Arc<BatchStore>, indexes: Arc<IndexStore>, schema: SchemaRef) -> Self {
-        // Snapshot the visibility cursor at construction time. The cursor is
-        // advanced by `flush_from_batch_store` after the WAL append succeeds,
-        // so this snapshot reflects WAL-durable data.
-        let visible_count = indexes.visible_count();
+        Self::new_at_visibility(batch_store, indexes, schema, MemTableVisibility::Published)
+    }
+
+    /// As [`Self::new`], bounded by `visibility`. Snapshotted at construction,
+    /// so every plan this scanner builds keys on one stable cursor.
+    pub fn new_at_visibility(
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        schema: SchemaRef,
+        visibility: MemTableVisibility,
+    ) -> Self {
+        let readable_count = indexes.prefix_count(visibility);
 
         Self {
             batch_store,
             indexes,
             schema,
-            visible_count,
+            readable_count,
             projection: None,
             filter: None,
             limit: None,
@@ -550,12 +556,12 @@ impl MemTableScanner {
         self
     }
 
-    /// The `visible_count` snapshot this scanner latched at
-    /// construction. A downstream recency filter must key on this same snapshot
-    /// (not a fresh read of the IndexStore watermark, which a concurrent append
-    /// could have advanced) so it stays consistent with the rows the search saw.
-    pub fn visible_count(&self) -> usize {
-        self.visible_count
+    /// The readable-prefix snapshot this scanner latched at construction. A
+    /// downstream recency filter must key on this same snapshot (not a fresh
+    /// read of the IndexStore cursor, which a concurrent append could have
+    /// advanced) so it stays consistent with the rows the search saw.
+    pub fn readable_count(&self) -> usize {
+        self.readable_count
     }
 
     /// Include the _rowaddr column in output.
@@ -1017,7 +1023,7 @@ impl MemTableScanner {
 
         let scan = MemTableScanExec::with_filter(
             self.batch_store.clone(),
-            self.visible_count,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             self.schema.clone(),
@@ -1079,7 +1085,7 @@ impl MemTableScanner {
 
         Ok(Arc::new(MemTableDedupScanExec::new(
             self.batch_store.clone(),
-            self.visible_count,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             pk_indices,
@@ -1092,7 +1098,7 @@ impl MemTableScanner {
 
     /// Plan a BTree index query.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data. Falls back to full scan if no index exists.
     async fn plan_btree_query(
         &self,
@@ -1102,14 +1108,14 @@ impl MemTableScanner {
             return self.plan_full_scan().await;
         }
 
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
 
         let index_exec = BTreeIndexExec::new(
             self.batch_store.clone(),
             self.indexes.clone(),
             predicate.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.output_schema(),
             self.with_row_id,
@@ -1141,7 +1147,7 @@ impl MemTableScanner {
     }
 
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
         let filter_predicate = self.filter_predicate()?;
@@ -1161,15 +1167,23 @@ impl MemTableScanner {
             .as_ref()
             .map(|_| self.indexes.has_pk_index() && !self.indexes.pk_has_overrides())
             .unwrap_or(true);
+        // A distance lower bound excludes the *nearest* rows, and
+        // `VectorIndexExec` can only drop them after the graph search has
+        // already cut to k — leaving fewer than k in-range rows, or none.
+        // Brute force filters the complete candidate set before its cut, so it
+        // is the only correct arm here. An upper bound is safe on HNSW: it
+        // trims the far tail, which the top-k would have dropped anyway.
+        let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
+            && hnsw_safe_with_bounds
             && self.has_vector_index(&query.column)
         {
             Arc::new(VectorIndexExec::new(
                 self.batch_store.clone(),
                 self.indexes.clone(),
                 query.clone(),
-                max_visible,
+                max_readable,
                 projection_indices,
                 base_schema,
                 self.with_row_id,
@@ -1179,7 +1193,7 @@ impl MemTableScanner {
                 MemTableBruteForceVectorExec::new(
                     self.batch_store.clone(),
                     query.clone(),
-                    max_visible,
+                    max_readable,
                     projection_indices,
                     base_schema,
                     self.with_row_id,
@@ -1193,14 +1207,14 @@ impl MemTableScanner {
 
     /// Plan a full-text search.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
         if !self.has_fts_index(&query.column, query.document_granularity) {
             return self.empty_fts_plan(query.document_granularity);
         }
 
-        let max_visible = self.visible_count;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
@@ -1211,7 +1225,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.indexes.clone(),
             query.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
@@ -1282,15 +1296,111 @@ impl MemTableScanner {
         }
     }
 
+    /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
+    /// values, or return false and leave the caller to fall back to a full scan.
+    fn collect_or_equalities(
+        &self,
+        expr: &Expr,
+        column: &mut Option<String>,
+        values: &mut Vec<ScalarValue>,
+    ) -> bool {
+        let mut same_column = |name: &str| match column {
+            Some(existing) => existing == name,
+            None => {
+                *column = Some(name.to_string());
+                true
+            }
+        };
+        // The exec answers `In` by concatenating a lookup per value, so a value
+        // listed twice would emit its rows twice. Two disjuncts can easily name
+        // the same value: the signed-zero rewrite turns both sides of
+        // `x = -0.0 OR x = 0.0` into the same two-element list.
+        fn push_once(values: &mut Vec<ScalarValue>, value: ScalarValue) {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                self.collect_or_equalities(&binary.left, column, values)
+                    && self.collect_or_equalities(&binary.right, column, values)
+            }
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                let (Expr::Column(col), Expr::Literal(lit, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                else {
+                    return false;
+                };
+                let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                push_once(values, value);
+                true
+            }
+            Expr::InList(in_list) if !in_list.negated => {
+                let Expr::Column(col) = in_list.expr.as_ref() else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                for item in &in_list.list {
+                    let Expr::Literal(lit, _) = item else {
+                        return false;
+                    };
+                    // A NULL among the values makes `IN` return NULL rather than
+                    // false, which a key lookup does not reproduce; fall back.
+                    if lit.is_null() {
+                        return false;
+                    }
+                    let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                        return false;
+                    };
+                    push_once(values, value);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Extract a BTree-compatible predicate from the filter.
     ///
     /// This method also coerces literal values to match the column's data type
     /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
-        let filter = self.filter.as_ref()?;
+        // `filter()` stores the parsed expression without running `optimize_expr`,
+        // so run it here to pick the plan from the same expression the full scan
+        // would evaluate. Coercion has to happen before the signed-zero rewrite
+        // inside it, otherwise `value = 0` keeps its integer literal and gets a
+        // bit-exact lookup while the scan beside it answers per IEEE 754. An
+        // expression `optimize_expr` rejects is reported by `plan_full_scan`,
+        // which runs the same pass, so there is nothing to report here.
+        let planner = Planner::new(self.schema.clone());
+        let filter = planner
+            .optimize_expr(self.filter.clone()?)
+            .inspect_err(|error| {
+                log::debug!("memtable index fast path skipped: {error}");
+            })
+            .ok()?;
 
         // Simple pattern matching for common predicates
-        match filter {
+        match &filter {
+            // `simplify` turns an `IN` list of three or fewer values back into an
+            // OR chain of equalities, and the signed-zero rewrite then turns any
+            // zero among them into a two-element list of its own, so the fast path
+            // has to accept the chain to keep covering `IN`.
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                let mut column = None;
+                let mut values = Vec::new();
+                if self.collect_or_equalities(&filter, &mut column, &mut values) {
+                    debug_assert!(column.is_some(), "a true return always names the column");
+                    return column.map(|column| ScalarPredicate::In { column, values });
+                }
+            }
             Expr::BinaryExpr(binary) => {
                 if let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
@@ -1480,7 +1590,7 @@ mod tests {
         let indexes = Arc::new(index_store);
         let scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
         let result = scanner.try_into_batch().await.unwrap();
-        // visible_count is 1, so we see batches 0 and 1 (20 rows)
+        // readable_count is 1, so we see batches 0 and 1 (20 rows)
         assert_eq!(result.num_rows(), 20);
     }
 
@@ -1497,6 +1607,105 @@ mod tests {
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.schema().field(0).name(), "id");
+    }
+
+    /// The index fast path is chosen from the filter the caller set, which has not
+    /// been through `optimize_expr`. Running it there is what keeps a float zero
+    /// from getting a bit-exact lookup while the full scan beside it answers per
+    /// IEEE 754. The integer spelling matters too: the rewrite only fires once
+    /// coercion has given the literal the column's type.
+    #[rstest::rstest]
+    #[case::float_literal("value = 0.0")]
+    #[case::integer_literal("value = 0")]
+    fn test_extract_btree_predicate_covers_both_zero_encodings(#[case] equality: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        let mut scanner = MemTableScanner::new(
+            batch_store,
+            Arc::new(IndexStore::new()),
+            schema as SchemaRef,
+        );
+
+        scanner.filter(equality).unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate over both encodings, got {other:?}"),
+        }
+
+        // `simplify` shortens a two-value `IN` list into an OR chain, and the
+        // rewrite then replaces the zero with a list of its own. Both spellings
+        // still have to reach the index.
+        scanner.filter("value IN (0.0, 1.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                        ScalarValue::Float64(Some(1.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate covering the list, got {other:?}"),
+        }
+
+        // A short list with no zero in it is shortened just the same, so this is
+        // what keeps the pre-existing `IN` fast path from being lost.
+        scanner.filter("value IN (1.0, 2.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(1.0)),
+                        ScalarValue::Float64(Some(2.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate, got {other:?}"),
+        }
+
+        // Both disjuncts rewrite to the same two-element list. The exec answers
+        // `In` with one lookup per value and concatenates, so a value listed twice
+        // would return its rows twice.
+        scanner.filter("value = -0.0 OR value = 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected a deduplicated In predicate, got {other:?}"),
+        }
+
+        // `<` has to compare against the negative encoding, or the lookup admits a
+        // row the predicate excludes.
+        scanner.filter("value < 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::Range { upper, .. }) => {
+                assert_eq!(upper, Some(ScalarValue::Float64(Some(-0.0))));
+            }
+            other => panic!("expected a Range predicate, got {other:?}"),
+        }
     }
 
     #[tokio::test]

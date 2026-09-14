@@ -195,7 +195,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         &self,
         field: &LanceField,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
         let rle = match self.encoding {
             TestEncoding::Array | TestEncoding::StructuralU16 => None,
@@ -612,6 +612,27 @@ pub async fn check_basic_random(field: Field) {
     check_specific_random(field, TestCases::basic()).await;
 }
 
+/// Runs one independently schedulable slice of [`check_basic_random`].
+///
+/// The complete matrix is the Cartesian product of all encodings, page sizes,
+/// and slicing modes.  Keeping these axes outside the helper lets expensive
+/// data types preserve the full matrix without concentrating it in one test.
+pub async fn check_basic_random_case(
+    field: Field,
+    encoding: TestEncoding,
+    page_size: u64,
+    use_slicing: bool,
+) {
+    check_specific_random(
+        field,
+        TestCases::basic()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing]),
+    )
+    .await;
+}
+
 pub async fn check_specific_random(field: Field, test_cases: TestCases) {
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
@@ -715,6 +736,8 @@ pub struct TestCases {
     skip_validation: bool,
     max_page_size: Option<u64>,
     page_sizes: Vec<u64>,
+    slicing_modes: Vec<bool>,
+    ingest_batch_counts: Vec<u32>,
     encodings: Vec<TestEncoding>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
@@ -729,6 +752,8 @@ impl Default for TestCases {
             skip_validation: false,
             max_page_size: None,
             page_sizes: vec![4096, 1024 * 1024],
+            slicing_modes: vec![false, true],
+            ingest_batch_counts: vec![1, 5, 10],
             encodings: TestEncoding::all().collect(),
             verify_encoding: None,
             expected_encoding: None,
@@ -808,6 +833,19 @@ impl TestCases {
 
     pub fn with_page_sizes(mut self, page_sizes: Vec<u64>) -> Self {
         self.page_sizes = page_sizes;
+        self
+    }
+
+    pub fn with_slicing_modes(mut self, slicing_modes: impl IntoIterator<Item = bool>) -> Self {
+        self.slicing_modes = slicing_modes.into_iter().collect();
+        self
+    }
+
+    pub fn with_ingest_batch_counts(
+        mut self,
+        ingest_batch_counts: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        self.ingest_batch_counts = ingest_batch_counts.into_iter().collect();
         self
     }
 
@@ -1445,7 +1483,7 @@ async fn check_round_trip_random(
     test_cases: &TestCases,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
-        for use_slicing in [false, true] {
+        for use_slicing in test_cases.slicing_modes.iter().copied() {
             for encoding in test_cases.encodings() {
                 if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
                     continue;
@@ -1460,7 +1498,7 @@ async fn check_round_trip_random(
                     field.clone().with_nullable(false)
                 };
 
-                for num_ingest_batches in [1, 5, 10] {
+                for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 

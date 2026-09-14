@@ -13,10 +13,14 @@
  */
 package org.lance.operation;
 
+import org.lance.index.IndexFile;
+
 import com.google.common.base.MoreObjects;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -30,13 +34,15 @@ public class RewrittenIndex {
   private final String newIndexDetailsTypeUrl;
   private final byte[] newIndexDetailsValue;
   private final int newIndexVersion;
+  private final Optional<List<IndexFile>> newIndexFiles;
 
   private RewrittenIndex(
       UUID oldId,
       UUID newId,
       String newIndexDetailsTypeUrl,
       byte[] newIndexDetailsValue,
-      int newIndexVersion) {
+      int newIndexVersion,
+      List<IndexFile> newIndexFiles) {
     if (oldId == null
         || newId == null
         || newIndexDetailsTypeUrl == null
@@ -50,6 +56,10 @@ public class RewrittenIndex {
     this.newIndexDetailsTypeUrl = newIndexDetailsTypeUrl;
     this.newIndexDetailsValue = newIndexDetailsValue;
     this.newIndexVersion = newIndexVersion;
+    this.newIndexFiles =
+        newIndexFiles == null || newIndexFiles.isEmpty()
+            ? Optional.empty()
+            : Optional.of(newIndexFiles);
   }
 
   public UUID getOldId() {
@@ -72,6 +82,11 @@ public class RewrittenIndex {
     return newIndexVersion;
   }
 
+  /** Files in the rewritten index, or empty when older writers did not record them. */
+  public Optional<List<IndexFile>> getNewIndexFiles() {
+    return newIndexFiles;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -85,7 +100,8 @@ public class RewrittenIndex {
         && Objects.equals(newId, that.newId)
         && Objects.equals(newIndexDetailsTypeUrl, that.newIndexDetailsTypeUrl)
         && Arrays.equals(newIndexDetailsValue, that.newIndexDetailsValue)
-        && newIndexVersion == that.newIndexVersion;
+        && newIndexVersion == that.newIndexVersion
+        && Objects.equals(newIndexFiles, that.newIndexFiles);
   }
 
   @Override
@@ -95,7 +111,8 @@ public class RewrittenIndex {
         newId,
         newIndexDetailsTypeUrl,
         Arrays.hashCode(newIndexDetailsValue),
-        newIndexVersion);
+        newIndexVersion,
+        newIndexFiles);
   }
 
   @Override
@@ -106,6 +123,7 @@ public class RewrittenIndex {
         .add("newIndexDetailsTypeUrl", newIndexDetailsTypeUrl)
         .add("newIndexDetailsValue", newIndexDetailsValue)
         .add("newIndexVersion", newIndexVersion)
+        .add("newIndexFiles", newIndexFiles)
         .toString();
   }
 
@@ -119,6 +137,7 @@ public class RewrittenIndex {
     private String newIndexDetailsTypeUrl;
     private byte[] newIndexDetailsValue;
     private int newIndexVersion;
+    private List<IndexFile> newIndexFiles;
 
     private Builder() {}
 
@@ -147,9 +166,19 @@ public class RewrittenIndex {
       return this;
     }
 
+    public Builder newIndexFiles(List<IndexFile> newIndexFiles) {
+      this.newIndexFiles = newIndexFiles;
+      return this;
+    }
+
     public RewrittenIndex build() {
       return new RewrittenIndex(
-          oldId, newId, newIndexDetailsTypeUrl, newIndexDetailsValue, newIndexVersion);
+          oldId,
+          newId,
+          newIndexDetailsTypeUrl,
+          newIndexDetailsValue,
+          newIndexVersion,
+          newIndexFiles);
     }
   }
 }

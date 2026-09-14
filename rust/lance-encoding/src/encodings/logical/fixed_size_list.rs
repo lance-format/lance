@@ -533,7 +533,7 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{TestCases, check_specific_random},
+        testing::{TestCases, TestEncoding, check_specific_random},
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -700,6 +700,11 @@ mod tests {
         #[case] dimension: i32,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(TestEncoding::StructuralU32, TestEncoding::StructuralSparse)]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+        #[values(1, 5, 10)] ingest_batch_count: u32,
     ) {
         let data_type = make_fsl_struct_type(struct_fields, dimension);
         let mut field_metadata = HashMap::new();
@@ -708,7 +713,11 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        let test_cases = TestCases::basic().with_u32_structural_encodings();
+        let test_cases = TestCases::basic()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing])
+            .with_ingest_batch_counts([ingest_batch_count]);
         check_specific_random(field, test_cases).await;
     }
 

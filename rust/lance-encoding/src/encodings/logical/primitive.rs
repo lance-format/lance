@@ -24,7 +24,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
@@ -45,7 +47,7 @@ use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
-        create_rle_decompressor,
+        compress_required_block, create_rle_decompressor,
     },
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
     utils::bytepack::BytepackedIntegerEncoder,
@@ -106,6 +108,14 @@ const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
+
+/// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
+///
+/// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
+/// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
+    / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
+    * u8::MAX as u64;
 
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
@@ -187,16 +197,116 @@ impl DecodeMiniBlockTask {
         self.value_decompressor.decoded_size_bytes(num_values)
     }
 
+    fn resolve_num_levels(
+        rep_decompressor: Option<&dyn BlockDecompressor>,
+        rep_levels: Option<&LanceBuffer>,
+        def_decompressor: Option<&dyn BlockDecompressor>,
+        def_levels: Option<&LanceBuffer>,
+        declared_num_levels: u16,
+    ) -> Result<u64> {
+        let rep_num_levels = match (rep_decompressor, rep_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock repetition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+        let def_num_levels = match (def_decompressor, def_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock definition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+
+        let inferred_num_levels = match (rep_num_levels, def_num_levels) {
+            (Some(rep_num_levels), Some(def_num_levels)) if rep_num_levels != def_num_levels => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "miniblock structural streams disagree on the level count: repetition inferred {rep_num_levels}, definition inferred {def_num_levels}"
+                    )
+                    .into(),
+                ));
+            }
+            (Some(num_levels), _) | (_, Some(num_levels)) => num_levels,
+            (None, None) => return Ok(u64::from(declared_num_levels)),
+        };
+
+        let declared_num_levels = u64::from(declared_num_levels);
+        if inferred_num_levels == declared_num_levels {
+            return Ok(inferred_num_levels);
+        }
+        let u16_modulus = u64::from(u16::MAX) + 1;
+        if inferred_num_levels <= declared_num_levels
+            || inferred_num_levels % u16_modulus != declared_num_levels
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels but the header declared {declared_num_levels}; the counts are not congruent modulo 65536"
+                )
+                .into(),
+            ));
+        }
+        if inferred_num_levels > MAX_LEGACY_RLE_LEVELS {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels, exceeding the legacy RLE payload bound of {MAX_LEGACY_RLE_LEVELS}"
+                )
+                .into(),
+            ));
+        }
+        Ok(inferred_num_levels)
+    }
+
     fn decode_levels(
-        rep_decompressor: &dyn BlockDecompressor,
+        decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
-        num_levels: u16,
+        expected_num_levels: u64,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let rep = rep.as_fixed_width().unwrap();
-        debug_assert_eq!(rep.num_values, num_levels as u64);
-        debug_assert_eq!(rep.bits_per_value, 16);
-        Ok(rep.data.borrow_to_typed_slice::<u16>())
+        let levels = decompressor.decompress(Some(levels), expected_num_levels)?;
+        let levels = levels.as_fixed_width().ok_or_else(|| {
+            Error::invalid_input_source(
+                "miniblock levels did not decode to fixed-width data".into(),
+            )
+        })?;
+        if levels.num_values != expected_num_levels {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} values, expected {expected_num_levels}",
+                    levels.num_values
+                )
+                .into(),
+            ));
+        }
+        if levels.bits_per_value != 16 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bits per value, expected 16",
+                    levels.bits_per_value
+                )
+                .into(),
+            ));
+        }
+        let expected_bytes = expected_num_levels.checked_mul(2).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("miniblock level byte count overflowed for {expected_num_levels} levels")
+                    .into(),
+            )
+        })?;
+        if levels.data.len() as u64 != expected_bytes {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bytes, expected {expected_bytes}",
+                    levels.data.len()
+                )
+                .into(),
+            ));
+        }
+        Ok(levels.data.borrow_to_typed_slice::<u16>())
     }
 
     // We are building a LevelBuffer (levels) and want to copy into it `total_len`
@@ -524,6 +634,14 @@ impl DecodeMiniBlockTask {
             def
         });
 
+        let num_levels = Self::resolve_num_levels(
+            self.rep_decompressor.as_deref(),
+            rep.as_ref(),
+            self.def_decompressor.as_deref(),
+            def.as_ref(),
+            num_levels,
+        )?;
+
         let buffers = buffer_sizes
             .into_iter()
             .map(|buf_size| {
@@ -556,6 +674,19 @@ impl DecodeMiniBlockTask {
                 )
             })
             .transpose()?;
+
+        if let (Some(rep), Some(def)) = (&rep, &def)
+            && rep.len() != def.len()
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock structural streams decoded different level counts: repetition {}, definition {}",
+                    rep.len(),
+                    def.len()
+                )
+                .into(),
+            ));
+        }
 
         Ok(DecodedMiniBlockChunk { rep, def, values })
     }
@@ -1569,7 +1700,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                     }
                     LevelCodec::Block(decompressor) => {
                         let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
-                        let decompressed = decompressor.decompress(frame, num_values)?;
+                        let decompressed = decompressor.decompress(Some(frame), num_values)?;
                         dense_levels_from_block(decompressed, num_values, level_type)
                     }
                 }
@@ -2624,7 +2755,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_bytes.unwrap();
                 Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                    LanceBuffer::from_bytes(dictionary_data, dictionary.dictionary_data_alignment),
+                    Some(LanceBuffer::from_bytes(
+                        dictionary_data,
+                        dictionary.dictionary_data_alignment,
+                    )),
                     dictionary.num_dictionary_items,
                 )?))
             } else {
@@ -2975,11 +3109,10 @@ impl FullZipScheduler {
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
-                if total_bytes_per_value == 0 {
-                    return Err(lance_core::Error::internal(
-                        "Invalid encoding: per-row byte width must be greater than 0",
-                    ));
-                }
+                // total_bytes_per_value == 0 is valid for constant-null FSL pages written by
+                // earlier encoders that produced bits_per_value=0 with no ctrl-word bytes.
+                // FixedFullZipDecoder::drain handles this case by producing AllNull output
+                // without touching the (empty) data buffer.
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
                     data,
@@ -3363,6 +3496,24 @@ impl FixedFullZipDecoder {
 
 impl StructuralPageDecoder for FixedFullZipDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        if self.total_bytes_per_value == 0 {
+            // No bytes per row: constant-null page with no ctrl-word bytes.
+            // The decompressor (ConstantDecompressor) ignores its input and returns AllNull.
+            return Ok(Box::new(FixedFullZipDecodeTask {
+                details: self.details.clone(),
+                data: vec![FullZipDecodeTaskItem {
+                    data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                        data: LanceBuffer::empty(),
+                        bits_per_value: 0,
+                        num_values: num_rows,
+                        block_info: BlockInfo::new(),
+                    }),
+                    rows_in_buf: num_rows,
+                }],
+                bytes_per_value: 0,
+                num_rows: num_rows as usize,
+            }));
+        }
         let mut task_data = Vec::with_capacity(self.data.len());
         let mut remaining = num_rows;
         while remaining > 0 {
@@ -5020,8 +5171,9 @@ impl PrimitiveStructuralEncoder {
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
-        let (compressor, compressor_desc) =
+        let compressor =
             compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
+        let mut compressor_desc = None;
         // Compress blocks of levels (sized according to the chunks)
         let mut level_chunks = Vec::with_capacity(chunks.len());
         let mut values_counter = 0;
@@ -5091,7 +5243,22 @@ impl PrimitiveStructuralEncoder {
             };
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
-            let compressed_levels = compressor.compress(chunk_levels_block)?;
+            let (compressed_levels, chunk_compressor_desc) =
+                compressor.compress(chunk_levels_block)?;
+            if let Some(compressor_desc) = compressor_desc.as_ref() {
+                if compressor_desc != &chunk_compressor_desc {
+                    return Err(Error::internal(
+                        "Rep/def block compressor changed encoding between chunks".to_string(),
+                    ));
+                }
+            } else {
+                compressor_desc = Some(chunk_compressor_desc);
+            }
+            let compressed_levels = compressed_levels.ok_or_else(|| {
+                Error::internal(
+                    "Rep/def block compressor selected a metadata-only codec".to_string(),
+                )
+            })?;
             let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
                 Error::invalid_input_source(
                     format!(
@@ -5116,7 +5283,9 @@ impl PrimitiveStructuralEncoder {
         };
         Ok(CompressedLevels {
             data: level_chunks,
-            compression: compressor_desc,
+            compression: compressor_desc.ok_or_else(|| {
+                Error::internal("Rep/def compression produced no chunks".to_string())
+            })?,
             rep_index,
         })
     }
@@ -5152,9 +5321,8 @@ impl PrimitiveStructuralEncoder {
 
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
-        let (compressor, encoding) =
-            compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
-        let compressed_buffer = compressor.compress(levels_block)?;
+        let (compressed_buffer, encoding) =
+            compress_required_block(compression_strategy, &levels_field, levels_block)?;
         Ok((compressed_buffer, encoding))
     }
 
@@ -5540,9 +5708,8 @@ impl PrimitiveStructuralEncoder {
             let num_dictionary_items = dictionary_data.num_values();
             let dict_values_field = Self::build_dict_values_compressor_field(field)?;
 
-            let (compressor, dictionary_encoding) = compression_strategy
-                .create_block_compressor(&dict_values_field, &dictionary_data)?;
-            let dictionary_buffer = compressor.compress(dictionary_data)?;
+            let (dictionary_buffer, dictionary_encoding) =
+                compress_required_block(compression_strategy, &dict_values_field, dictionary_data)?;
 
             data.push(dictionary_buffer);
             if let Some(rep_index) = rep_index {
@@ -6332,7 +6499,10 @@ impl PrimitiveStructuralEncoder {
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
             let fullzip_error = match &data_block {
-                DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
+                // 1-bit booleans are widened to bytes inside `encode_full_zip`.
+                DataBlock::FixedWidth(fixed)
+                    if fixed.bits_per_value != 1 && !fixed.bits_per_value.is_multiple_of(8) =>
+                {
                     Some(format!(
                         "Full-zip fixed-width values must be byte aligned, got {} bits per value",
                         fixed.bits_per_value
@@ -6540,6 +6710,97 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Rebuilds dictionary chunks whose values array is empty.
+    ///
+    /// Such chunks are entirely null and retain their key validity until rep/def has been
+    /// recorded.  At flush time their keys are zeroed and attached to a neighboring non-empty
+    /// dictionary.  If every chunk is empty, one non-null placeholder value makes key zero valid.
+    /// Rep/def retains the logical nullness, so these replacement keys are never exposed.
+    fn rebuild_empty_dictionary_chunks(arrays: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if !arrays.iter().any(|array| {
+            array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+        }) {
+            return Ok(arrays);
+        }
+
+        let zeroed = |data_type: &DataType, len: usize| {
+            new_null_array(data_type, len)
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .map(make_array)
+        };
+        let rebuild =
+            |keys: Vec<ArrayRef>, data_type: &DataType, values: ArrayRef| -> Result<ArrayRef> {
+                let keys = keys.iter().map(|keys| keys.as_ref()).collect::<Vec<_>>();
+                let keys = arrow_select::concat::concat(&keys)?;
+                let data = keys
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .child_data(vec![values.to_data()])
+                    .build()?;
+                Ok(make_array(data))
+            };
+
+        let mut rebuilt = Vec::with_capacity(arrays.len());
+        let mut pending_keys = Vec::with_capacity(arrays.len());
+        let mut empty_data_type = None;
+        for array in arrays {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            if dictionary.values().is_empty() {
+                pending_keys.push(zeroed(dictionary.keys().data_type(), array.len())?);
+                empty_data_type.get_or_insert_with(|| array.data_type().clone());
+            } else if pending_keys.is_empty() {
+                rebuilt.push(array);
+            } else {
+                pending_keys.push(make_array(dictionary.keys().to_data()));
+                rebuilt.push(rebuild(
+                    std::mem::take(&mut pending_keys),
+                    array.data_type(),
+                    dictionary.values().clone(),
+                )?);
+            }
+        }
+
+        if pending_keys.is_empty() {
+            return Ok(rebuilt);
+        }
+        if let Some(array) = rebuilt.pop() {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            let mut keys = Vec::with_capacity(pending_keys.len() + 1);
+            keys.push(make_array(dictionary.keys().to_data()));
+            keys.append(&mut pending_keys);
+            rebuilt.push(rebuild(
+                keys,
+                array.data_type(),
+                dictionary.values().clone(),
+            )?);
+        } else {
+            let data_type = empty_data_type.ok_or_else(|| {
+                Error::internal("Missing data type for an empty dictionary chunk")
+            })?;
+            let DataType::Dictionary(_, value_type) = &data_type else {
+                return Err(Error::internal(format!(
+                    "Expected dictionary data type, got {data_type}"
+                )));
+            };
+            rebuilt.push(rebuild(pending_keys, &data_type, zeroed(value_type, 1)?)?);
+        }
+        Ok(rebuilt)
+    }
+
     // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -6548,6 +6809,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        let arrays = Self::rebuild_empty_dictionary_chunks(arrays)?;
         DataBlock::validate_arrays(&arrays, &self.field.name)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
@@ -6611,6 +6873,14 @@ impl PrimitiveStructuralEncoder {
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
+            // Empty dictionaries have no valid key payload.  Keep the validity until rep/def is
+            // grouped with the buffered page; `do_flush` then rebuilds the keys against either a
+            // neighboring values array or an all-empty-page placeholder.
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
+            {
+                return Ok(array);
+            }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
         } else {
@@ -6631,6 +6901,7 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 array = dict::normalize_dict_nulls(array)?;
+                array = dict::clear_out_of_range_null_keys(array)?;
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -7014,10 +7285,10 @@ mod tests {
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
-        make_array,
+        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
+        PrimitiveArray, StringArray, UInt8Array, make_array, new_null_array, types::Int32Type,
     };
-    use arrow_buffer::ScalarBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -7040,6 +7311,75 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    fn valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a"])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn empty_dictionary() -> ArrayRef {
+        new_null_array(
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            1,
+        )
+    }
+
+    fn null_valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sliced_empty_dictionary_with_hidden_key_payload() -> ArrayRef {
+        let keys = PrimitiveArray::<Int32Type>::new(
+            ScalarBuffer::from(vec![5, 7, 9]),
+            Some(NullBuffer::new(BooleanBuffer::new_unset(3))),
+        );
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        Arc::new(dictionary.slice(1, 1))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_after_value(vec![valued_dictionary(), empty_dictionary()])]
+    #[case::empty_before_value(vec![empty_dictionary(), valued_dictionary()])]
+    #[case::null_value_after_value(vec![valued_dictionary(), null_valued_dictionary()])]
+    #[case::hidden_sliced_after_value(vec![
+        valued_dictionary(),
+        sliced_empty_dictionary_with_hidden_key_payload(),
+    ])]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_chunks(#[case] dictionaries: Vec<ArrayRef>) {
+        check_round_trip_encoding_of_data(
+            dictionaries,
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sliced_empty_dictionary_with_hidden_key_payload() {
+        check_round_trip_encoding_of_data(
+            vec![sliced_empty_dictionary_with_hidden_key_payload()],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
@@ -7224,7 +7564,7 @@ mod tests {
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!("expected fixed-size-list compression");
         };
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
         let expected_size = num_rows * dimension * size_of::<f32>();
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -7296,7 +7636,7 @@ mod tests {
             panic!("expected fixed-size-list compression");
         };
         let decompressor = NullableFslDecompressor {
-            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()).unwrap(),
         };
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -8744,7 +9084,7 @@ mod tests {
         let repeated_strings: Vec<_> = unique_values
             .iter()
             .cycle()
-            .take(100_000)
+            .take(10_000)
             .map(|s| Some(s.as_str()))
             .collect();
 
@@ -9609,6 +9949,43 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 
+    fn hand_built_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{DictionaryArray, Int32Array, types::Int32Type};
+        use arrow_buffer::NullBuffer;
+
+        let keys = Int32Array::new(
+            vec![0, 7, 7].into(),
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef
+    }
+
+    fn concatenated_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{builder::StringDictionaryBuilder, new_null_array, types::Int32Type};
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("a");
+        for _ in 0..7 {
+            builder.append_null();
+        }
+        let valued = Arc::new(builder.finish()) as ArrayRef;
+        let all_null = new_null_array(valued.data_type(), 8);
+        arrow_select::concat::concat(&[valued.as_ref(), all_null.as_ref()]).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys())]
+    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys())]
+    #[tokio::test]
+    async fn test_dictionary_out_of_range_null_keys_round_trip(#[case] dictionary: ArrayRef) {
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_page_sizes(vec![4096]);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &test_cases, HashMap::new()).await;
+    }
+
     #[test]
     fn test_encode_decode_complex_all_null_vals_roundtrip() {
         use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
@@ -9631,7 +10008,7 @@ mod tests {
             .create_block_decompressor(&encoding)
             .unwrap();
         let decompressed = decompressor
-            .decompress(compressed_buf, values.len() as u64)
+            .decompress(Some(compressed_buf), values.len() as u64)
             .unwrap();
         let decompressed_fixed_width = decompressed.as_fixed_width().unwrap();
         assert_eq!(decompressed_fixed_width.num_values, values.len() as u64);
@@ -9720,6 +10097,8 @@ mod tests {
         });
         BlockCompressor::compress(&RleEncoder::with_run_length_width(run_length_width), block)
             .unwrap()
+            .0
+            .unwrap()
     }
 
     fn encoded_u16_runs(levels: &[u16], run_length_width: RunLengthWidth) -> RleRuns {
@@ -9727,6 +10106,77 @@ mod tests {
         RleDecompressor::with_run_length_width(16, run_length_width)
             .decode_u16_runs(frame, levels.len() as u64)
             .unwrap()
+    }
+
+    #[test]
+    fn miniblock_levels_use_one_count_for_mixed_codecs() {
+        let actual_num_levels = usize::from(u16::MAX) + 8;
+        let levels = vec![1_u16; actual_num_levels];
+        let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
+        let rep_decompressor = RleDecompressor::new(16);
+        let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
+        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+            bits_per_value: 16,
+            data: None,
+        });
+
+        let num_levels = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&rep_decompressor),
+            Some(&rep_frame),
+            Some(&def_decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap();
+        assert_eq!(num_levels, actual_num_levels as u64);
+
+        let rep =
+            DecodeMiniBlockTask::decode_levels(&rep_decompressor, rep_frame, num_levels).unwrap();
+        let def =
+            DecodeMiniBlockTask::decode_levels(&def_decompressor, def_frame, num_levels).unwrap();
+        assert_eq!(rep.as_ref(), levels);
+        assert_eq!(def, rep);
+    }
+
+    #[test]
+    fn miniblock_levels_reject_non_wrapped_count_mismatch() {
+        let frame = encoded_u16_frame(&[1_u16; 8], RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&frame),
+            None,
+            None,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not congruent modulo 65536"));
+    }
+
+    #[test]
+    fn miniblock_levels_reject_cross_stream_count_disagreement() {
+        let rep_levels = vec![1_u16; usize::from(u16::MAX) + 8];
+        let def_levels = vec![1_u16; rep_levels.len() + usize::from(u16::MAX) + 1];
+        let rep_frame = encoded_u16_frame(&rep_levels, RunLengthWidth::U8);
+        let def_frame = encoded_u16_frame(&def_levels, RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&rep_frame),
+            Some(&decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("structural streams disagree on the level count")
+        );
     }
 
     fn physical_levels(levels: &[u16]) -> LazyLevels {

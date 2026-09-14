@@ -719,6 +719,7 @@ mod test {
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
@@ -771,6 +772,15 @@ mod test {
                 target,
                 reads: self.reads.clone(),
             })
+        }
+
+        // Only data file reads are blocked, so a listing can keep the pushdown.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
         }
     }
 

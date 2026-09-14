@@ -673,14 +673,9 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
 
     let shard_id = Uuid::new_v4();
     let row_bytes = 2048; // rough FineWeb text row size
-    // The memtable flush trigger is `estimated_size >= max_memtable_size ||
-    // batch_store_full`. FineWeb text rows vary in size, so a byte threshold
-    // is an unreliable way to flush exactly one generation per
-    // `max_memtable_rows`. Instead make the *batch-count* cap the trigger:
-    // set `max_memtable_batches` to one generation's worth of batches so the
-    // store fills (and flushes) precisely at each generation boundary,
-    // independent of text length. Keep `max_memtable_size` high so it never
-    // pre-empts the batch-count trigger.
+    // The memtable seals at `max_memtable_rows`, giving one generation per cap.
+    // `max_memtable_batches` is sized to that same boundary, and
+    // `max_memtable_size` kept high so the byte threshold never pre-empts it.
     let batches_per_gen = (args.max_memtable_rows / args.batch_rows).max(1);
     let config = ShardWriterConfig {
         shard_id,

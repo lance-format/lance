@@ -8,18 +8,18 @@ use lance_core::{Error, Result};
 
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
-pub const FLAG_DELETION_FILES: u64 = 1;
+pub const FLAG_DELETION_FILES: u64 = 1 << 0;
 /// Row ids are stable for both moves and updates. Fragments contain an index
 /// mapping row ids to row addresses.
-pub const FLAG_STABLE_ROW_IDS: u64 = 2;
+pub const FLAG_STABLE_ROW_IDS: u64 = 1 << 1;
 /// Files are written with the new v2 format (this flag is no longer used)
-pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
+pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 1 << 2;
 /// Table config is present
-pub const FLAG_TABLE_CONFIG: u64 = 8;
+pub const FLAG_TABLE_CONFIG: u64 = 1 << 3;
 /// Dataset uses multiple base paths (for shallow clones or multi-base datasets)
-pub const FLAG_BASE_PATHS: u64 = 16;
+pub const FLAG_BASE_PATHS: u64 = 1 << 4;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
-pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
+pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 1 << 5;
 /// Fragments contain data overlay files, which supply new values for a subset of
 /// cells without rewriting base data files. A reader that does not understand
 /// overlays must refuse the dataset, since ignoring an overlay would silently
@@ -29,7 +29,7 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// is treated as unknown (so a release reader/writer refuses an overlay dataset)
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
-pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
+pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 1 << 6;
 /// Some index declares covering columns: `IndexMetadata.covering_fields` names
 /// columns the index carries values for but is not keyed on.
 ///
@@ -49,18 +49,18 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// count it as supported and will open a covering dataset rather than refuse it;
 /// that exposure comes with the reclamation and is inherited by whichever flag
 /// takes the bit.
-pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
+pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// A dataset may reference recognized V2 data files with different exact
 /// versions. Readers and writers must both understand the per-file version
 /// contract before either can safely access the dataset.
-pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 256;
+pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 512;
+pub const FLAG_UNKNOWN: u64 = 1 << 9;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
-// at or above the boundary that build shipped with (128).
-const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
+// at or above the boundary that build shipped with (bit 7).
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;

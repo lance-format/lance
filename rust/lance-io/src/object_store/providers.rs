@@ -221,7 +221,7 @@ impl ObjectStoreRegistry {
         crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, store_prefix);
 
         if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(store_prefix, store.inner);
+            store.apply_wrapper(wrapper.as_ref());
         }
 
         // Always wrap with IO tracking
@@ -415,8 +415,14 @@ impl ObjectStoreRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
+    use object_store::ObjectStore as OSObjectStore;
+
+    use crate::object_store::providers::memory::MemoryStoreProvider;
+    use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+    use rstest::rstest;
 
     #[derive(Debug)]
     struct DummyProvider;
@@ -429,6 +435,125 @@ mod tests {
             _params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
             unreachable!("This test doesn't create stores")
+        }
+    }
+
+    /// A lister that exists only to be handed to a wrapper.
+    struct StubLister;
+
+    #[async_trait::async_trait]
+    impl PaginatedListStore for StubLister {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _opts: PaginatedListOptions,
+        ) -> object_store::Result<PaginatedListResult> {
+            unimplemented!("this lister exists to be wrapped, not to list")
+        }
+    }
+
+    /// A provider whose stores come with a paginated lister, which the memory store does not.
+    #[derive(Debug)]
+    struct PaginatedProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for PaginatedProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
+            store.paginated_lister = Some(Arc::new(StubLister));
+            Ok(store)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("memory".to_string())
+        }
+    }
+
+    /// Swaps the store out for an empty one, the way a wrapper enforcing visibility would, and
+    /// records the prefix each call was labelled with. `keep_pushdown` is what it answers when
+    /// asked about the lister.
+    #[derive(Debug)]
+    struct RecordingWrapper {
+        keep_pushdown: bool,
+        prefixes: Mutex<Vec<String>>,
+    }
+
+    impl WrappingObjectStore for RecordingWrapper {
+        fn wrap(
+            &self,
+            store_prefix: &str,
+            _original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            self.prefixes
+                .lock()
+                .unwrap()
+                .push(format!("wrap@{store_prefix}"));
+            Arc::new(object_store::memory::InMemory::new())
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            self.prefixes
+                .lock()
+                .unwrap()
+                .push(format!("wrap_paginated@{store_prefix}"));
+            self.keep_pushdown.then_some(original)
+        }
+    }
+
+    /// A decorator supplied through [`ObjectStoreParams`] has to reach the paginated lister
+    /// too, or `read_dir_page` would talk to the backend behind its back — and a decorator
+    /// that gives the pushdown up gets a store with no lister, so its listings go through the
+    /// wrapped `inner` and see what the wrapper allows rather than what the backend holds.
+    #[rstest]
+    #[case::keeps_the_pushdown(true)]
+    #[case::gives_up_the_pushdown(false)]
+    #[tokio::test]
+    async fn test_the_registry_hands_the_lister_to_the_wrapper(#[case] keep_pushdown: bool) {
+        let wrapper = Arc::new(RecordingWrapper {
+            keep_pushdown,
+            prefixes: Mutex::new(Vec::new()),
+        });
+        let registry = ObjectStoreRegistry::default();
+        registry.insert("pagmem", Arc::new(PaginatedProvider));
+
+        let store = registry
+            .get_store(
+                Url::parse("pagmem:///").unwrap(),
+                &ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.paginated_lister.is_some(), keep_pushdown);
+        // Both halves of the store are labelled with the same prefix.
+        assert_eq!(
+            *wrapper.prefixes.lock().unwrap(),
+            vec!["wrap@memory", "wrap_paginated@memory"]
+        );
+        if !keep_pushdown {
+            // `StubLister` panics if it is ever asked to list, so reaching a page at all is
+            // the other half of the assertion.
+            let page = store
+                .read_dir_page(Path::from(""), Default::default())
+                .await
+                .unwrap();
+            assert!(page.result.common_prefixes.is_empty());
+            assert!(page.result.objects.is_empty());
         }
     }
 

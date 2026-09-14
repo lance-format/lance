@@ -23,6 +23,7 @@
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use arrow_array::types::*;
@@ -186,6 +187,16 @@ impl InlineBytes {
             Self::Heap(b) => b,
         }
     }
+
+    /// Bytes this key owns outside its node. Inline keys own none; a spilled
+    /// key owns exactly its payload, since `Box<[u8]>` allocates no slack.
+    #[inline]
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(b) => b.len(),
+        }
+    }
 }
 
 impl PartialEq for InlineBytes {
@@ -291,6 +302,9 @@ struct FixedIntBackend {
     writer: Mutex<SkipListWriter<FixedKey>>,
     /// Row positions whose value is null (rare; not on the hot path).
     null_positions: Mutex<Vec<RowPosition>>,
+    /// `null_positions`' heap, kept alongside it so a memory poll never has to
+    /// take that lock. See [`Backend::resident_bytes`].
+    null_bytes: AtomicUsize,
     data_type: DataType,
 }
 
@@ -301,6 +315,7 @@ impl FixedIntBackend {
             reader,
             writer: Mutex::new(writer),
             null_positions: Mutex::new(Vec::new()),
+            null_bytes: AtomicUsize::new(0),
             data_type,
         }
     }
@@ -339,7 +354,15 @@ impl FixedIntBackend {
                 }
                 drop(writer);
                 if !nulls.is_empty() {
-                    self.null_positions.lock().unwrap().extend(nulls);
+                    let mut positions = self.null_positions.lock().unwrap();
+                    // Reserve and charge before the extend, so the counter is
+                    // never behind the positions a concurrent poll can reach.
+                    positions.reserve(nulls.len());
+                    self.null_bytes.store(
+                        positions.capacity() * std::mem::size_of::<RowPosition>(),
+                        Ordering::Relaxed,
+                    );
+                    positions.extend(nulls);
                 }
             }};
         }
@@ -457,7 +480,14 @@ struct BytesBackend {
     reader: SkipListReader<BytesKey>,
     writer: Mutex<SkipListWriter<BytesKey>>,
     null_positions: Mutex<Vec<RowPosition>>,
+    /// `null_positions`' heap, kept alongside it so a memory poll never has to
+    /// take that lock. See [`Backend::resident_bytes`].
+    null_bytes: AtomicUsize,
     data_type: DataType,
+    /// Payload of keys too long to live inline in their node. The skiplist's
+    /// own counter measures arena chunks only, so without this a column of long
+    /// strings would duplicate its whole payload uncharged.
+    key_heap_bytes: AtomicUsize,
 }
 
 impl BytesBackend {
@@ -467,7 +497,9 @@ impl BytesBackend {
             reader,
             writer: Mutex::new(writer),
             null_positions: Mutex::new(Vec::new()),
+            null_bytes: AtomicUsize::new(0),
             data_type,
+            key_heap_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -498,6 +530,18 @@ impl BytesBackend {
                             bytes: InlineBytes::new(bytes),
                             position,
                         };
+                        // Charge before publishing, the way the arena charges
+                        // a chunk before the node that lives in it: the insert
+                        // below splices the node in with `Release`, so a reader
+                        // that can reach the key can also see its payload. A
+                        // per-batch total added afterwards would leave a whole
+                        // in-flight batch of keys visible but uncharged, and an
+                        // admission sample landing there reads low. Inline keys
+                        // own nothing, so they skip the atomic entirely.
+                        let spilled = key.bytes.heap_bytes();
+                        if spilled > 0 {
+                            self.key_heap_bytes.fetch_add(spilled, Ordering::Relaxed);
+                        }
                         had_existing |= writer.insert_and_check_neighbors(key, |prev, next| {
                             prev.is_some_and(|key| key.bytes.as_slice() == bytes)
                                 || next.is_some_and(|key| key.bytes.as_slice() == bytes)
@@ -506,7 +550,15 @@ impl BytesBackend {
                 }
                 drop(writer);
                 if !nulls.is_empty() {
-                    self.null_positions.lock().unwrap().extend(nulls);
+                    let mut positions = self.null_positions.lock().unwrap();
+                    // Reserve and charge before the extend, so the counter is
+                    // never behind the positions a concurrent poll can reach.
+                    positions.reserve(nulls.len());
+                    self.null_bytes.store(
+                        positions.capacity() * std::mem::size_of::<RowPosition>(),
+                        Ordering::Relaxed,
+                    );
+                    positions.extend(nulls);
                 }
             }};
         }
@@ -833,6 +885,22 @@ impl Backend {
         }
     }
 
+    /// Lock-free by construction: admission reads this on every put and on every
+    /// `DRAIN_POLL_INTERVAL` tick while a writer is parked, so taking the
+    /// `null_positions` mutex here would park a memory poll behind an in-flight
+    /// insert.
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::FixedInt(b) => b.reader.resident_bytes() + b.null_bytes.load(Ordering::Relaxed),
+            Self::Bytes(b) => {
+                b.reader.resident_bytes()
+                    + b.null_bytes.load(Ordering::Relaxed)
+                    + b.key_heap_bytes.load(Ordering::Relaxed)
+            }
+            Self::Scalar(b) => b.reader.resident_bytes(),
+        }
+    }
+
     fn data_type(&self) -> Option<DataType> {
         match self {
             Self::FixedInt(b) => Some(b.data_type()),
@@ -937,6 +1005,15 @@ impl BTreeMemIndex {
         self.backend.get().map(|b| b.len()).unwrap_or(0)
     }
 
+    /// Heap bytes held by this index; zero before the first insert.
+    ///
+    /// Grows with rows (unlike the pre-allocated HNSW index). Arena-chunk
+    /// granular, so it steps rather than climbs smoothly — plus the exact
+    /// payload of any key too long to live inline in its node.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.backend.get().map(|b| b.resident_bytes()).unwrap_or(0)
+    }
+
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1032,8 +1109,9 @@ pub struct BTreeIndexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, Int64Array, StringArray, UInt32Array};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1268,6 +1346,124 @@ mod tests {
         assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
         assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
         assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
+    }
+
+    /// Keys longer than `INLINE_CAP` spill to a `Box<[u8]>` outside the
+    /// skiplist's arena, so the arena counter alone would leave an arbitrarily
+    /// large duplicate of the column uncharged.
+    #[test]
+    fn test_resident_bytes_counts_spilled_keys() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "s".to_string());
+
+        let rows = 256;
+        let width = 16 * 1024;
+        let values: Vec<String> = (0..rows)
+            .map(|i| format!("{i:07}{}", "z".repeat(width - 7)))
+            .collect();
+        let key_bytes = rows * width;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(
+                values.iter().map(|v| Some(v.as_str())).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        assert!(
+            index.resident_bytes() >= key_bytes,
+            "resident {} must cover the {key_bytes} bytes of spilled key payload",
+            index.resident_bytes()
+        );
+    }
+
+    /// Null positions live behind a mutex the memory poll must never take, so
+    /// their heap is mirrored into an atomic. That mirror has to actually track
+    /// the vector, or a column of nulls goes uncharged against the ceiling.
+    #[rstest]
+    #[case::fixed_int(DataType::Int32)]
+    #[case::bytes(DataType::Utf8)]
+    fn test_resident_bytes_counts_null_positions(#[case] data_type: DataType) {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            data_type.clone(),
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "c".to_string());
+
+        let rows = 1_024;
+        let column: ArrayRef = match data_type {
+            DataType::Int32 => Arc::new(Int32Array::from(vec![None::<i32>; rows])),
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>; rows])),
+            other => unreachable!("unhandled case {other:?}"),
+        };
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let expected = rows * std::mem::size_of::<RowPosition>();
+        assert!(
+            index.resident_bytes() >= expected,
+            "resident {} must cover the {expected} bytes of null positions",
+            index.resident_bytes()
+        );
+    }
+
+    /// Charging the batch's total after the loop is not enough: each key is
+    /// reachable to lock-free readers the moment it is spliced in, so an
+    /// admission sample landing mid-batch would see a growing index against a
+    /// stale byte total and admit a write it should have refused. The charge
+    /// has to land before the key it pays for.
+    #[test]
+    fn test_resident_bytes_covers_keys_already_published() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
+        let rows = 2_000usize;
+        let width = 8 * 1024usize;
+        let values: Vec<String> = (0..rows)
+            .map(|i| format!("{i:07}{}", "z".repeat(width - 7)))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(values)) as Arc<dyn Array>],
+        )
+        .unwrap();
+
+        let index = Arc::new(BTreeMemIndex::new(0, "s".to_string()));
+        let inserting = Arc::clone(&index);
+        let handle = std::thread::spawn(move || inserting.insert(&batch, 0).unwrap());
+
+        // Sample until the insert is partway through. Every sample that catches
+        // it there must already account for the keys it can see; the loop is
+        // only about *reaching* that state, so the assertion is inside it.
+        let mut sampled_mid_insert = false;
+        while !handle.is_finished() {
+            let published = index.len();
+            if published == 0 || published >= rows {
+                std::hint::spin_loop();
+                continue;
+            }
+            sampled_mid_insert = true;
+            let charged = index.resident_bytes();
+            assert!(
+                charged >= published * width,
+                "{published} keys are visible but only {charged} bytes are charged"
+            );
+        }
+        handle.join().unwrap();
+
+        assert!(
+            sampled_mid_insert,
+            "the insert never became observable partway through, so nothing was proven"
+        );
+        assert!(index.resident_bytes() >= rows * width);
     }
 
     #[test]

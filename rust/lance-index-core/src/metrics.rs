@@ -3,39 +3,12 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
-pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
-pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
-pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
-pub const COMPOUND_ADDRESSES_RESOLVED_METRIC: &str = "compound_addresses_resolved";
-pub const COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC: &str = "compound_address_resolution_batches";
-pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
-    "compound_peak_address_resolution_batch_size";
-pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
-pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
-pub const COMPOUND_SHOULD_SKIPPED_WINDOWS_METRIC: &str = "compound_should_skipped_windows";
-pub const COMPOUND_SHOULD_BOUND_RECOMPUTATIONS_METRIC: &str =
-    "compound_should_bound_recomputations";
-pub const COMPOUND_SHOULD_ESSENTIAL_EVALUATIONS_METRIC: &str =
-    "compound_should_essential_evaluations";
-pub const COMPOUND_SHOULD_NON_ESSENTIAL_EVALUATIONS_METRIC: &str =
-    "compound_should_non_essential_evaluations";
-pub const CROSS_COLUMN_STAGED_ATTEMPTS_METRIC: &str = "cross_column_staged_attempts";
-pub const CROSS_COLUMN_STAGED_SUCCESSES_METRIC: &str = "cross_column_staged_successes";
-pub const CROSS_COLUMN_STAGED_FALLBACKS_METRIC: &str = "cross_column_staged_fallbacks";
-pub const CROSS_COLUMN_STAGED_CANDIDATES_METRIC: &str = "cross_column_staged_candidates";
-pub const WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC: &str = "wand_exactness_certificate_attempts";
-pub const WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC: &str = "wand_exactness_certificate_strict";
-pub const WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC: &str =
-    "wand_exactness_certificate_exhaustive";
-pub const WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC: &str =
-    "wand_exactness_certificate_fallbacks";
-pub const WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC: &str =
-    "wand_exactness_certificate_candidates";
-
 /// A trait used by the index to report metrics
 ///
-/// Callers can implement this trait to collect metrics
+/// Callers can implement this trait to collect metrics. Production collectors
+/// must stay coarse-grained: do not record per-document, posting, candidate, or
+/// window events here. Benchmark-only instrumentation belongs in test- or
+/// benchmark-local hooks.
 pub trait MetricsCollector: Send + Sync {
     /// Record partition loads
     ///
@@ -95,74 +68,6 @@ pub trait MetricsCollector: Send + Sync {
     fn record_index_cache_miss(&self) {
         self.record_index_cache_misses(1);
     }
-
-    /// Record AND candidates returned from WAND alignment to the scoring loop.
-    ///
-    /// This excludes candidates pruned before `next()` returns. Use this with
-    /// `record_and_candidates_pruned_before_return` to recover total aligned
-    /// AND candidates.
-    fn record_and_candidates_seen(&self, _num_candidates: usize) {}
-
-    /// Record AND candidates pruned during WAND alignment before `next()` returns.
-    fn record_and_candidates_pruned_before_return(&self, _num_candidates: usize) {}
-
-    fn record_and_full_scores(&self, _num_scores: usize) {}
-
-    fn record_freqs_collected(&self, _num_collections: usize) {}
-
-    /// Record compound FTS document addresses resolved for final row-ID ties.
-    fn record_compound_addresses_resolved(&self, _num_addresses: usize) {}
-
-    /// Record bounded compound FTS address-resolution batches.
-    fn record_compound_address_resolution_batches(&self, _num_batches: usize) {}
-
-    /// Record the largest compound FTS address-resolution batch.
-    fn record_compound_peak_address_resolution_batch_size(&self, _num_addresses: usize) {}
-
-    /// Record unresolved score floors that required a resolved-key retry.
-    fn record_compound_score_floor_overflows(&self, _num_overflows: usize) {}
-
-    /// Record a candidate-buffer high-water mark for compound FTS.
-    fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}
-
-    /// Record pure-SHOULD compound FTS windows skipped using score bounds.
-    fn record_compound_should_skipped_windows(&self, _num_windows: usize) {}
-
-    /// Record score-bound recomputations for pure-SHOULD compound FTS windows.
-    fn record_compound_should_bound_recomputations(&self, _num_recomputations: usize) {}
-
-    /// Record essential-clause evaluations for pure-SHOULD compound FTS.
-    fn record_compound_should_essential_evaluations(&self, _num_evaluations: usize) {}
-
-    /// Record non-essential-clause evaluations for pure-SHOULD compound FTS.
-    fn record_compound_should_non_essential_evaluations(&self, _num_evaluations: usize) {}
-
-    /// Record cross-column queries that attempted candidate-driven staging.
-    fn record_cross_column_staged_attempts(&self, _num_attempts: usize) {}
-
-    /// Record staged executions that produced a complete candidate set.
-    fn record_cross_column_staged_successes(&self, _num_successes: usize) {}
-
-    /// Record staged executions abandoned in favor of exact eager execution.
-    fn record_cross_column_staged_fallbacks(&self, _num_fallbacks: usize) {}
-
-    /// Record unique row-address candidates produced by successful staging.
-    fn record_cross_column_staged_candidates(&self, _num_candidates: usize) {}
-
-    /// Record root Match WAND executions that attempted a k+1 exactness certificate.
-    fn record_wand_exactness_certificate_attempts(&self, _num_attempts: usize) {}
-
-    /// Record certificates proven by a strict score gap after the kth result.
-    fn record_wand_exactness_certificate_strict(&self, _num_certificates: usize) {}
-
-    /// Record certificates proven because WAND exhausted all matching documents.
-    fn record_wand_exactness_certificate_exhaustive(&self, _num_certificates: usize) {}
-
-    /// Record ambiguous certificates that fell back to the exact compound scorer.
-    fn record_wand_exactness_certificate_fallbacks(&self, _num_fallbacks: usize) {}
-
-    /// Record WAND candidates returned to the certificate classifier.
-    fn record_wand_exactness_certificate_candidates(&self, _num_candidates: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.

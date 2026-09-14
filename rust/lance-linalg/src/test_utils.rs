@@ -3,6 +3,24 @@
 
 use half::{bf16, f16};
 use proptest::prelude::*;
+use proptest::test_runner::{Config, TestCaseResult, TestRunner};
+use std::ops::Range;
+
+const CASES_PER_DIMENSION_SHARD: u32 = 16;
+const MIN_TEST_DIMENSION: usize = 4;
+const MAX_TEST_DIMENSION: usize = 4048;
+const NUM_DIMENSION_SHARDS: usize = 16;
+
+pub fn dimension_shard(shard: usize) -> Range<usize> {
+    let dimensions_per_shard = (MAX_TEST_DIMENSION - MIN_TEST_DIMENSION) / NUM_DIMENSION_SHARDS;
+    let start = MIN_TEST_DIMENSION + shard * dimensions_per_shard;
+    let end = if shard + 1 == NUM_DIMENSION_SHARDS {
+        MAX_TEST_DIMENSION
+    } else {
+        start + dimensions_per_shard
+    };
+    start..end
+}
 
 /// Arbitrary finite f16 value.
 pub fn arbitrary_f16() -> impl Strategy<Value = f16> {
@@ -78,4 +96,32 @@ where
         let y = prop::collection::vec(values(), dim);
         (x, y)
     })
+}
+
+pub fn run_vector_pair_proptest<T, S, F>(values: fn() -> S, dim_range: Range<usize>, property: F)
+where
+    T: std::fmt::Debug,
+    S: Strategy<Value = T> + 'static,
+    F: Fn(Vec<T>, Vec<T>) -> TestCaseResult,
+{
+    let strategy = arbitrary_vector_pair(values, dim_range);
+    let mut runner = TestRunner::new(Config {
+        cases: CASES_PER_DIMENSION_SHARD,
+        ..Config::default()
+    });
+    runner.run(&strategy, |(x, y)| property(x, y)).unwrap();
+}
+
+pub fn run_vector_proptest<T, S, F>(values: fn() -> S, dim_range: Range<usize>, property: F)
+where
+    T: std::fmt::Debug,
+    S: Strategy<Value = T>,
+    F: Fn(Vec<T>) -> TestCaseResult,
+{
+    let strategy = prop::collection::vec(values(), dim_range);
+    let mut runner = TestRunner::new(Config {
+        cases: CASES_PER_DIMENSION_SHARD,
+        ..Config::default()
+    });
+    runner.run(&strategy, property).unwrap();
 }

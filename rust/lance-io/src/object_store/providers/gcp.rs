@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
+use object_store::list::PaginatedListStore;
 use object_store::{
     ClientOptions, CredentialProvider, ObjectStore as OSObjectStore, Result as ObjectStoreResult,
     client::{HttpClient, HttpConnector, HttpRequestBody, ReqwestConnector},
@@ -15,7 +16,7 @@ use tokio::sync::RwLock;
 
 use object_store::{
     RetryConfig, StaticCredentialProvider,
-    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
+    gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
 };
 use url::Url;
 
@@ -24,10 +25,10 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
+    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
 };
 use lance_core::error::{Error, Result};
-
+use lance_core::utils::parse::str_is_truthy;
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
 
@@ -237,7 +238,9 @@ impl GcsStoreProvider {
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
+        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
+    ) -> Result<Arc<GoogleCloudStorage>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -279,7 +282,7 @@ impl GcsStoreProvider {
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 }
 
@@ -295,7 +298,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v.as_str() == "true")
+            .map(|v| str_is_truthy(v.as_str()))
             .unwrap_or(false);
 
         let accessor = params.get_accessor();
@@ -307,29 +310,31 @@ impl ObjectStoreProvider for GcsStoreProvider {
             Some(AimdThrottleState::new(throttle_config)?)
         };
 
-        let inner = if use_opendal {
+        let (inner, paginated_lister) = if use_opendal {
             // OpenDAL GCS intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
-            self.build_opendal_gcs_store(&base_path, &storage_options)
-                .await?
-        } else {
-            self.build_google_cloud_store(
-                &base_path,
-                &storage_options,
-                accessor,
-                throttle_state.as_ref(),
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            (
+                self.build_opendal_gcs_store(&base_path, &storage_options)
+                    .await?,
+                None,
             )
-            .await?
-        };
-        let inner = if let Some(throttle_state) = throttle_state {
-            Arc::new(AimdThrottledStore::new_with_state(
-                inner,
-                throttle_state,
-                !use_opendal,
-            )) as Arc<dyn OSObjectStore>
         } else {
-            inner
+            let store = self
+                .build_google_cloud_store(
+                    &base_path,
+                    &storage_options,
+                    accessor,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                store.clone() as Arc<dyn OSObjectStore>,
+                Some(store as Arc<dyn PaginatedListStore>),
+            )
         };
+        let (inner, paginated_lister) =
+            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
             inner,
@@ -344,6 +349,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 }
