@@ -5,6 +5,10 @@
 This specification defines how Lance datasets are organized on object storage.
 The layout design emphasizes portability, allowing datasets to be relocated or referenced across multiple storage systems with minimal metadata changes.
 
+Blob v2 adds managed `.blob` sidecar objects associated with data files and
+references to external objects. Their paths and base resolution rules are defined
+in the [Blob v2 Specification](blob.md#managed-sidecar-resolution).
+
 ## Dataset Root
 
 The dataset root is the location where the dataset was initially created.

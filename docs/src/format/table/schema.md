@@ -178,6 +178,11 @@ Lance supports custom extension types that provide semantic meaning on top of Ar
 
 #### Blob Type
 
+Blob v2 uses the `lance.blob.v2` Arrow extension marker on a struct field.
+Its accepted logical schemas and stored descriptor are defined in the
+[Blob v2 Specification](blob.md). The `blob` logical type below describes the
+earlier binary blob representation.
+
 Represents large binary data stored externally.
 
 | Logical Type | Description |
