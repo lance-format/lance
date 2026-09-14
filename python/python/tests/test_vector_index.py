@@ -2648,12 +2648,10 @@ def test_knn_deleted_rows(tmp_path):
 
 
 def test_nested_field_vector_index(tmp_path):
-    """Test vector index creation and querying on nested fields
+    """Test IVF_PQ indices on a vector field nested in a struct.
 
-    Note: While scalar indices work on nested fields, vector indices currently
-    have a limitation in the DataFusion integration layer that prevents them
-    from working with nested field paths. The Python validation layer now
-    correctly handles nested paths, but the Rust planner needs additional work.
+    Cover partition reads, nearest queries, appends, index optimization, and
+    cosine distance using the nested field path ``data.embedding``.
     """
     # Create a dataset with nested vector field
     dimensions = 128

@@ -75,6 +75,10 @@ use super::utils::{
     SelectionVectorToPrefilter,
 };
 
+mod adaptive_probe;
+
+use adaptive_probe::AutoProbePolicy;
+
 pub const QUERY_INDEX_COL: &str = "query_index";
 
 pub fn query_index_field() -> Field {
@@ -2321,8 +2325,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let state = state.clone();
                     let segment_bitmaps = segment_bitmaps.clone();
                     let mut query = query.clone();
-                    let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
-                    adjust_probes(&mut query, pruned_nprobes);
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
                             DataFusionError::Execution(format!(
@@ -2338,7 +2340,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
-                        let query = normalize_query_for_index(raw_index.as_ref(), query)?;
+                        query = normalize_query_for_index(raw_index.as_ref(), query)?;
+                        let (vector_type, _) = crate::index::vector::utils::get_vector_type(ds.schema(), &column)?;
+                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref(), &vector_type)?;
+                        policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
 
                         // A segment's index file may still physically contain rows for
                         // fragments that were pruned from its fragment_bitmap (e.g. after an
@@ -2798,30 +2803,6 @@ impl ExecutionPlan for ANNIvfBatchExec {
     }
 }
 
-fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
-    query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
-    if let Some(maximum) = query.maximum_nprobes
-        && query.minimum_nprobes > maximum
-    {
-        query.minimum_nprobes = maximum;
-    }
-}
-
-fn early_pruning(dists: &[f32], k: usize) -> usize {
-    if dists.is_empty() {
-        return 0;
-    }
-
-    const PRUNING_FACTORS: [f32; 3] = [0.6, 7.0, 81.0];
-    let factor = match k {
-        ..=1 => PRUNING_FACTORS[0],
-        2..=10 => PRUNING_FACTORS[1],
-        11.. => PRUNING_FACTORS[2],
-    };
-    let dist_threshold = dists[0] * factor;
-    dists.partition_point(|dist| *dist <= dist_threshold)
-}
-
 #[derive(Debug)]
 pub struct MultivectorScoringExec {
     // the inputs are sorted ANN search results
@@ -3010,6 +2991,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 
 #[cfg(test)]
 mod tests {
+    use super::adaptive_probe::AutoProbeConfig;
     use super::*;
 
     use std::any::Any;
@@ -3033,6 +3015,8 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::quantizer::QuantizationType;
+    use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
     use lance_index::{Index, IndexType};
     use lance_io::traits::Reader;
@@ -3125,8 +3109,18 @@ mod tests {
         row_ids: Vec<u64>,
     }
 
+    #[derive(Clone, Copy, Debug, DeepSizeOf)]
+    enum PreparedIndexKind {
+        Flat,
+        Product,
+        Hnsw,
+        Legacy,
+    }
+
     #[derive(Debug, DeepSizeOf)]
     struct PreparedThreadCapturingIndex {
+        metric: DistanceType,
+        kind: PreparedIndexKind,
         prepared_partitions: Arc<Mutex<Vec<usize>>>,
         searched_partitions: Arc<Mutex<Vec<usize>>>,
         search_threads: Arc<Mutex<Vec<String>>>,
@@ -3356,7 +3350,7 @@ mod tests {
         }
 
         fn supports_prepared_partition_search(&self) -> bool {
-            true
+            !matches!(self.kind, PreparedIndexKind::Legacy)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -3501,17 +3495,17 @@ mod tests {
             unimplemented!()
         }
 
-        fn sub_index_type(
-            &self,
-        ) -> (
-            lance_index::vector::v3::subindex::SubIndexType,
-            lance_index::vector::quantizer::QuantizationType,
-        ) {
-            unimplemented!()
+        fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+            match self.kind {
+                PreparedIndexKind::Flat => (SubIndexType::Flat, QuantizationType::Flat),
+                PreparedIndexKind::Product => (SubIndexType::Flat, QuantizationType::Product),
+                PreparedIndexKind::Hnsw => (SubIndexType::Hnsw, QuantizationType::Flat),
+                PreparedIndexKind::Legacy => panic!("legacy sub-index metadata is unavailable"),
+            }
         }
 
         fn metric_type(&self) -> DistanceType {
-            DistanceType::L2
+            self.metric
         }
     }
 
@@ -3683,6 +3677,8 @@ mod tests {
         let searched_partitions = Arc::new(Mutex::new(Vec::new()));
         let search_threads = Arc::new(Mutex::new(Vec::new()));
         let index: Arc<dyn VectorIndex> = Arc::new(PreparedThreadCapturingIndex {
+            metric: DistanceType::L2,
+            kind: PreparedIndexKind::Flat,
             prepared_partitions: prepared_partitions.clone(),
             searched_partitions: searched_partitions.clone(),
             search_threads: search_threads.clone(),
@@ -3696,37 +3692,97 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_adjust_probes_rules() {
+    #[rstest]
+    #[case::l2("l2", true)]
+    #[case::cosine("cosine", true)]
+    #[case::dot("dot", false)]
+    #[case::fixed_dot("fixed_dot", false)]
+    #[case::hamming("hamming", false)]
+    #[case::float16_column("f16", false)]
+    #[case::float64_query("query_f64", false)]
+    #[case::null_query("null", false)]
+    #[case::nonfinite_query("nonfinite", false)]
+    #[case::multivector("multi", false)]
+    #[case::product("product", false)]
+    #[case::hnsw("hnsw", false)]
+    #[case::legacy("legacy", false)]
+    #[case::bounded("bounded", false)]
+    #[case::fixed("fixed", false)]
+    #[case::large_k("large_k", false)]
+    #[case::refine("refine", false)]
+    fn test_auto_policy_gates_before_reading_experimental_config(
+        #[case] scenario: &str,
+        #[case] reads_config: bool,
+    ) {
         let mut query = base_query();
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 10);
-        assert_eq!(query.maximum_nprobes, None);
-
-        let mut query = base_query();
-        query.minimum_nprobes = 20;
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 20);
-        assert_eq!(query.maximum_nprobes, None);
-
-        let mut query = base_query();
-        query.maximum_nprobes = Some(25);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 10);
-        assert_eq!(query.maximum_nprobes, Some(25));
-
-        let mut query = base_query();
-        query.maximum_nprobes = Some(5);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 5);
-        assert_eq!(query.maximum_nprobes, Some(5));
-
-        let mut query = base_query();
-        query.minimum_nprobes = 30;
-        query.maximum_nprobes = Some(50);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 30);
-        assert_eq!(query.maximum_nprobes, Some(50));
+        query.k = if scenario == "large_k" { 101 } else { 1 };
+        query.key = match scenario {
+            "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
+            "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
+            "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
+            _ => Arc::new(Float32Array::from(vec![0.0])),
+        };
+        if scenario == "bounded" {
+            query.maximum_nprobes = Some(2);
+        } else if matches!(scenario, "fixed" | "fixed_dot") {
+            query.maximum_nprobes = Some(query.minimum_nprobes);
+        }
+        if scenario == "refine" {
+            query.refine_factor = Some(2);
+        }
+        let element_type = if scenario == "f16" {
+            DataType::Float16
+        } else {
+            DataType::Float32
+        };
+        let mut vector_type =
+            DataType::FixedSizeList(Arc::new(ArrowField::new("item", element_type, true)), 1);
+        if scenario == "multi" {
+            vector_type = DataType::List(Arc::new(ArrowField::new("item", vector_type, true)));
+        }
+        let index = PreparedThreadCapturingIndex {
+            metric: match scenario {
+                "cosine" => DistanceType::Cosine,
+                "dot" | "fixed_dot" => DistanceType::Dot,
+                "hamming" => DistanceType::Hamming,
+                _ => DistanceType::L2,
+            },
+            kind: match scenario {
+                "product" => PreparedIndexKind::Product,
+                "hnsw" => PreparedIndexKind::Hnsw,
+                "legacy" => PreparedIndexKind::Legacy,
+                _ => PreparedIndexKind::Flat,
+            },
+            prepared_partitions: Arc::default(),
+            searched_partitions: Arc::default(),
+            search_threads: Arc::default(),
+            row_ids: vec![vec![1], vec![2]],
+        };
+        let mut called = false;
+        let result = AutoProbePolicy::select_with_config(&query, &index, &vector_type, |_, _| {
+            called = true;
+            Err(DataFusionError::Execution(
+                "invalid LANCE_AUTO_PROBE_MARGIN".to_owned(),
+            ))
+        });
+        assert_eq!(called, reads_config);
+        if reads_config {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LANCE_AUTO_PROBE_MARGIN")
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                if matches!(scenario, "fixed" | "fixed_dot") {
+                    AutoProbePolicy::Fixed
+                } else {
+                    AutoProbePolicy::Legacy
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -3869,14 +3925,29 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::uncapped(false)]
+    #[case::auto_initial_cap(true)]
     #[tokio::test]
-    async fn test_sequential_late_search_prepares_all_then_stops_search_early() {
+    async fn test_sequential_late_search_prepares_all_then_stops_search_early(
+        #[case] has_auto_cap: bool,
+    ) {
         let (index, prepared_partitions, searched_partitions, _search_threads) =
             prepared_index(vec![21, 22, 23]);
         let mut query = base_query();
         query.k = 2;
         query.minimum_nprobes = 0;
         query.maximum_nprobes = Some(3);
+        if has_auto_cap {
+            AutoProbeConfig {
+                min_initial_nprobes: 1,
+                margin: 80.0,
+                max_initial_nprobes: Some(1),
+            }
+            .apply(&mut query, &[0.1, 0.2, 0.3], DistanceType::L2);
+            assert_eq!(query.minimum_nprobes, 1);
+            assert_eq!(query.maximum_nprobes, Some(3));
+        }
         let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
         state.record_batch(
             &RecordBatch::try_new(
@@ -3907,8 +3978,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
+        let first_late_partition = usize::from(has_auto_cap);
+        assert_eq!(
+            *prepared_partitions.lock().unwrap(),
+            (first_late_partition..3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            *searched_partitions.lock().unwrap(),
+            vec![first_late_partition]
+        );
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
     }
 
@@ -4906,6 +4984,7 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
+        let initial_nprobes = 20;
         let stats_holder = StatsHolder::default();
 
         let results = fixture
@@ -4913,7 +4992,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17 AND label = 18")
@@ -4932,7 +5011,7 @@ mod tests {
         // We skip the late search because by then we know there are no results
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(10 * num_deltas)
+            &(initial_nprobes * num_deltas)
         );
         assert_find_partitions_elapsed_recorded(&stats);
     }
@@ -4984,13 +5063,33 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
+        let initial_nprobes = 20;
+        // Use a fixed budget to identify which matching rows the initial search
+        // reaches, independently of centroid tie ordering and Auto calibration.
+        let initial_results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(initial_nprobes)
+            .maximum_nprobes(initial_nprobes)
+            .prefilter(true)
+            .filter("userid < 20")
+            .unwrap()
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(initial_results.num_rows() > 0 && initial_results.num_rows() < 20);
         let stats_holder = StatsHolder::default();
         let results = fixture
             .dataset
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .filter("userid < 20")
             .unwrap()
@@ -5008,21 +5107,35 @@ mod tests {
         // we can cheaply stop early.
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(10 * num_deltas)
+            &(initial_nprobes * num_deltas)
         );
         assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
 
-        // 15 of the results come from beyond the closest 10 partitions and these will have infinite
-        // distance.
-        let num_infinite_results = results
-            .column(0)
+        // Only the rows missing from the fixed-budget search should be emitted
+        // by the cheap prefilter shortcut with a placeholder distance.
+        let initial_ids = initial_results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values();
+        for (row_id, distance) in results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .zip(results[DIST_COL].as_primitive::<Float32Type>().values())
+        {
+            if initial_ids.contains(row_id) {
+                assert!(distance.is_finite());
+            } else {
+                assert_eq!(*distance, f32::INFINITY);
+            }
+        }
+        let num_infinite_results = results[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .filter(|val| val.is_infinite())
+            .filter(|distance| distance.is_infinite())
             .count();
-        assert_eq!(num_infinite_results, 15);
+        assert_eq!(num_infinite_results, 20 - initial_results.num_rows());
 
         // If we set a refine factor then the distance should not be infinite.
         let results = fixture
@@ -5030,7 +5143,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .refine(1)
             .filter("userid < 20")

@@ -260,7 +260,7 @@ pub async fn write_fragments_direct(
 
 fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
     for fragment in fragments {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             if data_file.file_version()? != expected {
                 return Ok(false);
             }
@@ -590,16 +590,28 @@ pub async fn open_writer(
             .await
         }
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::open_current_blob_v2_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
-                },
-                object_store,
-                schema,
-                base_dir,
-                options,
-            )
-            .await
+            let create_file_writer = move |object_writer, schema, filename, base_id| {
+                create_current_file_writer(version, object_writer, schema, filename, base_id)
+            };
+            if schema.fields_pre_order().any(Field::is_blob_v2) {
+                write::open_current_blob_v2_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            } else {
+                write::open_current_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            }
         }
     }
 }

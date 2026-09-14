@@ -543,9 +543,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -553,14 +553,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2738,7 +2739,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3955,7 +3956,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4027,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4070,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4080,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4117,7 +4118,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4149,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4166,7 +4167,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4175,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4208,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4233,13 +4234,14 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "serde",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "lance-geo"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4253,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4321,7 +4323,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4343,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4383,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4397,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4411,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4459,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4473,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4513,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -6054,7 +6056,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "12.0.0-beta.18"
+version = "12.1.0-beta.0"
 dependencies = [
  "alloc-stdlib",
  "arrow",
@@ -6959,9 +6961,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -7023,9 +7025,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",

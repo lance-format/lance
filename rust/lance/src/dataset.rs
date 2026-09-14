@@ -135,8 +135,8 @@ use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
-    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    default_commit_retry_timeout, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -156,6 +156,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -1668,7 +1669,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
         )

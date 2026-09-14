@@ -1979,16 +1979,19 @@ impl MergeInsertJob {
         use datafusion::logical_expr::{col, lit};
         let session_ctx =
             fragment_update_session_context(spill_session_context, spill_execution_options);
-        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
-        // single batch that is larger than the memory pool, so we must
-        // rechunk oversized batches before they reach the sort.
+        // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
+        // sort overhead and spill/merge reservation. SortExec must reserve an
+        // entire input batch even when spilling is enabled. This cap reduces
+        // reservation pressure but cannot guarantee success with a small pool
+        // or competing consumers; indivisible oversized rows pass through with
+        // a warning.
         let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
             .sort(vec![col(ROW_ADDR).sort(true, true)])?;
         let sorted_plan = sorted.create_physical_plan().await?;
         // Walk the physical plan and insert HardCapBatchSizeExec below every
-        // sort node so each input batch fits in the memory pool.
+        // sort node to enforce the input cap (deep-copying oversized slices).
         let capped_plan = sorted_plan
             .transform_down(|node| {
                 if node.downcast_ref::<SortExec>().is_some() {

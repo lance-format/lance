@@ -4,6 +4,7 @@
 //! Secondary Index
 //!
 
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -1153,6 +1154,30 @@ pub trait IndexBuilder {
     async fn build(&self) -> Result<()>;
 }
 
+fn remap_deletes_all_indexed_rows(
+    dataset: &Dataset,
+    indexed_fragments: &RoaringBitmap,
+    row_id_map: &RowAddrRemap,
+) -> bool {
+    indexed_fragments.iter().all(|fragment_id| {
+        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            return false;
+        };
+        let Some(physical_rows) = fragment.metadata().physical_rows else {
+            // Legacy fragments may not record their physical row count, so the
+            // remap cannot prove that every possible address was deleted.
+            return false;
+        };
+        (0..physical_rows).all(|offset| {
+            let Ok(offset) = u32::try_from(offset) else {
+                return false;
+            };
+            let row_addr = u64::from(RowAddress::new_from_parts(fragment_id, offset));
+            row_id_map.get(row_addr) == Some(None)
+        })
+    })
+}
+
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
@@ -1201,8 +1226,10 @@ pub(crate) async fn remap_index(
         )));
     }
 
-    if let Some(deleted_bitmap) = row_id_map.fully_deleted_fragments()
-        && Some(deleted_bitmap) == matched.fragment_bitmap
+    if matched
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|fragments| remap_deletes_all_indexed_rows(dataset, fragments, row_id_map))
     {
         // If remap deleted all rows, we can just return the same index ID.
         // This can happen if there is a bug where the index is covering empty
@@ -6346,6 +6373,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    #[tokio::test]
+    async fn test_remap_partial_map_does_not_keep_index() {
+        let data = gen_batch()
+            .col("int", array::step::<Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(16)),
+            )
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+        assert_eq!(dataset.count_all_rows().await.unwrap(), 256);
+        assert_eq!(
+            index_meta.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([0u32]))
+        );
+
+        let remap = RowAddrRemap::direct(HashMap::from([(0u64, None)]));
+        assert_eq!(remap.get(1), None);
+
+        let result = remap_index(&dataset, &index_meta.uuid, &remap)
+            .await
+            .unwrap();
+        assert_ne!(result, RemapResult::Keep(index_meta.uuid));
+
+        let complete_remap =
+            RowAddrRemap::direct((0u64..256).map(|offset| (offset, None)).collect());
+        let mut legacy_dataset = dataset.clone();
+        let manifest = Arc::make_mut(&mut legacy_dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[0].physical_rows = None;
+        assert!(!remap_deletes_all_indexed_rows(
+            &legacy_dataset,
+            index_meta.fragment_bitmap.as_ref().unwrap(),
+            &complete_remap,
+        ));
     }
 
     /// The `fields.len() > 1` rejection in `remap_index`, which had no dedicated
