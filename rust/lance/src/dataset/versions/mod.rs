@@ -642,7 +642,7 @@ pub async fn create_fragment_from_file(
     );
     if !same_family {
         return Err(Error::invalid_input(format!(
-            "File version family mismatch. Dataset fallback: {:?} Fragment version: {:?}",
+            "File version family mismatch. Dataset default: {:?} Fragment version: {:?}",
             dataset_version, file_version
         )));
     }

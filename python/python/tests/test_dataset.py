@@ -5213,10 +5213,14 @@ def test_legacy_dataset(tmp_path: Path):
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
-    # Append will write v1 if dataset was originally created with v1
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="stable", mode="append"
-    )
+    # Explicit targets cannot cross the V1/V2 boundary. Omitting the target
+    # continues to use the dataset default.
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="stable", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[1]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
@@ -5232,9 +5236,12 @@ def test_legacy_dataset(tmp_path: Path):
 
     assert len(dataset.get_fragments()) == 0
 
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="legacy", mode="append"
-    )
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="legacy", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
@@ -5250,9 +5257,12 @@ def test_legacy_dataset(tmp_path: Path):
 
     assert len(dataset.get_fragments()) == 0
 
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="stable", mode="append"
-    )
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="stable", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)

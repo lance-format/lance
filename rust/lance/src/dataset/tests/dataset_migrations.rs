@@ -246,9 +246,16 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
 
     if matches!(data_storage_version, LanceFileVersion::Stable) {
         let error = append_result.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(
-            error.to_string().contains("do not have a single version"),
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed"),
             "{error}"
+        );
+        assert_eq!(
+            Dataset::open(test_uri).await.unwrap().version().version,
+            broken_version
         );
         return;
     }

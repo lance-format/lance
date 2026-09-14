@@ -72,23 +72,25 @@ impl Transaction {
         fragments: &[Fragment],
         user_requested: Option<ConcreteFileVersion>,
     ) -> Result<DataStorageFormat> {
-        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
-            // Ensure user-requested matches data files
-            if let Some(user_requested) = user_requested
-                && user_requested != file_version
-            {
-                return Err(Error::invalid_input(format!(
-                    "User requested data storage version ({}) does not match version in data files ({})",
-                    user_requested, file_version
-                )));
+        // Mixed prewritten files cannot imply a default. An explicit default
+        // takes precedence; finalization validates the referenced file versions.
+        let version = match user_requested {
+            Some(ConcreteFileVersion::V1) => {
+                // Preserve legacy creation's homogeneous-file contract.
+                if let Some(actual) = Fragment::try_infer_version(fragments)?
+                    && actual != ConcreteFileVersion::V1
+                {
+                    return Err(Error::invalid_input(format!(
+                        "User requested data storage version ({}) does not match version in data files ({actual})",
+                        ConcreteFileVersion::V1
+                    )));
+                }
+                Some(ConcreteFileVersion::V1)
             }
-            Ok(DataStorageFormat::new(file_version))
-        } else {
-            // If no files use user-requested or default
-            Ok(user_requested
-                .map(DataStorageFormat::new)
-                .unwrap_or_default())
-        }
+            Some(version) => Some(version),
+            None => Fragment::try_infer_version(fragments)?,
+        };
+        Ok(version.map(DataStorageFormat::new).unwrap_or_default())
     }
 
     pub async fn restore_old_manifest(

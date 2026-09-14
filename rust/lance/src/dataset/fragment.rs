@@ -6791,8 +6791,17 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn create_from_file_v2() {
+    async fn create_from_file_v2(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        file_version: LanceFileVersion,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -6812,7 +6821,7 @@ mod tests {
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer = lance_file::versions::create_lazy_writer(
-            LanceFileVersion::Stable.resolve(),
+            file_version.resolve(),
             object_writer,
             FileWriterOptions::default(),
         )
@@ -6828,35 +6837,15 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
-        );
-
-        let mismatched_path = dataset.data_dir().join("mismatched_file.lance");
-        let object_writer = store.create(&mismatched_path).await.unwrap();
-        let mut mismatched_writer = lance_file::versions::create_lazy_writer(
-            lance_file::version::ConcreteFileVersion::V2_0,
-            object_writer,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-        mismatched_writer.write_batch(&new_data).await.unwrap();
-        mismatched_writer.finish().await.unwrap();
-
-        let mismatched_frag =
-            FileFragment::create_from_file("mismatched_file.lance", &dataset, 0, Some(128))
-                .await
-                .unwrap();
-        assert_eq!(
-            mismatched_frag.files[0].file_version().unwrap(),
-            ConcreteFileVersion::V2_0
+            file_version.resolve()
         );
 
         let op = Operation::Append {
-            fragments: vec![mismatched_frag],
+            fragments: vec![frag],
         };
         let transaction = Transaction::new_from_version(dataset.version().version, op);
         let dataset = CommitBuilder::new(Arc::new(dataset))
-            .with_storage_format(LanceFileVersion::V2_0)
+            .with_storage_format(file_version)
             .execute(transaction)
             .await
             .unwrap();
