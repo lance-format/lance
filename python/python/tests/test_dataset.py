@@ -2911,7 +2911,11 @@ def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: s
     assert result["nested"].to_pylist() == expected_nested
 
 
-def test_merge_insert_subcols_in_place(tmp_path: Path):
+@pytest.mark.parametrize(
+    "base_version,patch_version",
+    [("2.0", "2.2"), ("2.2", "2.0"), ("2.1", "2.3"), ("2.3", "2.1")],
+)
+def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_version):
     """`write_mode("rewrite_columns")` patches the source columns into the
     fragments that already hold the matched rows.
 
@@ -2928,7 +2932,10 @@ def test_merge_insert_subcols_in_place(tmp_path: Path):
     )
     # Split across two fragments
     dataset = lance.write_dataset(
-        initial_data, tmp_path / "dataset", max_rows_per_file=5
+        initial_data,
+        tmp_path / "dataset",
+        max_rows_per_file=5,
+        data_storage_version=base_version,
     )
     fragments_before = [f.fragment_id for f in dataset.get_fragments()]
 
@@ -2942,6 +2949,7 @@ def test_merge_insert_subcols_in_place(tmp_path: Path):
         dataset.merge_insert("a")
         .when_matched_update_all()
         .write_mode("rewrite_columns")
+        .data_storage_version(patch_version)
         .execute(new_values)
     )
 
@@ -2955,7 +2963,17 @@ def test_merge_insert_subcols_in_place(tmp_path: Path):
             "c": range(10, 20),
         }
     )
+    dataset = lance.dataset(dataset.uri)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == {base_version, patch_version}
     assert dataset.to_table().sort_by("a") == expected
+    assert dataset.to_table(columns=["c", "b", "a"], filter="b >= 20") == (
+        expected.filter(pc.greater_equal(expected["b"], 20)).select(["c", "b", "a"])
+    )
+    assert dataset.take([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
 
     # Patching columns cannot add rows, so asking for it explicitly on a merge
     # that also inserts is rejected rather than quietly rewriting whole rows.
@@ -4259,6 +4277,177 @@ def test_merge_insert_exact_data_storage_version(tmp_path: Path, version):
         "id": [1, 2, 3],
         "value": [10, 21, 30],
     }
+
+
+def _assert_mixed_version_reads(dataset, expected):
+    expected = expected.sort_by("id")
+    ordered = dataset.to_table(scan_in_order=True)
+    assert ordered.sort_by("id") == expected
+    assert dataset.to_table(columns=["value", "id"]).sort_by("id") == (
+        expected.select(["value", "id"])
+    )
+    assert dataset.to_table(filter="value >= 50").sort_by("id") == expected.filter(
+        pc.greater_equal(expected["value"], 50)
+    )
+    assert dataset.to_table(filter="value IS NULL").sort_by("id") == expected.filter(
+        pc.is_null(expected["value"])
+    )
+    # Updates can move rows to new fragments. Use scan order only for positional
+    # addressing; the full scan above is independently checked against the oracle.
+    indices = [len(ordered) - 1, 0, len(ordered) // 2, 0]
+    assert dataset.take(indices) == ordered.take(indices)
+    assert dataset.take(indices, columns=["value", "id"]) == ordered.take(
+        indices
+    ).select(["value", "id"])
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        ("2.0", "2.1", "2.2", "2.3"),
+        ("2.1", "2.2", "2.3", "2.0"),
+        ("2.2", "2.3", "2.0", "2.1"),
+        ("2.3", "2.0", "2.1", "2.2"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["reencode", "try_binary_copy"])
+def test_mixed_version_mutations_preserve_data(tmp_path: Path, versions, mode):
+    data = pa.table(
+        {
+            "id": range(8),
+            "value": pa.array([10, None, 30, 40, 50, 60, None, 80], pa.int64()),
+            "label": ["zero", None, "", "你好", "four", "five", "six", "seven"],
+            "items": pa.array(
+                [[0], None, [], [None, 3], [4, 5], [], [6], [7]],
+                pa.list_(pa.int64()),
+            ),
+        }
+    )
+    uri = tmp_path / "dataset"
+    dataset = lance.write_dataset(
+        data.slice(0, 4), uri, max_rows_per_file=2, data_storage_version=versions[0]
+    )
+    _assert_mixed_version_reads(lance.dataset(uri), data.slice(0, 4))
+    dataset = lance.write_dataset(
+        data.slice(4),
+        dataset,
+        mode="append",
+        max_rows_per_file=2,
+        data_storage_version=versions[1],
+    )
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == set(versions[:2])
+    _assert_mixed_version_reads(lance.dataset(uri), data)
+
+    expected_rows = data.to_pylist()
+    dataset.update(
+        {"value": "coalesce(value, 0) + 100"},
+        where="id IN (1, 4)",
+        data_storage_version=versions[2],
+    )
+    expected_rows[1]["value"] = 100
+    expected_rows[4]["value"] = 150
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.Table.from_pylist(expected_rows, schema=data.schema)
+    )
+
+    merged_rows = [
+        {"id": 2, "value": None, "label": "changed", "items": [9, None]},
+        {"id": 8, "value": 800, "label": "new", "items": []},
+    ]
+    (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .data_storage_version(versions[3])
+        .execute(pa.Table.from_pylist(merged_rows, schema=data.schema))
+    )
+    expected_rows[2] = merged_rows[0]
+    expected_rows.append(merged_rows[1])
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.Table.from_pylist(expected_rows, schema=data.schema)
+    )
+
+    dataset.delete("id IN (0, 6)")
+    expected = pa.Table.from_pylist(
+        [row for row in expected_rows if row["id"] not in (0, 6)], schema=data.schema
+    )
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    retained = dataset.get_fragments()[0].metadata
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=32,
+        excluded_fragment_ids=[retained.id],
+        data_storage_version=versions[0],
+        compaction_mode=mode,
+    )
+    assert metrics.fragments_removed > 0
+    assert retained in [fragment.metadata for fragment in dataset.get_fragments()]
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=32,
+        data_storage_version=versions[1],
+        compaction_mode=mode,
+    )
+    assert len(dataset.get_fragments()) == 1
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+
+@pytest.mark.parametrize("copy_kind", ["shallow_clone", "deep_clone", "branch"])
+def test_mixed_version_snapshot_data_isolation(tmp_path: Path, copy_kind):
+    uri = tmp_path / "source"
+    expected = pa.table(
+        {"id": range(8), "value": pa.array([10, None, 30, 40, 50, 60, None, 80])}
+    )
+    for i, version in enumerate(["2.0", "2.1", "2.2", "2.3"]):
+        dataset = lance.write_dataset(
+            expected.slice(i * 2, 2),
+            uri,
+            mode="create" if i == 0 else "append",
+            data_storage_version=version,
+        )
+    snapshot = dataset.version
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == {"2.0", "2.1", "2.2", "2.3"}
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    if copy_kind == "branch":
+        copied = dataset.create_branch("copy", snapshot)
+    else:
+        copied = getattr(dataset, copy_kind)(tmp_path / "copy", snapshot)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), expected)
+
+    copied.update({"value": "999"}, where="id = 3", data_storage_version="2.1")
+    copy_rows = expected.to_pylist()
+    copy_rows[3]["value"] = 999
+    copy_expected = pa.Table.from_pylist(copy_rows, schema=expected.schema)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    dataset.delete("id IN (0, 7)")
+    dataset.optimize.compact_files(data_storage_version="2.2")
+    changed_version = dataset.version
+    changed = expected.slice(1, 6)
+    _assert_mixed_version_reads(lance.dataset(uri), changed)
+    _assert_mixed_version_reads(lance.dataset(uri, version=snapshot), expected)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
+
+    restored = dataset.checkout_version(snapshot)
+    restored.restore()
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    _assert_mixed_version_reads(lance.dataset(uri, version=changed_version), changed)
+    appended = pa.table({"id": [8], "value": [90]}, schema=expected.schema)
+    lance.write_dataset(appended, restored, mode="append", data_storage_version="2.3")
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.concat_tables([expected, appended])
+    )
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
 
 
 @pytest.mark.parametrize("operation", ["update", "merge_insert", "compaction"])
@@ -5714,21 +5903,29 @@ def test_data_replacement(tmp_path: Path):
 
 
 def _write_overlay_file(
-    dataset, base_dir: Path, name: str, batch: pa.Table, fields: List[int]
+    dataset,
+    base_dir: Path,
+    name: str,
+    batch: pa.Table,
+    fields: List[int],
+    *,
+    version: Optional[str] = None,
 ):
     """Write an overlay value file (one value column per covered field, no key
     column) and return a DataFile mapping its columns to the given dataset
-    `fields`. The file version is copied from a base data file."""
-    path = base_dir / "data" / name
-    with LanceFileWriter(str(path)) as writer:
-        writer.write_batch(batch)
+    `fields`. Omission uses the exact version of the first base data file."""
     base_df = dataset.get_fragments()[0].metadata.files[0]
+    version = version or f"{base_df.file_major_version}.{base_df.file_minor_version}"
+    path = base_dir / "data" / name
+    with LanceFileWriter(str(path), version=version) as writer:
+        writer.write_batch(batch)
+    major, minor = map(int, version.split("."))
     return lance.fragment.DataFile(
         path=name,
         fields=fields,
         column_indices=list(range(len(fields))),
-        file_major_version=base_df.file_major_version,
-        file_minor_version=base_df.file_minor_version,
+        file_major_version=major,
+        file_minor_version=minor,
         file_size_bytes=os.path.getsize(path),
     )
 
@@ -5736,6 +5933,64 @@ def _write_overlay_file(
 @pytest.fixture
 def enable_unstable_data_overlay_files(monkeypatch):
     monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+@pytest.mark.parametrize("overlay_version", ["2.2", "2.3"])
+@pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
+def test_mixed_version_overlays_preserve_data(
+    tmp_path: Path, enable_unstable_data_overlay_files, overlay_version, mode
+):
+    uri = tmp_path / "dataset"
+    data = pa.table({"id": range(6), "value": [10, 20, 30, 40, 50, 60]})
+    dataset = lance.write_dataset(data.slice(0, 3), uri, data_storage_version="2.0")
+    dataset = lance.write_dataset(
+        data.slice(3), dataset, mode="append", data_storage_version="2.1"
+    )
+    # Only the second fragment has overlays. The newer overlay replaces one
+    # covered value with NULL, while a different updated row is later deleted.
+    for name, offsets, values in [
+        ("older.lance", [0, 1, 2], [400, 500, 600]),
+        ("newer.lance", [0, 2], [None, 999]),
+    ]:
+        file = _write_overlay_file(
+            dataset,
+            uri,
+            name,
+            pa.table({"value": pa.array(values, pa.int64())}),
+            fields=[1],
+            version=overlay_version,
+        )
+        dataset = lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [
+                    lance.LanceOperation.DataOverlayGroup(
+                        1, [lance.LanceOperation.DataOverlayFile(file, offsets=offsets)]
+                    )
+                ]
+            ),
+            read_version=dataset.version,
+        )
+    expected = pa.table({"id": range(6), "value": [10, 20, 30, None, 500, 999]})
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    dataset.delete("value = 500")
+    expected = expected.filter(pc.not_equal(expected["id"], 4))
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    before = dataset.version
+    options = dict(
+        target_rows_per_fragment=32,
+        data_storage_version="2.2",
+        compaction_mode=mode,
+    )
+    if mode == "force_binary_copy":
+        with pytest.raises(OSError, match="binary copy"):
+            dataset.optimize.compact_files(**options)
+        assert lance.dataset(uri).version == before
+    else:
+        dataset.optimize.compact_files(**options)
+        assert len(dataset.get_fragments()) == 1
+        assert not dataset.get_fragments()[0].metadata.overlays
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
 
 
 def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
