@@ -84,7 +84,7 @@ use crate::{
         ColumnInfo, DecodePageTask, DecodedArray, DecodedPage, FilterExpression, LoadedPageShard,
         MessageType, PageEncoding, PageInfo, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
-        StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
+        StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard, has_i32_offsets,
     },
     encoder::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
@@ -4640,6 +4640,20 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
 
     fn data_type(&self) -> &DataType {
         self.field.data_type()
+    }
+
+    fn rows_in_current_page(&self) -> Option<u64> {
+        self.page_decoders
+            .front()
+            .map(|page| page.num_rows() - self.rows_drained_in_current)
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        if has_i32_offsets(self.field.data_type()) {
+            Ok(num_rows.min(self.rows_in_current_page().unwrap_or(0)))
+        } else {
+            Ok(num_rows)
+        }
     }
 
     fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {

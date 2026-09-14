@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    decoder::has_i32_offsets,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
@@ -428,6 +429,25 @@ impl ChildState {
         composite.has_more = self.rows_drained != self.num_rows;
         Ok(composite)
     }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let mut safe_rows = 0;
+        let mut remaining = num_rows;
+        for decoder in &self.scheduled {
+            let rows_in_page = remaining.min(decoder.rows_left());
+            let safe_rows_in_page = decoder.max_rows_to_drain(rows_in_page)?;
+            safe_rows += safe_rows_in_page;
+            if safe_rows_in_page < rows_in_page {
+                return Ok(safe_rows);
+            }
+
+            remaining -= rows_in_page;
+            if remaining == 0 || has_i32_offsets(decoder.data_type()) {
+                return Ok(safe_rows);
+            }
+        }
+        Ok(safe_rows)
+    }
 }
 
 // Wrapper around ChildState that orders using rows_unawaited
@@ -545,6 +565,23 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             }),
             num_rows,
         })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let safe_rows = self
+            .children
+            .iter()
+            .try_fold(num_rows, |safe_rows, child| {
+                child
+                    .max_rows_to_drain(num_rows)
+                    .map(|child_safe_rows| safe_rows.min(child_safe_rows))
+            })?;
+        if num_rows > 0 && safe_rows == 0 {
+            return Err(Error::not_supported(
+                "A single row exceeds Arrow's i32 offset capacity".to_string(),
+            ));
+        }
+        Ok(safe_rows)
     }
 
     fn rows_loaded(&self) -> u64 {

@@ -177,6 +177,21 @@ impl StructuralFieldDecoder for StructuralListDecoder {
         &self.data_type
     }
 
+    fn rows_in_current_page(&self) -> Option<u64> {
+        self.child.rows_in_current_page()
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> lance_core::Result<u64> {
+        let child_limit = self.child.max_rows_to_drain(num_rows)?;
+        if matches!(self.data_type, DataType::List(_)) {
+            Ok(self
+                .rows_in_current_page()
+                .map_or(child_limit, |rows_in_page| child_limit.min(rows_in_page)))
+        } else {
+            Ok(child_limit)
+        }
+    }
+
     fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
         Err(lance_core::Error::not_supported(
             "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"

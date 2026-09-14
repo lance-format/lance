@@ -323,7 +323,32 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
 
+    /// Returns the number of requested rows that can be decoded into one Arrow array.
+    ///
+    /// Most page decoders can always drain the full request. Decoders that build arrays
+    /// with i32 offsets may return fewer rows to keep those offsets representable.
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        Ok(num_rows)
+    }
+
     fn data_type(&self) -> &DataType;
+}
+
+/// Returns whether concatenating arrays of this type can overflow an i32 offset buffer.
+pub(crate) fn has_i32_offsets(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Binary | DataType::Utf8 | DataType::List(_) | DataType::ListView(_) => true,
+        DataType::Map(_, _) => true,
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => has_i32_offsets(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_i32_offsets(field.data_type())),
+        DataType::Dictionary(_, values) => has_i32_offsets(values),
+        DataType::RunEndEncoded(_, values) => has_i32_offsets(values.data_type()),
+        _ => false,
+    }
 }
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
@@ -1462,6 +1487,7 @@ pub struct BatchDecodeStream {
     rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
+    limit_i32_offset_batch_size: bool,
 }
 
 impl BatchDecodeStream {
@@ -1480,6 +1506,16 @@ impl BatchDecodeStream {
         num_rows: u64,
         root_decoder: SimpleStructDecoder,
     ) -> Self {
+        Self::new_with_i32_offset_limit(scheduled, rows_per_batch, num_rows, root_decoder, true)
+    }
+
+    fn new_with_i32_offset_limit(
+        scheduled: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+        limit_i32_offset_batch_size: bool,
+    ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
@@ -1489,6 +1525,7 @@ impl BatchDecodeStream {
             rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
+            limit_i32_offset_batch_size,
         }
     }
 
@@ -1571,6 +1608,12 @@ impl BatchDecodeStream {
         );
         self.root_decoder.wait_for_loaded(loaded_need).await?;
 
+        if self.limit_i32_offset_batch_size {
+            let safe_to_take = LogicalPageDecoder::max_rows_to_drain(&self.root_decoder, to_take)?;
+            self.rows_remaining += to_take - safe_to_take;
+            to_take = safe_to_take;
+        }
+
         let next_task = self.root_decoder.drain(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
@@ -1628,6 +1671,7 @@ trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()>;
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64>;
 }
 impl RootDecoderType for StructuralStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
@@ -1643,6 +1687,9 @@ impl RootDecoderType for StructuralStructDecoder {
         // Waiting happens elsewhere (not as part of the decoder)
         Ok(())
     }
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        StructuralFieldDecoder::max_rows_to_drain(self, num_rows)
+    }
 }
 impl RootDecoderType for SimpleStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
@@ -1656,6 +1703,9 @@ impl RootDecoderType for SimpleStructDecoder {
     }
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()> {
         runtime.block_on(self.wait_for_loaded(loaded_need))
+    }
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        LogicalPageDecoder::max_rows_to_drain(self, num_rows)
     }
 }
 
@@ -1782,6 +1832,10 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             return Ok(None);
         }
 
+        let safe_to_take = self.root_decoder.max_rows_to_drain(to_take)?;
+        self.rows_remaining += to_take - safe_to_take;
+        to_take = safe_to_take;
+
         let next_task = self.root_decoder.drain_batch(to_take)?;
 
         self.rows_drained += to_take;
@@ -1873,6 +1927,7 @@ pub struct StructuralBatchDecodeStream {
     /// Post-decode feedback: actual bytes-per-row measured from the most
     /// recently decoded batch.  Zero means no feedback yet (use schema estimate).
     bytes_per_row_feedback: Arc<AtomicU64>,
+    limit_i32_offset_batch_size: bool,
 }
 
 impl StructuralBatchDecodeStream {
@@ -1893,6 +1948,27 @@ impl StructuralBatchDecodeStream {
         spawn_batch_decode_tasks: bool,
         batch_size_bytes: Option<u64>,
     ) -> Self {
+        Self::new_with_i32_offset_limit(
+            scheduled,
+            rows_per_batch,
+            num_rows,
+            root_decoder,
+            spawn_batch_decode_tasks,
+            batch_size_bytes,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_i32_offset_limit(
+        scheduled: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: StructuralStructDecoder,
+        spawn_batch_decode_tasks: bool,
+        batch_size_bytes: Option<u64>,
+        limit_i32_offset_batch_size: bool,
+    ) -> Self {
         let schema_bytes_per_row = if batch_size_bytes.is_some() {
             estimate_bytes_per_row(root_decoder.data_type()).max(1.0)
         } else {
@@ -1911,6 +1987,7 @@ impl StructuralBatchDecodeStream {
             batch_size_bytes,
             schema_bytes_per_row,
             bytes_per_row_feedback: Arc::new(AtomicU64::new(0)),
+            limit_i32_offset_batch_size,
         }
     }
 
@@ -1988,6 +2065,13 @@ impl StructuralBatchDecodeStream {
 
         if to_take == 0 {
             return Ok(None);
+        }
+
+        if self.limit_i32_offset_batch_size {
+            let safe_to_take =
+                StructuralFieldDecoder::max_rows_to_drain(&self.root_decoder, to_take)?;
+            self.rows_remaining += to_take - safe_to_take;
+            to_take = safe_to_take;
         }
 
         let next_task = self.root_decoder.drain_batch_task(to_take)?;
@@ -2180,6 +2264,31 @@ pub fn create_decode_stream(
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
     batch_size_bytes: Option<u64>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
+    create_decode_stream_with_i32_offset_limit(
+        schema,
+        num_rows,
+        batch_size,
+        is_structural,
+        should_validate,
+        spawn_structural_batch_decode_tasks,
+        rx,
+        batch_size_bytes,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_decode_stream_with_i32_offset_limit(
+    schema: &Schema,
+    num_rows: u64,
+    batch_size: u32,
+    is_structural: bool,
+    should_validate: bool,
+    spawn_structural_batch_decode_tasks: bool,
+    rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    batch_size_bytes: Option<u64>,
+    limit_i32_offset_batch_size: bool,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
         let structural_decoder = StructuralStructDecoder::new(
@@ -2188,13 +2297,14 @@ pub fn create_decode_stream(
             /*is_root=*/ true,
             /*nullable=*/ false,
         )?;
-        Ok(StructuralBatchDecodeStream::new(
+        Ok(StructuralBatchDecodeStream::new_with_i32_offset_limit(
             rx,
             batch_size,
             num_rows,
             structural_decoder,
             spawn_structural_batch_decode_tasks,
             batch_size_bytes,
+            limit_i32_offset_batch_size,
         )
         .into_stream())
     } else {
@@ -2205,7 +2315,14 @@ pub fn create_decode_stream(
         let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
+        Ok(BatchDecodeStream::new_with_i32_offset_limit(
+            rx,
+            batch_size,
+            num_rows,
+            simple_struct_decoder,
+            limit_i32_offset_batch_size,
+        )
+        .into_stream())
     }
 }
 
@@ -2952,6 +3069,17 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
+    /// Returns the number of logical rows remaining in the current encoded page.
+    ///
+    /// Composite decoders translate their child's page boundary into their own
+    /// logical row space. `None` means that the decoder has no page boundary.
+    fn rows_in_current_page(&self) -> Option<u64> {
+        None
+    }
+    /// Returns the number of requested rows that can be decoded into one Arrow array.
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        Ok(num_rows)
+    }
     /// Returns the exact decoded byte count for each of [`CANDIDATE_BATCH_SIZES`]
     /// row counts, clamped to `rows_remaining`.
     ///
@@ -3019,7 +3147,9 @@ pub async fn decode_batch(
     let is_structural = layout == EncodedBatchLayout::Structural;
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = !matches!(mode.ok().as_deref(), Some("never"));
-    let mut decode_stream = create_decode_stream(
+    // `EncodedBatch` is created from one RecordBatch, so every i32-offset array is
+    // already known to fit in one Arrow array. Preserve the single-batch contract here.
+    let mut decode_stream = create_decode_stream_with_i32_offset_limit(
         &batch.schema,
         batch.num_rows,
         batch.num_rows as u32,
@@ -3028,6 +3158,7 @@ pub async fn decode_batch(
         spawn_structural_batch_decode_tasks,
         rx,
         None,
+        false,
     )?;
     decode_stream.next().await.unwrap().task.await
 }
@@ -3036,7 +3167,112 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
+    use crate::repdef::{DefinitionInterpretation, RepDefUnraveler};
+    use arrow_array::StringArray;
     use std::collections::VecDeque;
+
+    struct StaticArrayDecodeTask(ArrayRef);
+
+    impl DecodeArrayTask for StaticArrayDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Ok((self.0, 0))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticArrayPageDecoder {
+        array: ArrayRef,
+        rows_drained: u64,
+    }
+
+    impl StaticArrayPageDecoder {
+        fn new(values: &[&str]) -> Self {
+            Self {
+                array: Arc::new(StringArray::from(values.to_vec())),
+                rows_drained: 0,
+            }
+        }
+    }
+
+    impl LogicalPageDecoder for StaticArrayPageDecoder {
+        fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<'_, Result<()>> {
+            std::future::ready(Ok(())).boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            self.array.len() as u64
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.array.len() as u64
+        }
+
+        fn rows_drained(&self) -> u64 {
+            self.rows_drained
+        }
+
+        fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+            let array = self
+                .array
+                .slice(self.rows_drained as usize, num_rows as usize);
+            self.rows_drained += num_rows;
+            Ok(NextDecodeTask {
+                task: Box::new(StaticArrayDecodeTask(array)),
+                num_rows,
+            })
+        }
+
+        fn data_type(&self) -> &DataType {
+            self.array.data_type()
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticStructuralDecodeTask(ArrayRef);
+
+    impl DecodePageTask for StaticStructuralDecodeTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            let num_rows = self.0.len() as u64;
+            Ok(DecodedPage {
+                data: DataBlock::from(self.0),
+                repdef: RepDefUnraveler::new(
+                    None,
+                    None,
+                    Arc::<[DefinitionInterpretation]>::from([]),
+                    num_rows,
+                ),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticStructuralPageDecoder {
+        array: ArrayRef,
+        rows_drained: u64,
+    }
+
+    impl StaticStructuralPageDecoder {
+        fn new(values: &[&str]) -> Self {
+            Self {
+                array: Arc::new(StringArray::from(values.to_vec())),
+                rows_drained: 0,
+            }
+        }
+    }
+
+    impl StructuralPageDecoder for StaticStructuralPageDecoder {
+        fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            let array = self
+                .array
+                .slice(self.rows_drained as usize, num_rows as usize);
+            self.rows_drained += num_rows;
+            Ok(Box::new(StaticStructuralDecodeTask(array)))
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.array.len() as u64
+        }
+    }
 
     #[derive(Debug)]
     struct FailingPageDecoder {
@@ -3249,6 +3485,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_array_stream_splits_i32_offset_pages() {
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let root_decoder = SimpleStructDecoder::new(fields, 4);
+        let (tx, rx) = unbounded_channel();
+        let pages = vec![
+            MessageType::DecoderReady(DecoderReady {
+                decoder: Box::new(StaticArrayPageDecoder::new(&["a", "b"])),
+                path: VecDeque::from([0]),
+            }),
+            MessageType::DecoderReady(DecoderReady {
+                decoder: Box::new(StaticArrayPageDecoder::new(&["c", "d"])),
+                path: VecDeque::from([0]),
+            }),
+        ];
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 4,
+            decoders: pages,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream = BatchDecodeStream::new(rx, 4, 4, root_decoder).into_stream();
+        let mut batch_sizes = Vec::new();
+        while let Some(task) = stream.next().await {
+            batch_sizes.push(task.task.await.unwrap().num_rows());
+        }
+
+        assert_eq!(batch_sizes, vec![2, 2]);
+    }
+
+    #[tokio::test]
     async fn test_structural_stream_stops_on_load_error() {
         let rows_per_batch = 1;
         let total_rows = 2;
@@ -3295,6 +3562,48 @@ mod tests {
             batches.next().await.is_none(),
             "stream should stop after the page-load error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_structural_stream_splits_i32_offset_pages() {
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
+        let (tx, rx) = unbounded_channel();
+        let pages = [["a", "b"], ["c", "d"]]
+            .into_iter()
+            .map(|values| {
+                let page = LoadedPageShard {
+                    decoder: Box::new(StaticStructuralPageDecoder::new(&values)),
+                    path: VecDeque::from([0]),
+                };
+                MessageType::UnloadedPage(UnloadedPageShard(async move { Ok(page) }.boxed()))
+            })
+            .collect();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 4,
+            decoders: pages,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            4,
+            4,
+            root_decoder,
+            /*spawn_batch_decode_tasks=*/ false,
+            None,
+        )
+        .into_stream();
+        let mut batch_sizes = Vec::new();
+        while let Some(task) = stream.next().await {
+            batch_sizes.push(task.task.await.unwrap().num_rows());
+        }
+
+        assert_eq!(batch_sizes, vec![2, 2]);
     }
 
     #[test]

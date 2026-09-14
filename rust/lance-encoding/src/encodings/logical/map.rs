@@ -168,6 +168,17 @@ impl StructuralFieldDecoder for StructuralMapDecoder {
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
+
+    fn rows_in_current_page(&self) -> Option<u64> {
+        self.child.rows_in_current_page()
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let child_limit = self.child.max_rows_to_drain(num_rows)?;
+        Ok(self
+            .rows_in_current_page()
+            .map_or(child_limit, |rows_in_page| child_limit.min(rows_in_page)))
+    }
 }
 
 #[derive(Debug)]
