@@ -1050,6 +1050,7 @@ impl From<&Manifest> for pb::Manifest {
                     build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragment_metadata: None,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),

@@ -32,6 +32,136 @@ message UUID {
   bytes uuid = 1;
 }
 
+// Fragment metadata layout for this version.
+message FragmentMetadata {
+  oneof layout {
+    FragmentMetadataTree tree = 1;
+  }
+}
+
+// Fragment state for one Version Manifest.
+message FragmentMetadataTree {
+  oneof root {
+    FragmentMetadataRoot inline_root = 1;
+    // External root path relative to this dataset.
+    string root_path = 2;
+  }
+
+  // Mutations not represented by the selected root.
+  repeated FragmentMetadataMutation mutations_since_root = 3;
+
+  // Next unused action sequence for this version.
+  uint64 next_action_sequence = 4;
+}
+
+// Inline or external root state.
+message FragmentMetadataRoot {
+  repeated FragmentMetadataChild children = 1;
+  repeated FragmentMetadataMutation buffer = 2;
+
+  // First action sequence not represented by this root.
+  uint64 next_action_sequence = 3;
+}
+
+/* Children are ordered by min_key. A child owns [min_key, next min_key);
+ * the last child inherits its parent's upper bound.
+ */
+message FragmentMetadataChild {
+  // Tree object path relative to its resolved dataset.
+  string path = 1;
+
+  // Absent inherits the containing object's dataset. Otherwise indexes Manifest.base_paths.
+  optional uint32 base_id = 2;
+
+  // Inclusive lower bound of this child's range.
+  uint64 min_key = 3;
+
+  // Fragment count in this subtree, including this object's buffer.
+  uint64 num_keys = 4;
+
+  // Edges from this object to its leaves. Zero for a leaf.
+  uint32 height = 5;
+
+  // Direct child count. Zero for a leaf.
+  uint32 num_children = 6;
+
+  // Physical rows in this subtree, including this object's buffer.
+  uint64 total_rows = 7;
+
+  // Stored byte length of the child object.
+  uint64 object_size = 8;
+
+  /* Every mutation for this leaf's range at or below this value has been
+   * applied, and none remain buffered above it. Zero means none. Must be 0
+   * for interiors.
+   */
+  uint64 materialized_through_action_sequence = 9;
+
+  // Visible rows in this subtree, including this object's buffer.
+  uint64 visible_rows = 10;
+}
+
+// Interior routing node.
+message FragmentMetadataNode {
+  repeated FragmentMetadataChild children = 1;
+  repeated FragmentMetadataMutation buffer = 2;
+}
+
+// Validated mutation with exact after-minus-before aggregate deltas.
+message FragmentMetadataMutation {
+  uint64 action_sequence = 1;
+  FragmentAction action = 2;
+  sint64 fragment_count_delta = 3;
+  sint64 total_rows_delta = 4;
+  sint64 visible_rows_delta = 5;
+}
+
+// Use add_fragment when no other action can represent the result.
+message FragmentAction {
+  oneof action {
+    DataFragment add_fragment = 1;
+    uint64 remove_fragment = 2;
+    AddDataFile add_data_file = 3;
+    RemoveDataFile remove_data_file = 4;
+    AddDeletionFile add_deletion_file = 5;
+    ClearDeletionFile clear_deletion_file = 6;
+    ReplaceDataFile replace_data_file = 7;
+  }
+}
+
+// Append to the ordered file list.
+message AddDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+}
+
+// Remove every matching path, preserving order.
+message RemoveDataFile {
+  uint64 frag_id = 1;
+  string path = 2;
+}
+
+message AddDeletionFile {
+  uint64 frag_id = 1;
+  DeletionFile deletion_file = 2;
+}
+
+message ClearDeletionFile {
+  uint64 frag_id = 1;
+}
+
+/* On the first expected_path match, replace path, file_size_bytes, and base_id.
+ * Preserve its column mapping and file version.
+ */
+message ReplaceDataFile {
+  uint64 frag_id = 1;
+  string expected_path = 2;
+  string path = 3;
+  uint64 file_size_bytes = 4;
+  // Absent means the file lives under the dataset root.
+  optional uint32 base_id = 5;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -42,6 +172,11 @@ message Manifest {
 
   // Fragments of the dataset.
   repeated DataFragment fragments = 2;
+
+  /* Tree tables set this, leave fragments empty, and set bit 9 on both flag
+   * fields. Old readers skip unknown fields and would otherwise see an empty table.
+   */
+  FragmentMetadata fragment_metadata = 22;
 
   // Snapshot version number.
   uint64 version = 3;
@@ -133,6 +268,8 @@ message Manifest {
    * * 1 << 8: reserved for datasets that may reference recognized V2 data files
    *   with different exact versions. Implementations that do not support the
    *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 9: fragment records live in fragment_metadata. The fragments list
+   *   must be empty. Readers that do not know this bit must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
 
@@ -147,12 +284,9 @@ message Manifest {
    */
   uint64 writer_feature_flags = 10;
 
-  /* The highest fragment ID that has been used so far.
-   *
-   * This ID is not guaranteed to be present in the current version, but it may
-   * have been used in previous versions.
-   *
-   * For a single fragment, will be zero. For no fragments, will be absent.
+  /* Highest fragment id ever allocated or reserved in this lineage.
+   * Absent only before the first allocation or reservation. Never decreases.
+   * u32::MAX means the fragment-id space is exhausted.
    */
   optional uint32 max_fragment_id = 11;
 
