@@ -6125,11 +6125,15 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        // Multivector search ranks the final candidates by PQ-approximated
+        // scores before refining, so the M4 code of `lightweight_pq_params`
+        // (unseeded KMeans) drops recall below the threshold in a few percent
+        // of runs. The 4-bit M32 code keeps recall at 1.0.
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
             lightweight_hnsw_params(),
-            lightweight_pq_params(),
+            lightweight_pq_params_with_bits(4),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
