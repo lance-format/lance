@@ -69,6 +69,14 @@ pub trait MetricsCollector: Send + Sync {
         self.record_index_cache_misses(1);
     }
 
+    /// Record the current number and deep-size estimate of prepared vector
+    /// partitions retained by a search.
+    fn record_prepared_partition_live(&self, _num_parts: usize, _bytes: usize) {}
+
+    /// Record the peak number and deep-size estimate of prepared vector
+    /// partitions retained by a search.
+    fn record_prepared_partition_peak(&self, _num_parts: usize, _bytes: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///

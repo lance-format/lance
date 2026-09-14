@@ -886,6 +886,10 @@ pub struct IndexMetrics {
     index_comparisons: Count,
     index_cache_hits: Count,
     index_cache_misses: Count,
+    prepared_partition_live_count: Gauge,
+    prepared_partition_live_bytes: Gauge,
+    prepared_partition_peak_count: Gauge,
+    prepared_partition_peak_bytes: Gauge,
     /// Per-query sink that accumulates exact index-file I/O as partitions are
     /// loaded from storage.  Shared by all clones of this `IndexMetrics`, so
     /// concurrent partition loads all funnel into the same counters.  Published
@@ -902,6 +906,14 @@ impl IndexMetrics {
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
             index_cache_hits: metrics.new_count(INDEX_CACHE_HITS_METRIC, partition),
             index_cache_misses: metrics.new_count(INDEX_CACHE_MISSES_METRIC, partition),
+            prepared_partition_live_count: MetricBuilder::new(metrics)
+                .gauge("ivf_prepared_partition_live_count", partition),
+            prepared_partition_live_bytes: MetricBuilder::new(metrics)
+                .gauge("ivf_prepared_partition_live_bytes", partition),
+            prepared_partition_peak_count: MetricBuilder::new(metrics)
+                .gauge("ivf_prepared_partition_peak_count", partition),
+            prepared_partition_peak_bytes: MetricBuilder::new(metrics)
+                .gauge("ivf_prepared_partition_peak_bytes", partition),
             io_stats: IoStats::new(),
             io_metrics: IoMetrics::new(metrics, partition),
         }
@@ -931,6 +943,14 @@ impl MetricsCollector for IndexMetrics {
     }
     fn record_index_cache_misses(&self, num_misses: usize) {
         self.index_cache_misses.add(num_misses);
+    }
+    fn record_prepared_partition_live(&self, num_parts: usize, bytes: usize) {
+        self.prepared_partition_live_count.set(num_parts);
+        self.prepared_partition_live_bytes.set(bytes);
+    }
+    fn record_prepared_partition_peak(&self, num_parts: usize, bytes: usize) {
+        self.prepared_partition_peak_count.set_max(num_parts);
+        self.prepared_partition_peak_bytes.set_max(bytes);
     }
     fn io_stats(&self) -> Option<IoStats> {
         Some(self.io_stats.clone())
