@@ -2612,15 +2612,18 @@ impl Dataset {
 
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
+        // Reading each manifest is an independent object-store GET, so fetch
+        // them concurrently instead of serially — otherwise listing versions on
+        // remote storage costs one round-trip latency per version.
         let mut versions: Vec<Version> = self
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
-                match read_manifest(&self.object_store, &location.path, location.size).await {
-                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
-                    Err(e) => Err(e),
-                }
+            .map_ok(|location| async move {
+                let manifest =
+                    read_manifest(&self.object_store, &location.path, location.size).await?;
+                Ok(Version::from(&manifest))
             })
+            .try_buffer_unordered(self.object_store.io_parallelism())
             .try_collect()
             .await?;
 
