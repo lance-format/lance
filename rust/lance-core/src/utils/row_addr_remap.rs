@@ -150,18 +150,15 @@ impl RowAddrRemap {
         }
     }
 
+    /// Returns fragments this remap can prove have no surviving physical rows.
+    ///
+    /// A non-empty direct map cannot provide this proof because it does not
+    /// record the physical row count of each fragment.
     pub fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         match self {
             Self::Compact(c) => c.fully_deleted_fragments(),
-            Self::Direct(m) => {
-                if m.values().all(|v| v.is_none()) {
-                    Some(RoaringBitmap::from_iter(
-                        m.keys().map(|addr| (addr >> 32) as u32),
-                    ))
-                } else {
-                    None
-                }
-            }
+            Self::Direct(m) if m.is_empty() => Some(RoaringBitmap::new()),
+            Self::Direct(_) => None,
         }
     }
 }
@@ -625,9 +622,7 @@ impl RemapStep {
     fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         match self {
             Self::Compact(compact) => compact.fully_deleted_fragments(),
-            Self::Direct(direct) if direct.values().all(Option::is_none) => Some(
-                RoaringBitmap::from_iter(direct.keys().map(|addr| (addr >> 32) as u32)),
-            ),
+            Self::Direct(direct) if direct.is_empty() => Some(RoaringBitmap::new()),
             Self::Direct(_) => None,
         }
     }
@@ -978,6 +973,27 @@ mod tests {
                 .fully_deleted_fragments()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_direct_partial_map_is_not_fully_deleted() {
+        let remap = RowAddrRemap::direct(HashMap::from([(addr(5, 1), None)]));
+
+        assert_eq!(remap.get(addr(5, 0)), None);
+        assert_eq!(remap.fully_deleted_fragments(), None);
+    }
+
+    #[test]
+    fn test_chained_partial_direct_maps_are_not_fully_deleted() {
+        let remap = RowAddrRemap::chained([
+            RowAddrRemap::direct(HashMap::from([(addr(5, 1), None)])),
+            RowAddrRemap::direct(HashMap::from([(addr(6, 1), None)])),
+        ]);
+
+        assert!(matches!(remap, RowAddrRemap::Compact(_)));
+        assert_eq!(remap.get(addr(5, 0)), None);
+        assert_eq!(remap.get(addr(6, 0)), None);
+        assert_eq!(remap.fully_deleted_fragments(), None);
     }
 
     #[test]
