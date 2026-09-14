@@ -302,6 +302,17 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+// Experimental: once the conjunction floor is positive, wide conjunctions only
+// intersect pairwise when at least this percentage of the lead block survives
+// the frequency-bound prune; below it the cursor merge's early exits win.
+// 0 always uses the pairwise kernel, values above 100 never do.
+static PAIRWISE_FLOOR_MIN_SURVIVOR_PCT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_PAIRWISE_FLOOR_MIN_SURVIVOR_PCT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(50)
+});
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
@@ -4425,7 +4436,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, _, false) => unsafe {
                         merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
                     },
-                    (_, _, has_floor) if use_pairwise_intersection => {
+                    (_, _, has_floor)
+                        if use_pairwise_intersection
+                            && (!has_floor || {
+                                let lead = &wins[0];
+                                let len = lead.end - lead.pos;
+                                let survivors = (lead.pos..lead.end)
+                                    .filter(|&pos| {
+                                        let freq = unsafe { *lead.freqs.add(pos) } as usize;
+                                        !freq_cannot_beat[freq.min(FREQ_LUT_BUCKETS - 1)]
+                                    })
+                                    .count();
+                                survivors * 100 >= len * *PAIRWISE_FLOOR_MIN_SURVIVOR_PCT
+                            }) =>
+                    {
                         #[cfg(test)]
                         {
                             self.and_window_stats.pairwise_intersections += 1;
