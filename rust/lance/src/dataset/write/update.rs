@@ -15,14 +15,13 @@ use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::{JsonArray, is_json_field};
@@ -30,7 +29,6 @@ use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
-use lance_datafusion::expr::safe_coerce_scalar;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -183,28 +181,10 @@ impl UpdateBuilder {
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             );
         if dest_type != src_type && !is_json_string {
-            expr = match expr {
-                // TODO: remove this branch once DataFusion supports casting List to FSL
-                // This should happen in Arrow 51.0.0
-                Expr::Literal(value @ ScalarValue::List(_), metadata)
-                    if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
-                {
-                    Expr::Literal(
-                        safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
-                            ArrowError::CastError(format!(
-                                "Failed to cast {} to {} during planning",
-                                value.data_type(),
-                                dest_type
-                            ))
-                        })?,
-                        metadata,
-                    )
-                }
-                _ => expr
-                    .cast_to(&dest_type, &df_schema)
-                    .map_err(box_error)
-                    .context(InvalidInputSnafu {})?,
-            };
+            expr = expr
+                .cast_to(&dest_type, &df_schema)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?;
         }
 
         // Optimize the expression. For example, this might apply the cast on
@@ -952,6 +932,63 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[rstest]
+    #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
+    #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
+    #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]
+    #[case::null_list("NULL", None, None)]
+    #[case::short_list("[3]", None, Some("has length 1"))]
+    #[case::long_list("[3, 4, 5]", None, Some("has length 3"))]
+    #[tokio::test]
+    async fn test_update_vector_literal(
+        #[case] expression: &str,
+        #[case] expected: Option<Vec<Option<f32>>>,
+        #[case] cast_error: Option<&str>,
+    ) {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(2)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let dataset = Arc::new(dataset);
+        let original = dataset.scan().try_into_batch().await.unwrap();
+        let result = async {
+            UpdateBuilder::new(dataset.clone())
+                .set("vector", expression)?
+                .build()?
+                .execute()
+                .await
+        }
+        .await;
+        if let Some(message) = cast_error {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains(message), "{error}");
+            let mut reopened = dataset.as_ref().clone();
+            reopened.checkout_latest().await.unwrap();
+            assert_eq!(reopened.version().version, dataset.version().version);
+            assert_eq!(reopened.scan().try_into_batch().await.unwrap(), original);
+            return;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let batch = result.new_dataset.scan().try_into_batch().await.unwrap();
+        let actual = batch["vector"].as_fixed_size_list();
+        let expected = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            [expected.clone(), expected],
+            2,
+        );
+        assert_eq!(actual, &expected);
     }
 
     #[rstest]
