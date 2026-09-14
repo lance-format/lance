@@ -1013,6 +1013,40 @@ impl TransactionAlteration {
     }
 }
 
+fn resolve_probe_bounds(
+    nprobes: Option<i32>,
+    minimum_nprobes: Option<i32>,
+    maximum_nprobes: Option<i32>,
+) -> (Option<usize>, Option<usize>) {
+    let normalize = |value: i32| value.max(1) as usize;
+
+    if minimum_nprobes.is_some() || maximum_nprobes.is_some() {
+        (
+            minimum_nprobes.map(normalize),
+            maximum_nprobes.map(normalize),
+        )
+    } else {
+        let exact = nprobes.map(normalize);
+        (exact, exact)
+    }
+}
+
+fn apply_probe_bounds(
+    scanner: &mut Scanner,
+    nprobes: Option<i32>,
+    minimum_nprobes: Option<i32>,
+    maximum_nprobes: Option<i32>,
+) {
+    let (minimum_nprobes, maximum_nprobes) =
+        resolve_probe_bounds(nprobes, minimum_nprobes, maximum_nprobes);
+    if let Some(minimum_nprobes) = minimum_nprobes {
+        scanner.minimum_nprobes(minimum_nprobes);
+    }
+    if let Some(maximum_nprobes) = maximum_nprobes {
+        scanner.maximum_nprobes(maximum_nprobes);
+    }
+}
+
 impl DirectoryNamespace {
     fn manifest_ns_for_read(&self) -> Option<&Arc<manifest::ManifestNamespace>> {
         self.write_manifest_ns
@@ -3170,6 +3204,8 @@ impl DirectoryNamespace {
         prefilter: Option<bool>,
         bypass_vector_index: Option<bool>,
         nprobes: Option<i32>,
+        minimum_nprobes: Option<i32>,
+        maximum_nprobes: Option<i32>,
         ef: Option<i32>,
         refine_factor: Option<i32>,
         distance_type: Option<&str>,
@@ -3240,9 +3276,7 @@ impl DirectoryNamespace {
                 })?;
 
             // ANN parameters — must be applied after nearest().
-            if let Some(n) = nprobes {
-                scanner.nprobes(n.max(1) as usize);
-            }
+            apply_probe_bounds(scanner, nprobes, minimum_nprobes, maximum_nprobes);
             if let Some(e) = ef {
                 scanner.ef(e.max(1) as usize);
             }
@@ -5029,6 +5063,8 @@ impl LanceNamespace for DirectoryNamespace {
             request.query.prefilter,
             request.query.bypass_vector_index,
             request.query.nprobes,
+            request.query.minimum_nprobes,
+            request.query.maximum_nprobes,
             request.query.ef,
             request.query.refine_factor,
             request.query.distance_type.as_deref(),
@@ -5071,6 +5107,8 @@ impl LanceNamespace for DirectoryNamespace {
             request.prefilter,
             request.bypass_vector_index,
             request.nprobes,
+            request.minimum_nprobes,
+            request.maximum_nprobes,
             request.ef,
             request.refine_factor,
             request.distance_type.as_deref(),
@@ -5443,10 +5481,12 @@ impl LanceNamespace for DirectoryNamespace {
                     scanner.distance_metric(metric);
                 }
 
-                // Apply nprobes if specified (maps to minimum_nprobes, matching lancedb behavior)
-                if let Some(nprobes) = request.nprobes {
-                    scanner.minimum_nprobes(nprobes as usize);
-                }
+                apply_probe_bounds(
+                    &mut scanner,
+                    request.nprobes,
+                    request.minimum_nprobes,
+                    request.maximum_nprobes,
+                );
 
                 // Apply ef (HNSW search effort) if specified
                 if let Some(ef) = request.ef {
@@ -6163,6 +6203,25 @@ mod tests {
     use arrow_ipc::reader::{FileReader, StreamReader};
     use lance::index::vector::StageParams;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::unset(None, None, None, None, None)]
+    #[case::legacy_exact(Some(20), None, None, Some(20), Some(20))]
+    #[case::minimum_only(None, Some(3), None, Some(3), None)]
+    #[case::maximum_only(None, None, Some(7), None, Some(7))]
+    #[case::new_fields_override_legacy(Some(20), Some(3), None, Some(3), None)]
+    fn test_resolve_probe_bounds(
+        #[case] nprobes: Option<i32>,
+        #[case] minimum_nprobes: Option<i32>,
+        #[case] maximum_nprobes: Option<i32>,
+        #[case] expected_minimum: Option<usize>,
+        #[case] expected_maximum: Option<usize>,
+    ) {
+        assert_eq!(
+            resolve_probe_bounds(nprobes, minimum_nprobes, maximum_nprobes),
+            (expected_minimum, expected_maximum)
+        );
+    }
 
     fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
         let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
