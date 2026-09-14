@@ -184,8 +184,10 @@ impl UpdateBuilder {
             );
         if dest_type != src_type && !is_json_string {
             expr = match expr {
-                // TODO: remove this branch once DataFusion supports casting List to FSL
-                // This should happen in Arrow 51.0.0
+                // Preserve the permissive Arrow cast used for list literal assignments:
+                // wrong-length lists become null, and failed element casts become null
+                // elements. DataFusion supports List -> FixedSizeList, but its ordinary
+                // CAST uses safe=false and rejects these inputs instead.
                 Expr::Literal(value @ ScalarValue::List(_), metadata)
                     if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
                 {
@@ -952,6 +954,81 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[rstest]
+    #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
+    #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::invalid_element("['invalid', '4.5']", Some(vec![None, Some(4.5)]), Some("Cannot cast string"))]
+    #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]
+    #[case::null_list("NULL", None, None)]
+    #[case::short_list("[3]", None, Some("has length 1"))]
+    #[case::long_list("[3, 4, 5]", None, Some("has length 3"))]
+    #[tokio::test]
+    async fn test_update_vector_literal(
+        #[case] expression: &str,
+        #[case] expected: Option<Vec<Option<f32>>>,
+        #[case] cast_error: Option<&str>,
+    ) {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(2)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Ordinary CAST accepts these types, but rejects values that the update
+        // literal coercion converts to nulls.
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let planner = Planner::new(schema.clone());
+        let expression_type = schema.field_with_name("vector").unwrap().data_type();
+        let expr = planner
+            .parse_expr(expression)
+            .unwrap()
+            .cast_to(
+                expression_type,
+                &DFSchema::try_from(schema.as_ref().clone()).unwrap(),
+            )
+            .unwrap();
+        let cast_result = planner.optimize_expr(expr).and_then(|expr| {
+            let physical = planner.create_physical_expr(&expr)?;
+            Ok(physical
+                .evaluate(&RecordBatch::new_empty(schema))?
+                .into_array(2)?)
+        });
+        let cast_array = if let Some(message) = cast_error {
+            let error = cast_result.unwrap_err();
+            assert!(matches!(error, Error::Arrow { .. }), "{error:?}");
+            assert!(error.to_string().contains(message), "{error}");
+            None
+        } else {
+            Some(cast_result.unwrap())
+        };
+
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .set("vector", expression)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let batch = result.new_dataset.scan().try_into_batch().await.unwrap();
+        let actual = batch["vector"].as_fixed_size_list();
+        let expected = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            [expected.clone(), expected],
+            2,
+        );
+        assert_eq!(actual, &expected);
+        if let Some(cast_array) = cast_array {
+            assert_eq!(cast_array.as_fixed_size_list(), &expected);
+        }
     }
 
     #[rstest]
