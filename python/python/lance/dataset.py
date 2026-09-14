@@ -3670,9 +3670,21 @@ class LanceDataset(pa.dataset.Dataset):
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
 
-        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
-        bypass spilling to disk. Setting this to true can avoid memory exhaustion
-        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+        Index training sorts can spill to disk under memory pressure.
+        ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
+        on the process's total memory usage. Spilling still requires memory for
+        individual input batches and for sorting and merging them, so large
+        batches or a small pool can cause memory reservation failures.
+
+        Setting ``LANCE_BYPASS_SPILLING`` to any value (including ``0`` or
+        ``false``) bypasses the bounded memory pool for these sorts. Sorting then
+        stays in memory, ignoring ``LANCE_MEM_POOL_SIZE``. This can avoid pool
+        reservation failures but increases memory use and can exhaust system
+        memory; use it only when the sort fits in available memory. The historical
+        SortExec allocation issues in
+        https://github.com/apache/datafusion/issues/10073 were fixed upstream by
+        https://github.com/apache/datafusion/pull/14644; that fix does not remove
+        the batch-size and memory-pool constraints above.
 
         **Experimental API**
 
