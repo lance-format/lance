@@ -4534,6 +4534,138 @@ mod tests {
             .expect("loading large frag reuse index details must not fail");
     }
 
+    /// A shallow clone stamps its index metadata with a `base_id`, and the
+    /// entry's external `details.binpb` stays in the SOURCE dataset's indices
+    /// directory. Loading the details on the clone must resolve the file
+    /// through the entry's base instead of the clone's own dataset root,
+    /// which never contained the file.
+    #[tokio::test]
+    async fn test_shallow_clone_loads_external_frag_reuse_details() {
+        // On disk: base-path resolution must reach the source dataset's
+        // store, which memory:// fixtures cannot demonstrate.
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let clone_uri = format!("{}/clone", clone_dir);
+
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use lance_index::frag_reuse::{FragDigest, FragReuseIndexDetails, FragReuseVersion};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            &source_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // An FRI entry whose details spill to the external file: real
+        // compactions produce run-compressed bitmaps far below the
+        // 204800-byte inline threshold, so synthesize enough reuse versions
+        // to cross it.
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        let mut versions = Vec::new();
+        for i in 0..3500u64 {
+            let old_id = 1_000 + i;
+            let mut addrs = RoaringTreemap::new();
+            for offset in 0..4u64 {
+                addrs.insert((old_id << 32) + offset);
+            }
+            let mut serialized = Vec::new();
+            addrs.serialize_into(&mut serialized).unwrap();
+            versions.push(FragReuseVersion {
+                dataset_version: i + 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialized,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            });
+        }
+        let details = FragReuseIndexDetails { versions };
+        let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
+        let entry = build_frag_reuse_index_metadata(&dataset, None, details, bitmap)
+            .await
+            .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![entry],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let source_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist");
+        // Sanity: the details actually went external.
+        let proto = source_meta
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+            .unwrap();
+        assert!(matches!(
+            proto.content,
+            Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
+        ));
+        let source_details = load_frag_reuse_index_details(&dataset, &source_meta)
+            .await
+            .unwrap();
+        assert_eq!(source_details.versions.len(), 3500);
+
+        let version = dataset.manifest.version;
+        let clone = dataset
+            .shallow_clone(clone_uri.as_str(), version, None)
+            .await
+            .unwrap();
+        let clone_meta = clone
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the clone must carry the fragment reuse index");
+        assert!(clone_meta.base_id.is_some());
+
+        // Before the fix this failed with a not-found error: the loader
+        // looked for details.binpb under the clone's own indices dir.
+        let clone_details = load_frag_reuse_index_details(&clone, &clone_meta)
+            .await
+            .expect("the clone must load external FRI details through its base");
+        assert_eq!(clone_details, source_details);
+
+        // The dataset-level open path goes through the same loader.
+        let index = clone
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .expect("the clone must open the fragment reuse index");
+        assert_eq!(index.details.versions, source_details.versions);
+    }
+
     #[tokio::test]
     async fn test_defer_index_remap_rejected_with_stable_row_ids() {
         let test_dir = TempStrDir::default();

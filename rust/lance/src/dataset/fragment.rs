@@ -1528,16 +1528,24 @@ impl FileFragment {
             }
         }
 
-        if let Err(error) = Fragment::try_infer_version(std::slice::from_ref(&self.metadata)) {
-            let first_file = self.metadata.files.first().ok_or_else(|| {
-                Error::internal("mixed file versions reported for an empty fragment")
-            })?;
-            return Err(Error::corrupt_file(
-                self.dataset
-                    .data_file_dir(first_file)?
-                    .join(first_file.path.as_str()),
-                format!("Fragment contains mixed file versions: {error}"),
-            ));
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        for data_file in self.metadata.referenced_lance_files() {
+            match data_file.file_version()? {
+                ConcreteFileVersion::V1 => saw_v1 = true,
+                ConcreteFileVersion::V2_0
+                | ConcreteFileVersion::V2_1
+                | ConcreteFileVersion::V2_2
+                | ConcreteFileVersion::V2_3 => saw_v2 = true,
+            }
+            if saw_v1 && saw_v2 {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str()),
+                    "Fragment mixes V1 and V2 data files",
+                ));
+            }
         }
 
         for data_file in &self.metadata.files {
@@ -1939,6 +1947,23 @@ impl FileFragment {
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
     ) -> Result<Updater> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.updater_with_version(columns, schemas, batch_size, blob_handling, write_version)
+            .await
+    }
+
+    pub(crate) async fn updater_with_version<T: AsRef<str>>(
+        &self,
+        columns: Option<&[T]>,
+        schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
+        blob_handling: Option<BlobHandling>,
+        write_version: ConcreteFileVersion,
+    ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
@@ -1979,7 +2004,15 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
+        Updater::try_new(
+            self.clone(),
+            reader,
+            deletion_vector,
+            schemas,
+            batch_size,
+            write_version,
+        )
+        .await
     }
 
     pub async fn merge_columns(
@@ -2317,6 +2350,48 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.write_column_with_version(data, schema, write_version)
+            .await
+    }
+
+    /// Write replacement column data using an exact V2 data file version.
+    ///
+    /// The input and commit requirements are the same as [`Self::write_columns`].
+    /// V1 targets and legacy datasets are not supported.
+    /// When the version differs from the manifest default, the commit that
+    /// publishes the returned replacement group derives the mixed-version
+    /// capability from its final manifest.
+    ///
+    /// ```
+    /// # use lance::{dataset::fragment::FileFragment, Result};
+    /// # use lance_core::datatypes::Schema;
+    /// # use lance_file::version::ConcreteFileVersion;
+    /// # async fn example(fragment: &FileFragment, batch: arrow_array::RecordBatch, schema: &Schema) -> Result<()> {
+    /// let replacement = fragment.write_column_with_version(
+    ///     futures::stream::iter([Ok(batch)]), schema, ConcreteFileVersion::V2_2,
+    /// ).await?;
+    /// // Commit the replacement with Operation::DataReplacement.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_column_with_version(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        versions::validate_write_version(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            write_version,
+        )?;
         let expected_rows = self.physical_rows().await? as u64;
 
         // Readers take everything but the field id from the manifest, so a
@@ -2394,13 +2469,7 @@ impl FileFragment {
                 .collect::<Vec<_>>(),
         );
 
-        let file_version = self
-            .dataset
-            .manifest
-            .data_storage_format
-            .lance_file_format();
-
-        if file_version == ConcreteFileVersion::V1 {
+        if write_version == ConcreteFileVersion::V1 {
             // The legacy reader pairs a fragment's files by batch boundary, so a
             // staged file chunked to the caller's batches leaves the fragment
             // unreadable. Rechunking is the legacy update path's job, not this
@@ -2420,7 +2489,7 @@ impl FileFragment {
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
         let mut writer = versions::open_update_writer(
-            file_version,
+            write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
@@ -3615,8 +3684,8 @@ mod tests {
     use super::*;
     use crate::{
         dataset::{
-            InsertBuilder,
-            transaction::{Operation, UpdateMode, UpdatedFragmentOffsets},
+            CommitBuilder, InsertBuilder,
+            transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets},
         },
         session::Session,
         utils::test::TestDatasetGenerator,
@@ -6783,8 +6852,17 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn create_from_file_v2() {
+    async fn create_from_file_v2(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        file_version: LanceFileVersion,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -6804,7 +6882,7 @@ mod tests {
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer = lance_file::versions::create_lazy_writer(
-            LanceFileVersion::Stable.resolve(),
+            file_version.resolve(),
             object_writer,
             FileWriterOptions::default(),
         )
@@ -6820,40 +6898,18 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            file_version.resolve()
         );
-
-        let mismatched_path = dataset.data_dir().join("mismatched_file.lance");
-        let object_writer = store.create(&mismatched_path).await.unwrap();
-        let mut mismatched_writer = lance_file::versions::create_lazy_writer(
-            lance_file::version::ConcreteFileVersion::V2_0,
-            object_writer,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-        mismatched_writer.write_batch(&new_data).await.unwrap();
-        mismatched_writer.finish().await.unwrap();
-
-        let err = FileFragment::create_from_file("mismatched_file.lance", &dataset, 1, Some(128))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err.to_string().contains("File version mismatch"));
 
         let op = Operation::Append {
             fragments: vec![frag],
         };
-        let dataset = Dataset::commit(
-            &dataset.uri,
-            op,
-            Some(dataset.version().version),
-            None,
-            None,
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap();
+        let transaction = Transaction::new_from_version(dataset.version().version, op);
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .with_storage_format(file_version)
+            .execute(transaction)
+            .await
+            .unwrap();
 
         assert_eq!(
             dataset

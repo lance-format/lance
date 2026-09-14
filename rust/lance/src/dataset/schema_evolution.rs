@@ -738,7 +738,7 @@ pub(super) async fn alter_columns(
     let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -767,8 +767,13 @@ pub(super) async fn alter_columns(
         }
 
         if let Some(data_type) = &alteration.data_type {
+            // Casts rewrite the column using the default output version.
             if !(can_cast_types(&field_src.data_type(), data_type)
-                && super::versions::is_upcast_downcast(version, &field_src.data_type(), data_type))
+                && super::versions::is_upcast_downcast(
+                    fallback_version,
+                    &field_src.data_type(),
+                    data_type,
+                ))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -1034,10 +1039,56 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         }
     }
 
-    let version = dataset.manifest.data_storage_format.lance_file_format();
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema =
-        super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
+    let mut new_schema = dataset.manifest.schema.clone();
+    for field in &columns_to_remove.fields {
+        let source = dataset.manifest.schema.project_by_ids(&[field.id], true);
+        let removed = columns_to_remove.project_by_ids(&[field.id], true);
+        let mut projected = None;
+        for data_file in dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .filter(|file| {
+                file.fields
+                    .iter()
+                    .any(|id| source.field_by_id(*id).is_some())
+            })
+        {
+            let file_version = data_file.file_version()?;
+            let candidate = super::versions::exclude_schema(file_version, &source, &removed)?;
+            if projected
+                .as_ref()
+                .is_some_and(|schema| schema != &candidate)
+            {
+                return Err(Error::not_supported_source(
+                    format!(
+                        "Dropping columns from '{}' has different metadata semantics for data file '{}' using exact version {}",
+                        field.name, data_file.path, file_version
+                    )
+                    .into(),
+                ));
+            }
+            projected = Some(candidate);
+        }
+        let projected = match projected {
+            Some(schema) => schema,
+            None => super::versions::exclude_schema(fallback_version, &source, &removed)?,
+        };
+        new_schema.fields.retain_mut(|existing| {
+            if existing.id != field.id {
+                return true;
+            }
+            if let Some(replacement) = projected.fields.first() {
+                *existing = replacement.clone();
+                true
+            } else {
+                false
+            }
+        });
+    }
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -1177,7 +1228,7 @@ mod test {
         }
     }
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
     };
@@ -2799,6 +2850,67 @@ mod test {
         let struct_array = list_value.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(struct_array.column_by_name("city").is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_versions_reject_ambiguous_nested_drop() -> Result<()> {
+        let dataset = prepare_dataset(LanceFileVersion::V2_0).await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .execute(vec![batch])
+            .await?;
+
+        let error = dataset
+            .drop_columns(&["people.item.city"])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("different metadata semantics"));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::V2_0, ConcreteFileVersion::V2_2, true)]
+    #[case(LanceFileVersion::V2_2, ConcreteFileVersion::V2_0, false)]
+    #[tokio::test]
+    async fn nested_drop_uses_only_affected_file_versions(
+        #[case] default: LanceFileVersion,
+        #[case] target: ConcreteFileVersion,
+        #[case] preserves_people: bool,
+    ) -> Result<()> {
+        let dataset = prepare_dataset(default).await?;
+        let batch = dataset
+            .scan()
+            .project(&["people"])?
+            .try_into_batch()
+            .await?;
+        let schema = dataset.schema().project(&["people"])?;
+        let replacement = dataset.get_fragments()[0]
+            .write_column_with_version(futures::stream::iter([Ok(batch)]), &schema, target)
+            .await?;
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::DataReplacement {
+                replacements: vec![replacement],
+            },
+            None,
+        );
+        let mut dataset = crate::dataset::CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await?;
+        dataset.drop_columns(&["people.item.city"]).await?;
+        assert_eq!(dataset.schema().field("people").is_some(), preserves_people);
+        assert!(dataset.schema().field("people.item.city").is_none());
+        assert_eq!(dataset.scan().try_into_batch().await?.num_rows(), 3);
+        dataset.validate().await?;
         Ok(())
     }
 

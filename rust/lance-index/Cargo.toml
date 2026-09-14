@@ -176,3 +176,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "inverted_request_cache"
+harness = false
