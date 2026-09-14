@@ -917,6 +917,11 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
+    /// Memoized [`DeepSizeOf::deep_size_of`]: every query that prepares this
+    /// partition needs its size to budget scoring chunks, and the walk over the
+    /// storage's arrays costs a few microseconds per partition — measurable on a
+    /// warm probe-everything query — while the size never changes once loaded.
+    size_bytes: OnceLock<usize>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
@@ -926,7 +931,14 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
+            size_bytes: OnceLock::new(),
         }
+    }
+
+    /// Bytes this entry pins in memory (its sub-index plus quantized storage),
+    /// computed on first use.
+    fn size_bytes(&self) -> usize {
+        *self.size_bytes.get_or_init(|| self.deep_size_of())
     }
 
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
@@ -1306,7 +1318,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
             match prepared.next().await {
                 Some(Ok(prepared)) => {
-                    bytes += prepared.part_entry.deep_size_of();
+                    bytes += prepared.part_entry.size_bytes();
                     chunk.push(prepared);
                 }
                 Some(Err(err)) => return Some(Err(err)),
