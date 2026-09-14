@@ -121,3 +121,13 @@ class CompactionOptions(TypedDict, total=False):
     are not combined into the same task. Duplicate and unknown IDs are
     ignored. (default: None)
     """
+    data_storage_version: Optional[str]
+    """
+    Output data file version, such as "2.2", "stable", or "next". If omitted,
+    compaction uses the compaction config target when set, otherwise the dataset's
+    default write version. It does not change that default.
+    The planner fixes release selectors to exact versions before distributing
+    tasks. V1/V2 cross-family targets are rejected. Binary copy requires matching
+    input versions and no overlays; TryBinaryCopy reencodes ineligible inputs,
+    while ForceBinaryCopy reports an error.
+    """

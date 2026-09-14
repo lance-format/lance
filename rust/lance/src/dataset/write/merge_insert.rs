@@ -124,8 +124,7 @@ use lance_datafusion::{
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
 };
-#[cfg(test)]
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
@@ -557,6 +556,20 @@ pub enum SourceDedupeBehavior {
     FirstSeen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanFileVersion(ConcreteFileVersion);
+
+impl PartialOrd for PlanFileVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // DataFusion requires extension-node parameters to have a deterministic
+        // structural order. This is only plan identity; operation capability
+        // decisions always match on ConcreteFileVersion directly.
+        self.0
+            .to_data_file_numbers()
+            .partial_cmp(&other.0.to_data_file_numbers())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
@@ -600,6 +613,16 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+    // Exact output data file version. The manifest default is used when absent.
+    data_storage_version: Option<PlanFileVersion>,
+}
+
+impl MergeInsertParams {
+    fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+        self.data_storage_version
+            .map(|version| version.0)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
 }
 
 /// Where the per-fragment patch tasks in
@@ -758,6 +781,7 @@ impl MergeInsertBuilder {
                 target_bases: None,
                 target_base_names_or_paths: None,
                 target_all_bases: None,
+                data_storage_version: None,
             },
         })
     }
@@ -910,6 +934,27 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Set the exact V2 data file version for rows written by this merge.
+    ///
+    /// If omitted, the dataset's default write version is used. The default
+    /// remains unchanged. Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::MergeInsertBuilder};
+    /// # use lance_file::version::LanceFileVersion;
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .data_storage_version(LanceFileVersion::V2_2)
+    ///     .try_build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn data_storage_version(&mut self, version: LanceFileVersion) -> &mut Self {
+        self.params.data_storage_version = Some(PlanFileVersion(version.resolve()));
+        self
+    }
+
     /// Write new fragments produced by this merge insert to these base IDs.
     ///
     /// New data files are distributed across the target bases round-robin,
@@ -952,6 +997,14 @@ impl MergeInsertBuilder {
 
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        let write_version = self.params.write_version(&self.dataset);
+        versions::validate_write_version(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            write_version,
+        )?;
         if !self.params.insert_not_matched
             && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
@@ -973,9 +1026,11 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        let mut params = self.params.clone();
+        params.data_storage_version = Some(PlanFileVersion(write_version));
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
-            params: self.params.clone(),
+            params,
         })
     }
 }
@@ -1145,11 +1200,7 @@ impl MergeInsertJob {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
         let target_schema = self.dataset.schema();
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
+        let version = self.params.write_version(&self.dataset);
         let mut options = versions::schema_compare_options(version);
         options.compare_nullability = NullabilityComparison::Ignore;
         // Merge columns are matched by name, so a complete source remains a
@@ -1531,6 +1582,7 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        write_version: ConcreteFileVersion,
     ) -> Result<PatchedFragments> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
@@ -1542,9 +1594,11 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
-        // single batch that is larger than the memory pool, so we must
-        // rechunk oversized batches before they reach the sort.
+        // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
+        // sort overhead and spill/merge reservation. SortExec must reserve an
+        // entire input batch even when spilling is enabled. This cap reduces
+        // reservation pressure but cannot guarantee success with a small pool
+        // or competing consumers; oversized single rows are rejected.
         const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
         let sorted = session_ctx
             .read_one_shot(source)?
@@ -1552,7 +1606,7 @@ impl MergeInsertJob {
             .sort(vec![col(ROW_ADDR).sort(true, true)])?;
         let sorted_plan = sorted.create_physical_plan().await?;
         // Walk the physical plan and insert HardCapBatchSizeExec below every
-        // sort node so each input batch fits in the memory pool.
+        // sort node to enforce the input cap (deep-copying oversized slices).
         let capped_plan = sorted_plan
             .transform_down(|node| {
                 if node.downcast_ref::<SortExec>().is_some() {
@@ -1621,8 +1675,9 @@ impl MergeInsertJob {
                 mut batches: Vec<RecordBatch>,
                 patched: Arc<PatchSink>,
                 reservation_size: usize,
-                current_version: u64,
+                versions: (u64, ConcreteFileVersion),
             ) -> Result<usize> {
+                let (current_version, write_version) = versions;
                 // batches still have _rowaddr
                 let write_schema = batches[0]
                     .schema()
@@ -1684,10 +1739,8 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let data_storage_version =
-                        dataset.manifest().data_storage_format.lance_file_format();
                     let mut writer = versions::open_writer(
-                        data_storage_version,
+                        write_version,
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
@@ -1723,9 +1776,16 @@ impl MergeInsertJob {
                         }
                     }
 
+                    let source_version = metadata
+                        .referenced_lance_files()
+                        .next()
+                        .map(|file| file.file_version())
+                        .transpose()?
+                        .unwrap_or_else(|| {
+                            dataset.manifest.data_storage_format.lance_file_format()
+                        });
                     if let Some(batch_size) =
-                        versions::row_group_size_for_rewrite(data_storage_version, &fragment)
-                            .await?
+                        versions::row_group_size_for_rewrite(source_version, &fragment).await?
                     {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
@@ -1760,11 +1820,12 @@ impl MergeInsertJob {
                     let update_schema = batches[0].schema();
                     let read_columns = update_schema.field_names();
                     let mut updater = fragment
-                        .updater(
+                        .updater_with_version(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
                             None,
                             None,
+                            write_version,
                         )
                         .await?;
 
@@ -1847,6 +1908,7 @@ impl MergeInsertJob {
                 new_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
+                write_version: ConcreteFileVersion,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -1872,7 +1934,7 @@ impl MergeInsertJob {
                 )?;
 
                 let (fragments, _) = write_fragments_internal(
-                    dataset.manifest.data_storage_format.lance_file_format(),
+                    write_version,
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -1960,7 +2022,7 @@ impl MergeInsertJob {
                         batches,
                         patched.clone(),
                         memory_size,
-                        current_version,
+                        (current_version, write_version),
                     );
                     tasks.spawn(fut);
                 }
@@ -1971,6 +2033,7 @@ impl MergeInsertJob {
                         new_fragments.clone(),
                         memory_size,
                         target_bases_info.clone(),
+                        write_version,
                     );
                     tasks.spawn(fut);
                 }
@@ -2830,6 +2893,7 @@ impl MergeInsertJob {
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
                 target_bases_info,
+                self.params.write_version(&self.dataset),
             )
             .await?;
 
@@ -2853,10 +2917,7 @@ impl MergeInsertJob {
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
-                self.dataset
-                    .manifest
-                    .data_storage_format
-                    .lance_file_format(),
+                self.params.write_version(&self.dataset),
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
@@ -3762,6 +3823,7 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use mock_instant::thread_local::MockClock;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
@@ -3845,6 +3907,7 @@ mod tests {
             Box::pin(update_stream),
             dataset.manifest().version + 1,
             None,
+            dataset.manifest.data_storage_format.lance_file_format(),
         )
         .await
         .unwrap_err();
@@ -4313,6 +4376,122 @@ mod tests {
         pairs.sort_unstable();
 
         assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
+    }
+
+    #[rstest::rstest]
+    #[case::full(false, false)]
+    #[case::column_patch(true, false)]
+    #[case::partial_column_patch(true, true)]
+    #[tokio::test]
+    async fn merge_insert_uses_explicit_exact_version(
+        #[case] partial: bool,
+        #[case] partial_rows: bool,
+        #[values(false, true)] indexed: bool,
+        #[values(
+            None,
+            Some(LanceFileVersion::V2_1),
+            Some(LanceFileVersion::V2_2),
+            Some(LanceFileVersion::V2_3)
+        )]
+        target: Option<LanceFileVersion>,
+    ) {
+        let mut dataset = create_test_dataset("memory://", LanceFileVersion::V2_0, false).await;
+        if indexed {
+            Arc::make_mut(&mut dataset)
+                .create_index(
+                    &["key"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let original_paths = dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let mut new_batch = create_new_batch(create_test_schema());
+        if partial {
+            new_batch = new_batch.project(&[0, 1]).unwrap();
+        }
+        if partial_rows {
+            new_batch = new_batch.slice(1, new_batch.num_rows() - 1);
+        }
+        let schema = new_batch.schema();
+        let mut builder = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        if partial {
+            builder.when_not_matched(WhenNotMatched::DoNothing);
+            if !indexed {
+                builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+            }
+        }
+        if let Some(target) = target {
+            builder.data_storage_version(target);
+        }
+        let (dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(new_batch)], schema))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, if partial { 0 } else { 3 });
+        let updated_rows = if partial_rows { 2 } else { 3 };
+        assert_eq!(stats.num_updated_rows, updated_rows);
+        assert_eq!(
+            dataset
+                .count_rows(Some("value = 2".to_string()))
+                .await
+                .unwrap(),
+            if partial { updated_rows as usize } else { 6 }
+        );
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .filter(|file| !original_paths.contains(&file.path))
+                .all(|file| file.file_version().unwrap()
+                    == target.unwrap_or(LanceFileVersion::V2_0).resolve())
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0,
+            target.is_some()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn merge_insert_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let dataset = create_test_dataset("memory://", source, false).await;
+        let error = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+            .unwrap()
+            .data_storage_version(target)
+            .try_build()
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
     }
 
     #[rstest::rstest]

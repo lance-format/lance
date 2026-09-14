@@ -319,6 +319,14 @@ impl<'a> InsertBuilder<'a> {
             }
 
             let version = dataset.manifest.data_storage_format.lance_file_format();
+            if (version == ConcreteFileVersion::V1)
+                != (context.storage_version == ConcreteFileVersion::V1)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Cannot append data files in version {} to a dataset with default version {version}: V1 and V2 storage versions cannot be mixed",
+                    context.storage_version
+                )));
+            }
             let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
             schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
             schema_cmp_opts.allow_missing_if_nullable = true;
@@ -411,22 +419,13 @@ impl<'a> InsertBuilder<'a> {
             }
         };
 
-        let storage_version = match (&params.mode, &dest) {
-            (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
-                // If overwriting an existing dataset, allow the user to specify but use
-                // the existing version if they don't
-                params
-                    .data_storage_version
-                    .map(LanceFileVersion::resolve)
-                    .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
-            }
-            (_, WriteDestination::Dataset(dataset)) => {
-                // If appending to an existing dataset, always use the dataset version
-                let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_format()
-            }
+        let storage_version = match &dest {
+            WriteDestination::Dataset(dataset) => params
+                .data_storage_version
+                .map(LanceFileVersion::resolve)
+                .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format()),
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
+            WriteDestination::Uri(_) => params.storage_version_or_default(),
         };
 
         Ok(WriteContext {
@@ -454,14 +453,304 @@ struct WriteContext<'a> {
 mod test {
     use std::collections::HashMap;
 
-    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
+    use arrow_array::{
+        ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray, record_batch,
+    };
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
+    use rstest::rstest;
 
     use crate::session::Session;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn append_resolves_explicit_or_default_exact_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        default_version: LanceFileVersion,
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        target_version: LanceFileVersion,
+    ) {
+        let batch = record_batch!(("id", Int32, [0])).unwrap();
+        let create_params = WriteParams {
+            data_storage_version: Some(default_version),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&create_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        let default_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&default_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.fragments[1].files[0]
+                .file_version()
+                .unwrap(),
+            default_version.resolve()
+        );
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+
+        let explicit_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(target_version),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&explicit_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version.resolve()
+        );
+        assert_eq!(
+            dataset.manifest.fragments[2].files[0]
+                .file_version()
+                .unwrap(),
+            target_version.resolve()
+        );
+        let expected_flags = if default_version == target_version {
+            0
+        } else {
+            FLAG_MIXED_DATA_FILE_VERSIONS
+        };
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            expected_flags
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            expected_flags
+        );
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&default_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.fragments[3].files[0]
+                .file_version()
+                .unwrap(),
+            default_version.resolve()
+        );
+        let expected =
+            arrow_select::concat::concat_batches(&batch.schema(), [&batch, &batch, &batch, &batch])
+                .unwrap();
+        let reopened = dataset
+            .checkout_version(dataset.version().version)
+            .await
+            .unwrap();
+        assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::default(None, ConcreteFileVersion::V2_0)]
+    #[case::explicit(Some(LanceFileVersion::V2_1), ConcreteFileVersion::V2_1)]
+    #[tokio::test]
+    async fn overwrite_resolves_exact_version(
+        #[case] target: Option<LanceFileVersion>,
+        #[case] expected: ConcreteFileVersion,
+    ) {
+        let batch = record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: target,
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            expected
+        );
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(
+            dataset.manifest.fragments[0].files[0]
+                .file_version()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+    }
+
+    #[tokio::test]
+    async fn create_from_mixed_prewritten_files_requires_explicit_default() {
+        let test_dir = TempStrDir::default();
+        let mut transaction = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [0])).unwrap()])
+            .await
+            .unwrap();
+        let other = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let Operation::Overwrite { fragments, .. } = &mut transaction.operation else {
+            panic!("expected overwrite");
+        };
+        let Operation::Overwrite {
+            fragments: other_fragments,
+            ..
+        } = other.operation
+        else {
+            panic!("expected overwrite");
+        };
+        fragments.extend(other_fragments);
+        let error = CommitBuilder::new(test_dir.as_str())
+            .execute(transaction.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("All data files must have the same version"),
+            "{error}"
+        );
+        let dataset = CommitBuilder::new(test_dir.as_str())
+            .with_storage_format(LanceFileVersion::V2_0)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            record_batch!(("id", Int32, [0, 1])).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_exact_version_appends_derive_capability_from_final_manifest() {
+        let create_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+        let original = Arc::new(
+            InsertBuilder::new("memory://")
+                .with_params(&create_params)
+                .execute(vec![record_batch!(("id", Int32, [0])).unwrap()])
+                .await
+                .unwrap(),
+        );
+        let v2_1_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let v2_2_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let tx_v2_1 = InsertBuilder::new(original.clone())
+            .with_params(&v2_1_params)
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let tx_v2_2 = InsertBuilder::new(original.clone())
+            .with_params(&v2_2_params)
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [2])).unwrap()])
+            .await
+            .unwrap();
+        let Operation::Append { fragments } = &tx_v2_2.operation else {
+            panic!("expected append");
+        };
+        let prewritten_files = fragments[0].files.clone();
+        CommitBuilder::new(original.clone())
+            .execute(tx_v2_1)
+            .await
+            .unwrap();
+        // The second writer still holds the original snapshot, forcing a retry.
+        let dataset = CommitBuilder::new(original).execute(tx_v2_2).await.unwrap();
+
+        let versions = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.files[0].file_version().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            vec![
+                ConcreteFileVersion::V2_0,
+                ConcreteFileVersion::V2_1,
+                ConcreteFileVersion::V2_2
+            ]
+        );
+        assert_eq!(dataset.manifest.fragments[2].files, prewritten_files);
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            record_batch!(("id", Int32, [0, 1, 2])).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn test_pass_session() {

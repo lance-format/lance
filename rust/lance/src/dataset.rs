@@ -135,8 +135,8 @@ use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
-    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    default_commit_retry_timeout, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -156,6 +156,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -796,6 +797,8 @@ impl Dataset {
         }?;
 
         ensure_can_read_manifest(&manifest)?;
+
+        versions::check_manifest_storage_version(&mut manifest)?;
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
@@ -1666,7 +1669,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
         )
@@ -3444,6 +3447,7 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
+        let mut blob_dirs = HashSet::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::internal(format!(
@@ -3463,8 +3467,36 @@ impl Dataset {
                 };
                 file_paths.push((
                     format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_root,
+                    base_root.clone(),
                 ));
+
+                if !data_file
+                    .schema(self.schema())
+                    .fields_pre_order()
+                    .any(|field| field.is_blob_v2())
+                {
+                    continue;
+                }
+
+                // Blob v2 sidecars are not listed in the manifest. Their directory is
+                // derived from the owning data file, so enumerate it to copy packed and
+                // dedicated payloads without decoding blob descriptors. External blobs
+                // remain caller-owned references and are deliberately not collected.
+                let data_file_key = blob::data_file_key_from_path(data_file.path.as_str());
+                let relative_blob_dir = format!("{}/{}", DATA_DIR, data_file_key);
+                let blob_dir = base_root.clone().join(DATA_DIR).join(data_file_key);
+                // Overlays can make the same data file reachable from multiple fragments.
+                if blob_dirs.insert(blob_dir.clone()) {
+                    let mut stream = self.object_store.read_dir_all(&blob_dir, None);
+                    while let Some(meta) = stream.next().await.transpose()? {
+                        if let Some(filename) = meta.location.filename() {
+                            file_paths.push((
+                                format!("{}/{}", relative_blob_dir, filename),
+                                base_root.clone(),
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
@@ -4191,6 +4223,8 @@ pub(crate) async fn write_manifest_file(
             config.disable_transaction_file,
         )?;
     }
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
