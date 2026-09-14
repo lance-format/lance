@@ -23,7 +23,9 @@ use lance_bitpacking::BitPackingUninit;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor};
+use crate::compression::{
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+};
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
@@ -312,10 +314,27 @@ impl MiniBlockCompressor for InlineBitpacking {
 }
 
 impl BlockCompressor for InlineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Inline bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Inline bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
         let (chunked, _) = self.chunk_data(fixed_width);
-        Ok(chunked.data.into_iter().next().unwrap())
+        let payload =
+            chunked.data.into_iter().next().ok_or_else(|| {
+                Error::internal("Inline bitpacking produced no payload".to_string())
+            })?;
+        Ok((
+            Some(payload),
+            ProtobufUtils21::inline_bitpacking(self.uncompressed_bit_width, None),
+        ))
     }
 }
 
@@ -344,7 +363,8 @@ impl MiniBlockDecompressor for InlineBitpacking {
 }
 
 impl BlockDecompressor for InlineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Inline bitpacking")?;
         if num_values == 0 {
             // Empty blocks carry no inline bit-width header to decode; avoid
             // spurious "too small for header" corrupt-file errors and mirror
@@ -549,21 +569,43 @@ impl OutOfLineBitpacking {
 }
 
 impl BlockCompressor for OutOfLineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Out-of-line bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Out-of-line bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
         let compressed = match fixed_width.bits_per_value {
             8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width as usize),
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Bitpacking word size must be 8, 16, 32, or 64, got {}",
+                    fixed_width.bits_per_value
+                )));
+            }
         };
-        Ok(compressed)
+        Ok((
+            Some(compressed),
+            ProtobufUtils21::out_of_line_bitpacking(
+                self.uncompressed_bit_width,
+                ProtobufUtils21::flat(self.compressed_bit_width, None),
+            ),
+        ))
     }
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Out-of-line bitpacking")?;
         let word_size = match self.uncompressed_bit_width {
             8 => std::mem::size_of::<u8>(),
             16 => std::mem::size_of::<u16>(),
@@ -656,7 +698,7 @@ mod test {
     fn test_inline_bitpacking_decompress_empty_block(#[case] bit_width: u64) {
         let decompressor = InlineBitpacking::new(bit_width);
         let decompressed =
-            BlockDecompressor::decompress(&decompressor, LanceBuffer::empty(), 0).unwrap();
+            BlockDecompressor::decompress(&decompressor, Some(LanceBuffer::empty()), 0).unwrap();
 
         let DataBlock::FixedWidth(block) = decompressed else {
             panic!("Expected FixedWidth block");

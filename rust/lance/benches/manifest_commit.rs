@@ -46,6 +46,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
+use lance_core::utils::parse::str_is_truthy;
 use lance_io::object_store::ObjectStoreRegistry;
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,13 +72,13 @@ fn get_num_iterations() -> usize {
 
 fn get_delete_dataset() -> bool {
     std::env::var("DELETE_DATASET")
-        .map(|s| s.to_lowercase() == "true")
+        .map(|s| str_is_truthy(&s))
         .unwrap_or(false)
 }
 
 fn get_enable_cache() -> bool {
     std::env::var("ENABLE_CACHE")
-        .map(|s| s.to_lowercase() == "true")
+        .map(|s| str_is_truthy(&s))
         .unwrap_or(false)
 }
 

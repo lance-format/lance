@@ -25,6 +25,7 @@ use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
+use crate::scalar::RowIdRemapper;
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
@@ -262,6 +263,23 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
+
+    /// Internal entry point for compact FRI loading without changing the
+    /// existing concrete-type API.
+    #[doc(hidden)]
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        if frag_reuse_index.is_some() {
+            return Err(Error::not_supported(
+                "this quantization storage does not support a generic row-id remapper".to_string(),
+            ));
+        }
+        Self::try_from_batch(batch, metadata, distance_type, None)
+    }
 
     fn metadata(&self) -> &Self::Metadata;
 

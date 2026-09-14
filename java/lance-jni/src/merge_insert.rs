@@ -12,7 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_file::version::LanceFileVersion;
@@ -54,6 +55,7 @@ fn inner_merge_insert<'local>(
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
+    let write_mode = extract_write_mode(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
     let data_storage_version = extract_data_storage_version(env, &jparam)?;
 
@@ -78,6 +80,7 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
+            .write_mode(write_mode)
             .mark_sstables_as_compacted(compacted_sstables)
             .try_build()?;
 
@@ -256,6 +259,26 @@ fn extract_data_storage_version<'local>(
         .call_method(jparam, "dataStorageVersion", "()Ljava/util/Optional;", &[])?
         .l()?;
     env.get_string_opt(&version)
+}
+
+fn extract_write_mode<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<MergeInsertWriteMode> {
+    let write_mode: JString = env
+        .call_method(jparam, "writeModeValue", "()Ljava/lang/String;", &[])?
+        .l()?
+        .into();
+    let write_mode = write_mode.extract(env)?;
+
+    match write_mode.as_str() {
+        "Auto" => Ok(MergeInsertWriteMode::Auto),
+        "RewriteRows" => Ok(MergeInsertWriteMode::RewriteRows),
+        "RewriteColumns" => Ok(MergeInsertWriteMode::RewriteColumns),
+        _ => Err(Error::input_error(format!(
+            "Illegal write_mode: {write_mode}",
+        ))),
+    }
 }
 
 fn extract_compacted_sstables<'local>(

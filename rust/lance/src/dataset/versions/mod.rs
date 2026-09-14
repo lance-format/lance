@@ -6,7 +6,11 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::catalog::Session;
@@ -19,7 +23,9 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -49,6 +55,19 @@ use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
 };
+
+/// Keep per-operation targets within the dataset's existing reader family.
+pub fn validate_write_version(
+    default_version: ConcreteFileVersion,
+    target: ConcreteFileVersion,
+) -> Result<()> {
+    if (default_version == ConcreteFileVersion::V1) != (target == ConcreteFileVersion::V1) {
+        return Err(Error::invalid_input(format!(
+            "Cannot write data files in version {target} to a dataset with default version {default_version}: V1 and V2 storage versions cannot be mixed"
+        )));
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
@@ -125,6 +144,7 @@ pub async fn write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
@@ -152,6 +172,7 @@ pub async fn write_fragments(
         params,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await?;
     Ok((fragments, schema))
@@ -168,17 +189,50 @@ pub async fn write_fragments_direct(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
-    let buffered_reader = match version {
-        ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+    let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
+        if file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "File row counts must be greater than zero",
+            ));
+        }
+        match version {
+            ConcreteFileVersion::V1 => {
+                if params.max_rows_per_group == 0 {
+                    return Err(Error::invalid_input(
+                        "max_rows_per_group must be greater than zero when file row counts are specified",
+                    ));
+                }
+                let max_rows_per_group = params.max_rows_per_group;
+                let batch_row_counts =
+                    file_row_counts
+                        .clone()
+                        .into_iter()
+                        .flat_map(move |file_rows| {
+                            (0..file_rows)
+                                .step_by(max_rows_per_group)
+                                .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+                        });
+                chunk_stream_with_sizes(data, batch_row_counts)
+            }
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream_with_sizes(data, file_row_counts.clone()),
+        }
+    } else {
+        match version {
+            ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
+                .map_ok(|batch| vec![batch])
+                .boxed(),
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -199,6 +253,7 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await
 }
@@ -262,7 +317,11 @@ pub async fn rewrite_files_binary_copy(
 }
 
 pub fn check_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
-    check_manifest_storage_contract(manifest, StorageContractMode::Validate)
+    check_manifest_storage_contract(manifest, StorageContractMode::Read)
+}
+
+pub fn check_manifest_storage_version_for_commit(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Commit)
 }
 
 pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
@@ -271,7 +330,8 @@ pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> 
 
 #[derive(Clone, Copy)]
 enum StorageContractMode {
-    Validate,
+    Read,
+    Commit,
     Finalize,
 }
 
@@ -279,20 +339,23 @@ fn check_manifest_storage_contract(
     manifest: &mut Manifest,
     mode: StorageContractMode,
 ) -> Result<()> {
-    let version = manifest.data_storage_format.lance_file_format();
-    if version == ConcreteFileVersion::V1 {
-        repair_legacy_manifest_storage(manifest)?;
-    }
-    validate_storage_contract(manifest, mode)
-}
-
-fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode) -> Result<()> {
-    let fallback = manifest.data_storage_format.lance_file_format();
+    let default_version = manifest.data_storage_format.lance_file_format();
     let mixed_enabled = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0
         && manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+
+    if mixed_enabled && default_version == ConcreteFileVersion::V1 {
+        return Err(Error::invalid_input(
+            "Dataset has mixed data-file-version capability enabled, which requires a V2 default, but the manifest default is V1",
+        ));
+    }
+
     let mut saw_v1 = false;
     let mut saw_v2 = false;
-    let mut first_non_fallback = None;
+    let mut first_file_version = None;
+    let mut first_mismatch = None;
+    let mut first_non_default = None;
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
 
     for fragment in manifest.fragments.iter() {
         for data_file in fragment.referenced_lance_files() {
@@ -305,19 +368,69 @@ fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode)
                 | ConcreteFileVersion::V2_3 => saw_v2 = true,
             }
 
-            if saw_v1 && saw_v2 {
-                return Err(Error::invalid_input(format!(
-                    "Dataset snapshot mixes V1 and V2 data files; file '{}' in fragment {} has version {}",
-                    data_file.path, fragment.id, file_version
-                )));
+            match first_file_version {
+                None => first_file_version = Some(file_version),
+                Some(first_version)
+                    if first_version != file_version && first_mismatch.is_none() =>
+                {
+                    first_mismatch = Some((first_version, file_version));
+                }
+                Some(_) => {}
             }
 
-            if !mixed_enabled && file_version != fallback && first_non_fallback.is_none() {
-                first_non_fallback = Some((data_file.path.clone(), fragment.id, file_version));
+            if !mixed_enabled && file_version != default_version && first_non_default.is_none() {
+                first_non_default = Some((data_file.path.clone(), fragment.id, file_version));
             }
 
-            validate_file_column_indices(manifest, fragment.id, data_file, file_version)?;
+            validate_file_column_indices(
+                &fields_by_id,
+                &mut validated_lists,
+                fragment.id,
+                data_file,
+                file_version,
+            )?;
         }
+    }
+
+    // Released Lance 0.16 could persist a V1 default while referencing both V1
+    // and V2 files. Keep those snapshots readable, but never publish a new
+    // manifest with that state.
+    if matches!(mode, StorageContractMode::Read)
+        && default_version == ConcreteFileVersion::V1
+        && !mixed_enabled
+        && saw_v1
+        && saw_v2
+    {
+        return Ok(());
+    }
+
+    let mut effective_version = default_version;
+    if default_version == ConcreteFileVersion::V1 {
+        if let Some((first_version, other_version)) = first_mismatch {
+            return Err(Error::internal(format!(
+                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: All data files must have the same version. Detected both {first_version} and {other_version}"
+            )));
+        }
+        if let Some(actual) = first_file_version
+            && actual != ConcreteFileVersion::V1
+        {
+            effective_version = actual;
+            first_non_default = None;
+            if matches!(mode, StorageContractMode::Finalize) {
+                log::warn!(
+                    "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
+                    default_version,
+                    actual
+                );
+                manifest.data_storage_format = DataStorageFormat::new(actual);
+            }
+        }
+    }
+
+    if saw_v1 && saw_v2 {
+        return Err(Error::invalid_input(
+            "Dataset snapshot mixes V1 and V2 data files",
+        ));
     }
 
     if mixed_enabled && saw_v1 {
@@ -325,18 +438,19 @@ fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode)
             "Dataset has mixed data-file-version capability enabled but references V1 data files",
         ));
     }
-    if let Some((path, fragment_id, file_version)) = first_non_fallback {
-        if file_version == ConcreteFileVersion::V1 || fallback == ConcreteFileVersion::V1 {
+    if let Some((path, fragment_id, file_version)) = first_non_default {
+        if file_version == ConcreteFileVersion::V1 || effective_version == ConcreteFileVersion::V1 {
             return Err(Error::invalid_input(format!(
-                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback}; V1 and V2 storage versions cannot be mixed"
+                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version}; V1 and V2 storage versions cannot be mixed"
             )));
         }
         match mode {
-            StorageContractMode::Validate => {
+            StorageContractMode::Read => {
                 return Err(Error::invalid_input(format!(
-                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback} and mixed data-file-version capability is not enabled"
+                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version} and mixed data-file-version capability is not enabled"
                 )));
             }
+            StorageContractMode::Commit => {}
             StorageContractMode::Finalize => {
                 manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
                 manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -349,10 +463,13 @@ fn validate_storage_contract(manifest: &mut Manifest, mode: StorageContractMode)
 
 #[cfg(test)]
 pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
     for fragment in manifest.fragments.iter() {
         for data_file in fragment.referenced_lance_files() {
             validate_file_column_indices(
-                manifest,
+                &fields_by_id,
+                &mut validated_lists,
                 fragment.id,
                 data_file,
                 data_file.file_version()?,
@@ -362,19 +479,25 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn field_column_requirements(manifest: &Manifest) -> HashMap<i32, (&Field, bool)> {
+    let mut fields_by_id = HashMap::new();
+    for field in manifest.schema.fields_pre_order() {
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        fields_by_id
+            .entry(field.id)
+            .or_insert((field, needs_column));
+    }
+    fields_by_id
+}
+
 fn validate_file_column_indices(
-    manifest: &Manifest,
+    fields_by_id: &HashMap<i32, (&Field, bool)>,
+    validated_lists: &mut HashSet<(usize, usize)>,
     fragment_id: u64,
     data_file: &DataFile,
     file_version: ConcreteFileVersion,
 ) -> Result<()> {
-    if matches!(
-        file_version,
-        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
-    ) {
-        return Ok(());
-    }
-    if data_file.column_indices.is_empty() {
+    if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
         return Ok(());
     }
     if data_file.fields.len() != data_file.column_indices.len() {
@@ -386,11 +509,20 @@ fn validate_file_column_indices(
             data_file.column_indices.len()
         )));
     }
+    if file_version == ConcreteFileVersion::V2_0 {
+        return Ok(());
+    }
+    let list_key = (
+        data_file.fields.as_ptr() as usize,
+        data_file.column_indices.as_ptr() as usize,
+    );
+    if !validated_lists.insert(list_key) {
+        return Ok(());
+    }
     for (field_id, column_index) in data_file.fields.iter().zip(data_file.column_indices.iter()) {
-        let Some(field) = manifest.schema.field_by_id(*field_id) else {
+        let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
             continue;
         };
-        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
         if needs_column && *column_index == -1 {
             return Err(Error::invalid_input(format!(
                 "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
@@ -523,7 +655,7 @@ pub async fn create_fragment_from_file(
     );
     if !same_family {
         return Err(Error::invalid_input(format!(
-            "File version family mismatch. Dataset fallback: {:?} Fragment version: {:?}",
+            "File version family mismatch. Dataset default: {:?} Fragment version: {:?}",
             dataset_version, file_version
         )));
     }
@@ -915,24 +1047,4 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => Ok(()),
     }
-}
-
-fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
-    let declared = manifest.data_storage_format.lance_file_format();
-    let actual = Fragment::try_infer_version(&manifest.fragments).map_err(|error| {
-        Error::invalid_input(format!(
-            "Dataset declares V1 storage but its referenced data files do not have a single version: {error}"
-        ))
-    })?;
-    if let Some(actual) = actual
-        && actual != ConcreteFileVersion::V1
-    {
-        log::warn!(
-            "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
-            declared,
-            actual
-        );
-        manifest.data_storage_format = DataStorageFormat::new(actual);
-    }
-    Ok(())
 }

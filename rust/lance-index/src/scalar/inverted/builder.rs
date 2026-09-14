@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
+use tokio::task::JoinSet;
 use tracing::instrument;
 
 // The legacy bitpacking block size. Position streams still use this block size;
@@ -419,7 +420,7 @@ impl InvertedIndexBuilder {
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
-        let mut index_tasks = Vec::with_capacity(num_workers);
+        let mut index_tasks = JoinSet::new();
         for _ in 0..num_workers {
             let tokenizer = tokenizer.clone();
             let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
@@ -427,7 +428,7 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
-            index_tasks.push(tokio::task::spawn(async move {
+            index_tasks.spawn(async move {
                 let mut worker =
                     IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -441,7 +442,7 @@ impl InvertedIndexBuilder {
                         .await?;
                 }
                 worker.finish().await
-            }));
+            });
         }
 
         let index_build = async {
@@ -455,7 +456,17 @@ impl InvertedIndexBuilder {
             let mut last_num_rows = 0;
             let mut total_num_rows = 0;
             let start = std::time::Instant::now();
-            while let Some(batch) = stream.try_next().await? {
+            loop {
+                let batch = match stream.try_next().await {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => break,
+                    Err(err) => {
+                        drop(stream);
+                        drop(sender);
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 let num_rows = batch.num_rows();
 
                 if sender.send(batch).await.is_err() {
@@ -485,8 +496,18 @@ impl InvertedIndexBuilder {
             let start = std::time::Instant::now();
             let mut tail_partitions = Vec::new();
             let mut files = Vec::new();
-            for index_task in index_tasks {
-                let output = index_task.await??;
+            while let Some(index_task) = index_tasks.join_next().await {
+                let output = match index_task {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(err)) => {
+                        index_tasks.shutdown().await;
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 self.new_partitions.extend(output.partitions);
                 files.extend(output.files);
                 if let Some(tail_partition) = output.tail_partition {
@@ -2439,8 +2460,9 @@ mod tests {
     use std::any::Any;
     use std::fmt::{Display, Formatter};
     use std::ops::Range;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2543,6 +2565,77 @@ mod tests {
 
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct CopyFailingObjectStore {
+        inner: InMemory,
+        copy_count: Arc<AtomicUsize>,
+    }
+
+    impl Display for CopyFailingObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyFailingObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyFailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            self.copy_count.fetch_add(1, Ordering::SeqCst);
+            Err(object_store::Error::Generic {
+                store: "CopyFailingObjectStore",
+                source: "native copy disabled in test".into(),
+            })
         }
     }
 
@@ -3093,6 +3186,99 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fts_remap_streams_files_when_native_copy_fails() -> Result<()> {
+        let copy_count = Arc::new(AtomicUsize::new(0));
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(CopyFailingObjectStore {
+            inner: InMemory::new(),
+            copy_count: copy_count.clone(),
+        });
+        let object_store = Arc::new(object_store);
+        let index_path = Path::from("index");
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_path.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        let probe_source = staged_partition_file_path(partitions[0], TOKENS_FILE);
+        let probe_source_size = base_store
+            .open_index_file(&probe_source)
+            .await?
+            .file_size_bytes()
+            .expect("written index file should report its size");
+        let copied = base_store
+            .copy_index_file_to(&probe_source, "probe.lance", base_store.as_ref())
+            .await?;
+        assert_eq!(copied.path, "probe.lance");
+        assert_eq!(copied.size_bytes, probe_source_size);
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "probe.lance").await?,
+            partitions[0]
+        );
+
+        let renamed = base_store
+            .rename_index_file("probe.lance", "renamed-probe.lance")
+            .await?;
+        assert_eq!(renamed.path, "renamed-probe.lance");
+        assert_eq!(renamed.size_bytes, probe_source_size);
+        assert!(base_store.open_index_file("probe.lance").await.is_err());
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "renamed-probe.lance").await?,
+            partitions[0]
+        );
+
+        let progress = Arc::new(RecordingProgress::default());
+        merge_index_files(object_store.as_ref(), &index_path, store, progress.clone()).await?;
+
+        let mut expected_partitions = partitions;
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;
+        }
+        let remap_progress = progress
+            .recorded_events()
+            .into_iter()
+            .filter_map(|(kind, stage, completed)| {
+                (kind == "progress" && stage == "remap_partition_files").then_some(completed)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remap_progress.last().copied(),
+            Some((expected_partitions.len() * PARTITION_FILE_SUFFIXES.len()) as u64)
+        );
+        assert_eq!(
+            copy_count.load(Ordering::SeqCst),
+            0,
+            "bulk index movement must not invoke native object-store copy"
+        );
 
         Ok(())
     }
@@ -3944,6 +4130,38 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LateCallbackDetectingProgress {
+        calls: AtomicUsize,
+        first_callback_started: Arc<Notify>,
+        release_first_callback: Arc<Notify>,
+        update_returned: Arc<AtomicBool>,
+        callback_after_return: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl IndexBuildProgress for LateCallbackDetectingProgress {
+        async fn stage_start(&self, _stage: &str, _total: Option<u64>, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _stage: &str, _completed: u64) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.update_returned.load(Ordering::SeqCst) {
+                self.callback_after_return.notify_one();
+            }
+            if call == 0 {
+                self.first_callback_started.notify_one();
+                self.release_first_callback.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn stage_complete(&self, _stage: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_builder_reports_progress_stages() -> Result<()> {
         let index_dir = TempDir::default();
@@ -4729,6 +4947,64 @@ mod tests {
         assert!(
             result.to_string().contains("injected progress failure"),
             "unexpected error: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_index_joins_workers_before_returning_stream_error() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let first_callback_started = Arc::new(Notify::new());
+        let release_first_callback = Arc::new(Notify::new());
+        let update_returned = Arc::new(AtomicBool::new(false));
+        let callback_after_return = Arc::new(Notify::new());
+        let progress = Arc::new(LateCallbackDetectingProgress {
+            calls: AtomicUsize::new(0),
+            first_callback_started: first_callback_started.clone(),
+            release_first_callback: release_first_callback.clone(),
+            update_returned: update_returned.clone(),
+            callback_after_return: callback_after_return.clone(),
+        });
+
+        let first_batch = make_doc_batch("hello world", 0);
+        let second_batch = make_doc_batch("goodbye world", 1);
+        let schema = first_batch.schema();
+        let source = stream::iter(vec![Ok(first_batch), Ok(second_batch)]).chain(stream::once({
+            let first_callback_started = first_callback_started.clone();
+            async move {
+                first_callback_started.notified().await;
+                Err(datafusion::error::DataFusionError::Execution(
+                    "injected stream failure".to_owned(),
+                ))
+            }
+        }));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, source));
+        let params = InvertedIndexParams::default().num_workers(1);
+        let mut builder = InvertedIndexBuilder::new(params).with_progress(progress);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            builder.update_index(stream, store.as_ref()),
+        )
+        .await
+        .expect("update_index should not hang")
+        .expect_err("stream failure should be returned");
+        assert!(
+            result.to_string().contains("injected stream failure"),
+            "unexpected error: {result}"
+        );
+
+        update_returned.store(true, Ordering::SeqCst);
+        release_first_callback.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), callback_after_return.notified())
+                .await
+                .is_err(),
+            "detached worker invoked progress after update_index returned"
         );
     }
 

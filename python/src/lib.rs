@@ -62,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod bitmap;
 pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -75,6 +76,7 @@ pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod object_store;
 pub(crate) mod otel;
 pub(crate) mod reader;
 pub(crate) mod rowids;
@@ -299,10 +301,14 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<object_store::PyObjectStoreProvider>()?;
+    m.add_class::<object_store::PyObjectStoreRegistry>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;

@@ -167,7 +167,20 @@ fn slice_batch(
     let batch_bytes = batch.get_array_memory_size();
     let num_rows = batch.num_rows();
 
-    if batch_bytes <= max_bytes || num_rows <= 1 {
+    if batch_bytes <= max_bytes {
+        return Ok(vec![batch]);
+    }
+
+    if num_rows <= 1 {
+        // A single row cannot be split further, but the size just measured may
+        // belong to its source buffer rather than to the row:
+        // `get_array_memory_size` reports whole buffers, and a slice shares
+        // them. Returning it uncopied hands the caller that inflated figure --
+        // a 100 KB row inside a 200 MB buffer measures as 200 MB, and a caller
+        // budgeting on it concludes the row cannot fit anywhere.
+        if deep_copy {
+            return Ok(vec![deep_copy_batch_sliced(&batch)?]);
+        }
         return Ok(vec![batch]);
     }
 
@@ -215,6 +228,42 @@ mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
     use futures::executor::block_on;
+
+    /// A single row that shares a large source buffer must report its own
+    /// size, not the buffer's. Callers budget on this figure, and an inflated
+    /// one makes a small row look impossible to place.
+    #[test]
+    fn a_single_row_slice_reports_its_own_size() {
+        use arrow_array::LargeStringArray;
+
+        let row = "x".repeat(100 * 1024);
+        let values: Vec<&str> = (0..2000).map(|_| row.as_str()).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "text",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(values))]).unwrap();
+        let whole = batch.get_array_memory_size();
+
+        let one_row = batch.slice(7, 1);
+        assert_eq!(
+            one_row.get_array_memory_size(),
+            whole,
+            "a slice shares its source buffer, which is the reason this test exists"
+        );
+
+        // Budget far below the row so the split recurses to the single-row floor.
+        let chunks = slice_batch(one_row, 1024, true).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let measured = chunks[0].get_array_memory_size();
+        assert_eq!(chunks[0].num_rows(), 1);
+        assert!(
+            measured < whole / 100,
+            "single row still measured as {measured} bytes against a {whole} byte source"
+        );
+    }
 
     fn make_batch(num_rows: usize) -> RecordBatch {
         let schema = test_schema();

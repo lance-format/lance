@@ -21,7 +21,7 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
@@ -358,20 +358,27 @@ impl PyShardWriter {
     /// Return current MemTable statistics.
     ///
     /// Returns a dict with keys: row_count, batch_count, estimated_size_bytes,
-    /// generation.
+    /// index_bytes, frozen_bytes, generation.
     pub fn memtable_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
-        let stats = rt()
+        let (stats, bytes) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
-                    Some(w) => w.memtable_stats().await,
+                    // Byte totals come from `memory()`, the lock-free view;
+                    // `memtable_stats` carries none.
+                    Some(w) => w
+                        .memtable_stats()
+                        .await
+                        .map(|stats| (stats, Some(w.memory()))),
                     None => {
                         let closed_guard = closed_state.lock().await;
                         closed_guard
                             .as_ref()
-                            .map(|state| state.memtable_stats.clone())
+                            // A closed writer holds nothing, so the byte totals
+                            // are zero by construction rather than stale.
+                            .map(|state| (state.memtable_stats.clone(), None))
                             .ok_or_else(|| {
                                 lance_core::Error::invalid_input("ShardWriter is already closed")
                             })
@@ -380,7 +387,7 @@ impl PyShardWriter {
             })?
             .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
 
-        memtable_stats_to_pydict(py, &stats)
+        memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
     /// Create an LSM scanner that includes the active MemTable for strong consistency.
@@ -940,11 +947,21 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     Ok(dict.into_any().unbind())
 }
 
-fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<Py<PyAny>> {
+fn memtable_stats_to_pydict(
+    py: Python<'_>,
+    stats: &MemTableStats,
+    bytes: Option<&ShardMemory>,
+) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("row_count", stats.row_count)?;
     dict.set_item("batch_count", stats.batch_count)?;
-    dict.set_item("estimated_size_bytes", stats.estimated_size)?;
+    // Row data only, as this key has always meant; `index_bytes` below is the
+    // rest of the active memtable's footprint.
+    dict.set_item(
+        "estimated_size_bytes",
+        bytes.map_or(0, ShardMemory::row_bytes),
+    )?;
+    dict.set_item("index_bytes", bytes.map_or(0, ShardMemory::index_bytes))?;
     dict.set_item("generation", stats.generation)?;
     dict.set_item(
         "max_buffered_batch_position",
@@ -967,7 +984,16 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
         stats.pending_wal_estimated_bytes,
     )?;
     dict.set_item("frozen_count", stats.frozen_count)?;
-    dict.set_item("frozen_bytes", stats.frozen_bytes)?;
+    dict.set_item("frozen_bytes", bytes.map_or(0, ShardMemory::frozen_bytes))?;
+    // Flushed generations still lingering out `frozen_memtable_grace`. Resident,
+    // but no flush reclaims them, so they are not in `frozen_bytes`.
+    dict.set_item("grace_bytes", bytes.map_or(0, ShardMemory::grace_bytes))?;
+    // The whole footprint: what a process-wide budget meters, as opposed to
+    // `frozen_bytes` + active, which is only what a flush can give back.
+    dict.set_item(
+        "retained_bytes",
+        bytes.map_or(0, ShardMemory::retained_bytes),
+    )?;
     Ok(dict.into_any().unbind())
 }
 
@@ -1040,7 +1066,6 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
     // regardless of whether the active memtable had buffered batches.
     let stats_before_close = MemTableStats {
         frozen_count: 0,
-        frozen_bytes: 0,
         ..stats_before_close
     };
 
@@ -1055,7 +1080,6 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
     MemTableStats {
         row_count: 0,
         batch_count: 0,
-        estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
         max_buffered_batch_position: None,
         durable_batch_count: global_end,
@@ -1066,6 +1090,5 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         pending_wal_row_count: 0,
         pending_wal_estimated_bytes: 0,
         frozen_count: 0,
-        frozen_bytes: 0,
     }
 }

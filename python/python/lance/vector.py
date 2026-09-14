@@ -198,6 +198,33 @@ def train_pq_codebook_on_accelerator(
     return pq_codebook, kmeans_list
 
 
+def _sample_init_centroids(
+    ds: Iterable["torch.Tensor"], k: int, filter_nan: bool
+) -> "torch.Tensor":
+    """Take up to k vectors from ds to seed kmeans, skipping non-finite ones."""
+    # `column is not null` does not exclude NaN vectors, so they can still be
+    # sampled here.  Training drops them (distance returns id -1), but a NaN
+    # centroid never recovers and leaves every partition NaN.
+    sampled = []
+    num_sampled = 0
+    for batch in ds:
+        if filter_nan:
+            batch = batch[batch.isfinite().flatten(1).all(dim=1)]
+        if batch.shape[0] == 0:
+            continue
+        sampled.append(batch)
+        num_sampled += batch.shape[0]
+        if num_sampled >= k:
+            break
+
+    if num_sampled == 0:
+        raise ValueError(
+            "Cannot initialize centroids: the sampled vectors are all null or "
+            "non-finite"
+        )
+    return torch.cat(sampled)[:k]
+
+
 def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
@@ -245,7 +272,7 @@ def train_ivf_centroids_on_accelerator(
         filter=filt,
     )
 
-    init_centroids = next(iter(ds))
+    init_centroids = _sample_init_centroids(ds, k, filter_nan)
     LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(

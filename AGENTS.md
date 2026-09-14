@@ -80,6 +80,7 @@ Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](pyth
 ## Testing Standards
 
 - **All bugfixes and features must have corresponding tests. We do not merge code without tests.**
+- Keep local unit tests lightweight: each test case should finish within one second on typical developer hardware. Split independent parameter matrices and use the smallest fixture or model that preserves the asserted behavior; do not relax assertions, coverage, or recall thresholds to meet the budget.
 - Use `rstest` (Rust) or `@pytest.mark.parametrize` (Python) for tests that differ only in inputs. Use `#[case::{name}(...)]` for readable case names.
 - Replace `print()` in tests with `assert` — prints don't catch regressions.
 - Extend existing tests instead of adding overlapping new ones. Add to existing test files.

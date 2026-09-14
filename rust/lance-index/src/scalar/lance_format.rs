@@ -41,7 +41,9 @@ pub struct LanceIndexStore {
     scheduler: Arc<ScanScheduler>,
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
-    file_sizes: HashMap<String, u64>,
+    // Partition priority views share this immutable map. Cloning all file names
+    // for every partition would make request rebinding quadratic in partitions.
+    file_sizes: Arc<HashMap<String, u64>>,
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
@@ -89,7 +91,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: HashMap::new(),
+            file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -100,7 +102,7 @@ impl LanceIndexStore {
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = file_sizes;
+        self.file_sizes = Arc::new(file_sizes);
         self
     }
 
@@ -406,6 +408,13 @@ impl IndexStore for LanceIndexStore {
         Arc::new(self.clone())
     }
 
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
+    }
+
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
     }
@@ -484,21 +493,16 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
 
-        let other_store = dest_store.as_any().downcast_ref::<Self>();
-        match other_store {
-            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
-                // If both this store and the destination are lance stores we can use object_store's copy
-                // This does blindly assume that both stores are using the same underlying object_store
-                // but there is no easy way to verify this and it happens to always be true at the moment
+        match dest_store.as_any().downcast_ref::<Self>() {
+            Some(dest_store) => {
                 let dest_path = dest_store.index_file_path(new_name)?;
-                self.object_store.copy(&path, &dest_path).await?;
-                let size_bytes = match self.file_sizes.get(name) {
-                    Some(size_bytes) => *size_bytes,
-                    None => self.object_store.size(&path).await?,
-                };
+                let result = self
+                    .object_store
+                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
+                    .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),
-                    size_bytes,
+                    size_bytes: result.size as u64,
                 })
             }
             _ => {
@@ -520,15 +524,14 @@ impl IndexStore for LanceIndexStore {
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
-        self.object_store.copy(&path, &new_path).await?;
+        let result = self
+            .object_store
+            .copy_bulk(&path, &self.object_store, &new_path)
+            .await?;
         self.object_store.delete(&path).await?;
-        let size_bytes = match self.file_sizes.get(name) {
-            Some(size_bytes) => *size_bytes,
-            None => self.object_store.size(&new_path).await?,
-        };
         Ok(IndexFile {
             path: new_name.to_string(),
-            size_bytes,
+            size_bytes: result.size as u64,
         })
     }
 

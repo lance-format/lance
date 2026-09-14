@@ -238,29 +238,47 @@ impl BatchDurableWatcher {
         }
     }
 
-    /// Whether the write is readable yet.
-    fn is_visible(&self) -> bool {
+    /// Whether the write's batches are indexed — the weaker half of
+    /// [`Self::is_visible`], with the append possibly still outstanding.
+    fn is_indexed(&self) -> bool {
         // WAL-only mode has no indexes, so there is nothing to index-wait on.
         let indexed = match &self.indexes {
             Some(indexes) => indexes.indexed_count(),
             None => self.target_indexed,
         };
-        if indexed < self.target_indexed {
-            return false;
-        }
-        !self.cursors.durable_write() || self.cursors.durable() >= self.target_durable
+        indexed >= self.target_indexed
+    }
+
+    /// Whether the write is readable yet.
+    fn is_visible(&self) -> bool {
+        self.is_indexed()
+            && (!self.cursors.durable_write() || self.cursors.durable() >= self.target_durable)
     }
 
     /// Wait until the write is visible, or until the writer poisons — in which
     /// case no cursor will ever reach the target, so surface the typed error
     /// rather than blocking forever.
     pub async fn wait(&mut self) -> Result<()> {
+        self.wait_until(Self::is_visible).await
+    }
+
+    /// Wait until the write is indexed, leaving durability outstanding. Pairs
+    /// with [`MemTableVisibility::Indexed`](crate::dataset::mem_wal::MemTableVisibility::Indexed)
+    /// on the read side.
+    ///
+    /// Not an acknowledgement: a caller promising durability must still await
+    /// [`Self::wait`].
+    pub async fn wait_indexed(&mut self) -> Result<()> {
+        self.wait_until(Self::is_indexed).await
+    }
+
+    async fn wait_until(&mut self, reached: fn(&Self) -> bool) -> Result<()> {
         loop {
             // Mark the current version seen *before* testing, so a wake-up landing
             // between the test and `changed()` below is not lost.
             self.rx.borrow_and_update();
             self.cursors.check_poisoned()?;
-            if self.is_visible() {
+            if reached(self) {
                 return Ok(());
             }
             self.rx
@@ -570,7 +588,7 @@ impl WalOnlyState {
     }
 
     /// Pending bytes (for size-based flush trigger).
-    pub fn estimated_size(&self) -> usize {
+    pub fn queue_bytes(&self) -> usize {
         self.pending
             .lock()
             .ok()
@@ -1341,7 +1359,7 @@ impl WalAppender {
     }
 
     async fn discover_next_position(&self) -> Result<u64> {
-        if let Ok(Some(manifest)) = self.manifest_store.read_latest().await {
+        if let Ok(Some(manifest)) = self.manifest_store.latest().await {
             let hint = manifest.wal_entry_position_last_seen;
             if let Some(tip) = probe_forward_from(
                 self.object_store.as_ref(),
@@ -1364,14 +1382,18 @@ impl WalAppender {
 /// hint for `next_position()`, probing forward from the hint to find the true
 /// tip before falling back to a full directory listing.
 ///
-/// Successful `read_entry` calls asynchronously update
-/// `wal_entry_position_last_seen` in the shard manifest (fire-and-forget).
+/// The highest position read is tracked in memory, so `next_position()` costs
+/// nothing after the first entry. Publishing that cursor for other processes is
+/// the epoch holder's job — a tailer holds no claim and writes no manifests.
 #[derive(Debug, Clone)]
 pub struct WalTailer {
     object_store: Arc<ObjectStore>,
     wal_dir: Path,
     manifest_store: Arc<ShardManifestStore>,
     shard_id: Uuid,
+    /// Highest entry position this tailer has read; 0 until it reads one.
+    /// Shared across clones so they pool what they have seen.
+    highest_read: Arc<AtomicU64>,
 }
 
 impl WalTailer {
@@ -1388,12 +1410,12 @@ impl WalTailer {
             wal_dir: shard_wal_path(&base_path, &shard_id),
             manifest_store,
             shard_id,
+            highest_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Read a WAL entry at the given position. Returns `None` if no entry exists.
-    /// On success, asynchronously updates `wal_entry_position_last_seen` in the
-    /// shard manifest as a best-effort cursor hint for future readers.
+    /// On success, records the position as this tailer's cursor.
     pub async fn read_entry(&self, entry_position: u64) -> Result<Option<WalReadEntry>> {
         let path = self
             .wal_dir
@@ -1417,10 +1439,8 @@ impl WalTailer {
         })?;
         let (writer_epoch, batches) = deserialize_appender_batches(bytes)?;
 
-        let ms = self.manifest_store.clone();
-        tokio::spawn(async move {
-            let _ = best_effort_cursor_update(&ms, entry_position).await;
-        });
+        self.highest_read
+            .fetch_max(entry_position, Ordering::Relaxed);
 
         Ok(Some(WalReadEntry {
             shard_id: self.shard_id,
@@ -1432,7 +1452,7 @@ impl WalTailer {
 
     /// Find the next append position (one past the latest entry).
     pub async fn next_position(&self) -> Result<u64> {
-        if let Some(hint) = self.manifest_cursor_hint().await
+        if let Some(hint) = self.cursor_hint().await
             && let Some(tip) = self.probe_forward(hint).await?
         {
             return Ok(tip);
@@ -1445,9 +1465,16 @@ impl WalTailer {
         scan_first_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
     }
 
-    async fn manifest_cursor_hint(&self) -> Option<u64> {
-        let manifest = self.manifest_store.read_latest().await.ok()??;
-        Some(manifest.wal_entry_position_last_seen)
+    /// Where to start probing for the WAL tip: what this tailer has already
+    /// read, or the cursor a previous process published.
+    async fn cursor_hint(&self) -> Option<u64> {
+        match self.highest_read.load(Ordering::Relaxed) {
+            0 => {
+                let manifest = self.manifest_store.latest().await.ok()??;
+                Some(manifest.wal_entry_position_last_seen)
+            }
+            read => Some(read),
+        }
     }
 
     async fn probe_forward(&self, hint: u64) -> Result<Option<u64>> {
@@ -1678,22 +1705,10 @@ async fn scan_first_position(
     Ok(min_position.unwrap_or(FIRST_WAL_ENTRY_POSITION))
 }
 
-async fn best_effort_cursor_update(manifest_store: &ShardManifestStore, entry_position: u64) {
-    let Ok(Some(manifest)) = manifest_store.read_latest().await else {
-        return;
-    };
-    if entry_position <= manifest.wal_entry_position_last_seen {
-        return;
-    }
-    let mut updated = manifest;
-    updated.version += 1;
-    updated.wal_entry_position_last_seen = entry_position;
-    let _ = manifest_store.write(&updated).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::MemTableVisibility;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -2302,7 +2317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_tailer_uses_manifest_cursor_hint() {
+    async fn test_wal_tailer_hints_from_memory_without_writing() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let appender = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
@@ -2317,26 +2332,33 @@ mod tests {
                 .unwrap();
         }
 
-        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let before = manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+
+        let tailer = WalTailer::new(store, base_path, shard_id);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.entry_position, 1);
 
-        // Best-effort cursor update is async; poll briefly until it lands.
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
-        let mut hint = 0u64;
-        for _ in 0..50 {
-            if let Some(m) = manifest_store.read_latest().await.unwrap() {
-                hint = m.wal_entry_position_last_seen;
-                if hint >= 1 {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(hint >= 1, "cursor hint never updated, last={hint}");
+        // A tailer holds no claim, so it must not touch the manifest. Publishing
+        // the cursor is the epoch holder's job, on the replay path.
+        assert_eq!(
+            manifest_store
+                .refresh_latest()
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            before,
+            "a tailer must not write manifests"
+        );
 
-        // next_position must still resolve to one past the last appended entry.
-        // Three entries from a fresh shard land at 1, 2, 3, so next is 4.
+        // The hint now comes from what this tailer has read. Three entries from
+        // a fresh shard land at 1, 2, 3, so next is 4.
         assert_eq!(tailer.next_position().await.unwrap(), 4);
     }
 
@@ -2495,6 +2517,72 @@ mod tests {
             0,
             "a row whose WAL append failed must never become readable"
         );
+    }
+
+    /// `wait_indexed` clears on the index apply alone; `wait` still needs the
+    /// append.
+    #[tokio::test]
+    async fn test_wait_indexed_clears_before_durable() {
+        let cursors = Arc::new(WriterCursors::new(true));
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        idx.set_durability(Arc::clone(&cursors), 0);
+        let indexes = Arc::new(idx);
+
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Indexed but not durable: the two bounds diverge.
+        assert_eq!(indexes.indexed_count(), 1);
+        assert_eq!(indexes.visible_count(), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Published), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Indexed), 1);
+
+        let mut watcher =
+            BatchDurableWatcher::new(Arc::clone(&cursors), Some(indexes.clone()), 1, 1);
+        watcher
+            .wait_indexed()
+            .await
+            .expect("the index apply has landed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watcher.wait())
+                .await
+                .is_err(),
+            "durability is still outstanding, so `wait` must not return"
+        );
+
+        // The append lands: now both clear.
+        cursors.advance_durable(1);
+        watcher.wait().await.expect("the append has landed");
+        assert_eq!(indexes.visible_count(), 1);
+    }
+
+    /// A poisoned writer wakes an index waiter with the typed error: its rows
+    /// may be indexed, but they are never going to exist.
+    #[tokio::test]
+    async fn test_wait_indexed_surfaces_a_poisoned_writer() {
+        let cursors = Arc::new(WriterCursors::new(true));
+        let mut watcher = BatchDurableWatcher::new(Arc::clone(&cursors), None, 1, 1);
+
+        cursors.mark_terminal_failure(&Error::io("the WAL PUT failed"));
+
+        watcher
+            .wait_indexed()
+            .await
+            .expect_err("a poisoned writer must not hand back a clean index wait");
     }
 
     /// An index-apply failure poisons the writer.

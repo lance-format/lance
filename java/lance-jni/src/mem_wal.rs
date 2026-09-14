@@ -29,7 +29,7 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr, write_pk_sidecar,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
     evaluate_sharding_spec_with_source_columns,
@@ -272,12 +272,16 @@ fn inner_memtable_stats<'local>(
     env: &mut JNIEnv<'local>,
     this: JObject<'local>,
 ) -> Result<JObject<'local>> {
-    let stats = {
+    let (stats, memory) = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-        block_on(guard.writer.memtable_stats())?
+        // Byte totals live on `memory()` now, not on `MemTableStats`.
+        (
+            block_on(guard.writer.memtable_stats())?,
+            guard.writer.memory(),
+        )
     };
-    memtable_stats_to_java(env, &stats)
+    memtable_stats_to_java(env, &stats, &memory)
 }
 
 #[unsafe(no_mangle)]
@@ -1355,17 +1359,21 @@ fn write_stats_to_java<'a>(
     )?)
 }
 
-fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Result<JObject<'a>> {
+fn memtable_stats_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    stats: &MemTableStats,
+    memory: &ShardMemory,
+) -> Result<JObject<'a>> {
     let max_buffered = box_u64_opt(env, stats.max_buffered_batch_position)?;
     let pending_start = box_u64_opt(env, stats.pending_wal_start_batch_position)?;
     let pending_end = box_u64_opt(env, stats.pending_wal_end_batch_position)?;
     Ok(env.new_object(
         "org/lance/memwal/MemTableStats",
-        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJ)V",
+        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJJJJ)V",
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
-            JValueGen::Long(stats.estimated_size as i64),
+            JValueGen::Long(memory.row_bytes() as i64),
             JValueGen::Long(stats.generation as i64),
             JValueGen::Object(&max_buffered),
             JValueGen::Long(stats.durable_batch_count as i64),
@@ -1375,6 +1383,9 @@ fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Re
             JValueGen::Long(stats.pending_wal_batch_count as i64),
             JValueGen::Long(stats.pending_wal_row_count as i64),
             JValueGen::Long(stats.pending_wal_estimated_bytes as i64),
+            JValueGen::Long(memory.index_bytes() as i64),
+            JValueGen::Long(memory.grace_bytes() as i64),
+            JValueGen::Long(memory.retained_bytes() as i64),
         ],
     )?)
 }

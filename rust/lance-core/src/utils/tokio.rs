@@ -184,20 +184,60 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    let (send, recv) = tokio::sync::oneshot::channel();
     // Propagate the current span into the task
     let span = Span::current();
-    global_cpu_runtime().spawn_blocking(move || {
+    let handle = global_cpu_runtime().spawn_blocking(move || {
         let _span_guard = span.enter();
-        let result = func();
-        let _ = send.send(result);
+        func()
     });
-    recv.map(|res| res.unwrap())
+    // Awaited through the join handle, not a result channel: a panic in `func`
+    // arrives as a `JoinError` still carrying its payload, so resuming it
+    // re-raises the original panic in the caller. Reporting the closure's
+    // outcome over a channel instead loses that -- the sender drops unsent and
+    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
+    // `RecvError`, pointing here rather than at the fault.
+    handle.map(|res| match res {
+        Ok(result) => result,
+        Err(join_error) => match join_error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // The CPU runtime outlives every caller, so its tasks are not
+            // cancelled out from under one.
+            Err(join_error) => panic!("spawn_cpu task failed: {join_error}"),
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in the closure must reach the caller intact.
+    ///
+    /// Reporting the closure's outcome over a channel loses it: the sender
+    /// drops unsent and the caller can only see an opaque receive error, so
+    /// every panic in every `spawn_cpu` closure looks the same.
+    #[tokio::test]
+    async fn spawn_cpu_reraises_the_closure_panic() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = tokio::spawn(async {
+            spawn_cpu(|| -> std::result::Result<(), std::io::Error> {
+                panic!("the original message")
+            })
+            .await
+        })
+        .await;
+        std::panic::set_hook(hook);
+
+        let payload = joined
+            .expect_err("the closure's panic propagates to the caller")
+            .into_panic();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .expect("the original payload survives");
+        assert_eq!(message, "the original message");
+    }
 
     // The env vars feed process-global `LazyLock`s that read once and are read
     // in parallel by other tests, so the pure parser is tested directly rather

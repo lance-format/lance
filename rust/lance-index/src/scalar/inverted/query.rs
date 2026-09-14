@@ -9,6 +9,49 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Return whether a Match query requires vocabulary expansion.
+///
+/// `None` selects automatic fuzziness, while `Some(0)` is the only exact
+/// Match mode. Keeping this predicate here prevents tokenization, scorer
+/// preparation, and posting search from assigning different meanings to the
+/// same wire value.
+pub fn uses_fuzzy_expansion(fuzziness: Option<u32>) -> bool {
+    fuzziness != Some(0)
+}
+
+/// Fully resolved fuzzy options for one token.
+pub(crate) struct FuzzyTermOptions<'a> {
+    pub(crate) edit_distance: u32,
+    pub(crate) exact_prefix: &'a str,
+    pub(crate) fuzzy_suffix: &'a str,
+}
+
+/// Resolve automatic edit distance and the exact prefix for one token.
+///
+/// JSON tokens have the form `path,type,value`. The path and type are always
+/// exact; automatic fuzziness and the caller's prefix length apply only to the
+/// value. Prefix lengths count Unicode scalar values, even though the returned
+/// prefix remains a byte slice for the FST automaton.
+pub(crate) fn fuzzy_term_options<'a>(
+    token: &'a str,
+    token_type: &DocType,
+    fuzziness: Option<u32>,
+    prefix_length: u32,
+) -> FuzzyTermOptions<'a> {
+    let value_start = token_type.prefix_len(token);
+    let value = &token[value_start..];
+    let edit_distance = fuzziness.unwrap_or_else(|| MatchQuery::auto_fuzziness(value));
+    let value_prefix_end = value
+        .char_indices()
+        .nth(prefix_length as usize)
+        .map_or(value.len(), |(offset, _)| offset);
+    FuzzyTermOptions {
+        edit_distance,
+        exact_prefix: &token[..value_start + value_prefix_end],
+        fuzzy_suffix: &value[value_prefix_end..],
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
     /// Controls result completeness for each recursively planned FTS node.
@@ -21,6 +64,8 @@ pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
+    /// Final fuzzy vocabulary budget for one Match leaf across all selected
+    /// segments and partitions.
     pub max_expansions: usize,
     // None means not a phrase query
     // Some(n) means a phrase query with slop n
@@ -294,8 +339,11 @@ pub struct MatchQuery {
     // - 2 for terms with length > 5
     pub fuzziness: Option<u32>,
 
-    /// The maximum number of terms to expand for fuzzy matching.
-    /// Default to 50.
+    /// The maximum final vocabulary size for this Match leaf.
+    ///
+    /// One budget is shared across all query positions and every selected
+    /// physical segment and partition. Sibling Match leaves, including fields
+    /// of a MultiMatch query, have independent budgets. Defaults to 50.
     #[serde(default = "MatchQuery::default_max_expansions")]
     pub max_expansions: usize,
 
@@ -379,7 +427,7 @@ impl MatchQuery {
     }
 
     pub fn auto_fuzziness(token: &str) -> u32 {
-        match token.len() {
+        match token.chars().count() {
             0..=2 => 0,
             3..=5 => 1,
             _ => 2,
@@ -959,10 +1007,52 @@ pub fn fill_fts_query_column(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fuzzy_expansion_mode_and_unicode_auto_boundaries() {
+        assert!(!uses_fuzzy_expansion(Some(0)));
+        assert!(uses_fuzzy_expansion(Some(1)));
+        assert!(uses_fuzzy_expansion(None));
+
+        for (token, expected) in [
+            ("ab", 0),
+            ("abc", 1),
+            ("abcde", 1),
+            ("abcdef", 2),
+            ("你好", 0),
+            ("你好啊", 1),
+            ("你好啊世界", 1),
+            ("你好啊世界呀", 2),
+        ] {
+            assert_eq!(
+                MatchQuery::auto_fuzziness(token),
+                expected,
+                "unexpected automatic fuzziness for {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_fuzzy_options_keep_path_and_type_exact() {
+        let automatic = fuzzy_term_options("payload,str,éclair", &DocType::Json, None, 1);
+        assert_eq!(automatic.edit_distance, 2);
+        assert_eq!(automatic.exact_prefix, "payload,str,é");
+        assert_eq!(automatic.fuzzy_suffix, "clair");
+
+        let explicit = fuzzy_term_options("payload,str,éclair", &DocType::Json, Some(1), 0);
+        assert_eq!(explicit.edit_distance, 1);
+        assert_eq!(explicit.exact_prefix, "payload,str,");
+        assert_eq!(explicit.fuzzy_suffix, "éclair");
+
+        let text = fuzzy_term_options("éclair", &DocType::Text, None, 1);
+        assert_eq!(text.edit_distance, 2);
+        assert_eq!(text.exact_prefix, "é");
+        assert_eq!(text.fuzzy_suffix, "clair");
+    }
+
     #[test]
     fn test_boolean_query_introspection_includes_must_not() {
-        use super::*;
-
         let implicit = MatchQuery::new("exclude".to_string())
             .with_boost(3.0)
             .with_fuzziness(Some(1))

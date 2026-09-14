@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        build_index_metadata_from_segments, load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -50,18 +50,16 @@ fn default_index_name(fields: &[&str]) -> String {
 }
 
 fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexParams> {
-    let mut merged = serde_json::to_value(InvertedIndexParams::default())?;
-    if let Some(raw_params) = params.params.as_deref() {
-        let provided = serde_json::from_str::<serde_json::Value>(raw_params)?;
-        let merged = merged.as_object_mut().ok_or_else(|| {
-            Error::internal("default inverted index parameters are not a JSON object".to_string())
-        })?;
-        let provided = provided.as_object().ok_or_else(|| {
-            Error::invalid_input("inverted index parameters must be a JSON object".to_string())
-        })?;
-        merged.extend(provided.clone());
-    }
-    Ok(serde_json::from_value(merged)?)
+    let provided = params
+        .params
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    provided.as_object().ok_or_else(|| {
+        Error::invalid_input("inverted index parameters must be a JSON object".to_string())
+    })?;
+    Ok(serde_json::from_value(provided)?)
 }
 
 fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
@@ -261,8 +259,10 @@ impl<'a> CreateIndexBuilder<'a> {
         )
         .await?;
 
-        // Load indices from the disk.
-        let indices = self.dataset.load_indices().await?;
+        // Load indices from the disk. Names are reserved against every index the
+        // manifest carries: one this build cannot read still owns its name, and
+        // handing that name out again commits two indices under it.
+        let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -635,8 +635,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let new_idx = self.execute_uncommitted().await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
-            self.dataset
-                .load_indices()
+            load_all_indices(self.dataset)
                 .await?
                 .iter()
                 .filter(|idx| idx.name == new_idx.name)
@@ -709,7 +708,7 @@ impl<'a> CreateIndexBuilder<'a> {
             false
         };
 
-        let indices = self.dataset.load_indices().await?;
+        let indices = load_all_indices(self.dataset).await?;
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
@@ -1044,6 +1043,7 @@ mod tests {
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
@@ -1063,6 +1063,24 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(7)));
+    }
+
+    #[rstest]
+    #[case::omitted(r#"{"base_tokenizer":"ngram"}"#, false)]
+    #[case::explicit(
+        r#"{"base_tokenizer":"ngram","stem":true,"remove_stop_words":true}"#,
+        true
+    )]
+    fn test_generic_inverted_params_preserve_ngram_defaults(
+        #[case] raw_params: &str,
+        #[case] expected_word_filters: bool,
+    ) {
+        let provided: serde_json::Value = serde_json::from_str(raw_params).unwrap();
+        let params = ScalarIndexParams::new("inverted".to_string()).with_params(&provided);
+        let resolved = serde_json::to_value(resolved_inverted_params(&params).unwrap()).unwrap();
+        assert_eq!(resolved["base_tokenizer"], "ngram");
+        assert_eq!(resolved["stem"], expected_word_filters);
+        assert_eq!(resolved["remove_stop_words"], expected_word_filters);
     }
 
     #[test]

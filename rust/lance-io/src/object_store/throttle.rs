@@ -48,6 +48,8 @@ use rand::Rng;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
@@ -873,6 +875,68 @@ impl AimdThrottledStore {
             multipart_parts_throttled_at_http,
         }
     }
+
+    /// Put a paginated lister on the same list budget as this store.
+    pub fn wrap_paginated(
+        &self,
+        inner: Arc<dyn PaginatedListStore>,
+    ) -> Arc<dyn PaginatedListStore> {
+        Arc::new(ThrottledListStore {
+            inner,
+            throttle: self.list.clone(),
+        })
+    }
+}
+
+/// A store paired with the paginated lister that shares its rate limits.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+type StoreWithLister = (Arc<dyn ObjectStore>, Option<Arc<dyn PaginatedListStore>>);
+
+/// Apply AIMD throttling to a store and to the lister that shares its list budget.
+///
+/// [`crate::object_store::ObjectStore::read_dir_page`] goes to the lister rather than
+/// through the store, so both have to be wrapped for list requests to be counted once
+/// against one rate.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn with_throttling(
+    state: Option<AimdThrottleState>,
+    multipart_parts_throttled_at_http: bool,
+    store: Arc<dyn ObjectStore>,
+    lister: Option<Arc<dyn PaginatedListStore>>,
+) -> StoreWithLister {
+    let Some(state) = state else {
+        return (store, lister);
+    };
+    let store = Arc::new(AimdThrottledStore::new_with_state(
+        store,
+        state,
+        multipart_parts_throttled_at_http,
+    ));
+    let lister = lister.map(|lister| store.wrap_paginated(lister));
+    (store, lister)
+}
+
+/// A [`PaginatedListStore`] whose requests draw on a store's list token bucket.
+struct ThrottledListStore {
+    inner: Arc<dyn PaginatedListStore>,
+    throttle: Arc<OperationThrottle>,
+}
+
+// Throttling only adds waiting, so every semantic of the store it wraps has to reach the
+// listing unchanged; the lint keeps a method added to the trait from silently falling back to
+// its default here.
+#[async_trait]
+#[deny(clippy::missing_trait_methods)]
+impl PaginatedListStore for ThrottledListStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        opts: PaginatedListOptions,
+    ) -> OSResult<PaginatedListResult> {
+        self.throttle
+            .throttled(|| self.inner.list_paginated(prefix, opts.clone()))
+            .await
+    }
 }
 
 #[async_trait]
@@ -1052,6 +1116,102 @@ mod tests {
             .body(object_store::client::HttpRequestBody::empty())
             .unwrap();
         assert_eq!(is_multipart_part_request(&request), expected);
+    }
+
+    /// One page of a fixed directory, counting the requests that reached it.
+    #[derive(Default)]
+    struct CountingListStore {
+        calls: AtomicUsize,
+        fail_with: Option<String>,
+    }
+
+    #[async_trait]
+    impl PaginatedListStore for CountingListStore {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _opts: PaginatedListOptions,
+        ) -> OSResult<PaginatedListResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.fail_with {
+                Some(message) => Err(make_generic_error(message)),
+                None => Ok(PaginatedListResult {
+                    result: ListResult {
+                        common_prefixes: vec![Path::from("prefix/child")],
+                        objects: Vec::new(),
+                        extensions: Default::default(),
+                    },
+                    page_token: None,
+                }),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_paginated_lister_acquires_a_token_before_listing() {
+        let lister = Arc::new(CountingListStore::default());
+        let throttled = AimdThrottledStore::new(
+            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+        let throttled_lister = throttled.wrap_paginated(lister.clone());
+
+        let mut page = Box::pin(
+            throttled_lister.list_paginated(Some("prefix/"), PaginatedListOptions::default()),
+        );
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition sleeps for
+        // 100 ms. A 50 ms timeout must expire before that.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut page)
+                .await
+                .is_err()
+        );
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 0);
+
+        let page = tokio::time::timeout(std::time::Duration::from_millis(300), page)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.result.common_prefixes.len(), 1);
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paginated_lister_throttle_errors_decrease_rate() {
+        let lister = Arc::new(CountingListStore {
+            calls: AtomicUsize::new(0),
+            fail_with: Some(THROTTLE_ERROR_RESPONSE.to_string()),
+        });
+        let mut config = AimdThrottleConfig::default().with_list_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_decrease_factor(0.5)
+                .with_window_duration(std::time::Duration::from_millis(1)),
+        );
+        config.max_retries = 1;
+        // The AIMD window is only evaluated when an outcome is recorded after the
+        // window has elapsed, so the retry backoff must outlast `window_duration`.
+        // With a zero backoff the two attempts against this in-memory lister can
+        // finish inside the first window (observed on Windows), leaving the rate
+        // untouched.
+        config.min_backoff_ms = 5;
+        config.max_backoff_ms = 5;
+        let throttled =
+            AimdThrottledStore::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, config)
+                .unwrap();
+        let throttled_lister = throttled.wrap_paginated(lister.clone());
+
+        assert!(
+            throttled_lister
+                .list_paginated(Some("prefix/"), PaginatedListOptions::default())
+                .await
+                .is_err()
+        );
+
+        // The request was retried once, and the throttle response pushed the rate down.
+        assert_eq!(lister.calls.load(Ordering::SeqCst), 2);
+        assert!(throttled.list.controller.current_rate() < 100.0);
     }
 
     #[tokio::test]

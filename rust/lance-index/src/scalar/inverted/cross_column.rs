@@ -22,19 +22,22 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use super::compound::{
     BoxScorer, ComposableScorer, CompoundLeafPlanInput, CompoundPlanAnalysis, CompoundScorerPlan,
     EmptyScorer, LeafQuery, MaterializedScorer, RowAddressMergeScorer, RowAddressSource,
-    ScoreBounds, ScoredRow, TopKCollector, collect_leaf_queries, expanded_leaf_tokens,
-    map_scorer_to_row_addresses, prepare_row_address_projection, tokenize_leaf,
+    ScoreBounds, ScoredRow, TopKCollector, collect_leaf_queries, map_scorer_to_row_addresses,
+    prepare_row_address_projection, tokenize_leaf,
 };
 use super::documents::{
     DocId, DocLengths, DocVisibility, PartitionDocuments, ResidentAddressProjection,
 };
 use super::index::{InvertedPartition, PostingLoadOptions};
-use super::query::{FtsQuery, FtsSearchParams, Operator, Tokens};
+use super::query::{FtsQuery, FtsSearchParams, Operator};
 use super::scorer::MemBM25Scorer;
 use super::wand::{
     FLAT_SEARCH_PERCENT_THRESHOLD, FlatDocuments, PostingIterator, WandCursor, WandDocuments,
 };
-use super::{DocInfo, DocumentGranularity, InvertedIndex};
+use super::{
+    DocInfo, DocumentGranularity, InvertedIndex, PreparedBm25Query, final_query_tokens,
+    has_all_query_positions,
+};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 
@@ -53,10 +56,9 @@ const MAX_STAGED_GENERATOR_CANDIDATES: usize = 1_000_000;
 
 struct PreparedCrossColumnLeaf {
     column_ordinal: usize,
-    tokens_by_segment: Vec<Arc<Tokens>>,
+    query: Arc<PreparedBm25Query>,
     params: Arc<FtsSearchParams>,
     operator: Operator,
-    scorer: Arc<MemBM25Scorer>,
 }
 
 struct LoadedCrossColumnLeaf {
@@ -252,21 +254,21 @@ fn staged_candidate_budget(num_docs: usize, limit: usize) -> usize {
 fn leaf_plan_input(leaf: &PreparedCrossColumnLeaf) -> Result<CompoundLeafPlanInput> {
     let mut seen_terms = HashSet::<(u32, String)>::new();
     let mut costs_by_position = HashMap::<u32, usize>::new();
-    for tokens in &leaf.tokens_by_segment {
-        for token_index in 0..tokens.len() {
-            let position = tokens.position(token_index);
-            let token = tokens.get_token(token_index);
-            if seen_terms.insert((position, token.to_owned())) {
-                let frequency = leaf.scorer.num_docs_containing_token(token);
-                let position_cost = costs_by_position.entry(position).or_default();
-                *position_cost = position_cost.saturating_add(frequency);
-            }
+    let tokens = leaf.query.tokens();
+    for token_index in 0..tokens.len() {
+        let position = tokens.position(token_index);
+        let token = tokens.get_token(token_index);
+        if seen_terms.insert((position, token.to_owned())) {
+            let frequency = leaf.query.scorer().num_docs_containing_token(token);
+            let position_cost = costs_by_position.entry(position).or_default();
+            *position_cost = position_cost.saturating_add(frequency);
         }
     }
 
     let requires_every_position =
         leaf.operator == Operator::And || leaf.params.phrase_slop.is_some();
-    let possible = !costs_by_position.is_empty()
+    let possible = (!requires_every_position || leaf.query.has_all_query_positions())
+        && !costs_by_position.is_empty()
         && if requires_every_position {
             costs_by_position.values().all(|cost| *cost > 0)
         } else {
@@ -287,7 +289,7 @@ fn leaf_plan_input(leaf: &PreparedCrossColumnLeaf) -> Result<CompoundLeafPlanInp
             .copied()
             .fold(0, usize::saturating_add)
     }
-    .min(leaf.scorer.num_docs());
+    .min(leaf.query.scorer().num_docs());
     Ok(CompoundLeafPlanInput::new(
         true,
         cost,
@@ -319,7 +321,11 @@ fn staged_generator(
     let num_docs = analysis
         .generator_leaves
         .iter()
-        .map(|&leaf_ordinal| leaves.get(leaf_ordinal).map(|leaf| leaf.scorer.num_docs()))
+        .map(|&leaf_ordinal| {
+            leaves
+                .get(leaf_ordinal)
+                .map(|leaf| leaf.query.scorer().num_docs())
+        })
         .collect::<Option<Vec<_>>>()?
         .into_iter()
         .max()
@@ -541,52 +547,50 @@ async fn prepare_column_leaves(
     for (leaf_ordinal, leaf) in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, leaf, &effective_params);
-        let tokens_by_segment = indices
-            .iter()
-            .map(|index| {
-                expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())
-                    .map(Arc::new)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for tokens in &tokens_by_segment {
-            for token in tokens.as_ref() {
-                if seen_terms.insert(token.clone()) {
-                    union_terms.push(token.clone());
-                }
+        let final_tokens = Arc::new(final_query_tokens(indices, &tokens, &effective_params)?);
+        for token in final_tokens.as_ref() {
+            if seen_terms.insert(token.clone()) {
+                union_terms.push(token.clone());
             }
         }
+        let has_all_positions = has_all_query_positions(&tokens, final_tokens.as_ref());
         leaf_metadata.push((
             *leaf_ordinal,
-            tokens_by_segment,
+            final_tokens,
+            has_all_positions,
             Arc::new(effective_params),
             leaf.operator(),
         ));
     }
 
-    // One union-term scorer per column means every leaf shares the same corpus
-    // totals and the index metadata for each segment is fetched only once.
+    // One union-term scorer per column preserves the existing metadata-I/O
+    // boundary while every leaf keeps its own canonical vocabulary budget.
     let scorer = build_column_scorer(indices, union_terms, metrics).await?;
-
     Ok(leaf_metadata
         .into_iter()
-        .map(|(leaf_ordinal, tokens_by_segment, params, operator)| {
-            (
-                leaf_ordinal,
-                PreparedCrossColumnLeaf {
-                    column_ordinal,
-                    tokens_by_segment,
-                    params,
-                    operator,
-                    scorer: scorer.clone(),
-                },
-            )
-        })
+        .map(
+            |(leaf_ordinal, tokens, has_all_positions, params, operator)| {
+                (
+                    leaf_ordinal,
+                    PreparedCrossColumnLeaf {
+                        column_ordinal,
+                        query: Arc::new(PreparedBm25Query::from_parts(
+                            tokens,
+                            scorer.clone(),
+                            has_all_positions,
+                        )),
+                        params,
+                        operator,
+                    },
+                )
+            },
+        )
         .collect())
 }
 
 fn viable_leaf_ordinals(
     column_ordinal: usize,
-    segment_ordinal: usize,
+    _segment_ordinal: usize,
     partition: &InvertedPartition,
     prepared_leaves: &[PreparedCrossColumnLeaf],
     leaf_ordinals: &[usize],
@@ -604,11 +608,7 @@ fn viable_leaf_ordinals(
                 leaf.column_ordinal
             )));
         }
-        let tokens = leaf.tokens_by_segment.get(segment_ordinal).ok_or_else(|| {
-            Error::internal(format!(
-                "cross-column FTS leaf {leaf_ordinal} has no tokens for segment {segment_ordinal}"
-            ))
-        })?;
+        let tokens = leaf.query.tokens();
         if partition.may_match_tokens(
             tokens.as_ref(),
             leaf.operator,
@@ -622,7 +622,7 @@ fn viable_leaf_ordinals(
 
 async fn load_source_leaves(
     partition: Arc<InvertedPartition>,
-    segment_ordinal: usize,
+    _segment_ordinal: usize,
     viable_leaf_ordinals: Vec<usize>,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     metrics: Arc<dyn MetricsCollector>,
@@ -642,12 +642,11 @@ async fn load_source_leaves(
                     "cross-column FTS source references missing leaf {leaf_ordinal}"
                 ))
             })?;
-            let tokens = leaf.tokens_by_segment.get(segment_ordinal).ok_or_else(|| {
-                Error::internal(format!(
-                    "cross-column FTS leaf {leaf_ordinal} has no tokens for segment {segment_ordinal}"
-                ))
-            })?;
-            let postings = if tokens.is_empty() {
+            let tokens = leaf.query.tokens();
+            let postings = if tokens.is_empty()
+                || ((leaf.operator == Operator::And || leaf.params.phrase_slop.is_some())
+                    && !leaf.query.has_all_query_positions())
+            {
                 Vec::new()
             } else {
                 partition
@@ -655,7 +654,7 @@ async fn load_source_leaves(
                         tokens.as_ref(),
                         leaf.params.as_ref(),
                         leaf.operator,
-                        leaf.scorer.as_ref(),
+                        leaf.query.scorer().as_ref(),
                         metrics.as_ref(),
                         PostingLoadOptions::cache_aware_exact(true),
                     )
@@ -667,7 +666,7 @@ async fn load_source_leaves(
                 postings,
                 params: leaf.params.clone(),
                 operator: leaf.operator,
-                scorer: leaf.scorer.clone(),
+                scorer: leaf.query.scorer().clone(),
             })
         }
     }))
@@ -1311,7 +1310,7 @@ fn score_cross_column_sources(
         debug_assert!(slot.is_none());
         *slot = Some(Box::new(MaterializedScorer::try_new(rows)?));
     }
-    let mut scorer = plan.build(&mut leaf_scorers, metrics.as_ref())?;
+    let mut scorer = plan.build(&mut leaf_scorers)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "cross-column compound FTS scorer did not consume every prepared leaf",
@@ -1502,7 +1501,6 @@ pub async fn cross_column_compound_search(
     let staged_candidates = if let Some((generator_leaf_ordinals, candidate_budget)) =
         staged_generator
     {
-        metrics.record_cross_column_staged_attempts(1);
         let generator_leaf_set = generator_leaf_ordinals
             .iter()
             .copied()
@@ -1558,7 +1556,7 @@ pub async fn cross_column_compound_search(
             )
         })
         .await?;
-        let staged = if let Some(local_candidates) = local_candidates {
+        if let Some(local_candidates) = local_candidates {
             let resolved = stream::iter(
                 local_candidates
                     .into_iter()
@@ -1579,17 +1577,6 @@ pub async fn cross_column_compound_search(
             .await?
         } else {
             None
-        };
-        match staged {
-            Some(candidates) => {
-                metrics.record_cross_column_staged_successes(1);
-                metrics.record_cross_column_staged_candidates(candidates.addresses.len());
-                Some(candidates)
-            }
-            None => {
-                metrics.record_cross_column_staged_fallbacks(1);
-                None
-            }
         }
     } else {
         None
@@ -1678,7 +1665,7 @@ mod tests {
     use crate::prefilter::NoFilter;
     use crate::scalar::inverted::encoding::compress_posting_list;
     use crate::scalar::inverted::query::{
-        BooleanQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
+        BooleanQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery, Tokens,
     };
     use crate::scalar::inverted::tokenizer::document_tokenizer::DocType;
     use crate::scalar::inverted::{
@@ -1743,19 +1730,28 @@ mod tests {
         num_docs: usize,
         token_docs: impl IntoIterator<Item = (&'static str, usize)>,
     ) -> PreparedCrossColumnLeaf {
+        let mut segment_tokens = tokens_by_segment.into_iter();
+        let tokens = Arc::new(segment_tokens.next().unwrap());
+        for segment_tokens in segment_tokens {
+            assert_eq!(segment_tokens.len(), tokens.len());
+            for index in 0..segment_tokens.len() {
+                assert_eq!(segment_tokens.get_token(index), tokens.get_token(index));
+                assert_eq!(segment_tokens.position(index), tokens.position(index));
+            }
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            num_docs as u64,
+            num_docs,
+            token_docs
+                .into_iter()
+                .map(|(token, count)| (token.to_owned(), count))
+                .collect(),
+        ));
         PreparedCrossColumnLeaf {
             column_ordinal: 0,
-            tokens_by_segment: tokens_by_segment.into_iter().map(Arc::new).collect(),
+            query: Arc::new(PreparedBm25Query::from_parts(tokens, scorer, true)),
             params: Arc::new(FtsSearchParams::new().with_phrase_slop(phrase_slop)),
             operator,
-            scorer: Arc::new(MemBM25Scorer::new(
-                num_docs as u64,
-                num_docs,
-                token_docs
-                    .into_iter()
-                    .map(|(token, count)| (token.to_owned(), count))
-                    .collect(),
-            )),
         }
     }
 

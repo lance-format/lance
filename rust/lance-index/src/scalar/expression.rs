@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, '$.name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -1837,12 +1837,9 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
                     search.exact_sargable_query_key()
                 }
                 _ => None,
@@ -2093,7 +2090,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, '$.name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
@@ -2997,9 +2994,11 @@ mod tests {
             ),
         ]);
 
+        // The typed accessors decode the path value, matching the representation
+        // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, '$.name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
@@ -3008,6 +3007,14 @@ mod tests {
                 "$.name".to_string(),
             ),
         );
+        // `json_extract` evaluates to serialized JSON text, which does not match the
+        // decoded keys in the index, so it must not route.
+        // https://github.com/lance-format/lance/issues/8806
+        check_no_index(&index_info, "json_extract(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, '$.name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, '$.name') < 'foo'");
+        // A typed accessor on a path the index was not built for still declines.
+        check_no_index(&index_info, "json_get_string(json, '$.other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -4199,7 +4206,7 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, '$.b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4218,13 +4225,13 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, '$.a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, '$.c') = 'foo'");
     }
 
     #[test]
@@ -5047,6 +5054,25 @@ mod tests {
                 if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
                     if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
                         if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
         ));
     }
 

@@ -1,9 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::partition::FuzzyAutomaton;
 use super::*;
 
+const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
+
+fn reuse_prepared_scorer_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    reuse_prepared_scorer_enabled_from_value(
+        std::env::var(LANCE_FTS_REUSE_PREPARED_SCORER_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn select_impact_scorer(
+    scorer: &MemBM25Scorer,
+    prepared_scorer: Option<&Arc<MemBM25Scorer>>,
+    is_legacy: impl FnOnce() -> bool,
+    reuse_prepared_scorer_enabled: impl FnOnce() -> bool,
+) -> Arc<MemBM25Scorer> {
+    let Some(prepared_scorer) = prepared_scorer else {
+        return Arc::new(scorer.clone());
+    };
+    if is_legacy() || !reuse_prepared_scorer_enabled() {
+        return Arc::new(scorer.clone());
+    }
+    debug_assert!(
+        std::ptr::eq(scorer, prepared_scorer.as_ref()),
+        "prepared BM25 scorer must be the canonical final scorer"
+    );
+    Arc::clone(prepared_scorer)
+}
+
 impl InvertedIndex {
+    /// Add this segment's lexicographically smallest fuzzy candidates for one
+    /// compiled query-token automaton to a caller-owned cross-segment merge
+    /// set.
+    ///
+    /// The set is trimmed after every partition merge, so it always contains
+    /// at most `limit` terms. Dropping the current largest term is lossless:
+    /// no later merge can make it one of the globally smallest `limit` terms.
+    pub(in crate::scalar::inverted) fn collect_fuzzy_candidates_with_automaton(
+        &self,
+        automaton: &FuzzyAutomaton,
+        limit: usize,
+        candidates: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        // The caller owns one compiled automaton for this source token. Reuse
+        // it across every physical partition instead of rebuilding a DFA per
+        // dictionary.
+        while candidates.len() > limit {
+            candidates.pop_last();
+        }
+        for partition in &self.partitions {
+            partition.collect_fuzzy_candidates_with_automaton(automaton, limit, candidates)?;
+            while candidates.len() > limit {
+                candidates.pop_last();
+            }
+            debug_assert!(candidates.len() <= limit);
+        }
+        Ok(())
+    }
+
     /// Build a single-segment [`MemBM25Scorer`] whose per-term IDF table
     /// covers every token that the per-partition scoring loop will look
     /// up. For fuzzy queries that means the union of Levenshtein
@@ -16,7 +82,7 @@ impl InvertedIndex {
         params: &FtsSearchParams,
         metrics: Option<&dyn MetricsCollector>,
     ) -> Result<MemBM25Scorer> {
-        if matches!(params.fuzziness, Some(n) if n != 0) {
+        if uses_fuzzy_expansion(params.fuzziness) {
             let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
             self.bm25_scorer_for_final_tokens(&expanded, metrics).await
         } else {
@@ -60,6 +126,57 @@ impl InvertedIndex {
             futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term, metrics)))
                 .await?;
         Ok((total_tokens, num_docs, token_docs))
+    }
+
+    /// Return BM25 statistics synchronously when every required value is loaded.
+    ///
+    /// This is an all-or-nothing probe for the full-prewarm query path. It never
+    /// starts I/O: an absent segment corpus statistic or one absent modern
+    /// posting-length table returns `None` for the entire segment.
+    pub(in crate::scalar::inverted) fn bm25_stats_for_terms_if_loaded(
+        &self,
+        terms: &[String],
+    ) -> Result<Option<(u64, usize, Vec<usize>)>> {
+        // Keep the legacy reader on its frozen asynchronous compatibility
+        // path; this optimization targets current partitioned formats.
+        if self.is_legacy() {
+            return Ok(None);
+        }
+        let Some(&(total_tokens, num_docs)) = self.corpus_stats.get() else {
+            return Ok(None);
+        };
+        if self
+            .partitions
+            .iter()
+            .any(|partition| !partition.inverted_list.posting_lengths_loaded())
+        {
+            return Ok(None);
+        }
+        let mut token_docs = Vec::with_capacity(terms.len());
+        for term in terms {
+            let mut term_docs = 0_usize;
+            for partition in &self.partitions {
+                let Some(token_id) = partition.tokens.get(term) else {
+                    continue;
+                };
+                let posting_len = partition
+                    .inverted_list
+                    .loaded_posting_len(token_id)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "FTS token '{term}' maps to invalid posting token id {token_id} in partition {}",
+                            partition.id()
+                        ))
+                    })?;
+                term_docs = term_docs.checked_add(posting_len).ok_or_else(|| {
+                    Error::index(format!(
+                        "FTS document frequency for term '{term}' overflows usize"
+                    ))
+                })?;
+            }
+            token_docs.push(term_docs);
+        }
+        Ok(Some((total_tokens, num_docs, token_docs)))
     }
 
     /// Aggregate immutable per-partition corpus statistics.  New modern files
@@ -133,34 +250,42 @@ impl InvertedIndex {
     /// Expand fuzzy query tokens against all partitions in this segment.
     ///
     /// `params.max_expansions` caps the whole query's expansion, not any
-    /// single partition's: for each query token the per-partition candidates
-    /// (each streamed in FST key order) merge into one lexicographically
-    /// ordered set, and the remaining budget takes a prefix of it. The
-    /// selected terms are a pure function of the segment's vocabulary, so
-    /// splitting the same corpus into more partitions cannot change which
-    /// terms a fuzzy query matches.
+    /// single partition's: source terms at the same query position and their
+    /// per-partition candidates merge into one lexicographically ordered set,
+    /// and the remaining budget takes a prefix of it. The selected terms are
+    /// a pure function of the segment's vocabulary, so changing source-token
+    /// order or splitting the same corpus into more partitions cannot change
+    /// which terms a fuzzy query matches.
     pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
-        let mut expanded_tokens = Vec::new();
-        let mut expanded_positions = Vec::new();
+        let initial_capacity = tokens.len().min(params.max_expansions);
+        let mut expanded_tokens = Vec::with_capacity(initial_capacity);
+        let mut expanded_positions = Vec::with_capacity(initial_capacity);
         let mut seen = HashSet::new();
+        let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
         for token_idx in 0..tokens.len() {
+            source_terms_by_position
+                .entry(tokens.position(token_idx))
+                .or_default()
+                .push(tokens.get_token(token_idx));
+        }
+        for (position, source_terms) in source_terms_by_position {
             let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
             if remaining == 0 {
                 break;
             }
-            let token = tokens.get_token(token_idx);
-            let position = tokens.position(token_idx);
             // Each partition contributes at most its `remaining`
             // lexicographically smallest candidates, so the global
             // lex-smallest `remaining` selection below is unaffected by the
             // per-partition truncation.
             let mut candidates = BTreeSet::new();
-            let base_prefix_len = tokens.token_type().prefix_len(token) as u32;
-            for partition in &self.partitions {
-                partition.collect_fuzzy_candidates(
-                    token,
-                    base_prefix_len,
-                    params,
+            let mut seen_source_terms = HashSet::new();
+            for source_term in source_terms {
+                if !seen_source_terms.insert(source_term) {
+                    continue;
+                }
+                let automaton = FuzzyAutomaton::new(source_term, tokens.token_type(), params)?;
+                self.collect_fuzzy_candidates_with_automaton(
+                    &automaton,
                     remaining,
                     &mut candidates,
                 )?;
@@ -184,8 +309,10 @@ impl InvertedIndex {
 
     /// Search documents that match the query and return row ids sorted by BM25 score.
     ///
-    /// When `base_scorer` is provided, search uses those corpus-level BM25 statistics
-    /// instead of deriving them from this segment alone.
+    /// When `base_scorer` is provided for an exact query, search uses those
+    /// corpus-level BM25 statistics instead of deriving them from this segment
+    /// alone. Fuzzy queries must use [`Self::bm25_search_prepared`], because a
+    /// scorer alone does not identify the canonical capped vocabulary.
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
         &self,
@@ -206,6 +333,10 @@ impl InvertedIndex {
     }
 
     /// Search logical FTS documents, retaining element coordinates when present.
+    ///
+    /// A scorer-only override is valid for exact queries. Fuzzy callers must
+    /// use [`Self::bm25_search_prepared_documents`] so the canonical vocabulary
+    /// and its statistics cannot diverge.
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search_documents(
         &self,
@@ -216,11 +347,79 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<Vec<ScoredDoc>> {
+        self.bm25_search_documents_impl(
+            tokens,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            base_scorer,
+            None,
+        )
+        .await
+    }
+
+    /// Search logical FTS documents with an exclusive initial raw-score floor.
+    ///
+    /// This is an internal optimization hook for a repeated bounded WAND pass.
+    /// Callers must round the floor down far enough to retain every candidate
+    /// equal to their inclusive logical threshold.
+    #[doc(hidden)]
+    #[instrument(level = "debug", skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bm25_search_documents_with_score_floor(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
+        initial_score_floor: f32,
+    ) -> Result<Vec<ScoredDoc>> {
+        if self.is_legacy() {
+            return Err(Error::invalid_input(
+                "an initial Match WAND score floor requires a modern FTS index",
+            ));
+        }
+        if !initial_score_floor.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "initial Match WAND score floor must be finite, got {initial_score_floor}"
+            )));
+        }
+        self.bm25_search_documents_impl(
+            tokens,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            base_scorer,
+            Some(initial_score_floor),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_search_documents_impl(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
+        initial_score_floor: Option<f32>,
+    ) -> Result<Vec<ScoredDoc>> {
+        if base_scorer.is_some() && uses_fuzzy_expansion(params.fuzziness) {
+            return Err(Error::invalid_input(
+                "fuzzy BM25 search cannot use an injected scorer without its prepared vocabulary; use bm25_search_prepared or bm25_search_prepared_documents",
+            ));
+        }
         // Fuzzy expansion runs once here, with the global `max_expansions`
         // budget, instead of once per partition: partitions receive the
         // final token list, so the matched terms cannot depend on how the
         // corpus happens to be partitioned.
-        let tokens = if matches!(params.fuzziness, Some(n) if n != 0) {
+        let tokens = if uses_fuzzy_expansion(params.fuzziness) {
             let expanded = Arc::new(self.expand_fuzzy_tokens(tokens.as_ref(), params.as_ref())?);
             if operator == Operator::And || params.phrase_slop.is_some() {
                 // AND/phrase semantics require every original token position
@@ -238,10 +437,6 @@ impl InvertedIndex {
             tokens
         };
 
-        // The wand only consults `scorer.doc_weight`, which is metadata-free.
-        // The outer aggregation below consults `scorer.query_weight`, which
-        // hits per-token `posting_len`; building a `MemBM25Scorer` with
-        // precomputed per-term IDFs avoids the v2 bulk metadata pull.
         let local_scorer;
         let scorer: &MemBM25Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
@@ -251,7 +446,146 @@ impl InvertedIndex {
                 .await?;
             &local_scorer
         };
-        let impact_scorer = Arc::new(scorer.clone());
+        self.bm25_search_final_documents(
+            tokens,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            scorer,
+            None,
+            initial_score_floor,
+        )
+        .await
+    }
+
+    /// Search with a vocabulary/scorer pair prepared once across every
+    /// physical segment. No fuzzy expansion or local scorer construction is
+    /// permitted below this boundary.
+    #[doc(hidden)]
+    pub async fn bm25_search_prepared(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let documents = self
+            .bm25_search_prepared_documents(prepared, params, operator, prefilter, metrics)
+            .await?;
+        Ok(documents
+            .into_iter()
+            .map(|document| (document.row_id, document.score.0))
+            .unzip())
+    }
+
+    /// Search logical FTS documents with a vocabulary/scorer pair prepared
+    /// once across every physical segment.
+    #[doc(hidden)]
+    pub async fn bm25_search_prepared_documents(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<ScoredDoc>> {
+        self.bm25_search_prepared_documents_impl(
+            prepared, params, operator, prefilter, metrics, None,
+        )
+        .await
+    }
+
+    /// Search logical FTS documents with a prepared vocabulary/scorer pair and
+    /// an exclusive initial raw-score floor.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bm25_search_prepared_documents_with_score_floor(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        initial_score_floor: f32,
+    ) -> Result<Vec<ScoredDoc>> {
+        if self.is_legacy() {
+            return Err(Error::invalid_input(
+                "an initial Match WAND score floor requires a modern FTS index",
+            ));
+        }
+        if !initial_score_floor.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "initial Match WAND score floor must be finite, got {initial_score_floor}"
+            )));
+        }
+        self.bm25_search_prepared_documents_impl(
+            prepared,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            Some(initial_score_floor),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_search_prepared_documents_impl(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        initial_score_floor: Option<f32>,
+    ) -> Result<Vec<ScoredDoc>> {
+        if (operator == Operator::And || params.phrase_slop.is_some())
+            && !prepared.has_all_query_positions()
+        {
+            return Ok(Vec::new());
+        }
+        let scorer = prepared.scorer();
+        let reusable_scorer = prepared.reusable_scorer();
+        self.bm25_search_final_documents(
+            prepared.tokens().clone(),
+            params,
+            operator,
+            prefilter,
+            metrics,
+            scorer.as_ref(),
+            reusable_scorer,
+            initial_score_floor,
+        )
+        .await
+    }
+
+    // This is the boundary between query preparation and final document search;
+    // each argument is an independent prepared input consumed by both legacy and
+    // modern implementations.
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_search_final_documents(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        scorer: &MemBM25Scorer,
+        prepared_scorer: Option<&Arc<MemBM25Scorer>>,
+        initial_score_floor: Option<f32>,
+    ) -> Result<Vec<ScoredDoc>> {
+        // The wand only consults `scorer.doc_weight`, which is metadata-free.
+        // The outer aggregation below consults `scorer.query_weight`; pairing
+        // final tokens with precomputed per-term IDFs avoids the v2 bulk
+        // metadata pull and keeps scoring aligned with the rewrite.
+        let impact_scorer = select_impact_scorer(
+            scorer,
+            prepared_scorer,
+            || self.is_legacy(),
+            || *LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED,
+        );
 
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
@@ -286,6 +620,7 @@ impl InvertedIndex {
                 scorer,
                 impact_scorer,
                 limit,
+                initial_score_floor,
             })
             .await
         }
@@ -329,6 +664,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                ..
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
@@ -500,10 +836,10 @@ impl InvertedIndex {
         }
         // For new-format indexes, aggregate_corpus_stats reads corpus stats from
         // persisted schema metadata (O(1)) without loading doc lengths as a side
-        // effect. Pre-load lengths in parallel now for partitions that contain at
-        // least one query token, so the scoring phase gets cache hits instead of
-        // issuing sequential per-partition IO.  Partitions with no matching terms
-        // are skipped to preserve the no-load optimization for no-hit queries.
+        // effect. Pre-load lengths in parallel now only for partitions whose
+        // dictionaries can satisfy the query leaf, so required-token misses avoid
+        // reading the full length column. The scoring phase then gets cache hits
+        // instead of issuing sequential per-partition IO.
         let io_parallelism = self.store.io_parallelism();
         let uncached_lengths = self
             .partitions
@@ -513,9 +849,12 @@ impl InvertedIndex {
                 if docs.cached_lengths().is_some() {
                     return None;
                 }
-                let has_match = (0..request.tokens.len())
-                    .any(|i| part.tokens.get(request.tokens.get_token(i)).is_some());
-                has_match.then_some(async move { docs.lengths().await.map(|_| ()) })
+                part.may_match_tokens(
+                    request.tokens.as_ref(),
+                    request.operator,
+                    request.params.phrase_slop.is_some(),
+                )
+                .then_some(async move { docs.lengths().await.map(|_| ()) })
             })
             .collect::<Vec<_>>();
         if !uncached_lengths.is_empty() {
@@ -541,6 +880,7 @@ impl InvertedIndex {
             scorer,
             impact_scorer,
             limit,
+            initial_score_floor,
         } = request;
         if self.partitions.len() > u32::MAX as usize {
             return Err(Error::index(format!(
@@ -548,7 +888,9 @@ impl InvertedIndex {
                 self.partitions.len()
             )));
         }
-        let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let impact_shared_threshold = Arc::new(AtomicU32::new(
+            initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
+        ));
         let io_parallelism = self.store.io_parallelism();
         let parts = self
             .partitions
@@ -582,6 +924,7 @@ impl InvertedIndex {
                                 grouped_expansions,
                                 impact_safe,
                                 exact_scoring_required,
+                                ..
                             } = part
                                 .load_posting_lists(
                                     tokens.as_ref(),
@@ -822,5 +1165,83 @@ impl InvertedIndex {
             }
         }
         Ok(resolved_documents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scorer() -> Arc<MemBM25Scorer> {
+        Arc::new(MemBM25Scorer::new(10, 2, HashMap::new()))
+    }
+
+    #[test]
+    fn test_reuse_prepared_scorer_kill_switch_parser() {
+        for value in [None, Some(""), Some("1"), Some("on"), Some("false")] {
+            assert!(
+                reuse_prepared_scorer_enabled_from_value(value),
+                "unexpected disable: {value:?}"
+            );
+        }
+        for value in [Some("0"), Some("off"), Some("OFF"), Some(" off ")] {
+            assert!(
+                !reuse_prepared_scorer_enabled_from_value(value),
+                "unexpected enable: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_impact_scorer_reuses_enabled_prepared_arc() {
+        let prepared = scorer();
+        let impact = select_impact_scorer(prepared.as_ref(), Some(&prepared), || false, || true);
+
+        assert!(Arc::ptr_eq(&impact, &prepared));
+        assert_eq!(Arc::strong_count(&prepared), 2);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_when_disabled() {
+        let prepared = scorer();
+        let unrelated = scorer();
+        let impact = select_impact_scorer(unrelated.as_ref(), Some(&prepared), || false, || false);
+
+        assert!(!Arc::ptr_eq(&impact, &unrelated));
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        assert_eq!(Arc::strong_count(&unrelated), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_legacy_without_reading_switch() {
+        let prepared = scorer();
+        let unrelated = scorer();
+        let impact = select_impact_scorer(
+            unrelated.as_ref(),
+            Some(&prepared),
+            || true,
+            || panic!("legacy search must not read the reuse switch"),
+        );
+
+        assert!(!Arc::ptr_eq(&impact, &unrelated));
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        assert_eq!(Arc::strong_count(&unrelated), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_nonprepared_without_reading_switch() {
+        let scorer = scorer();
+        let impact = select_impact_scorer(
+            scorer.as_ref(),
+            None,
+            || panic!("nonprepared search must not inspect the index format"),
+            || panic!("nonprepared search must not read the reuse switch"),
+        );
+
+        assert!(!Arc::ptr_eq(&impact, &scorer));
+        assert_eq!(Arc::strong_count(&scorer), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
     }
 }

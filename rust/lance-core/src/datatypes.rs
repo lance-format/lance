@@ -62,8 +62,9 @@ pub static BLOB_V2_LOGICAL_MINIMAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 /// The complete logical blob v2 fields used for writer input and rewrite output.
 ///
 /// `position` and `size` are an optional range within the external object named
-/// by `uri`. They do not describe Lance-managed data, packed, or dedicated
-/// storage.
+/// by `uri`; when present, `size` must be greater than zero. Every non-null row
+/// must set exactly one of `data` and `uri`. These fields do not describe
+/// Lance-managed data, packed, or dedicated storage.
 pub static BLOB_V2_LOGICAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     let mut fields = BLOB_V2_LOGICAL_MINIMAL_FIELDS
         .iter()

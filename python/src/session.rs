@@ -11,6 +11,7 @@ use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 use lance::session::{CacheSpec, Session as LanceSession};
 use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
 
+use crate::object_store::PyObjectStoreRegistry;
 use crate::rt;
 
 /// The Session holds stateful information for a dataset.
@@ -168,12 +169,14 @@ impl Session {
         metadata_cache_size_bytes=None,
         index_cache_backend=None,
         metadata_cache_backend=None,
+        store_registry=None,
     ))]
     fn create(
         index_cache_size_bytes: Option<usize>,
         metadata_cache_size_bytes: Option<usize>,
         index_cache_backend: Option<Bound<'_, PyAny>>,
         metadata_cache_backend: Option<Bound<'_, PyAny>>,
+        store_registry: Option<PyObjectStoreRegistry>,
     ) -> PyResult<Self> {
         let index_cache = resolve_cache_spec(
             "index_cache_backend",
@@ -187,9 +190,9 @@ impl Session {
             "metadata_cache_size_bytes",
             metadata_cache_size_bytes,
         )?;
-
+        let store_registry = store_registry.map(|r| r.inner).unwrap_or_default();
         let session =
-            LanceSession::with_cache_backends(index_cache, metadata_cache, Default::default());
+            LanceSession::with_cache_backends(index_cache, metadata_cache, store_registry);
         Ok(Self {
             inner: Arc::new(session),
         })
