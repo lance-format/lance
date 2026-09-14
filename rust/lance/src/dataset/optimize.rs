@@ -309,8 +309,18 @@ pub struct CompactionOptions {
     pub max_overlays_per_fragment: Option<usize>,
     /// Exact data file version for compacted output.
     ///
-    /// If omitted, the dataset manifest fallback is resolved when each task
-    /// starts and carried in its [`RewriteResult`].
+    /// If omitted, use the dataset's default write version without changing it.
+    /// The planner resolves release selectors before distributing tasks.
+    /// Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::dataset::optimize::CompactionOptions;
+    /// # use lance_file::version::LanceFileVersion;
+    /// let options = CompactionOptions {
+    ///     data_storage_version: Some(LanceFileVersion::V2_2),
+    ///     ..Default::default()
+    /// };
+    /// ```
     pub data_storage_version: Option<LanceFileVersion>,
     /// Transaction properties to store with this commit.
     ///
@@ -788,6 +798,11 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        let write_version = self.options.write_version(dataset);
+        versions::validate_write_version(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
+        )?;
         if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
             return Err(Error::invalid_input(
                 "defer_index_remap=true is not supported on datasets with stable row IDs: \
@@ -962,7 +977,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         let mut options = self.options.clone();
-        options.data_storage_version = Some(options.write_version(dataset).to_selector());
+        options.data_storage_version = Some(write_version.to_selector());
         let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
@@ -2290,9 +2305,6 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
-    /// Canonical exact output version resolved when the task started.
-    #[serde(default)]
-    pub write_version: String,
 }
 
 async fn reserve_fragment_ids(
@@ -2341,6 +2353,10 @@ async fn rewrite_files(
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
     let write_version = options.write_version(dataset.as_ref());
+    versions::validate_write_version(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        write_version,
+    )?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -2349,7 +2365,6 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
-            write_version: write_version.to_manifest_string().to_string(),
         });
     }
 
@@ -2634,7 +2649,6 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
-        write_version: write_version.to_manifest_string().to_string(),
     })
 }
 
@@ -2815,22 +2829,6 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    let mut resolved_write_version = None;
-    for task in &completed_tasks {
-        if task.write_version.is_empty() {
-            continue;
-        }
-        let task_version = ConcreteFileVersion::from_manifest_string(&task.write_version)?;
-        if let Some(expected) = resolved_write_version {
-            if task_version != expected {
-                return Err(Error::invalid_input(format!(
-                    "Compaction results use different exact output versions: {expected} and {task_version}"
-                )));
-            }
-        } else {
-            resolved_write_version = Some(task_version);
-        }
-    }
     // Before anything is written or committed. The condition is the planner's,
     // not `has_address_style`: a dataset whose only index is one this build
     // cannot read captures no row addresses at all, which is exactly the plan
@@ -3131,6 +3129,7 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -3401,30 +3400,176 @@ mod tests {
     }
 
     #[rstest]
-    #[case::stable(LanceFileVersion::Stable, LanceFileVersion::V2_1)]
-    #[case::next(LanceFileVersion::Next, LanceFileVersion::V2_3)]
+    #[case::default(None, LanceFileVersion::V2_0)]
+    #[case::stable(Some(LanceFileVersion::Stable), LanceFileVersion::V2_2)]
+    #[case::next(Some(LanceFileVersion::Next), LanceFileVersion::V2_3)]
     #[tokio::test]
     async fn plan_compaction_freezes_storage_version_selector(
-        #[case] selector: LanceFileVersion,
+        #[case] selector: Option<LanceFileVersion>,
         #[case] exact: LanceFileVersion,
     ) {
-        let test_dir = TempStrDir::default();
-        let data = sample_data();
-        let dataset = Dataset::write(
+        let data = arrow_array::record_batch!(("id", Int32, [1, 2, 3, 4, 5, 6])).unwrap();
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-            &test_dir,
-            None,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
         let options = CompactionOptions {
-            data_storage_version: Some(selector),
+            data_storage_version: selector,
+            excluded_fragment_ids: vec![2],
             ..Default::default()
         };
 
         let plan = plan_compaction(&dataset, &options).await.unwrap();
 
         assert_eq!(plan.options.data_storage_version, Some(exact));
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serialized["options"]["data_storage_version"],
+            exact.to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<CompactionPlan>(serialized).unwrap(),
+            plan
+        );
+        assert_eq!(plan.num_tasks(), 1);
+        let retained = dataset.manifest.fragments[2].clone();
+        let task = plan.compaction_tasks().next().unwrap();
+        let task: CompactionTask =
+            serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(
+            result
+                .new_fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == exact.resolve())
+        );
+        let result: RewriteResult =
+            serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .any(|fragment| fragment == &retained)
+        );
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        let actual = dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, data);
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn compaction_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(source),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: Some(target),
+            ..Default::default()
+        };
+        let error = plan_compaction(&dataset, &options).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+        // Standalone distributed tasks also validate, independently of the planner.
+        let mut task = plan_compaction(&dataset, &CompactionOptions::default())
+            .await
+            .unwrap()
+            .compaction_tasks()
+            .next()
+            .unwrap();
+        task.options = options;
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+    }
+
+    #[rstest]
+    #[case("0.1", Some(LanceFileVersion::Legacy))]
+    #[case("2.0", Some(LanceFileVersion::V2_0))]
+    #[case("2.1", Some(LanceFileVersion::V2_1))]
+    #[case("2.2", Some(LanceFileVersion::V2_2))]
+    #[case("2.3", Some(LanceFileVersion::V2_3))]
+    #[case("stable", Some(LanceFileVersion::Stable))]
+    #[case("next", Some(LanceFileVersion::Next))]
+    #[case("invalid", None)]
+    fn compaction_storage_version_config(
+        #[case] value: &str,
+        #[case] expected: Option<LanceFileVersion>,
+    ) {
+        let config = HashMap::from([(
+            "lance.compaction.data_storage_version".to_string(),
+            value.to_string(),
+        )]);
+        let result = CompactionOptions::from_dataset_config(&config);
+        if let Some(expected) = expected {
+            let options = result.unwrap();
+            assert_eq!(options.data_storage_version, Some(expected));
+            let json = serde_json::to_value(&options).unwrap();
+            assert_eq!(json["data_storage_version"], value);
+            assert_eq!(
+                serde_json::from_value::<CompactionOptions>(json).unwrap(),
+                options
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("lance.compaction.data_storage_version")
+            );
+            assert!(error.to_string().contains(value));
+            let error =
+                serde_json::from_value::<LanceFileVersion>(serde_json::json!(value)).unwrap_err();
+            assert!(error.to_string().contains(value));
+        }
     }
 
     #[rstest]

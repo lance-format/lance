@@ -260,7 +260,7 @@ pub async fn write_fragments_direct(
 
 fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
     for fragment in fragments {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             if data_file.file_version()? != expected {
                 return Ok(false);
             }
