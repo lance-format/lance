@@ -228,12 +228,40 @@ impl LsmScanPlanner {
                 scan
             };
 
-            source_plans.push(plan);
+            source_plans.push((plan, is_base));
         }
+
+        // Every arm has to agree before the union: a generation is written under
+        // the schema the shard held when it was sealed, so one sealed before a
+        // column was added does not carry it, one sealed before a rename carries
+        // the old name, and one sealed before a retype carries the old type.
+        // `UnionExec` requires schema equality and does not reconcile.
+        //
+        // The base arm is the authority when it is here -- it is the only source
+        // the schema change was applied to -- and the newest generation
+        // otherwise.
+        let target = source_plans
+            .iter()
+            .find(|(_, is_base)| *is_base)
+            .or_else(|| source_plans.last())
+            .map(|(plan, _)| plan.schema());
+        let mut source_plans = match target {
+            Some(target) => source_plans
+                .into_iter()
+                .map(|(plan, _)| {
+                    if plan.schema() == target {
+                        Ok(plan)
+                    } else {
+                        project_to_canonical(plan, &target)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
         // Union, then coalesce into a single partition (UnionExec emits one
         // per arm; downstream consumers only read partition 0).
-        let mut plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
+        let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
             #[allow(deprecated)]
@@ -243,7 +271,7 @@ impl LsmScanPlanner {
 
         // Project to the canonical output schema, dropping `_rowaddr` /
         // `_memtable_gen` unless the caller opted in.
-        plan = project_to_canonical(
+        let mut plan = project_to_canonical(
             plan,
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
@@ -332,9 +360,21 @@ impl LsmScanPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
 
+                // Asked of this generation, not of the base table. A generation
+                // is written under the schema the shard held when it was sealed,
+                // so a column added since is not in it and cannot be projected
+                // from it -- the arms are reconciled above the union instead.
+                // Projecting the base table's columns here asks an older file
+                // for a column it has never had, failing the scan outright.
+                let generation_schema: SchemaRef = Arc::new(dataset.schema().into());
                 let cols =
-                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    build_scanner_projection(projection, &generation_schema, &self.pk_columns);
+                let cols: Vec<&str> = cols
+                    .iter()
+                    .filter(|c| generation_schema.column_with_name(c).is_some())
+                    .map(|s| s.as_str())
+                    .collect();
+                scanner.project(&cols)?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
