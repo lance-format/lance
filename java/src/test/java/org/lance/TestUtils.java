@@ -684,6 +684,7 @@ public class TestUtils {
           new WriteParams.Builder()
               // Enable stable row ids to simplify test assertions across fragments
               .withEnableStableRowIds(true)
+              .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_1)
               .withMode(WriteParams.WriteMode.CREATE)
               .build();
       Dataset ds = Dataset.create(allocator, datasetPath, getSchema(), params);
@@ -734,6 +735,7 @@ public class TestUtils {
                 .withMaxRowsPerFile(maxRowsPerFile)
                 .withMode(WriteParams.WriteMode.APPEND)
                 .withEnableStableRowIds(true)
+                .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_1)
                 .build();
 
         List<FragmentMetadata> metas = Fragment.create(datasetPath, allocator, root, params);

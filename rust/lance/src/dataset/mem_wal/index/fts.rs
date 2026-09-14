@@ -51,19 +51,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch, UInt64Array};
 use crossbeam_skiplist::SkipMap;
 use fst::{Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{Operator, Tokens};
+use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::RowPosition;
 use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
@@ -770,12 +770,15 @@ impl std::fmt::Debug for TokenizerPool {
 
 impl TokenizerPool {
     fn new(params: &InvertedIndexParams, cap: usize) -> Result<Self> {
-        let template = params.build()?;
-        Ok(Self {
+        Ok(Self::from_template(params.build()?, cap))
+    }
+
+    fn from_template(template: Box<dyn LanceTokenizer>, cap: usize) -> Self {
+        Self {
             template,
             free: Mutex::new(Vec::new()),
             cap: cap.max(1),
-        })
+        }
     }
 
     /// Acquire a tokenizer. Pops from the free list, otherwise clones the
@@ -1003,12 +1006,165 @@ pub struct FtsMemIndex {
     /// The tail freezes into a partition once it reaches this many docs.
     freeze_threshold_rows: usize,
 
+    /// Query-local materializations disable freezes and tiered merges. Their
+    /// lifetime is bounded by one query, so background maintenance would only
+    /// outlive cancellation without providing reuse.
+    background_maintenance: bool,
+
     /// Background tiered-merge slot. `None` = idle; `Some` with `result: None`
     /// = a merge is running on a worker thread; `Some` with `result: Some` =
     /// the merged partition is ready for the writer to install. Only the
     /// writer mutates `state`; the worker is read-only and just fills `result`,
     /// so the single-writer / lock-free-reader contract is preserved.
     merge: Arc<Mutex<Option<PendingMerge>>>,
+}
+
+/// Query-owned term-only postings for one residual scan.
+///
+/// This deliberately exposes only the immutable feature-materialization API
+/// needed by hybrid execution. Unlike [`FtsMemIndex`], it never freezes or
+/// starts a detached tiered merge; dropping the query drops all residual
+/// postings.
+#[derive(Debug)]
+pub struct QueryLocalFtsIndex {
+    inner: FtsMemIndex,
+}
+
+#[derive(Debug, Default)]
+pub struct QueryLocalFtsStats {
+    doc_count: usize,
+    total_tokens: u64,
+    token_docs: FxHashMap<String, usize>,
+}
+
+impl QueryLocalFtsStats {
+    pub(crate) fn checked_add_assign(&mut self, other: Self) -> Result<()> {
+        self.doc_count = self
+            .doc_count
+            .checked_add(other.doc_count)
+            .ok_or_else(|| Error::internal("query-local FTS document count overflow"))?;
+        self.total_tokens = self
+            .total_tokens
+            .checked_add(other.total_tokens)
+            .ok_or_else(|| Error::internal("query-local FTS total token count overflow"))?;
+        for (token, df) in other.token_docs {
+            let current = self.token_docs.entry(token).or_default();
+            *current = current
+                .checked_add(df)
+                .ok_or_else(|| Error::internal("query-local FTS term document count overflow"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_to_scorer(&self, scorer: &mut MemBM25Scorer) -> Result<()> {
+        scorer.num_docs = scorer
+            .num_docs
+            .checked_add(self.doc_count)
+            .ok_or_else(|| Error::internal("residual BM25 document count overflow"))?;
+        scorer.total_tokens = scorer
+            .total_tokens
+            .checked_add(self.total_tokens)
+            .ok_or_else(|| Error::internal("residual BM25 total token count overflow"))?;
+        for (token, df) in &self.token_docs {
+            let current = scorer.token_docs.entry(token.clone()).or_default();
+            *current = current
+                .checked_add(*df)
+                .ok_or_else(|| Error::internal("residual BM25 term document count overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+impl QueryLocalFtsIndex {
+    #[cfg(test)]
+    pub(crate) fn try_with_params(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: FtsMemIndex::try_with_params_and_maintenance(
+                field_id,
+                column_name,
+                params,
+                false,
+            )?,
+        })
+    }
+
+    pub(crate) fn try_with_loaded_tokenizer(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        tokenizer: Box<dyn LanceTokenizer>,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        let pool = TokenizerPool::from_template(tokenizer, FtsMemIndex::DEFAULT_TOKENIZER_POOL_CAP);
+        Ok(Self {
+            inner: FtsMemIndex::with_tokenizer_pool_and_maintenance(
+                field_id,
+                column_name,
+                params,
+                pool,
+                false,
+            ),
+        })
+    }
+
+    /// Create an empty query-local shard without rebuilding tokenizer assets.
+    ///
+    /// The tokenizer pool and its loaded template are shared with the seed;
+    /// each shard only clones a writer tokenizer from that in-memory template.
+    pub(crate) fn empty_sibling(&self) -> Self {
+        let resolved_field = OnceLock::new();
+        if let Some(resolved) = self.inner.resolved_field.get() {
+            resolved_field
+                .set(resolved.clone())
+                .expect("new query-local shard traversal is empty");
+        }
+
+        Self {
+            inner: FtsMemIndex {
+                field_id: self.inner.field_id,
+                source_column_name: self.inner.source_column_name.clone(),
+                params: self.inner.params.clone(),
+                resolved_field,
+                tokenizer_pool: self.inner.tokenizer_pool.clone(),
+                writer_tokenizer: Mutex::new(self.inner.tokenizer_pool.acquire()),
+                state: ArcSwap::from(IndexState::empty()),
+                freeze_threshold_rows: self.inner.freeze_threshold_rows,
+                background_maintenance: false,
+                merge: Arc::new(Mutex::new(None)),
+            },
+        }
+    }
+
+    pub(crate) fn exact_query_terms(&self, query: &FtsQuery) -> Result<Vec<String>> {
+        self.inner.exact_query_terms(query)
+    }
+
+    pub(crate) fn insert_with_row_ids_for_terms(
+        &self,
+        batch: &RecordBatch,
+        row_ids: &UInt64Array,
+        terms: &FxHashSet<String>,
+    ) -> Result<QueryLocalFtsStats> {
+        self.inner
+            .insert_with_row_ids_for_terms(batch, row_ids, terms)
+    }
+
+    #[cfg(test)]
+    fn doc_count(&self) -> usize {
+        self.inner.doc_count()
+    }
+
+    pub(crate) fn exact_leaf_results(
+        &self,
+        query: &FtsQuery,
+        scorer: &MemBM25Scorer,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        self.inner.exact_leaf_results(query, scorer)
+    }
 }
 
 /// A tiered merge dispatched to a background worker.
@@ -1091,10 +1247,35 @@ impl FtsMemIndex {
         column_name: String,
         params: InvertedIndexParams,
     ) -> Result<Self> {
+        Self::try_with_params_and_maintenance(field_id, column_name, params, true)
+    }
+
+    fn try_with_params_and_maintenance(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        background_maintenance: bool,
+    ) -> Result<Self> {
         params.validate_format_version()?;
         let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
+        Ok(Self::with_tokenizer_pool_and_maintenance(
+            field_id,
+            column_name,
+            params,
+            pool,
+            background_maintenance,
+        ))
+    }
+
+    fn with_tokenizer_pool_and_maintenance(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        pool: TokenizerPool,
+        background_maintenance: bool,
+    ) -> Self {
         let writer_tokenizer = pool.template.box_clone();
-        Ok(Self {
+        Self {
             field_id,
             source_column_name: column_name,
             params,
@@ -1103,8 +1284,9 @@ impl FtsMemIndex {
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
+            background_maintenance,
             merge: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     pub(crate) fn try_with_resolved_field(
@@ -1256,7 +1438,46 @@ impl FtsMemIndex {
         self.insert_batch(batch, row_offset)
     }
 
+    /// Insert explicit, potentially non-contiguous rows while retaining
+    /// postings only for query terms.
+    /// The tokenizer still visits the complete document so BM25 document
+    /// lengths remain accurate when scoring with committed-index statistics.
+    pub(crate) fn insert_with_row_ids_for_terms(
+        &self,
+        batch: &RecordBatch,
+        row_ids: &UInt64Array,
+        terms: &FxHashSet<String>,
+    ) -> Result<QueryLocalFtsStats> {
+        if row_ids.len() != batch.num_rows() || row_ids.null_count() != 0 {
+            return Err(Error::invalid_input(format!(
+                "MemWAL FTS explicit row ids require {} non-null values, got len={} nulls={}",
+                batch.num_rows(),
+                row_ids.len(),
+                row_ids.null_count()
+            )));
+        }
+        self.insert_batch_with_keys(batch, |row_index| Ok(row_ids.value(row_index)), Some(terms))
+    }
+
     fn insert_batch(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        self.insert_batch_with_keys(
+            batch,
+            |row_index| {
+                row_offset
+                    .checked_add(row_index as u64)
+                    .ok_or_else(|| Error::invalid_input("MemWAL FTS row position overflow"))
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
+    fn insert_batch_with_keys(
+        &self,
+        batch: &RecordBatch,
+        row_position: impl Fn(usize) -> Result<u64>,
+        allowed_terms: Option<&FxHashSet<String>>,
+    ) -> Result<QueryLocalFtsStats> {
         let st = self.state.load_full();
         let document_position_start = st.tail.doc_count();
         if self.resolved_field.get().is_none() {
@@ -1284,14 +1505,46 @@ impl FtsMemIndex {
         // per-document map and per-`(term, doc)` `Vec` allocation that
         // dominated insert cost. `FxHashMap` skips SipHash on the hot lookup.
         let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
-        let mut documents: Vec<DocumentMetadata> = Vec::with_capacity(batch.num_rows());
+        let mut documents: Vec<DocumentMetadata> = if allowed_terms.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(batch.num_rows())
+        };
         let mut total_tokens: u64 = 0;
+        let mut query_local_corpus_doc_count = 0usize;
+        let mut query_local_corpus_total_tokens = 0u64;
         let preserve_zero_token_documents =
             self.params.get_document_granularity().is_list_element();
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
             let document_position = document_position_start + documents.len() as u64;
-            let num_tokens = index_text(text, document_position, tokenizer, &mut term_builders)?;
-            if preserve_zero_token_documents || num_tokens > 0 {
+            let (num_tokens, retained_term) = match allowed_terms {
+                Some(allowed_terms) => index_text_filtered(
+                    text,
+                    document_position,
+                    tokenizer,
+                    &mut term_builders,
+                    allowed_terms,
+                )?,
+                None => (
+                    index_text(text, document_position, tokenizer, &mut term_builders)?,
+                    false,
+                ),
+            };
+            let belongs_in_corpus = preserve_zero_token_documents || num_tokens > 0;
+            if allowed_terms.is_some() && belongs_in_corpus {
+                query_local_corpus_doc_count = query_local_corpus_doc_count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("query-local FTS document count overflow"))?;
+                query_local_corpus_total_tokens = query_local_corpus_total_tokens
+                    .checked_add(num_tokens as u64)
+                    .ok_or_else(|| Error::internal("query-local FTS total token count overflow"))?;
+            }
+            let retain_document = if allowed_terms.is_some() {
+                retained_term
+            } else {
+                belongs_in_corpus
+            };
+            if retain_document {
                 documents.push(DocumentMetadata { key, num_tokens });
                 total_tokens += num_tokens as u64;
             }
@@ -1301,15 +1554,28 @@ impl FtsMemIndex {
         for document in extracted_documents {
             index_document(
                 DocumentKey {
-                    row_position: row_offset + document.row_index as u64,
+                    row_position: row_position(document.row_index)?,
                     doc_index: document.doc_index,
                 },
                 &document.text,
             )?;
         }
 
+        let query_local_stats = if allowed_terms.is_some() {
+            QueryLocalFtsStats {
+                doc_count: query_local_corpus_doc_count,
+                total_tokens: query_local_corpus_total_tokens,
+                token_docs: term_builders
+                    .iter()
+                    .map(|(term, builder)| (term.to_string(), builder.row_positions.len()))
+                    .collect(),
+            }
+        } else {
+            QueryLocalFtsStats::default()
+        };
+
         if documents.is_empty() {
-            return Ok(());
+            return Ok(query_local_stats);
         }
 
         // Drop the tokenizer guard before publishing so we don't hold it
@@ -1326,10 +1592,124 @@ impl FtsMemIndex {
             self.params.has_positions(),
         );
 
-        if st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
+        if self.background_maintenance && st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
             self.freeze(&st)?;
         }
-        Ok(())
+        Ok(query_local_stats)
+    }
+
+    /// Analyze every exact leaf and return the deduplicated query terms in
+    /// canonical leaf traversal order.
+    pub(crate) fn exact_query_terms(&self, query: &FtsQuery) -> Result<Vec<String>> {
+        fn visit(index: &FtsMemIndex, query: &FtsQuery, terms: &mut Vec<String>) -> Result<()> {
+            match query {
+                FtsQuery::Match(query) => {
+                    if query.fuzziness != Some(0) {
+                        return Err(Error::invalid_input(
+                            "residual compound FTS only supports exact Match leaves",
+                        ));
+                    }
+                    terms.extend(index.analyze_for_search(&query.terms));
+                }
+                FtsQuery::Phrase(query) => {
+                    terms.extend(index.analyze_for_search(&query.terms));
+                }
+                FtsQuery::Boost(query) => {
+                    visit(index, &query.positive, terms)?;
+                    visit(index, &query.negative, terms)?;
+                }
+                FtsQuery::MultiMatch(query) => {
+                    for query in &query.match_queries {
+                        visit(index, &FtsQuery::Match(query.clone()), terms)?;
+                    }
+                }
+                FtsQuery::Boolean(query) => {
+                    for query in query
+                        .should
+                        .iter()
+                        .chain(&query.must)
+                        .chain(&query.must_not)
+                    {
+                        visit(index, query, terms)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut terms = Vec::new();
+        visit(self, query, &mut terms)?;
+        let mut seen = HashSet::with_capacity(terms.len());
+        terms.retain(|term| seen.insert(term.clone()));
+        Ok(terms)
+    }
+
+    /// Materialize each exact leaf with a caller-supplied scorer. Compound
+    /// semantics are deliberately evaluated by the canonical lance-index
+    /// scorer instead of being duplicated here.
+    pub(crate) fn exact_leaf_results(
+        &self,
+        query: &FtsQuery,
+        scorer: &MemBM25Scorer,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        fn visit(
+            index: &FtsMemIndex,
+            query: &FtsQuery,
+            scorer: &MemBM25Scorer,
+            leaves: &mut Vec<Vec<(u64, f32)>>,
+        ) -> Result<()> {
+            match query {
+                FtsQuery::Match(query) => {
+                    if query.fuzziness != Some(0) {
+                        return Err(Error::invalid_input(
+                            "residual compound FTS only supports exact Match leaves",
+                        ));
+                    }
+                    let st = index.state.load_full();
+                    let tokens = index.analyze_for_search(&query.terms);
+                    let rows = index
+                        .search_match_with_scorer(&st, &tokens, query.operator, scorer)
+                        .into_iter()
+                        .map(|entry| (entry.row_position, entry.score))
+                        .collect();
+                    leaves.push(rows);
+                }
+                FtsQuery::Phrase(query) => {
+                    let st = index.state.load_full();
+                    let tokens = index.analyze_for_search(&query.terms);
+                    let rows = index
+                        .search_phrase_with_scorer(&st, &tokens, query.slop, scorer)
+                        .into_iter()
+                        .map(|entry| (entry.row_position, entry.score))
+                        .collect();
+                    leaves.push(rows);
+                }
+                FtsQuery::Boost(query) => {
+                    visit(index, &query.positive, scorer, leaves)?;
+                    visit(index, &query.negative, scorer, leaves)?;
+                }
+                FtsQuery::MultiMatch(query) => {
+                    for query in &query.match_queries {
+                        visit(index, &FtsQuery::Match(query.clone()), scorer, leaves)?;
+                    }
+                }
+                FtsQuery::Boolean(query) => {
+                    for query in query
+                        .should
+                        .iter()
+                        .chain(&query.must)
+                        .chain(&query.must_not)
+                    {
+                        visit(index, query, scorer, leaves)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut leaves = Vec::new();
+        visit(self, query, scorer, &mut leaves)?;
+        Ok(leaves)
     }
 
     /// Freeze the current tail into a new immutable partition and publish a
@@ -1543,6 +1923,7 @@ impl FtsMemIndex {
                         Operator::Or,
                         &scorer,
                         theta,
+                        false,
                     ) {
                         topk.offer(e.score, e.key());
                     }
@@ -1562,11 +1943,82 @@ impl FtsMemIndex {
                         operator,
                         &scorer,
                         f32::NEG_INFINITY,
+                        false,
                     ));
                 }
                 results
             }
         }
+    }
+
+    fn search_match_with_scorer(
+        &self,
+        st: &IndexState,
+        query_tokens: &Tokens,
+        operator: Operator,
+        scorer: &MemBM25Scorer,
+    ) -> Vec<FtsEntry> {
+        if operator == Operator::And && has_grouped_positions(query_tokens) {
+            let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
+            for group in query_position_groups(query_tokens) {
+                let group_results =
+                    self.search_match_strings_with_scorer(st, &group, Operator::Or, scorer);
+                let group_map = group_results
+                    .into_iter()
+                    .map(|entry| (entry.key(), entry.score))
+                    .collect::<HashMap<_, _>>();
+                let Some(current) = result_map.as_mut() else {
+                    result_map = Some(group_map);
+                    continue;
+                };
+                current.retain(|key, score| {
+                    if let Some(group_score) = group_map.get(key) {
+                        *score += group_score;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            return result_map
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, score)| FtsEntry {
+                    row_position: key.row_position,
+                    doc_index: public_doc_index(&key.doc_index),
+                    score,
+                })
+                .collect();
+        }
+        let tokens = query_tokens_to_vec(query_tokens);
+        self.search_match_strings_with_scorer(st, &tokens, operator, scorer)
+    }
+
+    fn search_match_strings_with_scorer(
+        &self,
+        st: &IndexState,
+        tokens: &[String],
+        operator: Operator,
+        scorer: &MemBM25Scorer,
+    ) -> Vec<FtsEntry> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let tail = st.tail.snapshot();
+        let mut results = Vec::new();
+        for partition in st.partitions.iter() {
+            results.extend(partition.search_match(tokens, operator, scorer));
+        }
+        results.extend(score_terms(
+            &tail,
+            &st.tail.terms,
+            tokens,
+            operator,
+            scorer,
+            f32::NEG_INFINITY,
+            true,
+        ));
+        results
     }
 
     fn search_grouped_and(
@@ -1687,6 +2139,57 @@ impl FtsMemIndex {
                     &scorer,
                 ));
             }
+        }
+        results
+    }
+
+    fn search_phrase_with_scorer(
+        &self,
+        st: &IndexState,
+        query_tokens: &Tokens,
+        slop: u32,
+        scorer: &MemBM25Scorer,
+    ) -> Vec<FtsEntry> {
+        if query_tokens.is_empty() || scorer.num_docs() == 0 {
+            return Vec::new();
+        }
+        let groups = query_position_groups(query_tokens);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        if groups.len() == 1 {
+            return self.search_match_strings_with_scorer(st, &groups[0], Operator::Or, scorer);
+        }
+        if !self.params.has_positions() {
+            return Vec::new();
+        }
+        let has_grouped_terms = groups.iter().any(|group| group.len() > 1);
+        let tokens = position_groups_to_tokens(&groups);
+        let tail = st.tail.snapshot();
+        let mut results = Vec::new();
+        for partition in st.partitions.iter() {
+            if has_grouped_terms {
+                results.extend(partition.search_phrase_groups(&groups, slop, scorer));
+            } else {
+                results.extend(partition.search_phrase(&tokens, slop, scorer));
+            }
+        }
+        if has_grouped_terms {
+            results.extend(phrase_search_tail_groups(
+                &tail,
+                &st.tail.terms,
+                &groups,
+                slop,
+                scorer,
+            ));
+        } else {
+            results.extend(phrase_search_tail(
+                &tail,
+                &st.tail.terms,
+                &tokens,
+                slop,
+                scorer,
+            ));
         }
         results
     }
@@ -2264,8 +2767,33 @@ fn index_text(
     tokenizer: &mut dyn LanceTokenizer,
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
 ) -> Result<u32> {
+    index_text_with_predicate(text, document_position, tokenizer, term_builders, |_| true)
+        .map(|(num_tokens, _)| num_tokens)
+}
+
+fn index_text_filtered(
+    text: &str,
+    document_position: u64,
+    tokenizer: &mut dyn LanceTokenizer,
+    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
+    allowed_terms: &FxHashSet<String>,
+) -> Result<(u32, bool)> {
+    index_text_with_predicate(text, document_position, tokenizer, term_builders, |term| {
+        allowed_terms.contains(term)
+    })
+}
+
+#[inline]
+fn index_text_with_predicate(
+    text: &str,
+    document_position: u64,
+    tokenizer: &mut dyn LanceTokenizer,
+    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
+    mut retain_term: impl FnMut(&str) -> bool,
+) -> Result<(u32, bool)> {
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
+    let mut retained_term = false;
     while let Some(token) = stream.next() {
         let position = u32::try_from(token.position).map_err(|_| {
             Error::invalid_input(format!(
@@ -2274,13 +2802,16 @@ fn index_text(
             ))
         })?;
         let term = token.text.as_str();
-        if let Some(builder) = term_builders.get_mut(term) {
-            builder.observe(document_position, position);
-        } else {
-            term_builders.insert(
-                Arc::<str>::from(term),
-                BatchTermBuilder::with_first(document_position, position),
-            );
+        if retain_term(term) {
+            retained_term = true;
+            if let Some(builder) = term_builders.get_mut(term) {
+                builder.observe(document_position, position);
+            } else {
+                term_builders.insert(
+                    Arc::<str>::from(term),
+                    BatchTermBuilder::with_first(document_position, position),
+                );
+            }
         }
         num_tokens = num_tokens.checked_add(1).ok_or_else(|| {
             Error::invalid_input(format!(
@@ -2288,7 +2819,7 @@ fn index_text(
             ))
         })?;
     }
-    Ok(num_tokens)
+    Ok((num_tokens, retained_term))
 }
 
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
@@ -2379,6 +2910,11 @@ fn tail_token_df(
 
 /// Score `tokens` against the visible tail, summing each token's BM25
 /// contribution per document. Uses the shared corpus-wide `scorer`.
+///
+/// `retain_zero_weight_matches` is reserved for query-local residual postings
+/// scored with committed-index statistics. A term absent from the committed
+/// corpus has zero BM25 weight, but its fresh matching rows must remain visible
+/// to compound membership and MUST_NOT evaluation.
 fn score_terms(
     snap: &Snapshot,
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
@@ -2386,6 +2922,7 @@ fn score_terms(
     operator: Operator,
     scorer: &MemBM25Scorer,
     theta: f32,
+    retain_zero_weight_matches: bool,
 ) -> Vec<FtsEntry> {
     // Per-token tail data + its score upper bound (max freq over visible chunks,
     // scored at the most generous doc length of 1). If even the sum of those
@@ -2401,7 +2938,7 @@ fn score_terms(
             continue;
         };
         let qw = scorer.query_weight(token);
-        if qw == 0.0 {
+        if qw == 0.0 && !retain_zero_weight_matches {
             continue;
         }
         let slice = entry.value().load_full();
@@ -2411,7 +2948,9 @@ fn score_terms(
             .map(|c| c.max_freq)
             .max()
             .unwrap_or(0);
-        tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        if qw != 0.0 {
+            tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        }
         tail_terms.push((qw, slice));
     }
     if tail_ub <= theta {
@@ -2428,8 +2967,12 @@ fn score_terms(
                 continue;
             };
             for (i, &document_position) in chunk.row_positions.iter().enumerate() {
-                let dl = meta.dl(document_position).unwrap_or(1);
-                let score = qw * scorer.doc_weight(chunk.frequencies[i], dl);
+                let score = if qw == 0.0 {
+                    0.0
+                } else {
+                    let dl = meta.dl(document_position).unwrap_or(1);
+                    qw * scorer.doc_weight(chunk.frequencies[i], dl)
+                };
                 *doc_scores.entry(document_position).or_default() += score;
                 if let Some(doc_hits) = &mut doc_hits {
                     *doc_hits.entry(document_position).or_default() += 1;
@@ -4140,6 +4683,139 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn query_term_allowlist_preserves_document_lengths_with_external_scorer() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.as_ref());
+        let row_ids = UInt64Array::from(vec![900, 42, 777]);
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let index = QueryLocalFtsIndex::try_with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default(),
+        )
+        .unwrap();
+        let full_index = FtsMemIndex::new(1, "description".to_string());
+
+        let stats = index
+            .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
+            .unwrap();
+        full_index.insert(&batch, 0).unwrap();
+
+        // The unmatched nonempty row (row id 42) contributes no postings or
+        // metadata, but remains part of the approximate residual BM25 corpus.
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(index.inner.entry_count(), 2);
+        assert_eq!(stats.doc_count, 3);
+        assert_eq!(stats.total_tokens, 5);
+        assert_eq!(stats.token_docs.get("hello"), Some(&2));
+        let committed_scorer = MemBM25Scorer::new(6, 3, HashMap::from([("hello".to_string(), 2)]));
+        let mut residual_scorer = committed_scorer.clone();
+        stats.add_to_scorer(&mut residual_scorer).unwrap();
+        assert_eq!(residual_scorer.num_docs, 6);
+        assert_eq!(residual_scorer.total_tokens, 11);
+        assert_eq!(residual_scorer.token_docs.get("hello"), Some(&4));
+
+        let query = FtsQuery::Match(
+            lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
+                .with_column(Some("description".to_string())),
+        );
+        let leaves = index.exact_leaf_results(&query, &committed_scorer).unwrap();
+        let full_leaves = full_index
+            .exact_leaf_results(&query, &committed_scorer)
+            .unwrap();
+        let mut actual = leaves[0]
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, vec![777, 900]);
+        let mut actual_scores = leaves[0]
+            .iter()
+            .map(|(_, score)| score.to_bits())
+            .collect::<Vec<_>>();
+        let mut full_scores = full_leaves[0]
+            .iter()
+            .map(|(_, score)| score.to_bits())
+            .collect::<Vec<_>>();
+        actual_scores.sort_unstable();
+        full_scores.sort_unstable();
+        assert_eq!(actual_scores, full_scores);
+    }
+
+    #[test]
+    fn query_local_external_empty_scorer_retains_zero_score_membership() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.as_ref());
+        let row_ids = UInt64Array::from(vec![900, 42, 777]);
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let index = QueryLocalFtsIndex::try_with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default(),
+        )
+        .unwrap();
+        index
+            .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
+            .unwrap();
+
+        let committed_scorer = MemBM25Scorer::new(0, 0, HashMap::from([("hello".to_string(), 0)]));
+        let query = FtsQuery::Match(
+            lance_index::scalar::inverted::query::MatchQuery::new("hello".to_string())
+                .with_column(Some("description".to_string())),
+        );
+        let leaves = index.exact_leaf_results(&query, &committed_scorer).unwrap();
+
+        let mut actual = leaves[0].clone();
+        actual.sort_unstable_by_key(|(row_id, _)| *row_id);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].0, 777);
+        assert_eq!(actual[1].0, 900);
+        assert!(actual.iter().all(|(_, score)| score.to_bits() == 0));
+    }
+
+    #[test]
+    fn query_local_materialization_never_starts_background_maintenance() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.as_ref());
+        let row_ids = UInt64Array::from(vec![900, 42, 777]);
+        let terms = FxHashSet::from_iter(["hello".to_string()]);
+        let params = InvertedIndexParams::default();
+        let tokenizer = params.build().unwrap();
+        let mut index = QueryLocalFtsIndex::try_with_loaded_tokenizer(
+            1,
+            "description".to_string(),
+            params,
+            tokenizer,
+        )
+        .unwrap();
+        // Crossing the normal freeze threshold would create a partition and
+        // may launch a detached tiered merge. Query-local materialization must
+        // remain entirely in its query-owned tail instead.
+        index.inner.freeze_threshold_rows = 1;
+        index
+            .insert_with_row_ids_for_terms(&batch, &row_ids, &terms)
+            .unwrap();
+
+        assert!(index.inner.state.load().partitions.is_empty());
+        assert!(index.inner.merge.lock().unwrap().is_none());
+        assert_eq!(index.doc_count(), 2);
+
+        let sibling = index.empty_sibling();
+        assert!(Arc::ptr_eq(
+            &index.inner.tokenizer_pool,
+            &sibling.inner.tokenizer_pool
+        ));
+        assert_eq!(sibling.doc_count(), 0);
+        sibling
+            .insert_with_row_ids_for_terms(&batch, &UInt64Array::from(vec![901, 43, 778]), &terms)
+            .unwrap();
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(sibling.doc_count(), 2);
+        assert!(sibling.inner.state.load().partitions.is_empty());
+        assert!(sibling.inner.merge.lock().unwrap().is_none());
     }
 
     fn create_element_test_batch() -> RecordBatch {

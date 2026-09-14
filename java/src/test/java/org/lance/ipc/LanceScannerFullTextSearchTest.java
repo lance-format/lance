@@ -19,6 +19,7 @@ import org.lance.WriteParams;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
+import org.lance.index.scalar.InvertedIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -40,6 +41,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -53,6 +55,35 @@ class LanceScannerFullTextSearchTest {
         "memory://fts_java_match",
         FullTextQuery.match("hello", "doc", DocumentGranularity.ROW),
         2L);
+  }
+
+  @Test
+  void testJiebaTokenizer() throws Exception {
+    ScalarIndexParams indexParams =
+        InvertedIndexParams.builder()
+            .baseTokenizer("jieba/default")
+            .stem(false)
+            .removeStopWords(false)
+            .build();
+
+    runFtsQuery(
+        "memory://fts_java_jieba",
+        FullTextQuery.match("我们", "doc"),
+        1L,
+        Arrays.asList("我们都有光明的前途", "光明的前途"),
+        indexParams);
+  }
+
+  @Test
+  void testCodeAnalyzerBuilderCreatesIndex() throws Exception {
+    ScalarIndexParams indexParams = InvertedIndexParams.builder().analyzer("code").build();
+
+    runFtsQuery(
+        "memory://fts_java_code_analyzer",
+        FullTextQuery.match("helloWorld", "doc"),
+        1L,
+        Arrays.asList("helloWorld", "other_value"),
+        indexParams);
   }
 
   @Test
@@ -108,6 +139,25 @@ class LanceScannerFullTextSearchTest {
   }
 
   private void runFtsQuery(String uri, FullTextQuery query, long expectedTotal) throws Exception {
+    ScalarIndexParams indexParams =
+        ScalarIndexParams.create(
+            "inverted",
+            "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}");
+    runFtsQuery(
+        uri,
+        query,
+        expectedTotal,
+        Arrays.asList("hello world", "hello lance", "other text"),
+        indexParams);
+  }
+
+  private void runFtsQuery(
+      String uri,
+      FullTextQuery query,
+      long expectedTotal,
+      List<String> documents,
+      ScalarIndexParams scalarParams)
+      throws Exception {
 
     Schema schema =
         new Schema(
@@ -122,16 +172,13 @@ class LanceScannerFullTextSearchTest {
         VarCharVector titleVector = (VarCharVector) root.getVector("title");
 
         docVector.allocateNew();
-        docVector.setSafe(0, "hello world".getBytes(StandardCharsets.UTF_8));
-        docVector.setSafe(1, "hello lance".getBytes(StandardCharsets.UTF_8));
-        docVector.setSafe(2, "other text".getBytes(StandardCharsets.UTF_8));
-
         titleVector.allocateNew();
-        titleVector.setSafe(0, "bye world".getBytes(StandardCharsets.UTF_8));
-        titleVector.setSafe(1, "bye lance".getBytes(StandardCharsets.UTF_8));
-        titleVector.setSafe(2, "say hello".getBytes(StandardCharsets.UTF_8));
-
-        root.setRowCount(3);
+        List<String> titles = Arrays.asList("bye world", "bye lance", "say hello");
+        for (int i = 0; i < documents.size(); i++) {
+          docVector.setSafe(i, documents.get(i).getBytes(StandardCharsets.UTF_8));
+          titleVector.setSafe(i, titles.get(i).getBytes(StandardCharsets.UTF_8));
+        }
+        root.setRowCount(documents.size());
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
@@ -150,10 +197,6 @@ class LanceScannerFullTextSearchTest {
               new WriteParams.Builder().withMode(WriteParams.WriteMode.CREATE).build();
 
           try (Dataset dataset = Dataset.create(allocator, stream, uri, writeParams)) {
-            ScalarIndexParams scalarParams =
-                ScalarIndexParams.create(
-                    "inverted",
-                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}");
             IndexParams indexParams =
                 IndexParams.builder().setScalarIndexParams(scalarParams).build();
 

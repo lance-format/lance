@@ -1307,7 +1307,10 @@ mod tests {
         )
     }
 
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_search_bbox() {
         let bbox_type = RectType::new(Dimension::XY, Default::default());
 
@@ -1353,6 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_search_null() {
         let point_type = PointType::new(Dimension::XY, Default::default());
 
@@ -1389,6 +1393,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_empty_geometries_are_not_indexed() {
         let line_string_type = LineStringType::new(Dimension::XY, Default::default());
         let mut builder = LineStringBuilder::new(line_string_type);
@@ -1449,6 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_non_finite_bounds_are_not_treated_as_empty() {
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
@@ -1489,6 +1495,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_merge_rtree_indices_filters_rows_and_nulls() {
         let point_type = PointType::new(Dimension::XY, Default::default());
         let mut first_builder = PointBuilder::new(point_type.clone());
@@ -1586,6 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_removes_pre_fix_empty_entries() {
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
@@ -1651,6 +1659,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_and_search() {
         fn gen_data(num_items: u32, frag_id: u32, nulls_addrs: &mut RowAddrTreeMap) -> RectArray {
             let bbox_type = RectType::new(Dimension::XY, Default::default());
@@ -1748,6 +1757,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_prewarm() {
         let point_type = PointType::new(Dimension::XY, Default::default());
 

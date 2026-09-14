@@ -731,7 +731,6 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::io::exec::{LanceScanConfig, LanceScanExec};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 
@@ -1154,9 +1153,9 @@ mod test {
         let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4], true));
 
         let predicate = col("x")
-            .field_newstyle("a")
+            .field("a")
             .lt(lit(8))
-            .and(col("y").field_newstyle("b").gt(lit(3)));
+            .and(col("y").field("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -1394,7 +1393,7 @@ mod test {
         let dataset = Arc::new(test_dataset().await);
 
         let predicate = col("struct")
-            .field_newstyle("int")
+            .field("int")
             .gt(lit(4))
             .and(col(Column::from_name("str")).is_not_null());
 

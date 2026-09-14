@@ -126,6 +126,47 @@ impl RowIdSequenceCursor {
             }
         }
     }
+
+    // Keep the sparse loop in `extend_range` unchanged. Sharing this loop with
+    // the dense decoder measurably slows sparse system-only scans.
+    fn extend_dense_range(
+        &mut self,
+        sequence: &RowIdSequence,
+        selection: Range<usize>,
+        row_ids: &mut Vec<u64>,
+    ) {
+        if selection.is_empty() {
+            return;
+        }
+        if selection.start < self.rows_passed
+            || self.last_index.is_some_and(|last| selection.start < last)
+        {
+            *self = Self::default();
+        }
+        self.last_index = Some(selection.end - 1);
+
+        let mut index = selection.start;
+        while index < selection.end {
+            let Some(segment) = sequence.0.get(self.segment_idx) else {
+                break;
+            };
+            let segment_len = *self.segment_len.get_or_insert_with(|| segment.len());
+            let local_start = index - self.rows_passed;
+            if local_start >= segment_len {
+                self.advance_segment();
+                continue;
+            }
+
+            let count = (selection.end - index).min(segment_len - local_start);
+            let local_end = local_start + count;
+            self.segment_cursor
+                .extend_dense_range(segment, local_start..local_end, row_ids);
+            index += count;
+            if local_end == segment_len {
+                self.advance_segment();
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for RowIdSequence {
@@ -478,6 +519,23 @@ impl RowIdSequence {
         RowIdSequenceCursor::default()
     }
 
+    /// Choose the dense decoder once for a stream and reuse its cardinality.
+    ///
+    /// A stream uses one decoder for its lifetime, so multi-segment sequences
+    /// conservatively retain the sparse path. For a single bitmap segment, the
+    /// cardinality computed for the density decision seeds the cursor instead
+    /// of scanning the bitmap again on the first batch.
+    pub(crate) fn cursor_with_dense_range_expansion(&self) -> (RowIdSequenceCursor, bool) {
+        let mut cursor = self.cursor();
+        let [segment @ U64Segment::RangeWithBitmap { .. }] = self.0.as_slice() else {
+            return (cursor, false);
+        };
+        let segment_len = segment.len();
+        cursor.segment_len = Some(segment_len);
+        let use_dense_range_expansion = segment.use_dense_range_expansion(segment_len);
+        (cursor, use_dense_range_expansion)
+    }
+
     /// Get a contiguous range of row ids while preserving scan state from a
     /// previous call.
     pub(crate) fn select_range_with_cursor(
@@ -487,6 +545,17 @@ impl RowIdSequence {
     ) -> Vec<u64> {
         let mut row_ids = Vec::with_capacity(selection.len());
         cursor.extend_range(self, selection, &mut row_ids);
+        row_ids
+    }
+
+    /// Get a contiguous range from a sequence whose bitmap segments are dense.
+    pub(crate) fn select_dense_range_with_cursor(
+        &self,
+        cursor: &mut RowIdSequenceCursor,
+        selection: Range<usize>,
+    ) -> Vec<u64> {
+        let mut row_ids = Vec::with_capacity(selection.len());
+        cursor.extend_dense_range(self, selection, &mut row_ids);
         row_ids
     }
 
@@ -1403,6 +1472,51 @@ mod test {
             sequence.select_range_with_cursor(&mut cursor, 2..6),
             live[2..6]
         );
+    }
+
+    #[test]
+    fn test_dense_range_cursor_selection() {
+        let mut bitmap = Bitmap::new_full(40);
+        for hole in [3, 4, 17, 39] {
+            bitmap.clear(hole);
+        }
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 100..140,
+            bitmap,
+        }]);
+        let expected = sequence.iter().collect::<Vec<_>>();
+        let (mut cursor, use_dense_range_expansion) = sequence.cursor_with_dense_range_expansion();
+        assert!(use_dense_range_expansion);
+        assert_eq!(cursor.segment_len, Some(expected.len()));
+
+        let mut actual = Vec::new();
+        for selection in [0..7, 7..8, 8..31, 31..expected.len() + 5] {
+            actual.extend(sequence.select_dense_range_with_cursor(&mut cursor, selection));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            sequence.select_dense_range_with_cursor(&mut cursor, 2..9),
+            expected[2..9]
+        );
+
+        let mut sparse_bitmap = Bitmap::new_empty(40);
+        for value in (0..40).step_by(2) {
+            sparse_bitmap.set(value);
+        }
+        let sparse = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 0..40,
+            bitmap: sparse_bitmap,
+        }]);
+        let (sparse_cursor, use_dense_range_expansion) = sparse.cursor_with_dense_range_expansion();
+        assert!(!use_dense_range_expansion);
+        assert_eq!(sparse_cursor.segment_len, Some(20));
+
+        let mut multiple_segments = sequence.clone();
+        multiple_segments.extend(RowIdSequence::from(200..205));
+        let (multiple_cursor, use_dense_range_expansion) =
+            multiple_segments.cursor_with_dense_range_expansion();
+        assert!(!use_dense_range_expansion);
+        assert_eq!(multiple_cursor.segment_len, None);
     }
 
     #[test]

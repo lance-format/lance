@@ -238,29 +238,47 @@ impl BatchDurableWatcher {
         }
     }
 
-    /// Whether the write is readable yet.
-    fn is_visible(&self) -> bool {
+    /// Whether the write's batches are indexed — the weaker half of
+    /// [`Self::is_visible`], with the append possibly still outstanding.
+    fn is_indexed(&self) -> bool {
         // WAL-only mode has no indexes, so there is nothing to index-wait on.
         let indexed = match &self.indexes {
             Some(indexes) => indexes.indexed_count(),
             None => self.target_indexed,
         };
-        if indexed < self.target_indexed {
-            return false;
-        }
-        !self.cursors.durable_write() || self.cursors.durable() >= self.target_durable
+        indexed >= self.target_indexed
+    }
+
+    /// Whether the write is readable yet.
+    fn is_visible(&self) -> bool {
+        self.is_indexed()
+            && (!self.cursors.durable_write() || self.cursors.durable() >= self.target_durable)
     }
 
     /// Wait until the write is visible, or until the writer poisons — in which
     /// case no cursor will ever reach the target, so surface the typed error
     /// rather than blocking forever.
     pub async fn wait(&mut self) -> Result<()> {
+        self.wait_until(Self::is_visible).await
+    }
+
+    /// Wait until the write is indexed, leaving durability outstanding. Pairs
+    /// with [`MemTableVisibility::Indexed`](crate::dataset::mem_wal::MemTableVisibility::Indexed)
+    /// on the read side.
+    ///
+    /// Not an acknowledgement: a caller promising durability must still await
+    /// [`Self::wait`].
+    pub async fn wait_indexed(&mut self) -> Result<()> {
+        self.wait_until(Self::is_indexed).await
+    }
+
+    async fn wait_until(&mut self, reached: fn(&Self) -> bool) -> Result<()> {
         loop {
             // Mark the current version seen *before* testing, so a wake-up landing
             // between the test and `changed()` below is not lost.
             self.rx.borrow_and_update();
             self.cursors.check_poisoned()?;
-            if self.is_visible() {
+            if reached(self) {
                 return Ok(());
             }
             self.rx
@@ -1690,6 +1708,7 @@ async fn scan_first_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::MemTableVisibility;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -2498,6 +2517,72 @@ mod tests {
             0,
             "a row whose WAL append failed must never become readable"
         );
+    }
+
+    /// `wait_indexed` clears on the index apply alone; `wait` still needs the
+    /// append.
+    #[tokio::test]
+    async fn test_wait_indexed_clears_before_durable() {
+        let cursors = Arc::new(WriterCursors::new(true));
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        idx.set_durability(Arc::clone(&cursors), 0);
+        let indexes = Arc::new(idx);
+
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Indexed but not durable: the two bounds diverge.
+        assert_eq!(indexes.indexed_count(), 1);
+        assert_eq!(indexes.visible_count(), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Published), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Indexed), 1);
+
+        let mut watcher =
+            BatchDurableWatcher::new(Arc::clone(&cursors), Some(indexes.clone()), 1, 1);
+        watcher
+            .wait_indexed()
+            .await
+            .expect("the index apply has landed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watcher.wait())
+                .await
+                .is_err(),
+            "durability is still outstanding, so `wait` must not return"
+        );
+
+        // The append lands: now both clear.
+        cursors.advance_durable(1);
+        watcher.wait().await.expect("the append has landed");
+        assert_eq!(indexes.visible_count(), 1);
+    }
+
+    /// A poisoned writer wakes an index waiter with the typed error: its rows
+    /// may be indexed, but they are never going to exist.
+    #[tokio::test]
+    async fn test_wait_indexed_surfaces_a_poisoned_writer() {
+        let cursors = Arc::new(WriterCursors::new(true));
+        let mut watcher = BatchDurableWatcher::new(Arc::clone(&cursors), None, 1, 1);
+
+        cursors.mark_terminal_failure(&Error::io("the WAL PUT failed"));
+
+        watcher
+            .wait_indexed()
+            .await
+            .expect_err("a poisoned writer must not hand back a clean index wait");
     }
 
     /// An index-apply failure poisons the writer.

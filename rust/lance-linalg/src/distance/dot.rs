@@ -751,7 +751,7 @@ impl Dot for u8 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        super::dot_u8::dot_u8(x, y) as f32
+        super::dot_u8::dot_u8_u64(x, y) as f32
     }
 }
 
