@@ -573,7 +573,12 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        *f = (*updated).clone();
+                        let mut updated = (*updated).clone();
+                        // The post-image was built at the transaction's read
+                        // version, so carry forward overlays that may have been
+                        // committed while the delete was being rebased.
+                        updated.overlays = f.overlays.clone();
+                        *f = updated;
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -1730,14 +1735,16 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_build_manifest_replaces_and_removes_fragments() {
-        let manifest = sample_manifest_with_fragments(0..5);
+    fn test_delete_build_manifest_replaces_removes_and_preserves_overlays() {
+        let mut manifest = sample_manifest_with_fragments(0..5);
+        manifest.version = 2;
+        Arc::make_mut(&mut manifest.fragments)[2].overlays = vec![overlay_with_field(0, 2)];
 
         let mut updated2 = Fragment::new(2);
         updated2.physical_rows = Some(42);
 
         let transaction = Transaction::new(
-            manifest.version,
+            1,
             Operation::Delete {
                 updated_fragments: vec![updated2],
                 deleted_fragment_ids: vec![1, 3],
@@ -1758,6 +1765,9 @@ mod tests {
             .map(|f| f.physical_rows)
             .collect();
         assert_eq!(rows, vec![None, Some(42), None]);
+        let overlays = &new_manifest.fragments[1].overlays;
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].committed_version, 2);
     }
 
     #[test]
