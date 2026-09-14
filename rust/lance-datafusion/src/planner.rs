@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
@@ -201,6 +201,23 @@ impl Default for LanceContextProvider {
     }
 }
 
+/// The provider only ever mirrors the default session context, whose function
+/// registries are fixed once it is built. Building one clones every scalar,
+/// aggregate, window and higher-order UDF map, which is the single largest
+/// source of allocation churn in a query that carries no filter at all, so the
+/// snapshot is shared across every [`Planner`].
+///
+/// Premise: Lance's default session is never mutated after construction (UDFs
+/// are registered at build time). The `OnceLock` therefore holds a process-wide
+/// snapshot that will not refresh if a future change starts mutating the
+/// default session after it has been built.
+fn shared_context_provider() -> Arc<LanceContextProvider> {
+    static PROVIDER: OnceLock<Arc<LanceContextProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| Arc::new(LanceContextProvider::default()))
+        .clone()
+}
+
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
@@ -272,7 +289,7 @@ impl ContextProvider for LanceContextProvider {
 
 pub struct Planner {
     schema: SchemaRef,
-    context_provider: LanceContextProvider,
+    context_provider: Arc<LanceContextProvider>,
     enable_relations: bool,
 }
 
@@ -280,7 +297,7 @@ impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            context_provider: LanceContextProvider::default(),
+            context_provider: shared_context_provider(),
             enable_relations: false,
         }
     }
@@ -558,7 +575,7 @@ impl Planner {
             return self.legacy_parse_function(function);
         }
         let sql_to_rel = SqlToRel::new_with_options(
-            &self.context_provider,
+            self.context_provider.as_ref(),
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,

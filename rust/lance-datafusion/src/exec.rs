@@ -409,6 +409,9 @@ impl SessionContextCacheKey {
 
 struct CachedSessionContext {
     context: SessionContext,
+    /// Task contexts already derived from `context`, keyed by the batch size
+    /// override that produced them.
+    task_contexts: HashMap<Option<usize>, Arc<TaskContext>>,
     last_access: std::time::Instant,
 }
 
@@ -456,13 +459,57 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
         key,
         CachedSessionContext {
             context: context.clone(),
+            task_contexts: HashMap::new(),
             last_access: std::time::Instant::now(),
         },
     );
     context
 }
 
+/// Build the [`TaskContext`] for a plan execution.
+///
+/// `SessionContext::state()` deep-copies the whole [`SessionState`], including the
+/// scalar/aggregate/window UDF registries, and `state.task_ctx()` copies them again.
+/// That is hundreds of hash map entries per call, which is pure overhead for the
+/// short plans that vector search runs once per query. The derived context depends
+/// only on the cached session plus the batch size override, so memoize it next to
+/// the session it came from.
 fn get_task_context(
+    session_ctx: &SessionContext,
+    options: &LanceExecutionOptions,
+) -> Arc<TaskContext> {
+    let key = SessionContextCacheKey::from_options(options);
+    let mut cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Only reuse a memo that was derived from the very session we were handed;
+    // callers may pass a context they built themselves.
+    //
+    // Touching `last_access` here keeps session LRU eviction consistent with
+    // `get_session_context`: a plan that only reuses a memoized TaskContext still
+    // counts as a recent use of that session. Without it, a hot TaskContext path
+    // would leave the session looking idle and more likely to be evicted.
+    let entry = cache
+        .get_mut(&key)
+        .filter(|entry| entry.context.session_id() == session_ctx.session_id());
+    if let Some(entry) = entry {
+        entry.last_access = std::time::Instant::now();
+        if let Some(task_ctx) = entry.task_contexts.get(&options.batch_size) {
+            return task_ctx.clone();
+        }
+        let task_ctx = build_task_context(&entry.context, options);
+        entry
+            .task_contexts
+            .insert(options.batch_size, task_ctx.clone());
+        return task_ctx;
+    }
+    drop(cache);
+
+    build_task_context(session_ctx, options)
+}
+
+fn build_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
 ) -> Arc<TaskContext> {
@@ -1328,6 +1375,70 @@ mod tests {
                 "new config should be cached"
             );
         }
+    }
+
+    /// Functional check that `get_task_context` memoizes: a hit returns the same
+    /// `Arc`, while the un-memoized `build_task_context` path returns a fresh
+    /// `Arc` every call. The method-level wall-clock speedup (75.8× on AArch64
+    /// debug) is reported in the PR description, not asserted here — a timing
+    /// ratio is a benchmark, and a benchmark assertion flake under CI load.
+    #[test]
+    fn task_context_memo_returns_memoized_arc() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+        cache.lock().unwrap().clear();
+
+        let options = LanceExecutionOptions {
+            batch_size: Some(1024),
+            ..Default::default()
+        };
+        let session = get_session_context(&options);
+
+        let first = get_task_context(&session, &options);
+        let second = get_task_context(&session, &options);
+        let rebuilt = build_task_context(&session, &options);
+
+        // A memo hit returns the very same Arc.
+        assert!(Arc::ptr_eq(&first, &second));
+        // The un-memoized path allocates a fresh Arc, proving the memo is what
+        // deduplicates the work (otherwise the two paths would be identical).
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+    }
+
+    #[test]
+    fn test_task_context_memo_keyed_by_batch_size() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+        cache.lock().unwrap().clear();
+
+        let opts_default = LanceExecutionOptions::default();
+        let opts_batch_16 = LanceExecutionOptions {
+            batch_size: Some(16),
+            ..Default::default()
+        };
+        let opts_batch_32 = LanceExecutionOptions {
+            batch_size: Some(32),
+            ..Default::default()
+        };
+
+        let session = get_session_context(&opts_default);
+        let first = get_task_context(&session, &opts_batch_16);
+        let same = get_task_context(&session, &opts_batch_16);
+        let other = get_task_context(&session, &opts_batch_32);
+
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "same batch_size must reuse the memoized TaskContext"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different batch_size must produce a distinct TaskContext"
+        );
+
+        let key = SessionContextCacheKey::from_options(&opts_default);
+        let cache_guard = cache.lock().unwrap();
+        let entry = cache_guard.get(&key).expect("session entry");
+        assert_eq!(entry.task_contexts.len(), 2);
     }
 
     #[test]
