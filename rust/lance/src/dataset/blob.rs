@@ -4427,7 +4427,7 @@ async fn resolve_blob_read_location(
     Ok(location)
 }
 
-fn data_file_key_from_path(path: &str) -> &str {
+pub(super) fn data_file_key_from_path(path: &str) -> &str {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename.strip_suffix(".lance").unwrap_or(filename)
 }
