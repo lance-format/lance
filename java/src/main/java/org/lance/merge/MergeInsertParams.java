@@ -13,6 +13,7 @@
  */
 package org.lance.merge;
 
+import org.lance.DataStorageVersion;
 import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
@@ -39,7 +40,7 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
-  private Optional<String> dataStorageVersion = Optional.empty();
+  private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
   private MergeWriteMode writeMode = MergeWriteMode.Auto;
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
@@ -249,9 +250,10 @@ public class MergeInsertParams {
   /**
    * Set the exact data storage version for files written by this operation.
    *
-   * <p>If omitted, the manifest fallback is used. This does not change the manifest fallback.
+   * <p>If omitted, the dataset's default write version is used without changing it. Release
+   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
    */
-  public MergeInsertParams withDataStorageVersion(String version) {
+  public MergeInsertParams withDataStorageVersion(DataStorageVersion version) {
     this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
     return this;
   }
@@ -358,8 +360,9 @@ public class MergeInsertParams {
     return useIndex;
   }
 
-  public Optional<String> dataStorageVersion() {
-    return dataStorageVersion;
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
   }
 
   public MergeWriteMode writeMode() {

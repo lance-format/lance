@@ -530,10 +530,15 @@ class MergeInsertBuilder(_MergeInsertBuilder):
     def data_storage_version(self, version: str) -> "MergeInsertBuilder":
         """Set the exact data storage version for files written by this operation.
 
-        If omitted, the dataset manifest's fallback data storage version is used.
-        Selecting a different V2 version causes the commit to derive mixed
-        data-file-version support from its final manifest. The manifest fallback
-        itself is not changed.
+        If omitted, use the dataset's default write version without changing it.
+        Accepts "2.0", "2.1", "2.2", "2.3", "stable", or "next" for V2
+        datasets. Release selectors are resolved by the engine; V1/V2
+        cross-family targets are rejected.
+
+        Examples
+        --------
+        ``dataset.merge_insert("id").data_storage_version("2.2")`` selects V2.2
+        for the files written when the builder executes.
         """
         return super(MergeInsertBuilder, self).data_storage_version(version)
 
@@ -1569,7 +1574,9 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def data_storage_version(self) -> str:
         """
-        The version of the data storage format this dataset is using
+        The default data file version for writes that omit ``data_storage_version``.
+        Existing files may use other V2 versions; this is not a snapshot version
+        summary.
         """
         return self._ds.data_storage_version
 
@@ -3085,9 +3092,9 @@ class LanceDataset(pa.dataset.Dataset):
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
         data_storage_version : str, optional
-            Exact data storage version for files written by this operation. If
-            omitted, the manifest fallback is used. This does not change the
-            manifest fallback.
+            Output data file version, such as "2.2", "stable", or "next". If
+            omitted, use the dataset's default write version without changing it.
+            V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -7450,6 +7457,7 @@ class DatasetOptimizer:
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
+        data_storage_version: Optional[str] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7483,7 +7491,8 @@ class DatasetOptimizer:
         ``lance.compaction.binary_copy_read_batch_bytes``,
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
-        ``lance.compaction.max_source_bytes``.
+        ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.data_storage_version``.
 
         Parameters
         ----------
@@ -7559,6 +7568,11 @@ class DatasetOptimizer:
             fragments remain unchanged and act as boundaries, so fragments
             on opposite sides are not combined into the same compaction task.
             Duplicate and unknown IDs are ignored.
+        data_storage_version: str, optional
+            Output data file version, such as "2.2", "stable", or "next".
+            Uses the compaction config target when set, otherwise the dataset's
+            default write version. Does not change that default or the versions
+            of unselected files. V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -7586,6 +7600,7 @@ class DatasetOptimizer:
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
                 excluded_fragment_ids=excluded_fragment_ids,
+                data_storage_version=data_storage_version,
             ).items()
             if v is not None
         }
@@ -7950,8 +7965,10 @@ def write_dataset(
         shared.
     data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default (None)
-        will use the latest stable version.  See the user guide for more details.
+        efficient but require newer versions of lance to read. For create and
+        overwrite, None uses the latest stable version. For append, None uses
+        the dataset's default write version; an explicit V2 version applies
+        only to new files and does not change that default.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.

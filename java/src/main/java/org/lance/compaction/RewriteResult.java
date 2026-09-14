@@ -19,15 +19,12 @@ import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * Rewrite Result of a single compaction task. It will be passed across different workers and be
  * committed later.
  */
 public class RewriteResult implements Serializable {
-  private static final long serialVersionUID = 4501818269828675274L;
-
   private final CompactionMetrics metrics;
   private final List<FragmentMetadata> newFragments;
   private final List<FragmentMetadata> originalFragments;
@@ -36,21 +33,18 @@ public class RewriteResult implements Serializable {
   // Serialized RoaringTreemap of row addresses read from the original fragments.
   // null for stable row IDs.
   @Nullable private final byte[] rowAddrs;
-  @Nullable private final String writeVersion;
 
   public RewriteResult(
       CompactionMetrics metrics,
       List<FragmentMetadata> newFragments,
       List<FragmentMetadata> originalFragments,
       long readVersion,
-      byte[] rowAddrs,
-      String writeVersion) {
+      byte[] rowAddrs) {
     this.metrics = metrics;
     this.newFragments = newFragments;
     this.originalFragments = originalFragments;
     this.readVersion = readVersion;
     this.rowAddrs = rowAddrs;
-    this.writeVersion = writeVersion;
   }
 
   public long getReadVersion() {
@@ -72,10 +66,5 @@ public class RewriteResult implements Serializable {
 
   public List<FragmentMetadata> getOriginalFragments() {
     return originalFragments;
-  }
-
-  /** Returns the exact storage version used for rewritten files, if recorded. */
-  public Optional<String> getWriteVersion() {
-    return Optional.ofNullable(writeVersion);
   }
 }

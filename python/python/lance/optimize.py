@@ -123,6 +123,11 @@ class CompactionOptions(TypedDict, total=False):
     """
     data_storage_version: Optional[str]
     """
-    Exact data storage version for rewritten files. If omitted, compaction
-    uses the manifest fallback. This does not change the manifest fallback.
+    Output data file version, such as "2.2", "stable", or "next". If omitted,
+    compaction uses the compaction config target when set, otherwise the dataset's
+    default write version. It does not change that default.
+    The planner fixes release selectors to exact versions before distributing
+    tasks. V1/V2 cross-family targets are rejected. Binary copy requires matching
+    input versions and no overlays; TryBinaryCopy reencodes ineligible inputs,
+    while ForceBinaryCopy reports an error.
     """

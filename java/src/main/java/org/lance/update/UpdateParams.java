@@ -13,6 +13,8 @@
  */
 package org.lance.update;
 
+import org.lance.DataStorageVersion;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
@@ -47,7 +49,7 @@ public class UpdateParams {
 
   private final Map<String, String> updates;
   private Optional<String> whereClause = Optional.empty();
-  private Optional<String> dataStorageVersion = Optional.empty();
+  private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
   private int conflictRetries = DEFAULT_CONFLICT_RETRIES;
   private long retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS;
 
@@ -109,10 +111,10 @@ public class UpdateParams {
   /**
    * Set the exact data storage version for files written by this operation.
    *
-   * <p>If omitted, the manifest fallback is used. When another V2 version produces a mixed
-   * snapshot, the commit derives the required capability without changing the manifest fallback.
+   * <p>If omitted, the dataset's default write version is used without changing it. Release
+   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
    */
-  public UpdateParams withDataStorageVersion(String version) {
+  public UpdateParams withDataStorageVersion(DataStorageVersion version) {
     this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
     return this;
   }
@@ -134,8 +136,9 @@ public class UpdateParams {
     return retryTimeoutMs;
   }
 
-  public Optional<String> dataStorageVersion() {
-    return dataStorageVersion;
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
   }
 
   @Override

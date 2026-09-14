@@ -17,7 +17,7 @@ use lance::dataset::{
 };
 
 use crate::{
-    JNIEnvExt, block_on,
+    block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::{
         FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
@@ -149,7 +149,6 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNati
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
-    data_storage_version: JObject,            // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -171,7 +170,6 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNati
             max_source_rows,
             max_source_bytes,
             excluded_fragment_ids,
-            data_storage_version,
         ),
         JObject::null()
     )
@@ -196,7 +194,6 @@ fn inner_commit_compaction<'local>(
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
-    data_storage_version: JObject,            // Optional<String>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -219,7 +216,7 @@ fn inner_commit_compaction<'local>(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
-        &data_storage_version,
+        &JObject::null(),
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -357,7 +354,8 @@ const COMPACTION_PLAN_CLASS: &str = "org/lance/compaction/CompactionPlan";
 const COMPACTION_PLAN_CONSTRUCTOR_SIG: &str =
     "(Ljava/util/List;JLorg/lance/compaction/CompactionOptions;)V";
 const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
-const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[BLjava/lang/String;)V";
+const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
+    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
@@ -498,7 +496,6 @@ impl IntoJava for &RewriteResult {
         } else {
             JObject::null()
         };
-        let write_version: JObject<'_> = env.new_string(&self.write_version)?.into();
         Ok(env.new_object(
             REWRITE_RESULT_CLASS,
             REWRITE_RESULT_CONSTRUCTOR_SIG,
@@ -508,7 +505,6 @@ impl IntoJava for &RewriteResult {
                 JValueGen::Object(&original_fragments),
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&row_addrs),
-                JValueGen::Object(&write_version),
             ],
         )?)
     }
@@ -573,17 +569,12 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
         } else {
             Some(env.convert_byte_array(row_addrs_obj)?)
         };
-        let write_version_obj = env
-            .call_method(self, "getWriteVersion", "()Ljava/util/Optional;", &[])?
-            .l()?;
-        let write_version = env.get_string_opt(&write_version_obj)?.unwrap_or_default();
         Ok(RewriteResult {
             metrics,
             new_fragments,
             read_version,
             original_fragments,
             row_addrs,
-            write_version,
         })
     }
 }

@@ -256,7 +256,12 @@ fn extract_data_storage_version<'local>(
     jparam: &JObject,
 ) -> Result<Option<String>> {
     let version = env
-        .call_method(jparam, "dataStorageVersion", "()Ljava/util/Optional;", &[])?
+        .call_method(
+            jparam,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
     env.get_string_opt(&version)
 }

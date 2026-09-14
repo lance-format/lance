@@ -4200,44 +4200,94 @@ def test_update_with_retry_parameters(tmp_path: Path):
     check_update_stats(update_dict, (10,))
 
 
-def test_update_exact_data_storage_version(tmp_path: Path):
+@pytest.mark.parametrize(
+    "version", [None, "2.0", "2.1", "2.2", "2.3", "stable", "next"]
+)
+def test_update_exact_data_storage_version(tmp_path: Path, version):
     dataset = lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}),
         tmp_path / "dataset",
         data_storage_version="2.1",
+        max_rows_per_file=1,
     )
 
-    dataset.update({"value": "value + 1"}, data_storage_version="2.2")
+    dataset.update({"value": "value + 1"}, data_storage_version=version)
 
     files = [
         file for fragment in dataset.get_fragments() for file in fragment.metadata.files
     ]
-    assert {(file.file_major_version, file.file_minor_version) for file in files} == {
-        (2, 2)
+    exact = {None: "2.1", "stable": "2.2", "next": "2.3"}.get(version, version)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}" for file in files
+    } == {exact}
+    assert dataset.data_storage_version == "2.1"
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2],
+        "value": [11, 21],
     }
 
 
-def test_merge_insert_exact_data_storage_version(tmp_path: Path):
+@pytest.mark.parametrize(
+    "version", [None, "2.0", "2.1", "2.2", "2.3", "stable", "next"]
+)
+def test_merge_insert_exact_data_storage_version(tmp_path: Path, version):
     dataset = lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}),
         tmp_path / "dataset",
         data_storage_version="2.1",
+        max_rows_per_file=1,
     )
 
-    (
+    builder = (
         dataset.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .data_storage_version("2.2")
-        .execute(pa.table({"id": [2, 3], "value": [21, 30]}))
     )
+    if version is not None:
+        builder.data_storage_version(version)
+    builder.execute(pa.table({"id": [2, 3], "value": [21, 30]}))
 
     versions = {
-        (file.file_major_version, file.file_minor_version)
+        f"{file.file_major_version}.{file.file_minor_version}"
         for fragment in dataset.get_fragments()
         for file in fragment.metadata.files
     }
-    assert versions == {(2, 1), (2, 2)}
+    exact = {None: "2.1", "stable": "2.2", "next": "2.3"}.get(version, version)
+    assert versions == {"2.1", exact}
+    assert dataset.data_storage_version == "2.1"
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": [10, 21, 30],
+    }
+
+
+@pytest.mark.parametrize("operation", ["update", "merge_insert", "compaction"])
+@pytest.mark.parametrize("version", ["invalid", "legacy"])
+def test_operation_rejects_invalid_data_storage_version(
+    tmp_path: Path, operation, version
+):
+    data = pa.table({"id": [1, 2], "value": [10, 20]})
+    dataset = lance.write_dataset(
+        data, tmp_path / "dataset", data_storage_version="2.1"
+    )
+    # The core validates both the selector and the V1/V2 boundary before committing.
+    error = OSError if operation == "compaction" and version == "legacy" else ValueError
+    message = (
+        "Unknown Lance storage version: invalid"
+        if version == "invalid"
+        else "V1 and V2 storage versions cannot be mixed"
+    )
+    with pytest.raises(error, match=message):
+        if operation == "update":
+            dataset.update({"value": "value + 1"}, data_storage_version=version)
+        elif operation == "merge_insert":
+            dataset.merge_insert("id").data_storage_version(
+                version
+            ).when_matched_update_all().execute(data)
+        else:
+            dataset.optimize.compact_files(data_storage_version=version)
+    assert dataset.version == 1
+    assert dataset.to_table() == data
 
 
 def test_scan_with_batch_size(tmp_path: Path):

@@ -26,7 +26,6 @@ class CompactionMetrics:
 
 class RewriteResult:
     read_version: int
-    write_version: str
     metrics: CompactionMetrics
     old_fragments: List["FragmentMetadata"]
     new_fragments: List["FragmentMetadata"]

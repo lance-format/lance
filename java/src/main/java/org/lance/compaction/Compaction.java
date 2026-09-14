@@ -75,8 +75,7 @@ public class Compaction {
         compactionOptions.getMaxSourceFragments(),
         compactionOptions.getMaxSourceRows(),
         compactionOptions.getMaxSourceBytes(),
-        compactionOptions.getExcludedFragmentIds(),
-        compactionOptions.getDataStorageVersion());
+        compactionOptions.getExcludedFragmentIds());
   }
 
   /**
@@ -100,8 +99,7 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion) {
+      List<Long> excludedFragmentIds) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return commitCompactionNative(
           dataset,
@@ -119,8 +117,7 @@ public class Compaction {
           maxSourceFragments,
           maxSourceRows,
           maxSourceBytes,
-          excludedFragmentIds,
-          dataStorageVersion);
+          excludedFragmentIds);
     }
   }
 
@@ -140,8 +137,7 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion);
+      List<Long> excludedFragmentIds);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
