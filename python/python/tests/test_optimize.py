@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import CompactionOptions, RewriteResult
 from lance.vector import vec_to_table
 
 
@@ -39,6 +39,11 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def test_compaction_options_keys_are_optional():
+    assert CompactionOptions.__required_keys__ == frozenset()
+    assert "source_budget_mode" in CompactionOptions.__optional_keys__
 
 
 def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
@@ -89,8 +94,21 @@ def test_compact_files_source_budgets(tmp_path: Path):
     assert metrics.fragments_removed == 0
     assert dataset.version == version_before
 
+    # Soft mode admits one indivisible task even though it exceeds the byte
+    # budget, then stops before admitting another task.
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_bytes=1,
+        source_budget_mode="soft",
+    )
+    assert metrics.fragments_removed == 2
+
     with pytest.raises(OSError, match="must be greater than 0"):
         dataset.optimize.compact_files(max_source_rows=0)
+
+    with pytest.raises(ValueError, match="Invalid source budget mode"):
+        dataset.optimize.compact_files(source_budget_mode="invalid")
 
 
 def test_compact_files_max_source_fragments(tmp_path: Path):
@@ -628,6 +646,16 @@ def test_dataset_distributed_optimize(tmp_path: Path):
         ),
     )
     assert none_plan == plan
+
+    none_budget_mode_plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=400,
+            source_budget_mode=None,
+            num_threads=1,
+        ),
+    )
+    assert none_budget_mode_plan == plan
 
     # Plan can be pickled
     assert pickle.loads(pickle.dumps(plan)) == plan
