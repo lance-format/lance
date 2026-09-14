@@ -2162,6 +2162,40 @@ impl TopKCollector<u64> {
     }
 }
 
+/// Evaluate a compound query over exact, materialized leaf result sets.
+///
+/// This is the bridge used by query-local residual postings: it keeps Boolean,
+/// Boost, and MultiMatch semantics in the same scorer tree as the on-disk
+/// compound path while allowing a different posting source.
+#[doc(hidden)]
+pub fn materialized_compound_top_k(
+    query: &FtsQuery,
+    leaves: Vec<Vec<(u64, f32)>>,
+    limit: usize,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let mut leaf_count = 0;
+    let plan = CompoundScorerPlan::from_query(query, &mut leaf_count)?;
+    if leaf_count != leaves.len() {
+        return Err(Error::internal(format!(
+            "compound FTS planned {leaf_count} leaves but received {} materialized leaves",
+            leaves.len()
+        )));
+    }
+    let mut scorers = leaves
+        .into_iter()
+        .map(|rows| {
+            let rows = rows
+                .into_iter()
+                .map(|(row_id, score)| ScoredRow { row_id, score })
+                .collect();
+            MaterializedScorer::try_new(rows).map(|scorer| Some(Box::new(scorer) as BoxScorer<'_>))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut scorer = plan.build(&mut scorers)?;
+    let rows = TopKCollector::new(limit).collect(scorer.as_mut())?;
+    Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DisjunctionScore {
     Sum,
@@ -4414,6 +4448,7 @@ mod tests {
     use super::super::scorer::Scorer;
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::inverted::query::MultiMatchQuery;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -4424,6 +4459,25 @@ mod tests {
 
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    #[test]
+    fn materialized_compound_top_k_preserves_multimatch_and_tie_order() {
+        let query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+            ],
+        });
+        let (row_ids, scores) = materialized_compound_top_k(
+            &query,
+            vec![vec![(7, 1.0), (3, 2.0)], vec![(7, 3.0), (5, 3.0)]],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(row_ids, vec![5, 7]);
+        assert_eq!(scores, vec![3.0, 3.0]);
     }
 
     fn zero_weight_wand<'a>(

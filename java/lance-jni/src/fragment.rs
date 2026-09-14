@@ -691,7 +691,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -829,6 +829,11 @@ impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
         let files = export_vec::<DataFile>(env, &files)?;
+        let referenced_data_files = self
+            .referenced_lance_files()
+            .cloned()
+            .collect::<Vec<DataFile>>();
+        let referenced_data_files = export_vec::<DataFile>(env, &referenced_data_files)?;
         let deletion_file = match &self.deletion_file {
             Some(f) => f.into_java(env)?,
             None => JObject::null(),
@@ -858,6 +863,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&referenced_data_files),
             ],
         )
         .map_err(|e| {

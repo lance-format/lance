@@ -439,6 +439,11 @@ pub fn norm_l2_fsl(fsl: &FixedSizeListArray) -> crate::Result<Float32Array> {
     })
 }
 
+/// Squared L2 norm of every vector in a [FixedSizeListArray].
+///
+/// Each square is accumulated in `f32` (or wider) rather than in the element
+/// type: squaring an `f16` saturates to `inf` at `|x| >= 256` and to zero at
+/// `|x| <= 1.726e-4`.
 pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
     let dim = fsl.value_length() as usize;
     match fsl.value_type() {
@@ -447,7 +452,14 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
             .as_primitive::<Float16Type>()
             .values()
             .chunks_exact(dim)
-            .map(|v| v.iter().map(|v| v * v).sum::<f16>().to_f32())
+            .map(|v| {
+                v.iter()
+                    .map(|v| {
+                        let v = v.to_f32();
+                        v * v
+                    })
+                    .sum::<f32>()
+            })
             .collect::<Vec<_>>(),
         DataType::Float32 => fsl
             .values()
@@ -712,5 +724,42 @@ mod tests {
             .unwrap();
         let err = norm_l2_fsl(&fsl).unwrap_err().to_string();
         assert!(err.contains("float16/float32/float64"), "got: {err}");
+    }
+
+    /// `norm_squared_fsl` must accumulate in a type wider than the element type.
+    /// `f16 * f16` rounds each square back to `f16`, which saturates to `inf` at
+    /// `|x| >= 256` and to zero at `|x| <= 1.726e-4`.
+    #[test]
+    fn test_norm_squared_fsl_f16_accumulates_wide() {
+        use arrow_array::Float16Array;
+        use arrow_schema::Field;
+        use std::sync::Arc;
+
+        // dim 2: row 0 overflows at the square, row 1 underflows at the square.
+        let raw = [256.0f32, 0.0, 1e-4, 1e-4];
+        let values = Float16Array::from_iter_values(raw.map(f16::from_f32));
+        let field = Arc::new(Field::new("item", DataType::Float16, true));
+        let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        let got = norm_squared_fsl(&fsl);
+        // Independent reference: square and sum the same f16 inputs in f64.
+        let expected = raw
+            .chunks(2)
+            .map(|c| {
+                c.iter()
+                    .map(|&x| {
+                        let x = f16::from_f32(x).to_f64();
+                        x * x
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+
+        for (row, (&got, &want)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                approx::relative_eq!(got as f64, want, max_relative = 1e-3),
+                "row {row}: got {got}, want {want}"
+            );
+        }
     }
 }

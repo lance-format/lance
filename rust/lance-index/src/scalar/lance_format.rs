@@ -41,7 +41,9 @@ pub struct LanceIndexStore {
     scheduler: Arc<ScanScheduler>,
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
-    file_sizes: HashMap<String, u64>,
+    // Partition priority views share this immutable map. Cloning all file names
+    // for every partition would make request rebinding quadratic in partitions.
+    file_sizes: Arc<HashMap<String, u64>>,
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
@@ -89,7 +91,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: HashMap::new(),
+            file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -100,7 +102,7 @@ impl LanceIndexStore {
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = file_sizes;
+        self.file_sizes = Arc::new(file_sizes);
         self
     }
 
@@ -404,6 +406,13 @@ impl IndexStore for LanceIndexStore {
 
     fn clone_arc(&self) -> Arc<dyn IndexStore> {
         Arc::new(self.clone())
+    }
+
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
     }
 
     fn io_parallelism(&self) -> usize {
@@ -1077,89 +1086,86 @@ mod tests {
         .await;
     }
 
+    #[rstest::rstest]
+    #[case::boolean(DataType::Boolean)]
+    #[case::int32(DataType::Int32)]
+    #[case::utf8(DataType::Utf8)]
+    #[case::float32(DataType::Float32)]
+    #[case::date32(DataType::Date32)]
+    #[case::timestamp(DataType::Timestamp(TimeUnit::Nanosecond, None))]
+    #[case::date64(DataType::Date64)]
+    #[case::time64(DataType::Time64(TimeUnit::Nanosecond))]
+    #[case::time32(DataType::Time32(TimeUnit::Second))]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(16))]
+    #[case::duration_second(DataType::Duration(TimeUnit::Second))]
+    #[case::duration_millisecond(DataType::Duration(TimeUnit::Millisecond))]
+    #[case::duration_microsecond(DataType::Duration(TimeUnit::Microsecond))]
+    #[case::duration_nanosecond(DataType::Duration(TimeUnit::Nanosecond))]
     #[tokio::test]
-    async fn test_btree_types() {
-        for data_type in &[
-            DataType::Boolean,
-            DataType::Int32,
-            DataType::Utf8,
-            DataType::Float32,
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            DataType::Date64,
-            DataType::Date32,
-            DataType::Time64(TimeUnit::Nanosecond),
-            DataType::Time32(TimeUnit::Second),
-            DataType::FixedSizeBinary(16),
-            // Not supported today, error from datafusion:
-            // Min/max accumulator not implemented for Duration(Nanosecond)
-            // DataType::Duration(TimeUnit::Nanosecond),
-        ] {
-            let tempdir = TempDir::default();
-            let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen_batch()
-                .col(VALUE_COLUMN_NAME, array::rand_type(data_type))
-                .col(ROW_ID, array::step::<UInt64Type>())
-                .into_batch_rows(RowCount::from(4096 * 3))
-                .unwrap();
-
-            let sample_value = ScalarValue::try_from_array(data.column(0), 0).unwrap();
-            let sample_row_id = data.column(1).as_primitive::<UInt64Type>().value(0);
-
-            let sort_indices = arrow::compute::sort_to_indices(data.column(0), None, None).unwrap();
-            let sorted_values = arrow_select::take::take(
-                data.column(0),
-                &sort_indices,
-                Some(TakeOptions {
-                    check_bounds: false,
-                }),
-            )
+    async fn test_btree_types(#[case] data_type: DataType) {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+        let data: RecordBatch = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::rand_type(&data_type))
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_batch_rows(RowCount::from(4096 * 3))
             .unwrap();
-            let sorted_row_ids = arrow_select::take::take(
-                data.column(1),
-                &sort_indices,
-                Some(TakeOptions {
-                    check_bounds: false,
-                }),
+
+        let sample_value = ScalarValue::try_from_array(data.column(0), 0).unwrap();
+        let sample_row_id = data.column(1).as_primitive::<UInt64Type>().value(0);
+
+        let sort_indices = arrow::compute::sort_to_indices(data.column(0), None, None).unwrap();
+        let sorted_values = arrow_select::take::take(
+            data.column(0),
+            &sort_indices,
+            Some(TakeOptions {
+                check_bounds: false,
+            }),
+        )
+        .unwrap();
+        let sorted_row_ids = arrow_select::take::take(
+            data.column(1),
+            &sort_indices,
+            Some(TakeOptions {
+                check_bounds: false,
+            }),
+        )
+        .unwrap();
+        let sorted_batch =
+            RecordBatch::try_new(data.schema(), vec![sorted_values, sorted_row_ids]).unwrap();
+
+        let batch_one = sorted_batch.slice(0, 4096);
+        let batch_two = sorted_batch.slice(4096, 4096);
+        let batch_three = sorted_batch.slice(8192, 4096);
+        let training_data = RecordBatchIterator::new(
+            vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
+            data.schema(),
+        );
+
+        train_index(&index_store, training_data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
             )
+            .await
             .unwrap();
-            let sorted_batch =
-                RecordBatch::try_new(data.schema().clone(), vec![sorted_values, sorted_row_ids])
-                    .unwrap();
 
-            let batch_one = sorted_batch.slice(0, 4096);
-            let batch_two = sorted_batch.slice(4096, 4096);
-            let batch_three = sorted_batch.slice(8192, 4096);
-            let training_data = RecordBatchIterator::new(
-                vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
-                data.schema().clone(),
-            );
+        let result = index
+            .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
+            .await
+            .unwrap();
 
-            train_index(&index_store, training_data, None).await;
-            let index = BTreeIndexPlugin
-                .load_index(
-                    index_store,
-                    &default_details::<pbold::BTreeIndexDetails>(),
-                    None,
-                    &LanceCache::no_cache(),
-                )
-                .await
-                .unwrap();
+        assert!(result.is_exact());
+        let row_addrs = result.row_addrs().true_rows();
 
-            let result = index
-                .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
-                .await
-                .unwrap();
-
-            assert!(result.is_exact());
-            let row_addrs = result.row_addrs().true_rows();
-
-            // The random data may have had duplicates so there might be more than 1 result
-            // but even for boolean we shouldn't match the entire thing
-            assert!(!row_addrs.is_empty());
-            assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
-            assert!(row_addrs.contains(sample_row_id));
-        }
+        // The random data may have had duplicates so there might be more than 1 result
+        // but even for boolean we shouldn't match the entire thing
+        assert!(!row_addrs.is_empty());
+        assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
+        assert!(row_addrs.contains(sample_row_id));
     }
 
     #[tokio::test]

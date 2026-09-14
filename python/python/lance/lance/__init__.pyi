@@ -54,6 +54,7 @@ from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
+from .bitmap import Bitmap as Bitmap
 from .debug import format_fragment as format_fragment
 from .debug import format_manifest as format_manifest
 from .debug import format_schema as format_schema
@@ -490,6 +491,9 @@ class _Dataset:
         self,
         updates: Dict[str, str],
         predicate: Optional[str] = None,
+        conflict_retries: Optional[int] = None,
+        retry_timeout: Optional[timedelta] = None,
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
@@ -681,6 +685,7 @@ class _MergeInsertBuilder:
     def write_mode(
         self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
     ) -> Self: ...
+    def data_storage_version(self, version: str) -> Self: ...
     def target_bases(self, bases: list[str]) -> Self: ...
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -735,6 +740,12 @@ class _Fragment:
         batch_readahead: Optional[int] = None,
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,

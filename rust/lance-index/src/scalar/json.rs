@@ -401,37 +401,29 @@ impl ScalarQueryParser for JsonQueryParser {
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                // Support multiple JSON extraction functions
-                let json_functions = [
-                    "json_extract",
-                    "json_get",
-                    "json_get_int",
-                    "json_get_float",
-                    "json_get_bool",
-                    "json_get_string",
-                ];
-                if !json_functions.contains(&udf.name()) {
-                    return None;
-                }
+                // Only the typed accessors are routable. `json_extract` evaluates to
+                // serialized JSON text (`"click"`, `2`) while index keys hold decoded
+                // native values (`click`, `2`), so an indexed `json_extract` predicate
+                // would answer a different question than the unindexed one. Quoting is
+                // also not order-preserving (`ab` < `ab!` but `"ab"` > `"ab!"`), so even
+                // a Utf8 index cannot serve `json_extract` ranges. Let these fall back
+                // to a full scan until literals are transcoded into the index's
+                // representation. See https://github.com/lance-format/lance/issues/8806.
+                let value_type = match udf.name() {
+                    "json_get_int" => DataType::Int64,
+                    "json_get_float" => DataType::Float64,
+                    "json_get_bool" => DataType::Boolean,
+                    "json_get_string" => DataType::Utf8,
+                    _ => return None,
+                };
                 if udf.args.len() != 2 {
                     return None;
                 }
                 // We already know index 0 is a column reference to the column so we just need to
                 // ensure that index 1 matches our path
                 match &udf.args[1] {
-                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
-                        if path == &self.path {
-                            // Return the appropriate type based on the function
-                            match udf.name() {
-                                "json_get_int" => Some(DataType::Int64),
-                                "json_get_float" => Some(DataType::Float64),
-                                "json_get_bool" => Some(DataType::Boolean),
-                                "json_get_string" | "json_extract" => Some(DataType::Utf8),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
+                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) if path == &self.path => {
+                        Some(value_type)
                     }
                     _ => None,
                 }
@@ -1344,7 +1336,10 @@ mod tests {
         SargableQuery::Equals(ScalarValue::Float64(Some(2.0))),
         vec![1]
     )]
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_update_uses_trained_target_type(
         #[case] initial_docs: &[&str],
         #[case] update_docs: &[&str],
@@ -1443,6 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_update_reports_type_drift() {
         let (source_store, _source_dir) = local_json_index_store();
         let index = train_and_load_json_index(
@@ -1470,6 +1466,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_derived_params_preserve_wrapper() {
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
@@ -1537,12 +1534,6 @@ mod tests {
     /// Rows are fed in raw storage order (not sorted by value) to simulate what an
     /// unordered scan would produce.
     ///
-    /// Each case below runs a spilling `SortExec` that reserves a non-spillable merge
-    /// buffer from the process-wide cached DataFusion memory pool (see
-    /// `get_session_context`); running the cases concurrently contends for that shared
-    /// pool and can spuriously exhaust it, so this guard serializes them.
-    static FLOAT_INDEX_CASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[rstest]
     #[case::range_gt_zero(
         SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
@@ -1562,11 +1553,11 @@ mod tests {
         vec![0, 1, 2]
     )]
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_float_btree_index_unsorted_input(
         #[case] query: SargableQuery,
         #[case] expected: Vec<u64>,
     ) {
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
@@ -1612,11 +1603,11 @@ mod tests {
     /// contains JSONB bytes, so conversion must use the accompanying type tag to turn it
     /// into an Arrow null before sorting and training the target index.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_index_null_at_path() {
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,
