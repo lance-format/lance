@@ -682,6 +682,14 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
     for fragment in fragments {
+        // Binary copy only reads base files; overlays must be materialized by the scanner.
+        if !fragment.overlays.is_empty() {
+            log::debug!(
+                "Binary copy disabled: fragment {} has data overlays",
+                fragment.id
+            );
+            return Ok(false);
+        }
         if fragment.deletion_file.is_some() {
             log::debug!(
                 "Binary copy disabled: fragment {} has a deletion file",
@@ -10476,6 +10484,91 @@ mod tests {
             out.insert(ids.value(i), v);
         }
         out
+    }
+
+    #[rstest]
+    #[case::default_target(LanceFileVersion::V2_2, None)]
+    #[case::explicit_target(LanceFileVersion::V2_2, Some(LanceFileVersion::V2_2))]
+    #[case::non_default_target(LanceFileVersion::V2_0, Some(LanceFileVersion::V2_2))]
+    #[tokio::test]
+    async fn test_compaction_target_preserves_overlays(
+        #[case] default_version: LanceFileVersion,
+        #[case] target: Option<LanceFileVersion>,
+        #[values(
+            CompactionMode::Reencode,
+            CompactionMode::TryBinaryCopy,
+            CompactionMode::ForceBinaryCopy
+        )]
+        mode: CompactionMode,
+    ) {
+        let batch = record_batch!(
+            ("id", Int32, [0, 1, 2, 3]),
+            ("val", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(RecordBatch::new_empty(batch.schema()))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(default_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The first fragment is clean; eligibility must inspect every fragment.
+        let mut dataset = commit_overlay(
+            dataset,
+            1,
+            &[1],
+            OverlayCoverage::dense(bitmap([0, 1])),
+            vec![i32_array([Some(999), None])],
+        )
+        .await;
+        let expected = BTreeMap::from([(0, Some(10)), (1, Some(20)), (2, Some(999)), (3, None)]);
+        assert_eq!(id_val_map(&dataset).await, expected);
+        let manifest = dataset.manifest.clone();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4,
+            data_storage_version: target,
+            compaction_mode: Some(mode),
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        if mode == CompactionMode::ForceBinaryCopy {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("binary copy is not supported"));
+            assert_eq!(dataset.manifest, manifest);
+        } else {
+            let metrics = result.unwrap();
+            assert_eq!(metrics.fragments_removed, 2);
+            assert_eq!(metrics.fragments_added, 1);
+            assert!(dataset.manifest.fragments[0].overlays.is_empty());
+            assert_eq!(
+                dataset.manifest.fragments[0].files[0]
+                    .file_version()
+                    .unwrap(),
+                ConcreteFileVersion::V2_2
+            );
+        }
+        assert_eq!(id_val_map(&dataset).await, expected);
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version.resolve()
+        );
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]
