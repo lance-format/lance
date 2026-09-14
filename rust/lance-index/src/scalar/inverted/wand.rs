@@ -4140,9 +4140,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
+        /// Pairwise DocID intersection for wide conjunctions. With a
+        /// positive floor, `freq_cannot_beat` drops lead documents whose
+        /// frequency-bucketed bound cannot compete before any follower is
+        /// touched, mirroring the cursor kernels' score-first prune; the
+        /// bound is monotone, so pass B's exact prune would reject the same
+        /// documents and results are unchanged.
         #[inline]
         fn merge_window_docs_pairwise(
             wins: &[WindowList],
+            freq_cannot_beat: Option<&[bool; FREQ_LUT_BUCKETS]>,
             scratch: &mut Vec<u32>,
             docs_out: &mut Vec<u32>,
             offs_out: &mut Vec<u8>,
@@ -4153,9 +4160,32 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let first = &wins[0];
             // SAFETY: window construction keeps these decoded blocks alive
             // and unchanged until both intersection and scoring complete.
-            docs_out.extend_from_slice(unsafe {
+            let first_docs = unsafe {
                 std::slice::from_raw_parts(first.docs.add(first.pos), first.end - first.pos)
-            });
+            };
+            match freq_cannot_beat {
+                Some(cannot_beat) => {
+                    let first_freqs = unsafe {
+                        std::slice::from_raw_parts(
+                            first.freqs.add(first.pos),
+                            first.end - first.pos,
+                        )
+                    };
+                    docs_out.extend(
+                        first_docs
+                            .iter()
+                            .zip(first_freqs)
+                            .filter(|&(_, &freq)| {
+                                !cannot_beat[(freq as usize).min(FREQ_LUT_BUCKETS - 1)]
+                            })
+                            .map(|(&doc, _)| doc),
+                    );
+                    if docs_out.is_empty() {
+                        return;
+                    }
+                }
+                None => docs_out.extend_from_slice(first_docs),
+            }
             for win in &wins[1..] {
                 let slice =
                     unsafe { std::slice::from_raw_parts(win.docs.add(win.pos), win.end - win.pos) };
@@ -4395,13 +4425,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, _, false) => unsafe {
                         merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
                     },
-                    (_, _, false) if use_pairwise_intersection => {
+                    (_, _, has_floor) if use_pairwise_intersection => {
                         #[cfg(test)]
                         {
                             self.and_window_stats.pairwise_intersections += 1;
                         }
                         merge_window_docs_pairwise(
                             &wins,
+                            has_floor.then_some(&freq_cannot_beat),
                             &mut intersection_scratch,
                             &mut batch_docs,
                             &mut batch_offs,
@@ -10152,10 +10183,19 @@ mod tests {
                 .collect::<Vec<_>>();
             rows.sort_unstable();
             if mode == BulkAndMode::On {
-                assert_eq!(
-                    wand.and_window_stats.pairwise_intersections > 0,
-                    initial_floor == 0.0
+                // Every merged window must use the pairwise kernel, with or
+                // without a floor; a 0.1 shared floor can skip every window
+                // outright for narrow conjunctions.
+                assert!(
+                    wand.and_window_stats.pairwise_intersections > 0
+                        || (initial_floor > 0.0 && wand.and_window_stats.windows_skipped > 0)
                 );
+                if initial_floor == 0.0 && matches!(shape, "dense" | "sparse" | "shifted") {
+                    // The first window fills the heap, so later windows run
+                    // with a positive floor and must stay on the pairwise path.
+                    assert!(wand.threshold > 0.0);
+                    assert!(wand.and_window_stats.pairwise_intersections > 1);
+                }
                 if initial_floor == 0.0 && matches!(shape, "five" | "zero") {
                     assert_eq!(rows.len(), if shape == "five" { 5 } else { 0 });
                     assert_eq!(
