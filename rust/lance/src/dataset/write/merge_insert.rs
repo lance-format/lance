@@ -613,7 +613,7 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
-    // Exact output data file version. The manifest fallback is used when absent.
+    // Exact output data file version. The manifest default is used when absent.
     data_storage_version: Option<PlanFileVersion>,
 }
 
@@ -936,7 +936,20 @@ impl MergeInsertBuilder {
 
     /// Set the exact V2 data file version for rows written by this merge.
     ///
-    /// If omitted, the dataset manifest fallback is used.
+    /// If omitted, the dataset's default write version is used. The default
+    /// remains unchanged. Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::MergeInsertBuilder};
+    /// # use lance_file::version::LanceFileVersion;
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .data_storage_version(LanceFileVersion::V2_2)
+    ///     .try_build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn data_storage_version(&mut self, version: LanceFileVersion) -> &mut Self {
         self.params.data_storage_version = Some(PlanFileVersion(version.resolve()));
         self
@@ -984,6 +997,14 @@ impl MergeInsertBuilder {
 
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        let write_version = self.params.write_version(&self.dataset);
+        versions::validate_write_version(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            write_version,
+        )?;
         if !self.params.insert_not_matched
             && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
@@ -1005,9 +1026,11 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        let mut params = self.params.clone();
+        params.data_storage_version = Some(PlanFileVersion(write_version));
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
-            params: self.params.clone(),
+            params,
         })
     }
 }
@@ -3269,10 +3292,8 @@ impl RetryExecutor for MergeInsertJobWithProvider {
         // manifest execute_impl resolved against); keep a handle so conflict
         // cleanup resolves bases added between attempts.
         let cleanup_dataset = dataset.clone();
-        let write_version = self.job.params.write_version(&dataset);
-        let mut commit_builder = CommitBuilder::new(dataset)
-            .with_exact_storage_format(write_version)
-            .with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
+        let mut commit_builder =
+            CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
         if let Some(commit_retries) = self.job.params.commit_retries {
             commit_builder = commit_builder.with_max_retries(commit_retries);
         }
@@ -4355,24 +4376,79 @@ mod tests {
         assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
     }
 
+    #[rstest::rstest]
+    #[case::full(false, false)]
+    #[case::column_patch(true, false)]
+    #[case::partial_column_patch(true, true)]
     #[tokio::test]
-    async fn merge_insert_uses_explicit_exact_version() {
-        let test_dir = TempStrDir::default();
-        let dataset = create_test_dataset(test_dir.as_str(), LanceFileVersion::V2_0, false).await;
-        let new_batch = create_new_batch(create_test_schema());
+    async fn merge_insert_uses_explicit_exact_version(
+        #[case] partial: bool,
+        #[case] partial_rows: bool,
+        #[values(false, true)] indexed: bool,
+        #[values(
+            None,
+            Some(LanceFileVersion::V2_1),
+            Some(LanceFileVersion::V2_2),
+            Some(LanceFileVersion::V2_3)
+        )]
+        target: Option<LanceFileVersion>,
+    ) {
+        let mut dataset = create_test_dataset("memory://", LanceFileVersion::V2_0, false).await;
+        if indexed {
+            Arc::make_mut(&mut dataset)
+                .create_index(
+                    &["key"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let original_paths = dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let mut new_batch = create_new_batch(create_test_schema());
+        if partial {
+            new_batch = new_batch.project(&[0, 1]).unwrap();
+        }
+        if partial_rows {
+            new_batch = new_batch.slice(1, new_batch.num_rows() - 1);
+        }
+        let schema = new_batch.schema();
         let mut builder = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()]).unwrap();
-        builder.data_storage_version(LanceFileVersion::V2_1);
+        builder.when_matched(WhenMatched::UpdateAll);
+        if partial {
+            builder.when_not_matched(WhenNotMatched::DoNothing);
+            if !indexed {
+                builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+            }
+        }
+        if let Some(target) = target {
+            builder.data_storage_version(target);
+        }
         let (dataset, stats) = builder
             .try_build()
             .unwrap()
-            .execute_reader(RecordBatchIterator::new(
-                [Ok(new_batch)],
-                create_test_schema(),
-            ))
+            .execute_reader(RecordBatchIterator::new([Ok(new_batch)], schema))
             .await
             .unwrap();
 
-        assert_eq!(stats.num_inserted_rows, 3);
+        assert_eq!(stats.num_inserted_rows, if partial { 0 } else { 3 });
+        let updated_rows = if partial_rows { 2 } else { 3 };
+        assert_eq!(stats.num_updated_rows, updated_rows);
+        assert_eq!(
+            dataset
+                .count_rows(Some("value = 2".to_string()))
+                .await
+                .unwrap(),
+            if partial { updated_rows as usize } else { 6 }
+        );
         assert_eq!(
             dataset.manifest.data_storage_format.lance_file_format(),
             ConcreteFileVersion::V2_0
@@ -4383,11 +4459,36 @@ mod tests {
                 .fragments
                 .iter()
                 .flat_map(Fragment::referenced_lance_files)
-                .any(|file| file.file_version().unwrap() == ConcreteFileVersion::V2_1)
+                .filter(|file| !original_paths.contains(&file.path))
+                .all(|file| file.file_version().unwrap()
+                    == target.unwrap_or(LanceFileVersion::V2_0).resolve())
         );
-        assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
-            0
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0,
+            target.is_some()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn merge_insert_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let dataset = create_test_dataset("memory://", source, false).await;
+        let error = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+            .unwrap()
+            .data_storage_version(target)
+            .try_build()
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
         );
     }
 

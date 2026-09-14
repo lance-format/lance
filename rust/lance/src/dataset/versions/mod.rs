@@ -56,6 +56,19 @@ use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
 };
 
+/// Keep per-operation targets within the dataset's existing reader family.
+pub fn validate_write_version(
+    default_version: ConcreteFileVersion,
+    target: ConcreteFileVersion,
+) -> Result<()> {
+    if (default_version == ConcreteFileVersion::V1) != (target == ConcreteFileVersion::V1) {
+        return Err(Error::invalid_input(format!(
+            "Cannot write data files in version {target} to a dataset with default version {default_version}: V1 and V2 storage versions cannot be mixed"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
     version: ConcreteFileVersion,
