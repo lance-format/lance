@@ -12,6 +12,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
+use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
@@ -446,6 +447,8 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
+    let computed = !matches!(transforms, NewColumnTransform::AllNulls(_));
+    reject_computed_transform_on_mem_wal(dataset, computed).await?;
     let (fragments, schema, _fragments_to_cleanup, preserves_nullability) =
         add_columns_to_fragments(
             dataset,
@@ -469,6 +472,35 @@ pub(super) async fn add_columns(
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
+}
+
+/// Refuse a computed `add_columns` on a table with a MemWAL attached.
+///
+/// A computed transform derives the new column from rows it can read, which is
+/// the committed fragments and nothing else. Rows still in the WAL are invisible
+/// to it, so they acquire the column as a null and keep that null when they
+/// merge down -- a wrong value, written silently, that no later pass corrects.
+///
+/// Emptiness is not a safe exemption: a write may land between the check and the
+/// commit, so the only race-free rule is to refuse whenever a MemWAL is present.
+/// `AllNulls` is exempt because a null is what it means everywhere.
+///
+/// Takes the decision as a bool rather than the transform itself: a reference to
+/// `NewColumnTransform` held across an await would require it to be `Sync`,
+/// which its boxed reader is not.
+async fn reject_computed_transform_on_mem_wal(dataset: &Dataset, computed: bool) -> Result<()> {
+    if !computed {
+        return Ok(());
+    }
+    if dataset.mem_wal_index_details().await?.is_none() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(
+        "cannot add a computed column to a table with a MemWAL attached: rows held \
+         in the WAL are not visible to the transform and would take a null. Add the \
+         column as all-nulls and backfill it, or drop the MemWAL first."
+            .to_string(),
+    ))
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
