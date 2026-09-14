@@ -373,9 +373,9 @@ public class CompactionOptions implements Serializable {
 
     /**
      * Select the output data file version without changing the dataset's default write version.
-     * Omission uses the compaction config target when set, otherwise the dataset default. The planner
-     * resolves release selectors before distributing tasks. V1/V2 cross-family targets are rejected
-     * by the engine.
+     * Omission uses the compaction config target when set, otherwise the dataset default. The
+     * planner resolves release selectors before distributing tasks. V1/V2 cross-family targets are
+     * rejected by the engine.
      */
     public Builder withDataStorageVersion(DataStorageVersion version) {
       this.dataStorageVersion = Optional.of(Objects.requireNonNull(version, "version"));
