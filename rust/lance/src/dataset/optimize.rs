@@ -3777,7 +3777,7 @@ mod tests {
         .unwrap();
         let options = CompactionOptions {
             data_storage_version: selector,
-            excluded_fragment_ids: vec![2],
+            excluded_fragment_ids: vec![0],
             ..Default::default()
         };
 
@@ -3794,7 +3794,7 @@ mod tests {
             plan
         );
         assert_eq!(plan.num_tasks(), 1);
-        let retained = dataset.manifest.fragments[2].clone();
+        let retained = dataset.manifest.fragments[0].clone();
         let task = plan.compaction_tasks().next().unwrap();
         let task: CompactionTask =
             serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
