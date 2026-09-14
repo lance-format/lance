@@ -3109,11 +3109,10 @@ impl FullZipScheduler {
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
-                if total_bytes_per_value == 0 {
-                    return Err(lance_core::Error::internal(
-                        "Invalid encoding: per-row byte width must be greater than 0",
-                    ));
-                }
+                // total_bytes_per_value == 0 is valid for constant-null FSL pages written by
+                // earlier encoders that produced bits_per_value=0 with no ctrl-word bytes.
+                // FixedFullZipDecoder::drain handles this case by producing AllNull output
+                // without touching the (empty) data buffer.
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
                     data,
@@ -3497,6 +3496,24 @@ impl FixedFullZipDecoder {
 
 impl StructuralPageDecoder for FixedFullZipDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        if self.total_bytes_per_value == 0 {
+            // No bytes per row: constant-null page with no ctrl-word bytes.
+            // The decompressor (ConstantDecompressor) ignores its input and returns AllNull.
+            return Ok(Box::new(FixedFullZipDecodeTask {
+                details: self.details.clone(),
+                data: vec![FullZipDecodeTaskItem {
+                    data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                        data: LanceBuffer::empty(),
+                        bits_per_value: 0,
+                        num_values: num_rows,
+                        block_info: BlockInfo::new(),
+                    }),
+                    rows_in_buf: num_rows,
+                }],
+                bytes_per_value: 0,
+                num_rows: num_rows as usize,
+            }));
+        }
         let mut task_data = Vec::with_capacity(self.data.len());
         let mut remaining = num_rows;
         while remaining > 0 {
@@ -7547,7 +7564,7 @@ mod tests {
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!("expected fixed-size-list compression");
         };
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
         let expected_size = num_rows * dimension * size_of::<f32>();
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -7619,7 +7636,7 @@ mod tests {
             panic!("expected fixed-size-list compression");
         };
         let decompressor = NullableFslDecompressor {
-            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()).unwrap(),
         };
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),

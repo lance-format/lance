@@ -2182,6 +2182,38 @@ impl Dataset {
         })
     }
 
+    /// Deep clone the selected version into a new dataset.
+    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    fn deep_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        reference: Option<Bound<PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
+        let mut new_self = self.ds.as_ref().clone();
+        let reference = self.transform_ref(reference)?;
+        let ds = rt()
+            .block_on(
+                Some(py),
+                new_self.deep_clone(&target_path, reference, store_params),
+            )?
+            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?

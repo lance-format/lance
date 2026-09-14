@@ -4,6 +4,42 @@
 use super::partition::FuzzyAutomaton;
 use super::*;
 
+const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
+
+fn reuse_prepared_scorer_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    reuse_prepared_scorer_enabled_from_value(
+        std::env::var(LANCE_FTS_REUSE_PREPARED_SCORER_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn select_impact_scorer(
+    scorer: &MemBM25Scorer,
+    prepared_scorer: Option<&Arc<MemBM25Scorer>>,
+    is_legacy: impl FnOnce() -> bool,
+    reuse_prepared_scorer_enabled: impl FnOnce() -> bool,
+) -> Arc<MemBM25Scorer> {
+    let Some(prepared_scorer) = prepared_scorer else {
+        return Arc::new(scorer.clone());
+    };
+    if is_legacy() || !reuse_prepared_scorer_enabled() {
+        return Arc::new(scorer.clone());
+    }
+    debug_assert!(
+        std::ptr::eq(scorer, prepared_scorer.as_ref()),
+        "prepared BM25 scorer must be the canonical final scorer"
+    );
+    Arc::clone(prepared_scorer)
+}
+
 impl InvertedIndex {
     /// Add this segment's lexicographically smallest fuzzy candidates for one
     /// compiled query-token automaton to a caller-owned cross-segment merge
@@ -90,6 +126,57 @@ impl InvertedIndex {
             futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term, metrics)))
                 .await?;
         Ok((total_tokens, num_docs, token_docs))
+    }
+
+    /// Return BM25 statistics synchronously when every required value is loaded.
+    ///
+    /// This is an all-or-nothing probe for the full-prewarm query path. It never
+    /// starts I/O: an absent segment corpus statistic or one absent modern
+    /// posting-length table returns `None` for the entire segment.
+    pub(in crate::scalar::inverted) fn bm25_stats_for_terms_if_loaded(
+        &self,
+        terms: &[String],
+    ) -> Result<Option<(u64, usize, Vec<usize>)>> {
+        // Keep the legacy reader on its frozen asynchronous compatibility
+        // path; this optimization targets current partitioned formats.
+        if self.is_legacy() {
+            return Ok(None);
+        }
+        let Some(&(total_tokens, num_docs)) = self.corpus_stats.get() else {
+            return Ok(None);
+        };
+        if self
+            .partitions
+            .iter()
+            .any(|partition| !partition.inverted_list.posting_lengths_loaded())
+        {
+            return Ok(None);
+        }
+        let mut token_docs = Vec::with_capacity(terms.len());
+        for term in terms {
+            let mut term_docs = 0_usize;
+            for partition in &self.partitions {
+                let Some(token_id) = partition.tokens.get(term) else {
+                    continue;
+                };
+                let posting_len = partition
+                    .inverted_list
+                    .loaded_posting_len(token_id)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "FTS token '{term}' maps to invalid posting token id {token_id} in partition {}",
+                            partition.id()
+                        ))
+                    })?;
+                term_docs = term_docs.checked_add(posting_len).ok_or_else(|| {
+                    Error::index(format!(
+                        "FTS document frequency for term '{term}' overflows usize"
+                    ))
+                })?;
+            }
+            token_docs.push(term_docs);
+        }
+        Ok(Some((total_tokens, num_docs, token_docs)))
     }
 
     /// Aggregate immutable per-partition corpus statistics.  New modern files
@@ -366,6 +453,7 @@ impl InvertedIndex {
             prefilter,
             metrics,
             scorer,
+            None,
             initial_score_floor,
         )
         .await
@@ -458,13 +546,16 @@ impl InvertedIndex {
         {
             return Ok(Vec::new());
         }
+        let scorer = prepared.scorer();
+        let reusable_scorer = prepared.reusable_scorer();
         self.bm25_search_final_documents(
             prepared.tokens().clone(),
             params,
             operator,
             prefilter,
             metrics,
-            prepared.scorer().as_ref(),
+            scorer.as_ref(),
+            reusable_scorer,
             initial_score_floor,
         )
         .await
@@ -482,13 +573,19 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         scorer: &MemBM25Scorer,
+        prepared_scorer: Option<&Arc<MemBM25Scorer>>,
         initial_score_floor: Option<f32>,
     ) -> Result<Vec<ScoredDoc>> {
         // The wand only consults `scorer.doc_weight`, which is metadata-free.
         // The outer aggregation below consults `scorer.query_weight`; pairing
         // final tokens with precomputed per-term IDFs avoids the v2 bulk
         // metadata pull and keeps scoring aligned with the rewrite.
-        let impact_scorer = Arc::new(scorer.clone());
+        let impact_scorer = select_impact_scorer(
+            scorer,
+            prepared_scorer,
+            || self.is_legacy(),
+            || *LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED,
+        );
 
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
@@ -1068,5 +1165,83 @@ impl InvertedIndex {
             }
         }
         Ok(resolved_documents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scorer() -> Arc<MemBM25Scorer> {
+        Arc::new(MemBM25Scorer::new(10, 2, HashMap::new()))
+    }
+
+    #[test]
+    fn test_reuse_prepared_scorer_kill_switch_parser() {
+        for value in [None, Some(""), Some("1"), Some("on"), Some("false")] {
+            assert!(
+                reuse_prepared_scorer_enabled_from_value(value),
+                "unexpected disable: {value:?}"
+            );
+        }
+        for value in [Some("0"), Some("off"), Some("OFF"), Some(" off ")] {
+            assert!(
+                !reuse_prepared_scorer_enabled_from_value(value),
+                "unexpected enable: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_impact_scorer_reuses_enabled_prepared_arc() {
+        let prepared = scorer();
+        let impact = select_impact_scorer(prepared.as_ref(), Some(&prepared), || false, || true);
+
+        assert!(Arc::ptr_eq(&impact, &prepared));
+        assert_eq!(Arc::strong_count(&prepared), 2);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_when_disabled() {
+        let prepared = scorer();
+        let unrelated = scorer();
+        let impact = select_impact_scorer(unrelated.as_ref(), Some(&prepared), || false, || false);
+
+        assert!(!Arc::ptr_eq(&impact, &unrelated));
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        assert_eq!(Arc::strong_count(&unrelated), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_legacy_without_reading_switch() {
+        let prepared = scorer();
+        let unrelated = scorer();
+        let impact = select_impact_scorer(
+            unrelated.as_ref(),
+            Some(&prepared),
+            || true,
+            || panic!("legacy search must not read the reuse switch"),
+        );
+
+        assert!(!Arc::ptr_eq(&impact, &unrelated));
+        assert_eq!(Arc::strong_count(&prepared), 1);
+        assert_eq!(Arc::strong_count(&unrelated), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
+    }
+
+    #[test]
+    fn test_select_impact_scorer_clones_nonprepared_without_reading_switch() {
+        let scorer = scorer();
+        let impact = select_impact_scorer(
+            scorer.as_ref(),
+            None,
+            || panic!("nonprepared search must not inspect the index format"),
+            || panic!("nonprepared search must not read the reuse switch"),
+        );
+
+        assert!(!Arc::ptr_eq(&impact, &scorer));
+        assert_eq!(Arc::strong_count(&scorer), 1);
+        assert_eq!(Arc::strong_count(&impact), 1);
     }
 }
