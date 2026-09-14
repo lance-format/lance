@@ -15,14 +15,13 @@ use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::{JsonArray, is_json_field};
@@ -30,7 +29,6 @@ use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
-use lance_datafusion::expr::safe_coerce_scalar;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -183,30 +181,10 @@ impl UpdateBuilder {
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             );
         if dest_type != src_type && !is_json_string {
-            expr = match expr {
-                // Preserve the permissive Arrow cast used for list literal assignments:
-                // wrong-length lists become null, and failed element casts become null
-                // elements. DataFusion supports List -> FixedSizeList, but its ordinary
-                // CAST uses safe=false and rejects these inputs instead.
-                Expr::Literal(value @ ScalarValue::List(_), metadata)
-                    if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
-                {
-                    Expr::Literal(
-                        safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
-                            ArrowError::CastError(format!(
-                                "Failed to cast {} to {} during planning",
-                                value.data_type(),
-                                dest_type
-                            ))
-                        })?,
-                        metadata,
-                    )
-                }
-                _ => expr
-                    .cast_to(&dest_type, &df_schema)
-                    .map_err(box_error)
-                    .context(InvalidInputSnafu {})?,
-            };
+            expr = expr
+                .cast_to(&dest_type, &df_schema)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?;
         }
 
         // Optimize the expression. For example, this might apply the cast on
@@ -960,7 +938,7 @@ mod tests {
     #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
     #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
     #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
-    #[case::invalid_element("['invalid', '4.5']", Some(vec![None, Some(4.5)]), Some("Cannot cast string"))]
+    #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
     #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]
     #[case::null_list("NULL", None, None)]
     #[case::short_list("[3]", None, Some("has length 1"))]
@@ -982,42 +960,27 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
-        // Ordinary CAST accepts these types, but rejects values that the update
-        // literal coercion converts to nulls.
-        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-        let planner = Planner::new(schema.clone());
-        let expression_type = schema.field_with_name("vector").unwrap().data_type();
-        let expr = planner
-            .parse_expr(expression)
-            .unwrap()
-            .cast_to(
-                expression_type,
-                &DFSchema::try_from(schema.as_ref().clone()).unwrap(),
-            )
-            .unwrap();
-        let cast_result = planner.optimize_expr(expr).and_then(|expr| {
-            let physical = planner.create_physical_expr(&expr)?;
-            Ok(physical
-                .evaluate(&RecordBatch::new_empty(schema))?
-                .into_array(2)?)
-        });
-        let cast_array = if let Some(message) = cast_error {
-            let error = cast_result.unwrap_err();
-            assert!(matches!(error, Error::Arrow { .. }), "{error:?}");
+        let dataset = Arc::new(dataset);
+        let original = dataset.scan().try_into_batch().await.unwrap();
+        let result = async {
+            UpdateBuilder::new(dataset.clone())
+                .set("vector", expression)?
+                .build()?
+                .execute()
+                .await
+        }
+        .await;
+        if let Some(message) = cast_error {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
             assert!(error.to_string().contains(message), "{error}");
-            None
-        } else {
-            Some(cast_result.unwrap())
-        };
-
-        let result = UpdateBuilder::new(Arc::new(dataset))
-            .set("vector", expression)
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
+            let mut reopened = dataset.as_ref().clone();
+            reopened.checkout_latest().await.unwrap();
+            assert_eq!(reopened.version().version, dataset.version().version);
+            assert_eq!(reopened.scan().try_into_batch().await.unwrap(), original);
+            return;
+        }
+        let result = result.unwrap();
         assert_eq!(result.rows_updated, 2);
         let batch = result.new_dataset.scan().try_into_batch().await.unwrap();
         let actual = batch["vector"].as_fixed_size_list();
@@ -1026,9 +989,6 @@ mod tests {
             2,
         );
         assert_eq!(actual, &expected);
-        if let Some(cast_array) = cast_array {
-            assert_eq!(cast_array.as_fixed_size_list(), &expected);
-        }
     }
 
     #[rstest]
