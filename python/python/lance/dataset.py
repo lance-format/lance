@@ -6963,6 +6963,9 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        refine_column: Optional[str] = None,
+        refine_q: Optional[QueryVectorLike] = None,
+        refine_metric: Optional[str] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -6992,6 +6995,22 @@ class ScannerBuilder:
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
+        refine_column, refine_q, refine_metric: optional
+            Supply all three to rerank ``k * refine_factor`` coarse candidates
+            using another Float32 fixed-size vector column. ``refine_q`` must
+            match that column's dimension and the number of coarse queries.
+            Requires an explicit positive ``refine_factor``. Final ``_distance``
+            and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
+            coarse TopM still precedes refinement. Query filters are unsupported;
+            scalar filters retain their usual prefilter/postfilter behavior.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            builder.nearest("pca128", q128, k=10, refine_factor=2,
+                            refine_column="embedding", refine_q=q1024,
+                            refine_metric="cosine")
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7008,6 +7027,9 @@ class ScannerBuilder:
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
             distance_range=distance_range,
+            refine_column=refine_column,
+            refine_q=refine_q,
+            refine_metric=refine_metric,
         )
         return self
 
@@ -8195,6 +8217,9 @@ def _build_vector_search_query(
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+    refine_column: Optional[str] = None,
+    refine_q: Optional[QueryVectorLike] = None,
+    refine_metric: Optional[str] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8247,6 +8272,8 @@ def _build_vector_search_query(
         Both bounds are optional. The lower bound is inclusive and the upper
         bound is exclusive, so (0.0, 1.0) keeps distances d where
         0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+    refine_column, refine_q, refine_metric: optional
+        Cross-column refinement parameters; see ``ScannerBuilder.nearest``.
 
     Returns
     -------
@@ -8254,6 +8281,13 @@ def _build_vector_search_query(
         The scanner builder for method chaining.
     """
     q, q_dim = _coerce_query_vector(q)
+    refine_args = (refine_column, refine_q, refine_metric)
+    if any(value is not None for value in refine_args):
+        if not all(value is not None for value in refine_args):
+            raise ValueError(
+                "refine_column, refine_q, and refine_metric must be provided together"
+            )
+        refine_q, _ = _coerce_query_vector(refine_q)
 
     lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
     if lance_field is None:
@@ -8340,6 +8374,9 @@ def _build_vector_search_query(
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
         "distance_range": distance_range,
+        "refine_column": refine_column,
+        "refine_q": refine_q,
+        "refine_metric": refine_metric,
     }
 
 
