@@ -1132,15 +1132,14 @@ mod tests {
         )
         .unwrap();
         let sorted_batch =
-            RecordBatch::try_new(data.schema().clone(), vec![sorted_values, sorted_row_ids])
-                .unwrap();
+            RecordBatch::try_new(data.schema(), vec![sorted_values, sorted_row_ids]).unwrap();
 
         let batch_one = sorted_batch.slice(0, 4096);
         let batch_two = sorted_batch.slice(4096, 4096);
         let batch_three = sorted_batch.slice(8192, 4096);
         let training_data = RecordBatchIterator::new(
             vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
-            data.schema().clone(),
+            data.schema(),
         );
 
         train_index(&index_store, training_data, None).await;
