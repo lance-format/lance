@@ -12,7 +12,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -129,7 +129,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
-/// streaming search path.
+/// streaming and global-top-k search paths.
 ///
 /// The streaming path deliberately avoids per-partition CPU-task fan-out (a measured
 /// 14-30% latency win, see #6475). Searching a batch of partitions per `spawn_cpu`
@@ -141,7 +141,10 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
 ///
 /// This is a tunable knob: larger batches amortize dispatch overhead further and keep
 /// more work on a single CPU thread, at the cost of more prepared partitions held in
-/// memory at once. The batch is an upper bound: the search loop greedily drains
+/// memory at once. A prepared partition pins its whole quantized storage, so this
+/// (together with the prepare parallelism) is what bounds a query's resident
+/// partition memory independently of `nprobes`; see
+/// [`PreparedPartitionTracker`]. The batch is an upper bound: the search loop greedily drains
 /// whatever is already prepared rather than waiting for a full batch, so a slow
 /// producer yields small batches (matching the old search-as-it-arrives latency) and
 /// only a fast producer fills whole ones. Override with the
@@ -454,7 +457,54 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<PartitionEntry<S, Q>>,
+    /// Released together with `part_entry`, so the tracker's live count is the
+    /// number of partitions whose storage is pinned by in-flight searches.
+    _in_flight: PreparedPartitionGuard,
     _marker: PhantomData<(S, Q)>,
+}
+
+/// Live count and high-water mark of [`PreparedPartitionSearch`] values for one
+/// index.
+///
+/// A prepared partition holds a strong reference to its [`PartitionEntry`] — the
+/// partition's whole quantized storage — until it has been scored and dropped, so
+/// the index cache cannot evict it in the meantime. The count is therefore the
+/// partition memory a query holds *outside* the cache's budget. Every search path
+/// must keep it bounded by its prepare window and scoring chunk size rather than
+/// by `nprobes`: a query that probes thousands of partitions of a large RQ index
+/// would otherwise pin hundreds of GiB before scoring the first one.
+#[derive(Debug, Default)]
+pub(crate) struct PreparedPartitionTracker {
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl PreparedPartitionTracker {
+    fn track(self: &Arc<Self>) -> PreparedPartitionGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        PreparedPartitionGuard(self.clone())
+    }
+
+    /// Prepared partitions currently alive.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Most prepared partitions alive at once over the index's lifetime.
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+struct PreparedPartitionGuard(Arc<PreparedPartitionTracker>);
+
+impl Drop for PreparedPartitionGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -953,6 +1003,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_query_residual: bool,
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
+    prepared_partitions: Arc<PreparedPartitionTracker>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1121,6 +1172,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -1145,6 +1197,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -1164,6 +1217,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -1216,6 +1270,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -1485,6 +1540,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
             open_io_stats,
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
     }
@@ -1528,8 +1584,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // the open-time I/O is not attributed here (it is a one-time cost,
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
+    }
+
+    /// Prepared-partition accounting for this index instance; see
+    /// [`PreparedPartitionTracker`].
+    #[cfg(test)]
+    pub(crate) fn prepared_partitions(&self) -> &PreparedPartitionTracker {
+        &self.prepared_partitions
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -2152,7 +2216,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
-            let prepared = stream::iter(start_idx..end_idx)
+            // Stream prepared partitions through scoring in chunks rather than
+            // collecting all of them first. A prepared partition pins its whole
+            // quantized storage, so collecting `nprobes` of them before scoring
+            // makes peak memory scale with `nprobes` (a 4096-probe query over a
+            // large RQ index pinned hundreds of GiB per index segment). Chunking
+            // bounds resident partitions to the prepare window plus two chunks:
+            // one being accumulated by `chunks` while another is scored.
+            // `buffered` preserves the probe order, so the heap accumulates
+            // partitions in the same order as before (which decides which of
+            // several rows tied at the k-th distance the capped heap keeps).
+            let mut prepared_chunks = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -2174,32 +2248,44 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     }
                 })
                 .buffered(prepare_parallelism)
-                .try_collect::<Vec<_>>()
-                .await?;
+                .chunks(*STREAMING_SEARCH_BATCH_SIZE);
 
             let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
-            let search_metrics = metrics.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
-                let mut heap = BinaryHeap::with_capacity(heap_capacity);
-                scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
-                    for prepared in prepared {
-                        Self::accumulate_prepared_partition_search(
-                            use_query_residual,
-                            use_residual_scratch,
-                            prepared,
-                            &mut heap,
-                            scratch,
-                            search_metrics.as_ref(),
-                        )
-                        .map_err(DataFusionError::from)?;
-                    }
-                    Ok(())
-                })?;
-                Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
-            })
-            .await?;
+            let mut heap = BinaryHeap::with_capacity(heap_capacity);
+            // Score each chunk on the CPU pool while the next chunk prepares (the
+            // same overlap `search_partitions_batch` uses): `spawn_cpu` starts the
+            // scoring immediately and the async task, never a CPU-pool thread, does
+            // the waiting (#7642). The heap is threaded through each dispatch so
+            // scoring stays sequential, and a scored chunk is dropped before the
+            // next one is scored.
+            let mut pending = prepared_chunks.next().await;
+            while let Some(chunk) = pending {
+                let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+                let search_metrics = metrics.clone();
+                let scratch_pool = self.scratch_pool.clone();
+                let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    scratch_pool.with_scratch(|scratch| -> Result<()> {
+                        for prepared in chunk {
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heap,
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    Ok(heap)
+                });
+                let (scored, next) = futures::join!(score, prepared_chunks.next());
+                heap = scored?;
+                pending = next;
+            }
+
+            let batch = spawn_cpu(move || Self::global_heap_to_batch(heap)).await?;
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
@@ -2547,6 +2633,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 rq_search_cache: index.rq_search_cache.clone(),
                                 raw_query_context: raw_query_contexts[*query_index].clone(),
                                 part_entry: part_entry.clone(),
+                                _in_flight: index.prepared_partitions.track(),
                                 _marker: PhantomData,
                             };
                             Self::accumulate_prepared_partition_search(
@@ -2783,16 +2870,18 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
+    use futures::TryStreamExt;
     use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache, WeakLanceCache};
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tokio::get_num_compute_intensive_cpus;
     use lance_core::{ROW_ID, Result};
     use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::prefilter::PreFilter;
+    use lance_index::prefilter::{NoFilter, PreFilter};
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -2805,6 +2894,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -6513,6 +6603,118 @@ mod tests {
             .unwrap();
         let v3_index = index.as_any().downcast_ref::<super::IvfPq>();
         assert!(v3_index.is_some());
+    }
+
+    /// The global-top-k path (flat sub-index, no early-stop control) must not
+    /// pin every probed partition before scoring: a prepared partition holds the
+    /// partition's whole quantized storage, so with a high explicit `nprobes`
+    /// that made peak memory scale with `nprobes` instead of with the prepare
+    /// window. Probe every partition of an index with more partitions than the
+    /// window and check the in-flight high-water mark stays within it.
+    #[tokio::test]
+    async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const ROWS_PER_PARTITION: usize = 16;
+
+        // Resident partitions are bounded by the prepare window plus two scoring
+        // chunks (one being scored, one being assembled). Size the index so that
+        // the old collect-everything behavior would clearly exceed the bound.
+        let in_flight_bound =
+            get_num_compute_intensive_cpus().max(1) + 2 * *super::STREAMING_SEARCH_BATCH_SIZE;
+        let num_partitions = (2 * in_flight_bound).max(64);
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(num_partitions * ROWS_PER_PARTITION);
+        let query_vector = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let mut ivf_params = IvfBuildParams::new(num_partitions);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let tracker = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index")
+            .prepared_partitions();
+
+        let query = Query {
+            column: "vector".to_string(),
+            key: query_vector,
+            k: K,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: num_partitions,
+            maximum_nprobes: Some(num_partitions),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
+        assert_eq!(partitions.len(), num_partitions);
+        let results = index
+            .clone()
+            .search_partitions(
+                query,
+                Arc::new(partitions),
+                Arc::new(q_c_dists),
+                0,
+                num_partitions,
+                Arc::new(NoFilter),
+                None,
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let num_results: usize = results.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(num_results, K);
+        assert_eq!(
+            tracker.in_flight(),
+            0,
+            "every prepared partition must be released once the search completes"
+        );
+        assert!(
+            tracker.peak() >= 1,
+            "the search must have gone through prepared partitions"
+        );
+        assert!(
+            tracker.peak() <= in_flight_bound,
+            "peak in-flight prepared partitions {} exceeds the bound {} (probed {} partitions)",
+            tracker.peak(),
+            in_flight_bound,
+            num_partitions
+        );
     }
 
     #[rstest]
