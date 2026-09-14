@@ -3,6 +3,7 @@
 
 //! Query planner for LSM scanner.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -11,13 +12,17 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
 use lance_core::Result;
+use lance_core::datatypes::Schema as LanceSchema;
 use tracing::instrument;
 
 use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::exec::{
+    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN,
+    SchemaRelabelExec,
+};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -53,6 +58,70 @@ pub struct LsmScanPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+}
+
+/// What the base table calls each of its field ids, if a base arm is present.
+///
+/// A rename changes a field's name and keeps its id, so this is what turns a
+/// generation's stored names into the names every other arm uses.
+fn base_field_names(sources: &[LsmDataSource]) -> Option<HashMap<i32, String>> {
+    sources.iter().find_map(|source| match source {
+        LsmDataSource::BaseTable { dataset } => Some(
+            dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|f| (f.id, f.name.clone()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+/// Rename `plan`'s output columns to the names the base table uses for the same
+/// field ids.
+///
+/// Matched by id, so a column renamed since this generation was sealed keeps
+/// its values instead of arriving under a name no other arm has. Columns the
+/// base table does not declare -- `_rowaddr`, `_tombstone` -- keep their own
+/// names, as do all of them when there is no base arm to agree with.
+fn relabel_to_base_names(
+    plan: Arc<dyn ExecutionPlan>,
+    generation_schema: &LanceSchema,
+    base_names: Option<&HashMap<i32, String>>,
+) -> Arc<dyn ExecutionPlan> {
+    let Some(base_names) = base_names else {
+        return plan;
+    };
+    let ids: HashMap<&str, i32> = generation_schema
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f.id))
+        .collect();
+    let schema = plan.schema();
+    let mut renamed = false;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let base_name = ids
+                .get(field.name().as_str())
+                .and_then(|id| base_names.get(id))
+                .filter(|name| *name != field.name());
+            match base_name {
+                Some(name) => {
+                    renamed = true;
+                    field.as_ref().clone().with_name(name)
+                }
+                None => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    if !renamed {
+        return plan;
+    }
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    Arc::new(SchemaRelabelExec::new(plan, schema))
 }
 
 impl LsmScanPlanner {
@@ -173,6 +242,12 @@ impl LsmScanPlanner {
         // down safely. The active memtable is in-memory and is never capped.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
 
+        // What the base table calls each field id today. A generation sealed
+        // under an older name still stores the column under that name, and the
+        // union below matches arms by name, so the generation's columns are
+        // relabelled to these before they meet the base arm.
+        let base_names = base_field_names(&sources);
+
         let mut source_plans = Vec::new();
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
@@ -186,7 +261,7 @@ impl LsmScanPlanner {
                 _ => None,
             };
             let scan = self
-                .build_source_scan(&source, projection, filter, fetch)
+                .build_source_scan(&source, projection, filter, fetch, base_names.as_ref())
                 .await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
@@ -323,6 +398,7 @@ impl LsmScanPlanner {
         projection: Option<&[String]>,
         filter: Option<&Expr>,
         fetch: Option<usize>,
+        base_names: Option<&HashMap<i32, String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -399,7 +475,8 @@ impl LsmScanPlanner {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
-                scanner.create_plan().await
+                let plan = scanner.create_plan().await?;
+                Ok(relabel_to_base_names(plan, dataset.schema(), base_names))
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
