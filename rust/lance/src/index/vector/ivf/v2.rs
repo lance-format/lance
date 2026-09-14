@@ -199,6 +199,10 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 
+/// Largest global-top-k heap converted to the result batch on the async task
+/// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
+const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
+
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
 ///
@@ -2350,7 +2354,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 pending = next;
             }
 
-            let batch = spawn_cpu(move || Self::global_heap_to_batch(heap)).await?;
+            // Turning the heap into the result batch is a sort of `k * refine_factor`
+            // entries. Below a few thousand that is well under the ~100µs where a
+            // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
+            // common small-k query at one dispatch (as before the chunked scoring).
+            let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
+                Self::global_heap_to_batch(heap)?
+            } else {
+                spawn_cpu(move || Self::global_heap_to_batch(heap)).await?
+            };
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
