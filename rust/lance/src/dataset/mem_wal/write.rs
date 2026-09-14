@@ -1625,17 +1625,14 @@ fn field_id_of(field: &ArrowField) -> Option<i32> {
 /// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
 /// and the schema does not declare is dropped.
 ///
-/// Ids are tried first because a rename keeps the id and changes the name, so a
-/// name match would null the new name and drop the old one — the column's values
-/// lost. Entries written before ids were carried have none, and fall back to the
-/// name match, which is why both tiers exist.
+/// Ids are tried first because a rename keeps the id and changes the name: a
+/// name match would null the new name and drop the old one, losing the column's
+/// values. An entry carrying no ids falls back to the name match.
 ///
 /// Both cases are what a replayed WAL entry looks like after the table's schema
 /// moved: an entry predates a column added since, and carries one dropped
-/// since. Matching by position instead would reject the first outright and
-/// store the second under its neighbour's name. Live writes reach here already
-/// checked against the logical schema, so for them every column is present and
-/// this only appends `_tombstone`.
+/// since. Live writes reach here already checked against the logical schema, so
+/// for them every column is present and this only appends `_tombstone`.
 ///
 /// A column whose type changed is cast, the same way `alter_columns` casts the
 /// base data, so a replayed row lands in the state it would have had if it had
@@ -1650,10 +1647,6 @@ fn conform_to_storage_schema(
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
-    // A field id survives a rename; a name does not. Matching on it first is
-    // what keeps a renamed column's values attached to the column, instead of
-    // nulling the new name and dropping the old one. Absent on entries written
-    // before ids were carried, which is why the name match below remains.
     let by_field_id: HashMap<i32, &ArrayRef> = batch
         .schema()
         .fields()
