@@ -35,6 +35,7 @@
 //! base/SSTable Lance datasets, `MemTableScanner` for the active
 //! memtable) and requires no changes to `lance-index`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -55,7 +56,9 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
-use super::projection::{project_to_canonical, validate_projection_names};
+use super::projection::{
+    project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
+};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::index::scalar::inverted::{indexed_fts_document_granularities, resolve_fts_field};
@@ -412,7 +415,7 @@ impl LsmFtsSearchPlanner {
             &[SCORE_COLUMN]
         };
         validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
-        let target_schema = self.canonical_fts_schema(projection, document_granularity);
+        let target_schema = self.canonical_fts_schema(projection, document_granularity)?;
         let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
@@ -552,7 +555,10 @@ impl LsmFtsSearchPlanner {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -580,7 +586,10 @@ impl LsmFtsSearchPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
@@ -605,7 +614,7 @@ impl LsmFtsSearchPlanner {
                 let document_granularity = query_document_granularity(query)?;
                 if !active_source_can_execute_fts(source, column, document_granularity) {
                     return self
-                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity));
+                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity)?);
                 }
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
@@ -662,11 +671,19 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Canonical FTS output: user-projected cols + PK + `_score`.
+    ///
+    /// Data columns resolve through [`resolve_data_fields`], the same
+    /// nested-path resolver [`canonical_output_schema`] uses, so `meta.a`
+    /// contributes `meta: Struct<a>` and sibling leaves collapse into one
+    /// field at the parent's first-mentioned position. The FTS-specific
+    /// columns (`_score`, `_doc_index`) are appended around it.
+    ///
+    /// [`canonical_output_schema`]: super::projection::canonical_output_schema
     fn canonical_fts_schema(
         &self,
         user_projection: Option<&[String]>,
         document_granularity: DocumentGranularity,
-    ) -> SchemaRef {
+    ) -> Result<SchemaRef> {
         let mut ordered: Vec<String> = if let Some(p) = user_projection {
             p.to_vec()
         } else {
@@ -687,24 +704,35 @@ impl LsmFtsSearchPlanner {
         if !ordered.iter().any(|c| c == SCORE_COLUMN) {
             ordered.push(SCORE_COLUMN.to_string());
         }
-        let fields: Vec<Arc<Field>> = ordered
+
+        let data_names: Vec<String> = ordered
             .iter()
-            .filter_map(|name| {
-                if name == SCORE_COLUMN {
-                    Some(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)))
-                } else if name == DOC_INDEX_COL {
-                    Some(Arc::new(DOC_INDEX_FIELD.clone()))
-                } else if is_system_column(name) {
-                    Some(Arc::new(Field::new(name.clone(), DataType::UInt64, true)))
-                } else {
-                    self.base_schema
-                        .field_with_name(name)
-                        .ok()
-                        .map(|f| Arc::new(f.clone()))
-                }
+            .filter(|n| {
+                n.as_str() != SCORE_COLUMN && n.as_str() != DOC_INDEX_COL && !is_system_column(n)
             })
+            .cloned()
             .collect();
-        Arc::new(Schema::new(fields))
+        let mut by_name: HashMap<String, Arc<Field>> =
+            resolve_data_fields(&data_names, &self.base_schema)?
+                .into_iter()
+                .map(|f| (f.name().clone(), f))
+                .collect();
+
+        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(ordered.len());
+        for name in &ordered {
+            if name == SCORE_COLUMN {
+                fields.push(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)));
+            } else if name == DOC_INDEX_COL {
+                fields.push(Arc::new(DOC_INDEX_FIELD.clone()));
+            } else if is_system_column(name) {
+                fields.push(Arc::new(Field::new(name.clone(), DataType::UInt64, true)));
+            } else if let Some(field) = by_name.remove(&top_level_of(name)?) {
+                // `remove` is what collapses a second mention of the same
+                // parent (`meta.a` then `meta.c`) into the single merged field.
+                fields.push(field);
+            }
+        }
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     fn empty_plan(&self, schema: &SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
@@ -720,6 +748,7 @@ mod tests {
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         Array, BooleanArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
         UInt32Array,
@@ -798,6 +827,154 @@ mod tests {
                 .unwrap();
         }
         dataset
+    }
+
+    /// `fts_schema` plus `meta: Struct<a: Int64, b: Utf8>`.
+    fn nested_fts_schema() -> Arc<ArrowSchema> {
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("meta", DataType::Struct(nested_meta_fields()), true),
+        ]))
+    }
+
+    fn nested_meta_fields() -> arrow_schema::Fields {
+        arrow_schema::Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ])
+    }
+
+    /// The children `meta` carries in `schema`, in order.
+    fn meta_children(schema: &ArrowSchema) -> Vec<String> {
+        let DataType::Struct(fields) = schema
+            .field_with_name("meta")
+            .expect("meta survived canonicalization")
+            .data_type()
+            .clone()
+        else {
+            panic!("meta is not a struct");
+        };
+        fields.iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// The FTS planner builds its own canonical target, so it needs the same
+    /// nested-path resolver as every other arm. A flat `field_with_name`
+    /// lookup misses `meta.a` entirely and `project_to_canonical` then drops
+    /// the column from every source — a silent truncation, since
+    /// `validate_projection_names` accepts the name.
+    #[tokio::test]
+    async fn nested_projection_survives_fts_canonicalization() {
+        let schema = nested_fts_schema();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64, 20])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["b_1", "b_2"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["lance rocks", "unrelated"])),
+                Arc::new(meta),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(indexes),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["meta.a".to_string()];
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta_children(&plan.schema()), vec!["a"]);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "only id=1 contains 'lance'");
+        let hit = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+        assert_eq!(meta_children(hit.schema_ref()), vec!["a"]);
+        assert_eq!(
+            hit.column_by_name("meta")
+                .unwrap()
+                .as_struct()
+                .column_by_name("a")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    /// The no-source arm builds the same canonical target, so an empty result
+    /// still reports the narrowed struct rather than dropping it.
+    #[tokio::test]
+    async fn empty_fts_plan_preserves_nested_projection() {
+        let schema = nested_fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["meta.a".to_string()];
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta_children(&plan.schema()), vec!["a"]);
     }
 
     #[tokio::test]
