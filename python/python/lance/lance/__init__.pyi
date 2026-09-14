@@ -54,6 +54,7 @@ from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
+from .bitmap import Bitmap as Bitmap
 from .debug import format_fragment as format_fragment
 from .debug import format_manifest as format_manifest
 from .debug import format_schema as format_schema

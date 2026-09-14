@@ -481,6 +481,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 target_bases_info,
                 &spill_session_context,
                 &spill_execution_options,
+                params.write_version(&dataset),
             )
             .await?;
 

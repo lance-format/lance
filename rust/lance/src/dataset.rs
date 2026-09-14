@@ -70,6 +70,7 @@ pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -115,7 +116,8 @@ mod utils;
 pub(crate) mod versions;
 pub mod write;
 
-pub use data_file::{DataFilePart, DataFileTarget};
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -794,6 +796,8 @@ impl Dataset {
         }?;
 
         ensure_can_read_manifest(&manifest)?;
+
+        versions::check_manifest_storage_version(&mut manifest)?;
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
@@ -4189,6 +4193,8 @@ pub(crate) async fn write_manifest_file(
             config.disable_transaction_file,
         )?;
     }
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 

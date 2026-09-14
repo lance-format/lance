@@ -323,6 +323,14 @@ To enable the FRI, set `defer_index_remap=True` when compacting:
 dataset.optimize.compact_files(defer_index_remap=True)
 ```
 
+Rust callers can open the FRI for the dataset version they have loaded with
+`Dataset::frag_reuse_index()`, which returns `None` when that version has no FRI. The returned
+index exposes the raw remap: a physical row address is either unmapped, deleted by a recorded
+compaction, or mapped to the last address reached through the retained mappings. Neither outcome
+is validated against the loaded manifest. Unmapped addresses may still have moved in a compaction
+whose history was trimmed, and mapped destinations may since have been removed, so callers that
+need a complete translation must verify coverage and destinations themselves.
+
 For details on the index format and usage patterns, see the
 [Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 

@@ -38,7 +38,7 @@ use lance_index::vector::{
 };
 use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::throttle::is_throttle_error;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, ReadDirOptions};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
@@ -345,7 +345,7 @@ impl DirectoryNamespaceBuilder {
             session: None,
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
-            inline_optimization_enabled: true,
+            inline_optimization_enabled: false,
             table_version_tracking_enabled: false, // Default to disabled
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
@@ -388,8 +388,8 @@ impl DirectoryNamespaceBuilder {
 
     /// Enable or disable replacement index maintenance for the __manifest table.
     ///
-    /// When enabled (default), copy-on-write manifest rewrites build replacement indices
-    /// for fast reads. When disabled, rewrites only replace data files.
+    /// When enabled, copy-on-write manifest rewrites build replacement indices for fast
+    /// reads. This is disabled by default so rewrites only replace data files.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -414,7 +414,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: false)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -512,11 +512,11 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
-        // Extract inline_optimization_enabled (default: true)
+        // Extract inline_optimization_enabled (default: false)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
             .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
@@ -1157,34 +1157,74 @@ impl DirectoryNamespace {
         None
     }
 
+    /// Page size requested from [`ObjectStore::read_dir_page`] while scanning the namespace
+    /// directory for tables. Only bounds the cost of one backend request on stores that push
+    /// pagination down (S3, GCS, Azure); `list_directory_tables` always walks every page.
+    const LIST_DIRECTORY_PAGE_SIZE: usize = 1000;
+
     /// List tables using directory scanning (fallback method)
     async fn list_directory_tables(&self) -> Result<Vec<String>> {
         let mut tables = Vec::new();
-        let entries = self
-            .object_store
-            .read_dir(self.base_path.clone())
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {:?}", e),
+        let mut page_token = None;
+
+        loop {
+            let page = self
+                .object_store
+                .read_dir_page(
+                    self.base_path.clone(),
+                    ReadDirOptions {
+                        page_token,
+                        // Only a hint to backends with a paginated list API (S3, GCS, Azure):
+                        // it bounds the cost of one request, not the number of tables returned.
+                        // Every other backend still lists (and pages through) the whole
+                        // directory here regardless, same as `read_dir` always did.
+                        limit: Some(Self::LIST_DIRECTORY_PAGE_SIZE),
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to list directory: {:?}", e),
+                    })
+                })?;
+
+            let candidates: Vec<String> = page
+                .result
+                .common_prefixes
+                .iter()
+                .chain(page.result.objects.iter().map(|o| &o.location))
+                .filter_map(|p| {
+                    p.filename()?
+                        .trim_end_matches('/')
+                        .strip_suffix(".lance")
+                        .map(|name| name.to_string())
                 })
-            })?;
+                .collect();
 
-        for entry in entries {
-            let path = entry.trim_end_matches('/');
-            if !path.ends_with(".lance") {
-                continue;
+            // Each candidate needs its own `check_table_status` round trip (a `read_dir` probe
+            // for a deregistration marker), so this is linear in the number of listed entries;
+            // run a bounded number concurrently rather than one at a time.
+            let mut stream =
+                futures::stream::iter(candidates.into_iter().map(|table_name| async move {
+                    let status = self.check_table_status(&table_name).await?;
+                    Ok::<Option<String>, Error>((!status.is_deregistered).then_some(table_name))
+                }))
+                .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+            while let Some(result) = stream.next().await {
+                if let Some(table_name) = result? {
+                    tables.push(table_name);
+                }
             }
 
-            let table_name = &path[..path.len() - 6];
-
-            // Use atomic check to skip deregistered tables.
-            let status = self.check_table_status(table_name).await?;
-            if status.is_deregistered {
-                continue;
+            // A page can come back holding fewer children than the requested limit and still
+            // be followed by more (a backend can spend its page budget on keys a delimiter
+            // collapses away, or cap a page on its own besides) — walk until the token is
+            // `None`, not until a page comes back short.
+            page_token = page.page_token;
+            if page_token.is_none() {
+                break;
             }
-
-            tables.push(table_name.to_string());
         }
 
         Ok(tables)
@@ -6767,6 +6807,7 @@ mod tests {
                 Some(ListBehavior::EmptyListing) => Ok(ListResult {
                     common_prefixes: Vec::new(),
                     objects: Vec::new(),
+                    extensions: Default::default(),
                 }),
                 // Mirrors the object_store retry-exhaustion message shape for an
                 // Azure ServerBusy response, which is what the incident produced.
@@ -9740,9 +9781,15 @@ mod tests {
         properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
 
         let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
-        // Both should default to true
         assert!(builder.manifest_enabled);
         assert!(builder.dir_listing_enabled);
+        assert!(!builder.inline_optimization_enabled);
+    }
+
+    #[test]
+    fn test_builder_disables_inline_optimization_by_default() {
+        let builder = DirectoryNamespaceBuilder::new("memory://");
+        assert!(!builder.inline_optimization_enabled);
     }
 
     #[tokio::test]

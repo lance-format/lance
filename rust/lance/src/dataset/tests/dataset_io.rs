@@ -61,6 +61,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
+use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
@@ -1406,6 +1407,235 @@ async fn test_write_manifest(
 }
 
 #[tokio::test]
+async fn open_rejects_mixed_file_versions_without_capability() {
+    let uri = TempStdDir::default();
+    create_file(&uri, WriteMode::Create, LanceFileVersion::V2_0).await;
+    let dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+    let mut manifest = read_manifest(
+        dataset.object_store.as_ref(),
+        &dataset.manifest_location.path,
+        dataset.manifest_location.size,
+    )
+    .await
+    .unwrap();
+    let file = &mut Arc::make_mut(&mut manifest.fragments)[0].files[0];
+    file.file_major_version = 2;
+    file.file_minor_version = 1;
+    manifest.version += 1;
+
+    dataset
+        .commit_handler
+        .commit(
+            &mut manifest,
+            None,
+            &dataset.base,
+            dataset.object_store.as_ref(),
+            write_manifest_file_to_path,
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let err = Dataset::open(uri.to_str().unwrap()).await.unwrap_err();
+    assert!(err.to_string().contains("not enabled"), "{err}");
+}
+
+#[tokio::test]
+async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let first =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![0, 1]))]).unwrap();
+    let second =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2, 3]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(first.clone())], schema.clone()),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let file_name = "mixed-v2_1.lance";
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join(file_name))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::create_lazy_writer(
+        ConcreteFileVersion::V2_1,
+        object_writer,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&second).await.unwrap();
+    writer.finish().await.unwrap();
+    let data_file = dataset.create_data_file(file_name, None).await.unwrap();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    Arc::make_mut(&mut manifest.fragments).push(Fragment {
+        id: 1,
+        files: vec![data_file],
+        overlays: vec![],
+        deletion_file: None,
+        row_id_meta: None,
+        physical_rows: Some(second.num_rows()),
+        last_updated_at_version_meta: None,
+        created_at_version_meta: None,
+    });
+    manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let mixed = Dataset::open(&uri).await.unwrap();
+    let actual = mixed.scan().try_into_batch().await.unwrap();
+    let expected = concat_batches(&schema, &[first, second]).unwrap();
+    assert_eq!(actual, expected);
+
+    let mut filtered_scan = mixed.scan();
+    filtered_scan.filter("i >= 2").unwrap();
+    assert_eq!(filtered_scan.try_into_batch().await.unwrap().num_rows(), 2);
+
+    let taken = mixed
+        .take(&[0, 3], Arc::new(mixed.schema().clone()))
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn same_fragment_mixed_v2_files_validate_and_scan() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 0])),
+            Arc::new(Int32Array::from(vec![0, 0])),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let columns = [
+        (
+            "mixed-a-v2_0.lance",
+            ConcreteFileVersion::V2_0,
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "a",
+                    DataType::Int32,
+                    false,
+                )])),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .unwrap(),
+        ),
+        (
+            "mixed-b-v2_1.lance",
+            ConcreteFileVersion::V2_1,
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "b",
+                    DataType::Int32,
+                    false,
+                )])),
+                vec![Arc::new(Int32Array::from(vec![3, 4]))],
+            )
+            .unwrap(),
+        ),
+    ];
+    let mut data_files = Vec::with_capacity(columns.len());
+    for (file_name, version, batch) in columns {
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join(file_name))
+            .await
+            .unwrap();
+        let mut writer = lance_file::versions::create_lazy_writer(
+            version,
+            object_writer,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+        data_files.push(dataset.create_data_file(file_name, None).await.unwrap());
+    }
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    Arc::make_mut(&mut manifest.fragments)[0].files = data_files;
+    manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let mixed = Dataset::open(&uri).await.unwrap();
+    mixed.validate().await.unwrap();
+    let actual = mixed.scan().try_into_batch().await.unwrap();
+    let expected = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![3, 4])),
+        ],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn test_restore_rejects_unknown_target_flags() {
     let test_uri = TempStrDir::default();
     let data = gen_batch()
@@ -1535,6 +1765,31 @@ async fn test_serialized_manifest_rejects_unsupported_reader() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_missing_mixed_version_capability() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.data_storage_format = DataStorageFormat::new(ConcreteFileVersion::V2_0);
+    let serialized_manifest = pb::Manifest::from(&manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("not enabled"),
+        "unexpected message: {error}"
+    );
 }
 
 #[tokio::test]

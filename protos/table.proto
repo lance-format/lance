@@ -130,9 +130,10 @@ message Manifest {
    *   merely-carried column with an index keyed on a different column. Writers must
    *   refuse it too: one that treats every entry of fields as keyed would maintain
    *   the index against the wrong dependency set.
-   * * 1 << 8: reserved for datasets that may reference recognized V2 data files
-   *   with different exact versions. Implementations that do not support the
-   *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 8: the dataset may reference recognized V2 data files with different
+   *   exact versions. Readers and writers must use each DataFile's version
+   *   instead of treating data_format.version as a snapshot-wide identity.
+   *   This bit is paired in the reader and writer feature words and is one-way.
    */
   uint64 reader_feature_flags = 9;
 
@@ -183,10 +184,15 @@ message Manifest {
   message DataStorageFormat {
     // The format of the data files (e.g. "lance")
     string file_format = 1;
-    /* The max format version of the data files. The format of the version can vary by
+    /* The default format version used when writing data files. Write operations
+     * that do not select an exact version use this value. This setting does not
+     * constrain index or other file types. The version syntax is defined by
      * file_format and is not required to follow semver.
      *
-     * Every file in this version of the dataset has the same file_format version.
+     * Unless the mixed data-file-version capability is set, every referenced
+     * data file must use this version. When the capability is set, referenced
+     * data files may use other recognized exact V2 versions, and each DataFile's
+     * version is authoritative for decoding.
      */
     string version = 2;
   }
@@ -401,23 +407,27 @@ message DataFragment {
    * first row is row 1, the second row is row 42, and the third row is row 3.
    */
   oneof row_id_sequence {
-    // If small (< 200KB), the row ids are stored inline.
+    // Current Lance writers store row ids inline regardless of encoded size.
     bytes inline_row_ids = 5;
-    // Otherwise, stored as part of a file.
+    // Supported by current Lance readers, but not emitted by current Lance writers.
     ExternalFile external_row_ids = 6;
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {
-    // If small (< 200KB), the row latest updated versions are stored inline.
+    // Current Lance writers store last-updated versions inline regardless of encoded size.
     bytes inline_last_updated_at_versions = 7;
-    // Otherwise, stored as part of a file.
+    /* Valid external alternative. Current Lance writers do not emit this field,
+     * and current Lance readers cannot load it.
+     */
     ExternalFile external_last_updated_at_versions = 8;
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
-    // If small (< 200KB), the row created at versions are stored inline.
+    // Current Lance writers store created-at versions inline regardless of encoded size.
     bytes inline_created_at_versions = 9;
-    // Otherwise, stored as part of a file.
+    /* Valid external alternative. Current Lance writers do not emit this field,
+     * and current Lance readers cannot load it.
+     */
     ExternalFile external_created_at_versions = 10;
   } // created_at_version_sequence
 
@@ -768,6 +778,33 @@ message SsTable {
 
   // Directory name relative to the shard directory.
   string path = 2;
+
+  /* Payload size of the rows, as the writer's MemTable accounted for them: the
+     sum over its buffers of the window each one holds.
+
+     An estimate of the payload, not a bound on what reading the SSTable costs.
+     It excludes the per-array structure a reader materializes, so a consumer
+     budgeting memory from it must add its own headroom.
+
+     Absent on an SSTable written before this field existed, so a reader must
+     not read a missing value as zero. The same applies to the two below. */
+  optional uint64 in_memory_bytes = 3;
+
+  /* Rows held, counting the older duplicates of a primary key that the
+     generation's deletion vector masks. A scan that applies the deletion vector
+     yields fewer. */
+  optional uint64 physical_rows = 4;
+
+  /* Total payload size of the primary-key columns, summed over every row in
+     `physical_rows`. Not a per-row size: a variable-length key differs from row
+     to row, and a consumer wanting a mean divides by the row count.
+
+     Accounted the same way as `in_memory_bytes`, so the same caveat applies --
+     it is not the size of any encoded form of the key, such as a comparable
+     byte-ordered encoding a reader might build for sorting or deduplication.
+
+     Absent also on a table with no primary key. */
+  optional uint64 primary_key_bytes = 5;
 }
 
 // A pointer to the latest SSTable compacted for a shard.
