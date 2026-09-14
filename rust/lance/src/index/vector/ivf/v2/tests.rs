@@ -3551,6 +3551,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
         upper_bound: None,
         minimum_nprobes: 1,
         maximum_nprobes: None,
+        search_effort: 0.5,
         ef: None,
         refine_factor: None,
         metric_type: Some(distance_type),
@@ -3683,9 +3684,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
 #[case::rq4(4)]
 #[case::rq8(8)]
 #[tokio::test]
-async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(
-    #[case] num_bits: u8,
-) {
+async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(#[case] num_bits: u8) {
     const EDGE_DIM: usize = 8;
     let test_dir = TempStrDir::default();
     let values = [
@@ -3761,6 +3760,7 @@ async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(
         upper_bound: None,
         minimum_nprobes: 1,
         maximum_nprobes: Some(1),
+        search_effort: 0.5,
         ef: None,
         refine_factor: None,
         metric_type: Some(DistanceType::L2),

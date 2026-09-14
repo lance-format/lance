@@ -67,10 +67,9 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    DistCalculator, DistanceCalculatorOptions,
-    IndexFileKey, OriginLatencyClass, QueryResidual, QueryScratch, QueryScratchCapacity,
-    QueryScratchPool, RabitRawQueryContext, ResidentAttach, ResidentColumns,
-    ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
+    DistCalculator, DistanceCalculatorOptions, IndexFileKey, OriginLatencyClass, QueryResidual,
+    QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
+    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
     origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
     resident_store_fits, shares_resident_store,
 };

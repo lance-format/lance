@@ -7066,7 +7066,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no refine step (the batch path does not yet rerank);
+    /// - no exact or quantized refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -7091,12 +7091,13 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any refine factor sends the query onto a reranking path that the
-        // shared batch scan does not implement: the single-query path reranks
-        // with the original vectors even when the factor is 1, and rejects a
-        // factor of 0 outright (`Refine factor cannot be zero`). The batch path
-        // does neither, so fall back to the per-query loop for every `Some(_)`.
-        if q.refine_factor.is_some() {
+        // Any exact or quantized refine factor sends the query onto a reranking
+        // path that the shared batch scan does not implement. Exact refinement
+        // reranks with the original vectors even when the factor is 1, while
+        // quantized refinement overfetches and reranks with Accurate RQ scores.
+        // The batch path does neither, so fall back to the per-query loop for
+        // every configured refinement.
+        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -12836,6 +12837,27 @@ mod test {
         assert_eq!(query.minimum_nprobes, 2);
         assert_eq!(query.maximum_nprobes, Some(2));
         assert_eq!(query.search_effort, effort);
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 10).unwrap();
+        scan.nprobes(2);
+        scan.quantized_refine(40);
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "quantized refinement must not use the shared-scan batch node, got:\n{plan}"
+        );
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
     }
 
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
