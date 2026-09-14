@@ -28,7 +28,6 @@ from typing import (
     Literal,
     Optional,
     Sequence,
-    Set,
     Tuple,
     TypedDict,
     Union,
@@ -41,6 +40,9 @@ from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
+# Imported at runtime, not only for the annotations below: importing it here
+# is what registers `Bitmap` as a `collections.abc.MutableSet`.
+from .bitmap import Bitmap  # noqa: TC001
 from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
@@ -5137,6 +5139,47 @@ class LanceDataset(pa.dataset.Dataset):
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
 
+    def deep_clone(
+        self,
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Deep clone the specified version into a new dataset at target_path.
+
+        This operation copies the data, deletion, and index files referenced by
+        the selected version before committing the destination dataset.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the destination dataset. If omitted,
+            the source dataset's storage options are used.
+
+        Returns
+        -------
+        LanceDataset
+            The deep-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        if storage_options is None:
+            storage_options = self._storage_options
+        self._ds.deep_clone(target_uri, reference, storage_options)
+
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
     def migrate_manifest_paths_v2(self):
         """
         Migrate the manifest paths to the new format.
@@ -5966,7 +6009,9 @@ class Index:
     name: str
     fields: List[int]
     dataset_version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
+    """The fragments covered by this index. A ``Set[int]``/``List[int]`` is
+    also accepted when constructing an ``Index``."""
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
@@ -5984,7 +6029,7 @@ class IndexInformation(TypedDict):
     uuid: str
     fields: List[str]
     version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
     base_id: Optional[int]
 
 
@@ -6408,11 +6453,12 @@ class LanceOperation:
         layered over the base data without rewriting the base files.
 
         The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
-        every field in ``data_file``) or a ``List[List[int]]`` for a sparse
-        overlay (one offset list per field, in the order of the file's fields).
-        Offsets are **physical** row offsets (positions in the base files,
-        counting deleted rows), like deletion vectors.
+        pass a single iterable of ints (e.g. a :class:`~lance.bitmap.Bitmap`
+        or a ``List[int]``) for a dense overlay (one offset set shared by
+        every field in ``data_file``), or a list of int iterables for a
+        sparse overlay (one offset set per field, in the order of the file's
+        fields). Offsets are **physical** row offsets (positions in the base
+        files, counting deleted rows), like deletion vectors.
 
         Attributes
         ----------
@@ -6421,12 +6467,15 @@ class LanceOperation:
             value column per covered field. The value at each covered offset is
             stored at the rank (0-based count of covered offsets below it) of
             that offset in the field's coverage.
-        offsets : Union[List[int], List[List[int]]]
-            The covered physical row offsets. A flat list is dense coverage
-            (shared by every field); a list of per-field lists is sparse
-            coverage (in field order). Each list must be strictly ascending
-            with no duplicates, since the Nth offset maps to the Nth value row
-            in ``data_file``; a non-ascending list raises ``ValueError``.
+        offsets : Iterable[int] | List[Iterable[int]]
+            The covered physical row offsets. A single int iterable is dense
+            coverage (shared by every field); a list of int iterables is
+            sparse coverage (in field order). Offsets are always resolved in
+            ascending order — the smallest covered offset maps to row 0 of
+            ``data_file``, the next-smallest to row 1, and so on — regardless
+            of the order values are given in, so a plain ``List[int]`` need
+            not be pre-sorted. A repeated offset raises ``ValueError``: it
+            would shift every later offset onto the wrong row.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.
@@ -6435,7 +6484,7 @@ class LanceOperation:
         """
 
         data_file: DataFile
-        offsets: Union[List[int], List[List[int]]]
+        offsets: Union[Iterable[int], List[Iterable[int]]]
         committed_version: Optional[int] = None
 
     @dataclass
@@ -6799,7 +6848,9 @@ class ScannerBuilder:
                 # after a lance round-trip).  We replace any top-level field
                 # whose type tree contains such a type with an int8 placeholder
                 # so that ordinal field references in the filter remain correct.
-                for field in self.ds.schema:
+                # Filters are evaluated against the stored dataset fields.  The
+                # public schema may also contain scan-time fields such as _rowid.
+                for field in self.ds._ds.schema:
                     if _needs_substrait_placeholder(field.type):
                         pos = counter
                         counter += 1

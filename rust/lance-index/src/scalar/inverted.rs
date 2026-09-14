@@ -599,11 +599,21 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     async fn get_or_insert_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        single_flight_store_bound_open(index_store, cache, load).await
+        let rebind_store = index_store.clone();
+        single_flight_store_bound_open(index_store, cache, load, move |index| async move {
+            let index = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
+            index
+                .with_store(rebind_store, frag_reuse_index)
+                .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+        })
+        .await
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {

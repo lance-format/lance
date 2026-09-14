@@ -95,11 +95,14 @@ impl<'a> CommitBuilder<'a> {
 
     /// Pass the storage format to use for the dataset.
     ///
-    /// This is only needed when creating a new empty table. If any data files are
-    /// passed, the storage format will be inferred from the data files.
+    /// On creation, this sets the default storage version. If omitted, the version
+    /// is inferred from homogeneous data files, or uses the stable version for an
+    /// empty table. Creating from mixed prewritten files requires an explicit default.
     ///
-    /// All data files must use the same storage format as the existing dataset.
-    /// If a different format is passed, an error will be returned.
+    /// For an existing dataset, this only sets the manifest default on overwrite;
+    /// other operations preserve the existing default. If
+    /// prewritten fragments introduce another exact V2 version, the commit
+    /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
         self.storage_format = Some(storage_format.resolve());
 
@@ -417,21 +420,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-        // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset()
-            && let Some(storage_format) = self.storage_format
-        {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
-            if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
-            {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
-            }
-        }
 
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
