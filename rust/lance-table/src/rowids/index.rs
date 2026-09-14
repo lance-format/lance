@@ -4,6 +4,7 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+use super::bitmap::{Bitmap, count_ones};
 use super::{RowIdSequence, U64Segment};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -19,6 +20,11 @@ const MAX_PROBE_DEPTH: u64 = 64;
 /// Row ids the merged build may read before probing is worth its per-lookup
 /// cost instead.
 const MERGE_ROWS_BUDGET: u64 = 1 << 20;
+
+/// Bitmap bytes summarized by one entry of a bitmap rank directory. A lookup
+/// counts at most this many bytes; the directory costs one `u32` per block,
+/// 1/64 of the bitmap.
+const RANK_BLOCK_BYTES: usize = 256;
 
 /// An index of row ids
 ///
@@ -193,19 +199,23 @@ impl RowIdIndex {
         if upper == 0 {
             return Ok(None);
         }
-        let leaves = self.end_tree.len() / 2;
-        // Depth is log2(leaves), at most 64, and each level leaves one sibling.
-        let mut stack = [(0usize, 0usize, 0usize); 64];
-        stack[0] = (1, 0, leaves);
-        let mut depth = 1;
         let mut found: Option<RowAddress> = None;
-        while depth > 0 {
-            depth -= 1;
-            let (node, lo, hi) = stack[depth];
-            if lo >= upper || self.end_tree[node] < row_id {
-                continue;
+        // Depth-first, left to right, without a stack: `node` covers `width`
+        // slots from `lo`. A pruned subtree or a visited leaf moves on to the
+        // next subtree: up while `node` is a right child, then over to the
+        // sibling.
+        let (mut node, mut lo, mut width) = (1usize, 0usize, self.end_tree.len() / 2);
+        loop {
+            if lo >= upper {
+                // Every slot from here on starts above the id.
+                break;
             }
-            if hi - lo == 1 {
+            if self.end_tree[node] >= row_id {
+                if width > 1 {
+                    node *= 2;
+                    width /= 2;
+                    continue;
+                }
                 if lo < fragments
                     && let Some(candidate) = self.fragments[lo].resolve(row_id)
                 {
@@ -217,14 +227,17 @@ impl RowIdIndex {
                     }
                     found = Some(candidate);
                 }
-                continue;
             }
-            let mid = (lo + hi) / 2;
-            // Push the left half first so the right half pops first: candidates
-            // arrive in descending slot order.
-            stack[depth] = (2 * node, lo, mid);
-            stack[depth + 1] = (2 * node + 1, mid, hi);
-            depth += 2;
+            while node & 1 == 1 {
+                if node == 1 {
+                    return Ok(found);
+                }
+                node /= 2;
+                lo -= width;
+                width *= 2;
+            }
+            node += 1;
+            lo += width;
         }
         Ok(found)
     }
@@ -243,38 +256,85 @@ struct SegmentEntry {
     seq_idx: usize,
     range: RangeInclusive<u64>,
     start_offset: u32,
+    lookup: SegmentLookup,
+}
+
+/// How a [`SegmentEntry`] finds the position of a row id.
+#[derive(Debug)]
+enum SegmentLookup {
+    /// The encoding searches itself in logarithmic or constant time.
+    Native,
     /// Row id to position for an unsorted [`U64Segment::Array`], whose own
-    /// `position` scans. `None` for the encodings that search themselves.
-    positions: Option<Vec<(u64, u32)>>,
+    /// `position` scans.
+    Positions(Vec<(u64, u32)>),
+    /// Set bits before each [`RANK_BLOCK_BYTES`] block of a
+    /// [`U64Segment::RangeWithBitmap`] bitmap, whose own `position` counts
+    /// the whole prefix.
+    BitmapRank(Vec<u32>),
 }
 
 impl SegmentEntry {
     /// Position of `row_id` in this segment, or `None` if it holds no such id.
     fn position(&self, sequence: &RowIdSequence, row_id: u64) -> Option<usize> {
-        match &self.positions {
-            None => sequence.0[self.seq_idx].position(row_id),
-            Some(positions) => positions
+        let segment = &sequence.0[self.seq_idx];
+        match &self.lookup {
+            SegmentLookup::Native => segment.position(row_id),
+            SegmentLookup::Positions(positions) => positions
                 .binary_search_by_key(&row_id, |(id, _)| *id)
                 .ok()
                 .map(|found| positions[found].1 as usize),
+            SegmentLookup::BitmapRank(rank) => {
+                let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
+                    return None;
+                };
+                if !range.contains(&row_id) {
+                    return None;
+                }
+                let offset = (row_id - range.start) as usize;
+                if !bitmap.get(offset) {
+                    return None;
+                }
+                let block_start = offset / (RANK_BLOCK_BYTES * 8) * (RANK_BLOCK_BYTES * 8);
+                let ones_before = rank[offset / (RANK_BLOCK_BYTES * 8)] as usize
+                    + bitmap.slice(block_start, offset - block_start).count_ones();
+                Some(ones_before)
+            }
         }
     }
 }
 
-/// Row id to position for a segment, sorted by row id. The first position of a
-/// repeated id wins, which is what `position` returns.
-fn build_positions(segment: &U64Segment) -> Option<Vec<(u64, u32)>> {
-    if !matches!(segment, U64Segment::Array(_)) {
-        return None;
+/// The lookup structure for `segment`, and the ids it holds. A bitmap's rank
+/// directory counts its ones on the way, so the segment is read once.
+fn build_lookup(segment: &U64Segment) -> (SegmentLookup, usize) {
+    match segment {
+        U64Segment::Array(_) => {
+            let mut positions: Vec<(u64, u32)> = segment
+                .iter()
+                .enumerate()
+                .map(|(position, row_id)| (row_id, position as u32))
+                .collect();
+            positions.sort_unstable();
+            // The first position of a repeated id wins, as `position` does.
+            positions.dedup_by_key(|(row_id, _)| *row_id);
+            (SegmentLookup::Positions(positions), segment.len())
+        }
+        U64Segment::RangeWithBitmap { bitmap, .. } => {
+            let (rank, ones) = build_bitmap_rank(bitmap);
+            (SegmentLookup::BitmapRank(rank), ones)
+        }
+        _ => (SegmentLookup::Native, segment.len()),
     }
-    let mut positions: Vec<(u64, u32)> = segment
-        .iter()
-        .enumerate()
-        .map(|(position, row_id)| (row_id, position as u32))
-        .collect();
-    positions.sort_unstable();
-    positions.dedup_by_key(|(row_id, _)| *row_id);
-    Some(positions)
+}
+
+/// Set bits before each [`RANK_BLOCK_BYTES`] block of `bitmap`, and in total.
+fn build_bitmap_rank(bitmap: &Bitmap) -> (Vec<u32>, usize) {
+    let mut rank = Vec::with_capacity(bitmap.data.len().div_ceil(RANK_BLOCK_BYTES));
+    let mut ones = 0usize;
+    for block in bitmap.data.chunks(RANK_BLOCK_BYTES) {
+        rank.push(ones as u32);
+        ones += count_ones(block);
+    }
+    (rank, ones)
 }
 
 #[derive(Debug)]
@@ -296,7 +356,7 @@ impl FragmentEntry {
         let mut merge_rows: u64 = 0;
         let deleted = !source.deletion_vector.is_empty();
         for (seq_idx, segment) in source.row_id_sequence.0.iter().enumerate() {
-            let len = segment.len();
+            let (lookup, len) = build_lookup(segment);
             // A `Range` without deletions decomposes in constant time.
             if deleted || !matches!(segment, U64Segment::Range(_)) {
                 merge_rows += len as u64;
@@ -310,7 +370,7 @@ impl FragmentEntry {
                     seq_idx,
                     range,
                     start_offset,
-                    positions: build_positions(segment),
+                    lookup,
                 });
             }
             start_offset += len as u32;
@@ -405,8 +465,15 @@ impl DeepSizeOf for RowIdIndex {
                     + entry
                         .segments
                         .iter()
-                        .filter_map(|segment| segment.positions.as_ref())
-                        .map(|positions| positions.capacity() * std::mem::size_of::<(u64, u32)>())
+                        .map(|segment| match &segment.lookup {
+                            SegmentLookup::Native => 0,
+                            SegmentLookup::Positions(positions) => {
+                                positions.capacity() * std::mem::size_of::<(u64, u32)>()
+                            }
+                            SegmentLookup::BitmapRank(rank) => {
+                                rank.capacity() * std::mem::size_of::<u32>()
+                            }
+                        })
                         .sum::<usize>()
             })
             .sum();
@@ -789,6 +856,31 @@ mod tests {
 
         let error = index.get_many(&[0, 2]).unwrap_err();
         assert!(matches!(&error, Error::Internal { .. }));
+    }
+
+    #[test]
+    fn test_probe_ranks_a_bitmap_wider_than_one_block() {
+        // Three rank blocks and a partial fourth, with every third slot a hole,
+        // so each lookup combines a directory entry with a partial popcount.
+        let span = (RANK_BLOCK_BYTES * 8 * 3 + 17) as u64;
+        let present: Vec<bool> = (0..span).map(|slot| slot % 3 != 1).collect();
+        let segment = U64Segment::RangeWithBitmap {
+            range: 1000..1000 + span,
+            bitmap: present.as_slice().into(),
+        };
+        let index = RowIdIndex::probing(&[fragment(7, RowIdSequence(vec![segment]))]).unwrap();
+        let mut position = 0;
+        for slot in 0..span {
+            let found = index.get(1000 + slot).unwrap();
+            if slot % 3 == 1 {
+                assert_eq!(found, None);
+            } else {
+                assert_eq!(found, Some(RowAddress::new_from_parts(7, position)));
+                position += 1;
+            }
+        }
+        assert_eq!(index.get(999).unwrap(), None);
+        assert_eq!(index.get(1000 + span).unwrap(), None);
     }
 
     #[test]

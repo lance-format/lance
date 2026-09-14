@@ -1177,7 +1177,7 @@ impl MemTableScanner {
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
-            && self.has_vector_index(&query.column)
+            && self.has_vector_index(&query.column, query.distance_type)
         {
             Arc::new(VectorIndexExec::new(
                 self.batch_store.clone(),
@@ -1482,8 +1482,17 @@ impl MemTableScanner {
     }
 
     /// Check if a vector index exists for a column.
-    fn has_vector_index(&self, column: &str) -> bool {
-        self.indexes.get_hnsw_by_column(column).is_some()
+    /// Whether an HNSW index on `column` can answer a query in `distance_type`.
+    ///
+    /// The graph's metric is baked into its structure, so a query asking for a
+    /// different one has to brute-force instead — the same fallback
+    /// `Scanner::vector_search` applies when a requested metric disagrees with
+    /// a base index. `None` means "use the index's metric", which always
+    /// matches.
+    fn has_vector_index(&self, column: &str, distance_type: Option<DistanceType>) -> bool {
+        self.indexes
+            .get_hnsw_by_column(column)
+            .is_some_and(|hnsw| distance_type.is_none_or(|dt| dt == hnsw.distance_type()))
     }
 
     /// Check if an FTS index exists for a column.
@@ -2681,6 +2690,74 @@ mod tests {
             "plan output schema missing `{DISTANCE_COLUMN}` — got {:?}",
             out_schema
         );
+    }
+
+    /// The HNSW graph's metric is baked into its structure, so a query asking
+    /// for a different one must brute-force rather than traverse it. Without
+    /// this the memtable silently answers in the graph's metric while the base
+    /// arm answers in the requested one, and the union merges two scales.
+    #[tokio::test]
+    async fn vector_search_routes_to_brute_force_on_a_metric_mismatch() {
+        use lance_linalg::distance::DistanceType;
+        use std::sync::Arc;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        let plan_rendering_for = |requested: Option<DistanceType>| {
+            let schema = schema.clone();
+            async move {
+                let batch_store = Arc::new(BatchStore::with_capacity(4));
+                let mut indexes = IndexStore::new();
+                indexes.add_hnsw(
+                    "vector_hnsw".to_string(),
+                    1,
+                    "vector".to_string(),
+                    DistanceType::Cosine,
+                    64,
+                    8,
+                );
+                let mut scanner =
+                    MemTableScanner::new(batch_store, Arc::new(indexes), schema.clone());
+                let query: Arc<dyn arrow_array::Array> =
+                    Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+                scanner.nearest("vector", query.as_ref(), 5).unwrap();
+                if let Some(metric) = requested {
+                    scanner.distance_metric(metric);
+                }
+                let plan = scanner.create_plan().await.unwrap();
+                // The chosen exec sits under `apply_post_index_ops`'s wrappers,
+                // so match on the rendered tree rather than the root node.
+                format!(
+                    "{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+                )
+            }
+        };
+
+        let uses_graph = |rendered: &str| rendered.contains("VectorIndex");
+        let uses_brute_force = |rendered: &str| rendered.contains("MemTableBruteForceVector");
+
+        // Unset means "use the index's metric", so the graph is still usable.
+        let unset = plan_rendering_for(None).await;
+        assert!(uses_graph(&unset), "{unset}");
+        // Matching the graph's own metric keeps the graph.
+        let matching = plan_rendering_for(Some(DistanceType::Cosine)).await;
+        assert!(uses_graph(&matching), "{matching}");
+        // Disagreeing with it must not.
+        for mismatched in [DistanceType::Dot, DistanceType::L2] {
+            let rendered = plan_rendering_for(Some(mismatched)).await;
+            assert!(
+                uses_brute_force(&rendered) && !uses_graph(&rendered),
+                "{mismatched:?} query must not traverse a cosine graph: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]

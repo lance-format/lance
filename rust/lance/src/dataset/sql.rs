@@ -6,9 +6,11 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
+use datafusion::common::DataFusionError;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
+use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::{
     parser::Statement as DFStatement,
@@ -147,10 +149,15 @@ impl SqlQueryBuilder {
         register_functions(&ctx);
         let state = ctx.state();
         let dialect = state.config_options().sql_parser.dialect;
-        let statement = state.sql_to_statement(&self.sql, &dialect)?;
+        let statement = state
+            .sql_to_statement(&self.sql, &dialect)
+            .map_err(planning_error)?;
         let mut projected = statement.clone();
         let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
-        let plan = state.statement_to_plan(statement).await?;
+        let plan = state
+            .statement_to_plan(statement)
+            .await
+            .map_err(planning_error)?;
         let plan = if safe_to_inject_system_columns(&plan, &columns)
             && project_system_columns(&mut projected, &columns)
         {
@@ -161,7 +168,10 @@ impl SqlQueryBuilder {
         } else {
             plan
         };
-        let df = ctx.execute_logical_plan(plan).await?;
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(planning_error)?;
         Ok(SqlQuery::new(df))
     }
 }
@@ -277,17 +287,52 @@ pub struct SqlQuery {
     dataframe: DataFrame,
 }
 
+/// Classify a failure raised while DataFusion was building a plan.
+///
+/// A query that fails to plan is malformed input, but DataFusion does not
+/// report these under a consistent error variant: `get_field` rejects an
+/// unsupported base type with `exec_err!`, and the analyzer wraps that in
+/// `Context`, so it would otherwise reach callers as an internal failure.
+///
+/// Only the execution category is re-classified. Every other category is either
+/// already accurate or describes a failure the caller did not cause: an
+/// unreachable object store is not a malformed query, and any other SQL would
+/// have hit it too.
+///
+/// Errors Lance itself raised reach DataFusion through `External` and keep the
+/// category they came with. Lance uses the execution category for its own
+/// internal failures as well — a spill file that cannot be created, a poisoned
+/// lock — and those are not bad input either.
+fn planning_error(error: DataFusionError) -> lance_core::Error {
+    let raised_by_lance = matches!(error.find_root(), DataFusionError::External(_));
+    let error = lance_core::Error::from(error);
+    if raised_by_lance {
+        return error;
+    }
+    match error {
+        error @ lance_core::Error::Execution { .. } => {
+            lance_core::Error::invalid_input_source(Box::new(error))
+        }
+        error => error,
+    }
+}
+
 impl SqlQuery {
     pub fn new(dataframe: DataFrame) -> Self {
         Self { dataframe }
     }
 
     pub async fn into_stream(self) -> lance_core::Result<SendableRecordBatchStream> {
-        let exec_node = self
+        // Physical planning runs the analyzer, so a malformed query can still
+        // fail here rather than in `SqlQueryBuilder::build`. Keep it separate
+        // from execution so the two phases can be classified differently.
+        let task_ctx = Arc::new(self.dataframe.task_ctx());
+        let plan = self
             .dataframe
-            .execute_stream()
+            .create_physical_plan()
             .await
-            .map_err(lance_core::Error::from)?;
+            .map_err(planning_error)?;
+        let exec_node = execute_stream(plan, task_ctx).map_err(lance_core::Error::from)?;
         let schema = exec_node.schema();
         if SchemaAdapter::requires_logical_conversion(&schema) {
             let adapter = SchemaAdapter::new(schema);
@@ -317,6 +362,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::planning_error;
     use crate::dataset::ReadParams;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::write::WriteParams;
@@ -327,6 +373,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
+    use datafusion::common::DataFusionError;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
@@ -876,5 +923,107 @@ mod tests {
         pretty_assertions::assert_eq!(batch.num_rows(), 1);
         pretty_assertions::assert_eq!(batch.num_columns(), 1);
         pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+    }
+
+    /// A malformed query is user error and must surface as [`Error::InvalidInput`]
+    /// so that bindings and servers can map it to a client error rather than a
+    /// generic failure.
+    ///
+    /// The cases differ in how DataFusion reports them: a syntax error is a
+    /// `SQL` error, an unknown function is a `Plan` error wrapped in
+    /// `Diagnostic`, and a subscript on a non-struct column is `exec_err!`
+    /// wrapped in `Context`. Only the first is classified as user input on its
+    /// own; the other two would otherwise read as internal failures.
+    #[rstest]
+    #[case::syntax_error("SELEC id FROM dataset", "found: SELEC at")]
+    #[case::unknown_function(
+        "SELECT id FROM dataset WHERE no_such_function(data) = 'Alice'",
+        "no_such_function"
+    )]
+    #[case::subscript_on_json_column(
+        "SELECT id FROM dataset WHERE data['user'] = 'Alice'",
+        "Cannot access field"
+    )]
+    #[tokio::test]
+    async fn test_sql_malformed_query_is_invalid_input(
+        #[case] sql: &str,
+        #[case] expected_message: &str,
+    ) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some(r#"{"user": "Alice"}"#)])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let ds = Dataset::write(reader, "memory://test_sql_malformed_query", None)
+            .await
+            .unwrap();
+
+        let result = async { ds.sql(sql).build().await?.into_batch_records().await }.await;
+        let Err(error) = result else {
+            panic!("expected `{sql}` to fail");
+        };
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected the message to name {expected_message:?}, got: {error}"
+        );
+    }
+
+    /// `LanceTableProvider::scan` runs during physical planning and reports
+    /// every Lance failure as `DataFusionError::External`. Lance raises
+    /// [`Error::Execution`] for its own internal failures, which is the one
+    /// category `planning_error` re-classifies, so these must be recognized as
+    /// Lance's own and left alone rather than blamed on the query.
+    #[test]
+    fn test_planning_error_keeps_lance_error_category() {
+        let df_error = DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(DataFusionError::from(Error::execution(
+                "failed to create spill file",
+            ))),
+        );
+
+        match planning_error(df_error) {
+            Error::Execution { message, .. } => assert!(
+                message.contains("failed to create spill file"),
+                "expected the original message, got: {message}"
+            ),
+            other => panic!("expected the original execution error, got {other:?}"),
+        }
+    }
+
+    /// A failure that is neither the caller's fault nor Lance's own — DataFusion
+    /// hitting a resource limit while planning — must not be reported as a
+    /// malformed query just because it surfaced during planning.
+    #[test]
+    fn test_planning_error_keeps_internal_datafusion_error() {
+        let df_error = DataFusionError::Context(
+            "while planning".to_string(),
+            Box::new(DataFusionError::ResourcesExhausted(
+                "failed to allocate memory".to_string(),
+            )),
+        );
+
+        let error = planning_error(df_error);
+        assert!(
+            !matches!(error, Error::InvalidInput { .. }),
+            "expected the error not to be blamed on the query, got {error:?}"
+        );
     }
 }

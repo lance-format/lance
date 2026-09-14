@@ -15,14 +15,13 @@ use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::{JsonArray, is_json_field};
@@ -30,7 +29,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
-use lance_datafusion::expr::safe_coerce_scalar;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
@@ -80,6 +79,7 @@ pub struct UpdateBuilder {
     conflict_retries: u32,
     /// Total timeout for retries.
     retry_timeout: Duration,
+    data_storage_version: Option<LanceFileVersion>,
 }
 
 impl UpdateBuilder {
@@ -90,6 +90,7 @@ impl UpdateBuilder {
             updates: HashMap::new(),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            data_storage_version: None,
         }
     }
 
@@ -180,28 +181,10 @@ impl UpdateBuilder {
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             );
         if dest_type != src_type && !is_json_string {
-            expr = match expr {
-                // TODO: remove this branch once DataFusion supports casting List to FSL
-                // This should happen in Arrow 51.0.0
-                Expr::Literal(value @ ScalarValue::List(_), metadata)
-                    if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
-                {
-                    Expr::Literal(
-                        safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
-                            ArrowError::CastError(format!(
-                                "Failed to cast {} to {} during planning",
-                                value.data_type(),
-                                dest_type
-                            ))
-                        })?,
-                        metadata,
-                    )
-                }
-                _ => expr
-                    .cast_to(&dest_type, &df_schema)
-                    .map_err(box_error)
-                    .context(InvalidInputSnafu {})?,
-            };
+            expr = expr
+                .cast_to(&dest_type, &df_schema)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?;
         }
 
         // Optimize the expression. For example, this might apply the cast on
@@ -232,10 +215,42 @@ impl UpdateBuilder {
         self
     }
 
+    /// Set the exact V2 data file version for rewritten rows.
+    ///
+    /// If omitted, the dataset's default write version is used. The default
+    /// remains unchanged. Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::UpdateBuilder};
+    /// # use lance_file::version::LanceFileVersion;
+    /// # use std::sync::Arc;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let result = UpdateBuilder::new(dataset)
+    ///     .set("value", "value + 1")?
+    ///     .data_storage_version(LanceFileVersion::V2_2)
+    ///     .build()?.execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn data_storage_version(mut self, version: LanceFileVersion) -> Self {
+        self.data_storage_version = Some(version);
+        self
+    }
+
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
+        let default_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        let write_version = self
+            .data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or(default_version);
+        super::super::versions::validate_write_version(default_version, write_version)?;
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
@@ -257,6 +272,7 @@ impl UpdateBuilder {
             updates,
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
+            write_version,
         })
     }
 }
@@ -285,6 +301,7 @@ pub struct UpdateJob {
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     conflict_retries: u32,
     retry_timeout: Duration,
+    write_version: ConcreteFileVersion,
 }
 
 impl UpdateJob {
@@ -438,10 +455,7 @@ impl UpdateJob {
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let (mut new_fragments, _) = write_fragments_internal(
-            self.dataset
-                .manifest
-                .data_storage_format
-                .lance_file_format(),
+            self.write_version,
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
@@ -699,6 +713,7 @@ mod tests {
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -745,6 +760,144 @@ mod tests {
         (Arc::new(ds), test_dir)
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn update_uses_explicit_exact_version(
+        #[values(
+            None,
+            Some(LanceFileVersion::V2_1),
+            Some(LanceFileVersion::V2_2),
+            Some(LanceFileVersion::V2_3)
+        )]
+        target: Option<LanceFileVersion>,
+    ) {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let mut builder = UpdateBuilder::new(dataset)
+            .update_where("id < 10")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap();
+        if let Some(target) = target {
+            builder = builder.data_storage_version(target);
+        }
+        let result = builder.build().unwrap().execute().await.unwrap();
+
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert!(
+            result
+                .new_dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .any(|file| file.file_version().unwrap()
+                    == target.unwrap_or(LanceFileVersion::V2_0).resolve())
+        );
+        assert_eq!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0,
+            target.is_some()
+        );
+        assert_eq!(
+            result
+                .new_dataset
+                .count_rows(Some("name = 'bar'".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
+
+        let result = UpdateBuilder::new(result.new_dataset)
+            .update_where("name = 'bar'")
+            .unwrap()
+            .set("name", "'baz'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 10);
+        assert!(
+            result
+                .new_dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == ConcreteFileVersion::V2_0)
+        );
+        assert_eq!(
+            result
+                .new_dataset
+                .count_rows(Some("name = 'baz'".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn update_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let (dataset, _dir) = make_test_dataset(source, false).await;
+        let error = UpdateBuilder::new(dataset)
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(target)
+            .build()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_update_ignores_explicit_exact_version() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 0")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(LanceFileVersion::V2_1)
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert_eq!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn test_update_validation() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
@@ -779,6 +932,63 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[rstest]
+    #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
+    #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
+    #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]
+    #[case::null_list("NULL", None, None)]
+    #[case::short_list("[3]", None, Some("has length 1"))]
+    #[case::long_list("[3, 4, 5]", None, Some("has length 3"))]
+    #[tokio::test]
+    async fn test_update_vector_literal(
+        #[case] expression: &str,
+        #[case] expected: Option<Vec<Option<f32>>>,
+        #[case] cast_error: Option<&str>,
+    ) {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(2)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let dataset = Arc::new(dataset);
+        let original = dataset.scan().try_into_batch().await.unwrap();
+        let result = async {
+            UpdateBuilder::new(dataset.clone())
+                .set("vector", expression)?
+                .build()?
+                .execute()
+                .await
+        }
+        .await;
+        if let Some(message) = cast_error {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains(message), "{error}");
+            let mut reopened = dataset.as_ref().clone();
+            reopened.checkout_latest().await.unwrap();
+            assert_eq!(reopened.version().version, dataset.version().version);
+            assert_eq!(reopened.scan().try_into_batch().await.unwrap(), original);
+            return;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let batch = result.new_dataset.scan().try_into_batch().await.unwrap();
+        let actual = batch["vector"].as_fixed_size_list();
+        let expected = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            [expected.clone(), expected],
+            2,
+        );
+        assert_eq!(actual, &expected);
     }
 
     #[rstest]
@@ -1444,17 +1654,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        50
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
-        #[case] index_type: BuiltinIndexType,
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
         #[case] query: &str,
         #[case] expected_rows: usize,
     ) {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col("category", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(1),
                 FragmentRowCount::from(100),
@@ -1469,10 +1692,10 @@ mod tests {
 
         dataset
             .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("i_idx".to_string()),
-                &ScalarIndexParams::for_builtin(index_type),
+                &[indexed_column],
+                index_type,
+                Some("addr_idx".to_string()),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -1500,7 +1723,10 @@ mod tests {
             .new_dataset;
 
         let indices = dataset.load_indices().await.unwrap();
-        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "addr_idx")
+            .unwrap();
         assert_eq!(
             index
                 .fragment_bitmap
