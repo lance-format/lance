@@ -70,36 +70,72 @@ impl PartitionTransformer {
         self.with_distance = with_distance;
         self
     }
-}
-impl Transformer for PartitionTransformer {
-    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if !(batch.column_by_name(&self.output_column).is_none()
-            || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
-        {
-            // If the output columns are already present, we don't need to compute it again.
-            return Ok(batch.clone());
+
+    fn with_distances_to_chosen_partitions(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let fsl = self.input_vectors(batch)?;
+        let part_ids = batch
+            .column_by_name(&self.output_column)
+            .expect("checked by the caller")
+            .as_primitive::<UInt32Type>();
+        let mut dists = Vec::with_capacity(fsl.len());
+        for (vector, part_id) in fsl.iter().zip(part_ids.iter()) {
+            let (Some(vector), Some(part_id)) = (vector, part_id) else {
+                dists.push(None);
+                continue;
+            };
+            let centroid = self.centroids.slice(part_id as usize, 1);
+            let dist = self.distance_type.arrow_batch_func()(vector.as_ref(), &centroid)?;
+            dists.push(Some(dist.value(0)));
         }
+        let loss = dists
+            .iter()
+            .map(|d| d.unwrap_or_default() as f64)
+            .sum::<f64>();
+        let batch = batch.drop_column(CENTROID_DIST_COLUMN)?.try_with_column(
+            CENTROID_DIST_FIELD.clone(),
+            Arc::new(Float32Array::from(dists)),
+        )?;
+        Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
+    }
 
-        // clear the columns if any of them is present
-        let batch = batch
-            .drop_column(PART_ID_COLUMN)?
-            .drop_column(CENTROID_DIST_COLUMN)?;
-
+    fn input_vectors<'a>(&self, batch: &'a RecordBatch) -> Result<&'a FixedSizeListArray> {
         let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
             lance_core::Error::index(format!(
                 "PartitionTransformer: column {} not found in the RecordBatch",
                 self.input_column
             ))
         })?;
-
-        let fsl = arr.as_fixed_size_list_opt().ok_or_else(|| {
+        arr.as_fixed_size_list_opt().ok_or_else(|| {
             lance_core::Error::index(format!(
                 "PartitionTransformer: column {} is not a FixedSizeListArray: {}",
                 self.input_column,
                 arr.data_type(),
             ))
-        })?;
+        })
+    }
+}
+impl Transformer for PartitionTransformer {
+    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let has_part_ids = batch.column_by_name(&self.output_column).is_some();
+        let needs_dists =
+            self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none();
+        if has_part_ids && !needs_dists {
+            // If the output columns are already present, we don't need to compute it again.
+            return Ok(batch.clone());
+        }
+        if has_part_ids {
+            // The caller chose every row's partition (a join placing rows where
+            // there is room): keep it and measure the distance to that centroid
+            // rather than reassign the row to its nearest one.
+            return self.with_distances_to_chosen_partitions(batch);
+        }
+
+        // clear the columns if any of them is present
+        let batch = batch
+            .drop_column(PART_ID_COLUMN)?
+            .drop_column(CENTROID_DIST_COLUMN)?;
+        let fsl = self.input_vectors(&batch)?;
 
         let (part_ids, dists) = match &self.index {
             Some(index) => fsl
@@ -287,6 +323,26 @@ mod tests {
 
     /// Recomputing over an already-assigned batch would waste the work and could
     /// disagree with the ids the caller already wrote.
+    #[test]
+    fn test_keeps_chosen_partitions_and_measures_their_distance() {
+        // A caller that chose partition 1 for a vector nearest to partition 0
+        // gets the distance to partition 1, not a new assignment.
+        let batch = vector_batch(vec![vec![1.0, 1.0]])
+            .try_with_column(
+                PART_ID_FIELD.clone(),
+                Arc::new(UInt32Array::from(vec![1_u32])),
+            )
+            .unwrap();
+        let output = transformer().with_distance(true).transform(&batch).unwrap();
+        assert_eq!(part_ids_of(&output), vec![Some(1)]);
+        let dists = output
+            .column_by_name(CENTROID_DIST_COLUMN)
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        assert!((dists.value(0) - 99.0_f32 * 99.0 * 2.0).abs() < 1e-3);
+        assert!((loss_of(&output) - 99.0_f64 * 99.0 * 2.0).abs() < 1e-3);
+    }
+
     #[test]
     fn test_is_noop_when_partitions_already_present() {
         let assigned = transformer()

@@ -6566,6 +6566,81 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
     assert_eq!(indexed.num_rows(), baseline.num_rows());
 }
 
+/// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
+/// index stores decoded native values (`click`, `9`). The index must decline these
+/// predicates instead of answering them against a different representation.
+///
+/// The cases run sequentially rather than as separate `rstest` cases because each
+/// index build reserves a fixed slice of the shared DataFusion memory pool, and
+/// several concurrent builds exhaust it.
+///
+/// Regression test for https://github.com/lance-format/lance/issues/8806.
+#[tokio::test]
+async fn test_json_extract_matches_unindexed_results() {
+    let cases = [
+        (
+            vec![
+                r#"{"val": "click"}"#,
+                r#"{"val": "view"}"#,
+                r#"{"val": "click"}"#,
+            ],
+            r#"json_extract(json, 'val') = '"click"'"#,
+        ),
+        (
+            vec![r#"{"val": "a"}"#, r#"{"val": "m"}"#, r#"{"val": "z"}"#],
+            r#"json_extract(json, 'val') > '"m"'"#,
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 9}"#],
+            "json_extract(json, 'val') = '9'",
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 100}"#],
+            "json_extract(json, 'val') < '100'",
+        ),
+    ];
+
+    fn sorted_matches(batch: &RecordBatch) -> Vec<String> {
+        let mut rows = batch
+            .column_by_name("json")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.unwrap().to_string())
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    for (values, predicate) in cases {
+        let dataset = json_btree_dataset(values).await;
+
+        let indexed = dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Guard against both scans matching nothing, which would pass vacuously.
+        assert!(baseline.num_rows() > 0, "no rows matched {predicate}");
+        assert_eq!(
+            sorted_matches(&indexed),
+            sorted_matches(&baseline),
+            "index changed results for {predicate}"
+        );
+    }
+}
+
 async fn prepare_json_dataset() -> (Dataset, String) {
     let text_col = Arc::new(StringArray::from(vec![
         r#"{

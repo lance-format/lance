@@ -194,6 +194,7 @@ pub fn build_compaction_options(
     max_source_rows: &JObject,                 // Optional<Long>
     max_source_bytes: &JObject,                // Optional<Long>
     excluded_fragment_ids: &JObject,           // List<Long>
+    data_storage_version: &JObject,            // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -256,6 +257,9 @@ pub fn build_compaction_options(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(version) = env.get_string_opt(data_storage_version)? {
+        compaction_options.data_storage_version = Some(LanceFileVersion::from_str(&version)?);
+    }
 
     Ok(compaction_options)
 }

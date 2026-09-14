@@ -72,23 +72,25 @@ impl Transaction {
         fragments: &[Fragment],
         user_requested: Option<ConcreteFileVersion>,
     ) -> Result<DataStorageFormat> {
-        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
-            // Ensure user-requested matches data files
-            if let Some(user_requested) = user_requested
-                && user_requested != file_version
-            {
-                return Err(Error::invalid_input(format!(
-                    "User requested data storage version ({}) does not match version in data files ({})",
-                    user_requested, file_version
-                )));
+        // Mixed prewritten files cannot imply a default. An explicit default
+        // takes precedence; finalization validates the referenced file versions.
+        let version = match user_requested {
+            Some(ConcreteFileVersion::V1) => {
+                // Preserve legacy creation's homogeneous-file contract.
+                if let Some(actual) = Fragment::try_infer_version(fragments)?
+                    && actual != ConcreteFileVersion::V1
+                {
+                    return Err(Error::invalid_input(format!(
+                        "User requested data storage version ({}) does not match version in data files ({actual})",
+                        ConcreteFileVersion::V1
+                    )));
+                }
+                Some(ConcreteFileVersion::V1)
             }
-            Ok(DataStorageFormat::new(file_version))
-        } else {
-            // If no files use user-requested or default
-            Ok(user_requested
-                .map(DataStorageFormat::new)
-                .unwrap_or_default())
-        }
+            Some(version) => Some(version),
+            None => Fragment::try_infer_version(fragments)?,
+        };
+        Ok(version.map(DataStorageFormat::new).unwrap_or_default())
     }
 
     pub async fn restore_old_manifest(
@@ -982,8 +984,10 @@ impl Transaction {
                 let replaced_fields: Vec<u32> = new_datafiles
                     .first()
                     .map(|f| {
-                        f.fields
+                        f.schema(&schema)
+                            .field_ids()
                             .iter()
+                            .chain(f.fields.iter())
                             .filter(|&&id| id >= 0)
                             .map(|&id| id as u32)
                             .collect()
@@ -1003,6 +1007,16 @@ impl Transaction {
                         })?;
                     let mut new_frag = frag.clone();
 
+                    // Physical mappings differ across V2 encodings (a nested
+                    // parent may have no column of its own). Replacement and
+                    // tombstoning operate on the logical field coverage.
+                    let replacement_ids = new_file
+                        .schema(&schema)
+                        .field_ids()
+                        .into_iter()
+                        .chain(new_file.fields.iter().copied())
+                        .collect::<HashSet<_>>();
+
                     // TODO(rmeng): check new file and fragment are the same length
 
                     let mut columns_covered = HashSet::new();
@@ -1020,7 +1034,8 @@ impl Transaction {
                             file.base_id = new_file.base_id;
                             replaced_in_place = true;
                         }
-                        columns_covered.extend(file.fields.iter());
+                        columns_covered.extend(file.schema(&schema).field_ids());
+                        columns_covered.extend(file.fields.iter().copied());
                     }
                     // Reject a file whose version does not decode before any
                     // arm publishes it.
@@ -1030,23 +1045,17 @@ impl Transaction {
                     // Then it means it's a all-NULL column that is being replaced with real data
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
-                    if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
+                    if columns_covered.is_disjoint(&replacement_ids) {
                         new_frag.files.push(new_file.clone());
                     } else if !replaced_in_place
-                        && new_file.fields.iter().all(|field| {
-                            let mut covering = new_frag
-                                .files
-                                .iter()
-                                .filter(|file| file.fields.contains(field))
-                                .peekable();
-                            // Covered by something, and by nothing we cannot
-                            // tombstone. A field no file covers leaves the
-                            // mixed layout the error below reports.
-                            covering.peek().is_some()
-                                && covering.all(|file| {
-                                    file.file_version()
-                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                                })
+                        && replacement_ids.is_subset(&columns_covered)
+                        && new_frag.files.iter().all(|file| {
+                            file.file_version()
+                                .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                || file
+                                    .fields
+                                    .iter()
+                                    .all(|field| !replacement_ids.contains(field))
                         })
                     {
                         // Tombstone the replaced fields where they live and
@@ -1069,7 +1078,7 @@ impl Transaction {
                                 .fields
                                 .iter()
                                 .map(|field| {
-                                    if new_file.fields.contains(field) {
+                                    if replacement_ids.contains(field) {
                                         TOMBSTONE_FIELD_ID
                                     } else {
                                         *field
