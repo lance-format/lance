@@ -1,16 +1,77 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use lance_core::Error;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion};
+use lance_core::{Error, Result};
+use lance_index::frag_reuse::{
+    CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
+};
 use lance_index::is_system_index;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
+
+impl Dataset {
+    /// Opens the fragment reuse index (FRI) recorded in the dataset version this
+    /// handle has loaded, or `None` if that version has none. The index is served
+    /// from the session index cache, so repeated calls do not re-read it.
+    ///
+    /// The FRI records how physical row addresses moved in compactions run with
+    /// [`CompactionOptions::defer_index_remap`]: one reuse version per compaction,
+    /// applied oldest to newest. [`CompactFragReuseIndex::row_addr_remap`] gives
+    /// the raw per-address result:
+    ///
+    /// * `None`: not mapped by any retained version. Helpers such as
+    ///   [`CompactFragReuseIndex::remap_row_id`] return these unchanged.
+    /// * `Some(None)`: deleted by a recorded compaction.
+    /// * `Some(Some(addr))`: the last address reached through the retained
+    ///   mappings, not a validated current location.
+    ///
+    /// # Limitations
+    ///
+    /// * Covers only the loaded version; check out a newer version to observe
+    ///   later compactions.
+    /// * Versions are trimmed by [`cleanup_frag_reuse_index`] once indices catch
+    ///   up, so an unmapped address may still have moved.
+    /// * Mapped destinations are not checked against the manifest and can be
+    ///   stale, for example after every row of the destination fragment is deleted.
+    /// * Not every compaction records an FRI: it requires `defer_index_remap`,
+    ///   fresh index-free tables do not receive one automatically, and datasets
+    ///   with stable row ids reject the option.
+    /// * Says nothing about deletion files, source-value changes, or whether an
+    ///   address belongs to this table or branch.
+    ///
+    /// Prefer the remap methods over [`CompactFragReuseIndex::details`], which
+    /// mirrors the persisted format and is not a long-term client contract.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(dataset: &lance::Dataset) -> lance::Result<()> {
+    /// let old_row_addr: u64 = 42;
+    /// if let Some(frag_reuse_index) = dataset.frag_reuse_index().await? {
+    ///     match frag_reuse_index.row_addr_remap().get(old_row_addr) {
+    ///         None => println!("no recorded movement for {old_row_addr}"),
+    ///         Some(None) => println!("row {old_row_addr} was deleted by compaction"),
+    ///         Some(Some(new_row_addr)) => println!("row moved to {new_row_addr}"),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`CompactionOptions::defer_index_remap`]: crate::dataset::optimize::CompactionOptions::defer_index_remap
+    pub async fn frag_reuse_index(&self) -> Result<Option<Arc<CompactFragReuseIndex>>> {
+        self.open_frag_reuse_index(&NoOpMetricsCollector).await
+    }
+}
 
 /// Cleanup a fragment reuse index based on the current condition of the indices.
 /// If all the indices currently available are already caught up to as a specific reuse version,
@@ -197,10 +258,14 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::{assert_false, assert_true};
+    use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type};
+    use lance_core::ROW_ADDR;
+    use lance_core::utils::address::RowAddress;
     use lance_datagen::Dimension;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
+    use std::collections::HashMap;
 
     fn frag_digest(id: u64) -> lance_index::frag_reuse::FragDigest {
         lance_index::frag_reuse::FragDigest {
@@ -596,5 +661,220 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    async fn row_addrs_by_i(dataset: &Dataset) -> HashMap<i32, u64> {
+        let batch = dataset
+            .scan()
+            .project(&["i"])
+            .unwrap()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch["i"].as_primitive::<Int32Type>();
+        let addrs = batch[ROW_ADDR].as_primitive::<arrow_array::types::UInt64Type>();
+        ids.values()
+            .iter()
+            .copied()
+            .zip(addrs.values().iter().copied())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_frag_reuse_index_accessor() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+
+        // Non-deferred compaction of fragment 0 (deletions above the threshold) records no FRI.
+        dataset.delete("i < 200").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+        let num_fragments = dataset.fragments().len();
+        assert_eq!(num_fragments, 6);
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Deletions above the threshold make exactly these two fragments candidates.
+        dataset.delete("i >= 1000 AND i < 1250").await.unwrap();
+        dataset.delete("i >= 2000 AND i < 2250").await.unwrap();
+        let before = row_addrs_by_i(&dataset).await;
+        let pre_compaction_version = dataset.version().version;
+        let rewritten_frags = [
+            RowAddress::from(before[&1250]).fragment_id(),
+            RowAddress::from(before[&2250]).fragment_id(),
+        ];
+        let untouched_addr = before[&5000];
+        // Offset 0 of the first rewritten fragment is i=1000, deleted above.
+        let deleted_addr = u64::from(RowAddress::new_from_parts(rewritten_frags[0], 0));
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let after = row_addrs_by_i(&dataset).await;
+        for frag in rewritten_frags {
+            assert!(
+                dataset.fragments().iter().all(|f| f.id != u64::from(frag)),
+                "fragment {frag} should have been rewritten"
+            );
+        }
+
+        let frag_reuse_index = dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .expect("deferred compaction must record an FRI");
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("FRI must be in the manifest");
+        assert_eq!(frag_reuse_index.uuid, frag_reuse_index_meta.uuid);
+        assert_eq!(frag_reuse_index.details.versions.len(), 1);
+        assert_false!(frag_reuse_index.is_empty());
+
+        // Cache reuse, not an API guarantee.
+        let again = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&frag_reuse_index, &again));
+
+        let remap = frag_reuse_index.row_addr_remap();
+        for i in [1250, 1999, 2250, 2999] {
+            assert_eq!(
+                remap.get(before[&i]),
+                Some(Some(after[&i])),
+                "row i={i} should have moved"
+            );
+            assert_eq!(frag_reuse_index.remap_row_id(before[&i]), Some(after[&i]));
+        }
+        assert_eq!(remap.get(deleted_addr), Some(None));
+        assert_eq!(frag_reuse_index.remap_row_id(deleted_addr), None);
+        assert_eq!(remap.get(untouched_addr), None);
+        assert_eq!(after[&5000], untouched_addr);
+        assert_eq!(
+            frag_reuse_index.remap_row_id(untouched_addr),
+            Some(untouched_addr)
+        );
+
+        let pre_compaction = dataset
+            .checkout_version(pre_compaction_version)
+            .await
+            .unwrap();
+        assert!(pre_compaction.frag_reuse_index().await.unwrap().is_none());
+
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let trimmed = dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .expect("trimmed FRI keeps an (empty) manifest entry");
+        assert_true!(trimmed.is_empty());
+        assert_eq!(trimmed.details.versions.len(), 0);
+        assert_ne!(trimmed.uuid, frag_reuse_index.uuid);
+        assert_eq!(trimmed.row_addr_remap().get(before[&1250]), None);
+        assert_eq!(
+            trimmed.remap_row_id(before[&1250]),
+            Some(before[&1250]),
+            "trimmed history passes a moved address through unchanged"
+        );
+    }
+
+    /// Deleting every row of a destination fragment removes it from the manifest,
+    /// but the FRI still maps into it.
+    #[tokio::test]
+    async fn test_frag_reuse_index_mapped_destination_can_be_removed() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Target equals fragment size, so only the two deletion-heavy fragments are candidates.
+        dataset.delete("i < 250").await.unwrap();
+        dataset.delete("i >= 1000 AND i < 1250").await.unwrap();
+        let before = row_addrs_by_i(&dataset).await;
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let after = row_addrs_by_i(&dataset).await;
+        let moved_rows = [250, 999, 1250, 1999];
+        let destination_frags: Vec<u32> = moved_rows
+            .iter()
+            .map(|i| RowAddress::from(after[i]).fragment_id())
+            .collect();
+        for i in moved_rows {
+            assert_ne!(before[&i], after[&i], "row i={i} should have moved");
+        }
+
+        dataset.delete("i < 2000").await.unwrap();
+        let remaining_frag_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        for frag in &destination_frags {
+            assert!(
+                !remaining_frag_ids.contains(&u64::from(*frag)),
+                "destination fragment {frag} should be removed; remaining: {remaining_frag_ids:?}"
+            );
+        }
+
+        let frag_reuse_index = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(frag_reuse_index.details.versions.len(), 1);
+        for i in moved_rows {
+            assert_eq!(
+                frag_reuse_index.row_addr_remap().get(before[&i]),
+                Some(Some(after[&i])),
+                "row i={i} still maps into a removed fragment"
+            );
+            assert_eq!(frag_reuse_index.remap_row_id(before[&i]), Some(after[&i]));
+        }
     }
 }

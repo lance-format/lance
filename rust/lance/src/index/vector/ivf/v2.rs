@@ -2395,6 +2395,186 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         )))
     }
 
+    fn supports_batch_partition_search(&self) -> bool {
+        S::supports_global_topk_heap()
+    }
+
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>> {
+        if !S::supports_global_topk_heap() {
+            return Err(Error::not_supported(
+                "batch partition search requires a global top-k heap sub-index",
+            ));
+        }
+        let query_count = partitions_per_query.len();
+        if q_c_dists_per_query.len() != query_count {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: {query_count} query partition lists but {} distance lists",
+                q_c_dists_per_query.len()
+            )));
+        }
+        if query_count == 0 {
+            return Ok(Vec::new());
+        }
+        if !query.key.len().is_multiple_of(query_count) {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: query key length {} is not divisible by query count {query_count}",
+                query.key.len()
+            )));
+        }
+        let dim = query.key.len() / query_count;
+
+        // Per-query immutable search state: the query vector slice and the
+        // optional Rabit raw-query context both depend only on the query vector,
+        // so compute them once up front rather than per probed partition.
+        let mut base_queries = Vec::with_capacity(query_count);
+        let mut raw_query_contexts = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
+                return Err(Error::invalid_input(format!(
+                    "batch partition search: query {query_index} has {} partitions but {} distances",
+                    partitions_per_query[query_index].len(),
+                    q_c_dists_per_query[query_index].len()
+                )));
+            }
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
+            base_queries.push(single_query);
+        }
+        // Shared across every chunk's scoring dispatch below, so wrap once in an
+        // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = Arc::new(base_queries);
+        let raw_query_contexts = Arc::new(raw_query_contexts);
+
+        // Invert the per-query partition lists so each distinct partition is
+        // loaded once and scored against every query that probes it.
+        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+        for (query_index, (parts, dists)) in partitions_per_query
+            .iter()
+            .zip(q_c_dists_per_query.iter())
+            .enumerate()
+        {
+            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
+                assignments
+                    .entry(*part_id)
+                    .or_default()
+                    .push((query_index, *dist_q_c));
+            }
+        }
+
+        pre_filter.wait_for_ready().await?;
+
+        // Score partitions in a deterministic order. `assignments` is a HashMap,
+        // so its iteration order (and hence the order partitions accumulate into
+        // each per-query heap) is otherwise arbitrary. When several rows tie at
+        // the k-th distance, which one the capped heap keeps depends on insertion
+        // order, so a stable partition order is what makes the selected top-k
+        // deterministic across runs. (Any of the tied rows is an equally valid
+        // k-th neighbor, so this does not affect recall.)
+        let mut assignment_list: Vec<(u32, Vec<(usize, f32)>)> = assignments.into_iter().collect();
+        assignment_list.sort_by_key(|(part_id, _)| *part_id);
+
+        // Load each distinct partition's storage exactly once (the shared I/O
+        // that batch search exists to save), but *stream* the loaded partitions
+        // through scoring in chunks rather than materializing them all. A wide
+        // batch probes up to `min(query_count * nprobes, num_partitions)` distinct
+        // partitions, so collecting every loaded partition before scoring would
+        // make peak memory scale with the batch width — up to the whole index.
+        // Streaming bounds resident partition storage to the load window plus one
+        // chunk. `buffered` preserves the sorted load order above, so scoring order
+        // (and thus the k-th-distance tie-break) stays deterministic.
+        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_index = self.clone();
+        let load_metrics = metrics.clone();
+        let mut loaded_chunks = stream::iter(assignment_list)
+            .map(move |(part_id, probing_queries)| {
+                let index = load_index.clone();
+                let metrics = load_metrics.clone();
+                async move {
+                    let part_entry = index
+                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .await?;
+                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                }
+            })
+            .buffered(load_parallelism)
+            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
+            .map(|_| BinaryHeap::with_capacity(heap_capacity))
+            .collect();
+
+        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
+        // dispatches the scoring immediately and only touches CPU-bound state, so
+        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
+        // flight during scoring: the async task, never a CPU-pool thread, does the
+        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
+        // docs recommend with `buffered`). Scoring stays sequential across chunks —
+        // each mutates the same per-query heaps — so a step costs about
+        // max(load, score) rather than their sum, and a scored chunk's storage is
+        // dropped before the next is scored, keeping peak memory bounded.
+        let mut pending = loaded_chunks.next().await;
+        while let Some(chunk) = pending {
+            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+            let index = self.clone();
+            let pre_filter = pre_filter.clone();
+            let base_queries = base_queries.clone();
+            let raw_query_contexts = raw_query_contexts.clone();
+            let scratch_pool = self.scratch_pool.clone();
+            let search_metrics = metrics.clone();
+            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                scratch_pool.with_scratch(|scratch| -> Result<()> {
+                    for (part_id, part_entry, probing_queries) in &chunk {
+                        let partition_centroid = index.ivf.centroid(*part_id);
+                        for (query_index, dist_q_c) in probing_queries {
+                            let mut single_query = base_queries[*query_index].clone();
+                            single_query.dist_q_c = *dist_q_c;
+                            let prepared = PreparedPartitionSearch::<S, Q> {
+                                query: single_query,
+                                pre_filter: pre_filter.clone(),
+                                partition_id: *part_id,
+                                partition_centroid: partition_centroid.clone(),
+                                rq_search_cache: index.rq_search_cache.clone(),
+                                raw_query_context: raw_query_contexts[*query_index].clone(),
+                                part_entry: part_entry.clone(),
+                                _marker: PhantomData,
+                            };
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heaps[*query_index],
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(heaps)
+            });
+            // Load the next chunk while this one is scored on the CPU pool.
+            let (scored, next) = futures::join!(score, loaded_chunks.next());
+            heaps = scored?;
+            pending = next;
+        }
+
+        heaps
+            .into_iter()
+            .map(Self::global_heap_to_batch)
+            .collect::<Result<Vec<_>>>()
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -3190,11 +3370,15 @@ mod tests {
         (batch, schema)
     }
 
+    /// Rows of `vectors_per_row` vectors around their cluster's centroid. The
+    /// `straddling_row`, if any, spreads its vectors over the centroids instead,
+    /// one per vector, so it belongs to several partitions at once.
     fn generate_clustered_multivec_batch(
         cluster_sizes: &[usize],
         centroids: &[(f32, f32)],
         vectors_per_row: usize,
         start_id: u64,
+        straddling_row: Option<u64>,
     ) -> (RecordBatch, SchemaRef) {
         assert_eq!(
             cluster_sizes.len(),
@@ -3209,9 +3393,14 @@ mod tests {
         let mut current_id = start_id;
         for (&rows, &(x, y)) in cluster_sizes.iter().zip(centroids.iter()) {
             for _ in 0..rows {
-                ids.push(current_id);
+                let row_id = current_id;
+                ids.push(row_id);
                 current_id += 1;
-                for _ in 0..vectors_per_row {
+                for vector_idx in 0..vectors_per_row {
+                    let (x, y) = match straddling_row {
+                        Some(id) if id == row_id => centroids[vector_idx % centroids.len()],
+                        _ => (x, y),
+                    };
                     for dim in 0..DIM {
                         let base = match dim {
                             0 => x,
@@ -3611,7 +3800,7 @@ mod tests {
         delete_ids(dataset, &ids[1..]).await;
         compact_after_deletions(dataset).await;
 
-        append_constant_vector_with_start_id(
+        append_template_vector_with_start_id(
             dataset,
             ROWS_TO_APPEND_FOR_JOIN,
             &template_values,
@@ -3643,13 +3832,13 @@ mod tests {
         (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
-    async fn append_constant_vector_with_start_id(
+    async fn append_template_vector_with_start_id(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         next_id: &mut u64,
     ) {
-        append_constant_vector_batch(dataset, rows, template, *next_id, None).await;
+        append_template_vector_batch(dataset, rows, template, *next_id, None).await;
         *next_id += rows as u64;
     }
 
@@ -3676,10 +3865,15 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + total_rows as u64,
         ));
+        // A tiny per-row drift keeps the appended rows distinct (identical rows
+        // cannot be split by clustering) without moving them off their template's
+        // partition.
         let mut appended_values = Vec::with_capacity(total_rows * DIM);
         for template in templates {
-            for _ in 0..rows_per_template {
-                appended_values.extend_from_slice(template);
+            for row in 0..rows_per_template {
+                let mut values = template.clone();
+                values[0] += row as f32 * 0.0001;
+                appended_values.extend_from_slice(&values);
             }
         }
         let vectors = Arc::new(
@@ -3698,17 +3892,17 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
     }
 
-    async fn append_constant_vector_with_params(
+    async fn append_template_vector_with_params(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         write_params: Option<WriteParams>,
     ) {
         let start_id = dataset.count_all_rows().await.unwrap() as u64;
-        append_constant_vector_batch(dataset, rows, template, start_id, write_params).await;
+        append_template_vector_batch(dataset, rows, template, start_id, write_params).await;
     }
 
-    async fn append_constant_vector_batch(
+    async fn append_template_vector_batch(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
@@ -3725,9 +3919,14 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + rows as u64,
         ));
+        // The same tiny per-row drift as `append_partition_templates`: a split
+        // into `ceil(rows / target)` pieces needs that many distinct rows, and
+        // identical rows would leave some pieces empty at random.
         let mut appended_values = Vec::with_capacity(rows * DIM);
-        for _ in 0..rows {
-            appended_values.extend_from_slice(template);
+        for row in 0..rows {
+            let mut values = template.to_vec();
+            values[0] += row as f32 * 0.0001;
+            appended_values.extend_from_slice(&values);
         }
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(
@@ -3761,7 +3960,7 @@ mod tests {
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        append_constant_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
+        append_template_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -5926,11 +6125,15 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        // Multivector search ranks the final candidates by PQ-approximated
+        // scores before refining, so the M4 code of `lightweight_pq_params`
+        // (unseeded KMeans) drops recall below the threshold in a few percent
+        // of runs. The 4-bit M32 code keeps recall at 1.0.
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
             lightweight_hnsw_params(),
-            lightweight_pq_params(),
+            lightweight_pq_params_with_bits(4),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -7001,7 +7204,7 @@ mod tests {
             ..Default::default()
         };
         append_params.mode = WriteMode::Append;
-        append_constant_vector_with_params(
+        append_template_vector_with_params(
             &mut dataset,
             SMALL_APPEND_ROWS,
             &template_values,
@@ -7194,14 +7397,17 @@ mod tests {
         .await;
         expected_rows += NO_SPLIT_APPEND_ROWS;
 
+        // The oversized partition is split straight to the target size in one
+        // optimize: ceil(rows / target) pieces instead of a single halving.
+        let split_rows = expected_rows + SPLIT_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
             &mut next_id,
             SPLIT_APPEND_ROWS,
-            2,
-            expected_rows + SPLIT_APPEND_ROWS,
+            split_rows.div_ceil(IndexType::IvfPq.target_partition_size()),
+            split_rows,
             1,
             true,
         )
@@ -7247,17 +7453,21 @@ mod tests {
             .unwrap();
 
         let expected_rows = NUM_ROWS + APPEND_ROWS;
+        // Every vector of a row counts towards the partition size, and the split
+        // goes straight to the target size: ceil(vectors / target) pieces.
+        let expected_partitions =
+            (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            2,
-            "Expected one oversized multivector partition to split, stats: {}",
+            expected_partitions,
+            "Expected the oversized multivector partition to split into {expected_partitions}, stats: {}",
             final_ctx.stats_json()
         );
         let partitions = final_ctx.stats()["indices"][0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions.len(), expected_partitions);
         assert_eq!(
             partitions
                 .iter()
@@ -7348,10 +7558,14 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
+        // Both partitions hold BASE + APPEND rows and are split straight to the
+        // target size in one optimize: ceil(rows / target) pieces each.
+        let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
+            .div_ceil(IndexType::IvfFlat.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            4,
+            2 * pieces_per_partition,
             "Expected both original partitions to split in one optimize, stats: {}",
             final_ctx.stats_json()
         );
@@ -7369,7 +7583,7 @@ mod tests {
         let partitions = indices[0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions.len(), 2 * pieces_per_partition);
         let expected_rows = 2 * BASE_ROWS_PER_PARTITION + 2 * APPEND_ROWS_PER_PARTITION;
         let total_partition_rows = partitions
             .iter()
@@ -7424,9 +7638,17 @@ mod tests {
         // distinct directions avoid the collinear assignment in the old fixture.
         let centroids = [(-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)];
         let total_rows = cluster_sizes.iter().sum::<usize>();
+        // Row 1600, the one retained below, has one vector in each partition.
+        // Joining the partition that holds one of them must reassign only that
+        // vector, not re-add the two the other partitions keep.
         let mut dataset = {
-            let (batch, schema) =
-                generate_clustered_multivec_batch(&cluster_sizes, &centroids, MULTIVEC_PER_ROW, 0);
+            let (batch, schema) = generate_clustered_multivec_batch(
+                &cluster_sizes,
+                &centroids,
+                MULTIVEC_PER_ROW,
+                0,
+                Some(1600),
+            );
             let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
             Dataset::write(
                 batches,
@@ -7498,6 +7720,7 @@ mod tests {
             &centroids[2..],
             MULTIVEC_PER_ROW,
             total_rows as u64,
+            None,
         );
         dataset
             .append(
@@ -7677,12 +7900,12 @@ mod tests {
     async fn test_optimize_join_after_delete_with_stable_row_ids() {
         // Regression test for https://github.com/lance-format/lance/issues/7701:
         // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
-        // so optimize joins the smallest after a scattered delete.
+        // so one optimize joins all of them but the largest after a scattered delete.
         let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
 
         assert_eq!(
-            run.num_partitions_after, 3,
-            "optimize should have joined the smallest partition, got stats: {}",
+            run.num_partitions_after, 1,
+            "optimize should have joined every undersized partition but one, got stats: {}",
             run.stats_json
         );
 
