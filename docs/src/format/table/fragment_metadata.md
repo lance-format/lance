@@ -40,9 +40,11 @@ the root and leaves.*
 | Write | Native Lance validates the change. The tree stores the resulting mutation. |
 | Publish | Write immutable tree objects first, then commit the Version Manifest. |
 
-Protobuf messages are in `protos/table.proto`. Operation semantics, conflict
-rules, and native validation stay with [transactions](transaction.md). A
-storage action is the result of a successful native transaction.
+Protobuf messages are in `protos/fragment_metadata.proto`.
+`Manifest.fragment_metadata` is declared in `protos/table.proto`. Operation
+semantics, conflict rules, and native validation stay with
+[transactions](transaction.md). A storage action is the result of a successful
+native transaction.
 
 Readers must treat a violation of any requirement on this page as a corrupt
 snapshot.
@@ -53,6 +55,11 @@ A tree table must set `Manifest.fragment_metadata`, leave `Manifest.fragments`
 empty, and set flag 512 in both `reader_feature_flags` and
 `writer_feature_flags`. These fields must agree. When `FLAG_FRAGMENT_METADATA`
 is set, `FragmentMetadata.layout` must select exactly one recognized layout.
+
+Each version stores fragment records either in the tree or in
+`Manifest.fragments`, never both. A writer may convert a flat table by
+publishing a new tree-backed version. Whether and when to convert is
+writer policy.
 
 A `FragmentMetadataTree` must contain exactly one of an inline root or a
 `root_path`.
@@ -221,12 +228,13 @@ fragment IDs as follows.
 Interior nodes must have at least two children. The root may have zero, one,
 or more.
 
-Children are ordered by `min_key`. A child's `min_key` is the inclusive lower
-bound of its range. The next child's `min_key` is the exclusive upper bound.
-The first child of the root must have `min_key` 0. An interior node's first
+Children are ordered by `min_key`. `min_key` is the inclusive lower bound of
+this child's fragment-ID range. It need not equal an ID currently stored in
+the child. The next child's `min_key` is the exclusive upper bound. The
+first child of the root must have `min_key` 0. An interior node's first
 child must begin at the lower bound assigned by its parent. Together, the
-children must partition the parent range. Routing a key selects the
-rightmost child whose `min_key` is at most that key.
+children must partition the parent range. Routing a fragment ID selects the
+rightmost child whose `min_key` is at most that fragment ID.
 
 Ranges must not overlap. Each mutation buffered by an interior must belong to
 exactly one child range. The same rule applies to a root once it has children.
@@ -289,8 +297,9 @@ leaf summaries from records. Writers must not publish a materialization whose
 recomputed summaries disagree with the derived version totals.
 
 File and deletion-file actions must leave all other `DataFragment` fields
-unchanged. Changes to overlays, row-ID state, lineage, or other
-fragment-level metadata must use `add_fragment`.
+unchanged. Use `add_fragment` when no other action can represent the change.
+This includes changes to overlay files, version sequences, and row-ID state.
+It replaces the complete fragment record.
 
 Removal actions are idempotent. Removing an absent fragment, file, or deletion
 file is a no-op where specified below. Actions that modify an existing

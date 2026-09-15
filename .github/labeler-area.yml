@@ -44,6 +44,7 @@ A-format:
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
           - "protos/transaction.proto"
           - "docs/src/format/**"
 
@@ -62,6 +63,7 @@ format-change:
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
           - "protos/transaction.proto"
           - "docs/src/format/**"
 
