@@ -630,35 +630,6 @@ mod tests {
     use super::*;
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
 
-    /// A lance field, as a generation's schema records it.
-    fn lance_field(name: &str, id: i32, children: Vec<LanceField>) -> LanceField {
-        let arrow = if children.is_empty() {
-            Field::new(name, DataType::Int64, true)
-        } else {
-            Field::new(
-                name,
-                DataType::Struct(
-                    children
-                        .iter()
-                        .map(|c| Field::new(&c.name, DataType::Int64, true))
-                        .collect(),
-                ),
-                true,
-            )
-        };
-        let mut field = LanceField::try_from(&arrow).expect("lance field");
-        field.set_id(-1, &mut (id - 1).clone());
-        field.id = id;
-        for (child, source) in field.children.iter_mut().zip(children.iter()) {
-            child.id = source.id;
-        }
-        field
-    }
-
-    fn names(pairs: &[(i32, &str)]) -> HashMap<i32, String> {
-        pairs.iter().map(|(id, n)| (*id, n.to_string())).collect()
-    }
-
     fn create_test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
