@@ -397,6 +397,37 @@ parameter; explicit `storage_options` override environment variables:
     settings such as the security token (`TENCENTCLOUD_SECURITY_TOKEN`) and region
     (`TENCENTCLOUD_REGION`) must be configured via environment variables.
 
+## Hugging Face Configuration
+
+Use `hf://datasets/<owner>/<repo>/<path>` to read a Lance dataset hosted on
+Hugging Face. Pass these options through `storage_options`:
+
+| Key | Description |
+| --- | --- |
+| `hf_token` | Hugging Face access token. Falls back to `HF_TOKEN` or `HUGGINGFACE_TOKEN` when omitted. |
+| `hf_revision` | Repository revision, such as a commit ID, branch, or tag. Defaults to `main`. |
+| `hf_download_mode` | `http` (default) or `xet`. |
+| `hf_enable_resolve_cache` | `"true"` reuses resolved HTTP download URLs and XET file metadata across readers. Defaults to `"false"`. |
+
+These options also accept names without the `hf_` prefix. The prefixed name
+takes precedence when both are supplied. `hf_enable_resolve_cache` accepts only
+the strings `"true"` and `"false"`.
+
+Enable the resolve cache only when existing files will not change. Updates,
+including changes behind a moving branch or tag, may remain invisible while
+cached results are reused. HTTP download URLs refresh near expiry, and issued
+URLs may remain usable until expiry after Hub permissions change. The cache
+reduces Hub resolution requests; it does not cache file contents.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "hf://datasets/owner/repo/data.lance",
+    storage_options={"hf_enable_resolve_cache": "true"},
+)
+```
+
 ## GooseFS Configuration
 
 [GooseFS](https://cloud.tencent.com/product/goosefs) is a distributed caching
