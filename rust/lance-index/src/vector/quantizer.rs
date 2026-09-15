@@ -58,6 +58,11 @@ pub trait Quantization:
     fn quantization_type() -> QuantizationType;
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Self::Metadata;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
+    /// Whether current-format IVF storage should retain one quantizer and pass
+    /// it to each loaded partition.
+    fn retain_quantizer_for_partition_storage() -> bool {
+        false
+    }
     fn field(&self) -> Field;
     fn extra_fields(&self) -> Vec<Field> {
         vec![]
@@ -281,6 +286,21 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         Self::try_from_batch(batch, metadata, distance_type, None)
     }
 
+    /// Internal entry point for loaders that retain the index-level quantizer.
+    /// Implementations can share query-time state derived from the quantizer
+    /// across all partition storage instances.
+    #[doc(hidden)]
+    fn try_from_batch_with_quantizer(
+        batch: RecordBatch,
+        quantizer: &Quantizer,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        let _ = quantizer;
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
+    }
+
     fn metadata(&self) -> &Self::Metadata;
 
     fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
@@ -456,5 +476,14 @@ mod tests {
             "RABIT".parse::<QuantizationType>().unwrap(),
             QuantizationType::Rabit
         );
+    }
+
+    #[test]
+    fn test_only_product_quantizer_is_retained_for_partition_storage() {
+        assert!(ProductQuantizer::retain_quantizer_for_partition_storage());
+        assert!(!ScalarQuantizer::retain_quantizer_for_partition_storage());
+        assert!(!RabitQuantizer::retain_quantizer_for_partition_storage());
+        assert!(!FlatQuantizer::retain_quantizer_for_partition_storage());
+        assert!(!FlatBinQuantizer::retain_quantizer_for_partition_storage());
     }
 }

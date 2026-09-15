@@ -13,7 +13,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::distance::*;
-use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2, dot::DotPrepared, l2::L2Prepared};
 use lance_testing::datagen::generate_random_array_with_seed;
 use rand::{Rng, SeedableRng, prelude::StdRng};
 
@@ -28,6 +28,59 @@ fn construct_dist_table(c: &mut Criterion) {
     construct_dist_table_for_type::<Float16Type>(c, "f16");
     construct_dist_table_for_type::<Float32Type>(c, "f32");
     construct_dist_table_for_type::<Float64Type>(c, "f64");
+}
+
+fn construct_prepared_table(c: &mut Criterion) {
+    let codebook = generate_random_array_with_seed::<Float32Type>(256 * DIM, [88; 32]);
+    let query = generate_random_array_with_seed::<Float32Type>(DIM, [32; 32]);
+    let sub_dim = DIM / PQ;
+    let block_size = 256 * sub_dim;
+    let dot_targets = codebook
+        .as_slice()
+        .chunks_exact(block_size)
+        .map(|block| DotPrepared::new(block, sub_dim))
+        .collect::<Vec<_>>();
+    let l2_targets = codebook
+        .as_slice()
+        .chunks_exact(block_size)
+        .map(|block| L2Prepared::new(block, sub_dim))
+        .collect::<Vec<_>>();
+
+    c.bench_function(
+        format!(
+            "construct_dist_table_prepared: {},PQ={},DIM={},type=f32",
+            DistanceType::L2,
+            PQ,
+            DIM,
+        )
+        .as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(build_distance_table_l2_prepared(
+                    &l2_targets,
+                    query.as_slice(),
+                ));
+            })
+        },
+    );
+
+    c.bench_function(
+        format!(
+            "construct_dist_table_prepared: {},PQ={},DIM={},type=f32",
+            DistanceType::Dot,
+            PQ,
+            DIM,
+        )
+        .as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(build_distance_table_dot_prepared(
+                    &dot_targets,
+                    query.as_slice(),
+                ));
+            })
+        },
+    );
 }
 
 fn construct_dist_table_for_type<T: ArrowFloatType>(c: &mut Criterion, type_name: &str)
@@ -127,12 +180,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = construct_dist_table, compute_distances);
+    targets = construct_dist_table, construct_prepared_table, compute_distances);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = construct_dist_table, compute_distances);
+    targets = construct_dist_table, construct_prepared_table, compute_distances);
 
 criterion_main!(benches);

@@ -4,7 +4,7 @@
 //! Product Quantization
 //!
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{Array, FixedSizeListArray, UInt8Array, cast::AsArray};
@@ -14,7 +14,7 @@ use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, assume_eq};
-use lance_linalg::distance::{DistanceType, Dot, L2, l2::L2Prepared};
+use lance_linalg::distance::{DistanceType, Dot, L2, dot::DotPrepared, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
@@ -29,6 +29,7 @@ pub(crate) mod utils;
 
 use self::distance::{
     build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance,
+    prepare_dot_targets, prepare_l2_targets,
 };
 pub use self::utils::num_centroids;
 use super::quantizer::{
@@ -39,6 +40,37 @@ use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
+#[derive(Debug)]
+pub(super) struct LazyPreparedTargets<T> {
+    targets: OnceLock<Vec<T>>,
+}
+
+impl<T> LazyPreparedTargets<T> {
+    fn new() -> Self {
+        Self {
+            targets: OnceLock::new(),
+        }
+    }
+
+    fn get_or_init(&self, init: impl FnOnce() -> Vec<T>) -> &[T] {
+        self.targets.get_or_init(init)
+    }
+
+    #[cfg(test)]
+    fn get(&self) -> Option<&[T]> {
+        self.targets.get().map(Vec::as_slice)
+    }
+}
+
+impl<T: DeepSizeOf> DeepSizeOf for LazyPreparedTargets<T> {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.targets
+            .get()
+            .map(|targets| targets.deep_size_of_children(context))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
@@ -46,54 +78,89 @@ pub struct ProductQuantizer {
     pub dimension: usize,
     pub codebook: FixedSizeListArray,
     pub distance_type: DistanceType,
-    /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
-    /// Only populated when codebook is f32 and distance_type is L2
-    /// (Cosine is converted to L2 before construction, so it benefits too).
-    /// Wrapped in Arc so all clones (one per cached IVF partition) share one copy.
-    l2_targets: Option<Arc<Vec<L2Prepared>>>,
+    /// Lazy pre-transposed targets for fast f32 L2 batch computation.
+    /// The cache only exists for L2 f32 codebooks (Cosine is converted to L2)
+    /// and is shared by an IVF index and all its loaded partitions.
+    l2_targets: Option<Arc<LazyPreparedTargets<L2Prepared>>>,
+    /// Lazy pre-transposed targets for fast f32 Dot computation.
+    /// The cache is shared by an IVF index and all its loaded partitions.
+    dot_targets: Option<Arc<LazyPreparedTargets<DotPrepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.codebook.get_array_memory_size()
-            + self.num_sub_vectors.deep_size_of_children(_context)
-            + self.num_bits.deep_size_of_children(_context)
-            + self.dimension.deep_size_of_children(_context)
-            + self.distance_type.deep_size_of_children(_context)
-            // deep_size_of_children on the Arc de-duplicates shared allocations
-            // via the context, so partitions sharing one l2_targets are counted once.
-            + self.l2_targets.deep_size_of_children(_context)
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        (&self.codebook as &dyn Array).deep_size_of_children(context)
+            + self.num_sub_vectors.deep_size_of_children(context)
+            + self.num_bits.deep_size_of_children(context)
+            + self.dimension.deep_size_of_children(context)
+            + self.distance_type.deep_size_of_children(context)
+            // Arc accounting de-duplicates targets shared by loaded partitions.
+            + self.l2_targets.deep_size_of_children(context)
+            + self.dot_targets.deep_size_of_children(context)
     }
 }
 
 impl ProductQuantizer {
-    /// Build per-sub-vector L2Prepared from the codebook if applicable (f32 + L2).
+    /// Create a lazy shared target cache if this codebook supports prepared L2.
     fn build_l2_targets(
         codebook: &FixedSizeListArray,
-        distance_type: DistanceType,
-        num_sub_vectors: usize,
         num_bits: u32,
-        dimension: usize,
-    ) -> Option<Arc<Vec<L2Prepared>>> {
-        if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
+        distance_type: DistanceType,
+    ) -> Option<Arc<LazyPreparedTargets<L2Prepared>>> {
+        if codebook.value_type() != DataType::Float32
+            || num_bits != 8
+            || distance_type != DistanceType::L2
+        {
             return None;
         }
-        let values = codebook
-            .values()
-            .as_primitive::<datatypes::Float32Type>()
-            .values();
-        let sub_dim = dimension / num_sub_vectors;
-        let num_centroids = 2_usize.pow(num_bits);
-        let block_size = sub_dim * num_centroids;
+        Some(Arc::new(LazyPreparedTargets::new()))
+    }
 
-        let targets: Vec<L2Prepared> = (0..num_sub_vectors)
-            .map(|sub_idx| {
-                let block_start = sub_idx * block_size;
-                let block = &values[block_start..block_start + block_size];
-                L2Prepared::new(block, sub_dim)
+    /// Create a lazy shared target cache if this codebook supports prepared Dot.
+    fn build_dot_targets(
+        codebook: &FixedSizeListArray,
+        num_bits: u32,
+        distance_type: DistanceType,
+    ) -> Option<Arc<LazyPreparedTargets<DotPrepared>>> {
+        if codebook.value_type() != DataType::Float32
+            || num_bits != 8
+            || distance_type != DistanceType::Dot
+        {
+            return None;
+        }
+        Some(Arc::new(LazyPreparedTargets::new()))
+    }
+
+    fn l2_targets(&self) -> Option<&[L2Prepared]> {
+        self.l2_targets.as_ref().map(|targets| {
+            targets.get_or_init(|| {
+                prepare_l2_targets(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                )
             })
-            .collect();
-        Some(Arc::new(targets))
+        })
+    }
+
+    fn dot_targets(&self) -> Option<&[DotPrepared]> {
+        self.dot_targets.as_ref().map(|targets| {
+            targets.get_or_init(|| {
+                prepare_dot_targets(
+                    self.codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.dimension,
+                )
+            })
+        })
     }
 
     pub fn new(
@@ -103,13 +170,8 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
-        let l2_targets = Self::build_l2_targets(
-            &codebook,
-            distance_type,
-            num_sub_vectors,
-            num_bits,
-            dimension,
-        );
+        let l2_targets = Self::build_l2_targets(&codebook, num_bits, distance_type);
+        let dot_targets = Self::build_dot_targets(&codebook, num_bits, distance_type);
         Self {
             num_bits,
             num_sub_vectors,
@@ -117,6 +179,7 @@ impl ProductQuantizer {
             codebook,
             distance_type,
             l2_targets,
+            dot_targets,
         }
     }
 
@@ -186,7 +249,7 @@ impl ProductQuantizer {
         let num_centroids = 2_usize.pow(NUM_BITS);
         let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
 
-        let values = if let Some(targets) = &self.l2_targets {
+        let values = if let Some(targets) = self.l2_targets() {
             // Fast path for f32 + L2: use pre-transposed codebook.
             // SAFETY: l2_targets is only populated when T::Native is f32.
             let flat_f32: &[f32] = unsafe {
@@ -313,7 +376,14 @@ impl ProductQuantizer {
                 self.dot_distances_impl::<datatypes::Float16Type>(key.as_primitive(), code)
             }
             DataType::Float32 => {
-                self.dot_distances_impl::<datatypes::Float32Type>(key.as_primitive(), code)
+                if let Some(targets) = self.dot_targets() {
+                    let query = key.as_primitive::<datatypes::Float32Type>().values();
+                    let distance_table =
+                        distance::build_distance_table_dot_prepared(targets, query);
+                    Ok(self.compute_dot_distance(&distance_table, code))
+                } else {
+                    self.dot_distances_impl::<datatypes::Float32Type>(key.as_primitive(), code)
+                }
             }
             DataType::Float64 => {
                 self.dot_distances_impl::<datatypes::Float64Type>(key.as_primitive(), code)
@@ -340,8 +410,12 @@ impl ProductQuantizer {
             key.values(),
         );
 
+        Ok(self.compute_dot_distance(&distance_table, code))
+    }
+
+    fn compute_dot_distance(&self, distance_table: &[f32], code: &UInt8Array) -> Float32Array {
         let distances = compute_pq_distance(
-            &distance_table,
+            distance_table,
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
@@ -350,7 +424,7 @@ impl ProductQuantizer {
 
         let diff = self.num_sub_vectors as f32 - 1.0;
         let distances = distances.into_iter().map(|d| d - diff).collect::<Vec<_>>();
-        Ok(distances.into())
+        distances.into()
     }
 
     fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {
@@ -359,9 +433,9 @@ impl ProductQuantizer {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float16Type>(key.as_primitive()))
             }
             DataType::Float32 => {
-                if let Some(targets) = &self.l2_targets {
+                if let Some(targets) = self.l2_targets() {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
-                    Ok(build_distance_table_l2_prepared(targets.as_slice(), query))
+                    Ok(build_distance_table_l2_prepared(targets, query))
                 } else {
                     Ok(self
                         .build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))
@@ -563,6 +637,10 @@ impl Quantization for ProductQuantizer {
         )))
     }
 
+    fn retain_quantizer_for_partition_storage() -> bool {
+        true
+    }
+
     fn field(&self) -> Field {
         let num_bytes_per_sub_vector = self.num_sub_vectors * self.num_bits as usize / 8;
         Field::new(
@@ -691,6 +769,31 @@ mod tests {
     }
 
     #[test]
+    fn test_four_bit_pq_keeps_low_setup_distance_path() {
+        const DIM: usize = 128;
+        const NUM_BITS: u32 = 4;
+        const NUM_SUB_VECTORS: usize = 16;
+        let codebook = FixedSizeListArray::try_new_from_values(
+            generate_random_array((1 << NUM_BITS) * DIM),
+            DIM as i32,
+        )
+        .unwrap();
+
+        let l2 = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            codebook.clone(),
+            DistanceType::L2,
+        );
+        assert!(l2.l2_targets.is_none());
+
+        let dot =
+            ProductQuantizer::new(NUM_SUB_VECTORS, NUM_BITS, DIM, codebook, DistanceType::Dot);
+        assert!(dot.dot_targets.is_none());
+    }
+
+    #[test]
     fn test_distance_with_legacy_truncated_dimension() {
         const DIM: usize = 64;
         const NUM_SUB_VECTORS: usize = 14;
@@ -728,9 +831,11 @@ mod tests {
             DistanceType::L2,
         );
         assert!(prepared_l2.l2_targets.is_some());
+        assert!(prepared_l2.l2_targets.as_ref().unwrap().get().is_none());
         let distances = prepared_l2
             .compute_distances(&Float32Array::from(query.clone()), &code)
             .unwrap();
+        assert!(prepared_l2.l2_targets.as_ref().unwrap().get().is_some());
         assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
 
         let generic_l2 = ProductQuantizer::new(
@@ -768,6 +873,8 @@ mod tests {
                 .unwrap(),
             DistanceType::Dot,
         );
+        assert!(dot.dot_targets.is_some());
+        assert!(dot.dot_targets.as_ref().unwrap().get().is_none());
         let expected_dot_distance = 1.0
             - indexed_vector[..PERSISTED_DIM]
                 .iter()
@@ -777,6 +884,7 @@ mod tests {
         let distances = dot
             .compute_distances(&Float32Array::from(query), &code)
             .unwrap();
+        assert!(dot.dot_targets.as_ref().unwrap().get().is_some());
         assert_relative_eq!(distances.value(0), expected_dot_distance, epsilon = 1e-4);
     }
 
