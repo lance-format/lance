@@ -11,6 +11,8 @@ on:
       - release/**
     paths:
       - Cargo.*
+      - .cargo/config.toml
+      - clippy.toml
       - python/**
       - rust/**
       - protos/**
