@@ -85,10 +85,14 @@ ds = lance.dataset(
 ```
 
 Base ids are assigned when bases are registered (`initial_bases` ids are assigned
-sequentially starting at 1, in order) and can be inspected through the manifest base
-paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
-as regular storage options. Exact per-base parameter maps (`base_store_params`,
-keyed by base path URI) take precedence over base-scoped keys for that base.
+sequentially starting at 1, in order) and can be inspected with
+`ds.base_paths()`. The returned dictionary maps each base id to its registered
+`DatasetBasePath`; its iteration order is unspecified, and it does not include the
+primary storage unless that path was explicitly registered as a base.
+
+Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated as
+regular storage options. Exact per-base parameter maps (`base_store_params`, keyed
+by base path URI) take precedence over base-scoped keys for that base.
 
 ## S3 Configuration
 

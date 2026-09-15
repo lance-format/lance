@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.fragment.DeletionFile;
 import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
@@ -76,6 +77,24 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       testDataset.createNewFragment(20);
+    }
+  }
+
+  @Test
+  void testFragmentWriteRejectsZeroMaxPageBytes(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("zero_max_page_bytes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      WriteParams params =
+          new WriteParams.Builder()
+              .withFileWriteOptions(FileWriteOptions.builder().maxPageBytes(0).build())
+              .build();
+
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class, () -> testDataset.createNewFragment(3, params));
+      assertTrue(error.getMessage().contains("max_page_bytes must be greater than 0, got 0"));
     }
   }
 
