@@ -77,6 +77,7 @@ pub struct FlatQueryParams {
     upper_bound: Option<f32>,
     dist_q_c: f32,
     approx_mode: ApproxMode,
+    prefer_low_setup_cost: bool,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -86,6 +87,10 @@ impl From<&Query> for FlatQueryParams {
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
             approx_mode: q.approx_mode,
+            // Prepared distance-table builders pay off across multiple IVF
+            // partitions. Avoid that setup when the search is guaranteed to
+            // stop after one partition.
+            prefer_low_setup_cost: q.maximum_nprobes == Some(1),
         }
     }
 }
@@ -148,6 +153,7 @@ impl IvfSubIndex for FlatIndex {
             &mut scratch.query_f32,
             DistanceCalculatorOptions {
                 approx_mode: params.approx_mode,
+                prefer_low_setup_cost: params.prefer_low_setup_cost,
             },
         );
         let mut res = BinaryHeap::with_capacity(k);
@@ -270,6 +276,7 @@ impl IvfSubIndex for FlatIndex {
             &mut scratch.query_f32,
             DistanceCalculatorOptions {
                 approx_mode: params.approx_mode,
+                prefer_low_setup_cost: params.prefer_low_setup_cost,
             },
         );
         metrics.record_comparisons(storage.len());
