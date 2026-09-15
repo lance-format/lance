@@ -12,6 +12,7 @@ use lance_core::Result;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
+use lance_index::frag_reuse::row_map::RowMapBlockCache;
 use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -204,10 +205,19 @@ pub(super) async fn open_mapping(
                             MAPPING_FILE.to_string(),
                             reference.map_size_bytes,
                         )]));
-                    Arc::new(StablePartitionMapping::try_new(
+                    // Row-map label chunks live in the index cache (following the
+                    // v0 placement choice: FRI file content is index-cached, not
+                    // file-cached). Keyed by the transition fingerprint so the
+                    // chunk entries are stable across queries and snapshots.
+                    let block_cache = RowMapBlockCache::new(
+                        WeakLanceCache::from(&dataset.index_cache),
+                        *transition.fingerprint(),
+                    );
+                    Arc::new(StablePartitionMapping::try_new_with_cache(
                         Arc::new(store),
                         transition.sources().to_vec(),
                         transition.destinations().to_vec(),
+                        Some(block_cache),
                     )?)
                 }
             };

@@ -3,7 +3,7 @@
 
 //! Stable-partition mapping semantics, independent of dataset lineage traversal.
 
-use super::row_map::RowMapReader;
+use super::row_map::{RowMapBlockCache, RowMapReader};
 use crate::scalar::IndexStore;
 use async_trait::async_trait;
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -26,6 +26,9 @@ pub struct StablePartitionMapping {
     sources: HashMap<u32, (u64, u64)>,
     destinations: Vec<FragmentDigest>,
     total_rows: u64,
+    /// When present, the row-map reader routes its label reads through the
+    /// shared index cache in ~4 MiB chunks. `None` reads labels directly.
+    block_cache: Option<RowMapBlockCache>,
 }
 
 impl std::fmt::Debug for StablePartitionMapping {
@@ -40,10 +43,17 @@ impl std::fmt::Debug for StablePartitionMapping {
 impl StablePartitionMapping {
     /// Bind the file store to source scan order and destination label order.
     /// The store resolves the dataset base; this reader does not interpret manifests.
-    pub fn try_new(
+    ///
+    /// `block_cache`, when supplied, routes the row map's label reads through the
+    /// shared index cache in ~4 MiB chunks. Pass `None` (see [`try_new`]) to read
+    /// labels directly, which is byte-identical to the pre-cache behavior.
+    ///
+    /// [`try_new`]: Self::try_new
+    pub fn try_new_with_cache(
         store: Arc<dyn IndexStore>,
         sources: Vec<FragmentDigest>,
         destinations: Vec<FragmentDigest>,
+        block_cache: Option<RowMapBlockCache>,
     ) -> Result<Self> {
         let mut total_rows = 0_u64;
         let mut offsets = HashMap::with_capacity(sources.len());
@@ -84,7 +94,47 @@ impl StablePartitionMapping {
             sources: offsets,
             destinations,
             total_rows,
+            block_cache,
         })
+    }
+
+    /// Convenience constructor with no block cache: reads labels directly.
+    pub fn try_new(
+        store: Arc<dyn IndexStore>,
+        sources: Vec<FragmentDigest>,
+        destinations: Vec<FragmentDigest>,
+    ) -> Result<Self> {
+        Self::try_new_with_cache(store, sources, destinations, None)
+    }
+
+    /// Open (once) the row-map reader, validating its dimensions against the
+    /// transition digests. Reuses the cached reader on later calls; the reader
+    /// carries the block cache so its label reads are chunked when enabled.
+    async fn open_reader(&self) -> Result<&RowMapReader> {
+        self.reader
+            .get_or_try_init(|| async {
+                let reader = RowMapReader::open_with_cache(
+                    self.store.open_index_file(MAPPING_FILE).await?,
+                    self.block_cache.clone(),
+                )
+                .await?;
+                let counts = reader.counts();
+                if counts.total_rows() != self.total_rows
+                    || counts.num_destinations() as usize != self.destinations.len()
+                {
+                    return Err(corrupt("row-map dimensions differ from transition digests"));
+                }
+                for (label, destination) in self.destinations.iter().enumerate() {
+                    if u64::from(counts.total(label as u16)) != destination.physical_rows {
+                        return Err(corrupt(format!(
+                            "row-map total differs for destination {}",
+                            destination.id
+                        )));
+                    }
+                }
+                Ok(reader)
+            })
+            .await
     }
 }
 
@@ -131,28 +181,7 @@ impl MappingReader for StablePartitionMapping {
         if requests.is_empty() {
             return Ok(output);
         }
-        let reader = self
-            .reader
-            .get_or_try_init(|| async {
-                let reader =
-                    RowMapReader::open(self.store.open_index_file(MAPPING_FILE).await?).await?;
-                let counts = reader.counts();
-                if counts.total_rows() != self.total_rows
-                    || counts.num_destinations() as usize != self.destinations.len()
-                {
-                    return Err(corrupt("row-map dimensions differ from transition digests"));
-                }
-                for (label, destination) in self.destinations.iter().enumerate() {
-                    if u64::from(counts.total(label as u16)) != destination.physical_rows {
-                        return Err(corrupt(format!(
-                            "row-map total differs for destination {}",
-                            destination.id
-                        )));
-                    }
-                }
-                Ok(reader)
-            })
-            .await?;
+        let reader = self.open_reader().await?;
         requests.sort_unstable_by_key(|&(row, _)| row);
         let mut remaining = requests.as_slice();
         while let Some(&(first, _)) = remaining.first() {
