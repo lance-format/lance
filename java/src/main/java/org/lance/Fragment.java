@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
 import org.lance.ipc.LanceScanner;
@@ -311,6 +312,7 @@ public class Fragment {
               tableId,
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions(),
               lanceSchema.memoryAddress(),
               sessionHandle);
         }
@@ -333,6 +335,7 @@ public class Fragment {
           tableId,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold(),
+          params.getFileWriteOptions(),
           0L,
           sessionHandle);
     }
@@ -383,6 +386,7 @@ public class Fragment {
             tableId,
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
             lanceSchema.memoryAddress(),
             sessionHandle);
       }
@@ -404,6 +408,7 @@ public class Fragment {
         tableId,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold(),
+        params.getFileWriteOptions(),
         0L,
         sessionHandle);
   }
@@ -435,6 +440,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       long schemaMemoryAddress,
       long sessionHandle);
 
@@ -456,6 +462,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       long schemaMemoryAddress,
       long sessionHandle);
 }

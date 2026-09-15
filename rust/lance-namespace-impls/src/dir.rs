@@ -38,7 +38,7 @@ use lance_index::vector::{
 };
 use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::throttle::is_throttle_error;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, ReadDirOptions};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
+use crate::merge_insert_on_columns;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
@@ -344,7 +345,7 @@ impl DirectoryNamespaceBuilder {
             session: None,
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
-            inline_optimization_enabled: true,
+            inline_optimization_enabled: false,
             table_version_tracking_enabled: false, // Default to disabled
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
@@ -387,8 +388,8 @@ impl DirectoryNamespaceBuilder {
 
     /// Enable or disable replacement index maintenance for the __manifest table.
     ///
-    /// When enabled (default), copy-on-write manifest rewrites build replacement indices
-    /// for fast reads. When disabled, rewrites only replace data files.
+    /// When enabled, copy-on-write manifest rewrites build replacement indices for fast
+    /// reads. This is disabled by default so rewrites only replace data files.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -413,7 +414,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: false)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -511,11 +512,11 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
-        // Extract inline_optimization_enabled (default: true)
+        // Extract inline_optimization_enabled (default: false)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
             .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
@@ -1156,34 +1157,74 @@ impl DirectoryNamespace {
         None
     }
 
+    /// Page size requested from [`ObjectStore::read_dir_page`] while scanning the namespace
+    /// directory for tables. Only bounds the cost of one backend request on stores that push
+    /// pagination down (S3, GCS, Azure); `list_directory_tables` always walks every page.
+    const LIST_DIRECTORY_PAGE_SIZE: usize = 1000;
+
     /// List tables using directory scanning (fallback method)
     async fn list_directory_tables(&self) -> Result<Vec<String>> {
         let mut tables = Vec::new();
-        let entries = self
-            .object_store
-            .read_dir(self.base_path.clone())
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {:?}", e),
+        let mut page_token = None;
+
+        loop {
+            let page = self
+                .object_store
+                .read_dir_page(
+                    self.base_path.clone(),
+                    ReadDirOptions {
+                        page_token,
+                        // Only a hint to backends with a paginated list API (S3, GCS, Azure):
+                        // it bounds the cost of one request, not the number of tables returned.
+                        // Every other backend still lists (and pages through) the whole
+                        // directory here regardless, same as `read_dir` always did.
+                        limit: Some(Self::LIST_DIRECTORY_PAGE_SIZE),
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to list directory: {:?}", e),
+                    })
+                })?;
+
+            let candidates: Vec<String> = page
+                .result
+                .common_prefixes
+                .iter()
+                .chain(page.result.objects.iter().map(|o| &o.location))
+                .filter_map(|p| {
+                    p.filename()?
+                        .trim_end_matches('/')
+                        .strip_suffix(".lance")
+                        .map(|name| name.to_string())
                 })
-            })?;
+                .collect();
 
-        for entry in entries {
-            let path = entry.trim_end_matches('/');
-            if !path.ends_with(".lance") {
-                continue;
+            // Each candidate needs its own `check_table_status` round trip (a `read_dir` probe
+            // for a deregistration marker), so this is linear in the number of listed entries;
+            // run a bounded number concurrently rather than one at a time.
+            let mut stream =
+                futures::stream::iter(candidates.into_iter().map(|table_name| async move {
+                    let status = self.check_table_status(&table_name).await?;
+                    Ok::<Option<String>, Error>((!status.is_deregistered).then_some(table_name))
+                }))
+                .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+            while let Some(result) = stream.next().await {
+                if let Some(table_name) = result? {
+                    tables.push(table_name);
+                }
             }
 
-            let table_name = &path[..path.len() - 6];
-
-            // Use atomic check to skip deregistered tables.
-            let status = self.check_table_status(table_name).await?;
-            if status.is_deregistered {
-                continue;
+            // A page can come back holding fewer children than the requested limit and still
+            // be followed by more (a backend can spend its page budget on keys a delimiter
+            // collapses away, or cap a page on its own besides) — walk until the token is
+            // `None`, not until a page comes back short.
+            page_token = page.page_token;
+            if page_token.is_none() {
+                break;
             }
-
-            tables.push(table_name.to_string());
         }
 
         Ok(tables)
@@ -5115,11 +5156,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<MergeInsertIntoTableResponse> {
         self.record_op("merge_insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let on = request.on.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge_insert_into_table".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
@@ -5145,8 +5182,8 @@ impl LanceNamespace for DirectoryNamespace {
                 .await?,
         );
 
-        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
-            .map_err(|e| {
+        let mut merge_builder =
+            MergeInsertBuilder::try_new(dataset.clone(), on.to_vec()).map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
                     message: format!("Failed to create merge_insert_into_table builder: {}", e),
                 })
@@ -6770,6 +6807,7 @@ mod tests {
                 Some(ListBehavior::EmptyListing) => Ok(ListResult {
                     common_prefixes: Vec::new(),
                     objects: Vec::new(),
+                    extensions: Default::default(),
                 }),
                 // Mirrors the object_store retry-exhaustion message shape for an
                 // Azure ServerBusy response, which is what the incident produced.
@@ -9743,9 +9781,15 @@ mod tests {
         properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
 
         let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
-        // Both should default to true
         assert!(builder.manifest_enabled);
         assert!(builder.dir_listing_enabled);
+        assert!(!builder.inline_optimization_enabled);
+    }
+
+    #[test]
+    fn test_builder_disables_inline_optimization_by_default() {
+        let builder = DirectoryNamespaceBuilder::new("memory://");
+        assert!(!builder.inline_optimization_enabled);
     }
 
     #[tokio::test]
@@ -11384,7 +11428,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11435,7 +11479,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11460,6 +11504,244 @@ mod tests {
         assert_eq!(
             namespace.list_tables(list_req).await.unwrap().tables,
             vec!["test_table".to_string()]
+        );
+    }
+
+    /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+    ///
+    /// `region` is nullable so tests can cover a NULL in one half of the key.
+    fn create_composite_key_ipc_data(rows: &[(Option<&str>, i32, &str)]) -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter(
+                    rows.iter().map(|(region, _, _)| *region),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, id, _)| *id),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, _, value)| *value),
+                )),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    /// `test_table`'s rows as `(region, id, value)`, sorted for a stable comparison.
+    async fn read_composite_key_rows(root: &str) -> Vec<(Option<String>, i32, String)> {
+        use arrow::array::Array;
+
+        let dataset = Dataset::open(&format!("{}/test_table.lance", root))
+            .await
+            .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    regions
+                        .is_valid(row)
+                        .then(|| regions.value(row).to_string()),
+                    ids.value(row),
+                    values.value(row).to_string(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_matches_on_every_column_of_a_composite_key() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let seed = create_composite_key_ipc_data(&[
+            (Some("us"), 1, "a"),
+            (Some("us"), 2, "b"),
+            (Some("eu"), 1, "c"),
+        ]);
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(merge_req, bytes::Bytes::from(seed))
+            .await
+            .unwrap();
+
+        // ("us", 1) matches an existing row; ("eu", 2) matches nothing even though a row
+        // with region "eu" and a row with id 2 both exist.
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (Some("us"), 1, "updated"),
+                    (Some("eu"), 2, "inserted"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_updated_rows, Some(1));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                // ("eu", 1) keeps its value: matching on `id` alone would have clobbered it.
+                (Some("eu".into()), 1, "c".into()),
+                (Some("eu".into()), 2, "inserted".into()),
+                (Some("us".into()), 1, "updated".into()),
+                (Some("us".into()), 2, "b".into()),
+            ]
+        );
+    }
+
+    /// Core switches NULL join semantics on the arity of the match key
+    /// (`merge_insert.rs`, `NullEquality`): a single-column key treats NULL as equal to
+    /// NULL, while a composite key uses standard SQL equality, under which it is not. So
+    /// adding a second key column changes whether NULL-keyed rows match at all.
+    #[tokio::test]
+    async fn test_merge_insert_composite_key_never_matches_a_null_key_column() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (None, 1, "seeded"),
+                    (Some("us"), 1, "us-seeded"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(None, 1, "not-a-match")])),
+            )
+            .await
+            .unwrap();
+
+        // The incoming row is byte-identical to the seeded one, and still does not match.
+        assert_eq!(response.num_updated_rows, Some(0));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                (None, 1, "not-a-match".into()),
+                (None, 1, "seeded".into()),
+                (Some("us".into()), 1, "us-seeded".into()),
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, "'on' field is required")]
+    #[case::empty(Some(vec![]), "must name at least one column")]
+    #[case::duplicate(
+        Some(vec!["region".to_string(), "region".to_string()]),
+        "names column 'region' more than once"
+    )]
+    #[tokio::test]
+    async fn test_merge_insert_rejects_an_invalid_on_key(
+        #[case] on: Option<Vec<String>>,
+        #[case] expected_message: &str,
+    ) {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = on;
+        let error = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(Some("us"), 1, "a")])),
+            )
+            .await
+            .unwrap_err();
+
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected a Namespace error, got: {}", error);
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected a NamespaceError source");
+        assert_eq!(ns_err.code(), lance_namespace::ErrorCode::InvalidInput);
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error message: {error}"
         );
     }
 

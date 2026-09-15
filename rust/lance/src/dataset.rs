@@ -70,6 +70,7 @@ pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -115,7 +116,8 @@ mod utils;
 pub(crate) mod versions;
 pub mod write;
 
-pub use data_file::{DataFilePart, DataFileTarget};
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -133,8 +135,8 @@ use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
-    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    default_commit_retry_timeout, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -154,6 +156,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -795,6 +798,8 @@ impl Dataset {
 
         ensure_can_read_manifest(&manifest)?;
 
+        versions::check_manifest_storage_version(&mut manifest)?;
+
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section
@@ -835,16 +840,17 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            if let Some(transaction) =
+                decode_inline_transaction(message_data, manifest_location.version)
+            {
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -1663,7 +1669,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
         )
@@ -3441,6 +3447,7 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
+        let mut blob_dirs = HashSet::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::internal(format!(
@@ -3460,8 +3467,36 @@ impl Dataset {
                 };
                 file_paths.push((
                     format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_root,
+                    base_root.clone(),
                 ));
+
+                if !data_file
+                    .schema(self.schema())
+                    .fields_pre_order()
+                    .any(|field| field.is_blob_v2())
+                {
+                    continue;
+                }
+
+                // Blob v2 sidecars are not listed in the manifest. Their directory is
+                // derived from the owning data file, so enumerate it to copy packed and
+                // dedicated payloads without decoding blob descriptors. External blobs
+                // remain caller-owned references and are deliberately not collected.
+                let data_file_key = blob::data_file_key_from_path(data_file.path.as_str());
+                let relative_blob_dir = format!("{}/{}", DATA_DIR, data_file_key);
+                let blob_dir = base_root.clone().join(DATA_DIR).join(data_file_key);
+                // Overlays can make the same data file reachable from multiple fragments.
+                if blob_dirs.insert(blob_dir.clone()) {
+                    let mut stream = self.object_store.read_dir_all(&blob_dir, None);
+                    while let Some(meta) = stream.next().await.transpose()? {
+                        if let Some(filename) = meta.location.filename() {
+                            file_paths.push((
+                                format!("{}/{}", relative_blob_dir, filename),
+                                base_root.clone(),
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
@@ -4113,6 +4148,31 @@ impl ManifestWriteConfig {
     }
 }
 
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
+        }
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
@@ -4163,6 +4223,8 @@ pub(crate) async fn write_manifest_file(
             config.disable_transaction_file,
         )?;
     }
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 

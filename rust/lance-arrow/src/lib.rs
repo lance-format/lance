@@ -1268,22 +1268,23 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                         if left_list.data_type().is_struct()
                             && right_list.data_type().is_struct() =>
                     {
-                        // If there is nothing to merge just use the left field
+                        // Identical inner types: nothing to merge, keep the left column.
                         if left_list.data_type() == right_list.data_type() {
                             fields.push(left_field.as_ref().clone());
                             columns.push(left_column.clone());
-                        }
-                        // If we have two List<Struct> and they have different sets of fields then
-                        // we can merge them if the offsets arrays are the same.  Otherwise, we
-                        // have to consider it an error.
-                        let merged_sub_array = merge_list_struct(&left_column, &right_column);
+                        } else {
+                            // The struct fields differ, so merge them structurally. merge_list_struct
+                            // only succeeds when both lists share offsets or one side is all-null;
+                            // it panics otherwise.
+                            let merged_sub_array = merge_list_struct(&left_column, &right_column);
 
-                        fields.push(Field::new(
-                            left_field.name(),
-                            merged_sub_array.data_type().clone(),
-                            left_field.is_nullable(),
-                        ));
-                        columns.push(merged_sub_array);
+                            fields.push(Field::new(
+                                left_field.name(),
+                                merged_sub_array.data_type().clone(),
+                                left_field.is_nullable(),
+                            ));
+                            columns.push(merged_sub_array);
+                        }
                     }
                     // otherwise, just use the field on the left hand side
                     _ => {
@@ -1877,6 +1878,105 @@ mod tests {
             RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
         let merged = x_batch.merge(&y_null_batch).unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn test_merge_list_struct_identical_schema() {
+        // Merging two batches whose `List<Struct>` columns have identical types
+        // should yield a single column equal to the input (there is nothing to
+        // merge), not a struct with the field pushed twice.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(item_field.clone()),
+            true,
+        )]));
+
+        let build_list = |values: Vec<i32>| {
+            let len = values.len();
+            let item_struct = Arc::new(StructArray::new(
+                Fields::from(vec![x_field.clone()]),
+                vec![Arc::new(Int32Array::from(values))],
+                None,
+            ));
+            ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths([len]),
+                item_struct,
+                None,
+            )
+        };
+
+        // Distinct values so the equality assertion proves the left column is kept,
+        // not that some column with the same values happens to be present.
+        let left =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(build_list(vec![1, 2]))]).unwrap();
+        let right = RecordBatch::try_new(schema, vec![Arc::new(build_list(vec![3, 4]))]).unwrap();
+
+        let merged = left.merge(&right).unwrap();
+
+        // Exactly one column, equal to the left input: the field must not be duplicated.
+        assert_eq!(merged.num_columns(), 1);
+        assert_eq!(merged, left);
+    }
+
+    #[test]
+    fn test_merge_nested_list_struct_identical_schema() {
+        // A `List<Struct>` nested inside a struct reaches the identical-type
+        // short-circuit through the recursive `merge` call. The recursion must
+        // keep the field exactly once, equal to the left input.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let companies_field = Arc::new(Field::new(
+            "companies",
+            DataType::List(item_field.clone()),
+            true,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![companies_field.clone()])),
+            true,
+        )]));
+
+        let build_outer = |x: i32| {
+            // One list row: [{x}].
+            let item_struct = Arc::new(StructArray::new(
+                Fields::from(vec![x_field.clone()]),
+                vec![Arc::new(Int32Array::from(vec![x]))],
+                None,
+            ));
+            let companies = Arc::new(ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths([1]),
+                item_struct,
+                None,
+            ));
+            StructArray::new(
+                Fields::from(vec![companies_field.clone()]),
+                vec![companies],
+                None,
+            )
+        };
+
+        // Distinct values so equality proves the left column is kept.
+        let left = RecordBatch::try_new(schema.clone(), vec![Arc::new(build_outer(10))]).unwrap();
+        let right = RecordBatch::try_new(schema, vec![Arc::new(build_outer(20))]).unwrap();
+
+        let merged = left.merge(&right).unwrap();
+
+        // The recursive identical-type merge keeps exactly one `companies` field,
+        // with no double-push inside the nested struct.
+        assert_eq!(merged.column(0).as_struct().num_columns(), 1);
+        assert_eq!(merged, left);
     }
 
     #[test]

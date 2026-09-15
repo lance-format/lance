@@ -10,7 +10,7 @@ pub struct Bitmap {
 }
 
 /// Set bits in `data`, counted a word at a time.
-fn count_ones(data: &[u8]) -> usize {
+pub(super) fn count_ones(data: &[u8]) -> usize {
     let mut words = data.chunks_exact(8);
     let full: usize = words
         .by_ref()

@@ -103,7 +103,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
-use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
+use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
@@ -126,6 +126,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -306,6 +307,21 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
+    /// Exact data file version for compacted output.
+    ///
+    /// If omitted, use the dataset's default write version without changing it.
+    /// The planner resolves release selectors before distributing tasks.
+    /// Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::dataset::optimize::CompactionOptions;
+    /// # use lance_file::version::LanceFileVersion;
+    /// let options = CompactionOptions {
+    ///     data_storage_version: Some(LanceFileVersion::V2_2),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    pub data_storage_version: Option<LanceFileVersion>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -339,6 +355,7 @@ impl Default for CompactionOptions {
             max_source_bytes: None,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
+            data_storage_version: None,
             transaction_properties: None,
         }
     }
@@ -368,6 +385,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
+    /// - `lance.compaction.data_storage_version`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -461,6 +479,14 @@ impl CompactionOptions {
                 }
                 "compaction_mode" => {
                     self.compaction_mode = Some(CompactionMode::try_from(value.as_str())?);
+                }
+                "data_storage_version" => {
+                    self.data_storage_version = Some(value.parse().map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}': {}",
+                            key, value, error
+                        ))
+                    })?);
                 }
                 "binary_copy_read_batch_bytes" => {
                     self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
@@ -559,6 +585,12 @@ impl CompactionOptions {
         self.transaction_properties = Some(Arc::new(properties));
         self
     }
+
+    fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+        self.data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
 }
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
@@ -578,13 +610,28 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let version = options.write_version(dataset);
     versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
             false
         })
+}
+
+fn first_binary_copy_version_mismatch(
+    fragments: &[Fragment],
+    target: ConcreteFileVersion,
+) -> Result<Option<(String, ConcreteFileVersion)>> {
+    for fragment in fragments {
+        for data_file in fragment.referenced_lance_files() {
+            let actual = data_file.file_version()?;
+            if actual != target {
+                return Ok(Some((data_file.path.clone(), actual)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(super) async fn can_use_binary_copy_current(
@@ -635,6 +682,14 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
     for fragment in fragments {
+        // Binary copy only reads base files; overlays must be materialized by the scanner.
+        if !fragment.overlays.is_empty() {
+            log::debug!(
+                "Binary copy disabled: fragment {} has data overlays",
+                fragment.id
+            );
+            return Ok(false);
+        }
         if fragment.deletion_file.is_some() {
             log::debug!(
                 "Binary copy disabled: fragment {} has a deletion file",
@@ -751,6 +806,11 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        let write_version = self.options.write_version(dataset);
+        versions::validate_write_version(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
+        )?;
         if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
             return Err(Error::invalid_input(
                 "defer_index_remap=true is not supported on datasets with stable row IDs: \
@@ -924,8 +984,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        let mut compaction_plan =
-            CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        let mut options = self.options.clone();
+        options.data_storage_version = Some(write_version.to_selector());
+        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
@@ -2273,7 +2334,7 @@ async fn reserve_fragment_ids(
         &transaction,
         &Default::default(),
         &Default::default(),
-        DEFAULT_COMMIT_RETRY_TIMEOUT,
+        default_commit_retry_timeout(),
         dataset.manifest_location.naming_scheme,
         None,
     )
@@ -2299,6 +2360,11 @@ async fn rewrite_files(
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
+    let write_version = options.write_version(dataset.as_ref());
+    versions::validate_write_version(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        write_version,
+    )?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -2343,6 +2409,15 @@ async fn rewrite_files(
     let mode = options.compaction_mode();
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
+        if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
+        {
+            return Err(Error::not_supported_source(
+                format!(
+                    "compaction task {task_id}: binary copy target is {write_version}, but data file '{path}' uses {actual}"
+                )
+                .into(),
+            ));
+        }
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -2459,6 +2534,7 @@ async fn rewrite_files(
         // (e.g. absolute file:// URIs with base_id == 0). Without this flag
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
+        data_storage_version: Some(write_version.to_selector()),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -2470,9 +2546,8 @@ async fn rewrite_files(
     }
 
     if can_binary_copy {
-        let version = dataset.manifest.data_storage_format.lance_file_format();
         new_fragments = versions::rewrite_files_binary_copy(
-            version,
+            write_version,
             dataset.as_ref(),
             &fragments,
             &params,
@@ -2506,7 +2581,7 @@ async fn rewrite_files(
         }
     } else {
         let (frags, _) = write_fragments_internal_with_file_row_counts(
-            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
@@ -3062,6 +3137,7 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -3332,6 +3408,179 @@ mod tests {
     }
 
     #[rstest]
+    #[case::default(None, LanceFileVersion::V2_0)]
+    #[case::stable(Some(LanceFileVersion::Stable), LanceFileVersion::V2_2)]
+    #[case::next(Some(LanceFileVersion::Next), LanceFileVersion::V2_3)]
+    #[tokio::test]
+    async fn plan_compaction_freezes_storage_version_selector(
+        #[case] selector: Option<LanceFileVersion>,
+        #[case] exact: LanceFileVersion,
+    ) {
+        let data = arrow_array::record_batch!(("id", Int32, [1, 2, 3, 4, 5, 6])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: selector,
+            excluded_fragment_ids: vec![2],
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+
+        assert_eq!(plan.options.data_storage_version, Some(exact));
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serialized["options"]["data_storage_version"],
+            exact.to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<CompactionPlan>(serialized).unwrap(),
+            plan
+        );
+        assert_eq!(plan.num_tasks(), 1);
+        let retained = dataset.manifest.fragments[2].clone();
+        let task = plan.compaction_tasks().next().unwrap();
+        let task: CompactionTask =
+            serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(
+            result
+                .new_fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == exact.resolve())
+        );
+        let result: RewriteResult =
+            serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .any(|fragment| fragment == &retained)
+        );
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        let actual = dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, data);
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn compaction_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(source),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: Some(target),
+            ..Default::default()
+        };
+        let error = plan_compaction(&dataset, &options).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+        // Standalone distributed tasks also validate, independently of the planner.
+        let mut task = plan_compaction(&dataset, &CompactionOptions::default())
+            .await
+            .unwrap()
+            .compaction_tasks()
+            .next()
+            .unwrap();
+        task.options = options;
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+    }
+
+    #[rstest]
+    #[case("0.1", Some(LanceFileVersion::Legacy))]
+    #[case("2.0", Some(LanceFileVersion::V2_0))]
+    #[case("2.1", Some(LanceFileVersion::V2_1))]
+    #[case("2.2", Some(LanceFileVersion::V2_2))]
+    #[case("2.3", Some(LanceFileVersion::V2_3))]
+    #[case("stable", Some(LanceFileVersion::Stable))]
+    #[case("next", Some(LanceFileVersion::Next))]
+    #[case("invalid", None)]
+    fn compaction_storage_version_config(
+        #[case] value: &str,
+        #[case] expected: Option<LanceFileVersion>,
+    ) {
+        let config = HashMap::from([(
+            "lance.compaction.data_storage_version".to_string(),
+            value.to_string(),
+        )]);
+        let result = CompactionOptions::from_dataset_config(&config);
+        if let Some(expected) = expected {
+            let options = result.unwrap();
+            assert_eq!(options.data_storage_version, Some(expected));
+            let json = serde_json::to_value(&options).unwrap();
+            assert_eq!(json["data_storage_version"], value);
+            assert_eq!(
+                serde_json::from_value::<CompactionOptions>(json).unwrap(),
+                options
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("lance.compaction.data_storage_version")
+            );
+            assert!(error.to_string().contains(value));
+            let error =
+                serde_json::from_value::<LanceFileVersion>(serde_json::json!(value)).unwrap_err();
+            assert!(error.to_string().contains(value));
+        }
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_compact_all_good(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -3566,6 +3815,7 @@ mod tests {
             reader,
             &test_dir,
             Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 max_rows_per_file: 1,
                 ..Default::default()
             }),
@@ -4381,38 +4631,52 @@ mod tests {
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076
     ///
-    /// A zone map or bloom filter index reports matches as physical row addresses, so
+    /// Zone map, bloom filter, and FM indices report matches as physical row addresses, so
     /// compaction invalidates it even under stable row ids. Reusing it for the rewritten
     /// fragments made a filtered scan fail with an internal error (a fragment referenced
     /// by the index no longer existed) or, once translation tolerated that, silently drop
     /// every match.
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        100
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
         #[case] builtin: BuiltinIndexType,
         #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
+        #[case] query: &str,
+        #[case] expected_rows: usize,
     ) {
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-        let mut dataset = Dataset::write(
-            data_gen.batch(200),
-            "memory://test/table",
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                max_rows_per_file: 100, // 2 fragments, so compaction has something to merge
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         dataset
             .create_index(
-                &["i"],
+                &[indexed_column],
                 index_type,
-                None,
+                Some("addr_idx".to_string()),
                 &ScalarIndexParams::for_builtin(builtin),
                 false,
             )
@@ -4432,7 +4696,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .find(|index| index.fields == vec![0])
+            .find(|index| index.name == "addr_idx")
             .expect("index must survive compaction")
             .clone();
         assert!(
@@ -4445,9 +4709,9 @@ mod tests {
         // Every fragment therefore falls back to a full scan, and the filter is answered
         // in full.
         let mut scanner = dataset.scan();
-        scanner.filter("i > 0").unwrap();
+        scanner.filter(query).unwrap();
         let matched = scanner.try_into_batch().await.unwrap();
-        assert_eq!(matched.num_rows(), 199);
+        assert_eq!(matched.num_rows(), expected_rows);
     }
 
     // Regression test for https://github.com/lancedb/lance/issues/6161
@@ -4517,6 +4781,138 @@ mod tests {
         load_frag_reuse_index_details(&dataset, &frag_reuse_meta)
             .await
             .expect("loading large frag reuse index details must not fail");
+    }
+
+    /// A shallow clone stamps its index metadata with a `base_id`, and the
+    /// entry's external `details.binpb` stays in the SOURCE dataset's indices
+    /// directory. Loading the details on the clone must resolve the file
+    /// through the entry's base instead of the clone's own dataset root,
+    /// which never contained the file.
+    #[tokio::test]
+    async fn test_shallow_clone_loads_external_frag_reuse_details() {
+        // On disk: base-path resolution must reach the source dataset's
+        // store, which memory:// fixtures cannot demonstrate.
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let clone_uri = format!("{}/clone", clone_dir);
+
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use lance_index::frag_reuse::{FragDigest, FragReuseIndexDetails, FragReuseVersion};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            &source_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // An FRI entry whose details spill to the external file: real
+        // compactions produce run-compressed bitmaps far below the
+        // 204800-byte inline threshold, so synthesize enough reuse versions
+        // to cross it.
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        let mut versions = Vec::new();
+        for i in 0..3500u64 {
+            let old_id = 1_000 + i;
+            let mut addrs = RoaringTreemap::new();
+            for offset in 0..4u64 {
+                addrs.insert((old_id << 32) + offset);
+            }
+            let mut serialized = Vec::new();
+            addrs.serialize_into(&mut serialized).unwrap();
+            versions.push(FragReuseVersion {
+                dataset_version: i + 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialized,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            });
+        }
+        let details = FragReuseIndexDetails { versions };
+        let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
+        let entry = build_frag_reuse_index_metadata(&dataset, None, details, bitmap)
+            .await
+            .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![entry],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let source_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist");
+        // Sanity: the details actually went external.
+        let proto = source_meta
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+            .unwrap();
+        assert!(matches!(
+            proto.content,
+            Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
+        ));
+        let source_details = load_frag_reuse_index_details(&dataset, &source_meta)
+            .await
+            .unwrap();
+        assert_eq!(source_details.versions.len(), 3500);
+
+        let version = dataset.manifest.version;
+        let clone = dataset
+            .shallow_clone(clone_uri.as_str(), version, None)
+            .await
+            .unwrap();
+        let clone_meta = clone
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the clone must carry the fragment reuse index");
+        assert!(clone_meta.base_id.is_some());
+
+        // Before the fix this failed with a not-found error: the loader
+        // looked for details.binpb under the clone's own indices dir.
+        let clone_details = load_frag_reuse_index_details(&clone, &clone_meta)
+            .await
+            .expect("the clone must load external FRI details through its base");
+        assert_eq!(clone_details, source_details);
+
+        // The dataset-level open path goes through the same loader.
+        let index = clone
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .expect("the clone must open the fragment reuse index");
+        assert_eq!(index.details.versions, source_details.versions);
     }
 
     #[tokio::test]
@@ -10088,6 +10484,91 @@ mod tests {
             out.insert(ids.value(i), v);
         }
         out
+    }
+
+    #[rstest]
+    #[case::default_target(LanceFileVersion::V2_2, None)]
+    #[case::explicit_target(LanceFileVersion::V2_2, Some(LanceFileVersion::V2_2))]
+    #[case::non_default_target(LanceFileVersion::V2_0, Some(LanceFileVersion::V2_2))]
+    #[tokio::test]
+    async fn test_compaction_target_preserves_overlays(
+        #[case] default_version: LanceFileVersion,
+        #[case] target: Option<LanceFileVersion>,
+        #[values(
+            CompactionMode::Reencode,
+            CompactionMode::TryBinaryCopy,
+            CompactionMode::ForceBinaryCopy
+        )]
+        mode: CompactionMode,
+    ) {
+        let batch = record_batch!(
+            ("id", Int32, [0, 1, 2, 3]),
+            ("val", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(RecordBatch::new_empty(batch.schema()))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(default_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The first fragment is clean; eligibility must inspect every fragment.
+        let mut dataset = commit_overlay(
+            dataset,
+            1,
+            &[1],
+            OverlayCoverage::dense(bitmap([0, 1])),
+            vec![i32_array([Some(999), None])],
+        )
+        .await;
+        let expected = BTreeMap::from([(0, Some(10)), (1, Some(20)), (2, Some(999)), (3, None)]);
+        assert_eq!(id_val_map(&dataset).await, expected);
+        let manifest = dataset.manifest.clone();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4,
+            data_storage_version: target,
+            compaction_mode: Some(mode),
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        if mode == CompactionMode::ForceBinaryCopy {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("binary copy is not supported"));
+            assert_eq!(dataset.manifest, manifest);
+        } else {
+            let metrics = result.unwrap();
+            assert_eq!(metrics.fragments_removed, 2);
+            assert_eq!(metrics.fragments_added, 1);
+            assert!(dataset.manifest.fragments[0].overlays.is_empty());
+            assert_eq!(
+                dataset.manifest.fragments[0].files[0]
+                    .file_version()
+                    .unwrap(),
+                ConcreteFileVersion::V2_2
+            );
+        }
+        assert_eq!(id_val_map(&dataset).await, expected);
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version.resolve()
+        );
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]

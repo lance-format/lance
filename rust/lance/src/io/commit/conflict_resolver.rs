@@ -711,7 +711,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
-                    ..
+                    removed_indices: committed_removed_indices,
                 } => {
                     let self_has_frag_reuse = new_indices
                         .iter()
@@ -734,10 +734,49 @@ impl<'a> TransactionRebase<'a> {
                                 .iter()
                                 .any(|created_index| created_index.name == new_index.name)
                         });
+                    // An appended segment has no removed source UUID to identify the
+                    // logical index it extends, so a concurrent same-name removal
+                    // must conflict. Replacement-style maintenance is handled by
+                    // exact source identity below, allowing disjoint segment changes
+                    // under the same logical name to merge.
+                    let has_append_drop_conflict = new_indices.iter().any(|new_index| {
+                        !removed_indices
+                            .iter()
+                            .any(|removed_index| removed_index.name == new_index.name)
+                            && committed_removed_indices
+                                .iter()
+                                .any(|removed_index| removed_index.name == new_index.name)
+                    }) || created_indices.iter().any(|created_index| {
+                        !committed_removed_indices
+                            .iter()
+                            .any(|removed_index| removed_index.name == created_index.name)
+                            && removed_indices
+                                .iter()
+                                .any(|removed_index| removed_index.name == created_index.name)
+                    });
+                    // Replacement metadata depends on the exact source segments it
+                    // was built from. If either side removed the same UUID, publishing
+                    // a replacement would undo a drop or use a stale source identity.
+                    // Concurrent pure removals remain idempotent.
+                    let has_replaced_identity_conflict =
+                        removed_indices.iter().any(|removed_index| {
+                            committed_removed_indices.iter().any(|committed_removed| {
+                                committed_removed.uuid == removed_index.uuid
+                                    && (new_indices.iter().any(|new_index| {
+                                        new_index.name == removed_index.name
+                                            || new_index.name == committed_removed.name
+                                    }) || created_indices.iter().any(|created_index| {
+                                        created_index.name == removed_index.name
+                                            || created_index.name == committed_removed.name
+                                    }))
+                            })
+                        });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
                         || has_regular_name_conflict
+                        || has_append_drop_conflict
+                        || has_replaced_identity_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -4356,6 +4395,148 @@ mod tests {
             different_name_result.is_ok(),
             "Expected compatibility for different-name CreateIndex, got {:?}",
             different_name_result
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::optimize_after_drop(false, true)]
+    #[case::drop_after_optimize(true, true)]
+    #[case::append_segment_after_drop(false, false)]
+    #[case::drop_after_append_segment(true, false)]
+    fn test_create_index_conflicts_with_concurrent_drop(
+        #[case] drop_is_current: bool,
+        #[case] maintenance_replaces_existing: bool,
+    ) {
+        let existing = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let drop_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![existing.clone()],
+        };
+        let maintenance_operation = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: Uuid::new_v4(),
+                ..existing.clone()
+            }],
+            removed_indices: maintenance_replaces_existing
+                .then(|| existing.clone())
+                .into_iter()
+                .collect(),
+        };
+        let (current_operation, committed_operation) = if drop_is_current {
+            (drop_operation, maintenance_operation)
+        } else {
+            (maintenance_operation, drop_operation)
+        };
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, current_operation, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
+
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected a retryable conflict between index maintenance and drop, got {result:?}"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("preempted by concurrent transaction")
+                && message.contains("version 1"),
+            "Unexpected conflict message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_index_drops_are_compatible() {
+        let existing = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let drop_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![existing],
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, drop_operation.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
+
+        assert!(
+            result.is_ok(),
+            "Concurrent drops of the same index should be idempotent, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_index_replacement_compatible_with_removing_disjoint_segment() {
+        let index = |uuid| IndexMetadata {
+            uuid,
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let replaced = index(Uuid::new_v4());
+        let concurrently_removed = index(Uuid::new_v4());
+        let replacement_operation = Operation::CreateIndex {
+            new_indices: vec![index(Uuid::new_v4())],
+            removed_indices: vec![replaced],
+        };
+        let removal_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![concurrently_removed],
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, replacement_operation, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
+
+        assert!(
+            result.is_ok(),
+            "Replacing one segment should be compatible with removing another, got {result:?}"
         );
     }
 

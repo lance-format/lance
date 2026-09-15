@@ -77,8 +77,6 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
           tool: protoc
-      - name: Test Rust reader concurrency
-        run: cargo test --profile ci --locked --no-default-features reader::tests
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -95,6 +93,39 @@ jobs:
         run: |
           source venv/bin/activate
           pytest --doctest-modules python/lance
+
+  python-rust-test:
+    timeout-minutes: 30
+    name: pylance crate Rust tests
+    runs-on: "ubuntu-24.04-4x"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      # The default `extension-module` feature leaves libpython unlinked, which the
+      # host interpreter resolves at load time but a test binary cannot. Disabling it
+      # links libpython so these tests run instead of only compiling.
+      - name: Test Rust
+        run: cargo test --profile ci --locked --no-default-features
+
   linux-wheel:
     timeout-minutes: 45
     name: Python Linux x86_64 wheel
