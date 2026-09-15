@@ -662,13 +662,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
     use super::StructuralStructDecoder;
+    use crate::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
     use crate::decoder::StructuralFieldDecoder;
     use crate::testing::{
         TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
@@ -1128,5 +1129,49 @@ mod tests {
             .collect::<Vec<_>>();
         check_round_trip_encoding_of_data(struct_arrays, &TestCases::default(), HashMap::new())
             .await;
+    }
+
+    /// A null list produces an "invisible" item: a rep/def entry that owns no value in the
+    /// leaf page.  The full-zip decoder works out which items own a value from
+    /// `max_visible_def`, and adding a second nullable layer *above* the list (the struct
+    /// itself) must not move that threshold.  When it does, the decoder hands a value to
+    /// every null list and each later value shifts by one.
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_full_zip_invisible_items_under_nullable_struct(
+        #[values(false, true)] variable_width_items: bool,
+    ) {
+        // struct<x: list<item>> with both layers nullable:
+        //   {x: [_, _]} / {x: null} / {x: [_]} / null / {x: [_, _]}
+        let (item_type, items): (DataType, ArrayRef) = if variable_width_items {
+            (
+                DataType::Utf8,
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            )
+        } else {
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            )
+        };
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", item_type, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3, 3, 5])),
+            items,
+            Some(NullBuffer::from(vec![true, false, true, true, true])),
+        );
+        let fields = Fields::from(vec![Field::new("x", lists.data_type().clone(), true)]);
+        let rows = StructArray::new(
+            fields,
+            vec![Arc::new(lists)],
+            Some(NullBuffer::from(vec![true, true, true, false, true])),
+        );
+
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, metadata).await;
     }
 }

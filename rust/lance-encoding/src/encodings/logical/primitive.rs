@@ -64,7 +64,7 @@ use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
         MiniBlockRepDefBudget, NormalizedStructuralPlan, RepDefSlicer, SerializedRepDefs,
-        build_control_word_iterator,
+        build_control_word_iterator, max_visible_level,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -870,12 +870,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         // we were still in the middle of loading rows.  We do need to latch skip_in_chunk though.
         self.offset_in_current_chunk = skip_in_chunk;
 
-        let max_visible_level = self
-            .def_meaning
-            .iter()
-            .take_while(|l| !l.is_list())
-            .map(|l| l.num_def_levels())
-            .sum::<u16>();
+        let max_visible_level = max_visible_level(&self.def_meaning);
 
         Ok(Box::new(DecodeMiniBlockTask {
             instructions: drain_instructions,
@@ -1604,11 +1599,7 @@ impl ComplexAllNullScheduler {
             .iter()
             .map(|meaning| meaning.num_def_levels())
             .sum::<u16>();
-        let max_visible_level = def_meaning
-            .iter()
-            .take_while(|l| !l.is_list())
-            .map(|l| l.num_def_levels())
-            .sum::<u16>();
+        let max_visible_level = max_visible_level(&def_meaning);
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
@@ -3023,11 +3014,7 @@ impl FullZipScheduler {
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
-        let max_visible_def = def_meaning
-            .iter()
-            .filter(|d| !d.is_list())
-            .map(|d| d.num_def_levels())
-            .sum();
+        let max_visible_def = max_visible_level(&def_meaning);
 
         let bits_per_offset = match layout.details {
             Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
@@ -3415,9 +3402,14 @@ struct FixedFullZipDecoder {
 }
 
 impl FixedFullZipDecoder {
-    fn slice_next_task(&mut self, num_rows: u64) -> FullZipDecodeTaskItem {
+    fn slice_next_task(&mut self, num_rows: u64) -> Result<FullZipDecodeTaskItem> {
         debug_assert!(num_rows > 0);
-        let cur_buf = self.data.front_mut().unwrap();
+        let cur_buf = self.data.front_mut().ok_or_else(|| {
+            Error::corrupt_file_named(
+                "fixed_full_zip",
+                format!("page data ran out with {num_rows} row(s) left to decode"),
+            )
+        })?;
         let start = self.offset_in_current;
         if self.details.ctrl_word_parser.has_rep() {
             // This is a slightly slower path.  In order to figure out where to split we need to
@@ -3426,7 +3418,22 @@ impl FixedFullZipDecoder {
             // We always need at least one value.  Now loop through until we have passed num_rows
             // values
             let mut num_items = 0;
+            let bytes_per_word = self.details.ctrl_word_parser.bytes_per_word();
             while self.offset_in_current < cur_buf.len() {
+                // The item walk is driven by the control words themselves, so a page that
+                // disagrees with its own layout can step past the end of the buffer.  Check
+                // before every read and every advance so that a malformed page is reported
+                // instead of panicking in `slice_with_length`.
+                let bytes_avail = cur_buf.len() - self.offset_in_current;
+                if bytes_avail < bytes_per_word {
+                    return Err(Error::corrupt_file_named(
+                        "fixed_full_zip",
+                        format!(
+                            "truncated control word: {bytes_avail} byte(s) remain in the page \
+                             buffer but a control word requires {bytes_per_word}"
+                        ),
+                    ));
+                }
                 let control = self.details.ctrl_word_parser.parse_desc(
                     &cur_buf[self.offset_in_current..],
                     self.details.max_rep,
@@ -3439,11 +3446,22 @@ impl FixedFullZipDecoder {
                     rows_started += 1;
                 }
                 num_items += 1;
-                if control.is_visible {
-                    self.offset_in_current += self.total_bytes_per_value;
+                let bytes_in_item = if control.is_visible {
+                    self.total_bytes_per_value
                 } else {
-                    self.offset_in_current += self.details.ctrl_word_parser.bytes_per_word();
+                    bytes_per_word
+                };
+                if bytes_in_item > bytes_avail {
+                    return Err(Error::corrupt_file_named(
+                        "fixed_full_zip",
+                        format!(
+                            "truncated item: {bytes_avail} byte(s) remain in the page buffer at \
+                             offset {} but the item requires {bytes_in_item}",
+                            self.offset_in_current
+                        ),
+                    ));
                 }
+                self.offset_in_current += bytes_in_item;
             }
 
             let task_slice = cur_buf.slice_with_length(start, self.offset_in_current - start);
@@ -3452,7 +3470,7 @@ impl FixedFullZipDecoder {
                 self.offset_in_current = 0;
             }
 
-            FullZipDecodeTaskItem {
+            Ok(FullZipDecodeTaskItem {
                 data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
                     data: task_slice,
                     bits_per_value: self.bytes_per_value as u64 * 8,
@@ -3460,7 +3478,7 @@ impl FixedFullZipDecoder {
                     block_info: BlockInfo::new(),
                 }),
                 rows_in_buf: rows_started,
-            }
+            })
         } else {
             // If there's no repetition we can calculate the slicing point by just multiplying
             // the number of rows by the total bytes per value
@@ -3481,7 +3499,7 @@ impl FixedFullZipDecoder {
                 self.offset_in_current += bytes_needed;
                 cur_buf.slice_with_length(offset_in_cur, bytes_needed)
             };
-            FullZipDecodeTaskItem {
+            Ok(FullZipDecodeTaskItem {
                 data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
                     data: task_slice,
                     bits_per_value: self.bytes_per_value as u64 * 8,
@@ -3489,7 +3507,7 @@ impl FixedFullZipDecoder {
                     block_info: BlockInfo::new(),
                 }),
                 rows_in_buf: rows_taken,
-            }
+            })
         }
     }
 }
@@ -3517,7 +3535,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
         let mut task_data = Vec::with_capacity(self.data.len());
         let mut remaining = num_rows;
         while remaining > 0 {
-            let task_item = self.slice_next_task(remaining);
+            let task_item = self.slice_next_task(remaining)?;
             remaining -= task_item.rows_in_buf;
             task_data.push(task_item);
         }
@@ -10941,5 +10959,100 @@ mod tests {
                 "error should say what is wrong, got: {msg}"
             );
         }
+    }
+
+    /// Drains `num_rows` from a single-buffer fixed full-zip page built from `buf`.
+    ///
+    /// `bits_rep` picks the control word width (1 -> one byte, 9 -> two bytes) and each
+    /// visible item is a one-word control plus a 4 byte value.
+    fn drain_fixed_full_zip(buf: Vec<u8>, bits_rep: u8, num_rows: u64) -> lance_core::Result<()> {
+        use crate::compression::FixedPerValueDecompressor;
+        use crate::decoder::StructuralPageDecoder;
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct UnusedFixedDecompressor;
+
+        impl FixedPerValueDecompressor for UnusedFixedDecompressor {
+            fn decompress(&self, _: FixedWidthDataBlock, _: u64) -> crate::Result<DataBlock> {
+                unreachable!("these cases fail while slicing, before any value is decoded")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        let details = Arc::new(super::FullZipDecodeDetails {
+            value_decompressor: super::PerValueDecompressor::Fixed(Arc::new(
+                UnusedFixedDecompressor,
+            )),
+            def_meaning: vec![DefinitionInterpretation::AllValidList].into(),
+            ctrl_word_parser: ControlWordParser::new(bits_rep, 0),
+            max_rep: 1,
+            max_visible_def: 0,
+        });
+        let bytes_per_word = bits_rep.div_ceil(8) as usize;
+
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        let mut decoder = super::FixedFullZipDecoder {
+            details,
+            data,
+            offset_in_current: 0,
+            bytes_per_value: 4,
+            total_bytes_per_value: 4 + bytes_per_word,
+            num_rows,
+        };
+        decoder.drain(num_rows).map(|_| ())
+    }
+
+    /// Two one-item rows, each a control word plus a 4 byte value, slice cleanly.
+    #[test]
+    fn fixed_full_zip_wellformed_page_slices() {
+        assert!(drain_fixed_full_zip(vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0], 1, 2).is_ok());
+    }
+
+    /// The item walk is driven by the page's own control words, so a page that disagrees
+    /// with its layout can run off the end of the buffer.  Each way of doing so must
+    /// surface a corrupt-file error.
+    ///
+    /// These assert the error variant and message rather than merely expecting a panic:
+    /// before the walk was bounds checked these aborted the process inside
+    /// `LanceBuffer::slice_with_length`, which a `#[should_panic]` test would have
+    /// accepted as a pass.
+    #[rstest::rstest]
+    // Second value is one byte short of a full 4 byte value
+    #[case::truncated_item(vec![1, 0, 0, 0, 0, 1, 0, 0, 0], 1, 2, "truncated item")]
+    // Two byte control words, with a lone trailing byte after the first item
+    #[case::truncated_control_word(
+        vec![1, 0, 0, 0, 0, 0, 1],
+        9,
+        2,
+        "truncated control word"
+    )]
+    // A well-formed two row page cannot satisfy a request for three rows
+    #[case::page_exhausted(vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0], 1, 3, "page data ran out")]
+    fn fixed_full_zip_malformed_page_is_corrupt_file(
+        #[case] buf: Vec<u8>,
+        #[case] bits_rep: u8,
+        #[case] num_rows: u64,
+        #[case] expected_msg: &str,
+    ) {
+        use lance_core::Error;
+
+        let err = drain_fixed_full_zip(buf, bits_rep, num_rows)
+            .expect_err("a malformed page must not slice");
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_msg),
+            "error should say what is wrong, got: {msg}"
+        );
     }
 }
