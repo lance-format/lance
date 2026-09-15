@@ -1,21 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod spill;
 mod validate;
 
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
+use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{
+        Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+    },
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
 
+pub use spill::{
+    DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, RowLineage,
+    RowLineageMeta, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes, place_row_lineage,
+    read_spilled_row_ids, read_spilled_versions,
+};
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -53,6 +62,67 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
                 .await?;
             read_row_ids(&data)
         }
+        Some(RowIdMeta::Column(data_file)) => spill::read_spilled_row_ids(dataset, data_file).await,
+    }
+}
+
+/// Which of a fragment's two per-row version sequences is meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowVersionKind {
+    /// The dataset version each row first appeared at.
+    CreatedAt,
+    /// The dataset version each row was last written at.
+    LastUpdatedAt,
+}
+
+impl RowVersionKind {
+    fn meta(self, fragment: &Fragment) -> Option<&RowDatasetVersionMeta> {
+        match self {
+            Self::CreatedAt => fragment.created_at_version_meta.as_ref(),
+            Self::LastUpdatedAt => fragment.last_updated_at_version_meta.as_ref(),
+        }
+    }
+
+    /// The reserved field id of the hidden column a spilled sequence lives in.
+    pub fn field_id(self) -> i32 {
+        match self {
+            Self::CreatedAt => ROW_CREATED_AT_VERSION_FIELD_ID,
+            Self::LastUpdatedAt => ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        }
+    }
+}
+
+/// Load one of `fragment`'s per-row version sequences, wherever it is stored.
+///
+/// `None` when the fragment carries no such metadata, which readers treat as
+/// every row being at version 1. A sequence spilled to a data file is cached
+/// per fragment and file; an inline one is decoded from the manifest bytes.
+pub async fn load_row_version_sequence(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    kind: RowVersionKind,
+) -> Result<Option<Arc<RowDatasetVersionSequence>>> {
+    let Some(meta) = kind.meta(fragment) else {
+        return Ok(None);
+    };
+    match meta {
+        RowDatasetVersionMeta::Column(data_file) => {
+            let key = RowVersionSequenceKey {
+                fragment_id: fragment.id,
+                field_id: kind.field_id(),
+                data_file,
+            };
+            dataset
+                .metadata_cache
+                .get_or_insert_with_key(key, || {
+                    spill::read_spilled_versions(dataset, data_file, kind.field_id())
+                })
+                .await
+                .map(Some)
+        }
+        RowDatasetVersionMeta::Inline(_) | RowDatasetVersionMeta::External(_) => meta
+            .load_sequence()
+            .map(|sequence| Some(Arc::new(sequence))),
     }
 }
 

@@ -411,6 +411,18 @@ message DataFragment {
     bytes inline_row_ids = 5;
     // Supported by current Lance readers, but not emitted by current Lance writers.
     ExternalFile external_row_ids = 6;
+    /* The row ids are stored as a hidden column of a Lance data file, at the
+     * reserved field id -3, one uint64 per physical row in offset order. The
+     * `fields`/`column_indices` pair locates the column the same way it does
+     * for a user column, so the column may share a file with the other row
+     * lineage columns or with user data, or sit in a file of its own.
+     *
+     * A writer MUST set the spilled row lineage feature flag (2048) when any
+     * fragment uses this arm or either of the other column arms below. A
+     * reader that does not understand the flag would see an unset oneof and
+     * treat the fragment as having no row ids at all.
+     */
+    DataFile column_row_ids = 12;
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {
@@ -420,6 +432,11 @@ message DataFragment {
      * and current Lance readers cannot load it.
      */
     ExternalFile external_last_updated_at_versions = 8;
+    /* The versions are stored as a hidden column of a Lance data file, at the
+     * reserved field id -5, one uint64 per physical row in offset order. Located
+     * and gated exactly like `column_row_ids`.
+     */
+    DataFile column_last_updated_at_versions = 13;
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
@@ -429,6 +446,11 @@ message DataFragment {
      * and current Lance readers cannot load it.
      */
     ExternalFile external_created_at_versions = 10;
+    /* The versions are stored as a hidden column of a Lance data file, at the
+     * reserved field id -4, one uint64 per physical row in offset order. Located
+     * and gated exactly like `column_row_ids`.
+     */
+    DataFile column_created_at_versions = 14;
   } // created_at_version_sequence
 
   /* Number of original rows in the fragment, this includes rows that are now marked with
@@ -447,6 +469,12 @@ message DataFile {
    * default. An object with a value in fields of -1 must not be stored to disk. -2 is
    * used for "tombstoned", meaning a field that is no longer in use. This is often
    * because the original field id was reassigned to a different data file.
+   *
+   * Every negative value is reserved for system use and never names a field of the
+   * dataset schema. -3, -4 and -5 are the hidden row lineage columns that a
+   * DataFragment's `column_row_ids`, `column_created_at_versions` and
+   * `column_last_updated_at_versions` point at; they appear only in the files those
+   * arms reference, never in `DataFragment.files`.
    *
    * In Lance v1 IDs are assigned based on position in the file, offset by the max
    * existing field id in the table (if any already). So when a fragment is first created

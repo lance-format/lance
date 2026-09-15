@@ -48,8 +48,8 @@ impl PyRowIdSequence {
     fn from_inline_metadata(metadata: PyRef<'_, PyRowIdMeta>) -> PyResult<Self> {
         match &metadata.0 {
             RowIdMeta::Inline(data) => read_row_ids(data).infer_error().map(Self),
-            RowIdMeta::External(_) => Err(PyNotImplementedError::new_err(
-                "Row ids stored in an external file cannot be read into a RowIdSequence",
+            RowIdMeta::External(_) | RowIdMeta::Column(_) => Err(PyNotImplementedError::new_err(
+                "Row ids stored outside the manifest cannot be read into a RowIdSequence",
             )),
         }
     }

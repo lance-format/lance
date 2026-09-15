@@ -325,6 +325,11 @@ impl DataFileFieldInterner {
                 offset: file.offset,
                 size: file.size,
             })),
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                data_file,
+            ) => Ok(RowDatasetVersionMeta::Column(DataFile::try_from(
+                data_file,
+            )?)),
         }
     }
 
@@ -344,6 +349,9 @@ impl DataFileFieldInterner {
                     size: file.size,
                 }))
             }
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(data_file) => Ok(
+                RowDatasetVersionMeta::Column(DataFile::try_from(data_file)?),
+            ),
         }
     }
 
@@ -548,27 +556,72 @@ impl Fragment {
         files
             .iter()
             .chain(overlays.iter().map(|overlay| &overlay.data_file))
+            .chain(self.spilled_row_lineage_files())
+    }
+
+    /// The data files holding this fragment's spilled row lineage sequences:
+    /// its row ids and its created-at and last-updated-at versions, whichever
+    /// of them live in a column rather than inline. A file shared by several
+    /// sequences is yielded once.
+    pub fn spilled_row_lineage_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+        let row_ids = self.row_id_meta.as_ref().and_then(RowIdMeta::column_file);
+        let created_at = self
+            .created_at_version_meta
+            .as_ref()
+            .and_then(RowDatasetVersionMeta::column_file);
+        let last_updated_at = self
+            .last_updated_at_version_meta
+            .as_ref()
+            .and_then(RowDatasetVersionMeta::column_file);
+        let same_file = |a: Option<&DataFile>, b: &DataFile| {
+            a.is_some_and(|a| a.path == b.path && a.base_id == b.base_id)
+        };
+        row_ids
+            .into_iter()
+            .chain(created_at.filter(move |file| !same_file(row_ids, file)))
+            .chain(
+                last_updated_at
+                    .filter(move |file| !same_file(row_ids, file) && !same_file(created_at, file)),
+            )
     }
 
     /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
-    /// the fields a clone has to normalize (`base_id`) across base and overlay
-    /// files alike.
+    /// the fields a clone has to normalize (`base_id`) across base, overlay
+    /// and lineage files alike.
+    ///
+    /// Unlike the shared view, a lineage file referenced by several sequences
+    /// is yielded once per reference, so a rewrite reaches every copy.
     pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
         // Destructured for the same reason as `referenced_lance_files`, and so
-        // the two disjoint field borrows are visible to the borrow checker.
+        // the disjoint field borrows are visible to the borrow checker.
         let Self {
             id: _,
             files,
             overlays,
             deletion_file: _,
-            row_id_meta: _,
+            row_id_meta,
             physical_rows: _,
-            last_updated_at_version_meta: _,
-            created_at_version_meta: _,
+            last_updated_at_version_meta,
+            created_at_version_meta,
         } = self;
         files
             .iter_mut()
             .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+            .chain(
+                row_id_meta
+                    .iter_mut()
+                    .filter_map(RowIdMeta::column_file_mut),
+            )
+            .chain(
+                created_at_version_meta
+                    .iter_mut()
+                    .filter_map(RowDatasetVersionMeta::column_file_mut),
+            )
+            .chain(
+                last_updated_at_version_meta
+                    .iter_mut()
+                    .filter_map(RowDatasetVersionMeta::column_file_mut),
+            )
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -741,6 +794,9 @@ impl From<&Fragment> for pb::DataFragment {
                     offset: file.offset,
                     size: file.size,
                 })
+            }
+            RowIdMeta::Column(data_file) => {
+                pb::data_fragment::RowIdSequence::ColumnRowIds(pb::DataFile::from(data_file))
             }
         });
         let last_updated_at_version_sequence =

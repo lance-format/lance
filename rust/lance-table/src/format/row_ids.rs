@@ -8,7 +8,22 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::DataFile;
 use super::pb;
+
+/// Field id of the hidden `_rowid` column that a spilled row id sequence lives in.
+///
+/// Field ids are `i32` and every negative value is reserved for system use:
+/// `-1` is the unassigned sentinel, `-2` is
+/// [`TOMBSTONE_FIELD_ID`](crate::format::overlay::TOMBSTONE_FIELD_ID), and
+/// `-3..=-5` are the three row lineage columns.
+pub const ROW_ID_FIELD_ID: i32 = -3;
+/// Field id of the hidden `_row_created_at_version` column that a spilled
+/// created-at version sequence lives in.
+pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = -4;
+/// Field id of the hidden `_row_last_updated_at_version` column that a spilled
+/// last-updated-at version sequence lives in.
+pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = -5;
 
 /// A reference to a part of a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
@@ -124,6 +139,33 @@ impl DeepSizeOf for InlineRowIdsInner {
 pub enum RowIdMeta {
     Inline(InlineRowIds),
     External(ExternalFile),
+    /// The sequence is spilled to a hidden [`ROW_ID_FIELD_ID`] column of a Lance
+    /// data file, one row id per physical row, in offset order.
+    ///
+    /// Unlike [`Self::External`], which is an opaque byte range, this is an
+    /// ordinary column: it carries the file's encodings and page layout, so it
+    /// can be read back a page at a time instead of whole. The file may also
+    /// carry the fragment's spilled version sequences, in which case the same
+    /// [`DataFile`] appears in their metadata too.
+    Column(DataFile),
+}
+
+impl RowIdMeta {
+    /// The data file backing this sequence, if it is spilled to a column.
+    pub fn column_file(&self) -> Option<&DataFile> {
+        match self {
+            Self::Column(data_file) => Some(data_file),
+            Self::Inline(_) | Self::External(_) => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Self::column_file`].
+    pub fn column_file_mut(&mut self) -> Option<&mut DataFile> {
+        match self {
+            Self::Column(data_file) => Some(data_file),
+            Self::Inline(_) | Self::External(_) => None,
+        }
+    }
 }
 
 impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
@@ -138,6 +180,9 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
                     offset: file.offset,
                     size: file.size,
                 }))
+            }
+            pb::data_fragment::RowIdSequence::ColumnRowIds(data_file) => {
+                Ok(Self::Column(DataFile::try_from(data_file)?))
             }
         }
     }
