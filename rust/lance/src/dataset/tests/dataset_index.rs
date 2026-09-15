@@ -5189,10 +5189,8 @@ async fn test_fts_without_index() {
 
 #[tokio::test]
 async fn test_fts_without_index_uses_scalar_index_for_prefilter() {
-    // Verify that flat FTS (no inverted index on text) routes its prefilter
-    // through `FilteredReadExec` so a scalar index on the filter column is
-    // actually used. Six rows with two distinct ids: a prefilter of `id = 1`
-    // must match exactly the three text rows tagged with id=1.
+    // Flat FTS must use the scalar index for candidates while keeping all six
+    // rows in the scoring corpus. The id=1 candidates contain two alpha matches.
     let text = StringArray::from(vec![
         "alpha bravo",
         "charlie delta",
@@ -5240,11 +5238,21 @@ async fn test_fts_without_index_uses_scalar_index_for_prefilter() {
         .unwrap();
 
     let plan = scan.analyze_plan().await.unwrap();
-    // The flat-FTS path now reads via `FilteredReadExec` (prints as `LanceRead`)
-    // with the prefilter plumbed into it, so the scalar index on `id` is used.
+    // The text read supplies the global corpus. The scalar index independently
+    // supplies the candidate mask, which is applied when matches are emitted.
     assert_contains!(&plan, "FlatMatchQuery");
-    assert_contains!(&plan, "LanceRead");
-    assert_contains!(&plan, "full_filter=id = Int32(1)");
+    let corpus_read = plan
+        .lines()
+        .find(|line| line.contains("LanceRead:") && line.contains("projection=[text]"))
+        .unwrap_or_else(|| panic!("missing text corpus read: {plan}"));
+    assert_contains!(corpus_read, "full_filter=--, refine_filter=--");
+    assert_contains!(corpus_read, "rows_scanned=6");
+    let candidate_index = plan
+        .lines()
+        .find(|line| line.contains("ScalarIndexQuery:"))
+        .unwrap_or_else(|| panic!("missing scalar candidate index: {plan}"));
+    assert_contains!(candidate_index, "query=[id = 1]@id_idx(BTree)");
+    assert_contains!(candidate_index, "indices_loaded=1");
     // The legacy plan ran a `LanceScan` wrapped in a manual `LanceFilterExec`;
     // make sure we did not regress to that shape.
     assert_not_contains!(&plan, "LanceScan:");
@@ -5257,6 +5265,10 @@ async fn test_fts_without_index_uses_scalar_index_for_prefilter() {
         2,
         "expected the two id=1 rows that match `alpha`, got plan:\n{plan}"
     );
+    assert_eq!(results["id"].as_primitive::<Int32Type>().values(), &[1, 1]);
+    let mut matched_text = results["text"].as_string::<i32>().iter().collect_vec();
+    matched_text.sort_unstable();
+    assert_eq!(matched_text, [Some("alpha bravo"), Some("alpha echo")]);
 }
 
 #[tokio::test]
