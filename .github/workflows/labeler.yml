@@ -4,6 +4,9 @@ on:
   # pull_request_target is required so labels can be applied to PRs from forks.
   pull_request_target:
     types: [opened, synchronize, reopened]
+    paths-ignore:
+      - kotoba/**
+      - .github/workflows/kotoba*.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
