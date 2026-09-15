@@ -140,10 +140,39 @@ impl IvfModel {
         self.centroids.as_ref()
     }
 
+    /// Row range of `partition` in the storage file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model carries no layout entry for `partition`. Use
+    /// [`Self::try_row_range`] to get that reported instead.
+    #[deprecated(note = "use IvfModel::try_row_range")]
     pub fn row_range(&self, partition: usize) -> Range<usize> {
         let start = self.offsets[partition];
         let end = start + self.lengths[partition] as usize;
         start..end
+    }
+
+    /// Row range of `partition` in the storage file.
+    ///
+    /// A partition the layout carries with no rows is valid and gives an empty
+    /// range at its own offset. A partition the layout does not carry is an
+    /// error: offsets and lengths come from the index file, so a partition the
+    /// caller can name and the layout does not cover means the two disagree.
+    pub fn try_row_range(&self, partition: usize) -> Result<Range<usize>> {
+        let (Some(&start), Some(&len)) = (self.offsets.get(partition), self.lengths.get(partition))
+        else {
+            return Err(Error::corrupt_file_named(
+                "ivf metadata",
+                format!(
+                    "partition {partition} has no row range: the layout covers {} partitions, \
+                     the model reports {}",
+                    self.offsets.len().min(self.lengths.len()),
+                    self.num_partitions()
+                ),
+            ));
+        };
+        Ok(start..start + len as usize)
     }
 
     pub async fn load(reader: &V1FileReader) -> Result<Self> {
@@ -270,8 +299,34 @@ mod tests {
         ivf.add_partition(20);
         ivf.add_partition(50);
 
-        assert_eq!(ivf.row_range(0), 0..20);
-        assert_eq!(ivf.row_range(1), 20..70);
+        assert_eq!(ivf.try_row_range(0).unwrap(), 0..20);
+        assert_eq!(ivf.try_row_range(1).unwrap(), 20..70);
+    }
+
+    /// A partition the layout does not cover has to be reported: the consumers
+    /// read the returned range and treat an empty one as an empty partition, so
+    /// an absent entry that answers `0..0` reads as a partition with no rows.
+    #[test]
+    fn test_try_row_range_rejects_absent_partition() {
+        let mut ivf = IvfModel::empty();
+        ivf.add_partition(20);
+
+        for partition in [1, usize::MAX] {
+            let error = ivf.try_row_range(partition).unwrap_err();
+            assert!(
+                matches!(&error, Error::CorruptFile { .. }),
+                "expected CorruptFile, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(&partition.to_string()),
+                "the error must name the partition asked for: {error}"
+            );
+        }
+
+        // A partition the layout does carry with no rows stays valid, at its
+        // own offset rather than at zero.
+        ivf.add_partition(0);
+        assert_eq!(ivf.try_row_range(1).unwrap(), 20..20);
     }
 
     #[tokio::test]
