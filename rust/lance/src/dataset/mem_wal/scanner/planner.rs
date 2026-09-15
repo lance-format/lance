@@ -5,15 +5,19 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use tracing::instrument;
 
 use crate::dataset::mem_wal::TOMBSTONE;
+use crate::dataset::scanner::ColumnOrdering;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -29,6 +33,35 @@ use lance_io::object_store::ObjectStoreParams;
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
 /// column (active / SSTables written since deletes existed).
+/// Build the physical sort ordering for `ordering` against `schema`.
+///
+/// Every key must be a top-level column the plan actually emits: the sort runs
+/// above the source projection, so a key outside it has no values to sort by.
+/// Nested paths are rejected rather than silently resolved against a struct.
+pub(super) fn lex_ordering(ordering: &[ColumnOrdering], schema: &Schema) -> Result<LexOrdering> {
+    let exprs = ordering
+        .iter()
+        .map(|c| {
+            let index = schema.index_of(&c.column_name).map_err(|_| {
+                Error::invalid_input(format!(
+                    "order_by column '{}' is not in the scan projection; \
+                     project it to sort by it",
+                    c.column_name
+                ))
+            })?;
+            Ok(PhysicalSortExpr {
+                expr: Arc::new(Column::new(&c.column_name, index)),
+                options: SortOptions {
+                    descending: !c.ascending,
+                    nulls_first: c.nulls_first,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    LexOrdering::new(exprs)
+        .ok_or_else(|| Error::invalid_input("order_by requires at least one column".to_string()))
+}
+
 fn fold_not_tombstone(filter: Option<&Expr>) -> Expr {
     let live = !col(TOMBSTONE);
     match filter {
@@ -106,6 +139,7 @@ impl LsmScanPlanner {
     /// * `filter` - Filter expression to apply
     /// * `limit` - Maximum rows to return
     /// * `offset` - Number of rows to skip
+    /// * `ordering` - Sort keys applied above the union; `None` scans unordered
     /// * `with_memtable_gen` - Whether to include _memtable_gen in output
     /// * `keep_row_address` - Whether to include _rowaddr in output
     ///
@@ -126,6 +160,7 @@ impl LsmScanPlanner {
         filter: Option<&Expr>,
         limit: Option<usize>,
         offset: Option<usize>,
+        ordering: Option<&[ColumnOrdering]>,
         with_memtable_gen: bool,
         keep_row_address: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -171,7 +206,14 @@ impl LsmScanPlanner {
         // the LocalLimitExec below pull until it sees `n_needed` live rows or
         // reaches EOF. Sources without a block filter can still push the limit
         // down safely. The active memtable is in-memory and is never capped.
-        let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+        // An ordered scan takes the sort's top-k instead, so the any-N
+        // pushdown below must not run: it would hand the sort the first N rows
+        // in scan order rather than the N that rank highest.
+        let ordering = ordering.filter(|o| !o.is_empty());
+        let n_needed = match ordering {
+            Some(_) => None,
+            None => limit.map(|l| l.saturating_add(offset.unwrap_or(0))),
+        };
 
         let mut source_plans = Vec::new();
         for source in sources {
@@ -248,7 +290,17 @@ impl LsmScanPlanner {
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
 
-        // 6. Add limit / offset if specified
+        // 6. Sort, then limit / offset if specified. The sort sits above the
+        // union and the cross-generation block-list, so its `fetch` keeps the
+        // top `offset + limit` *live* rows — capping a source before the block
+        // list is what leaves the ranked arms under-filled.
+        if let Some(ordering) = ordering {
+            let fetch = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+            plan = Arc::new(
+                SortExec::new(lex_ordering(ordering, plan.schema().as_ref())?, plan)
+                    .with_fetch(fetch),
+            );
+        }
         if limit.is_some() || offset.unwrap_or(0) > 0 {
             plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
         }
@@ -484,6 +536,7 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
 
@@ -978,6 +1031,103 @@ mod integration_tests {
         // Count total rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows due to limit");
+    }
+
+    /// Helper: collect the `id` column of a scan result.
+    async fn scan_ids(scanner: LsmScanner) -> Vec<i32> {
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_ranks_across_sources() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".to_string())]))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        assert_eq!(
+            scan_ids(scanner).await,
+            vec![7, 6, 5],
+            "top-k must rank over every source, not the first source to yield"
+        );
+    }
+
+    /// The any-N limit pushdown is unsound under a sort: it hands the sort the
+    /// first `n` rows in *scan* order. With ids written ascending and a
+    /// descending sort, a source-level fetch would return the k lowest ids.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_suppresses_any_n_pushdown() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let ids: Vec<i32> = (1..=10).collect();
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &ids, "base")]).await,
+        );
+
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".to_string())]))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap();
+
+        assert_eq!(scan_ids(scanner).await, vec![10, 9, 8]);
+    }
+
+    /// The sort sits above the cross-generation block-list, so a stale base row
+    /// that would have out-ranked the live ones neither appears in the top-k
+    /// nor consumes one of its slots.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_ranks_live_rows_only() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&schema, &[1, 2, 3], "zzz")],
+            )
+            .await,
+        );
+
+        // id=3's live name sorts last, so descending by name the live top-2 is
+        // zzz_2, zzz_1 -- the superseded zzz_3 must not take the first slot.
+        let (batch_store, index_store) = pk_indexed(&[create_test_batch(&schema, &[3], "aaa")]);
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("name".to_string())]))
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+
+        assert_eq!(scan_ids(scanner).await, vec![2, 1]);
     }
 
     #[tokio::test]

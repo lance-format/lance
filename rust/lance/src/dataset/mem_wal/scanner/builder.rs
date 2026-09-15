@@ -15,6 +15,7 @@ use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
@@ -26,11 +27,12 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::{FreshTierWatermark, ShardSnapshot};
-use super::planner::LsmScanPlanner;
+use super::planner::{LsmScanPlanner, lex_ordering};
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use crate::dataset::Dataset;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::mem_wal::util::derived_store_params;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
@@ -207,6 +209,10 @@ pub struct LsmScanner {
     filter: Option<Expr>,
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Sort keys for a plain scan, applied above the union so the top-k is
+    /// taken over live rows. Only the scan path honors it; the vector and FTS
+    /// planners rank by `_distance` / `_score` instead.
+    ordering: Option<Vec<ColumnOrdering>>,
     /// Vector (KNN) search; when set, `create_plan` routes to the vector planner.
     nearest: Option<LsmVectorQuery>,
     /// Full-text search; when set, `create_plan` routes to the FTS planner.
@@ -267,6 +273,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
+            ordering: None,
             nearest: None,
             full_text_query: None,
             with_row_address: false,
@@ -310,6 +317,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
+            ordering: None,
             nearest: None,
             full_text_query: None,
             with_row_address: false,
@@ -446,6 +454,30 @@ impl LsmScanner {
         Ok(self)
     }
 
+    /// Sort the scan by `ordering`, mirroring
+    /// [`crate::dataset::scanner::Scanner::order_by`]. Every key must be a
+    /// top-level column in the scan's projection. An empty list clears it.
+    ///
+    /// Ordering applies to the plain scan only; it is rejected alongside a
+    /// vector or full-text query, which rank by `_distance` / `_score`.
+    pub fn order_by(mut self, ordering: Option<Vec<ColumnOrdering>>) -> Result<Self> {
+        let ordering = ordering.filter(|o| !o.is_empty());
+        if let Some(ordering) = &ordering {
+            for column in ordering {
+                self.schema
+                    .field_with_name(&column.column_name)
+                    .map_err(|_| {
+                        Error::invalid_input(format!(
+                            "order_by column '{}' not found",
+                            column.column_name
+                        ))
+                    })?;
+            }
+        }
+        self.ordering = ordering;
+        Ok(self)
+    }
+
     /// Find the `k` nearest neighbors of `key` in `column`. Routes `create_plan`
     /// through the LSM vector planner (base ∪ SSTables ∪ in-memory). Mirrors
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
@@ -544,6 +576,12 @@ impl LsmScanner {
         if self.nearest.is_some() && self.full_text_query.is_some() {
             return Err(Error::invalid_input(
                 "LSM scanner does not support combined vector and full-text search".to_string(),
+            ));
+        }
+        if self.ordering.is_some() && (self.nearest.is_some() || self.full_text_query.is_some()) {
+            return Err(Error::invalid_input(
+                "LSM scanner does not support order_by with vector or full-text search"
+                    .to_string(),
             ));
         }
         if self.nearest.is_some() {
@@ -727,9 +765,17 @@ impl LsmScanner {
             if let Some(warmer) = &self.warmer {
                 planner = planner.with_warmer(warmer.clone());
             }
-            let plan = planner
+            let mut plan = planner
                 .plan_point_lookup(&keys, self.projection.as_deref())
                 .await?;
+            // `pk IN (..)` can return many rows, so an ordering still has to be
+            // applied — and above the lookup, before the limit trims it.
+            if let Some(ordering) = &self.ordering {
+                plan = Arc::new(
+                    SortExec::new(lex_ordering(ordering, plan.schema().as_ref())?, plan)
+                        .with_fetch(self.limit),
+                );
+            }
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
                 None => plan,
@@ -756,6 +802,7 @@ impl LsmScanner {
                 self.filter.as_ref(),
                 self.limit,
                 self.offset,
+                self.ordering.as_deref(),
                 self.with_memtable_gen,
                 self.with_row_address,
             )
