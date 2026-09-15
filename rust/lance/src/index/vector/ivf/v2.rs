@@ -917,11 +917,17 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
-    /// Memoized [`DeepSizeOf::deep_size_of`]: every query that prepares this
-    /// partition needs its size to budget scoring chunks, and the walk over the
-    /// storage's arrays costs a few microseconds per partition — measurable on a
-    /// warm probe-everything query — while the size never changes once loaded.
-    size_bytes: OnceLock<usize>,
+    /// Memoized size of the immutable parts (this struct, the sub-index and the
+    /// quantized storage): every query that prepares this partition needs its
+    /// size to budget scoring chunks, and the walk over the storage's arrays
+    /// costs a few microseconds per partition — measurable on a warm
+    /// probe-everything query — while these never change once loaded.
+    immutable_bytes: OnceLock<usize>,
+    /// Memoized size of `partition_rows`, set when the coverage is built. Kept
+    /// apart from `immutable_bytes` because the coverage can appear after an
+    /// earlier query already memoized the size; folding it in later keeps
+    /// [`Self::size_bytes`] equal to [`DeepSizeOf::deep_size_of`].
+    coverage_bytes: OnceLock<usize>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
@@ -931,20 +937,31 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
-            size_bytes: OnceLock::new(),
+            immutable_bytes: OnceLock::new(),
+            coverage_bytes: OnceLock::new(),
         }
     }
 
-    /// Bytes this entry pins in memory (its sub-index plus quantized storage),
-    /// computed on first use.
+    /// Bytes this entry pins in memory, equal to [`DeepSizeOf::deep_size_of`]
+    /// but memoized: the immutable parts are computed on first use and the
+    /// lazily built partition coverage is added once it exists.
     fn size_bytes(&self) -> usize {
-        *self.size_bytes.get_or_init(|| self.deep_size_of())
+        let immutable = *self.immutable_bytes.get_or_init(|| {
+            let mut context = lance_core::deepsize::Context::new();
+            std::mem::size_of::<Self>()
+                + self.index.deep_size_of_children(&mut context)
+                + self.storage.deep_size_of_children(&mut context)
+        });
+        immutable + self.coverage_bytes.get().copied().unwrap_or_default()
     }
 
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
-        self.partition_rows
-            .get_or_init(|| Arc::new(self.storage.row_ids().collect()))
-            .clone()
+        let rows = self
+            .partition_rows
+            .get_or_init(|| Arc::new(self.storage.row_ids().collect()));
+        self.coverage_bytes
+            .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
+        rows.clone()
     }
 }
 
@@ -3224,6 +3241,9 @@ mod tests {
             .await;
         let weak_cache = WeakLanceCache::from(&cache);
         let size_without_coverage = entry.deep_size_of();
+        // Memoize the chunk-budget size before the coverage exists; it must
+        // still pick the coverage up once a later filter builds it.
+        assert_eq!(entry.size_bytes(), size_without_coverage);
         let cache_weight_without_coverage = cache.size_bytes().await;
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
@@ -3258,6 +3278,7 @@ mod tests {
         let second_rows = entry.partition_rows();
         assert!(Arc::ptr_eq(&first_rows, &second_rows));
         assert!(entry.deep_size_of() > size_without_coverage);
+        assert_eq!(entry.size_bytes(), entry.deep_size_of());
         let cache_weight_with_coverage = cache.size_bytes().await;
         assert!(cache_weight_with_coverage > cache_weight_without_coverage);
         assert!(cache_weight_with_coverage >= entry.deep_size_of());
