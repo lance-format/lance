@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Overview — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/index/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../file/">Specification</a>
+    <a href="../file/encoding/">Encoding Strategy</a>
+    <a href="../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../table/">Lance Table Format</a>
+    <a href="../table/schema/">Schema</a>
+    <a href="../table/versioning/">Versioning</a>
+    <a href="../table/transaction/">Transactions</a>
+    <a href="../table/layout/">Layout</a>
+    <a href="../table/branch_tag/">Branch & Tag</a>
+    <a href="../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a class="active" href="./">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="scalar/btree/">BTree</a>
+    <a href="scalar/bitmap/">Bitmap</a>
+    <a href="scalar/label_list/">Label List</a>
+    <a href="scalar/zonemap/">Zone Map</a>
+    <a href="scalar/bloom_filter/">Bloom Filter</a>
+    <a href="scalar/fts/">Full Text Search</a>
+    <a href="scalar/ngram/">N-gram</a>
+    <a href="scalar/fmindex/">FM-Index</a>
+    <a href="scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="system/frag_reuse/">Fragment Reuse</a>
+    <a href="system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../namespace/">Overview</a>
+    <a href="../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../namespace/operations/">Overview</a>
+    <a href="../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../namespace/operations/models/">Operation Models</a>
+    <a href="../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../namespace/operations/models/Identity/">Identity</a>
+    <a href="../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../namespace/supported-catalogs/">Overview</a>
+    <a href="../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Index Formats</span>
+        <span>/</span><b>Overview</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="indices-in-lance">Indices in Lance<a class="headerlink" href="#indices-in-lance" title="Permanent link">&para;</a></h1>
+<p>Lance treats indices as independent, redundant data structures layered on top of table row identifiers. This keeps the file format free of built-in search structures and lets index formats evolve independently from the table layout.</p>
+<p>Lance supports three main categories of indices to accelerate data access: scalar
+indices, vector indices, and system indices.</p>
+<p><strong>Scalar indices</strong> accelerate queries on scalar data types such as integers, timestamps,
+and strings. This includes primary skipping structures such as <a href="scalar/zonemap/">zone maps</a>
+as well as secondary structures such as <a href="scalar/btree/">B-trees</a>, <a href="scalar/bitmap/">bitmap indices</a>,
+and <a href="scalar/fts/">full-text search indices</a>. They typically accept predicates such as equality,
+range, set-membership, or token matches and return matching row identifiers.</p>
+<figure>
+  <img alt="" src="scalar_index.drawio.svg" />
+</figure>
+<p><strong><a href="vector/">Vector indices</a></strong> are specialized for approximate nearest neighbor search on
+high-dimensional embeddings. Examples include IVF-based layouts and HNSW graphs. Instead of scalar
+predicates, vector indices receive a query vector and return row identifiers plus distance scores.</p>
+<p><strong>System indices</strong> are auxiliary structures that support internal table maintenance and row-identifier
+resolution. They are not queried directly by end users. Examples include the <a href="system/frag_reuse/">Fragment Reuse Index</a>,
+which supports efficient remapping after compaction.</p>
+<h2 id="design">Design<a class="headerlink" href="#design" title="Permanent link">&para;</a></h2>
+<p>Lance indices are designed with the following design choices in mind:</p>
+<ol>
+<li><strong>Indices are loaded on demand</strong>: A dataset can be loaded and read without loading any indices.
+   Indices are only loaded when a query can benefit from them.
+   This design minimizes memory usage and speeds up dataset opening time.</li>
+<li><strong>Indices can be loaded progressively</strong>: indices are designed so that only the necessary parts
+   are loaded into memory during query execution. For example, when querying a B-tree index,
+   it loads a small page table to figure out which pages of the index to load for the given query,
+   and then only loads those pages to perform the indexed search. This amortizes the cost of
+   cold index queries, since each query only needs to load a small portion of the index.</li>
+<li><strong>Indices can be coalesced to larger units than fragments.</strong> Indices are much smaller than
+   data files, so it is efficient to coalesce index segments to cover multiple fragments.
+   This reduces the number of index files that need to be opened during query execution and
+   then number of unique index data structures that need to be queried.</li>
+<li><strong>Index files are immutable once written, similar to data files.</strong> They can be modified only
+   by creating new files. This means they can be safely cached in memory or on disk without
+   worrying about consistency issues.</li>
+</ol>
+<h2 id="basic-concepts">Basic Concepts<a class="headerlink" href="#basic-concepts" title="Permanent link">&para;</a></h2>
+<p>An index in Lance is defined over a specific column (or multiple columns) of a dataset.
+It is identified by its name.</p>
+<p>An index is made up of multiple <strong>index segments</strong>, identified by their unique UUIDs.
+Each segment is an independent, self-contained index covering a subset of the data.</p>
+<p>Each index segment covers a disjoint subset of fragments in the dataset. The segments must cover
+all rows in the fragments they cover, with one exception: if a fragment has delete markers at the time
+of index creation, the index segment is allowed to not contain the deleted rows. The fragments an index
+covers are those recorded in the <code>fragment_bitmap</code> field.</p>
+<p>Index segments together <strong>do not</strong> need to cover all fragments. This means an index isn't required to
+be fully up-to-date. When this happens, engines can split their queries into indexed and unindexed
+subplans and merge the results.</p>
+<figure>
+  <img alt="" src="starter-example.drawio.svg" />
+<br />
+<figcaption>Abstract layout of a typical dataset, with three fragments and two indices.
+  </figcaption>
+</figure>
+<p>Consider the example dataset in the figure above:</p>
+<ul>
+<li>The dataset contains three fragments with ids 0, 1, 2. Fragment 1 has 10 deleted rows, indicated
+  by the deletion file.</li>
+<li>There is an index called "id_idx", which has two segments: one covering fragments 0 and another covering
+  fragment 1. Fragment 2 is not covered by the index. Queries using this index will need to query both
+  segments and then scan fragment 2 directly. Additionally, when querying the segment covering fragment 1,
+  the engine will need to filter out the 10 deleted rows.</li>
+<li>There is another index called "vec_idx", which has a single segment covering all three fragments.
+  Because it covers all fragments, queries using this index do not need to scan any fragments directly.
+  They do, however, need to filter out the 10 deleted rows from fragment 1.</li>
+</ul>
+<h2 id="index-storage">Index Storage<a class="headerlink" href="#index-storage" title="Permanent link">&para;</a></h2>
+<p>The content of each index is stored at the <code>_indices/{UUID}</code> directory under the <a href="../table/layout/#base-path-system">base path</a>.
+We call this location the <strong>index directory</strong>.
+The actual content stored in the index directory depends on the index type. These can be
+arbitrary files defined by the index implementation. However, often they are made up of
+Lance files containing the index data structures. This allows reuse of the existing Lance
+file format code for reading and writing index data.</p>
+<h2 id="creating-and-updating-index-segments">Creating and Updating Index Segments<a class="headerlink" href="#creating-and-updating-index-segments" title="Permanent link">&para;</a></h2>
+<p>Index segments are created and updated through a transactional process:</p>
+<ol>
+<li>
+<p><strong>Build the index data</strong>: Read the relevant column data from the fragments to be indexed
+   and construct the index data structures. Write these to files in a new <code>_indices/{UUID}</code>
+   directory, where <code>{UUID}</code> is a newly generated unique identifier.</p>
+</li>
+<li>
+<p><strong>Prepare the metadata</strong>: Create an <code>IndexMetadata</code> message with:</p>
+</li>
+<li><code>uuid</code>: The newly generated UUID</li>
+<li><code>name</code>: The index name (must match existing segments if adding to an existing index)</li>
+<li><code>fields</code>: The columns the index depends on: the keyed column(s) it is searched on, followed
+     by any merely-carried columns named in <code>covering_fields</code>. <code>fields[0]</code> is always a keyed column.</li>
+<li><code>covering_fields</code>: The trailing subset of <code>fields</code> whose values the index carries but is not
+     keyed on, letting a query that only projects those columns be answered without a fragment take.
+     Empty for an index that carries no extra columns. Declaring a column here does not by itself
+     make it servable -- see <a href="#serving-carried-columns">Serving carried columns</a>.</li>
+<li><code>fragment_bitmap</code>: The set of fragment IDs covered by this segment</li>
+<li><code>index_details</code>: Index-specific configuration and parameters</li>
+<li><code>version</code>: The format version of this index type</li>
+<li>
+<p>See the full protobuf definition in <a href="https://github.com/lance-format/lance/blob/main/protos/table.proto">table.proto</a>.</p>
+</li>
+<li>
+<p><strong>Commit the transaction</strong>: Write a new manifest that includes the new index segment
+   in its <code>IndexSection</code>. This is done atomically using the same transaction mechanism
+   as data writes.</p>
+</li>
+</ol>
+<p>When updating a column in place (without deleting the row), the engine must remove the
+affected fragment IDs from the <code>fragment_bitmap</code> field of any index segment whose <code>fields</code>
+include that column — whether the index is keyed on it or merely carries it. This marks
+those fragments as needing re-indexing without invalidating the entire segment and prevents
+invalid data from being read from the index.</p>
+<h2 id="index-compatibility">Index Compatibility<a class="headerlink" href="#index-compatibility" title="Permanent link">&para;</a></h2>
+<p>Before using an index segment, engines must verify they support it:</p>
+<ol>
+<li>
+<p><strong>Check the index type</strong>: The <code>index_details</code> field contains a protobuf <code>Any</code> message
+   whose type URL identifies the index type (e.g., B-tree, IVF, HNSW). If the engine
+   does not recognize the type, it should skip this index segment.</p>
+</li>
+<li>
+<p><strong>Check the version</strong>: The <code>version</code> field in <code>IndexMetadata</code> indicates the format
+   version of the index segment. If the engine does not support this version, it should
+   skip this index segment. This allows index formats to evolve over time while
+   maintaining backwards compatibility.</p>
+</li>
+</ol>
+<p>When an engine cannot use an index segment, it should fall back to scanning the
+fragments that would have been covered by that segment.</p>
+<h3 id="serving-carried-columns">Serving carried columns<a class="headerlink" href="#serving-carried-columns" title="Permanent link">&para;</a></h3>
+<p><code>IndexMetadata.covering_fields</code> records the columns an index segment <em>declares</em> it
+carries. It does not establish that the segment's storage holds their values.</p>
+<p><strong>The segment's storage schema is authoritative.</strong> Before answering a query from a
+carried column, an engine must confirm that column is present in the storage it opened,
+and fall back to a take against the base table when it is not. A segment whose
+declaration names a column its storage does not hold is a legal state, not corruption:
+a maintenance operation that cannot carry the payload through a rebuild is permitted to
+withdraw it and leave the declaration standing.</p>
+<div class="admonition note">
+<p class="admonition-title">Current state</p>
+<p>No index builder writes carried values yet, so today every declaration is ahead of
+its storage. Engines that read <code>covering_fields</code> must therefore treat it purely as a
+declaration and serve every column from the base table until they have verified the
+storage themselves. This is transitional; the rule above is not.</p>
+</div>
+<h2 id="loading-an-index">Loading an index<a class="headerlink" href="#loading-an-index" title="Permanent link">&para;</a></h2>
+<p>When loading an index:</p>
+<ol>
+<li>Get the offset to the index section from the <code>index_section</code> field in the <a href="../table/#manifest">manifest</a>.</li>
+<li>Read the index section from the manifest file. This is a protobuf message of type <code>IndexSection</code>, which
+   contains a list of <code>IndexMetadata</code> messages, each describing an index segment.</li>
+<li>Read the index files from the <code>_indices/{UUID}</code> directory under the dataset directory,
+   where <code>{UUID}</code> is the UUID of the index segment.</li>
+</ol>
+<div class="admonition tip">
+<p class="admonition-title">Optimizing manifest loading</p>
+<p>When the manifest file is small, you can read and cache the index section eagerly. This avoids
+an extra file read when loading indices.</p>
+</div>
+<p>The <code>IndexMetadata</code> message contains important information about the index segment:</p>
+<ul>
+<li><code>uuid</code>: the unique identifier of the index segment.</li>
+<li><code>fields</code>: the columns the index depends on: the keyed column(s) the index is searched on, followed
+  by any columns it merely carries, as named in <code>covering_fields</code>. <code>fields[0]</code> is always a keyed column.</li>
+<li><code>covering_fields</code>: the trailing subset of <code>fields</code> whose values the index carries alongside its own
+  data but is not keyed on. Empty for an index that carries no extra columns. This declaration is
+  not authoritative for what the segment can serve -- see
+  <a href="#serving-carried-columns">Serving carried columns</a>.</li>
+<li><code>fragment_bitmap</code>: the set of fragment IDs covered by this index segment.</li>
+<li><code>index_details</code>: a protobuf <code>Any</code> message that contains index-specific details, such as index type,
+  parameters, and storage format. This allows different index types to store their own metadata.</li>
+</ul>
+<details>
+  <summary>Full protobuf definitions</summary>
+
+There are both part of the `table.proto` file in the Lance source code.
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">IndexSection</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexMetadata</span><span class="w"> </span><span class="na">indices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="p">}</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="kd">message</span><span class="w"> </span><span class="nc">IndexMetadata</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span><span class="c1">// Unique ID of an index. It is unique across all the dataset versions.</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">  </span><span class="n">UUID</span><span class="w"> </span><span class="na">uuid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">  </span><span class="cm">/* The columns to build the index. These refer to file.Field.id.</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="cm">   *</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="cm">   * fields[0] is always a column the index is keyed on. Trailing entries may</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="cm">   * instead be merely carried, not keyed on -- see `covering_fields` below.</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="cm">   */</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">int32</span><span class="w"> </span><span class="na">fields</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span><span class="c1">// Index name. Must be unique within one dataset version.</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">  </span><span class="c1">// The version of the dataset this index was built from.</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">dataset_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">  </span><span class="cm">/* A bitmap of the included fragment ids.</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="cm">   *</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="cm">   * This may by used to determine how much of the dataset is covered by the</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="cm">   * index. This information can be retrieved from the dataset by looking at</span>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="cm">   * the dataset at `dataset_version`. However, since the old version may be</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="cm">   * deleted while the index is still in use, this information is also stored</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="cm">   * in the index.</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="cm">   *</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="cm">   * The bitmap is stored as a 32-bit Roaring bitmap.</span>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="cm">   */</span>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="w">  </span><span class="kt">bytes</span><span class="w"> </span><span class="na">fragment_bitmap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="w">  </span><span class="cm">/* Details, specific to the index type, which are needed to load / interpret the index</span>
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="cm">   *</span>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="cm">   * Indices should avoid putting large amounts of information in this field, as it will</span>
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="cm">   * bloat the manifest.</span>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="cm">   *</span>
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a><span class="cm">   * Indexes are plugins, and so the format of the details message is flexible and not fully</span>
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a><span class="cm">   * defined by the table format.  However, there are some conventions that should be followed:</span>
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a><span class="cm">   *</span>
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="cm">   * - When Lance APIs refer to indexes they will use the type URL of the index details as the</span>
+</span><span id="__span-0-44"><a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a><span class="cm">   *   identifier for the index type.  If a user provides a simple string identifier like</span>
+</span><span id="__span-0-45"><a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a><span class="cm">   *   "btree" then it will be converted to "/lance.table.BTreeIndexDetails"</span>
+</span><span id="__span-0-46"><a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a><span class="cm">   * - Type URLs comparisons are case-insensitive.  Thereform an index must have a unique type</span>
+</span><span id="__span-0-47"><a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a><span class="cm">   *   URL ignoring case.</span>
+</span><span id="__span-0-48"><a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a><span class="cm">   */</span>
+</span><span id="__span-0-49"><a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a><span class="w">  </span><span class="n">google.protobuf.Any</span><span class="w"> </span><span class="na">index_details</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-0-50"><a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a>
+</span><span id="__span-0-51"><a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a><span class="w">  </span><span class="c1">// The minimum lance version that this index is compatible with.</span>
+</span><span id="__span-0-52"><a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">int32</span><span class="w"> </span><span class="na">index_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-0-53"><a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a>
+</span><span id="__span-0-54"><a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a><span class="w">  </span><span class="cm">/* Timestamp when the index was created (UTC timestamp in milliseconds since epoch)</span>
+</span><span id="__span-0-55"><a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a><span class="cm">   *</span>
+</span><span id="__span-0-56"><a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a><span class="cm">   * This field is optional for backward compatibility. For existing indices created before</span>
+</span><span id="__span-0-57"><a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a><span class="cm">   * this field was added, this will be None/null.</span>
+</span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a><span class="cm">   */</span>
+</span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">created_at</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a>
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a><span class="w">  </span><span class="cm">/* The base path index of the data file. Used when the file is imported or referred from another dataset.</span>
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a><span class="cm">   * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.</span>
+</span><span id="__span-0-63"><a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a><span class="cm">   */</span>
+</span><span id="__span-0-64"><a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">base_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-0-65"><a id="__codelineno-0-65" name="__codelineno-0-65" href="#__codelineno-0-65"></a>
+</span><span id="__span-0-66"><a id="__codelineno-0-66" name="__codelineno-0-66" href="#__codelineno-0-66"></a><span class="w">  </span><span class="cm">/* List of files and their sizes for this index segment.</span>
+</span><span id="__span-0-67"><a id="__codelineno-0-67" name="__codelineno-0-67" href="#__codelineno-0-67"></a><span class="cm">   * This enables skipping HEAD calls when opening indices and allows reporting</span>
+</span><span id="__span-0-68"><a id="__codelineno-0-68" name="__codelineno-0-68" href="#__codelineno-0-68"></a><span class="cm">   * of index sizes without extra IO.</span>
+</span><span id="__span-0-69"><a id="__codelineno-0-69" name="__codelineno-0-69" href="#__codelineno-0-69"></a><span class="cm">   * If this is empty, the index files sizes are unknown.</span>
+</span><span id="__span-0-70"><a id="__codelineno-0-70" name="__codelineno-0-70" href="#__codelineno-0-70"></a><span class="cm">   */</span>
+</span><span id="__span-0-71"><a id="__codelineno-0-71" name="__codelineno-0-71" href="#__codelineno-0-71"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexFile</span><span class="w"> </span><span class="na">files</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-0-72"><a id="__codelineno-0-72" name="__codelineno-0-72" href="#__codelineno-0-72"></a>
+</span><span id="__span-0-73"><a id="__codelineno-0-73" name="__codelineno-0-73" href="#__codelineno-0-73"></a><span class="w">  </span><span class="cm">/* The subset of `fields` whose values this index co-locates alongside its own</span>
+</span><span id="__span-0-74"><a id="__codelineno-0-74" name="__codelineno-0-74" href="#__codelineno-0-74"></a><span class="cm">   * data, so a query projecting only those columns can be answered from the</span>
+</span><span id="__span-0-75"><a id="__codelineno-0-75" name="__codelineno-0-75" href="#__codelineno-0-75"></a><span class="cm">   * index without a take against the base table.</span>
+</span><span id="__span-0-76"><a id="__codelineno-0-76" name="__codelineno-0-76" href="#__codelineno-0-76"></a><span class="cm">   *</span>
+</span><span id="__span-0-77"><a id="__codelineno-0-77" name="__codelineno-0-77" href="#__codelineno-0-77"></a><span class="cm">   * Must be a suffix of `fields`: the columns the index is keyed on come first,</span>
+</span><span id="__span-0-78"><a id="__codelineno-0-78" name="__codelineno-0-78" href="#__codelineno-0-78"></a><span class="cm">   * the columns it merely carries come last, and at least one keyed column</span>
+</span><span id="__span-0-79"><a id="__codelineno-0-79" name="__codelineno-0-79" href="#__codelineno-0-79"></a><span class="cm">   * always remains. Empty for an index that carries no extra columns, which is</span>
+</span><span id="__span-0-80"><a id="__codelineno-0-80" name="__codelineno-0-80" href="#__codelineno-0-80"></a><span class="cm">   * every index written before this field existed.</span>
+</span><span id="__span-0-81"><a id="__codelineno-0-81" name="__codelineno-0-81" href="#__codelineno-0-81"></a><span class="cm">   *</span>
+</span><span id="__span-0-82"><a id="__codelineno-0-82" name="__codelineno-0-82" href="#__codelineno-0-82"></a><span class="cm">   * Carried columns are listed in `fields` as well. That is deliberate: every</span>
+</span><span id="__span-0-83"><a id="__codelineno-0-83" name="__codelineno-0-83" href="#__codelineno-0-83"></a><span class="cm">   * consumer that reads `fields` as the index's dependency set -- staleness,</span>
+</span><span id="__span-0-84"><a id="__codelineno-0-84" name="__codelineno-0-84" href="#__codelineno-0-84"></a><span class="cm">   * commit conflict detection, schema evolution guards -- then covers them with</span>
+</span><span id="__span-0-85"><a id="__codelineno-0-85" name="__codelineno-0-85" href="#__codelineno-0-85"></a><span class="cm">   * no change and no way to forget one.</span>
+</span><span id="__span-0-86"><a id="__codelineno-0-86" name="__codelineno-0-86" href="#__codelineno-0-86"></a><span class="cm">   *</span>
+</span><span id="__span-0-87"><a id="__codelineno-0-87" name="__codelineno-0-87" href="#__codelineno-0-87"></a><span class="cm">   * This declaration is not authoritative for what the segment can actually</span>
+</span><span id="__span-0-88"><a id="__codelineno-0-88" name="__codelineno-0-88" href="#__codelineno-0-88"></a><span class="cm">   * serve. The segment's own storage schema is: a reader must confirm the</span>
+</span><span id="__span-0-89"><a id="__codelineno-0-89" name="__codelineno-0-89" href="#__codelineno-0-89"></a><span class="cm">   * storage carries a column before answering a query from it, and fall back to</span>
+</span><span id="__span-0-90"><a id="__codelineno-0-90" name="__codelineno-0-90" href="#__codelineno-0-90"></a><span class="cm">   * a take against the base table otherwise. A declaration naming columns the</span>
+</span><span id="__span-0-91"><a id="__codelineno-0-91" name="__codelineno-0-91" href="#__codelineno-0-91"></a><span class="cm">   * storage does not hold is a legal state, not corruption -- a maintenance</span>
+</span><span id="__span-0-92"><a id="__codelineno-0-92" name="__codelineno-0-92" href="#__codelineno-0-92"></a><span class="cm">   * operation that cannot carry the values through a rebuild is permitted to</span>
+</span><span id="__span-0-93"><a id="__codelineno-0-93" name="__codelineno-0-93" href="#__codelineno-0-93"></a><span class="cm">   * withdraw the payload while leaving this declaration in place.</span>
+</span><span id="__span-0-94"><a id="__codelineno-0-94" name="__codelineno-0-94" href="#__codelineno-0-94"></a><span class="cm">   */</span>
+</span><span id="__span-0-95"><a id="__codelineno-0-95" name="__codelineno-0-95" href="#__codelineno-0-95"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">int32</span><span class="w"> </span><span class="na">covering_fields</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-0-96"><a id="__codelineno-0-96" name="__codelineno-0-96" href="#__codelineno-0-96"></a>
+</span><span id="__span-0-97"><a id="__codelineno-0-97" name="__codelineno-0-97" href="#__codelineno-0-97"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h2 id="handling-deleted-and-invalidated-rows">Handling deleted and invalidated rows<a class="headerlink" href="#handling-deleted-and-invalidated-rows" title="Permanent link">&para;</a></h2>
+<p>Since index segments are immutable, they may contain references to rows that have been deleted
+or updated. These should be filtered out during query execution.</p>
+<figure>
+  <img alt="" src="indices-fragment%20handling.drawio.svg" />
+<br />
+<figcaption>Representation of index segment covering fragments that have deleted rows,
+  completely deleted fragments, and updated fragments.
+  </figcaption>
+</figure>
+<p>There are four situations to consider:</p>
+<ol>
+<li><strong>A fragment has some deleted rows.</strong> A few of the rows in the fragment have been marked
+   as deleted, but some of the rows are still present. The row addresses from the deletion
+   file should be used to filter out results from the index.</li>
+<li><strong>A fragment has been completely deleted.</strong> This can be detected by checking if a
+   fragment ID present in the fragment bitmap is missing from the dataset.
+   Any row addresses from this fragment should be filtered out.</li>
+<li><strong>A fragment has had one of the index's columns updated in place.</strong> This cannot be detected
+   just by examining metadata. To prevent reading invalid data, the engine should filter out any
+   row addresses that are not in the index's current <code>fragment_bitmap</code>.
+   The column need not be one the index is keyed on: every column in <code>fields</code> counts, including
+   the merely-carried ones named in <code>covering_fields</code>. A carried column can be updated while the
+   keyed column is untouched, and a segment left covering that fragment would answer from an
+   obsolete carried value.</li>
+<li><strong>A fragment has an updated value in an <a href="../table/data_overlay_file/">overlay file</a>.</strong>
+   This can be detected by checking if any of the fragments in the index's <code>fragment_bitmap</code>
+   have overlay files. For each overlay whose <code>committed_version</code> is greater than the index
+   segment's <code>dataset_version</code>, the overlay carries updated values not reflected in the index,
+   so its covered rows must be excluded from index results. Excluded rows are re-evaluated
+   against their current (overlaid) values on the flat path — dropping them without
+   re-evaluation would silently lose rows that match under the new value. Exclusion is
+   field-aware: only overlays covering a column in the index's <code>fields</code> matter — keyed or
+   merely carried. Restricting this to the keyed column would leave a fragment covered after
+   an overlay updated a carried one, and the index would then serve a stale carried value.
+   You may exclude just the affected rows or the whole fragment; the latter is simpler and
+   safer but re-evaluates more rows than necessary.
+   See <a href="../table/data_overlay_file/#index-integration">Data Overlay Files</a>
+   for the exclusion set, re-evaluation, and correctness invariant.</li>
+</ol>
+<h2 id="compaction-and-remapping">Compaction and remapping<a class="headerlink" href="#compaction-and-remapping" title="Permanent link">&para;</a></h2>
+<p>When fragments are compacted, the row addresses of the rows in the fragments change.
+This means that any index segments referencing those fragments will no longer point
+to existing row addresses. There are three ways to handle this:</p>
+<figure>
+<img alt="" src="indices-compaction.drawio.svg" />
+</figure>
+<ol>
+<li>
+<p>Do nothing and let the index segment not cover those fragments anymore. This approach is
+   simple and valid, but it means compaction can immediately make an index out-of-date. This
+   is the worst options for query performance.</p>
+</li>
+<li>
+<p>Immediately rewrite the index segments with the row addresses remapped. This approach
+   ensures the index is kept up-to-date, but it incurs significant write amplification
+   during compaction.</p>
+</li>
+<li>
+<p>Create a <a href="system/frag_reuse/">Fragment Reuse Index</a> that maps old row addresses to new
+   row addresses. This allows readers to remap the row addresses in memory upon reading
+   the index segments. This approach adds some IO and computation overhead during query
+   execution, but avoids write amplification during compaction.</p>
+</li>
+</ol>
+<h2 id="stable-row-id-for-index">Stable Row ID for Index<a class="headerlink" href="#stable-row-id-for-index" title="Permanent link">&para;</a></h2>
+<p>Indices can optionally use stable row IDs instead of row addresses. A stable row ID is a
+logical identifier that remains constant even when rows are moved during compaction.</p>
+<p><strong>Benefits:</strong></p>
+<ul>
+<li>No remapping needed after compaction</li>
+<li>Updates only invalidate the index if data in one of its <code>fields</code> changes — the keyed
+  column(s) or any column named in <code>covering_fields</code></li>
+</ul>
+<p><strong>Tradeoffs:</strong></p>
+<ul>
+<li>Requires an additional lookup to translate stable row IDs to physical row addresses
+  at query time</li>
+</ul>
+<p>This feature is currently experimental. Performance evaluation is ongoing to determine
+when the tradeoff is worthwhile.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../table/mem_wal/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">MemTable & WAL</div>
+        </a>
+        <a class="next" href="scalar/btree/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">BTree</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#design">Design</a>
+      <a class="ld-toc__h2" href="#basic-concepts">Basic Concepts</a>
+      <a class="ld-toc__h2" href="#index-storage">Index Storage</a>
+      <a class="ld-toc__h2" href="#creating-and-updating-index-segments">Creating and Updating Index Segments</a>
+      <a class="ld-toc__h2" href="#index-compatibility">Index Compatibility</a>
+      <a class="ld-toc__h3" href="#serving-carried-columns">Serving carried columns</a>
+      <a class="ld-toc__h2" href="#loading-an-index">Loading an index</a>
+      <a class="ld-toc__h2" href="#handling-deleted-and-invalidated-rows">Handling deleted and invalidated rows</a>
+      <a class="ld-toc__h2" href="#compaction-and-remapping">Compaction and remapping</a>
+      <a class="ld-toc__h2" href="#stable-row-id-for-index">Stable Row ID for Index</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../">Specification</a>
+        <a href="../file/">File format</a>
+        <a href="../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../../guide/read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

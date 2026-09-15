@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Voting — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/community/voting/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab active" href="../">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Community
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Community</div>
+    <a href="../">Lance Community Governance</a>
+    <a href="../maintainers/">Maintainers</a>
+    <a href="../pmc/">PMC</a>
+    <a href="../communication/">Communication</a>
+    <a class="active" href="./">Voting</a>
+    <a href="../contributing/">Contributing</a>
+    <a href="../release/">Release</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Project Specific Guidelines</div>
+    <a href="../project-specific/">Project Specific Guidelines</a>
+    <a href="../project-specific/namespace/">Lance Namespace</a>
+    <a href="../project-specific/namespace-impls/">Lance Namespace Impls</a>
+    <a href="../project-specific/ray/">Lance Ray</a>
+    <a href="../project-specific/spark/">Lance Spark</a>
+    <a href="../project-specific/trino/">Lance Trino</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance</div>
+    <a href="../project-specific/lance/general/">General</a>
+    <a href="../project-specific/lance/release/">Release</a>
+    <a href="../project-specific/lance/rust/">Rust</a>
+    <a href="../project-specific/lance/python/">Python</a>
+    <a href="../project-specific/lance/docs/">Docs</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Community</span>
+        <span>/</span><b>Voting</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-community-voting-process">Lance Community Voting Process<a class="headerlink" href="#lance-community-voting-process" title="Permanent link">&para;</a></h1>
+<p>Lance uses a consensus-based voting process for decision-making.</p>
+<h2 id="expressing-votes">Expressing Votes<a class="headerlink" href="#expressing-votes" title="Permanent link">&para;</a></h2>
+<p>Votes are expressed as the following:</p>
+<ul>
+<li><strong>+1</strong>: Yes</li>
+<li><strong>0</strong>: Abstain</li>
+<li><strong>-1</strong>: No</li>
+</ul>
+<p>When voting, it is recommended that voters indicate whether their vote is binding or not (e.g., <code>+1 (non-binding)</code>, <code>-1 (binding)</code>)
+to ease the counting of binding votes.</p>
+<p>In addition to the vote, voters can also express their justification as part of the comment.
+<strong>-1</strong> votes must include justification to allow meaningful discussion.
+Any <strong>-1</strong> vote not accompanied by justification is considered invalid.</p>
+<p>For votes conducted on GitHub Discussions,
+each vote should be cast as an independent comment instead of as a reply within a comment.
+This ensures that people can discuss the vote as replies to that specific comment if needed
+(e.g., to discuss <strong>-1</strong> vetoes or address concerns).</p>
+<p>For votes conducted on a pull request, cast <strong>+1</strong> by approving the PR and <strong>-1</strong> by
+requesting changes. These votes are counted automatically, so a <strong>+1</strong> written only as
+a comment does not count.</p>
+<h2 id="binding-votes">Binding Votes<a class="headerlink" href="#binding-votes" title="Permanent link">&para;</a></h2>
+<p>Only votes from the binding voters are counted for each decision,
+but other people in the community are also encouraged to cast non-binding votes.
+Binding voters should consider any concern from non-binding voters during the vote process.</p>
+<h2 id="vetoes">Vetoes<a class="headerlink" href="#vetoes" title="Permanent link">&para;</a></h2>
+<p>A <strong>-1</strong> binding vote is considered a veto for all decision types. Vetoes:</p>
+<ul>
+<li>Stop the proposal until the concerns are resolved</li>
+<li>Cannot be overruled</li>
+<li>Trigger consensus gathering to address concerns</li>
+</ul>
+<h2 id="voting-requirements">Voting Requirements<a class="headerlink" href="#voting-requirements" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Decision Type</th>
+<th>+1 Votes Required</th>
+<th>Binding Voters</th>
+<th>Location</th>
+<th>Minimum Period</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Governance process and structure modifications</td>
+<td>3</td>
+<td>PMC</td>
+<td>Private Mailing List</td>
+<td>1 week</td>
+</tr>
+<tr>
+<td>Changes in maintainers and PMC rosters</td>
+<td>3 (excluding the people proposed for change)</td>
+<td>PMC</td>
+<td>Private Mailing List</td>
+<td>1 week</td>
+</tr>
+<tr>
+<td>Incubating subproject graduation to subproject</td>
+<td>3</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Subproject management</td>
+<td>1</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Release a new stable major version of the core project</td>
+<td>3</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Release a new stable minor version of the core project</td>
+<td>3</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>3 days</td>
+</tr>
+<tr>
+<td>Release a new stable patch version of the core project</td>
+<td>3</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Lance Format Specification modifications</td>
+<td>3 (excluding proposer)</td>
+<td>PMC</td>
+<td>GitHub PR (see <a href="#lance-format-specification-changes">below</a>)</td>
+<td>72 hours, excluding weekends</td>
+</tr>
+<tr>
+<td>Code modifications in the core project (except changes to format specifications)</td>
+<td>1 (excluding proposer)</td>
+<td>Maintainers with write access</td>
+<td>GitHub PR</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Release a new stable version of subprojects</td>
+<td>1</td>
+<td>PMC</td>
+<td>GitHub Discussions</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>Code modifications in subprojects</td>
+<td>1 (excluding proposer)</td>
+<td>Contributors with write access</td>
+<td>GitHub PR</td>
+<td>N/A</td>
+</tr>
+</tbody>
+</table>
+<h2 id="lance-format-specification-changes">Lance Format Specification Changes<a class="headerlink" href="#lance-format-specification-changes" title="Permanent link">&para;</a></h2>
+<p>The pull request <em>is</em> the proposal. Open a PR with the specification change,
+and the PMC votes on it there — there is no separate design document or
+discussion thread to write first, and the requirement is enforced structurally
+in CI rather than by convention.</p>
+<h3 id="proposing-a-change">Proposing a Change<a class="headerlink" href="#proposing-a-change" title="Permanent link">&para;</a></h3>
+<p>Keep a format-specification PR to the specification itself: the protobuf
+definitions and the spec documentation, plus the minimum library changes needed
+to keep the build green (for example, matching a renamed generated field).
+Implement the behavior behind the change in follow-up PRs.</p>
+<p>This is not just a tidiness preference. The vote is on the format — a durable
+compatibility contract that outlives any one implementation — and PMC members
+should be able to read the whole of what they are voting on. A PR that also
+carries the reader, writer, and test changes buries the contract in
+implementation detail, and it drags an ordinary code review through a 72-hour
+voting period it does not need.</p>
+<p>Discussion happens as review comments on the PR, so reviewers can respond to
+specific lines of the specification. Open the PR as a draft while it is still
+taking shape; the voting period starts when you mark it ready for review.</p>
+<h3 id="how-the-vote-is-counted">How the Vote is Counted<a class="headerlink" href="#how-the-vote-is-counted" title="Permanent link">&para;</a></h3>
+<p>A PR counts as a format-specification change when it modifies the protobuf
+definitions (<code>protos/**/*.proto</code>) or the spec documentation (<code>docs/src/format/**</code>);
+such PRs are labeled <code>format-change</code> automatically. The
+<a href="https://github.com/lance-format/lance/blob/main/.github/workflows/format-vote-gate.yml">format spec vote gate</a>
+blocks merging a <code>format-change</code> PR until all of the following hold:</p>
+<ul>
+<li><strong>Three binding +1 votes.</strong> Three PMC members have approved the PR, excluding
+  the proposer. Cast +1 by approving the PR. Only approvals on the latest commit
+  count — pushing new commits invalidates earlier approvals, since the proposal
+  has changed.</li>
+<li><strong>No veto.</strong> No PMC member has an outstanding "Request changes" review. A <code>-1</code>
+  binding vote (cast by requesting changes) is a veto and blocks the merge until
+  withdrawn.</li>
+<li><strong>Minimum voting period.</strong> At least 72 hours have elapsed since the vote
+  opened. Weekends do not count toward the 72 hours, so a proposal opened on a
+  Friday afternoon still gets three working days of attention. The voting period
+  opens once the PR is both labeled <code>format-change</code> and marked ready for
+  review, whichever comes last. Weekends are delimited in UTC; the gate comments
+  on the PR with the exact closing time in both UTC and Pacific Time.</li>
+</ul>
+<p>The gate is the <code>format-spec-vote</code> required status check on protected branches.
+The PMC roster used to count votes is read from
+<a href="../pmc/"><code>docs/src/community/pmc.yaml</code></a>. It re-evaluates on a 15-minute
+schedule, so the tally comment and the status check trail a review by a few
+minutes; the comment links to a "Run workflow" page for anyone who would rather
+re-check immediately.</p>
+<p>For a trivial edit that does not change the format — a typo, wording, or
+formatting fix — a PMC member may apply the <code>format-waived</code> label to waive the
+vote.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../communication/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Communication</div>
+        </a>
+        <a class="next" href="../contributing/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Contributing</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#expressing-votes">Expressing Votes</a>
+      <a class="ld-toc__h2" href="#binding-votes">Binding Votes</a>
+      <a class="ld-toc__h2" href="#vetoes">Vetoes</a>
+      <a class="ld-toc__h2" href="#voting-requirements">Voting Requirements</a>
+      <a class="ld-toc__h2" href="#lance-format-specification-changes">Lance Format Specification Changes</a>
+      <a class="ld-toc__h3" href="#proposing-a-change">Proposing a Change</a>
+      <a class="ld-toc__h3" href="#how-the-vote-is-counted">How the Vote is Counted</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../../guide/read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

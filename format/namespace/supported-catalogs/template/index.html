@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Template — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/namespace/supported-catalogs/template/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../../index/scalar/btree/">BTree</a>
+    <a href="../../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../../index/scalar/label_list/">Label List</a>
+    <a href="../../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../../index/scalar/ngram/">N-gram</a>
+    <a href="../../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../">Overview</a>
+    <a href="../../object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../operations/">Overview</a>
+    <a href="../../operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../operations/models/">Operation Models</a>
+    <a href="../../operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../operations/models/Identity/">Identity</a>
+    <a href="../../operations/models/IndexContent/">IndexContent</a>
+    <a href="../../operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../operations/models/PartitionField/">PartitionField</a>
+    <a href="../../operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../operations/models/TableVersion/">TableVersion</a>
+    <a href="../../operations/models/TagContents/">TagContents</a>
+    <a href="../../operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../">Overview</a>
+    <a href="../lance-dir/">Lance Directory Catalog</a>
+    <a href="../lance-rest/">Lance REST Catalog</a>
+    <a href="../gravitino/">Apache Gravitino</a>
+    <a href="../hive2/">Apache Hive MetaStore V2</a>
+    <a href="../hive3/">Apache Hive MetaStore V3</a>
+    <a href="../iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../polaris/">Apache Polaris</a>
+    <a href="../glue/">AWS Glue</a>
+    <a href="../biglake/">Google BigLake</a>
+    <a href="../dataproc/">Google Dataproc</a>
+    <a href="../onelake/">Microsoft OneLake</a>
+    <a href="../unity/">Unity Catalog</a>
+    <a class="active" href="./">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Namespace Client Spec</span>
+        <span>/</span><span>Supported Catalogs</span>
+        <span>/</span><b>Template</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="catalog-integration-template">Catalog Integration Template<a class="headerlink" href="#catalog-integration-template" title="Permanent link">&para;</a></h1>
+<p>This template defines the standard structure for Lance Catalog implementation specs.
+Each implementation spec describes how a specific catalog system integrates with the Lance Namespace Client.</p>
+<h2 id="required-sections">Required Sections<a class="headerlink" href="#required-sections" title="Permanent link">&para;</a></h2>
+<h3 id="1-background">1. Background<a class="headerlink" href="#1-background" title="Permanent link">&para;</a></h3>
+<p>Provide a brief introduction to the catalog system being integrated:</p>
+<ul>
+<li>What the catalog system is and its purpose</li>
+<li>Link to the catalog spec for detailed design information</li>
+<li>Any important context for understanding the implementation</li>
+</ul>
+<h3 id="2-namespace-implementation-configuration-properties">2. Namespace Implementation Configuration Properties<a class="headerlink" href="#2-namespace-implementation-configuration-properties" title="Permanent link">&para;</a></h3>
+<p>List all configuration properties accepted by the namespace implementation:</p>
+<ul>
+<li>Required vs optional properties</li>
+<li>Property descriptions and default values</li>
+<li>Prefix-based properties (e.g., <code>storage.*</code>, <code>headers.*</code>)</li>
+</ul>
+<h3 id="3-object-mapping">3. Object Mapping<a class="headerlink" href="#3-object-mapping" title="Permanent link">&para;</a></h3>
+<p>Describe how objects in the catalog system map to Lance Namespace concepts using paragraphs (not tables):</p>
+<p><strong>Namespace Mapping:</strong>
+- How the root namespace is represented
+- How child namespaces are organized
+- How namespace identifiers are constructed
+- Where namespace properties are stored</p>
+<p><strong>Table Mapping:</strong>
+- How tables are represented
+- How table identifiers are constructed
+- Where table data is stored (location)
+- Where table properties are stored</p>
+<h3 id="4-lance-table-identification">4. Lance Table Identification<a class="headerlink" href="#4-lance-table-identification" title="Permanent link">&para;</a></h3>
+<p>Describe how to determine if a table in the catalog is a Lance table:</p>
+<ul>
+<li>Required properties, markers, or naming conventions</li>
+<li>Storage location requirements</li>
+<li>How the implementation verifies table validity</li>
+</ul>
+<h3 id="5-basic-operations">5. Basic Operations<a class="headerlink" href="#5-basic-operations" title="Permanent link">&para;</a></h3>
+<p>For each of the 8 recommended basic operations, provide a detailed subsection. Each operation subsection should include:</p>
+<ul>
+<li>A brief description of what the operation does</li>
+<li>Step-by-step implementation details</li>
+<li>An <strong>Error Handling</strong> paragraph describing which errors can occur and under what conditions</li>
+</ul>
+<p>The 8 basic operations are:</p>
+<p><strong>Namespace Operations:</strong></p>
+<ul>
+<li>CreateNamespace</li>
+<li>ListNamespaces</li>
+<li>DescribeNamespace</li>
+<li>DropNamespace (only <code>Restrict</code> behavior mode required)</li>
+</ul>
+<p><strong>Table Operations:</strong></p>
+<ul>
+<li>DeclareTable</li>
+<li>ListTables</li>
+<li>DescribeTable (only <code>load_detailed_metadata=false</code> required)</li>
+<li>DeregisterTable</li>
+</ul>
+<p><strong>Note:</strong> For basic implementations, DropNamespace only needs to support the <code>Restrict</code> behavior mode
+(namespace must be empty before dropping). DescribeTable only needs to support <code>load_detailed_metadata=false</code>
+(only return table <code>location</code> without opening the dataset).</p>
+<h3 id="6-additional-operations-optional">6. Additional Operations (Optional)<a class="headerlink" href="#6-additional-operations-optional" title="Permanent link">&para;</a></h3>
+<p>If the implementation supports operations beyond the 8 basic operations, document them in this section.
+Each additional operation should follow the same structure as basic operations:</p>
+<ul>
+<li>A brief description of what the operation does</li>
+<li>Step-by-step implementation details</li>
+<li>An <strong>Error Handling</strong> paragraph describing which errors can occur</li>
+</ul>
+<p>Common additional operations include:</p>
+<ul>
+<li>DropTable</li>
+<li>RegisterTable</li>
+<li>RenameTable</li>
+<li>Table version operations (CreateTableVersion, ListTableVersions, DescribeTableVersion, BatchCreateTableVersions, BatchDeleteTableVersions)</li>
+</ul>
+<hr />
+<h2 id="template-structure">Template Structure<a class="headerlink" href="#template-structure" title="Permanent link">&para;</a></h2>
+<div class="language-markdown highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="gh"># {Catalog Name}</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>This document describes how the {Catalog Name} implements the Lance Namespace client spec.
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="gu">## Background</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>{Brief description of the catalog system and its purpose}. For details on the catalog design, see the [<span class="nt">{Catalog Name} Catalog Spec</span>](<span class="na">link-to-the-spec</span>).
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="gu">## Namespace Implementation Configuration Properties</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>The Lance {Catalog Name} namespace implementation accepts the following configuration properties:
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>The <span class="gs">**{property_name}**</span> property is {required/optional} and {description}. {Default value if optional}.
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>{Additional properties...}
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="gu">## Object Mapping</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="gu">### Namespace</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>The <span class="gs">**root namespace**</span> is {description of how root namespace maps}.
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>A <span class="gs">**child namespace**</span> is {description of child namespace representation}.
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a>The <span class="gs">**namespace identifier**</span> is {description of identifier format}.
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="gs">**Namespace properties**</span> are {description of where/how properties are stored}.
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="gu">### Table</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a>A <span class="gs">**table**</span> is {description of table representation}.
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a>The <span class="gs">**table identifier**</span> is {description of identifier format}.
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a>The <span class="gs">**table location**</span> is {description of where table data is stored}.
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="gs">**Table properties**</span> are {description of where/how properties are stored}.
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="gu">## Lance Table Identification</span>
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a>
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a>{Paragraph describing how to identify a Lance table in this catalog system}
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a>
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="gu">## Basic Operations</span>
+</span><span id="__span-0-44"><a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a>
+</span><span id="__span-0-45"><a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a><span class="gu">### CreateNamespace</span>
+</span><span id="__span-0-46"><a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a>
+</span><span id="__span-0-47"><a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a>{Brief description of operation}
+</span><span id="__span-0-48"><a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a>
+</span><span id="__span-0-49"><a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a>The implementation:
+</span><span id="__span-0-50"><a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a>
+</span><span id="__span-0-51"><a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a><span class="k">1.</span> {Step 1}
+</span><span id="__span-0-52"><a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a><span class="k">2.</span> {Step 2}
+</span><span id="__span-0-53"><a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a><span class="k">3.</span> {Step N}
+</span><span id="__span-0-54"><a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a>
+</span><span id="__span-0-55"><a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a><span class="gs">**Error Handling:**</span>
+</span><span id="__span-0-56"><a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a>
+</span><span id="__span-0-57"><a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a>If {condition}, return error code <span class="sb">`N`</span> ({ErrorName}).
+</span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a>
+</span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a>{Additional error conditions...}
+</span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a>
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a><span class="gu">### ListNamespaces</span>
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a>
+</span><span id="__span-0-63"><a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a>{Same structure as above}
+</span><span id="__span-0-64"><a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a>
+</span><span id="__span-0-65"><a id="__codelineno-0-65" name="__codelineno-0-65" href="#__codelineno-0-65"></a><span class="gu">### DescribeNamespace</span>
+</span><span id="__span-0-66"><a id="__codelineno-0-66" name="__codelineno-0-66" href="#__codelineno-0-66"></a>
+</span><span id="__span-0-67"><a id="__codelineno-0-67" name="__codelineno-0-67" href="#__codelineno-0-67"></a>{Same structure as above}
+</span><span id="__span-0-68"><a id="__codelineno-0-68" name="__codelineno-0-68" href="#__codelineno-0-68"></a>
+</span><span id="__span-0-69"><a id="__codelineno-0-69" name="__codelineno-0-69" href="#__codelineno-0-69"></a><span class="gu">### DropNamespace</span>
+</span><span id="__span-0-70"><a id="__codelineno-0-70" name="__codelineno-0-70" href="#__codelineno-0-70"></a>
+</span><span id="__span-0-71"><a id="__codelineno-0-71" name="__codelineno-0-71" href="#__codelineno-0-71"></a>{Same structure as above}
+</span><span id="__span-0-72"><a id="__codelineno-0-72" name="__codelineno-0-72" href="#__codelineno-0-72"></a>
+</span><span id="__span-0-73"><a id="__codelineno-0-73" name="__codelineno-0-73" href="#__codelineno-0-73"></a><span class="gs">**Note:**</span> Basic implementations only need to support <span class="sb">`Restrict`</span> behavior mode.
+</span><span id="__span-0-74"><a id="__codelineno-0-74" name="__codelineno-0-74" href="#__codelineno-0-74"></a>
+</span><span id="__span-0-75"><a id="__codelineno-0-75" name="__codelineno-0-75" href="#__codelineno-0-75"></a><span class="gu">### DeclareTable</span>
+</span><span id="__span-0-76"><a id="__codelineno-0-76" name="__codelineno-0-76" href="#__codelineno-0-76"></a>
+</span><span id="__span-0-77"><a id="__codelineno-0-77" name="__codelineno-0-77" href="#__codelineno-0-77"></a>{Same structure as above}
+</span><span id="__span-0-78"><a id="__codelineno-0-78" name="__codelineno-0-78" href="#__codelineno-0-78"></a>
+</span><span id="__span-0-79"><a id="__codelineno-0-79" name="__codelineno-0-79" href="#__codelineno-0-79"></a><span class="gu">### ListTables</span>
+</span><span id="__span-0-80"><a id="__codelineno-0-80" name="__codelineno-0-80" href="#__codelineno-0-80"></a>
+</span><span id="__span-0-81"><a id="__codelineno-0-81" name="__codelineno-0-81" href="#__codelineno-0-81"></a>{Same structure as above}
+</span><span id="__span-0-82"><a id="__codelineno-0-82" name="__codelineno-0-82" href="#__codelineno-0-82"></a>
+</span><span id="__span-0-83"><a id="__codelineno-0-83" name="__codelineno-0-83" href="#__codelineno-0-83"></a><span class="gu">### DescribeTable</span>
+</span><span id="__span-0-84"><a id="__codelineno-0-84" name="__codelineno-0-84" href="#__codelineno-0-84"></a>
+</span><span id="__span-0-85"><a id="__codelineno-0-85" name="__codelineno-0-85" href="#__codelineno-0-85"></a>{Same structure as above}
+</span><span id="__span-0-86"><a id="__codelineno-0-86" name="__codelineno-0-86" href="#__codelineno-0-86"></a>
+</span><span id="__span-0-87"><a id="__codelineno-0-87" name="__codelineno-0-87" href="#__codelineno-0-87"></a><span class="gs">**Note:**</span> Basic implementations only need to support <span class="sb">`load_detailed_metadata=false`</span> (only return table <span class="sb">`location`</span>).
+</span><span id="__span-0-88"><a id="__codelineno-0-88" name="__codelineno-0-88" href="#__codelineno-0-88"></a>
+</span><span id="__span-0-89"><a id="__codelineno-0-89" name="__codelineno-0-89" href="#__codelineno-0-89"></a><span class="gu">### DeregisterTable</span>
+</span><span id="__span-0-90"><a id="__codelineno-0-90" name="__codelineno-0-90" href="#__codelineno-0-90"></a>
+</span><span id="__span-0-91"><a id="__codelineno-0-91" name="__codelineno-0-91" href="#__codelineno-0-91"></a>{Same structure as above}
+</span><span id="__span-0-92"><a id="__codelineno-0-92" name="__codelineno-0-92" href="#__codelineno-0-92"></a>
+</span><span id="__span-0-93"><a id="__codelineno-0-93" name="__codelineno-0-93" href="#__codelineno-0-93"></a><span class="gu">## Additional Operations</span>
+</span><span id="__span-0-94"><a id="__codelineno-0-94" name="__codelineno-0-94" href="#__codelineno-0-94"></a>
+</span><span id="__span-0-95"><a id="__codelineno-0-95" name="__codelineno-0-95" href="#__codelineno-0-95"></a>{Optional section for operations beyond the 8 basic operations}
+</span><span id="__span-0-96"><a id="__codelineno-0-96" name="__codelineno-0-96" href="#__codelineno-0-96"></a>
+</span><span id="__span-0-97"><a id="__codelineno-0-97" name="__codelineno-0-97" href="#__codelineno-0-97"></a><span class="gu">### DropTable</span>
+</span><span id="__span-0-98"><a id="__codelineno-0-98" name="__codelineno-0-98" href="#__codelineno-0-98"></a>
+</span><span id="__span-0-99"><a id="__codelineno-0-99" name="__codelineno-0-99" href="#__codelineno-0-99"></a>{Same structure as basic operations}
+</span><span id="__span-0-100"><a id="__codelineno-0-100" name="__codelineno-0-100" href="#__codelineno-0-100"></a>
+</span><span id="__span-0-101"><a id="__codelineno-0-101" name="__codelineno-0-101" href="#__codelineno-0-101"></a><span class="gu">### {Other Additional Operations}</span>
+</span><span id="__span-0-102"><a id="__codelineno-0-102" name="__codelineno-0-102" href="#__codelineno-0-102"></a>
+</span><span id="__span-0-103"><a id="__codelineno-0-103" name="__codelineno-0-103" href="#__codelineno-0-103"></a>{Same structure as basic operations}
+</span></code></pre></div>
+<h2 id="error-handling-guidelines">Error Handling Guidelines<a class="headerlink" href="#error-handling-guidelines" title="Permanent link">&para;</a></h2>
+<p>Each operation's error handling section should describe errors in paragraph form, one paragraph per error condition. Include:</p>
+<ul>
+<li>The condition that triggers the error</li>
+<li>The error code number</li>
+<li>The error name in parentheses</li>
+</ul>
+<p>Example:</p>
+<blockquote>
+<p>If the namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the namespace contains tables or child namespaces, return error code <code>3</code> (NamespaceNotEmpty).</p>
+</blockquote>
+<p>For catalog specs that map to HTTP (like REST), also include the HTTP status code:</p>
+<blockquote>
+<p>If the namespace does not exist, return HTTP <code>404 Not Found</code> with error code <code>1</code> (NamespaceNotFound).</p>
+</blockquote>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../unity/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Unity Catalog</div>
+        </a>
+        <a class="next" href="../../../../examples/python/llm_dataset_creation/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">LLM Dataset Creation</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#required-sections">Required Sections</a>
+      <a class="ld-toc__h3" href="#1-background">1. Background</a>
+      <a class="ld-toc__h3" href="#2-namespace-implementation-configuration-properties">2. Namespace Implementation Configuration Properties</a>
+      <a class="ld-toc__h3" href="#3-object-mapping">3. Object Mapping</a>
+      <a class="ld-toc__h3" href="#4-lance-table-identification">4. Lance Table Identification</a>
+      <a class="ld-toc__h3" href="#5-basic-operations">5. Basic Operations</a>
+      <a class="ld-toc__h3" href="#6-additional-operations-optional">6. Additional Operations (Optional)</a>
+      <a class="ld-toc__h2" href="#template-structure">Template Structure</a>
+      <a class="ld-toc__h2" href="#error-handling-guidelines">Error Handling Guidelines</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

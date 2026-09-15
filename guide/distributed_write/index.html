@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Distributed Write — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/distributed_write/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a class="active" href="./">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Distributed Write</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="distributed-write">Distributed Write<a class="headerlink" href="#distributed-write" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Lance provides out-of-the-box <a href="https://github.com/lance-format/lance-ray">Ray</a> and <a href="https://github.com/lance-format/lance-spark">Spark</a> integrations.</p>
+<p>This page is intended for users who wish to perform distributed operations in a custom manner, i.e. using <code>slurm</code> or <code>Kubernetes</code> without the Lance integration.</p>
+</div>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The <a href="../../format/">Lance format</a> is designed to support parallel writing across multiple distributed workers. A distributed write operation can be performed by two phases:</p>
+<ol>
+<li><strong>Parallel Writes</strong>: Generate new <code>lance.LanceFragment</code> in parallel across multiple workers.</li>
+<li><strong>Commit</strong>: Collect all the <code>lance.FragmentMetadata</code> and commit into a single dataset in a single <code>lance.LanceOperation</code>.</li>
+</ol>
+<p><img alt="Distributed Append" src="../../images/distributed_append.png" /></p>
+<h2 id="write-new-data">Write new data<a class="headerlink" href="#write-new-data" title="Permanent link">&para;</a></h2>
+<p>Writing or appending new data is straightforward with <code>lance.fragment.write_fragments</code>.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.fragment</span><span class="w"> </span><span class="kn">import</span> <span class="n">write_fragments</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="c1"># Run on each worker</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">data_uri</span> <span class="o">=</span> <span class="s2">"./dist_write"</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">schema</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="p">(</span><span class="s2">"a"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">int32</span><span class="p">()),</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="p">(</span><span class="s2">"b"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">string</span><span class="p">()),</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">])</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="c1"># Run on worker 1</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="n">data1</span> <span class="o">=</span> <span class="p">{</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="s2">"a"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>    <span class="s2">"b"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"x"</span><span class="p">,</span> <span class="s2">"y"</span><span class="p">,</span> <span class="s2">"z"</span><span class="p">],</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="p">}</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="n">fragments_1</span> <span class="o">=</span> <span class="n">write_fragments</span><span class="p">(</span><span class="n">data1</span><span class="p">,</span> <span class="n">data_uri</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">)</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="nb">print</span><span class="p">(</span><span class="s2">"Worker 1: "</span><span class="p">,</span> <span class="n">fragments_1</span><span class="p">)</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="c1"># Run on worker 2</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="n">data2</span> <span class="o">=</span> <span class="p">{</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>    <span class="s2">"a"</span><span class="p">:</span> <span class="p">[</span><span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">],</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>    <span class="s2">"b"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"u"</span><span class="p">,</span> <span class="s2">"v"</span><span class="p">,</span> <span class="s2">"w"</span><span class="p">],</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="p">}</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="n">fragments_2</span> <span class="o">=</span> <span class="n">write_fragments</span><span class="p">(</span><span class="n">data2</span><span class="p">,</span> <span class="n">data_uri</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">)</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="nb">print</span><span class="p">(</span><span class="s2">"Worker 2: "</span><span class="p">,</span> <span class="n">fragments_2</span><span class="p">)</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>Worker 1:  [FragmentMetadata(id=0, files=...)]
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>Worker 2:  [FragmentMetadata(id=0, files=...)]
+</span></code></pre></div></p>
+<p>Now, use <code>lance.fragment.FragmentMetadata.to_json</code> to serialize the fragment metadata, and collect all serialized metadata on a single worker to execute the final commit operation.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance</span><span class="w"> </span><span class="kn">import</span> <span class="n">FragmentMetadata</span><span class="p">,</span> <span class="n">LanceOperation</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># Serialize Fragments into JSON data</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="n">fragments_json1</span> <span class="o">=</span> <span class="p">[</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">fragment</span><span class="o">.</span><span class="n">to_json</span><span class="p">())</span> <span class="k">for</span> <span class="n">fragment</span> <span class="ow">in</span> <span class="n">fragments_1</span><span class="p">]</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">fragments_json2</span> <span class="o">=</span> <span class="p">[</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">fragment</span><span class="o">.</span><span class="n">to_json</span><span class="p">())</span> <span class="k">for</span> <span class="n">fragment</span> <span class="ow">in</span> <span class="n">fragments_2</span><span class="p">]</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1"># On one worker, collect all fragments</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">all_fragments</span> <span class="o">=</span> <span class="p">[</span><span class="n">FragmentMetadata</span><span class="o">.</span><span class="n">from_json</span><span class="p">(</span><span class="n">f</span><span class="p">)</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> \
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    <span class="n">fragments_json1</span> <span class="o">+</span> <span class="n">fragments_json2</span><span class="p">]</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># Commit the fragments into a single dataset</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="c1"># Use LanceOperation.Overwrite to overwrite the dataset or create new dataset.</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="n">op</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceOperation</span><span class="o">.</span><span class="n">Overwrite</span><span class="p">(</span><span class="n">schema</span><span class="p">,</span> <span class="n">all_fragments</span><span class="p">)</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="n">read_version</span> <span class="o">=</span> <span class="mi">0</span> <span class="c1"># Because it is empty at the time.</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">lance</span><span class="o">.</span><span class="n">LanceDataset</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>    <span class="n">data_uri</span><span class="p">,</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>    <span class="n">op</span><span class="p">,</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>    <span class="n">read_version</span><span class="o">=</span><span class="n">read_version</span><span class="p">,</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="p">)</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="c1"># We can read the dataset using the Lance API:</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="n">data_uri</span><span class="p">)</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">get_fragments</span><span class="p">())</span> <span class="o">==</span> <span class="mi">2</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="k">assert</span> <span class="n">dataset</span><span class="o">.</span><span class="n">version</span> <span class="o">==</span> <span class="mi">1</span>
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>     a  b
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>0  1  x
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>1  2  y
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>2  3  z
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>3  4  u
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>4  5  v
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>5  6  w
+</span></code></pre></div></p>
+<h2 id="append-data">Append data<a class="headerlink" href="#append-data" title="Permanent link">&para;</a></h2>
+<p>Appending additional data follows a similar process. Use <code>lance.LanceOperation.Append</code> to commit the new fragments, ensuring that the <code>read_version</code> is set to the current dataset's version.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="n">data_uri</span><span class="p">)</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">read_version</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">version</span> <span class="c1"># record the read version</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">op</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceOperation</span><span class="o">.</span><span class="n">Append</span><span class="p">(</span><span class="n">all_fragments</span><span class="p">)</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="n">lance</span><span class="o">.</span><span class="n">LanceDataset</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="n">data_uri</span><span class="p">,</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    <span class="n">op</span><span class="p">,</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    <span class="n">read_version</span><span class="o">=</span><span class="n">read_version</span><span class="p">,</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="p">)</span>
+</span></code></pre></div>
+<h2 id="add-new-columns">Add New Columns<a class="headerlink" href="#add-new-columns" title="Permanent link">&para;</a></h2>
+<p><a href="../../format/">Lance Format excels at operations such as adding columns</a>. Thanks to its two-dimensional layout (<a href="https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/">see this blog post</a>), adding new columns is highly efficient since it avoids copying the existing data files. Instead, the process simply creates new data files and links them to the existing dataset using metadata-only operations.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="kn">import</span> <span class="n">RecordBatch</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow.compute</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pc</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./add_columns_example"</span><span class="p">)</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">get_fragments</span><span class="p">())</span> <span class="o">==</span> <span class="mi">2</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="k">assert</span> <span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">combine_chunks</span><span class="p">()</span> <span class="o">==</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pydict</span><span class="p">({</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="s2">"name"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"alice"</span><span class="p">,</span> <span class="s2">"bob"</span><span class="p">,</span> <span class="s2">"charlie"</span><span class="p">,</span> <span class="s2">"craig"</span><span class="p">,</span> <span class="s2">"dave"</span><span class="p">,</span> <span class="s2">"eve"</span><span class="p">],</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="s2">"age"</span><span class="p">:</span> <span class="p">[</span><span class="mi">25</span><span class="p">,</span> <span class="mi">33</span><span class="p">,</span> <span class="mi">44</span><span class="p">,</span> <span class="mi">55</span><span class="p">,</span> <span class="mi">66</span><span class="p">,</span> <span class="mi">77</span><span class="p">],</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="p">},</span> <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">)</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="k">def</span><span class="w"> </span><span class="nf">name_len</span><span class="p">(</span><span class="n">names</span><span class="p">:</span> <span class="n">RecordBatch</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RecordBatch</span><span class="p">:</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>    <span class="k">return</span> <span class="n">RecordBatch</span><span class="o">.</span><span class="n">from_arrays</span><span class="p">(</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>        <span class="p">[</span><span class="n">pc</span><span class="o">.</span><span class="n">utf8_length</span><span class="p">(</span><span class="n">names</span><span class="p">[</span><span class="s2">"name"</span><span class="p">])],</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>        <span class="p">[</span><span class="s2">"name_len"</span><span class="p">],</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>    <span class="p">)</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="c1"># On Worker 1</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="n">frag1</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">get_fragments</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="n">new_fragment1</span><span class="p">,</span> <span class="n">new_schema</span> <span class="o">=</span> <span class="n">frag1</span><span class="o">.</span><span class="n">merge_columns</span><span class="p">(</span><span class="n">name_len</span><span class="p">,</span> <span class="p">[</span><span class="s2">"name"</span><span class="p">])</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="c1"># On Worker 2</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="n">frag2</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">get_fragments</span><span class="p">()[</span><span class="mi">1</span><span class="p">]</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="n">new_fragment2</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">frag2</span><span class="o">.</span><span class="n">merge_columns</span><span class="p">(</span><span class="n">name_len</span><span class="p">,</span> <span class="p">[</span><span class="s2">"name"</span><span class="p">])</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="c1"># On Worker 3 - Commit</span>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="n">all_fragments</span> <span class="o">=</span> <span class="p">[</span><span class="n">new_fragment1</span><span class="p">,</span> <span class="n">new_fragment2</span><span class="p">]</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="n">op</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceOperation</span><span class="o">.</span><span class="n">Merge</span><span class="p">(</span><span class="n">all_fragments</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="n">new_schema</span><span class="p">)</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="n">lance</span><span class="o">.</span><span class="n">LanceDataset</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a>    <span class="s2">"./add_columns_example"</span><span class="p">,</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a>    <span class="n">op</span><span class="p">,</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a>    <span class="n">read_version</span><span class="o">=</span><span class="n">dataset</span><span class="o">.</span><span class="n">version</span><span class="p">,</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="p">)</span>
+</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a>
+</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a><span class="c1"># Verify dataset</span>
+</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./add_columns_example"</span><span class="p">)</span>
+</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>      name  age  name_len
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>0    alice   25         5
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>1      bob   33         3
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>2  charlie   44         7
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>3    craig   55         5
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>4     dave   66         4
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>5      eve   77         3
+</span></code></pre></div></p>
+<h2 id="update-columns">Update Columns<a class="headerlink" href="#update-columns" title="Permanent link">&para;</a></h2>
+<p>Currently, Lance supports the fragment level update columns ability to update existing columns in a distributed manner.</p>
+<p>This operation performs a left-outer-hash-join with the right table (new data)
+on the column specified by <code>left_on</code> and <code>right_on</code>. For every row in the current
+fragment, the updated column value is:
+1. If no matched row on the right side, the column value of the left side row.
+2. If there is exactly one corresponding row on the right side, the column value
+   of the matching row.
+3. If there are multiple corresponding rows, the column value of a random row.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="c1"># Create initial dataset with two fragments</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="c1"># First fragment</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="n">data1</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>    <span class="p">{</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">],</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>        <span class="s2">"name"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"Charlie"</span><span class="p">,</span> <span class="s2">"David"</span><span class="p">],</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>        <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">85</span><span class="p">,</span> <span class="mi">90</span><span class="p">,</span> <span class="mi">75</span><span class="p">,</span> <span class="mi">80</span><span class="p">],</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>    <span class="p">}</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="p">)</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="n">dataset_uri</span> <span class="o">=</span> <span class="s2">"./my_dataset.lance"</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">data1</span><span class="p">,</span> <span class="n">dataset_uri</span><span class="p">)</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="c1"># Second fragment</span>
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="n">data2</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-7-18"><a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>    <span class="p">{</span>
+</span><span id="__span-7-19"><a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>
+</span><span id="__span-7-20"><a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a>        <span class="s2">"name"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"Eve"</span><span class="p">,</span> <span class="s2">"Frank"</span><span class="p">,</span> <span class="s2">"Grace"</span><span class="p">,</span> <span class="s2">"Henry"</span><span class="p">],</span>
+</span><span id="__span-7-21"><a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a>        <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">88</span><span class="p">,</span> <span class="mi">92</span><span class="p">,</span> <span class="mi">78</span><span class="p">,</span> <span class="mi">82</span><span class="p">],</span>
+</span><span id="__span-7-22"><a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a>    <span class="p">}</span>
+</span><span id="__span-7-23"><a id="__codelineno-7-23" name="__codelineno-7-23" href="#__codelineno-7-23"></a><span class="p">)</span>
+</span><span id="__span-7-24"><a id="__codelineno-7-24" name="__codelineno-7-24" href="#__codelineno-7-24"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">data2</span><span class="p">,</span> <span class="n">dataset_uri</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"append"</span><span class="p">)</span>
+</span><span id="__span-7-25"><a id="__codelineno-7-25" name="__codelineno-7-25" href="#__codelineno-7-25"></a>
+</span><span id="__span-7-26"><a id="__codelineno-7-26" name="__codelineno-7-26" href="#__codelineno-7-26"></a><span class="c1"># Prepare update data for fragment 0 using 'id' as join key</span>
+</span><span id="__span-7-27"><a id="__codelineno-7-27" name="__codelineno-7-27" href="#__codelineno-7-27"></a><span class="n">update_data1</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-7-28"><a id="__codelineno-7-28" name="__codelineno-7-28" href="#__codelineno-7-28"></a>    <span class="p">{</span>
+</span><span id="__span-7-29"><a id="__codelineno-7-29" name="__codelineno-7-29" href="#__codelineno-7-29"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
+</span><span id="__span-7-30"><a id="__codelineno-7-30" name="__codelineno-7-30" href="#__codelineno-7-30"></a>        <span class="s2">"name"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"Alan"</span><span class="p">,</span> <span class="s2">"Chase"</span><span class="p">],</span>
+</span><span id="__span-7-31"><a id="__codelineno-7-31" name="__codelineno-7-31" href="#__codelineno-7-31"></a>        <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">95</span><span class="p">,</span> <span class="mi">85</span><span class="p">],</span>
+</span><span id="__span-7-32"><a id="__codelineno-7-32" name="__codelineno-7-32" href="#__codelineno-7-32"></a>    <span class="p">}</span>
+</span><span id="__span-7-33"><a id="__codelineno-7-33" name="__codelineno-7-33" href="#__codelineno-7-33"></a><span class="p">)</span>
+</span><span id="__span-7-34"><a id="__codelineno-7-34" name="__codelineno-7-34" href="#__codelineno-7-34"></a>
+</span><span id="__span-7-35"><a id="__codelineno-7-35" name="__codelineno-7-35" href="#__codelineno-7-35"></a><span class="c1"># Prepare update data for fragment 1</span>
+</span><span id="__span-7-36"><a id="__codelineno-7-36" name="__codelineno-7-36" href="#__codelineno-7-36"></a><span class="n">update_data2</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-7-37"><a id="__codelineno-7-37" name="__codelineno-7-37" href="#__codelineno-7-37"></a>    <span class="p">{</span>
+</span><span id="__span-7-38"><a id="__codelineno-7-38" name="__codelineno-7-38" href="#__codelineno-7-38"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">5</span><span class="p">,</span> <span class="mi">7</span><span class="p">],</span>
+</span><span id="__span-7-39"><a id="__codelineno-7-39" name="__codelineno-7-39" href="#__codelineno-7-39"></a>        <span class="s2">"name"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"Eva"</span><span class="p">,</span> <span class="s2">"Gracie"</span><span class="p">],</span>
+</span><span id="__span-7-40"><a id="__codelineno-7-40" name="__codelineno-7-40" href="#__codelineno-7-40"></a>        <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">98</span><span class="p">,</span> <span class="mi">88</span><span class="p">],</span>
+</span><span id="__span-7-41"><a id="__codelineno-7-41" name="__codelineno-7-41" href="#__codelineno-7-41"></a>    <span class="p">}</span>
+</span><span id="__span-7-42"><a id="__codelineno-7-42" name="__codelineno-7-42" href="#__codelineno-7-42"></a><span class="p">)</span>
+</span><span id="__span-7-43"><a id="__codelineno-7-43" name="__codelineno-7-43" href="#__codelineno-7-43"></a>
+</span><span id="__span-7-44"><a id="__codelineno-7-44" name="__codelineno-7-44" href="#__codelineno-7-44"></a><span class="c1"># Update fragment 0</span>
+</span><span id="__span-7-45"><a id="__codelineno-7-45" name="__codelineno-7-45" href="#__codelineno-7-45"></a><span class="n">fragment0</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">get_fragment</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</span><span id="__span-7-46"><a id="__codelineno-7-46" name="__codelineno-7-46" href="#__codelineno-7-46"></a><span class="n">updated_fragment0</span><span class="p">,</span> <span class="n">fields_modified0</span> <span class="o">=</span> <span class="n">fragment0</span><span class="o">.</span><span class="n">update_columns</span><span class="p">(</span>
+</span><span id="__span-7-47"><a id="__codelineno-7-47" name="__codelineno-7-47" href="#__codelineno-7-47"></a>    <span class="n">update_data1</span><span class="p">,</span> <span class="n">left_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span> <span class="n">right_on</span><span class="o">=</span><span class="s2">"id"</span>
+</span><span id="__span-7-48"><a id="__codelineno-7-48" name="__codelineno-7-48" href="#__codelineno-7-48"></a><span class="p">)</span>
+</span><span id="__span-7-49"><a id="__codelineno-7-49" name="__codelineno-7-49" href="#__codelineno-7-49"></a>
+</span><span id="__span-7-50"><a id="__codelineno-7-50" name="__codelineno-7-50" href="#__codelineno-7-50"></a><span class="c1"># Update fragment 1</span>
+</span><span id="__span-7-51"><a id="__codelineno-7-51" name="__codelineno-7-51" href="#__codelineno-7-51"></a><span class="n">fragment1</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">get_fragment</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+</span><span id="__span-7-52"><a id="__codelineno-7-52" name="__codelineno-7-52" href="#__codelineno-7-52"></a><span class="n">updated_fragment1</span><span class="p">,</span> <span class="n">fields_modified1</span> <span class="o">=</span> <span class="n">fragment1</span><span class="o">.</span><span class="n">update_columns</span><span class="p">(</span>
+</span><span id="__span-7-53"><a id="__codelineno-7-53" name="__codelineno-7-53" href="#__codelineno-7-53"></a>    <span class="n">update_data2</span><span class="p">,</span> <span class="n">left_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span> <span class="n">right_on</span><span class="o">=</span><span class="s2">"id"</span>
+</span><span id="__span-7-54"><a id="__codelineno-7-54" name="__codelineno-7-54" href="#__codelineno-7-54"></a><span class="p">)</span>
+</span><span id="__span-7-55"><a id="__codelineno-7-55" name="__codelineno-7-55" href="#__codelineno-7-55"></a>
+</span><span id="__span-7-56"><a id="__codelineno-7-56" name="__codelineno-7-56" href="#__codelineno-7-56"></a><span class="n">union_fields_modified</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">fields_modified0</span> <span class="o">+</span> <span class="n">fields_modified1</span><span class="p">))</span>
+</span><span id="__span-7-57"><a id="__codelineno-7-57" name="__codelineno-7-57" href="#__codelineno-7-57"></a><span class="c1"># Commit the changes for both fragments</span>
+</span><span id="__span-7-58"><a id="__codelineno-7-58" name="__codelineno-7-58" href="#__codelineno-7-58"></a><span class="n">op</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceOperation</span><span class="o">.</span><span class="n">Update</span><span class="p">(</span>
+</span><span id="__span-7-59"><a id="__codelineno-7-59" name="__codelineno-7-59" href="#__codelineno-7-59"></a>    <span class="n">updated_fragments</span><span class="o">=</span><span class="p">[</span><span class="n">updated_fragment0</span><span class="p">,</span> <span class="n">updated_fragment1</span><span class="p">],</span>
+</span><span id="__span-7-60"><a id="__codelineno-7-60" name="__codelineno-7-60" href="#__codelineno-7-60"></a>    <span class="n">fields_modified</span><span class="o">=</span><span class="n">union_fields_modified</span><span class="p">,</span>
+</span><span id="__span-7-61"><a id="__codelineno-7-61" name="__codelineno-7-61" href="#__codelineno-7-61"></a><span class="p">)</span>
+</span><span id="__span-7-62"><a id="__codelineno-7-62" name="__codelineno-7-62" href="#__codelineno-7-62"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceDataset</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
+</span><span id="__span-7-63"><a id="__codelineno-7-63" name="__codelineno-7-63" href="#__codelineno-7-63"></a>    <span class="nb">str</span><span class="p">(</span><span class="n">dataset_uri</span><span class="p">),</span> <span class="n">op</span><span class="p">,</span> <span class="n">read_version</span><span class="o">=</span><span class="n">dataset</span><span class="o">.</span><span class="n">version</span>
+</span><span id="__span-7-64"><a id="__codelineno-7-64" name="__codelineno-7-64" href="#__codelineno-7-64"></a><span class="p">)</span>
+</span><span id="__span-7-65"><a id="__codelineno-7-65" name="__codelineno-7-65" href="#__codelineno-7-65"></a>
+</span><span id="__span-7-66"><a id="__codelineno-7-66" name="__codelineno-7-66" href="#__codelineno-7-66"></a><span class="c1"># Verify the update</span>
+</span><span id="__span-7-67"><a id="__codelineno-7-67" name="__codelineno-7-67" href="#__codelineno-7-67"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="n">dataset_uri</span><span class="p">)</span>
+</span><span id="__span-7-68"><a id="__codelineno-7-68" name="__codelineno-7-68" href="#__codelineno-7-68"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>   id    name  score
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>0   1    Alan     95
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>1   2     Bob     90
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>2   3   Chase     85
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>3   4   David     80
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>4   5     Eva     98
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>5   6   Frank     92
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>6   7  Gracie     88
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>7   8   Henry     82
+</span></code></pre></div></p>
+<h3 id="handling-stable-row-id">Handling stable row id<a class="headerlink" href="#handling-stable-row-id" title="Permanent link">&para;</a></h3>
+<p>On a dataset created with <code>enable_stable_row_ids=True</code>, each row keeps the same
+<code>_rowid</code> for its lifetime, even when an update rewrites it into a different
+fragment. Lance cannot infer which new row replaces which old one, so when you
+assemble the transaction yourself, carrying those ids across is your job: read
+the rows you are rewriting with <code>with_row_id=True</code> and attach their ids to the
+new fragment with <code>lance.fragment.RowIdSequence</code>.</p>
+<p>Rows you leave without an id are treated as newly inserted. That is not an error,
+so a fragment written without <code>row_id_meta</code> commits successfully while silently
+giving every rewritten row a fresh identity, breaking <code>_rowid</code> for anything
+downstream that relies on it.</p>
+<p>You do <strong>not</strong> need to supply <code>created_at_version_meta</code> or
+<code>last_updated_at_version_meta</code>. Leave them as <code>None</code>. Lance derives both while
+building the manifest: <code>last_updated_at_version_meta</code> becomes the version being
+committed, and <code>created_at_version_meta</code> is copied from whichever existing row
+carries the same stable row id, so a rewritten row keeps the version it first
+appeared in.</p>
+<h4 id="mixing-updated-and-new-rows">Mixing updated and new rows<a class="headerlink" href="#mixing-updated-and-new-rows" title="Permanent link">&para;</a></h4>
+<p>A single fragment may hold both rewritten rows and brand new ones. Order it so
+that <strong>the rewritten rows come first and the new rows last</strong>, then pass only the
+row ids of the rewritten rows. The row ids bind to the leading rows in fragment
+order, and the commit generates new ids for the remaining rows.</p>
+<p>Do not generate ids for the new rows yourself. Row ids are handed out from a counter
+in the manifest, and a commit that loses a race is retried against the version
+that won, which may have consumed the very ids you picked. Only the commit knows
+which values are free, so it assigns them after conflict resolution has settled.
+Supplying more row ids than the fragment has rows is rejected.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow.compute</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pc</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.fragment</span><span class="w"> </span><span class="kn">import</span> <span class="n">RowIdSequence</span><span class="p">,</span> <span class="n">write_fragments</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="n">schema</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([(</span><span class="s2">"id"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">int64</span><span class="p">()),</span> <span class="p">(</span><span class="s2">"score"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">int64</span><span class="p">())])</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="n">dataset_uri</span> <span class="o">=</span> <span class="s2">"./stable_row_ids.lance"</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">"id"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">],</span> <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">85</span><span class="p">,</span> <span class="mi">90</span><span class="p">,</span> <span class="mi">75</span><span class="p">,</span> <span class="mi">80</span><span class="p">]},</span> <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">),</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a>    <span class="n">dataset_uri</span><span class="p">,</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a>    <span class="n">enable_stable_row_ids</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a><span class="p">)</span>
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a>
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a><span class="c1"># On a worker: read the rows to rewrite, keeping their stable row ids.</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a><span class="n">rows</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"score"</span><span class="p">],</span> <span class="n">with_row_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</span><span id="__span-9-16"><a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a><span class="n">rewritten</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">filter</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"id"</span><span class="p">)</span><span class="o">.</span><span class="n">isin</span><span class="p">([</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">]))</span>
+</span><span id="__span-9-17"><a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a>
+</span><span id="__span-9-18"><a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="c1"># Rewritten rows first, then the row that did not exist before.</span>
+</span><span id="__span-9-19"><a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a><span class="n">new_data</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span>
+</span><span id="__span-9-20"><a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a>    <span class="p">{</span>
+</span><span id="__span-9-21"><a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a>        <span class="s2">"id"</span><span class="p">:</span> <span class="n">rewritten</span><span class="p">[</span><span class="s2">"id"</span><span class="p">]</span><span class="o">.</span><span class="n">to_pylist</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="mi">5</span><span class="p">],</span>
+</span><span id="__span-9-22"><a id="__codelineno-9-22" name="__codelineno-9-22" href="#__codelineno-9-22"></a>        <span class="s2">"score"</span><span class="p">:</span> <span class="p">[</span><span class="mi">95</span><span class="p">,</span> <span class="mi">70</span><span class="p">,</span> <span class="mi">60</span><span class="p">],</span>
+</span><span id="__span-9-23"><a id="__codelineno-9-23" name="__codelineno-9-23" href="#__codelineno-9-23"></a>    <span class="p">},</span>
+</span><span id="__span-9-24"><a id="__codelineno-9-24" name="__codelineno-9-24" href="#__codelineno-9-24"></a>    <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">,</span>
+</span><span id="__span-9-25"><a id="__codelineno-9-25" name="__codelineno-9-25" href="#__codelineno-9-25"></a><span class="p">)</span>
+</span><span id="__span-9-26"><a id="__codelineno-9-26" name="__codelineno-9-26" href="#__codelineno-9-26"></a><span class="n">fragments</span> <span class="o">=</span> <span class="n">write_fragments</span><span class="p">(</span><span class="n">new_data</span><span class="p">,</span> <span class="n">dataset_uri</span><span class="p">,</span> <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">)</span>
+</span><span id="__span-9-27"><a id="__codelineno-9-27" name="__codelineno-9-27" href="#__codelineno-9-27"></a><span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">fragments</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
+</span><span id="__span-9-28"><a id="__codelineno-9-28" name="__codelineno-9-28" href="#__codelineno-9-28"></a>
+</span><span id="__span-9-29"><a id="__codelineno-9-29" name="__codelineno-9-29" href="#__codelineno-9-29"></a><span class="c1"># Only the rewritten rows have ids. The trailing row gets one at commit time.</span>
+</span><span id="__span-9-30"><a id="__codelineno-9-30" name="__codelineno-9-30" href="#__codelineno-9-30"></a><span class="n">fragments</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">row_id_meta</span> <span class="o">=</span> <span class="n">RowIdSequence</span><span class="p">(</span><span class="n">rewritten</span><span class="p">[</span><span class="s2">"_rowid"</span><span class="p">])</span><span class="o">.</span><span class="n">to_inline_metadata</span><span class="p">()</span>
+</span><span id="__span-9-31"><a id="__codelineno-9-31" name="__codelineno-9-31" href="#__codelineno-9-31"></a>
+</span><span id="__span-9-32"><a id="__codelineno-9-32" name="__codelineno-9-32" href="#__codelineno-9-32"></a><span class="c1"># On the committing worker: tombstone the old copies of the rewritten rows.</span>
+</span><span id="__span-9-33"><a id="__codelineno-9-33" name="__codelineno-9-33" href="#__codelineno-9-33"></a><span class="n">updated_fragment</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">get_fragments</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">delete</span><span class="p">(</span><span class="s2">"id in (2, 3)"</span><span class="p">)</span>
+</span><span id="__span-9-34"><a id="__codelineno-9-34" name="__codelineno-9-34" href="#__codelineno-9-34"></a>
+</span><span id="__span-9-35"><a id="__codelineno-9-35" name="__codelineno-9-35" href="#__codelineno-9-35"></a><span class="n">op</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceOperation</span><span class="o">.</span><span class="n">Update</span><span class="p">(</span>
+</span><span id="__span-9-36"><a id="__codelineno-9-36" name="__codelineno-9-36" href="#__codelineno-9-36"></a>    <span class="n">updated_fragments</span><span class="o">=</span><span class="p">[</span><span class="n">updated_fragment</span><span class="p">],</span>
+</span><span id="__span-9-37"><a id="__codelineno-9-37" name="__codelineno-9-37" href="#__codelineno-9-37"></a>    <span class="n">new_fragments</span><span class="o">=</span><span class="n">fragments</span><span class="p">,</span>
+</span><span id="__span-9-38"><a id="__codelineno-9-38" name="__codelineno-9-38" href="#__codelineno-9-38"></a><span class="p">)</span>
+</span><span id="__span-9-39"><a id="__codelineno-9-39" name="__codelineno-9-39" href="#__codelineno-9-39"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">LanceDataset</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span><span class="n">dataset_uri</span><span class="p">,</span> <span class="n">op</span><span class="p">,</span> <span class="n">read_version</span><span class="o">=</span><span class="n">dataset</span><span class="o">.</span><span class="n">version</span><span class="p">)</span>
+</span><span id="__span-9-40"><a id="__codelineno-9-40" name="__codelineno-9-40" href="#__codelineno-9-40"></a>
+</span><span id="__span-9-41"><a id="__codelineno-9-41" name="__codelineno-9-41" href="#__codelineno-9-41"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">with_row_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>   id  score  _rowid
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>0   1     85       0
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>1   4     80       3
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>2   2     95       1
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>3   3     70       2
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>4   5     60       4
+</span></code></pre></div></p>
+<p>Row ids 1 and 2 followed their rows into the new fragment, and the inserted row
+received the next unused id. Reading the lineage columns shows that the rewritten
+rows kept their original creation version while the inserted row is stamped with
+the version that added it:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="nb">print</span><span class="p">(</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>        <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"_row_created_at_version"</span><span class="p">,</span> <span class="s2">"_row_last_updated_at_version"</span><span class="p">]</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="p">)</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>Output:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>   id  _row_created_at_version  _row_last_updated_at_version
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>0   1                        1                             1
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>1   4                        1                             1
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>2   2                        1                             2
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>3   3                        1                             2
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>4   5                        2                             2
+</span></code></pre></div></p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../observability/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Observability</div>
+        </a>
+        <a class="next" href="../distributed_indexing/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Distributed Indexing</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#write-new-data">Write new data</a>
+      <a class="ld-toc__h2" href="#append-data">Append data</a>
+      <a class="ld-toc__h2" href="#add-new-columns">Add New Columns</a>
+      <a class="ld-toc__h2" href="#update-columns">Update Columns</a>
+      <a class="ld-toc__h3" href="#handling-stable-row-id">Handling stable row id</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>SELECT — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/trino/operations/dql/select/">
+<link rel="icon" href="../../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../../.." aria-label="Lance">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../../">Overview</a>
+    <a href="../../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../../pytorch/">PyTorch</a>
+    <a href="../../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../../duckdb/">Overview</a>
+    <a href="../../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../../huggingface/">Home</a>
+    <a href="../../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../../spark/">Welcome</a>
+    <a href="../../../../spark/install/">Install</a>
+    <a href="../../../../spark/config/">Config</a>
+    <a href="../../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../../ray/">Welcome</a>
+    <a href="../../../../ray/read/">Read</a>
+    <a href="../../../../ray/write/">Write</a>
+    <a href="../../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../../ray/compaction/">Compaction</a>
+    <a href="../../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../">Welcome</a>
+    <a href="../../../install/">Install</a>
+    <a href="../../../config/">Config</a>
+    <a href="../../../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../ddl/describe-table/">DESCRIBE</a>
+    <a href="../../ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../dml/insert/">INSERT</a>
+    <a href="../../dml/update/">UPDATE</a>
+    <a href="../../dml/delete/">DELETE</a>
+    <a href="../../dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a class="active" href="./">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../../../context/guide/storage/">Storage backends</a>
+    <a href="../../../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Trino</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><span>DQL</span>
+        <span>/</span><b>SELECT</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="select">SELECT<a class="headerlink" href="#select" title="Permanent link">&para;</a></h1>
+<p>Query data from Lance tables using standard SQL.</p>
+<h2 id="syntax">Syntax<a class="headerlink" href="#syntax" title="Permanent link">&para;</a></h2>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="p">[</span><span class="k">DISTINCT</span><span class="p">]</span><span class="w"> </span><span class="o">&lt;</span><span class="n">select_list</span><span class="o">&gt;</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">FROM</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="p">[</span><span class="k">WHERE</span><span class="w"> </span><span class="o">&lt;</span><span class="n">condition</span><span class="o">&gt;</span><span class="p">]</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="p">[</span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="o">&lt;</span><span class="n">columns</span><span class="o">&gt;</span><span class="p">]</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="p">[</span><span class="k">HAVING</span><span class="w"> </span><span class="o">&lt;</span><span class="n">condition</span><span class="o">&gt;</span><span class="p">]</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="p">[</span><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="o">&lt;</span><span class="n">columns</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[</span><span class="k">ASC</span><span class="o">|</span><span class="k">DESC</span><span class="p">]]</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="p">[</span><span class="k">LIMIT</span><span class="w"> </span><span class="o">&lt;</span><span class="n">n</span><span class="o">&gt;</span><span class="p">]</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">[</span><span class="k">OFFSET</span><span class="w"> </span><span class="o">&lt;</span><span class="n">n</span><span class="o">&gt;</span><span class="p">]</span>
+</span></code></pre></div>
+<h2 id="clauses">Clauses<a class="headerlink" href="#clauses" title="Permanent link">&para;</a></h2>
+<h3 id="select-list">SELECT list<a class="headerlink" href="#select-list" title="Permanent link">&para;</a></h3>
+<p>Specify columns to retrieve:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">-- All columns</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span><span class="p">;</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">-- Specific columns</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span><span class="p">;</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="c1">-- Expressions</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">price</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">quantity</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">total</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="p">;</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="c1">-- Distinct values</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">DISTINCT</span><span class="w"> </span><span class="n">category</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="where">WHERE<a class="headerlink" href="#where" title="Permanent link">&para;</a></h3>
+<p>Filter rows based on conditions:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">-- Comparison operators</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">price</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1">-- Logical operators</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">age</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">18</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'active'</span><span class="p">;</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1">-- IN operator</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="s1">'pending'</span><span class="p">,</span><span class="w"> </span><span class="s1">'processing'</span><span class="p">);</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1">-- LIKE pattern matching</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">email</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">'%@gmail.com'</span><span class="p">;</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="c1">-- NULL checks</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">phone</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">;</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="c1">-- BETWEEN</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">order_date</span><span class="w"> </span><span class="k">BETWEEN</span><span class="w"> </span><span class="nb">DATE</span><span class="w"> </span><span class="s1">'2024-01-01'</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="nb">DATE</span><span class="w"> </span><span class="s1">'2024-12-31'</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="group-by">GROUP BY<a class="headerlink" href="#group-by" title="Permanent link">&para;</a></h3>
+<p>Group rows for aggregation:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">category</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">count</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">category</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="k">SELECT</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="n">region</span><span class="p">,</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">orders</span><span class="p">,</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">    </span><span class="k">SUM</span><span class="p">(</span><span class="n">amount</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total</span><span class="p">,</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">    </span><span class="k">AVG</span><span class="p">(</span><span class="n">amount</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">average</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">region</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="having">HAVING<a class="headerlink" href="#having" title="Permanent link">&para;</a></h3>
+<p>Filter groups after aggregation:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">category</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">count</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">category</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">HAVING</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="order-by">ORDER BY<a class="headerlink" href="#order-by" title="Permanent link">&para;</a></h3>
+<p>Sort results:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1">-- Ascending (default)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">name</span><span class="p">;</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1">-- Descending</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">created_at</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="c1">-- Multiple columns</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">category</span><span class="w"> </span><span class="k">ASC</span><span class="p">,</span><span class="w"> </span><span class="n">price</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="limit-and-offset">LIMIT and OFFSET<a class="headerlink" href="#limit-and-offset" title="Permanent link">&para;</a></h3>
+<p>Limit result set:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1">-- First 10 rows</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">LIMIT</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1">-- Pagination (skip 20, take 10)</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">id</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">LIMIT</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="k">OFFSET</span><span class="w"> </span><span class="mi">20</span><span class="p">;</span>
+</span></code></pre></div>
+<h2 id="aggregate-functions">Aggregate Functions<a class="headerlink" href="#aggregate-functions" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>COUNT(*)</code></td>
+<td>Count rows</td>
+</tr>
+<tr>
+<td><code>COUNT(column)</code></td>
+<td>Count non-null values</td>
+</tr>
+<tr>
+<td><code>COUNT(DISTINCT column)</code></td>
+<td>Count distinct values</td>
+</tr>
+<tr>
+<td><code>SUM(column)</code></td>
+<td>Sum of values</td>
+</tr>
+<tr>
+<td><code>AVG(column)</code></td>
+<td>Average of values</td>
+</tr>
+<tr>
+<td><code>MIN(column)</code></td>
+<td>Minimum value</td>
+</tr>
+<tr>
+<td><code>MAX(column)</code></td>
+<td>Maximum value</td>
+</tr>
+</tbody>
+</table>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="basic-query">Basic query<a class="headerlink" href="#basic-query" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">customers</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="filtered-query-with-projection">Filtered query with projection<a class="headerlink" href="#filtered-query-with-projection" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">email</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'active'</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">name</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="k">LIMIT</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="aggregation-with-grouping">Aggregation with grouping<a class="headerlink" href="#aggregation-with-grouping" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">    </span><span class="n">category</span><span class="p">,</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">    </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">product_count</span><span class="p">,</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">    </span><span class="k">AVG</span><span class="p">(</span><span class="n">price</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">avg_price</span><span class="p">,</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">    </span><span class="k">MIN</span><span class="p">(</span><span class="n">price</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">min_price</span><span class="p">,</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="w">    </span><span class="k">MAX</span><span class="p">(</span><span class="n">price</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">max_price</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">category</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="k">HAVING</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">5</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">product_count</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="join-tables">Join tables<a class="headerlink" href="#join-tables" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">SELECT</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">    </span><span class="n">o</span><span class="p">.</span><span class="n">id</span><span class="p">,</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">    </span><span class="n">o</span><span class="p">.</span><span class="n">order_date</span><span class="p">,</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">    </span><span class="k">c</span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">customer_name</span><span class="p">,</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">    </span><span class="n">o</span><span class="p">.</span><span class="n">amount</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="n">o</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="k">JOIN</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">customers</span><span class="w"> </span><span class="k">c</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">customer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">id</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">amount</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1000</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="subquery">Subquery<a class="headerlink" href="#subquery" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">category</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">    </span><span class="k">SELECT</span><span class="w"> </span><span class="n">category</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">    </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="w">    </span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">category</span>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="w">    </span><span class="k">HAVING</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">price</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">50</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="common-table-expression-cte">Common Table Expression (CTE)<a class="headerlink" href="#common-table-expression-cte" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">WITH</span><span class="w"> </span><span class="n">high_value_orders</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="k">SELECT</span><span class="w"> </span><span class="n">customer_id</span><span class="p">,</span><span class="w"> </span><span class="k">SUM</span><span class="p">(</span><span class="n">amount</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">customer_id</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="w">    </span><span class="k">HAVING</span><span class="w"> </span><span class="k">SUM</span><span class="p">(</span><span class="n">amount</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">10000</span>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="p">)</span>
+</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">h</span><span class="p">.</span><span class="n">total</span>
+</span><span id="__span-12-8"><a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a><span class="k">FROM</span><span class="w"> </span><span class="n">high_value_orders</span><span class="w"> </span><span class="n">h</span>
+</span><span id="__span-12-9"><a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a><span class="k">JOIN</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">customers</span><span class="w"> </span><span class="k">c</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">h</span><span class="p">.</span><span class="n">customer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">id</span><span class="p">;</span>
+</span></code></pre></div>
+<h2 id="time-travel">Time Travel<a class="headerlink" href="#time-travel" title="Permanent link">&para;</a></h2>
+<p>Lance supports time travel queries, allowing you to query historical versions of your data. This is useful for auditing, debugging, or recovering data from a specific point in time.</p>
+<h3 id="query-by-version-number">Query by Version Number<a class="headerlink" href="#query-by-version-number" title="Permanent link">&para;</a></h3>
+<p>Use <code>FOR VERSION AS OF</code> to query a specific version:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="c1">-- Query version 1 of a table</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">VERSION</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="c1">-- Query version 5 of a table</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">VERSION</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="c1">-- Compare data between versions</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a><span class="k">SELECT</span><span class="w"> </span><span class="s1">'current'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">version</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span>
+</span><span id="__span-13-10"><a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a><span class="k">SELECT</span><span class="w"> </span><span class="s1">'v1'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">version</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">VERSION</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Supported version types:</p>
+<ul>
+<li><code>TINYINT</code></li>
+<li><code>SMALLINT</code></li>
+<li><code>INTEGER</code></li>
+<li><code>BIGINT</code></li>
+</ul>
+<h3 id="query-by-timestamp">Query by Timestamp<a class="headerlink" href="#query-by-timestamp" title="Permanent link">&para;</a></h3>
+<p>Use <code>FOR TIMESTAMP AS OF</code> to query data as of a specific timestamp:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1">-- Query data as of a specific date</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="k">FOR</span><span class="w"> </span><span class="k">TIMESTAMP</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="nb">DATE</span><span class="w"> </span><span class="s1">'2024-01-15'</span><span class="p">;</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="c1">-- Query data as of a specific timestamp</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="k">FOR</span><span class="w"> </span><span class="k">TIMESTAMP</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="k">TIMESTAMP</span><span class="w"> </span><span class="s1">'2024-06-01 12:00:00'</span><span class="p">;</span>
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>
+</span><span id="__span-14-9"><a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a><span class="c1">-- Query data with timezone</span>
+</span><span id="__span-14-10"><a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-14-11"><a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a><span class="k">FOR</span><span class="w"> </span><span class="k">TIMESTAMP</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="k">TIMESTAMP</span><span class="w"> </span><span class="s1">'2024-06-01 12:00:00 America/New_York'</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Supported timestamp types:</p>
+<ul>
+<li><code>DATE</code> - Resolves to start of day in session timezone</li>
+<li><code>TIMESTAMP</code> - Uses session timezone</li>
+<li><code>TIMESTAMP WITH TIME ZONE</code> - Uses specified timezone</li>
+</ul>
+<h3 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h3>
+<p>Lance stores data in immutable fragments. Each write operation (INSERT, UPDATE, DELETE) creates a new version of the table. Time travel queries read from the version that was current at the specified version number or timestamp.</p>
+<p>When querying by timestamp, Lance finds the latest version whose creation timestamp is at or before the requested timestamp.</p>
+<h3 id="limitations">Limitations<a class="headerlink" href="#limitations" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Only <code>FOR ... AS OF</code> is supported (end version). Start version (<code>FOR ... BETWEEN</code>) is not supported.</li>
+<li>Version numbers must be positive integers.</li>
+<li>Timestamps must be in the past.</li>
+<li>Versions may be cleaned up by compaction operations, making old versions unavailable.</li>
+</ul>
+<h3 id="examples_1">Examples<a class="headerlink" href="#examples_1" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1">-- Track changes over time</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">WITH</span><span class="w"> </span><span class="n">current_data</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">    </span><span class="k">SELECT</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">cnt</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">metrics</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="p">),</span>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="n">historical_data</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="w">    </span><span class="k">SELECT</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">cnt</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">metrics</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">VERSION</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="mi">1</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="p">)</span>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="k">SELECT</span>
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="w">    </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">cnt</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">current_data</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">cnt</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">historical_data</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">new_rows</span><span class="p">;</span>
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a><span class="c1">-- Restore accidentally deleted data</span>
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-15-13"><a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">VERSION</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">OF</span><span class="w"> </span><span class="mi">10</span>
+</span><span id="__span-15-14"><a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="p">);</span>
+</span></code></pre></div>
+<h2 id="blob-virtual-columns">Blob Virtual Columns<a class="headerlink" href="#blob-virtual-columns" title="Permanent link">&para;</a></h2>
+<p>Tables with blob-encoded columns automatically expose virtual columns for accessing blob metadata. These columns are hidden from <code>DESCRIBE TABLE</code> but can be selected in queries.</p>
+<h3 id="virtual-column-naming">Virtual Column Naming<a class="headerlink" href="#virtual-column-naming" title="Permanent link">&para;</a></h3>
+<p>For each blob column, two virtual columns are available:</p>
+<table>
+<thead>
+<tr>
+<th>Virtual Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;column&gt;__blob_pos</code></td>
+<td>BIGINT</td>
+<td>Byte offset of the blob data in the blob file</td>
+</tr>
+<tr>
+<td><code>&lt;column&gt;__blob_size</code></td>
+<td>BIGINT</td>
+<td>Size of the blob data in bytes</td>
+</tr>
+</tbody>
+</table>
+<h3 id="querying-blob-metadata">Querying Blob Metadata<a class="headerlink" href="#querying-blob-metadata" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1">-- Get blob position and size</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">content__blob_pos</span><span class="p">,</span><span class="w"> </span><span class="n">content__blob_size</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">documents</span><span class="p">;</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="c1">-- Filter by blob size</span>
+</span><span id="__span-16-6"><a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">title</span>
+</span><span id="__span-16-7"><a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">documents</span>
+</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">content__blob_size</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1000000</span><span class="p">;</span><span class="w">  </span><span class="c1">-- Blobs larger than 1MB</span>
+</span><span id="__span-16-9"><a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>
+</span><span id="__span-16-10"><a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a><span class="c1">-- Aggregate blob statistics</span>
+</span><span id="__span-16-11"><a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a><span class="k">SELECT</span>
+</span><span id="__span-16-12"><a id="__codelineno-16-12" name="__codelineno-16-12" href="#__codelineno-16-12"></a><span class="w">    </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total_blobs</span><span class="p">,</span>
+</span><span id="__span-16-13"><a id="__codelineno-16-13" name="__codelineno-16-13" href="#__codelineno-16-13"></a><span class="w">    </span><span class="k">SUM</span><span class="p">(</span><span class="n">image__blob_size</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total_bytes</span><span class="p">,</span>
+</span><span id="__span-16-14"><a id="__codelineno-16-14" name="__codelineno-16-14" href="#__codelineno-16-14"></a><span class="w">    </span><span class="k">AVG</span><span class="p">(</span><span class="n">image__blob_size</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">avg_size</span><span class="p">,</span>
+</span><span id="__span-16-15"><a id="__codelineno-16-15" name="__codelineno-16-15" href="#__codelineno-16-15"></a><span class="w">    </span><span class="k">MAX</span><span class="p">(</span><span class="n">image__blob_size</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">largest_blob</span>
+</span><span id="__span-16-16"><a id="__codelineno-16-16" name="__codelineno-16-16" href="#__codelineno-16-16"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">media</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="multiple-blob-columns">Multiple Blob Columns<a class="headerlink" href="#multiple-blob-columns" title="Permanent link">&para;</a></h3>
+<p>When a table has multiple blob columns, each has its own virtual columns:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="c1">-- Table created with: blob_columns = 'image, video'</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">SELECT</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="w">    </span><span class="n">id</span><span class="p">,</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="w">    </span><span class="n">image__blob_pos</span><span class="p">,</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="w">    </span><span class="n">image__blob_size</span><span class="p">,</span>
+</span><span id="__span-17-6"><a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a><span class="w">    </span><span class="n">video__blob_pos</span><span class="p">,</span>
+</span><span id="__span-17-7"><a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a><span class="w">    </span><span class="n">video__blob_size</span>
+</span><span id="__span-17-8"><a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">media</span><span class="p">;</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Blob virtual columns return metadata about where the blob is stored, not the blob content itself. The actual blob data is stored out-of-line and not materialized during queries.</p>
+</div>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../dml/merge/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">MERGE</div>
+        </a>
+        <a class="next" href="../../../../context/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Home</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#syntax">Syntax</a>
+      <a class="ld-toc__h2" href="#clauses">Clauses</a>
+      <a class="ld-toc__h3" href="#select-list">SELECT list</a>
+      <a class="ld-toc__h3" href="#where">WHERE</a>
+      <a class="ld-toc__h3" href="#group-by">GROUP BY</a>
+      <a class="ld-toc__h3" href="#having">HAVING</a>
+      <a class="ld-toc__h3" href="#order-by">ORDER BY</a>
+      <a class="ld-toc__h3" href="#limit-and-offset">LIMIT and OFFSET</a>
+      <a class="ld-toc__h2" href="#aggregate-functions">Aggregate Functions</a>
+      <a class="ld-toc__h2" href="#examples">Examples</a>
+      <a class="ld-toc__h3" href="#basic-query">Basic query</a>
+      <a class="ld-toc__h3" href="#filtered-query-with-projection">Filtered query with projection</a>
+      <a class="ld-toc__h3" href="#aggregation-with-grouping">Aggregation with grouping</a>
+      <a class="ld-toc__h3" href="#join-tables">Join tables</a>
+      <a class="ld-toc__h3" href="#subquery">Subquery</a>
+      <a class="ld-toc__h3" href="#common-table-expression-cte">Common Table Expression (CTE)</a>
+      <a class="ld-toc__h2" href="#time-travel">Time Travel</a>
+      <a class="ld-toc__h3" href="#query-by-version-number">Query by Version Number</a>
+      <a class="ld-toc__h3" href="#query-by-timestamp">Query by Timestamp</a>
+      <a class="ld-toc__h3" href="#how-it-works">How It Works</a>
+      <a class="ld-toc__h3" href="#limitations">Limitations</a>
+      <a class="ld-toc__h3" href="#examples_1">Examples</a>
+      <a class="ld-toc__h2" href="#blob-virtual-columns">Blob Virtual Columns</a>
+      <a class="ld-toc__h3" href="#virtual-column-naming">Virtual Column Naming</a>
+      <a class="ld-toc__h3" href="#querying-blob-metadata">Querying Blob Metadata</a>
+      <a class="ld-toc__h3" href="#multiple-blob-columns">Multiple Blob Columns</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../../format/">Specification</a>
+        <a href="../../../../../format/file/">File format</a>
+        <a href="../../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../../quickstart/">Getting started</a>
+        <a href="../../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../../..";</script>
+<script src="../../../../../assets/site.js" defer></script>
+</body>
+</html>

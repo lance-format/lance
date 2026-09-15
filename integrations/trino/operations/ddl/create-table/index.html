@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>CREATE TABLE / REPLACE TABLE — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/trino/operations/ddl/create-table/">
+<link rel="icon" href="../../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../../.." aria-label="Lance">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../../">Overview</a>
+    <a href="../../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../../pytorch/">PyTorch</a>
+    <a href="../../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../../duckdb/">Overview</a>
+    <a href="../../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../../huggingface/">Home</a>
+    <a href="../../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../../spark/">Welcome</a>
+    <a href="../../../../spark/install/">Install</a>
+    <a href="../../../../spark/config/">Config</a>
+    <a href="../../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../../ray/">Welcome</a>
+    <a href="../../../../ray/read/">Read</a>
+    <a href="../../../../ray/write/">Write</a>
+    <a href="../../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../../ray/compaction/">Compaction</a>
+    <a href="../../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../">Welcome</a>
+    <a href="../../../install/">Install</a>
+    <a href="../../../config/">Config</a>
+    <a href="../../../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../show-schemas/">SHOW SCHEMAS</a>
+    <a href="../create-schema/">CREATE SCHEMA</a>
+    <a href="../drop-schema/">DROP SCHEMA</a>
+    <a href="../show-tables/">SHOW TABLES</a>
+    <a href="../describe-table/">DESCRIBE</a>
+    <a class="active" href="./">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../dml/insert/">INSERT</a>
+    <a href="../../dml/update/">UPDATE</a>
+    <a href="../../dml/delete/">DELETE</a>
+    <a href="../../dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../../../context/guide/storage/">Storage backends</a>
+    <a href="../../../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Trino</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><span>DDL</span>
+        <span>/</span><b>CREATE TABLE / REPLACE TABLE</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="create-table-replace-table">CREATE TABLE / REPLACE TABLE<a class="headerlink" href="#create-table-replace-table" title="Permanent link">&para;</a></h1>
+<p>Create a new table or replace an existing table in the Lance catalog.</p>
+<h2 id="syntax">Syntax<a class="headerlink" href="#syntax" title="Permanent link">&para;</a></h2>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="p">[</span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="p">]</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="o">&lt;</span><span class="k">column_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">&lt;</span><span class="n">data_type</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...]</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="p">)</span><span class="w"> </span><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">property_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="n">value</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
+</span></code></pre></div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="p">[</span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="p">]</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">property_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="n">value</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">AS</span><span class="w"> </span><span class="o">&lt;</span><span class="n">query</span><span class="o">&gt;</span>
+</span></code></pre></div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">OR</span><span class="w"> </span><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">property_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="n">value</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">AS</span><span class="w"> </span><span class="o">&lt;</span><span class="n">query</span><span class="o">&gt;</span>
+</span></code></pre></div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="o">&lt;</span><span class="k">column_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">&lt;</span><span class="n">data_type</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...]</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="p">)</span><span class="w"> </span><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">property_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="n">value</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
+</span></code></pre></div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="o">&lt;</span><span class="k">table_name</span><span class="o">&gt;</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="o">&lt;</span><span class="n">property_name</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="n">value</span><span class="o">&gt;</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">AS</span><span class="w"> </span><span class="o">&lt;</span><span class="n">query</span><span class="o">&gt;</span>
+</span></code></pre></div>
+<h2 id="parameters">Parameters<a class="headerlink" href="#parameters" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>IF NOT EXISTS</code></td>
+<td>Optional. Prevents error if the table already exists.</td>
+</tr>
+<tr>
+<td><code>OR REPLACE</code></td>
+<td>Optional. Replaces the table if it already exists, or creates it if it doesn't.</td>
+</tr>
+<tr>
+<td><code>REPLACE TABLE</code></td>
+<td>Replaces an existing table. The table must already exist.</td>
+</tr>
+<tr>
+<td><code>table_name</code></td>
+<td>Fully qualified table name: <code>catalog.schema.table</code>.</td>
+</tr>
+<tr>
+<td><code>column_name</code></td>
+<td>Name of the column.</td>
+</tr>
+<tr>
+<td><code>data_type</code></td>
+<td>Data type of the column. See <a href="../../data-types/">Data Types</a>.</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>A SELECT query whose results populate the table.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="table-properties">Table Properties<a class="headerlink" href="#table-properties" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blob_columns</code></td>
+<td>Comma-separated list of VARBINARY columns to use blob encoding (out-of-line storage for large binary data). Example: <code>'image, video'</code></td>
+</tr>
+<tr>
+<td><code>vector_columns</code></td>
+<td>Comma-separated list of vector columns with dimensions. Format: <code>'column1:dim1, column2:dim2'</code>. Columns must be <code>ARRAY(REAL)</code> or <code>ARRAY(DOUBLE)</code>. Example: <code>'embedding:768'</code></td>
+</tr>
+<tr>
+<td><code>file_format_version</code></td>
+<td>Lance file format version for new tables. Valid values: <code>'legacy'</code>, <code>'0.1'</code>, <code>'2.0'</code>, <code>'2.1'</code>, <code>'2.2'</code>, <code>'stable'</code>, <code>'next'</code>. Default uses the Lance SDK's default version.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="create-an-empty-table">Create an empty table<a class="headerlink" href="#create-an-empty-table" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="n">name</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="n">email</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">    </span><span class="n">created_at</span><span class="w"> </span><span class="nb">DATE</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="create-table-with-insert">Create table with INSERT<a class="headerlink" href="#create-table-with-insert" title="Permanent link">&para;</a></h3>
+<p>After creating an empty table, you must insert data before querying:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">    </span><span class="n">product_id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span><span class="n">name</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">    </span><span class="n">price</span><span class="w"> </span><span class="n">DOUBLE</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="p">);</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">products</span><span class="w"> </span><span class="k">VALUES</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">    </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">'Widget'</span><span class="p">,</span><span class="w"> </span><span class="mi">9</span><span class="p">.</span><span class="mi">99</span><span class="p">),</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">    </span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="s1">'Gadget'</span><span class="p">,</span><span class="w"> </span><span class="mi">19</span><span class="p">.</span><span class="mi">99</span><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="create-table-from-query-ctas">Create table from query (CTAS)<a class="headerlink" href="#create-table-from-query-ctas" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">us_customers</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="k">AS</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">customers</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">country</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'US'</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="create-table-with-row-count">Create table with row count<a class="headerlink" href="#create-table-with-row-count" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">summary</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">AS</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="n">region</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">cnt</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">region</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="replace-existing-table-create-or-replace">Replace existing table (CREATE OR REPLACE)<a class="headerlink" href="#replace-existing-table-create-or-replace" title="Permanent link">&para;</a></h3>
+<p>Use <code>CREATE OR REPLACE</code> to replace a table if it exists, or create it if it doesn't:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">OR</span><span class="w"> </span><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">daily_stats</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">AS</span><span class="w"> </span><span class="k">SELECT</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">    </span><span class="k">current_date</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">report_date</span><span class="p">,</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">    </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total_orders</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="replace-table-with-new-data-replace-table-as-select">Replace table with new data (REPLACE TABLE AS SELECT)<a class="headerlink" href="#replace-table-with-new-data-replace-table-as-select" title="Permanent link">&para;</a></h3>
+<p>Use <code>REPLACE TABLE</code> to completely replace an existing table's data and schema:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1">-- Replace table with new data (same schema)</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">user_stats</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="k">AS</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="n">user_id</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">order_count</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">orders</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">user_id</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Replace with a different schema:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="c1">-- Original table had: (id BIGINT, name VARCHAR, value DOUBLE)</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="c1">-- Replace with completely different schema</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">metrics</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="k">AS</span><span class="w"> </span><span class="k">SELECT</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">    </span><span class="nb">VARCHAR</span><span class="w"> </span><span class="s1">'metric_1'</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">metric_name</span><span class="p">,</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="w">    </span><span class="n">VARBINARY</span><span class="w"> </span><span class="n">X</span><span class="s1">'0102030405'</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">data</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="replace-table-with-empty-schema">Replace table with empty schema<a class="headerlink" href="#replace-table-with-empty-schema" title="Permanent link">&para;</a></h3>
+<p>Replace a table with a new schema but no data:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">staging</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="n">new_id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="n">description</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="n">created_at</span><span class="w"> </span><span class="nb">DATE</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="create-table-with-blob-columns">Create table with blob columns<a class="headerlink" href="#create-table-with-blob-columns" title="Permanent link">&para;</a></h3>
+<p>Blob encoding stores large binary data out-of-line, which is efficient for storing images, documents, or other large binary content:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">documents</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">    </span><span class="n">title</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="n">content</span><span class="w"> </span><span class="n">VARBINARY</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">blob_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'content'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Multiple blob columns:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">media</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">    </span><span class="n">image</span><span class="w"> </span><span class="n">VARBINARY</span><span class="p">,</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="n">video</span><span class="w"> </span><span class="n">VARBINARY</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">blob_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'image, video'</span><span class="p">);</span>
+</span></code></pre></div>
+<h4 id="blob-virtual-columns">Blob Virtual Columns<a class="headerlink" href="#blob-virtual-columns" title="Permanent link">&para;</a></h4>
+<p>When a table has blob columns, virtual columns are automatically available to retrieve blob metadata:</p>
+<ul>
+<li><code>&lt;column&gt;__blob_pos</code> - The byte position of the blob data in the blob file</li>
+<li><code>&lt;column&gt;__blob_size</code> - The size of the blob data in bytes</li>
+</ul>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1">-- Query blob metadata</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">content__blob_pos</span><span class="p">,</span><span class="w"> </span><span class="n">content__blob_size</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">documents</span><span class="p">;</span>
+</span></code></pre></div>
+<p>These virtual columns are hidden from <code>INSERT</code> statements and <code>DESCRIBE TABLE</code> but are selectable in queries.</p>
+<h3 id="create-table-with-vector-columns">Create table with vector columns<a class="headerlink" href="#create-table-with-vector-columns" title="Permanent link">&para;</a></h3>
+<p>Vector columns use FixedSizeList encoding, optimized for ML embeddings and similarity search:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">embeddings</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="w">    </span><span class="nb">text</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">,</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="w">    </span><span class="n">embedding</span><span class="w"> </span><span class="nb">ARRAY</span><span class="p">(</span><span class="nb">REAL</span><span class="p">)</span>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">vector_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'embedding:768'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Multiple vector columns with different dimensions:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">multi_modal</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="w">    </span><span class="n">text_embedding</span><span class="w"> </span><span class="nb">ARRAY</span><span class="p">(</span><span class="nb">REAL</span><span class="p">),</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="w">    </span><span class="n">image_embedding</span><span class="w"> </span><span class="nb">ARRAY</span><span class="p">(</span><span class="n">DOUBLE</span><span class="p">)</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">vector_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'text_embedding:768, image_embedding:512'</span><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="combine-blob-and-vector-columns">Combine blob and vector columns<a class="headerlink" href="#combine-blob-and-vector-columns" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">image_search</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="w">    </span><span class="n">image</span><span class="w"> </span><span class="n">VARBINARY</span><span class="p">,</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="w">    </span><span class="n">embedding</span><span class="w"> </span><span class="nb">ARRAY</span><span class="p">(</span><span class="nb">REAL</span><span class="p">)</span>
+</span><span id="__span-18-5"><a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-18-6"><a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="w">    </span><span class="n">blob_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'image'</span><span class="p">,</span>
+</span><span id="__span-18-7"><a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="w">    </span><span class="n">vector_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'embedding:512'</span>
+</span><span id="__span-18-8"><a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="create-table-with-specific-file-format-version">Create table with specific file format version<a class="headerlink" href="#create-table-with-specific-file-format-version" title="Permanent link">&para;</a></h3>
+<p>Specify the Lance file format version for the table:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">legacy_table</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-19-3"><a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a><span class="w">    </span><span class="n">name</span><span class="w"> </span><span class="nb">VARCHAR</span>
+</span><span id="__span-19-4"><a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">file_format_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'legacy'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Create a table with the latest stable format:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">modern_table</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-20-3"><a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a><span class="w">    </span><span class="k">data</span><span class="w"> </span><span class="nb">VARCHAR</span>
+</span><span id="__span-20-4"><a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">file_format_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'2.1'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Combine with other table properties:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="k">default</span><span class="p">.</span><span class="n">ml_data</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span>
+</span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a><span class="w">    </span><span class="n">embedding</span><span class="w"> </span><span class="nb">ARRAY</span><span class="p">(</span><span class="nb">REAL</span><span class="p">)</span>
+</span><span id="__span-21-4"><a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-21-5"><a id="__codelineno-21-5" name="__codelineno-21-5" href="#__codelineno-21-5"></a><span class="w">    </span><span class="n">vector_columns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'embedding:768'</span><span class="p">,</span>
+</span><span id="__span-21-6"><a id="__codelineno-21-6" name="__codelineno-21-6" href="#__codelineno-21-6"></a><span class="w">    </span><span class="n">file_format_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'2.0'</span>
+</span><span id="__span-21-7"><a id="__codelineno-21-7" name="__codelineno-21-7" href="#__codelineno-21-7"></a><span class="p">);</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">File Format Version</p>
+<p>The <code>file_format_version</code> property only applies when creating new tables. When inserting data into existing tables, the connector automatically uses the table's existing format version to ensure compatibility.</p>
+</div>
+<h2 id="supported-data-types">Supported Data Types<a class="headerlink" href="#supported-data-types" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BIGINT</code></td>
+<td>64-bit signed integer</td>
+</tr>
+<tr>
+<td><code>INTEGER</code></td>
+<td>32-bit signed integer</td>
+</tr>
+<tr>
+<td><code>SMALLINT</code></td>
+<td>16-bit signed integer</td>
+</tr>
+<tr>
+<td><code>TINYINT</code></td>
+<td>8-bit signed integer</td>
+</tr>
+<tr>
+<td><code>DOUBLE</code></td>
+<td>64-bit floating point</td>
+</tr>
+<tr>
+<td><code>REAL</code></td>
+<td>32-bit floating point</td>
+</tr>
+<tr>
+<td><code>VARCHAR</code></td>
+<td>Variable-length string</td>
+</tr>
+<tr>
+<td><code>BOOLEAN</code></td>
+<td>Boolean (true/false)</td>
+</tr>
+<tr>
+<td><code>DATE</code></td>
+<td>Calendar date</td>
+</tr>
+<tr>
+<td><code>TIMESTAMP</code></td>
+<td>no time zone</td>
+</tr>
+<tr>
+<td><code>TIMESTAMP WITH TIME ZONE</code></td>
+<td>UTC</td>
+</tr>
+<tr>
+<td><code>VARBINARY</code></td>
+<td>Variable-length binary</td>
+</tr>
+<tr>
+<td><code>ARRAY&lt;type&gt;</code></td>
+<td>Array of elements</td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations<a class="headerlink" href="#limitations" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Table and column comments are not supported</li>
+<li>NOT NULL constraints are not supported</li>
+<li>Default column values are not supported</li>
+<li>CHAR type is not supported (use VARCHAR)</li>
+<li>TIME is not supported</li>
+<li>DECIMAL type is not supported (use DOUBLE)</li>
+<li>MAP and ROW types are not supported for writes</li>
+<li>Column names cannot contain dots or special characters</li>
+<li>Blob columns return empty bytes on read (data is stored out-of-line and not materialized)</li>
+<li>Vector columns must be <code>ARRAY(REAL)</code> or <code>ARRAY(DOUBLE)</code> type</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../describe-table/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">DESCRIBE</div>
+        </a>
+        <a class="next" href="../drop-table/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">DROP TABLE</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#syntax">Syntax</a>
+      <a class="ld-toc__h2" href="#parameters">Parameters</a>
+      <a class="ld-toc__h2" href="#table-properties">Table Properties</a>
+      <a class="ld-toc__h2" href="#examples">Examples</a>
+      <a class="ld-toc__h3" href="#create-an-empty-table">Create an empty table</a>
+      <a class="ld-toc__h3" href="#create-table-with-insert">Create table with INSERT</a>
+      <a class="ld-toc__h3" href="#create-table-from-query-ctas">Create table from query (CTAS)</a>
+      <a class="ld-toc__h3" href="#create-table-with-row-count">Create table with row count</a>
+      <a class="ld-toc__h3" href="#replace-existing-table-create-or-replace">Replace existing table (CREATE OR REPLACE)</a>
+      <a class="ld-toc__h3" href="#replace-table-with-new-data-replace-table-as-select">Replace table with new data (REPLACE TABLE AS SELECT)</a>
+      <a class="ld-toc__h3" href="#replace-table-with-empty-schema">Replace table with empty schema</a>
+      <a class="ld-toc__h3" href="#create-table-with-blob-columns">Create table with blob columns</a>
+      <a class="ld-toc__h3" href="#create-table-with-vector-columns">Create table with vector columns</a>
+      <a class="ld-toc__h3" href="#combine-blob-and-vector-columns">Combine blob and vector columns</a>
+      <a class="ld-toc__h3" href="#create-table-with-specific-file-format-version">Create table with specific file format version</a>
+      <a class="ld-toc__h2" href="#supported-data-types">Supported Data Types</a>
+      <a class="ld-toc__h2" href="#limitations">Limitations</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../../format/">Specification</a>
+        <a href="../../../../../format/file/">File format</a>
+        <a href="../../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../../quickstart/">Getting started</a>
+        <a href="../../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../../..";</script>
+<script src="../../../../../assets/site.js" defer></script>
+</body>
+</html>
