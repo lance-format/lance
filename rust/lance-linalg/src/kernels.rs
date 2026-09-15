@@ -449,6 +449,51 @@ mod tests {
     }
 
     #[test]
+    fn test_argmin_value_float_with_bias() {
+        // Case 1: bias = None → 文档说 "equivalent to argmin_value_float"
+        // 输入 [5.0, 1.0, 3.0]：最小值的下标和值是多少？
+        let f = Float32Array::from(vec![5.0, 1.0, 3.0]);
+        assert_eq!(
+            // impl Iterator 是"某个具体类型"的占位符，裸 None 无法推断出
+            // 它装的是哪种迭代器，必须用 turbofish 显式标注
+            argmin_value_float_with_bias(
+                f.values().iter().copied(),
+                None::<std::vec::IntoIter<f32>>, 
+                // 这里关联trait 时在传参数None失败 需要对应None进行类型标准
+            ),
+            Some((1, 1.0)) // ← 填空 1
+        );
+
+        // Case 2: bias 有值 —— 陷阱现形的地方
+        // iter = [5.0, 8.0]，bias = [-1.0, -5.0]
+        // 手算：加 bias 后各是多少？最小的下标是几？
+        // 函数返回的第二个元素是「bias 后的值」还是「原始值」？
+        // 加 bias 后是 [4.0, 3.0]，最小在下标 1；但返回的是原始值 8.0，
+        // 不是 bias 后的 3.0（文档：the returned value is the original value）
+        let f = Float32Array::from(vec![5.0, 8.0]);
+        assert_eq!(
+            argmin_value_float_with_bias(
+                f.values().iter().copied(),
+                Some(vec![-1.0, -5.0].into_iter())
+            ),
+            Some((1, 8.0))
+        );
+
+        // Case 3: zip 短路 —— iter 比 bias 长
+        // 第三个元素 9.0 参与比较了吗？结果会变吗？
+        // iter 有三个值但 bias 只有两个：zip 短路，9.0 根本没参与比较，
+        // 结果与 Case 2 相同
+        let f = Float32Array::from(vec![5.0, 8.0, 9.0]);
+        assert_eq!(
+            argmin_value_float_with_bias(
+                f.values().iter().copied(),
+                Some(vec![-1.0, -5.0].into_iter())
+            ),
+            Some((1, 8.0))
+        );
+    }
+
+    #[test]
     fn test_numeric_hashes() {
         let a: UInt8Array = [1_u8, 2, 3, 4, 5].iter().copied().collect();
         let ha = hash(&a).unwrap();
