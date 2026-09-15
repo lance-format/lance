@@ -19,6 +19,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
@@ -26,12 +27,22 @@ use crate::metrics::MetricsCollector;
 use crate::{Index, IndexParams, IndexType};
 
 /// Metadata about a single file within an index segment.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexFile {
     /// Path relative to the index directory (e.g., "index.idx", "auxiliary.idx")
     pub path: String,
     /// Size of the file in bytes
     pub size_bytes: u64,
+    /// Metadata suffix size for a Lance-format file.
+    ///
+    /// `None` means the size is unavailable or the file uses another format.
+    pub file_metadata_size_bytes: Option<NonZeroU64>,
+}
+
+impl DeepSizeOf for IndexFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+    }
 }
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";

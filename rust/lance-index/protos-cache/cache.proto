@@ -201,6 +201,11 @@ message IvfStateHeader {
   string quantizer_metadata_json = 7;
   uint64 index_file_size = 9;
   uint64 aux_file_size = 10;
+  /* Lance metadata suffix sizes used to avoid dependent footer reads.
+   * Zero means the value was unavailable when the state was cached.
+   */
+  uint64 index_file_metadata_size_bytes = 11;
+  uint64 aux_file_metadata_size_bytes = 12;
 }
 
 /* RabitQ quantizer. Sections: sub-index IPC, rotate-matrix IPC (Matrix rotation

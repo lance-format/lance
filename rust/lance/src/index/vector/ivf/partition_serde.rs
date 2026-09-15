@@ -1142,6 +1142,8 @@ mod tests {
             quantization_type: QuantizationType::Flat,
             index_file_size: 1024,
             aux_file_size: 512,
+            index_file_metadata_size_bytes: std::num::NonZeroU64::new(256),
+            aux_file_metadata_size_bytes: std::num::NonZeroU64::new(128),
             rq_search_cache: empty_rabit_search_cache_cell(),
         };
 
