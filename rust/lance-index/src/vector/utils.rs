@@ -84,7 +84,7 @@ fn prefers_flat_amx_assignment(
     centroid_type == &DataType::Float16
         && distance_type == DistanceType::Dot
         && dimension >= 32
-        && num_centroids >= 32
+        && num_centroids >= 16
         && amx_fp16_available()
 }
 
@@ -471,7 +471,7 @@ mod tests {
     #[case::not_f16(&DataType::Float32, 10_000, 768, DistanceType::Dot)]
     #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2)]
     #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot)]
-    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot)]
+    #[case::k_below_half_a_block(&DataType::Float16, 15, 768, DistanceType::Dot)]
     fn test_flat_amx_assignment_declines_unsupported_shapes(
         #[case] centroid_type: &DataType,
         #[case] num_centroids: usize,
