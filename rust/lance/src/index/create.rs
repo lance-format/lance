@@ -248,14 +248,24 @@ impl<'a> CreateIndexBuilder<'a> {
             .map(|resolved| resolved.canonical_path.as_str())
             .unwrap_or(quoted_column.as_str());
 
+        // A fragment list naming the whole table is a whole-table build, not a
+        // subset: `effective_vector_fragments` normalizes it to `None` so a
+        // retrain gets the same row floor as a create.
         let vector_fragments_for_validation =
             is_builtin_vector_index(self.index_type, self.params)
-                .then_some(self.fragments.as_deref())
+                .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
                 .flatten();
+        let quantizer_minimum_rows = self
+            .params
+            .as_any()
+            .downcast_ref::<VectorIndexParams>()
+            .and_then(|params| super::vector::vector_quantizer_minimum_rows(&params.stages));
         let train = should_train_index(
             self.dataset,
             self.train,
-            vector_fragments_for_validation,
+            vector_fragments_for_validation.as_deref(),
+            quantizer_minimum_rows,
+            column,
         )
         .await?;
 
@@ -569,11 +579,11 @@ impl<'a> CreateIndexBuilder<'a> {
                         "unable to cast index extension to vector".to_string(),
                     ))?;
 
+                // An extension that has not been trained writes nothing: the
+                // definition is the whole index until there is data for it.
                 if train {
                     ext.create_index(self.dataset, column, &index_id, self.params)
                         .await?;
-                } else {
-                    todo!("create empty vector index when train=false");
                 }
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());
@@ -929,10 +939,21 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
         && params.as_any().is::<VectorIndexParams>()
 }
 
+/// Whether there is enough data to train, as opposed to recording the
+/// definition and training later.
+///
+/// A quantizer needs one row per code to train at all. Below that the answer is
+/// the same as `train=false`: keep the definition, cover no rows, and leave
+/// `optimize_indices` to train it once the column fills.
+///
+/// An index type with a quantizer is measured in non-null vectors, since a
+/// column of nulls trains nothing; every other type is satisfied by any row.
 async fn should_train_index(
     dataset: &Dataset,
     train: bool,
     vector_fragments: Option<&[u32]>,
+    minimum_rows: Option<usize>,
+    column: &str,
 ) -> Result<bool> {
     if !train {
         return Ok(false);
@@ -942,12 +963,20 @@ async fn should_train_index(
         return Ok(false);
     }
 
+    // A fragment subset is a caller-driven segment build: the caller chose the
+    // fragments, often supplies the IVF model, and owns the row math. Only
+    // whole-table builds fall back to a definition-only index.
     if let Some(fragment_ids) = vector_fragments {
         dataset.get_fragments_from_ids(fragment_ids)?;
         return Ok(true);
     }
 
-    Ok(dataset.count_rows(None).await? > 0)
+    // Only a quantizer counts vectors; every other index type is satisfied by
+    // any row at all.
+    let Some(minimum) = minimum_rows.map(|minimum| minimum.max(1)) else {
+        return Ok(dataset.count_rows(None).await? > 0);
+    };
+    super::vector::has_vectors_to_train(dataset, column, minimum).await
 }
 
 fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
