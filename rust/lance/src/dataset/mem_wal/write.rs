@@ -12,7 +12,7 @@
 //! - [`IndexStore`] - In-memory index management
 //! - [`MemTableFlusher`] - Flush MemTable to storage as single Lance file
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -1647,26 +1647,36 @@ fn conform_to_storage_schema(
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
-    let by_field_id: HashMap<i32, &ArrayRef> = batch
+    let by_field_id: HashMap<i32, usize> = batch
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| field_id_of(f).map(|id| (id, batch.column(i))))
+        .filter_map(|(i, f)| field_id_of(f).map(|id| (id, i)))
+        .collect();
+
+    // An entry column an id match has already taken. A rename frees a name for
+    // something else to use, so the entry's column can answer to the schema's
+    // name without being the schema's column -- and it is the id match that
+    // says which one it really is.
+    let claimed: HashSet<usize> = storage_schema
+        .fields()
+        .iter()
+        .filter_map(|f| field_id_of(f))
+        .filter_map(|id| by_field_id.get(&id).copied())
         .collect();
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
     for field in storage_schema.fields() {
         let name = field.name();
         let carried = field_id_of(field)
-            .and_then(|id| by_field_id.get(&id).map(|c| (*c).clone()))
-            .or_else(|| match batch.schema().column_with_name(name) {
-                // The entry carries this name under a different id, so it is a
-                // different column: a rename freed the name and something else
-                // took it. Absent, not carried.
-                Some((_, f)) if field_id_of(f).is_some() && field_id_of(field).is_some() => None,
-                Some((i, _)) => Some(batch.column(i).clone()),
-                None => None,
+            .and_then(|id| by_field_id.get(&id).map(|i| batch.column(*i).clone()))
+            .or_else(|| {
+                // No column of this id. The entry may still carry this column
+                // under this name with an id of its own -- a cast takes a new
+                // id and keeps the name -- but only if nothing has claimed it.
+                let (i, _) = batch.schema().column_with_name(name)?;
+                (!claimed.contains(&i)).then(|| batch.column(i).clone())
             });
         if let Some(column) = carried {
             columns.push(if column.data_type() == field.data_type() {

@@ -151,6 +151,37 @@ impl datafusion::physical_plan::RecordBatchStream for SchemaRelabelStream {
     }
 }
 
+/// `array` with its type relabelled to `target`, rebuilding a struct whose
+/// children are named differently.
+///
+/// Only names differ here -- the layout is identical -- so an array whose type
+/// already matches, and any type this cannot express, is returned as it is and
+/// left for `RecordBatch::try_new` to reject.
+fn relabel_array(array: &ArrayRef, target: &DataType) -> ArrayRef {
+    if array.data_type() == target {
+        return Arc::clone(array);
+    }
+    let (DataType::Struct(_), DataType::Struct(target_fields)) = (array.data_type(), target) else {
+        return Arc::clone(array);
+    };
+    let Some(source) = array.as_any().downcast_ref::<StructArray>() else {
+        return Arc::clone(array);
+    };
+    if source.columns().len() != target_fields.len() {
+        return Arc::clone(array);
+    }
+    let children: Vec<ArrayRef> = source
+        .columns()
+        .iter()
+        .zip(target_fields)
+        .map(|(child, field)| relabel_array(child, field.data_type()))
+        .collect();
+    match StructArray::try_new(target_fields.clone(), children, source.nulls().cloned()) {
+        Ok(rebuilt) => Arc::new(rebuilt),
+        Err(_) => Arc::clone(array),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,36 +281,5 @@ mod tests {
             error.contains("column types must match"),
             "expected a data type error, got: {error}"
         );
-    }
-}
-
-/// `array` with its type relabelled to `target`, rebuilding a struct whose
-/// children are named differently.
-///
-/// Only names differ here -- the layout is identical -- so an array whose type
-/// already matches, and any type this cannot express, is returned as it is and
-/// left for `RecordBatch::try_new` to reject.
-fn relabel_array(array: &ArrayRef, target: &DataType) -> ArrayRef {
-    if array.data_type() == target {
-        return Arc::clone(array);
-    }
-    let (DataType::Struct(_), DataType::Struct(target_fields)) = (array.data_type(), target) else {
-        return Arc::clone(array);
-    };
-    let Some(source) = array.as_any().downcast_ref::<StructArray>() else {
-        return Arc::clone(array);
-    };
-    if source.columns().len() != target_fields.len() {
-        return Arc::clone(array);
-    }
-    let children: Vec<ArrayRef> = source
-        .columns()
-        .iter()
-        .zip(target_fields)
-        .map(|(child, field)| relabel_array(child, field.data_type()))
-        .collect();
-    match StructArray::try_new(target_fields.clone(), children, source.nulls().cloned()) {
-        Ok(rebuilt) => Arc::new(rebuilt),
-        Err(_) => Arc::clone(array),
     }
 }

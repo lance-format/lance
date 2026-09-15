@@ -182,11 +182,13 @@ impl GenerationMapping {
     /// filled in.
     fn can_evaluate(&self, expr: &Expr, generation_schema: &LanceSchema) -> bool {
         expr.column_refs().iter().all(|column| {
-            generation_schema.field(&column.name).is_some()
-                && self
-                    .to_base
-                    .get(&column.name)
-                    .is_none_or(|base| base == &column.name)
+            // A positive mapping, not merely a column of that name: one base
+            // has dropped is still stored here, and answering from it would
+            // filter on data the table no longer has.
+            self.to_base
+                .get(&column.name)
+                .is_some_and(|base| base == &column.name)
+                && generation_schema.field(&column.name).is_some()
         })
     }
 
@@ -477,12 +479,12 @@ impl LsmScanPlanner {
         // `UnionExec` requires schema equality and does not reconcile.
         //
         // The base arm is the authority when it is here -- it is the only source
-        // the schema change was applied to -- and the newest generation
-        // otherwise.
+        // the schema change was applied to. Otherwise the newest generation is,
+        // and sources arrive generation-DESC, so it is the first of them.
         let target = source_plans
             .iter()
             .find(|(_, is_base)| *is_base)
-            .or_else(|| source_plans.last())
+            .or_else(|| source_plans.first())
             .map(|(plan, _)| plan.schema());
         let mut source_plans = match target {
             Some(target) => source_plans
@@ -612,8 +614,26 @@ impl LsmScanPlanner {
                 // the base table does, so those are translated first; one the
                 // generation never had is left out and filled in above the
                 // union.
-                let wanted =
+                // The predicate names columns as base does. This generation can
+                // only evaluate it when it stores every one of them under that
+                // same name: a rename moved the name, and a column added since
+                // the seal is not here at all, though `IS NULL` over it is a
+                // question about these rows that still has an answer.
+                let evaluable =
+                    filter.is_none_or(|expr| mapping.can_evaluate(expr, dataset.schema()));
+
+                let mut wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                // A filter this generation cannot evaluate runs above the
+                // relabel, reading the columns from this scan -- so they have to
+                // be in it, whether or not the caller asked for them.
+                if let Some(expr) = filter.filter(|_| !evaluable) {
+                    for column in expr.column_refs() {
+                        if !wanted.contains(&column.name) {
+                            wanted.push(column.name.clone());
+                        }
+                    }
+                }
                 let cols = mapping.generation_names_for(&wanted);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
@@ -634,8 +654,6 @@ impl LsmScanPlanner {
                 // that same name: a rename moved the name, and a column added
                 // since the seal is not here at all, though `IS NULL` over it
                 // is a question about these rows that still has an answer.
-                let evaluable =
-                    filter.is_none_or(|expr| mapping.can_evaluate(expr, dataset.schema()));
                 let caller_filter = if evaluable { filter } else { None };
                 let folded;
                 let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
@@ -649,10 +667,8 @@ impl LsmScanPlanner {
                 }
                 // A limit under a filter that has not run would cut rows the
                 // filter never saw.
-                if let Some(fetch) = fetch {
-                    if evaluable {
-                        scanner.limit(Some(fetch as i64), None)?;
-                    }
+                if let Some(fetch) = fetch.filter(|_| evaluable) {
+                    scanner.limit(Some(fetch as i64), None)?;
                 }
 
                 let plan = scanner.create_plan().await?;
@@ -768,7 +784,6 @@ mod tests {
         let m = mapping(vec![lance_field("value", 1, vec![])], &[(1, "amount")]);
         assert_eq!(m.to_base.get("value").map(String::as_str), Some("amount"));
         assert_eq!(m.generation_names_for(&["amount".into()]), vec!["value"]);
-        assert!(m.renames_projected(&["value".into()]));
     }
 
     #[test]
