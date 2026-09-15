@@ -351,6 +351,36 @@ impl GetStat for FixedWidthDataBlock {
 }
 
 impl FixedWidthDataBlock {
+    /// Compute per-chunk maximum bit-width statistics for bitpacking encoders.
+    ///
+    /// Algorithm (load-bearing contract — see below):
+    /// for each `CHUNK_SIZE` window, compute `bits_per_value - leading_zeros(OR-fold(chunk))`.
+    /// The OR-fold guarantees: every value in the chunk satisfies `v >> bit_width == 0`.
+    ///
+    /// # Contract is load-bearing for u128 dispatch
+    ///
+    /// This contract is consumed specifically by the **u128** path in
+    /// `encodings::physical::bitpacking::pack_u128_chunk`, which dispatches by this returned
+    /// `bit_width` value into kernels with strict invariants:
+    /// - 1..=32   → reinterpret-cast `&[u128] → &mut [u32]` and pack with FastLanes u32 SIMD
+    /// - 33..=64  → reinterpret-cast `&[u128] → &mut [u64]` and pack with FastLanes u64 SIMD
+    /// - 65..=127 → scalar u128 sequential pack
+    /// - 128      → memcpy identity
+    ///
+    /// The narrow branches (≤32, ≤64) only correctly truncate the high u128 lanes if **every
+    /// value** in the chunk fits in `bit_width` bits. Switching this algorithm to anything
+    /// other than the OR-fold (e.g. a per-element max that ignored the sign bit, or a
+    /// chunk-statistics aggregator that returned a min-bit-width) would silently break
+    /// u128 narrow-branch correctness. The u8/u16/u32/u64 paths do not currently use a
+    /// per-chunk dispatch and would be unaffected today, but the OR-fold contract still
+    /// describes the *upper bound* semantics for all widths and any new consumer must rely
+    /// on the same property.
+    ///
+    /// Sign safety (u128 specifically): for `i128`-as-`u128`, `leading_zeros` is computed on
+    /// the raw unsigned bit pattern, so any negative value forces `bit_width = 128` and the
+    /// dispatch falls into the memcpy branch. Do not "optimize" the OR-fold to skip the sign
+    /// bit. The same property holds mechanically for narrower signed types but they currently
+    /// have no narrow-dispatch consumer that would rely on it.
     fn max_bit_widths(&mut self) -> Arc<dyn Array> {
         if self.num_values == 0 {
             return Arc::new(UInt64Array::from(vec![0u64]));
@@ -398,6 +428,14 @@ impl FixedWidthDataBlock {
                 let u64_slice = u64_slice.as_ref();
                 Arc::new(UInt64Array::from(calculate_max_bit_width(
                     u64_slice,
+                    self.bits_per_value,
+                )))
+            }
+            128 => {
+                let u128_slice = self.data.borrow_to_typed_slice::<u128>();
+                let u128_slice = u128_slice.as_ref();
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u128_slice,
                     self.bits_per_value,
                 )))
             }
@@ -1055,6 +1093,97 @@ mod tests {
             ])) as ArrayRef;
             let actual_bit_widths = block.expect_stat(Stat::BitWidth);
             assert_eq!(actual_bit_widths.as_ref(), expected_bit_width.as_ref(),);
+        }
+    }
+
+    /// OR-fold contract test for u128 narrow dispatch (see `max_bit_widths` doc).
+    ///
+    /// This test pins the load-bearing property that `Stat::BitWidth` must satisfy for
+    /// every chunk: every value in the chunk has `v >> bit_width == 0`. The narrow
+    /// dispatch in `pack_u128_chunk` (1..=32 → u32 SIMD, 33..=64 → u64 SIMD) reinterprets
+    /// `&[u128]` to `&[u32]`/`&[u64]` and silently truncates the high lanes; if any value
+    /// in the chunk had bits set above position `bit_width - 1`, those bits would be
+    /// discarded without warning. This test guards against future changes to the
+    /// statistics algorithm (e.g. switching from OR-fold to a per-element max that
+    /// ignored sign, or to a min-bit-width aggregation) that would silently break
+    /// narrow-branch correctness.
+    #[test]
+    fn test_bit_width_or_fold_invariant_for_u128_narrow_dispatch() {
+        use arrow_array::Decimal128Array;
+
+        // Single chunk crossing all four u128 dispatch regimes:
+        //   width 0  → all zeros
+        //   width 24 → narrow u32
+        //   width 40 → narrow u64
+        //   width 80 → sequential u128
+        //   width 128 → memcpy (sign bit set)
+        // We construct each chunk as exactly 1024 values to force a chunk boundary.
+        let chunk_size = 1024;
+        let cases: Vec<(u64, Vec<i128>)> = vec![
+            (0, vec![0i128; chunk_size]),
+            (
+                24,
+                // Force bit 23 set so the OR-fold lands at width 24, not 10.
+                // Without `| (1 << 23)`, `i & 0xFFFFFF` is a no-op for
+                // `i ∈ 0..1024` and OR-folds to 0x3FF (computed_width = 10).
+                (0..chunk_size)
+                    .map(|i| ((i as i128).wrapping_mul(31) & 0xFFFFFF) | (1i128 << 23))
+                    .collect(),
+            ),
+            (
+                40,
+                (0..chunk_size)
+                    .map(|i| ((i as i128).wrapping_mul(7) & ((1i128 << 40) - 1)) | (1i128 << 39))
+                    .collect(),
+            ),
+            (
+                80,
+                (0..chunk_size)
+                    .map(|i| {
+                        ((i as i128).wrapping_mul(0x0BAD_F00D) & ((1i128 << 80) - 1))
+                            | (1i128 << 79)
+                    })
+                    .collect(),
+            ),
+            (128, vec![-1i128; chunk_size]),
+        ];
+
+        for (expected_width, values) in cases {
+            // Verify the OR-fold invariant directly on the source values: for the
+            // computed bit_width, every value satisfies (v as u128) >> bit_width == 0.
+            let or_fold = values.iter().fold(0u128, |acc, &v| acc | (v as u128));
+            let computed_width = 128 - or_fold.leading_zeros() as u64;
+            assert_eq!(
+                computed_width, expected_width,
+                "OR-fold computed_width={computed_width} != expected={expected_width}"
+            );
+            for &v in &values {
+                if computed_width < 128 {
+                    assert_eq!(
+                        (v as u128) >> computed_width,
+                        0,
+                        "value {v:#x} has bit set above width={computed_width}"
+                    );
+                }
+            }
+
+            // Verify Stat::BitWidth produces the same value end-to-end through the
+            // public surface (Decimal128Array → DataBlock::expect_stat).
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(38, 0)
+                .unwrap();
+            let block = DataBlock::from_array(Arc::new(array) as ArrayRef);
+            let stat = block.expect_stat(Stat::BitWidth);
+            let stat_array = stat
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("BitWidth stat must be UInt64Array");
+            assert_eq!(stat_array.len(), 1);
+            assert_eq!(
+                stat_array.value(0),
+                expected_width,
+                "Stat::BitWidth disagrees with OR-fold for expected_width={expected_width}"
+            );
         }
     }
 
