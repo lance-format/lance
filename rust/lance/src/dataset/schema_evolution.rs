@@ -12,6 +12,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
+use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
@@ -471,6 +472,29 @@ pub(super) async fn add_columns(
         .await
 }
 
+/// Refuse to change a column's type on a table with a MemWAL attached.
+///
+/// A cast gives the column a new field id and keeps its name, which is exactly
+/// what dropping a column and adding another under that name looks like. Rows
+/// the WAL still holds carry the old id, and nothing in the schemas says which
+/// of the two happened -- so they could only be reconciled by guessing.
+///
+/// A table without a MemWAL is unaffected: this is the only thing the check
+/// looks at.
+///
+/// Takes the decision as a bool rather than the alterations themselves: a
+/// reference to them held across an await would have to be `Sync`.
+async fn reject_cast_on_mem_wal(dataset: &Dataset, casts: bool) -> Result<()> {
+    if !casts || dataset.mem_wal_index_details().await?.is_none() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(
+        "cannot change a column's type on a table with a MemWAL attached: a cast takes a \
+         new field id, which rows still in the WAL cannot be matched to. Drop the MemWAL, \
+         or add a column of the new type and backfill it.",
+    ))
+}
+
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
     let Some(first_fragment) = fragments.first() else {
         return;
@@ -729,6 +753,8 @@ pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
 ) -> Result<()> {
+    reject_cast_on_mem_wal(dataset, alterations.iter().any(|a| a.data_type.is_some())).await?;
+
     // Validate referenced columns exist and enforce NOT NULL when tightening
     // a column from nullable to non-nullable.
     let mut new_schema = dataset.schema().clone();

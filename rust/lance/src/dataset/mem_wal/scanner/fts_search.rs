@@ -56,8 +56,10 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
+use super::planner::stored_names;
 use super::projection::{project_to_canonical, validate_projection_names};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::arrow_schema_with_field_ids;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
@@ -723,8 +725,21 @@ impl LsmFtsSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one.
+                let stored = arrow_schema_with_field_ids(dataset.schema());
+                let names = stored_names(&stored, &self.base_schema);
+                let wanted = self.fts_scanner_projection(projection);
+                let cols: Vec<&str> = wanted
+                    .iter()
+                    .filter_map(|name| {
+                        names
+                            .iter()
+                            .find(|(_, table_name)| *table_name == name)
+                            .map(|(stored_name, _)| stored_name.as_str())
+                    })
+                    .collect();
+                scanner.project(&cols)?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.

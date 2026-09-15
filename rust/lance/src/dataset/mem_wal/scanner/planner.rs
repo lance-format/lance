@@ -3,21 +3,30 @@
 
 //! Query planner for LSM scanner.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion::common::DFSchema;
+use datafusion::execution::context::ExecutionProps;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
+use datafusion_physical_expr::create_physical_expr;
 use lance_core::Result;
+use lance_core::is_system_column;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
+use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
+use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::exec::{
+    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN, ReconcileExec,
+};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -45,6 +54,10 @@ pub struct LsmScanPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which is what resolves a
+    /// generation's columns to the table's. Supplied by the caller rather than
+    /// read off whichever source happens to be present.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -55,17 +68,117 @@ pub struct LsmScanPlanner {
     warmer: Option<Arc<dyn SsTableWarmer>>,
 }
 
+/// Apply `expr` above a source that has been reconciled, for a generation whose
+/// stored names the predicate could not be run against directly.
+fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let df_schema = DFSchema::try_from(schema.as_ref().clone())
+        .map_err(|e| lance_core::Error::internal(format!("filter schema: {e}")))?;
+    let props = ExecutionProps::new();
+    let physical = create_physical_expr(expr, &df_schema, &props)
+        .map_err(|e| lance_core::Error::internal(format!("plan filter `{expr}`: {e}")))?;
+    Ok(Arc::new(FilterExec::try_new(physical, plan).map_err(
+        |e| lance_core::Error::internal(format!("filter: {e}")),
+    )?))
+}
+
+/// What the table calls each of this generation's stored columns, keyed by the
+/// stored name.
+///
+/// Matched by field id, which a rename keeps. A stored column whose id the
+/// table no longer declares is absent from the result: the table has dropped
+/// it, and reading it would answer with data the table no longer has.
+pub(super) fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
+    eprintln!(
+        "DBG stored={:?} table={:?}",
+        stored
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), field_id_of(f)))
+            .collect::<Vec<_>>(),
+        table
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), field_id_of(f)))
+            .collect::<Vec<_>>()
+    );
+    let by_id: HashMap<i32, &str> = table
+        .fields()
+        .iter()
+        .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
+        .collect();
+    // A caller that supplies no ids leaves only names to match on.
+    if by_id.is_empty() {
+        return stored
+            .fields()
+            .iter()
+            .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
+            .filter(|f| table.field_with_name(f.name()).is_ok())
+            .map(|f| (f.name().clone(), f.name().clone()))
+            .collect();
+    }
+    stored
+        .fields()
+        .iter()
+        // A generation's own columns are numbered in its own schema, so their
+        // ids collide with whatever the table gave those numbers. They are not
+        // the table's columns and are never resolved to one.
+        .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
+        .filter_map(|f| {
+            let id = field_id_of(f)?;
+            by_id
+                .get(&id)
+                .map(|name| (f.name().clone(), name.to_string()))
+        })
+        .collect()
+}
+
+/// `schema` with each field carrying the id `stored` gives the same name.
+///
+/// A scan's output schema is built from the dataset and carries no ids, so they
+/// are put back before identity is resolved against it.
+fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
+    fn restore(field: &Field, among: &Fields) -> Field {
+        let Some(source) = among.iter().find(|f| f.name() == field.name()) else {
+            return field.clone();
+        };
+        let mut metadata = field.metadata().clone();
+        metadata.extend(source.metadata().clone());
+        let field = field.clone().with_metadata(metadata);
+        // A struct's children carry their own ids, and a child can be renamed
+        // while its parent's name does not move.
+        match (field.data_type(), source.data_type()) {
+            (DataType::Struct(children), DataType::Struct(source_children)) => {
+                let children: Vec<Field> = children
+                    .iter()
+                    .map(|child| restore(child, source_children))
+                    .collect();
+                field.with_data_type(DataType::Struct(children.into()))
+            }
+            _ => field,
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| restore(field, stored.fields()))
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
 impl LsmScanPlanner {
     /// Create a new planner.
     pub fn new(
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
+        identity_schema: SchemaRef,
     ) -> Self {
         Self {
             collector,
             pk_columns,
             base_schema,
+            identity_schema,
             session: None,
             store_params: None,
             sstable_cache: None,
@@ -228,12 +341,39 @@ impl LsmScanPlanner {
                 scan
             };
 
-            source_plans.push(plan);
+            source_plans.push((plan, is_base));
         }
+
+        // Every arm has to agree before the union: a generation is written under
+        // the schema the shard held when it was sealed, so one sealed before a
+        // column was added does not carry it. `UnionExec` requires schema
+        // equality and does not reconcile.
+        //
+        // The base arm is the authority when it is here -- it is the only source
+        // the schema change was applied to. Otherwise the newest generation is,
+        // and sources arrive generation-DESC, so it is the first of them.
+        let target = source_plans
+            .iter()
+            .find(|(_, is_base)| *is_base)
+            .or_else(|| source_plans.first())
+            .map(|(plan, _)| plan.schema());
+        let mut source_plans = match target {
+            Some(target) => source_plans
+                .into_iter()
+                .map(|(plan, _)| {
+                    if plan.schema() == target {
+                        Ok(plan)
+                    } else {
+                        project_to_canonical(plan, &target)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
         // Union, then coalesce into a single partition (UnionExec emits one
         // per arm; downstream consumers only read partition 0).
-        let mut plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
+        let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
             #[allow(deprecated)]
@@ -243,7 +383,7 @@ impl LsmScanPlanner {
 
         // Project to the canonical output schema, dropping `_rowaddr` /
         // `_memtable_gen` unless the caller opted in.
-        plan = project_to_canonical(
+        let mut plan = project_to_canonical(
             plan,
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
@@ -289,6 +429,33 @@ impl LsmScanPlanner {
     }
 
     /// Build scan plan for a single data source.
+    /// What one generation's scan should produce once reconciled: the columns
+    /// this query needs, named as the table names them, plus the ones the
+    /// generation carries of its own.
+    ///
+    /// The same for every generation, and taken from the table rather than from
+    /// whichever source the collector ordered first.
+    fn generation_target(
+        &self,
+        wanted: &[String],
+        source: &Schema,
+        names: &HashMap<String, String>,
+    ) -> SchemaRef {
+        let mut fields: Vec<Field> = wanted
+            .iter()
+            .filter_map(|name| self.identity_schema.field_with_name(name).ok().cloned())
+            .collect();
+        // A generation's own columns are not the table's, so they pass through
+        // as the generation has them.
+        for field in source.fields() {
+            let is_the_tables = names.contains_key(field.name());
+            if !is_the_tables && fields.iter().all(|f| f.name() != field.name()) {
+                fields.push(field.as_ref().clone());
+            }
+        }
+        Arc::new(Schema::new(fields))
+    }
+
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
@@ -332,9 +499,41 @@ impl LsmScanPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
 
-                let cols =
+                // What the table calls each of this generation's columns, by
+                // field id: a rename changes the name and keeps the id.
+                let stored = arrow_schema_with_field_ids(dataset.schema());
+                let names = stored_names(&stored, &self.identity_schema);
+
+                // Asked of this generation under its own names, so an older
+                // file is only asked for columns it has. A column it never had
+                // is filled in after the scan.
+                let mut wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // A predicate this generation cannot answer as written runs
+                // after reconciliation, reading its columns from this scan --
+                // so they have to be in it whether the caller asked or not.
+                let answerable = filter.is_none_or(|expr| {
+                    expr.column_refs()
+                        .iter()
+                        .all(|c| names.get(c.name.as_str()) == Some(&c.name))
+                });
+                if let Some(expr) = filter.filter(|_| !answerable) {
+                    for column in expr.column_refs() {
+                        if !wanted.contains(&column.name) {
+                            wanted.push(column.name.clone());
+                        }
+                    }
+                }
+                let cols: Vec<&str> = wanted
+                    .iter()
+                    .filter_map(|name| {
+                        names
+                            .iter()
+                            .find(|(_, table_name)| *table_name == name)
+                            .map(|(stored_name, _)| stored_name.as_str())
+                    })
+                    .collect();
+                scanner.project(&cols)?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
@@ -342,24 +541,36 @@ impl LsmScanPlanner {
                 // The older real row a tombstone supersedes is dropped by the
                 // cross-gen block-list, not by this filter. Gen written before
                 // deletes existed lack the column → no fold, nothing to drop.
+                let caller_filter = if answerable { filter } else { None };
                 let folded;
                 let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(filter);
+                    folded = fold_not_tombstone(caller_filter);
                     Some(&folded)
                 } else {
-                    filter
+                    caller_filter
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
-                // Per-source limit pushdown: SSTables are
-                // within-gen live (dedup-on-flush deletion vectors), so any
-                // `fetch` post-filter rows are valid contributions.
-                if let Some(fetch) = fetch {
+                // A limit under a filter that has not run would cut rows the
+                // filter never saw.
+                if let Some(fetch) = fetch.filter(|_| answerable) {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
-                scanner.create_plan().await
+                let scan = scanner.create_plan().await?;
+                // Planned against what the scan actually produces, which is the
+                // projection plus `_rowaddr`, and carrying the ids the dataset
+                // gives those columns.
+                let source = with_ids_from(&scan.schema(), &stored);
+                let target = self.generation_target(&wanted, &source, &names);
+                let plan = Plan::resolve(&source, &target, &self.pk_columns)?;
+                let reconciled: Arc<dyn ExecutionPlan> =
+                    Arc::new(ReconcileExec::new(scan, Arc::new(plan)));
+                match filter {
+                    Some(expr) if !answerable => filter_above(reconciled, expr),
+                    _ => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
