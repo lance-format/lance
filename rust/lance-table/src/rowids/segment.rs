@@ -265,8 +265,7 @@ impl U64Segment {
         match self {
             Self::Range(range) => (range.end - range.start) as usize,
             Self::RangeWithHoles { range, holes } => {
-                let holes = holes.iter().count();
-                (range.end - range.start) as usize - holes
+                (range.end - range.start) as usize - holes.len()
             }
             Self::RangeWithBitmap { range, bitmap } => {
                 let holes = bitmap.count_zeros();
