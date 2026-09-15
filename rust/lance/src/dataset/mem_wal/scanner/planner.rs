@@ -573,6 +573,126 @@ mod tests {
     use super::*;
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
 
+    /// A lance field, as a generation's schema records it.
+    fn lance_field(name: &str, id: i32, children: Vec<LanceField>) -> LanceField {
+        let arrow = if children.is_empty() {
+            Field::new(name, DataType::Int64, true)
+        } else {
+            Field::new(
+                name,
+                DataType::Struct(
+                    children
+                        .iter()
+                        .map(|c| Field::new(&c.name, DataType::Int64, true))
+                        .collect(),
+                ),
+                true,
+            )
+        };
+        let mut field = LanceField::try_from(&arrow).expect("lance field");
+        field.set_id(-1, &mut (id - 1).clone());
+        field.id = id;
+        for (child, source) in field.children.iter_mut().zip(children.iter()) {
+            child.id = source.id;
+        }
+        field
+    }
+
+    fn names(pairs: &[(i32, &str)]) -> HashMap<i32, String> {
+        pairs.iter().map(|(id, n)| (*id, n.to_string())).collect()
+    }
+
+    fn rename_one(
+        field: &Field,
+        generation: &[LanceField],
+        base: &HashMap<i32, String>,
+        taken: &[&str],
+    ) -> (Field, bool) {
+        let taken: HashSet<&str> = taken.iter().copied().collect();
+        let mut renamed = false;
+        let out = rename_field(field, generation, base, &taken, &mut renamed);
+        (out, renamed)
+    }
+
+    #[test]
+    fn a_column_takes_the_name_base_now_gives_its_id() {
+        let generation = vec![lance_field("value", 1, vec![])];
+        let base = names(&[(1, "amount")]);
+        let field = Field::new("value", DataType::Int64, true);
+        let (out, renamed) = rename_one(&field, &generation, &base, &["id", "value"]);
+        assert_eq!(out.name(), "amount");
+        assert!(renamed);
+    }
+
+    #[test]
+    fn a_column_base_no_longer_declares_keeps_its_name() {
+        // A retype gives the column a new id, so its old id is absent from base.
+        let generation = vec![lance_field("value", 1, vec![])];
+        let base = names(&[(2, "value")]);
+        let field = Field::new("value", DataType::Int64, true);
+        let (out, renamed) = rename_one(&field, &generation, &base, &["value"]);
+        assert_eq!(out.name(), "value");
+        assert!(!renamed);
+    }
+
+    #[test]
+    fn a_tombstone_is_never_renamed_onto_a_base_name() {
+        // `_tombstone` is numbered in the generation's own schema, so its id
+        // collides with whatever base gave that id. Renaming it would carry a
+        // tombstone in under a user column's name.
+        let generation = vec![lance_field(TOMBSTONE, 2, vec![])];
+        let base = names(&[(2, "extra")]);
+        let field = Field::new(TOMBSTONE, DataType::Boolean, false);
+        let (out, renamed) = rename_one(&field, &generation, &base, &[TOMBSTONE]);
+        assert_eq!(out.name(), TOMBSTONE);
+        assert!(!renamed, "a tombstone must keep its own name");
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_the_arm_already_carries_is_skipped() {
+        let generation = vec![
+            lance_field("value", 1, vec![]),
+            lance_field("other", 2, vec![]),
+        ];
+        let base = names(&[(1, "other")]);
+        let field = Field::new("value", DataType::Int64, true);
+        let (out, renamed) = rename_one(&field, &generation, &base, &["value", "other"]);
+        assert_eq!(out.name(), "value", "renaming would collide with `other`");
+        assert!(!renamed);
+    }
+
+    #[test]
+    fn a_renamed_struct_child_is_matched_by_its_own_id() {
+        let generation = vec![lance_field("info", 1, vec![lance_field("c", 2, vec![])])];
+        let base = names(&[(1, "info"), (2, "d")]);
+        let field = Field::new(
+            "info",
+            DataType::Struct(vec![Field::new("c", DataType::Int64, true)].into()),
+            true,
+        );
+        let (out, renamed) = rename_one(&field, &generation, &base, &["id", "info"]);
+        assert!(renamed);
+        let DataType::Struct(children) = out.data_type() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(
+            children[0].name(),
+            "d",
+            "the child takes base's name for its id"
+        );
+        assert_eq!(out.name(), "info", "the parent's name has not moved");
+    }
+
+    #[test]
+    fn a_column_the_generation_does_not_declare_is_left_alone() {
+        let generation = vec![lance_field("value", 1, vec![])];
+        let base = names(&[(1, "amount")]);
+        let field = Field::new("_rowaddr", DataType::UInt64, true);
+        let (out, renamed) = rename_one(&field, &generation, &base, &["_rowaddr"]);
+        assert_eq!(out.name(), "_rowaddr");
+        assert!(!renamed);
+    }
+
     fn create_test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
