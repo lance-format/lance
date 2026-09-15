@@ -134,6 +134,7 @@ message Manifest {
    *   exact versions. Readers and writers must use each DataFile's version
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
+   * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
    */
   uint64 reader_feature_flags = 9;
 
