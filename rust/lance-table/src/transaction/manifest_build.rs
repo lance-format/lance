@@ -573,7 +573,10 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        *f = (*updated).clone();
+                        // A Delete only changes deletion files. Keep the current
+                        // fragment so a rebase cannot undo a concurrent Project
+                        // that pruned data files from the staged post-image.
+                        f.deletion_file = updated.deletion_file.clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -600,6 +603,10 @@ impl Transaction {
                 for fragment in updated_fragments {
                     updated_by_id.entry(fragment.id).or_insert(fragment);
                 }
+                let live_field_ids = schema
+                    .fields_pre_order()
+                    .map(|field| field.id)
+                    .collect::<HashSet<_>>();
                 let updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
@@ -614,6 +621,15 @@ impl Transaction {
                             // fields it rewrote, since the fresh base values
                             // supersede them.
                             updated.overlays = f.overlays.clone();
+                            // A concurrent Project may have pruned files from the
+                            // current fragment after this post-image was staged.
+                            // Match Project's rule: retain a file if any field in
+                            // it remains live, including mixed live/dropped files.
+                            updated.files.retain(|file| {
+                                file.fields
+                                    .iter()
+                                    .any(|field_id| live_field_ids.contains(field_id))
+                            });
                             if matches!(update_mode, Some(RewriteColumns)) {
                                 crate::format::overlay::tombstone_overlay_fields(
                                     &mut updated.overlays,
@@ -704,6 +720,14 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                // New fragments were staged against the same pre-Project schema.
+                for fragment in &mut new_fragments {
+                    fragment.files.retain(|file| {
+                        file.fields
+                            .iter()
+                            .any(|field_id| live_field_ids.contains(field_id))
+                    });
+                }
 
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
@@ -1729,12 +1753,84 @@ mod tests {
         assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
     }
 
-    #[test]
-    fn test_delete_build_manifest_replaces_and_removes_fragments() {
-        let manifest = sample_manifest_with_fragments(0..5);
+    #[rstest::rstest]
+    #[case::unspecified(None)]
+    #[case::rewrite_rows(Some(UpdateMode::RewriteRows))]
+    #[case::rewrite_columns(Some(UpdateMode::RewriteColumns))]
+    fn test_update_build_manifest_does_not_restore_projected_files(
+        #[case] update_mode: Option<UpdateMode>,
+    ) {
+        let mut manifest = sample_manifest_with_fragments(0..3);
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        Arc::make_mut(&mut manifest.fragments)[1].files = vec![projected_file.clone()];
 
-        let mut updated2 = Fragment::new(2);
-        updated2.physical_rows = Some(42);
+        // Model an update staged before a projection removed field 1's file.
+        let mut updated = manifest.fragments[1].clone();
+        updated.files.push(DataFile::new_legacy_from_fields(
+            "dropped.lance",
+            vec![1],
+            None,
+        ));
+        updated.physical_rows = Some(42);
+        let inserted_projected_file =
+            DataFile::new_legacy_from_fields("inserted-projected.lance", vec![0], None);
+        let mut inserted = Fragment::new(0);
+        inserted.files = vec![
+            inserted_projected_file.clone(),
+            DataFile::new_legacy_from_fields("inserted-dropped.lance", vec![1], None),
+        ];
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated],
+                new_fragments: vec![inserted],
+                fields_modified: vec![1],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment = &new_manifest.fragments[1];
+        assert_eq!(fragment.files, vec![projected_file]);
+        assert_eq!(fragment.physical_rows, Some(42));
+        assert_eq!(
+            new_manifest.fragments[3].files,
+            vec![inserted_projected_file]
+        );
+        assert_eq!(new_manifest.max_field_id(), 0);
+    }
+
+    #[test]
+    fn test_delete_build_manifest_updates_deletion_file_and_removes_fragments() {
+        let mut manifest = sample_manifest_with_fragments(0..5);
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        Arc::make_mut(&mut manifest.fragments)[2].files = vec![projected_file.clone()];
+
+        // Model a delete staged before a projection removed field 1's file.
+        let mut updated2 = manifest.fragments[2].clone();
+        updated2.files.push(DataFile::new_legacy_from_fields(
+            "dropped.lance",
+            vec![1],
+            None,
+        ));
+        let deletion_file = crate::format::DeletionFile {
+            read_version: manifest.version,
+            id: 0,
+            file_type: crate::format::DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        updated2.deletion_file = Some(deletion_file.clone());
 
         let transaction = Transaction::new(
             manifest.version,
@@ -1752,12 +1848,14 @@ mod tests {
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![0, 2, 4]);
-        let rows: Vec<Option<usize>> = new_manifest
+        let fragment2 = new_manifest
             .fragments
             .iter()
-            .map(|f| f.physical_rows)
-            .collect();
-        assert_eq!(rows, vec![None, Some(42), None]);
+            .find(|fragment| fragment.id == 2)
+            .unwrap();
+        assert_eq!(fragment2.files, vec![projected_file]);
+        assert_eq!(fragment2.deletion_file, Some(deletion_file));
+        assert_eq!(new_manifest.max_field_id(), 0);
     }
 
     #[test]
