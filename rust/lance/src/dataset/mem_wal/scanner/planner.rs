@@ -13,6 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
 use lance_core::Result;
 use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
+use lance_core::is_system_column;
 use tracing::instrument;
 
 use crate::dataset::mem_wal::TOMBSTONE;
@@ -95,8 +96,9 @@ fn rename_field(
     let Some(source) = generation_fields.iter().find(|f| f.name == *field.name()) else {
         return field.as_ref().clone();
     };
-    let rename = base_names
-        .get(&source.id)
+    let rename = (field.name() != TOMBSTONE && !is_system_column(field.name()))
+        .then(|| base_names.get(&source.id))
+        .flatten()
         .filter(|n| *n != field.name())
         .filter(|n| !taken.contains(n.as_str()));
     let field = match rename {
@@ -124,10 +126,10 @@ fn rename_field(
 /// keep their own names when there is no base arm to agree with.
 ///
 /// A column the base table does not declare -- `_tombstone`, `_rowaddr` -- is
-/// never renamed onto a base name: it exists only in a generation, so its id is
-/// drawn from the generation's own numbering and can collide with the id base
-/// gave an unrelated column. A rename onto a name the arm already carries is
-/// skipped for the same reason.
+/// never renamed: it exists only in a generation, so its id is drawn from the
+/// generation's own numbering and collides with whatever base gave that id,
+/// which would carry a tombstone in under a user column's name. A rename onto
+/// a name the arm already carries is skipped for the same reason.
 fn relabel_to_base_names(
     plan: Arc<dyn ExecutionPlan>,
     generation_schema: &LanceSchema,
