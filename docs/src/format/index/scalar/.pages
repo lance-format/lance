@@ -7,5 +7,6 @@ nav:
   - Bloom Filter: bloom_filter.md
   - Full Text Search: fts.md
   - N-gram: ngram.md
+  - MinHash LSH (experimental): minhash_lsh.md
   - FM-Index: fmindex.md
   - RTree: rtree.md
