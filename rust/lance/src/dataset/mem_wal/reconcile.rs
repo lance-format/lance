@@ -21,7 +21,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, StructArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, RecordBatch, RecordBatchOptions,
+    StructArray,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use lance_core::{Error, Result};
@@ -51,6 +54,18 @@ pub(crate) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
             DataType::Struct(children) => {
                 let children: Vec<ArrowField> = children.iter().map(|c| strip(c)).collect();
                 field.with_data_type(DataType::Struct(children.into()))
+            }
+            DataType::List(element) => field
+                .clone()
+                .with_data_type(DataType::List(Arc::new(strip(element)))),
+            DataType::LargeList(element) => field
+                .clone()
+                .with_data_type(DataType::LargeList(Arc::new(strip(element)))),
+            DataType::FixedSizeList(element, size) => {
+                let size = *size;
+                field
+                    .clone()
+                    .with_data_type(DataType::FixedSizeList(Arc::new(strip(element)), size))
             }
             _ => field,
         }
@@ -208,6 +223,17 @@ fn resolve_field(
     };
 
     let source = &source_fields[index];
+    // A nested column's children are part of the array's own type, metadata
+    // included, so the array is rebuilt under the target's children even when
+    // nothing about them moved -- otherwise the batch disagrees with the schema
+    // it is built under. The leaves are reused, so it costs a pointer copy.
+    if is_nested(field.data_type()) {
+        return Ok(Source::Nested(
+            index,
+            resolve_children(source, field)?,
+            field.data_type().clone(),
+        ));
+    }
     if source.data_type() == field.data_type() {
         return Ok(Source::Take(index));
     }
@@ -225,20 +251,54 @@ fn resolve_field(
             field.data_type()
         )));
     }
-    // A struct whose children were renamed keeps the parent's name and id, so
-    // only the children differ. Resolve them the same way rather than casting,
-    // which Arrow matches by name.
-    if let (DataType::Struct(source_children), DataType::Struct(target_children)) =
-        (source.data_type(), field.data_type())
-    {
-        let claimed = claimed_children(source_children, target_children);
-        let children = target_children
-            .iter()
-            .map(|child| resolve_field(child, source_children, &claimed, &[]))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Source::Nested(index, children, field.data_type().clone()));
+    unreachable!("a struct is resolved above and any other mismatch is rejected")
+}
+
+/// Whether this type carries its children inside its own type, so an array of
+/// it has to be rebuilt rather than taken as it stands.
+fn is_nested(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+    )
+}
+
+/// The child fields of a nested type, if it has them.
+fn children_of(data_type: &DataType) -> Option<arrow_schema::Fields> {
+    match data_type {
+        DataType::Struct(children) => Some(children.clone()),
+        // A list has exactly one child: its element. Its name is part of the
+        // type, so it is resolved like any other.
+        DataType::List(element) | DataType::LargeList(element) => {
+            Some(vec![element.as_ref().clone()].into())
+        }
+        DataType::FixedSizeList(element, _) => Some(vec![element.as_ref().clone()].into()),
+        _ => None,
     }
-    unreachable!("a non-struct type mismatch is rejected above")
+}
+
+/// How each of `field`'s children is produced from `source`'s.
+fn resolve_children(source: &ArrowField, field: &ArrowField) -> Result<Vec<Source>> {
+    let (Some(source_children), Some(target_children)) = (
+        children_of(source.data_type()),
+        children_of(field.data_type()),
+    ) else {
+        return Err(Error::invalid_input(format!(
+            "column `{}` is stored as {} and the schema declares {}; a column's type \
+             cannot change on a table with a MemWAL",
+            field.name(),
+            source.data_type(),
+            field.data_type()
+        )));
+    };
+    let claimed = claimed_children(&source_children, &target_children);
+    target_children
+        .iter()
+        .map(|child| resolve_field(child, &source_children, &claimed, &[]))
+        .collect()
 }
 
 fn claimed_children(source: &arrow_schema::Fields, target: &arrow_schema::Fields) -> Vec<bool> {
@@ -259,9 +319,65 @@ fn claimed_children(source: &arrow_schema::Fields, target: &arrow_schema::Fields
 fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -> Result<ArrayRef> {
     match source {
         Source::Take(i) => Ok(Arc::clone(&columns[*i])),
+        // A list is rebuilt around its element: the offsets and the validity
+        // say which rows hold what, and only the element's own type moves.
+        Source::Nested(i, children, to @ (DataType::List(_) | DataType::LargeList(_))) => {
+            let list = columns[*i]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::invalid_input(format!("column `{name}` is not a list")))?;
+            let Some(element) = children_of(to).and_then(|c| c.first().cloned()) else {
+                unreachable!("a list target has an element");
+            };
+            let child = take_column(
+                &children[0],
+                std::slice::from_ref(list.values()),
+                list.values().len(),
+                element.name(),
+            )?;
+            Ok(Arc::new(
+                ListArray::try_new(
+                    element,
+                    list.offsets().clone(),
+                    child,
+                    list.nulls().cloned(),
+                )
+                .map_err(|e| Error::invalid_input(format!("rebuild list column `{name}`: {e}")))?,
+            ))
+        }
+        // A fixed-size list is rebuilt the same way, keeping its width.
+        Source::Nested(i, children, to @ DataType::FixedSizeList(_, _)) => {
+            let DataType::FixedSizeList(_, size) = to else {
+                unreachable!("matched above");
+            };
+            let list = columns[*i]
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("column `{name}` is not a fixed-size list"))
+                })?;
+            let Some(element) = children_of(to).and_then(|c| c.first().cloned()) else {
+                unreachable!("a fixed-size list target has an element");
+            };
+            let child = take_column(
+                &children[0],
+                std::slice::from_ref(list.values()),
+                list.values().len(),
+                element.name(),
+            )?;
+            Ok(Arc::new(
+                FixedSizeListArray::try_new(element, *size, child, list.nulls().cloned()).map_err(
+                    |e| {
+                        Error::invalid_input(format!(
+                            "rebuild fixed-size list column `{name}`: {e}"
+                        ))
+                    },
+                )?,
+            ))
+        }
         Source::Nested(i, children, to) => {
             let DataType::Struct(target_children) = to else {
-                unreachable!("Nested is only built for a struct target");
+                unreachable!("Nested is only built for a struct or list target");
             };
             let struct_array = columns[*i]
                 .as_any()

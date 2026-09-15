@@ -415,6 +415,9 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -437,11 +440,13 @@ impl LsmFtsSearchPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
+        identity_schema: SchemaRef,
     ) -> Self {
         Self {
             collector,
             pk_columns,
             base_schema,
+            identity_schema,
             session: None,
             store_params: None,
             sstable_cache: None,
@@ -911,7 +916,7 @@ impl LsmFtsSearchPlanner {
                 // Asked of this generation under its own names: a rename moved
                 // the table's name while the file still holds the old one.
                 let stored = arrow_schema_with_field_ids(dataset.schema());
-                let names = stored_names(&stored, &self.base_schema);
+                let names = stored_names(&stored, &self.identity_schema);
                 let wanted = self.fts_scanner_projection(projection);
                 let cols: Vec<&str> = wanted
                     .iter()

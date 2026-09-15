@@ -82,6 +82,15 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
     )?))
 }
 
+/// Whether a column of this type is rebuilt rather than taken as it stands.
+///
+/// A struct's children are part of its own type, so the array is rebuilt under
+/// the table's children -- which means the values a predicate would see here
+/// are not the ones it will see after reconciliation.
+fn is_reconstructed(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Struct(_))
+}
+
 /// What the table calls each of this generation's stored columns, keyed by the
 /// stored name.
 ///
@@ -89,19 +98,6 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
 /// table no longer declares is absent from the result: the table has dropped
 /// it, and reading it would answer with data the table no longer has.
 pub(super) fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
-    eprintln!(
-        "DBG stored={:?} table={:?}",
-        stored
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), field_id_of(f)))
-            .collect::<Vec<_>>(),
-        table
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), field_id_of(f)))
-            .collect::<Vec<_>>()
-    );
     let by_id: HashMap<i32, &str> = table
         .fields()
         .iter()
@@ -147,13 +143,35 @@ fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
         let field = field.clone().with_metadata(metadata);
         // A struct's children carry their own ids, and a child can be renamed
         // while its parent's name does not move.
-        match (field.data_type(), source.data_type()) {
+        let data_type = field.data_type().clone();
+        match (&data_type, source.data_type()) {
             (DataType::Struct(children), DataType::Struct(source_children)) => {
                 let children: Vec<Field> = children
                     .iter()
                     .map(|child| restore(child, source_children))
                     .collect();
                 field.with_data_type(DataType::Struct(children.into()))
+            }
+            // A list's element is a field with an id of its own, and so are its
+            // children in turn.
+            (DataType::List(element), DataType::List(source_element)) => {
+                let one: Fields = vec![source_element.as_ref().clone()].into();
+                field.with_data_type(DataType::List(Arc::new(restore(element, &one))))
+            }
+            (DataType::LargeList(element), DataType::LargeList(source_element)) => {
+                let one: Fields = vec![source_element.as_ref().clone()].into();
+                field.with_data_type(DataType::LargeList(Arc::new(restore(element, &one))))
+            }
+            (
+                DataType::FixedSizeList(element, size),
+                DataType::FixedSizeList(source_element, _),
+            ) => {
+                let size = *size;
+                let one: Fields = vec![source_element.as_ref().clone()].into();
+                field.with_data_type(DataType::FixedSizeList(
+                    Arc::new(restore(element, &one)),
+                    size,
+                ))
             }
             _ => field,
         }
@@ -512,10 +530,20 @@ impl LsmScanPlanner {
                 // A predicate this generation cannot answer as written runs
                 // after reconciliation, reading its columns from this scan --
                 // so they have to be in it whether the caller asked or not.
+                // A predicate can run here only against columns this generation
+                // stores under the table's own name and shape. A nested column
+                // names its parent in the reference -- `info.a` refers to
+                // `info` -- and the parent's name does not move when a child is
+                // renamed, so a name check alone would push the predicate down
+                // to be evaluated against the child names this generation has.
+                // Anything reconstructed is answered after reconciliation.
                 let answerable = filter.is_none_or(|expr| {
-                    expr.column_refs()
-                        .iter()
-                        .all(|c| names.get(c.name.as_str()) == Some(&c.name))
+                    expr.column_refs().iter().all(|c| {
+                        names.get(c.name.as_str()) == Some(&c.name)
+                            && stored
+                                .field_with_name(&c.name)
+                                .is_ok_and(|f| !is_reconstructed(f.data_type()))
+                    })
                 });
                 if let Some(expr) = filter.filter(|_| !answerable) {
                     for column in expr.column_refs() {

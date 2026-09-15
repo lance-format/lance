@@ -83,6 +83,9 @@ pub struct LsmVectorSearchPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Vector column name.
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
@@ -129,6 +132,7 @@ impl LsmVectorSearchPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
+        identity_schema: SchemaRef,
         vector_column: String,
         distance_type: lance_linalg::distance::DistanceType,
     ) -> Self {
@@ -136,6 +140,7 @@ impl LsmVectorSearchPlanner {
             collector,
             pk_columns,
             base_schema,
+            identity_schema,
             vector_column,
             distance_type,
             dataset: None,
@@ -502,7 +507,7 @@ impl LsmVectorSearchPlanner {
                 // projecting the table's names would ask for a column that is
                 // not there.
                 let stored = arrow_schema_with_field_ids(dataset.schema());
-                let names = stored_names(&stored, &self.base_schema);
+                let names = stored_names(&stored, &self.identity_schema);
                 let wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 let cols: Vec<&str> = wanted

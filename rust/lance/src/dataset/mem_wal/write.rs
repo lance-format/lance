@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use super::reconcile::{Plan, without_field_ids};
 use arc_swap::ArcSwap;
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_null_array};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
@@ -1625,6 +1625,31 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
 ///
 /// A primary key the batch does not carry stays an error — there is no value to
 /// invent.
+/// A batch a caller just handed in, under the storage schema.
+///
+/// Live input is trusted for its values and not for its identity: it has been
+/// validated against the logical schema, so its columns are the right ones in
+/// the right order, and any field ids it carries are the caller's to claim
+/// rather than the table's to honour. Dropping them leaves the columns matched
+/// by name, which is what a validated batch's order already established.
+///
+/// A replayed entry is the opposite: its ids are the table's, written when the
+/// entry was, and they are the only thing that survives a rename.
+fn conform_live_batch(
+    batch: RecordBatch,
+    storage_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
+) -> Result<RecordBatch> {
+    let plain = Arc::new(without_field_ids(batch.schema().as_ref()));
+    let batch = RecordBatch::try_new_with_options(
+        plain,
+        batch.columns().to_vec(),
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| Error::invalid_input(format!("bind a live batch to its own schema: {e}")))?;
+    conform_to_storage_schema(batch, storage_schema, pk_columns)
+}
+
 fn conform_to_storage_schema(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -2665,9 +2690,7 @@ impl ShardWriter {
                 // `_tombstone`.
                 let batches = batches
                     .into_iter()
-                    .map(|b| {
-                        conform_to_storage_schema(b, &writer_state.schema, &writer_state.pk_columns)
-                    })
+                    .map(|b| conform_live_batch(b, &writer_state.schema, &writer_state.pk_columns))
                     .collect::<Result<Vec<_>>>()?;
                 self.put_memtable(batches, state, writer_state, backpressure)
                     .await
@@ -2792,9 +2815,7 @@ impl ShardWriter {
                 // Mirrors `put`.
                 let batches = batches
                     .into_iter()
-                    .map(|b| {
-                        conform_to_storage_schema(b, &writer_state.schema, &writer_state.pk_columns)
-                    })
+                    .map(|b| conform_live_batch(b, &writer_state.schema, &writer_state.pk_columns))
                     .collect::<Result<Vec<_>>>()?;
                 self.put_memtable_no_wait(batches, state, writer_state, backpressure)
                     .await

@@ -592,6 +592,7 @@ impl LsmScanner {
             collector,
             self.pk_columns.clone(),
             base_schema,
+            Arc::clone(&self.identity_schema),
             nearest.column.clone(),
             distance_type,
         )
@@ -660,9 +661,13 @@ impl LsmScanner {
         };
 
         let collector = self.build_collector();
-        let mut planner =
-            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
-                .with_filter(self.filter.clone());
+        let mut planner = super::LsmFtsSearchPlanner::new(
+            collector,
+            self.pk_columns.clone(),
+            base_schema,
+            Arc::clone(&self.identity_schema),
+        )
+        .with_filter(self.filter.clone());
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
