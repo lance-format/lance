@@ -52,8 +52,8 @@ pub use inverted::tokenizer::InvertedIndexParams;
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
 /// `Vec<`[`lance_table::format::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn index_files_to_table(
     files: Vec<lance_index_core::scalar::IndexFile>,
 ) -> Vec<lance_table::format::IndexFile> {
@@ -62,6 +62,7 @@ pub fn index_files_to_table(
         .map(|f| lance_table::format::IndexFile {
             path: f.path,
             size_bytes: f.size_bytes,
+            file_metadata_size_bytes: None,
         })
         .collect()
 }
@@ -69,8 +70,8 @@ pub fn index_files_to_table(
 /// Convert a `Vec<`[`lance_table::format::IndexFile`]`>` to a
 /// `Vec<`[`lance_index_core::scalar::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn table_files_to_index(
     files: Vec<lance_table::format::IndexFile>,
 ) -> Vec<lance_index_core::scalar::IndexFile> {
