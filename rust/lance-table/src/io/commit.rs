@@ -951,6 +951,29 @@ pub trait CommitHandler: Debug + Send + Sync {
         }
     }
 
+    /// Whether `path` is the handler's authoritative location for `version`.
+    ///
+    /// Cleanup uses this to revalidate staging-shaped manifest candidates that
+    /// may not appear in [`Self::list_manifest_locations`]. The default uses
+    /// the handler's version resolver; handlers whose resolver performs repair
+    /// should override this with a read-only authority lookup.
+    async fn is_manifest_path_authoritative(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        object_store: &dyn OSObjectStore,
+    ) -> Result<bool> {
+        match self
+            .resolve_version_location(base_path, version, object_store)
+            .await
+        {
+            Ok(location) => Ok(location.path == *path),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// List detached manifest locations.
     ///
     /// Returns a stream of detached manifest locations in arbitrary order.
