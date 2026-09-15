@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::fragment::FileFragment;
+use super::hash_joiner::HashJoiner;
 use super::{
     Dataset,
     transaction::{Operation, Transaction},
@@ -694,6 +695,13 @@ async fn add_columns_from_stream(
 
                 let new_batch =
                     arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+
+                // Reject nulls the dataset's file format cannot store (e.g. integer
+                // nulls on Legacy), matching the hash-join based merge path, instead
+                // of silently writing them as default values.
+                for column in new_batch.columns() {
+                    HashJoiner::check_lance_support_null(column, updater.dataset())?;
+                }
 
                 updater.update(new_batch).await?;
             }
@@ -4532,5 +4540,62 @@ mod test {
         assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_via_reader_rejects_unsupported_nulls() {
+        // Legacy files cannot store integer nulls: a new column of [1, NULL, 3] must
+        // fail, matching the hash-join based merge path, instead of being silently
+        // written and read back as [1, 0, 3].
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let value_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let values = RecordBatch::try_new(
+            value_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
+        )
+        .unwrap();
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(values)],
+                    value_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {}",
+            err
+        );
     }
 }
