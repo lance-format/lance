@@ -57,7 +57,7 @@ use tokio::{
     sync::{Mutex, OnceCell},
     task::spawn_blocking,
 };
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::documents::{
     DocId, DocLengths, DocVisibility, PartitionDocumentStore, PartitionDocuments,

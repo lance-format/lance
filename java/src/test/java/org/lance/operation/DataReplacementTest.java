@@ -134,6 +134,13 @@ public class DataReplacementTest extends OperationTestBase {
                     new CommitBuilder(initDataset).execute(replaceTxn)) {
                   assertEquals(4, datasetWithAddress.version());
                   assertEquals(rowCount, datasetWithAddress.countRows());
+                  FragmentMetadata fragmentWithOverlay =
+                      datasetWithAddress.getFragments().get(0).metadata();
+                  List<DataFile> referencedFiles = fragmentWithOverlay.getReferencedLanceFiles();
+                  assertEquals(2, referencedFiles.size());
+                  assertEquals(fragmentMetas.get(0).getFiles().get(0), referencedFiles.get(0));
+                  assertEquals(datafile.getPath(), referencedFiles.get(1).getPath());
+                  assertEquals(datafile.getBaseId(), referencedFiles.get(1).getBaseId());
 
                   try (LanceScanner scanner = datasetWithAddress.newScan()) {
                     try (ArrowReader resultReader = scanner.scanBatches()) {

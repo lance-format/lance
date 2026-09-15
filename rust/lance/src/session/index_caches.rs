@@ -14,7 +14,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -97,7 +97,7 @@ pub struct FragReuseIndexKey<'a> {
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
-    type ValueType = FragReuseIndex;
+    type ValueType = CompactFragReuseIndex;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("frag_reuse/{}", self.uuid))
@@ -120,6 +120,7 @@ impl CacheKey for FragReuseIndexKey<'_> {
 pub struct IndexMetadataKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
 }
 
 impl CacheKey for IndexMetadataKey<'_> {
@@ -127,10 +128,11 @@ impl CacheKey for IndexMetadataKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "{}:{}/{}",
+            "{}:{}/{}/{}",
             self.store_identity.len(),
             self.store_identity,
-            self.version
+            self.version,
+            self.e_tag.unwrap_or("")
         ))
     }
 
@@ -149,6 +151,13 @@ impl CacheKey for IndexMetadataKey<'_> {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.store_identity);
         builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -204,10 +213,28 @@ mod tests {
         let first = IndexMetadataKey {
             version: 7,
             store_identity: "s3$first-options",
+            e_tag: Some("manifest-etag"),
         };
         let second = IndexMetadataKey {
             version: 7,
             store_identity: "s3$second-options",
+            e_tag: Some("manifest-etag"),
+        };
+
+        assert_ne!(first.key(), second.key());
+    }
+
+    #[test]
+    fn index_metadata_key_isolates_manifest_generation() {
+        let first = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$options",
+            e_tag: Some("first-etag"),
+        };
+        let second = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$options",
+            e_tag: Some("second-etag"),
         };
 
         assert_ne!(first.key(), second.key());

@@ -250,6 +250,84 @@ async fn load_global_scoring_test_index(
     (tmpdir, cache, index)
 }
 
+fn scored_document_bits(documents: Vec<ScoredDoc>) -> Vec<(u64, u32)> {
+    let mut results = documents
+        .into_iter()
+        .map(|document| (document.row_id, document.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    results
+}
+
+#[tokio::test]
+async fn test_prepared_scorer_reuse_preserves_deferred_and_resident_results() {
+    let (_tmpdir, _cache, index) = load_global_scoring_test_index(true, true).await;
+    let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(Arc::ptr_eq(
+        prepared.reusable_scorer().unwrap(),
+        prepared.scorer()
+    ));
+    let injected_scorer = Arc::new(prepared.scorer().as_ref().clone());
+    let injected_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            Some(injected_scorer.clone()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(Arc::ptr_eq(injected_prepared.scorer(), &injected_scorer));
+    assert!(injected_prepared.reusable_scorer().is_none());
+    assert_eq!(Arc::strong_count(&injected_scorer), 2);
+
+    let mut expected = None;
+    for is_resident in [false, true] {
+        if is_resident {
+            index
+                .prewarm_with_options(&FtsPrewarmOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(index.has_resident_document_projections(), is_resident);
+        for query in [&prepared, &injected_prepared] {
+            let actual = scored_document_bits(
+                index
+                    .bm25_search_prepared_documents(
+                        query.clone(),
+                        params.clone(),
+                        Operator::Or,
+                        Arc::new(NoFilter),
+                        Arc::new(NoOpMetricsCollector),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected, "resident={is_resident}");
+            } else {
+                expected = Some(actual);
+            }
+            assert_eq!(Arc::strong_count(&injected_scorer), 2);
+            assert_eq!(index.has_resident_document_projections(), is_resident);
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_wand_exactness_certificate_support_requires_all_impact_postings() {
     let (_tmpdir, _cache, mixed_impact_index) = load_global_scoring_test_index(true, false).await;

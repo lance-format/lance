@@ -3,12 +3,12 @@ name: Format spec vote gate
 # Structurally enforces the PMC vote required for Lance format-specification
 # changes (see https://lance.org/community/voting/). The path labeler
 # (.github/labeler-area.yml) applies the `format-change` label to PRs that touch
-# the format spec (`protos/**/*.proto`, `docs/src/format/**`); this gate reads
-# that label and blocks merging until the PR has 3 binding +1 votes from PMC
-# members (PR approvals, excluding the author), has no outstanding veto (a PMC
-# "Request changes" review), and the 72-hour voting period has elapsed. That
-# period starts once the PR is labeled and ready for review, and pauses over
-# weekends.
+# the persisted format protos or `docs/src/format/**`; execution-only wire
+# schemas are excluded. This gate reads that label and blocks merging until the
+# PR has 3 binding +1 votes from PMC members (PR approvals, excluding the
+# author), has no outstanding veto (a PMC "Request changes" review), and the
+# 72-hour voting period has elapsed. That period starts once the PR is labeled
+# and ready for review, and pauses over weekends.
 #
 # The gate publishes its verdict as the `format-spec-vote` commit status on the
 # PR head. To make it a merge blocker, an org admin must add `format-spec-vote`

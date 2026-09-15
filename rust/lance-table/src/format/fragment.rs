@@ -527,7 +527,8 @@ impl Fragment {
 
     /// Every Lance-format file this fragment references: the base data files
     /// plus the data file of each overlay. The fragment's other referenced
-    /// files (deletion files, external row-id files) are not in this format.
+    /// files are not in this format: a deletion file is `.arrow` or `.bin`, and
+    /// external row-id or row-version metadata is a raw byte range.
     ///
     /// Prefer this over `files`, which is the base data files only and so omits
     /// overlays.
@@ -652,15 +653,15 @@ impl Fragment {
         // Determine version from first file
         let Some(sample_file) = fragments
             .iter()
-            .find(|f| !f.files.is_empty())
-            .map(|f| &f.files[0])
+            .flat_map(Self::referenced_lance_files)
+            .next()
         else {
             return Ok(None);
         };
         let file_version = sample_file.file_version()?;
         // Ensure all files match
         for frag in fragments {
-            for file in &frag.files {
+            for file in frag.referenced_lance_files() {
                 let this_file_version = file.file_version()?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(format!(
@@ -950,6 +951,23 @@ mod tests {
             Fragment::try_infer_version(&[v2_0.clone(), v2_0_second]).unwrap(),
             Some(ConcreteFileVersion::V2_0)
         );
+
+        let mut mixed_overlay = v2_0.clone();
+        mixed_overlay.overlays.push(DataOverlayFile {
+            data_file: DataFile::new(
+                "overlay-v2_1.lance",
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_1,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+            committed_version: 1,
+        });
+        let error = Fragment::try_infer_version(&[mixed_overlay]).unwrap_err();
+        assert!(error.to_string().contains("2.0"));
+        assert!(error.to_string().contains("2.1"));
 
         let v2_1 = Fragment::new(2).with_file(
             "v2_1.lance",
