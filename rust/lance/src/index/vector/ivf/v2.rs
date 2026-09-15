@@ -218,12 +218,20 @@ const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
 /// A permit is acquired before a partition is loaded and released the moment the
 /// prepared partition is pulled out of the `buffered` window, before it is added
 /// to a scoring chunk or channel. Scoring therefore never holds permits and chunk
-/// assembly never waits on permits held by its own partitions, so no combination
-/// of budget, chunk and channel sizes can deadlock; the chunks stay bounded per
-/// segment search by [`GLOBAL_TOPK_CHUNK_BYTES`] and
-/// [`STREAMING_SEARCH_BATCH_SIZE`]. Segments share the budget dynamically instead
-/// of splitting it up front, so one segment stalled on I/O does not idle the
-/// others' share.
+/// assembly never waits on permits held by its own partitions. Permits are
+/// acquired *sequentially, in probe order, ahead of the window* (`then` before
+/// `buffered`) rather than inside the buffered futures: `buffered` yields in
+/// order, so if later partitions could take permits while an earlier one still
+/// waits, completed later partitions would sit behind the waiting head holding
+/// permits, and several searches in that state would hold the whole budget
+/// with none able to advance (a deadlock reproduced with 8 concurrent
+/// probe-everything searches). With in-order acquisition the permit holders of
+/// a window are always its oldest entries, so every window's head can complete
+/// and be pulled, and no combination of budget, chunk and channel sizes can
+/// deadlock. The chunks stay bounded per segment search by
+/// [`GLOBAL_TOPK_CHUNK_BYTES`] and [`STREAMING_SEARCH_BATCH_SIZE`]. Segments
+/// share the budget dynamically instead of splitting it up front, so one segment
+/// stalled on I/O does not idle the others' share.
 ///
 /// Defaults to twice the CPU count: enough loads in flight to keep the CPU pool
 /// decoding while others wait on I/O, and a single segment search on an idle node
@@ -248,6 +256,15 @@ impl PreparePartitionBudget {
         self.permits.clone().acquire_owned().await.map_err(|_| {
             Error::internal("prepare partition budget semaphore was closed".to_string())
         })
+    }
+
+    /// [`Self::acquire`] for a `then` stage: keeps `item` alongside the permit so
+    /// the loading future receives `(item, permit)` in probe order. A named
+    /// `async fn` rather than an `async` block in the closure, which the compiler
+    /// cannot type as a `then` callback.
+    async fn acquire_for<T>(self: Arc<Self>, item: T) -> (T, Result<OwnedSemaphorePermit>) {
+        let permit = self.acquire().await;
+        (item, permit)
     }
 
     #[cfg(test)]
@@ -2412,33 +2429,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // `buffered` preserves the probe order, so the heap accumulates
             // partitions in the same order as before (which decides which of
             // several rows tied at the k-th distance the capped heap keeps).
-            let mut prepared = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    let raw_query_context = prepare_raw_query_context.clone();
-                    let budget = prepare_budget.clone();
-                    async move {
-                        let permit = budget.acquire().await?;
-                        let prepared = index
-                            .prepare_partition_without_prefilter_wait(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await?;
-                        Ok((permit, prepared))
-                    }
-                })
-                .buffered(prepare_parallelism)
-                .map(release_prepare_permit)
-                .fuse();
+            let mut prepared = Box::pin(
+                stream::iter(start_idx..end_idx)
+                    .then(move |idx| prepare_budget.clone().acquire_for(idx))
+                    .map(move |(idx, permit)| {
+                        let part_id = partitions.value(idx);
+                        let mut query = query.clone();
+                        query.dist_q_c = q_c_dists.value(idx);
+                        let index = prepare_index.clone();
+                        let pre_filter = pre_filter.clone();
+                        let metrics = prepare_metrics.clone();
+                        let raw_query_context = prepare_raw_query_context.clone();
+                        async move {
+                            let permit = permit?;
+                            let prepared = index
+                                .prepare_partition_without_prefilter_wait(
+                                    part_id as usize,
+                                    &query,
+                                    pre_filter,
+                                    metrics.as_ref(),
+                                    raw_query_context,
+                                )
+                                .await?;
+                            Ok((permit, prepared))
+                        }
+                    })
+                    .buffered(prepare_parallelism)
+                    .map(release_prepare_permit)
+                    .fuse(),
+            );
             let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
             let use_query_residual = self.use_query_residual;
@@ -2505,7 +2524,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_raw_query_context = raw_query_context.clone();
         tokio::spawn(async move {
             let prepare_stream = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
+                .then(move |idx| prepare_budget.clone().acquire_for(idx))
+                .map(move |(idx, permit)| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
@@ -2513,9 +2533,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
-                    let budget = prepare_budget.clone();
                     async move {
-                        let permit = budget.acquire().await?;
+                        let permit = permit?;
                         let prepared = index
                             .prepare_partition(
                                 part_id as usize,
@@ -2784,22 +2803,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_index = self.clone();
         let load_metrics = metrics.clone();
         let load_budget = self.prepare_budget.load_full();
-        let mut loaded_chunks = stream::iter(assignment_list)
-            .map(move |(part_id, probing_queries)| {
-                let index = load_index.clone();
-                let metrics = load_metrics.clone();
-                let budget = load_budget.clone();
-                async move {
-                    let permit = budget.acquire().await?;
-                    let part_entry = index
-                        .load_partition(part_id as usize, true, metrics.as_ref())
-                        .await?;
-                    Result::Ok((permit, (part_id as usize, part_entry, probing_queries)))
-                }
-            })
-            .buffered(load_parallelism)
-            .map(release_prepare_permit)
-            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+        let mut loaded_chunks = Box::pin(
+            stream::iter(assignment_list)
+                .then(move |assignment| load_budget.clone().acquire_for(assignment))
+                .map(move |((part_id, probing_queries), permit)| {
+                    let index = load_index.clone();
+                    let metrics = load_metrics.clone();
+                    async move {
+                        let permit = permit?;
+                        let part_entry = index
+                            .load_partition(part_id as usize, true, metrics.as_ref())
+                            .await?;
+                        Result::Ok((permit, (part_id as usize, part_entry, probing_queries)))
+                    }
+                })
+                .buffered(load_parallelism)
+                .map(release_prepare_permit)
+                .chunks(*STREAMING_SEARCH_BATCH_SIZE),
+        );
 
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
@@ -7061,6 +7082,24 @@ mod tests {
         assert_eq!(sorted_row_ids(&first), expected[0]);
         assert_eq!(sorted_row_ids(&second), expected[1]);
         assert_eq!(budget.available(), 1);
+
+        // Many searches contending for a budget smaller than one search's
+        // prepare window: every stream's head must always be able to make
+        // progress, so this must not deadlock.
+        let contended = Arc::new(super::PreparePartitionBudget::new(4));
+        ivf_index.set_prepare_budget(contended.clone());
+        let searches = (0..8).map(|i| global_search(i % 2, None));
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            futures::future::join_all(searches),
+        )
+        .await
+        .expect("8 concurrent searches under a budget of 4 partitions deadlocked");
+        for (i, batches) in all.iter().enumerate() {
+            assert_eq!(sorted_row_ids(batches), expected[i % 2]);
+        }
+        assert_eq!(contended.available(), 4);
+        ivf_index.set_prepare_budget(budget.clone());
 
         // Streaming path (an early-stop control that never stops): every probed
         // partition contributes a batch.
