@@ -35,23 +35,12 @@ fn validate_packed_array_length(array_type: &str, byte_len: usize, width: usize)
     Ok(())
 }
 
-fn first_descending_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
-    match array {
-        EncodedU64Array::U16 { offsets, .. } => offsets
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
-        EncodedU64Array::U32 { offsets, .. } => offsets
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
-        EncodedU64Array::U64(values) => values
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, values[index], values[index + 1])),
-    }
-}
-
+/// Find the first pair of neighbours that is not strictly increasing.
+///
+/// Both `RangeWithHoles` holes and `SortedArray` values are documented as
+/// strictly increasing, so equal neighbours are as corrupt as descending ones:
+/// `SegmentStats::n_holes` derives the hole count by subtracting the value
+/// count from the slot span, which underflows once a value is repeated.
 fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
     let mut values = array.iter();
     let previous = values.next()?;
@@ -151,9 +140,9 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             }
             Some(SortedArray(array)) => {
                 let array = EncodedU64Array::try_from(array)?;
-                if let Some((index, previous, next)) = first_descending_pair(&array) {
+                if let Some((index, previous, next)) = first_non_increasing_pair(&array) {
                     return Err(corrupt_row_id_metadata(format!(
-                        "SortedArray values are not sorted at indices {index} and {}: {previous} exceeds {next}",
+                        "SortedArray values are not strictly increasing at indices {index} and {}: {previous} is not less than {next}",
                         index + 1
                     )));
                 }
@@ -668,27 +657,44 @@ mod test {
     }
 
     #[rstest]
-    #[case::u16(pb::encoded_u64_array::Array::U16Array(
+    #[case::u16_descending(pb::encoded_u64_array::Array::U16Array(
         pb::encoded_u64_array::U16Array {
             base: 100,
             offsets: vec![2, 0, 1, 0],
         }
     ))]
-    #[case::u32(pb::encoded_u64_array::Array::U32Array(
+    #[case::u32_descending(pb::encoded_u64_array::Array::U32Array(
         pb::encoded_u64_array::U32Array {
             base: 100,
             offsets: vec![2, 0, 0, 0, 1, 0, 0, 0],
         }
     ))]
-    #[case::u64(pb::encoded_u64_array::Array::U64Array(
+    #[case::u64_descending(pb::encoded_u64_array::Array::U64Array(
         pb::encoded_u64_array::U64Array {
             values: vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        }
+    ))]
+    #[case::u16_duplicate(pb::encoded_u64_array::Array::U16Array(
+        pb::encoded_u64_array::U16Array {
+            base: 100,
+            offsets: vec![5, 0, 5, 0],
+        }
+    ))]
+    #[case::u32_duplicate(pb::encoded_u64_array::Array::U32Array(
+        pb::encoded_u64_array::U32Array {
+            base: 100,
+            offsets: vec![5, 0, 0, 0, 5, 0, 0, 0],
+        }
+    ))]
+    #[case::u64_duplicate(pb::encoded_u64_array::Array::U64Array(
+        pb::encoded_u64_array::U64Array {
+            values: vec![5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0],
         }
     ))]
     fn test_rejects_unsorted_sorted_array(#[case] array: pb::encoded_u64_array::Array) {
         assert_corrupt_segment(
             pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
-            "SortedArray values are not sorted at indices 0 and 1: 2 exceeds 1",
+            "SortedArray values are not strictly increasing at indices 0 and 1",
         );
     }
 }
