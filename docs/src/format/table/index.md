@@ -193,6 +193,12 @@ versioning, index integration, compaction, and a worked example — see the
 
 ## Related Specifications
 
+### Blob v2
+
+Logical blob inputs, physical descriptors, payload objects, and snapshot ownership.
+
+See [Blob v2 Specification](blob.md)
+
 ### Storage Layout
 
 File organization, base path system, and multi-location storage.
