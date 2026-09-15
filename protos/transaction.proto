@@ -195,6 +195,13 @@ message Transaction {
     uint32 num_fragments = 1;
   }
 
+  /* An operation that reserves stable row ids for future use, advancing
+   * `next_row_id` without adding any fragments.
+   */
+  message ReserveRowIds {
+    uint64 num_row_ids = 1;
+  }
+
   // An operation that clones a dataset.
   message Clone {
     /* - true:  Performs a metadata-only clone (copies manifest without data files).
@@ -425,6 +432,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    ReserveRowIds reserve_row_ids = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

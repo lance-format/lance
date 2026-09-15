@@ -615,6 +615,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     max_memtable_size: max_memtable_size
                                         .unwrap_or(default_config.max_memtable_size),
                                     max_memtable_rows: default_config.max_memtable_rows,
+                                    enable_row_ids: false,
                                     max_memtable_batches: default_config.max_memtable_batches,
                                     manifest_scan_batch_size: default_config
                                         .manifest_scan_batch_size,

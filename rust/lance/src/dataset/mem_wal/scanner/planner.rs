@@ -13,18 +13,40 @@ use datafusion::prelude::{Expr, col};
 use lance_core::Result;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
+use crate::dataset::mem_wal::{TOMBSTONE, WAL_ROW_ID};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
 use super::projection::{
-    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
-    validate_projection_names,
+    build_scanner_projection, canonical_output_schema, cols_with_wal_row_id, null_columns,
+    project_to_canonical, surface_wal_row_id, validate_projection_names, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
+
+/// Reject a `_rowid` projection over a mem_wal source that predates
+/// `__wal_row_id`.
+///
+/// The alternative is a silent NULL for every row the WAL holds, which reads
+/// exactly like a row that legitimately has no id — so a stale base row would
+/// answer a take that should have hit the WAL. Fail loud instead: the feature
+/// has no backward compatibility, and a shard is drained before it is enabled.
+fn require_wal_row_id(present: bool, source: &LsmDataSource) -> Result<()> {
+    if present {
+        return Ok(());
+    }
+    Err(lance_core::Error::not_supported_source(
+        format!(
+            "_rowid was requested but {} predates the {} column; \
+         drain the shard's SSTables before enabling stable row ids",
+            source.display_name(),
+            WAL_ROW_ID
+        )
+        .into(),
+    ))
+}
 
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
@@ -138,7 +160,6 @@ impl LsmScanPlanner {
             .unwrap_or(false);
         let keep_row_address = keep_row_address || user_wants_rowaddr;
         validate_projection_names(projection, &self.base_schema, &[])?;
-
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
 
@@ -221,6 +242,16 @@ impl LsmScanPlanner {
                 scan
             };
 
+            // Rename `__wal_row_id` into `_rowid` last, so a per-arm `_rowid`
+            // used as a recency key upstream is overwritten rather than
+            // surfaced. The base arm already produced real ids via
+            // `with_row_id()`.
+            let scan = if is_base {
+                scan
+            } else {
+                surface_wal_row_id(scan)?
+            };
+
             // Tag with generation only if the caller wants `_memtable_gen`.
             let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
                 Arc::new(MemtableGenTagExec::new(scan, source.generation()))
@@ -296,6 +327,7 @@ impl LsmScanPlanner {
         filter: Option<&Expr>,
         fetch: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let keep_row_id = wants_row_id(projection);
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 // Use Lance Scanner
@@ -306,9 +338,12 @@ impl LsmScanPlanner {
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
-                // No `with_row_id()`: opting in only for base would mismatch
-                // the union schema against flushed/active. `_rowid` stays NULL
-                // for every row via `project_to_canonical`.
+                // The WAL arms answer `_rowid` from their own `__wal_row_id`
+                // column, so base opting in here lines the union up rather than
+                // breaking it.
+                if keep_row_id {
+                    scanner.with_row_id();
+                }
 
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
@@ -334,6 +369,10 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                if keep_row_id {
+                    require_wal_row_id(dataset.schema().field(WAL_ROW_ID).is_some(), source)?;
+                }
+                let cols = cols_with_wal_row_id(&cols, keep_row_id);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
@@ -374,6 +413,10 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                if keep_row_id {
+                    require_wal_row_id(schema.column_with_name(WAL_ROW_ID).is_some(), source)?;
+                }
+                let cols = cols_with_wal_row_id(&cols, keep_row_id);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
@@ -1841,7 +1884,7 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .project(&["id", "_rowoffset", "name", "_rowaddr", "_rowid"])
+            .project(&["id", "_rowoffset", "name", "_rowaddr"])
             .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
@@ -1864,10 +1907,10 @@ mod integration_tests {
             .collect();
         assert_eq!(
             names,
-            vec!["id", "_rowoffset", "name", "_rowaddr", "_rowid"],
+            vec!["id", "_rowoffset", "name", "_rowaddr"],
             "system columns must appear at the user's requested position"
         );
-        for sys in ["_rowoffset", "_rowaddr", "_rowid"] {
+        for sys in ["_rowoffset", "_rowaddr"] {
             assert!(is_system_column(sys));
         }
 
@@ -1878,16 +1921,16 @@ mod integration_tests {
         //   id=4   → gen2   (1 row,  NULL  `_rowaddr`)
         //   id=5,6 → active (2 rows, NULL  `_rowaddr`)
         //   id=7   → active (1 row,  NULL  `_rowaddr`)
-        // Total 7 rows, 2 real / 5 NULL `_rowaddr`. `_rowid` and
-        // `_rowoffset` are NULL everywhere (no opt-in / no scanner support).
+        // Total 7 rows, 2 real / 5 NULL `_rowaddr`. `_rowoffset` is NULL
+        // everywhere (no scanner support). `_rowid` is covered separately:
+        // this shard predates `__wal_row_id`, so it is rejected rather than
+        // NULL-filled.
         let mut rowaddr_real = 0usize;
         let mut rowaddr_null = 0usize;
-        let mut rowid_null = 0usize;
         let mut rowoffset_null = 0usize;
         let mut total = 0usize;
         for batch in &batches {
             let rowaddr = batch.column_by_name("_rowaddr").unwrap();
-            let rowid = batch.column_by_name("_rowid").unwrap();
             let rowoffset = batch.column_by_name("_rowoffset").unwrap();
             for i in 0..batch.num_rows() {
                 total += 1;
@@ -1895,9 +1938,6 @@ mod integration_tests {
                     rowaddr_null += 1;
                 } else {
                     rowaddr_real += 1;
-                }
-                if rowid.is_null(i) {
-                    rowid_null += 1;
                 }
                 if rowoffset.is_null(i) {
                     rowoffset_null += 1;
@@ -1913,7 +1953,6 @@ mod integration_tests {
             rowaddr_null, 5,
             "expected 5 rows (id=3-7) with NULL `_rowaddr` from non-base sources"
         );
-        assert_eq!(rowid_null, total, "_rowid must be NULL for every row");
         assert_eq!(
             rowoffset_null, total,
             "_rowoffset must be NULL for every row"
@@ -1921,13 +1960,11 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_lsm_scan_projection_with_rowid_only_no_rowaddr() {
-        // Test 4: when only `_rowid` (not `_rowaddr`) is requested, the
-        // canonical-projection wrap activates (system column triggers it),
-        // but the per-arm `null_columns(_rowaddr)` wrap stays off
-        // (`keep_row_address` remains false). `_rowid` ends up NULL for
-        // every row because no arm opts into `with_row_id()` in this
-        // planner (a base-only opt-in would mismatch the union schema).
+    async fn a_rowid_projection_is_rejected_on_a_shard_without_wal_row_ids() {
+        // `_rowid` is answered from the shard's own `__wal_row_id` column. A
+        // shard that predates it has no answer, and NULL-filling would read
+        // exactly like a row that legitimately has no id -- so a take routed
+        // by that NULL would silently return base's stale copy. Reject.
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
@@ -1938,47 +1975,14 @@ mod integration_tests {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
-        let plan = scanner.create_plan().await.unwrap();
-        let plan_str = format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-        );
-        // Canonical wrap activates for the user-requested `_rowid`.
+        let err = scanner.create_plan().await.unwrap_err();
         assert!(
-            plan_str.contains("ProjectionExec"),
-            "expected canonical projection wrap, got:\n{plan_str}",
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got {err:?}"
         );
-        // The per-arm `null_columns(_rowaddr)` wrap is gated on
-        // `keep_row_address`, which stays false here. So no
-        // `NULL as _rowaddr` projection should appear.
         assert!(
-            !plan_str.contains("NULL as _rowaddr"),
-            "no per-arm `_rowaddr` NULL'ing expected when caller didn't ask for `_rowaddr`, got:\n{plan_str}",
-        );
-
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-
-        let mut total = 0usize;
-        let mut rowid_null = 0usize;
-        for batch in &batches {
-            let rowid = batch.column_by_name("_rowid").unwrap();
-            for i in 0..batch.num_rows() {
-                total += 1;
-                if rowid.is_null(i) {
-                    rowid_null += 1;
-                }
-            }
-        }
-        assert_eq!(total, 7, "expected 7 unique pks after dedup");
-        assert_eq!(
-            rowid_null, total,
-            "_rowid must be NULL for every row (no opt-in)"
+            err.to_string().contains("__wal_row_id"),
+            "the message must name the missing column: {err}"
         );
     }
 

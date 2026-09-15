@@ -57,6 +57,7 @@ pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
                 | Operation::Rewrite(_)
                 | Operation::DataReplacement(_)
                 | Operation::ReserveFragments(_)
+                | Operation::ReserveRowIds(_)
                 | Operation::Update(_)
                 | Operation::UpdateConfig(_)
                 | Operation::UpdateMemWalState(_)

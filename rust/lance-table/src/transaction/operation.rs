@@ -134,6 +134,18 @@ pub enum Operation {
     /// indices to be remapped to the new row ids as part of the operation.
     ReserveFragments { num_fragments: u32 },
 
+    /// Reserves stable row ids for future use.
+    ///
+    /// Advances the manifest's `next_row_id` by `num_row_ids` without adding
+    /// any fragments, so a writer can hold a range of ids and stamp them into
+    /// rows it has not committed yet. The WAL uses this to assign a row's id at
+    /// insert time, long before the row reaches a base fragment.
+    ///
+    /// The reserved ids are never handed back: a writer that crashes before
+    /// using them leaks the chunk, which is harmless because ids need not be
+    /// contiguous. Only valid on a dataset that already uses stable row ids.
+    ReserveRowIds { num_row_ids: u64 },
+
     /// Update values in the dataset.
     ///
     /// Updates are generally vertical or horizontal.
@@ -261,6 +273,7 @@ impl std::fmt::Display for Operation {
             Self::Merge { .. } => write!(f, "Merge"),
             Self::Restore { .. } => write!(f, "Restore"),
             Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
+            Self::ReserveRowIds { .. } => write!(f, "ReserveRowIds"),
             Self::Update { .. } => write!(f, "Update"),
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
@@ -319,6 +332,7 @@ impl Operation {
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
             Self::ReserveFragments { .. } => "ReserveFragments",
+            Self::ReserveRowIds { .. } => "ReserveRowIds",
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",

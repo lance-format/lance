@@ -148,6 +148,9 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
             )) => Operation::ReserveFragments { num_fragments },
+            Some(pb::transaction::Operation::ReserveRowIds(pb::transaction::ReserveRowIds {
+                num_row_ids,
+            })) => Operation::ReserveRowIds { num_row_ids },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 old_fragments,
                 new_fragments,
@@ -550,6 +553,11 @@ impl From<&Transaction> for pb::Transaction {
             Operation::ReserveFragments { num_fragments } => {
                 pb::transaction::Operation::ReserveFragments(pb::transaction::ReserveFragments {
                     num_fragments: *num_fragments,
+                })
+            }
+            Operation::ReserveRowIds { num_row_ids } => {
+                pb::transaction::Operation::ReserveRowIds(pb::transaction::ReserveRowIds {
+                    num_row_ids: *num_row_ids,
                 })
             }
             Operation::Rewrite {

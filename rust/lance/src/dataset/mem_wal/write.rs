@@ -19,8 +19,8 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array, new_null_array};
+use arrow_schema::{FieldRef as ArrowFieldRef, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -56,7 +56,9 @@ use super::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
     WalOnlyState, WalRetryConfig, WalTailer, WriterCursors, apply_index_range, empty_flush_result,
 };
-use super::{TOMBSTONE, relax_non_pk_nullability, schema_with_tombstone};
+use super::{
+    TOMBSTONE, WAL_ROW_ID, relax_non_pk_nullability, schema_with_tombstone, schema_with_wal_row_id,
+};
 use crate::session::Session;
 
 use super::manifest::ShardManifestStore;
@@ -244,6 +246,19 @@ pub struct ShardWriterConfig {
     /// Default: `None`.
     pub session: Option<Arc<Session>>,
 
+    /// Whether this shard carries a stable row id per row.
+    ///
+    /// When `true`, the storage schema gains the physical
+    /// [`WAL_ROW_ID`](super::WAL_ROW_ID) column and every write must supply the
+    /// ids: [`ShardWriter::put`] is rejected in favour of
+    /// [`ShardWriter::put_with_row_ids`]. A delete still goes through
+    /// [`ShardWriter::delete`] and null-fills the column, because a tombstone
+    /// carries no identity of its own.
+    ///
+    /// Only valid on a base dataset created with stable row ids, and only in
+    /// memtable mode. Default: `false`.
+    pub enable_row_ids: bool,
+
     /// Admission control for every `put`, **replacing** lance's built-in
     /// per-shard valve ([`LocalBackpressureController`]).
     ///
@@ -276,6 +291,7 @@ impl Default for ShardWriterConfig {
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
+            enable_row_ids: false,
             hnsw_params: HashMap::new(),
             warmer: None,
             observer: None,
@@ -393,6 +409,12 @@ impl ShardWriterConfig {
     /// full WAL-only-mode contract. Defaults to `true`.
     pub fn with_enable_memtable(mut self, enable: bool) -> Self {
         self.enable_memtable = enable;
+        self
+    }
+
+    /// Carry a stable row id per row. See [`ShardWriterConfig::enable_row_ids`].
+    pub fn with_enable_row_ids(mut self, enable: bool) -> Self {
+        self.enable_row_ids = enable;
         self
     }
 
@@ -1621,6 +1643,56 @@ fn ensure_tombstone_column(
     })
 }
 
+/// Re-label `batch` to the storage schema, injecting `_tombstone = false` and
+/// `__wal_row_id = row_ids` when absent.
+///
+/// The row-id sibling of [`ensure_tombstone_column`], for a shard that assigns
+/// stable ids. `row_ids` is one id per row of `batch`, resolved by the caller
+/// before the WAL append so the log entry carries them and a replay restores
+/// them unchanged.
+///
+/// A batch that already carries the column keeps its ids: that is the replay
+/// path, where the entry was written with them.
+fn ensure_row_id_column(
+    batch: RecordBatch,
+    storage_schema: &Arc<ArrowSchema>,
+    row_ids: &UInt64Array,
+) -> Result<RecordBatch> {
+    if batch.num_rows() != row_ids.len() {
+        return Err(Error::invalid_input(format!(
+            "row id count {} does not match the batch's {} rows",
+            row_ids.len(),
+            batch.num_rows()
+        )));
+    }
+    if row_ids.null_count() > 0 {
+        return Err(Error::invalid_input(
+            "row ids must not be null: a null id belongs only to a tombstone, \
+             which the delete path builds instead",
+        ));
+    }
+    let batch = ensure_tombstone_column(batch, &strip_row_id_field(storage_schema))?;
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(row_ids.clone()));
+    RecordBatch::try_new(storage_schema.clone(), columns)
+        .map_err(|e| Error::invalid_input(format!("failed to inject {} column: {}", WAL_ROW_ID, e)))
+}
+
+/// `storage_schema` without its trailing `__wal_row_id` field, so
+/// [`ensure_tombstone_column`] can re-label against the schema it expects.
+fn strip_row_id_field(storage_schema: &Arc<ArrowSchema>) -> Arc<ArrowSchema> {
+    let fields: Vec<ArrowFieldRef> = storage_schema
+        .fields()
+        .iter()
+        .filter(|f| f.name() != WAL_ROW_ID)
+        .cloned()
+        .collect();
+    Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        storage_schema.metadata().clone(),
+    ))
+}
+
 /// Build a tombstone batch from a key-only `keys` batch: primary keys carried
 /// through, `_tombstone` true, every other column null.
 ///
@@ -2072,6 +2144,15 @@ impl ShardWriter {
             ));
         }
 
+        // WAL-only mode has no memtable to carry the ids and rejects `delete`
+        // and `put_no_wait` outright; the row-id write path is built on the
+        // memtable ones.
+        if !config.enable_memtable && config.enable_row_ids {
+            return Err(Error::invalid_input(
+                "enable_row_ids requires enable_memtable = true",
+            ));
+        }
+
         // A durable writer needs a flush ticker to make progress, in either
         // mode. With `durable_write` on, a put becomes durable only once its WAL
         // append lands, and neither mode self-triggers that append per put — the
@@ -2092,6 +2173,15 @@ impl ShardWriter {
         // `_tombstone` and appends it here — idempotent across reopens.
         let logical_schema = schema;
         let tombstoned = schema_with_tombstone(&logical_schema);
+        // `__wal_row_id` follows `_tombstone`, and only on a shard that assigns
+        // ids. It is nullable, so `relax_non_pk_nullability` below leaves it
+        // alone and `build_tombstone_batch` null-fills it like any other
+        // non-PK column.
+        let tombstoned = if config.enable_row_ids {
+            schema_with_wal_row_id(&tombstoned)
+        } else {
+            tombstoned
+        };
 
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;
@@ -2635,6 +2725,7 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
+                self.reject_missing_row_ids()?;
                 // Callers pass logical-shaped batches and never name
                 // `_tombstone`.
                 let batches = batches
@@ -2761,6 +2852,7 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
+                self.reject_missing_row_ids()?;
                 // Mirrors `put`.
                 let batches = batches
                     .into_iter()
@@ -2773,6 +2865,85 @@ impl ShardWriter {
                 "put_no_wait is only supported in MemTable mode",
             )),
         }
+    }
+
+    /// Like [`Self::put`], but stamping each row with the stable row id the
+    /// caller resolved for it.
+    ///
+    /// `row_ids[i]` holds one id per row of `batches[i]`. The ids are injected
+    /// as the physical [`WAL_ROW_ID`](super::WAL_ROW_ID) column *before* the WAL
+    /// append, so the log entry carries them and a replay reproduces them
+    /// exactly. Nothing downstream mints: the memtable, the SSTable and
+    /// compaction all carry these ids through unchanged.
+    ///
+    /// Only valid on a shard opened with
+    /// [`ShardWriterConfig::enable_row_ids`]; [`Self::put`] is rejected there in
+    /// turn, so a row can never reach storage without an id.
+    #[instrument(name = "sw_put_with_row_ids", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
+    pub async fn put_with_row_ids(
+        &self,
+        batches: Vec<RecordBatch>,
+        row_ids: Vec<UInt64Array>,
+    ) -> Result<WriteResult> {
+        let (result, watcher) = self.put_no_wait_with_row_ids(batches, row_ids).await?;
+        if let Some(mut watcher) = watcher {
+            watcher.wait().await?;
+        }
+        Ok(result)
+    }
+
+    /// Like [`Self::put_with_row_ids`], but returns the durability watcher
+    /// *without* awaiting it. The row-id analog of [`Self::put_no_wait`].
+    #[instrument(name = "sw_put_no_wait_with_row_ids", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
+    pub async fn put_no_wait_with_row_ids(
+        &self,
+        batches: Vec<RecordBatch>,
+        row_ids: Vec<UInt64Array>,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
+        Self::validate_non_empty(&batches)?;
+        self.validate_against_logical_schema(&batches)?;
+        if !self.config.enable_row_ids {
+            return Err(Error::invalid_input(
+                "put_with_row_ids requires a shard opened with enable_row_ids",
+            ));
+        }
+        if batches.len() != row_ids.len() {
+            return Err(Error::invalid_input(format!(
+                "got {} row id arrays for {} batches",
+                row_ids.len(),
+                batches.len()
+            )));
+        }
+
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            } => {
+                let batches = batches
+                    .into_iter()
+                    .zip(row_ids.iter())
+                    .map(|(b, ids)| ensure_row_id_column(b, &writer_state.schema, ids))
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_memtable_no_wait(batches, state, writer_state, backpressure)
+                    .await
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "put_with_row_ids is only supported in MemTable mode",
+            )),
+        }
+    }
+
+    /// Reject an id-less put on a shard that assigns ids: the row would reach
+    /// storage with a null `__wal_row_id`, which only a tombstone may carry.
+    fn reject_missing_row_ids(&self) -> Result<()> {
+        if self.config.enable_row_ids {
+            return Err(Error::invalid_input(
+                "this shard assigns stable row ids; use put_with_row_ids",
+            ));
+        }
+        Ok(())
     }
 
     /// Reject caller input that violates the logical schema: wrong column names,
@@ -11299,5 +11470,268 @@ mod shard_writer_tests {
             err.to_string().contains("must not be nullable"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A shard opened with `enable_row_ids` carries the caller's ids through
+    /// the memtable, the flush and the SSTable, and surfaces them as `_rowid`
+    /// on every arm of the LSM read.
+    #[tokio::test]
+    async fn wal_row_ids_survive_the_flush_and_surface_as_rowid() {
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use arrow_array::UInt64Array;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let initial = create_test_batch(&schema, 0, 4, vector_dim);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.initialize_mem_wal().execute().await.unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_enable_row_ids(true),
+            )
+            .await
+            .unwrap();
+
+        // Two generations: one flushed, one still in the active memtable.
+        writer
+            .put_with_row_ids(
+                vec![create_test_batch(&schema, 100, 3, vector_dim)],
+                vec![UInt64Array::from(vec![1_000, 1_001, 1_002])],
+            )
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer
+            .put_with_row_ids(
+                vec![create_test_batch(&schema, 200, 2, vector_dim)],
+                vec![UInt64Array::from(vec![2_000, 2_001])],
+            )
+            .await
+            .unwrap();
+
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let mut snapshot =
+            ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+        for sstable in &manifest.sstables {
+            snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
+        }
+
+        let batch = LsmScanner::new(
+            Arc::new(dataset.clone()),
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, writer.in_memory_memtable_refs().await.unwrap())
+        .project(&["id", "_rowid"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let mut seen: Vec<(i64, u64)> = (0..batch.num_rows())
+            .map(|i| (ids.value(i), row_ids.value(i)))
+            .collect();
+        seen.sort();
+
+        // Base rows keep the ids the initial write assigned (0..4); the WAL
+        // rows keep the ids the caller resolved, through the flush and the
+        // SSTable.
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0),
+                (1, 1),
+                (2, 2),
+                (3, 3),
+                (100, 1_000),
+                (101, 1_001),
+                (102, 1_002),
+                (200, 2_000),
+                (201, 2_001),
+            ]
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// A delete carries no id, and its tombstone never reaches the output.
+    #[tokio::test]
+    async fn a_tombstone_carries_no_row_id_and_is_dropped_at_egress() {
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use arrow_array::UInt64Array;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                [Ok(create_test_batch(&schema, 0, 2, vector_dim))],
+                schema.clone(),
+            ),
+            &uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.initialize_mem_wal().execute().await.unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_enable_row_ids(true),
+            )
+            .await
+            .unwrap();
+
+        writer
+            .put_with_row_ids(
+                vec![create_test_batch(&schema, 100, 2, vector_dim)],
+                vec![UInt64Array::from(vec![5_000, 5_001])],
+            )
+            .await
+            .unwrap();
+
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![100i64]))],
+        )
+        .unwrap();
+        writer.delete(vec![keys]).await.unwrap();
+
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let snapshot =
+            ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+        let batch = LsmScanner::new(
+            Arc::new(dataset.clone()),
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, writer.in_memory_memtable_refs().await.unwrap())
+        .project(&["id", "_rowid"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let mut seen: Vec<(i64, u64)> = (0..batch.num_rows())
+            .map(|i| (ids.value(i), row_ids.value(i)))
+            .collect();
+        seen.sort();
+        assert_eq!(seen, vec![(0, 0), (1, 1), (101, 5_001)]);
+
+        writer.close().await.unwrap();
+    }
+
+    /// `put` and `put_with_row_ids` are mutually exclusive per shard, so a row
+    /// can never reach storage without an id (and an id can never be handed to
+    /// a shard that has nowhere to put it).
+    #[tokio::test]
+    async fn put_and_put_with_row_ids_are_mutually_exclusive() {
+        use arrow_array::UInt64Array;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                [Ok(create_test_batch(&schema, 0, 2, vector_dim))],
+                schema.clone(),
+            ),
+            &uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.initialize_mem_wal().execute().await.unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let with_ids = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_enable_row_ids(true),
+            )
+            .await
+            .unwrap();
+        let err = with_ids
+            .put(vec![create_test_batch(&schema, 10, 1, vector_dim)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("put_with_row_ids"),
+            "unexpected error: {err}"
+        );
+        with_ids.close().await.unwrap();
+
+        let plain_shard = Uuid::new_v4();
+        let plain = dataset
+            .mem_wal_writer(plain_shard, ShardWriterConfig::new(plain_shard))
+            .await
+            .unwrap();
+        let err = plain
+            .put_with_row_ids(
+                vec![create_test_batch(&schema, 10, 1, vector_dim)],
+                vec![UInt64Array::from(vec![7u64])],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enable_row_ids"),
+            "unexpected error: {err}"
+        );
+        plain.close().await.unwrap();
     }
 }

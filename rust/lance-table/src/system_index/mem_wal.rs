@@ -52,6 +52,14 @@ pub struct SsTable {
     /// [`Self::in_memory_bytes`], and is also `None` on a table with no primary
     /// key.
     pub primary_key_bytes: Option<u64>,
+    /// Highest stable row id held by any row in this SSTable.
+    ///
+    /// Recorded at flush so a successor can tell how far into a reserved range
+    /// its predecessor got without reading the SSTable back -- see
+    /// [`RowIdReservation`]. `None` on an SSTable written before this field
+    /// existed and on a shard that does not assign stable row ids; a reader must
+    /// carry the first case as *underivable* rather than as zero.
+    pub max_row_id: Option<u64>,
 }
 
 impl SsTable {
@@ -63,6 +71,7 @@ impl SsTable {
             in_memory_bytes: None,
             physical_rows: None,
             primary_key_bytes: None,
+            max_row_id: None,
         }
     }
 }
@@ -75,6 +84,7 @@ impl From<&SsTable> for pb::SsTable {
             in_memory_bytes: sstable.in_memory_bytes,
             physical_rows: sstable.physical_rows,
             primary_key_bytes: sstable.primary_key_bytes,
+            max_row_id: sstable.max_row_id,
         }
     }
 }
@@ -87,6 +97,7 @@ impl From<pb::SsTable> for SsTable {
             in_memory_bytes: sstable.in_memory_bytes,
             physical_rows: sstable.physical_rows,
             primary_key_bytes: sstable.primary_key_bytes,
+            max_row_id: sstable.max_row_id,
         }
     }
 }
@@ -225,6 +236,52 @@ impl ShardStatus {
     }
 }
 
+/// A half-open range of stable row ids a shard holds exclusively.
+///
+/// Taken with an [`crate::transaction::Operation::ReserveRowIds`] commit
+/// against the base dataset and recorded in the shard manifest *before* any id
+/// is issued from it, so a successor finds every range its predecessor held.
+///
+/// How far into the range the predecessor got is deliberately not recorded:
+/// writing it would put a manifest commit on every write. A successor derives
+/// it instead, as the highest id in the range across its memtables, its
+/// SSTables ([`SsTable::max_row_id`]) and the base fragments overlapping it --
+/// the three places an issued id can be. A range it cannot derive a position
+/// for is dropped rather than guessed at, which abandons ids but can never
+/// issue one twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub struct RowIdReservation {
+    /// First id in the range.
+    pub start: u64,
+    /// One past the last id in the range.
+    pub end: u64,
+}
+
+impl RowIdReservation {
+    /// Whether `id` falls in this range.
+    pub fn contains(&self, id: u64) -> bool {
+        self.start <= id && id < self.end
+    }
+}
+
+impl From<&RowIdReservation> for pb::RowIdReservation {
+    fn from(r: &RowIdReservation) -> Self {
+        Self {
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
+impl From<pb::RowIdReservation> for RowIdReservation {
+    fn from(r: pb::RowIdReservation) -> Self {
+        Self {
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
 /// Shard manifest containing epoch-based fencing and WAL state.
 /// Each shard has exactly one active writer at any time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +310,14 @@ pub struct ShardManifest {
     /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
     /// across claims via `..base` so only fresh constructions set it.
     pub status: ShardStatus,
+    /// Stable row id ranges this shard reserved and may still issue, in the
+    /// order they were taken. Empty when the shard has never reserved, or when
+    /// stable row ids are off.
+    ///
+    /// More than one because a shard reserves its next range in the background
+    /// while still drawing from the current one. A range drops out once it is
+    /// exhausted.
+    pub row_id_reservations: Vec<RowIdReservation>,
 }
 
 impl ShardManifest {
@@ -270,6 +335,7 @@ impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
             + self.sstables.deep_size_of_children(context)
+            + self.row_id_reservations.deep_size_of_children(context)
     }
 }
 
@@ -293,6 +359,7 @@ impl From<&ShardManifest> for pb::ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.iter().map(|sstable| sstable.into()).collect(),
             status: rm.status.to_i32(),
+            row_id_reservations: rm.row_id_reservations.iter().map(Into::into).collect(),
         }
     }
 }
@@ -322,6 +389,11 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.into_iter().map(SsTable::from).collect(),
             status: ShardStatus::from_i32(rm.status),
+            row_id_reservations: rm
+                .row_id_reservations
+                .into_iter()
+                .map(RowIdReservation::from)
+                .collect(),
         })
     }
 }
@@ -629,12 +701,17 @@ mod tests {
             in_memory_bytes: None,
             physical_rows: None,
             primary_key_bytes: None,
+            max_row_id: None,
         };
         let decoded = SsTable::from(legacy);
         assert_eq!(decoded.generation, 7);
         assert_eq!(decoded.in_memory_bytes, None);
         assert_eq!(decoded.physical_rows, None);
         assert_eq!(decoded.primary_key_bytes, None);
+        // Not zero: zero is a valid row id, and a reader that took it for one
+        // would place a reserved range as barely touched when the generation
+        // may hold its whole contents.
+        assert_eq!(decoded.max_row_id, None);
     }
 
     /// All three survive the round trip, so a reader sees what the flush
@@ -647,11 +724,80 @@ mod tests {
             in_memory_bytes: Some(4_096),
             physical_rows: Some(10),
             primary_key_bytes: Some(80),
+            max_row_id: Some(1_000_042),
         };
         let encoded = pb::SsTable::from(&recorded);
         assert_eq!(encoded.in_memory_bytes, Some(4_096));
         assert_eq!(encoded.physical_rows, Some(10));
         assert_eq!(encoded.primary_key_bytes, Some(80));
+        assert_eq!(encoded.max_row_id, Some(1_000_042));
         assert_eq!(SsTable::from(encoded), recorded);
+    }
+
+    /// A shard holds more than one range while a background reservation is in
+    /// flight, and their order is what a successor places them by -- so the
+    /// round trip has to preserve the sequence, not just the set.
+    #[test]
+    fn every_reserved_range_survives_the_round_trip_in_order() {
+        let manifest = ShardManifest {
+            shard_id: Uuid::nil(),
+            version: 3,
+            shard_spec_id: 0,
+            shard_field_values: HashMap::new(),
+            writer_epoch: 5,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            current_generation: 1,
+            sstables: Vec::new(),
+            status: ShardStatus::Active,
+            row_id_reservations: vec![
+                RowIdReservation {
+                    start: 100,
+                    end: 200,
+                },
+                RowIdReservation {
+                    start: 900,
+                    end: 1_000,
+                },
+            ],
+        };
+
+        let encoded = pb::ShardManifest::from(&manifest);
+        assert_eq!(encoded.row_id_reservations.len(), 2);
+        assert_eq!(
+            ShardManifest::try_from(encoded)
+                .unwrap()
+                .row_id_reservations,
+            manifest.row_id_reservations
+        );
+    }
+
+    /// A shard that has never reserved decodes as holding nothing, which is what
+    /// sends it to reserve rather than to resume.
+    #[test]
+    fn a_manifest_with_no_reserved_ranges_decodes_as_empty() {
+        let legacy = pb::ShardManifest {
+            shard_id: Some((&Uuid::nil()).into()),
+            row_id_reservations: Vec::new(),
+            ..Default::default()
+        };
+        assert!(
+            ShardManifest::try_from(legacy)
+                .unwrap()
+                .row_id_reservations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_range_contains_its_start_but_not_its_end() {
+        let range = RowIdReservation {
+            start: 100,
+            end: 200,
+        };
+        assert!(range.contains(100));
+        assert!(range.contains(199));
+        assert!(!range.contains(200));
+        assert!(!range.contains(99));
     }
 }

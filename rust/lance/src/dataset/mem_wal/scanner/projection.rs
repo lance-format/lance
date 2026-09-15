@@ -25,6 +25,8 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 
+use crate::dataset::mem_wal::WAL_ROW_ID;
+
 use super::exec::SchemaRelabelExec;
 
 /// Column name for distance in vector search results.
@@ -47,6 +49,73 @@ pub fn wants_row_address(projection: Option<&[String]>) -> bool {
 /// Auto-managed by the planner; must never reach `scanner.project()`.
 fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
+}
+
+/// Append the physical `__wal_row_id` column to a scanner projection when the
+/// source carries it and the caller asked for `_rowid`.
+///
+/// The mem_wal arms answer `_rowid` from this column, not from the scanner's
+/// own `_rowid` — which, on the active memtable, is the batch-store row offset
+/// used as a recency sort key. [`surface_wal_row_id`] renames it at the end of
+/// the arm, after that internal value has been cleared.
+pub fn cols_with_wal_row_id(cols: &[String], present: bool) -> Vec<String> {
+    if !present {
+        return cols.to_vec();
+    }
+    let mut out = cols.to_vec();
+    if !out.iter().any(|c| c == WAL_ROW_ID) {
+        out.push(WAL_ROW_ID.to_string());
+    }
+    out
+}
+
+/// Rename `__wal_row_id` to `_rowid`, replacing any `_rowid` the arm carried
+/// for its own purposes.
+///
+/// Runs last in an arm, after [`null_columns`] has cleared the internal
+/// `_rowid`: the two are different values (a stable identity versus a memtable
+/// row position) and only one of them may leave the arm. A no-op when the
+/// source has no `__wal_row_id`.
+///
+/// Stays nullable, matching both [`canonical_output_schema`] and the base arm's
+/// `ROW_ID_FIELD`; the tombstone fold has already removed the only rows that
+/// can hold a null there.
+pub fn surface_wal_row_id(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let input_schema = plan.schema();
+    let Some((wal_idx, _)) = input_schema.column_with_name(WAL_ROW_ID) else {
+        return Ok(plan);
+    };
+    let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(input_schema.fields().len());
+    let mut renamed = false;
+    for (idx, field) in input_schema.fields().iter().enumerate() {
+        let name = field.name();
+        if name == WAL_ROW_ID {
+            continue;
+        }
+        if name == ROW_ID {
+            project_exprs.push((
+                Arc::new(Column::new(WAL_ROW_ID, wal_idx)),
+                ROW_ID.to_string(),
+            ));
+            renamed = true;
+        } else {
+            project_exprs.push((Arc::new(Column::new(name, idx)), name.clone()));
+        }
+    }
+    if !renamed {
+        project_exprs.push((
+            Arc::new(Column::new(WAL_ROW_ID, wal_idx)),
+            ROW_ID.to_string(),
+        ));
+    }
+    let projected = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!(
+            "Failed to build {} rename ProjectionExec: {}",
+            WAL_ROW_ID, e
+        ))
+    })?;
+    Ok(Arc::new(projected))
 }
 
 /// Projection to pass to underlying scanners: user cols minus
