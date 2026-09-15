@@ -340,7 +340,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
-                | IndexType::RTree,
+                | IndexType::RTree
+                | IndexType::MinHashLsh,
                 LANCE_SCALAR_INDEX,
             ) => {
                 assert!(
