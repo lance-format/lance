@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -81,8 +80,8 @@ impl PyIndexSegment {
     }
 
     #[getter]
-    fn fragment_ids(&self) -> HashSet<u32> {
-        self.inner.fragment_bitmap().iter().collect()
+    fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
+        crate::bitmap::PyBitmap::new(self.inner.fragment_bitmap().clone())
     }
 
     #[getter]
@@ -92,9 +91,9 @@ impl PyIndexSegment {
 
     fn __repr__(&self) -> String {
         format!(
-            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
+            "IndexSegment(uuid={}, fragment_ids={}, index_version={})",
             self.uuid(),
-            self.fragment_ids(),
+            self.fragment_ids().__repr__(),
             self.index_version()
         )
     }
@@ -319,7 +318,7 @@ fn train_pq_model<'py>(
 /// from lance.lance import indices
 ///
 /// # Mint one model and broadcast `model` to every worker.
-/// model = indices.build_rq_model(dimension=128, num_bits=1)
+/// model = indices.build_rq_model(dimension=128, num_bits=5)
 /// seg = ds.create_index_uncommitted(
 ///     column="vector",
 ///     index_type="IVF_RQ",
@@ -330,7 +329,7 @@ fn train_pq_model<'py>(
 /// )
 /// ```
 #[pyfunction]
-#[pyo3(signature = (dimension, num_bits=1, dtype="float32"))]
+#[pyo3(signature = (dimension, num_bits=5, dtype="float32"))]
 pub fn build_rq_model(dimension: usize, num_bits: u8, dtype: &str) -> PyResult<String> {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
     use lance_index::vector::bq::RQRotationType;
@@ -614,7 +613,7 @@ pub struct PyIndexSegmentDescription {
     /// The dataset version at which the index segment was last updated
     pub dataset_version_at_last_update: u64,
     /// The fragment ids that are covered by the index segment
-    pub fragment_ids: HashSet<u32>,
+    pub fragment_ids: crate::bitmap::PyBitmap,
     /// The version of the index
     pub index_version: i32,
     /// The timestamp when the index segment was created
@@ -632,11 +631,8 @@ pub struct PyIndexSegmentDescription {
 
 impl PyIndexSegmentDescription {
     pub fn from_metadata(segment: &lance_table::format::IndexMetadata) -> Self {
-        let fragment_ids = segment
-            .fragment_bitmap
-            .as_ref()
-            .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
-            .unwrap_or_default();
+        let fragment_ids =
+            crate::bitmap::PyBitmap::new(segment.fragment_bitmap.clone().unwrap_or_default());
         let size_bytes = segment.total_size_bytes();
 
         Self {
@@ -653,10 +649,10 @@ impl PyIndexSegmentDescription {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
-            self.fragment_ids,
+            self.fragment_ids.__repr__(),
             self.index_version,
             self.created_at,
             self.size_bytes,

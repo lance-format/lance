@@ -111,6 +111,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
@@ -135,6 +136,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -162,6 +164,7 @@ fn inner_create_with_ffi_array<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -195,6 +198,7 @@ fn inner_create_with_ffi_array<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -221,6 +225,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
@@ -244,6 +249,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -270,6 +276,7 @@ fn inner_create_with_ffi_stream<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -293,6 +300,7 @@ fn inner_create_with_ffi_stream<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -317,6 +325,7 @@ fn create_fragment<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
@@ -338,6 +347,7 @@ fn create_fragment<'a>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     write_params.session = session_from_handle(session_handle);
@@ -691,7 +701,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -829,6 +839,11 @@ impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
         let files = export_vec::<DataFile>(env, &files)?;
+        let referenced_data_files = self
+            .referenced_lance_files()
+            .cloned()
+            .collect::<Vec<DataFile>>();
+        let referenced_data_files = export_vec::<DataFile>(env, &referenced_data_files)?;
         let deletion_file = match &self.deletion_file {
             Some(f) => f.into_java(env)?,
             None => JObject::null(),
@@ -858,6 +873,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&referenced_data_files),
             ],
         )
         .map_err(|e| {

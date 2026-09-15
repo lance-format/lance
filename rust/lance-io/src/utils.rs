@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
+use std::{cmp::min, num::NonZero, ops::Range, sync::atomic::AtomicU64};
 
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,35 @@ use crate::traits::{ProtoStruct, Reader};
 use lance_core::{Error, Result};
 
 pub mod tracking_store;
+
+/// Chunk size for splitting a large metadata read into concurrent range requests.
+///
+/// A single object-store GET streams its body over one connection, so its
+/// throughput is capped by the TCP window over the round-trip time; on
+/// high-latency links that tops out in the tens of MB/s. Fetching the range as
+/// a window of concurrent chunk requests multiplies that per-connection limit.
+/// 16 MiB keeps per-request overhead negligible (a ~1 GiB manifest costs ~64
+/// GET requests) while a `Reader::io_parallelism` window of such chunks is
+/// enough to saturate the link.
+pub const METADATA_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Read `range` from `reader` as `chunk_size`-sized concurrent range requests,
+/// yielding the chunks in file order. Concurrency is bounded by
+/// [`Reader::io_parallelism`], clamped to at least 1: a `buffered(0)` window
+/// never polls its input, so an unvalidated reader value (e.g.
+/// `LANCE_URING_IO_PARALLELISM=0`) would hang the read.
+pub fn read_range_in_chunks(
+    reader: &dyn Reader,
+    range: Range<usize>,
+    chunk_size: usize,
+) -> impl Stream<Item = object_store::Result<Bytes>> + '_ {
+    let end = range.end;
+    let chunk_ranges = range
+        .step_by(chunk_size)
+        .map(move |start| start..min(start + chunk_size, end));
+    futures::stream::iter(chunk_ranges.map(|chunk| reader.get_range(chunk)))
+        .buffered(reader.io_parallelism().max(1))
+}
 
 /// Read a protobuf message at file position 'pos'.
 ///
@@ -34,12 +64,19 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 
     if msg_len + 4 > buf.len() {
         let remaining_range = range.end..min(4 + pos + msg_len, file_size);
-        let remaining_bytes = reader.get_range(remaining_range).await?;
-        let buf = [buf, remaining_bytes].concat();
-        if buf.len() < msg_len + 4 {
+        // Assemble into one pre-allocated buffer; fetching the remainder as
+        // concurrent chunks lifts the single-connection throughput cap on
+        // large messages (e.g. manifests of datasets with many fragments).
+        let mut full = BytesMut::with_capacity(buf.len() + remaining_range.len());
+        full.extend_from_slice(&buf);
+        let mut chunks = read_range_in_chunks(reader, remaining_range, METADATA_READ_CHUNK_SIZE);
+        while let Some(chunk) = chunks.try_next().await? {
+            full.extend_from_slice(&chunk);
+        }
+        if full.len() < msg_len + 4 {
             return Err(Error::io("file size is too small".to_string()));
         }
-        Ok(M::decode(&buf[4..4 + msg_len])?)
+        Ok(M::decode(&full[4..4 + msg_len])?)
     } else {
         Ok(M::decode(&buf[4..4 + msg_len])?)
     }
@@ -199,7 +236,8 @@ impl CachedFileSize {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
+    use futures::TryStreamExt;
     use object_store::path::Path;
 
     use crate::{
@@ -208,7 +246,7 @@ mod tests {
         object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
-        utils::read_struct,
+        utils::{METADATA_READ_CHUNK_SIZE, read_range_in_chunks, read_struct},
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we
@@ -252,6 +290,73 @@ mod tests {
                 .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
+    }
+
+    #[tokio::test]
+    async fn test_read_range_in_chunks_reassembles_in_order() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/chunked");
+        // Patterned data with a range that neither starts nor ends on a chunk
+        // boundary, so ordering or off-by-one mistakes change the bytes.
+        let data: Vec<u8> = (0..10 * 1024 + 37).map(|i| (i % 251) as u8).collect();
+        store.put(&path, &data).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
+
+        let range = 5..data.len() - 3;
+        let mut assembled = BytesMut::new();
+        let mut chunks = read_range_in_chunks(reader.as_ref(), range.clone(), 1024);
+        while let Some(chunk) = chunks.try_next().await.unwrap() {
+            assembled.extend_from_slice(&chunk);
+        }
+        assert_eq!(assembled.as_ref(), &data[range]);
+    }
+
+    #[tokio::test]
+    async fn test_read_range_in_chunks_zero_parallelism_reader() {
+        // A reader advertising io_parallelism 0 (e.g. LANCE_URING_IO_PARALLELISM=0)
+        // must not hang the chunked read: the window is clamped to at least 1.
+        let store = ObjectStore::memory();
+        let path = Path::from("/zero_parallelism");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 249) as u8).collect();
+        store.put(&path, &data).await.unwrap();
+        let reader =
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap()
+                .with_io_parallelism(0);
+
+        let assembled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf = BytesMut::new();
+            let mut chunks = read_range_in_chunks(&reader, 0..data.len(), 1024);
+            while let Some(chunk) = chunks.try_next().await.unwrap() {
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        })
+        .await
+        .expect("chunked read with a zero-parallelism reader must not hang");
+        assert_eq!(assembled.as_ref(), &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_read_message_larger_than_chunk_size() {
+        // A message body crossing METADATA_READ_CHUNK_SIZE forces read_message
+        // to fetch the remainder as multiple concurrent chunks.
+        let store = ObjectStore::memory();
+        let path = Path::from("/large_message");
+
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let payload: Vec<u8> = (0..METADATA_READ_CHUNK_SIZE + 5 * 1024 * 1024)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let message = BytesWrapper(Bytes::from(payload));
+        let pos = object_writer.write_struct(&message).await.unwrap();
+        object_writer.shutdown().await.unwrap();
+
+        let object_reader =
+            CloudObjectReader::new(store.inner, path, 4096, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap();
+        let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
+        assert_eq!(message, actual);
     }
 
     #[tokio::test]

@@ -13,6 +13,9 @@
  */
 package org.lance.cleanup;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -24,6 +27,7 @@ import java.util.Optional;
 public class CleanupPolicy {
   private final Optional<Long> beforeTimestampMillis;
   private final Optional<Long> beforeVersion;
+  private final Optional<List<Long>> versions;
   private final Optional<Boolean> deleteUnverified;
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
@@ -32,12 +36,14 @@ public class CleanupPolicy {
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
       Optional<Long> beforeVersion,
+      Optional<List<Long>> versions,
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
       Optional<Boolean> cleanReferencedBranches,
       Optional<Long> deleteRateLimit) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
+    this.versions = versions;
     this.deleteUnverified = deleteUnverified;
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
     this.cleanReferencedBranches = cleanReferencedBranches;
@@ -54,6 +60,10 @@ public class CleanupPolicy {
 
   public Optional<Long> getBeforeVersion() {
     return beforeVersion;
+  }
+
+  public Optional<List<Long>> getVersions() {
+    return versions;
   }
 
   public Optional<Boolean> getDeleteUnverified() {
@@ -76,6 +86,7 @@ public class CleanupPolicy {
   public static class Builder {
     private Optional<Long> beforeTimestampMillis = Optional.empty();
     private Optional<Long> beforeVersion = Optional.empty();
+    private Optional<List<Long>> versions = Optional.empty();
     private Optional<Boolean> deleteUnverified = Optional.empty();
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
@@ -92,6 +103,12 @@ public class CleanupPolicy {
     /** Set a version threshold; versions older than this will be cleaned. */
     public Builder withBeforeVersion(long beforeVersion) {
       this.beforeVersion = Optional.of(beforeVersion);
+      return this;
+    }
+
+    /** Set the exact dataset versions to clean. */
+    public Builder withVersions(List<Long> versions) {
+      this.versions = Optional.of(Collections.unmodifiableList(new ArrayList<>(versions)));
       return this;
     }
 
@@ -123,6 +140,7 @@ public class CleanupPolicy {
       return new CleanupPolicy(
           beforeTimestampMillis,
           beforeVersion,
+          versions,
           deleteUnverified,
           errorIfTaggedOldVersions,
           cleanReferencedBranches,

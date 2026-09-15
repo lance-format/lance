@@ -176,6 +176,13 @@ impl StructuralFieldDecoder for StructuralListDecoder {
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
+
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        Err(lance_core::Error::not_supported(
+            "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"
+                .to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -240,8 +247,8 @@ mod tests {
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
-        UInt8Array, UInt64Array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StringArray,
+        StructArray, UInt8Array, UInt64Array,
         builder::{
             Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder, UInt32Builder,
         },
@@ -1493,74 +1500,37 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_boolean_list_fails_without_panic() {
-        let empty_inner_lists = 70_000usize;
-        let booleans_per_list = 8usize;
-
+    fn unsplittable_nested_list(items: ArrayRef, empty_inner_lists: usize) -> ArrayRef {
         let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        let values = (0..booleans_per_list)
-            .map(|idx| idx % 2 == 0)
-            .collect::<Vec<_>>();
-        inner_offsets.push(values.len() as i32);
-
-        let inner_items = BooleanArray::from(values);
+        inner_offsets.push(items.len() as i32);
         let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Boolean, true)),
+            Arc::new(Field::new("item", items.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
+            items,
             None,
         );
-        let outer_list = ListArray::new(
+        Arc::new(ListArray::new(
             Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 1])),
             Arc::new(inner_list),
             None,
-        );
-
-        let err = try_encode_v22_pages(Arc::new(outer_list))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Mini-block cannot encode"),
-            "unexpected error: {err}"
-        );
+        ))
     }
 
+    #[rstest]
+    #[case::boolean(Arc::new(BooleanArray::from(vec![true, false, true, false, true, false, true, false])))]
+    #[case::string(Arc::new(StringArray::from(vec!["value", "other"])))]
     #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_string_single_row_falls_back_to_fullzip() {
-        let empty_inner_lists = 70_000usize;
-
-        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        inner_offsets.push(1);
-        inner_offsets.push(2);
-
-        let mut strings = StringBuilder::new();
-        strings.append_value("value");
-        strings.append_value("other");
-        let inner_items = strings.finish();
-        let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
-            None,
-        );
-        let outer_list = ListArray::new(
-            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 2])),
-            Arc::new(inner_list),
-            None,
-        );
-
-        let outer_list = Arc::new(outer_list) as ArrayRef;
-        let pages = encode_v22_pages(outer_list.clone()).await;
+    async fn test_nested_sparse_single_row_falls_back_to_fullzip(#[case] items: ArrayRef) {
+        let list = unsplittable_nested_list(items, 70_000);
+        let pages = encode_v22_pages(list.clone()).await;
         assert_has_fullzip_layout(&pages);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_indices(vec![0])
             .with_dense_encodings();
-        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::new()).await;
     }
 
     /// Builds the HNSW-flush repro shape: a dense prefix where every row has
@@ -1639,5 +1609,50 @@ mod tests {
             .unwrap();
         assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_list_i32_not_supported() {
+        // Lists encode items using repetition levels so the number of decoded
+        // bytes depends on the per-row list lengths, which are not known at
+        // planning time without inspecting page data.  For this PR we
+        // explicitly reject the call rather than returning a wrong estimate.
+        use crate::decoder::StructuralFieldDecoder;
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        use arrow_schema::Field;
+
+        // Build a List<i32> array where every row has a random (variable) length
+        // to illustrate the case we cannot plan for.
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        let lengths = [0usize, 3, 1, 7, 2, 0, 5];
+        let mut value = 0i32;
+        for &len in &lengths {
+            for _ in 0..len {
+                builder.values().append_value(value);
+                value += 1;
+            }
+            builder.append(true);
+        }
+        let _list_array = builder.finish(); // variable-length rows confirmed
+
+        // Construct the decoder tree directly (no pages needed for this check).
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(item_field.clone());
+
+        let child = Box::new(StructuralPrimitiveFieldDecoder::new(&item_field, false));
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let err = decoder
+            .plan_decoded_bytes(lengths.len() as u64)
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("repetition"),
+            "error should mention repetition, got: {err}"
+        );
     }
 }
