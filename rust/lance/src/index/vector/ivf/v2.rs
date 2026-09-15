@@ -18,6 +18,7 @@ use std::{
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
+use arc_swap::ArcSwap;
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
@@ -86,7 +87,7 @@ use lance_select::RowAddrTreeMap;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -202,6 +203,81 @@ pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
 const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
+
+/// Process-wide budget on partitions in the prepare window of vector searches:
+/// being loaded and decoded, or loaded and waiting to be pulled into a scoring
+/// chunk, summed over every index segment and every concurrent query.
+///
+/// Each `search_partitions` call keeps up to `prepare_parallelism` (the CPU
+/// count) partitions in flight ahead of scoring. A query fans out over every
+/// index segment on the node (a distributed table has tens) and queries run
+/// concurrently, so without a shared budget the node-wide window is
+/// `segments * queries * CPUs` partitions: the memory a query pins scales with
+/// segment count and concurrency even though each segment search is bounded.
+///
+/// A permit is acquired before a partition is loaded and released the moment the
+/// prepared partition is pulled out of the `buffered` window, before it is added
+/// to a scoring chunk or channel. Scoring therefore never holds permits and chunk
+/// assembly never waits on permits held by its own partitions, so no combination
+/// of budget, chunk and channel sizes can deadlock; the chunks stay bounded per
+/// segment search by [`GLOBAL_TOPK_CHUNK_BYTES`] and
+/// [`STREAMING_SEARCH_BATCH_SIZE`]. Segments share the budget dynamically instead
+/// of splitting it up front, so one segment stalled on I/O does not idle the
+/// others' share.
+///
+/// Defaults to twice the CPU count: enough loads in flight to keep the CPU pool
+/// decoding while others wait on I/O, and a single segment search on an idle node
+/// is not throttled below its own window. Override with the
+/// `LANCE_IVF_PREPARE_PARTITION_BUDGET` environment variable.
+#[derive(Debug)]
+pub(crate) struct PreparePartitionBudget {
+    permits: Arc<Semaphore>,
+}
+
+impl PreparePartitionBudget {
+    pub(crate) fn new(partitions: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(partitions.max(1))),
+        }
+    }
+
+    /// Wait for a slot in the prepare window. The permit is meant to be dropped
+    /// as soon as the prepared partition leaves the `buffered` window; see
+    /// [`release_prepare_permit`].
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.map_err(|_| {
+            Error::internal("prepare partition budget semaphore was closed".to_string())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+pub(crate) static PREPARE_PARTITION_BUDGET: LazyLock<Arc<PreparePartitionBudget>> =
+    LazyLock::new(|| {
+        let partitions = std::env::var("LANCE_IVF_PREPARE_PARTITION_BUDGET")
+            .map(|value| {
+                value
+                    .parse()
+                    .expect("failed to parse LANCE_IVF_PREPARE_PARTITION_BUDGET")
+            })
+            .unwrap_or_else(|_| 2 * get_num_compute_intensive_cpus().max(1));
+        assert!(
+            partitions > 0,
+            "LANCE_IVF_PREPARE_PARTITION_BUDGET must be greater than 0, got {partitions}"
+        );
+        Arc::new(PreparePartitionBudget::new(partitions))
+    });
+
+/// Drop the prepare permit of a partition as it is pulled out of the `buffered`
+/// prepare window (`.buffered(n).map(release_prepare_permit)`), so the permit
+/// covers exactly the window and nothing downstream.
+fn release_prepare_permit<T>(item: Result<(OwnedSemaphorePermit, T)>) -> Result<T> {
+    item.map(|(_permit, value)| value)
+}
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
@@ -1070,6 +1146,9 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     prepared_partitions: Arc<PreparedPartitionTracker>,
+    /// The process-wide [`PREPARE_PARTITION_BUDGET`]; swappable so tests can
+    /// run a search against a tiny budget.
+    prepare_budget: ArcSwap<PreparePartitionBudget>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1637,6 +1716,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
+            prepare_budget: ArcSwap::new(PREPARE_PARTITION_BUDGET.clone()),
             _marker: PhantomData,
         })
     }
@@ -1681,6 +1761,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
+            prepare_budget: ArcSwap::new(PREPARE_PARTITION_BUDGET.clone()),
             _marker: PhantomData,
         })
     }
@@ -1690,6 +1771,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[cfg(test)]
     pub(crate) fn prepared_partitions(&self) -> &PreparedPartitionTracker {
         &self.prepared_partitions
+    }
+
+    /// Replace the prepare budget this index searches under (tests only; the
+    /// budget is process-wide in production).
+    #[cfg(test)]
+    pub(crate) fn set_prepare_budget(&self, budget: Arc<PreparePartitionBudget>) {
+        self.prepare_budget.store(budget);
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -2304,6 +2392,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         }
 
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+        let prepare_budget = self.prepare_budget.load_full();
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
@@ -2312,6 +2401,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
+            let prepare_budget = prepare_budget.clone();
             // Stream prepared partitions through scoring in chunks rather than
             // collecting all of them first. A prepared partition pins its whole
             // quantized storage, so collecting `nprobes` of them before scoring
@@ -2331,8 +2421,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
+                    let budget = prepare_budget.clone();
                     async move {
-                        index
+                        let permit = budget.acquire().await?;
+                        let prepared = index
                             .prepare_partition_without_prefilter_wait(
                                 part_id as usize,
                                 &query,
@@ -2340,10 +2432,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 metrics.as_ref(),
                                 raw_query_context,
                             )
-                            .await
+                            .await?;
+                        Ok((permit, prepared))
                     }
                 })
                 .buffered(prepare_parallelism)
+                .map(release_prepare_permit)
                 .fuse();
             let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
@@ -2419,8 +2513,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
+                    let budget = prepare_budget.clone();
                     async move {
-                        index
+                        let permit = budget.acquire().await?;
+                        let prepared = index
                             .prepare_partition(
                                 part_id as usize,
                                 &query,
@@ -2428,10 +2524,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 metrics.as_ref(),
                                 raw_query_context,
                             )
-                            .await
+                            .await?;
+                        Ok((permit, prepared))
                     }
                 })
-                .buffered(prepare_parallelism);
+                .buffered(prepare_parallelism)
+                .map(release_prepare_permit);
 
             futures::pin_mut!(prepare_stream);
             while let Some(prepared) = prepare_stream.next().await {
@@ -2685,18 +2783,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
+        let load_budget = self.prepare_budget.load_full();
         let mut loaded_chunks = stream::iter(assignment_list)
             .map(move |(part_id, probing_queries)| {
                 let index = load_index.clone();
                 let metrics = load_metrics.clone();
+                let budget = load_budget.clone();
                 async move {
+                    let permit = budget.acquire().await?;
                     let part_entry = index
                         .load_partition(part_id as usize, true, metrics.as_ref())
                         .await?;
-                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                    Result::Ok((permit, (part_id as usize, part_entry, probing_queries)))
                 }
             })
             .buffered(load_parallelism)
+            .map(release_prepare_permit)
             .chunks(*STREAMING_SEARCH_BATCH_SIZE);
 
         let use_query_residual = self.use_query_residual;
@@ -3000,7 +3102,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PartitionSearchControl, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -6827,6 +6929,172 @@ mod tests {
             in_flight_bound,
             num_partitions
         );
+    }
+
+    /// The prepare budget must bound the in-flight window without ever
+    /// deadlocking: a permit is released the moment a prepared partition leaves
+    /// the `buffered` window, before it enters a scoring chunk or channel, so a
+    /// budget smaller than every chunk and channel still lets the global-top-k,
+    /// streaming and multi-query batch paths complete, even with two searches
+    /// sharing it, and they return the same rows as under the default budget.
+    #[tokio::test]
+    async fn test_prepare_budget_of_one_bounds_window_without_deadlock() {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const ROWS_PER_PARTITION: usize = 16;
+        // More partitions than any chunk or channel holds, so a budget of one
+        // partition is exceeded by every path's own batching.
+        let num_partitions = 2 * (*super::STREAMING_SEARCH_BATCH_SIZE).max(16) + 8;
+
+        struct NeverStop;
+        impl PartitionSearchControl for NeverStop {
+            fn should_stop(&self) -> bool {
+                false
+            }
+        }
+
+        fn sorted_row_ids(batches: &[RecordBatch]) -> Vec<u64> {
+            let mut ids: Vec<u64> = batches
+                .iter()
+                .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(num_partitions * ROWS_PER_PARTITION);
+        let vectors = batch["vector"].as_fixed_size_list().clone();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let mut ivf_params = IvfBuildParams::new(num_partitions);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf_index = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index");
+
+        let make_query = |key: ArrayRef| Query {
+            column: "vector".to_string(),
+            key,
+            k: K,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: num_partitions,
+            maximum_nprobes: Some(num_partitions),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let queries = [make_query(vectors.value(0)), make_query(vectors.value(7))];
+        let probes: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                let (partitions, q_c_dists) = index.find_partitions(query).unwrap();
+                (Arc::new(partitions), Arc::new(q_c_dists))
+            })
+            .collect();
+        let global_search =
+            |query_index: usize, control: Option<Arc<dyn PartitionSearchControl>>| {
+                let index = index.clone();
+                let query = queries[query_index].clone();
+                let (partitions, q_c_dists) = probes[query_index].clone();
+                async move {
+                    index
+                        .search_partitions(
+                            query,
+                            partitions,
+                            q_c_dists,
+                            0,
+                            num_partitions,
+                            Arc::new(NoFilter),
+                            control,
+                            Arc::new(NoOpMetricsCollector),
+                        )
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap()
+                }
+            };
+
+        // Reference results under the default (process-wide) budget.
+        let expected: Vec<Vec<u64>> = vec![
+            sorted_row_ids(&global_search(0, None).await),
+            sorted_row_ids(&global_search(1, None).await),
+        ];
+        assert_eq!(expected[0].len(), K);
+
+        let budget = Arc::new(super::PreparePartitionBudget::new(1));
+        ivf_index.set_prepare_budget(budget.clone());
+
+        // Global top-k path, two searches sharing the single permit.
+        let (first, second) = futures::join!(global_search(0, None), global_search(1, None));
+        assert_eq!(sorted_row_ids(&first), expected[0]);
+        assert_eq!(sorted_row_ids(&second), expected[1]);
+        assert_eq!(budget.available(), 1);
+
+        // Streaming path (an early-stop control that never stops): every probed
+        // partition contributes a batch.
+        let streamed = global_search(0, Some(Arc::new(NeverStop))).await;
+        assert_eq!(streamed.len(), num_partitions);
+        assert_eq!(budget.available(), 1);
+
+        // Multi-query batch path.
+        let mut batch_query = queries[0].clone();
+        batch_query.key = Arc::new(
+            arrow_select::concat::concat(&[queries[0].key.as_ref(), queries[1].key.as_ref()])
+                .unwrap(),
+        );
+        let batched = index
+            .clone()
+            .search_partitions_batch(
+                batch_query,
+                probes
+                    .iter()
+                    .map(|(partitions, _)| partitions.clone())
+                    .collect(),
+                probes
+                    .iter()
+                    .map(|(_, q_c_dists)| q_c_dists.clone())
+                    .collect(),
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), 2);
+        assert_eq!(sorted_row_ids(&batched[..1]), expected[0]);
+        assert_eq!(sorted_row_ids(&batched[1..]), expected[1]);
+        assert_eq!(budget.available(), 1);
     }
 
     #[rstest]
