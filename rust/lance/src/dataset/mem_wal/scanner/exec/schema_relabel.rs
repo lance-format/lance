@@ -8,8 +8,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -123,9 +123,18 @@ impl Stream for SchemaRelabelStream {
             Poll::Ready(Some(Ok(batch))) => {
                 // Carry the row count explicitly: `try_new` infers it from the
                 // first column, which a column-less batch does not have.
+                // A struct's child names live in the array's own type, not in
+                // the schema above it, so a renamed child needs the array
+                // rebuilt. The children are reused, so it costs a pointer copy.
+                let columns: Vec<ArrayRef> = batch
+                    .columns()
+                    .iter()
+                    .zip(self.schema.fields())
+                    .map(|(column, field)| relabel_array(column, field.data_type()))
+                    .collect();
                 let relabeled = RecordBatch::try_new_with_options(
                     self.schema.clone(),
-                    batch.columns().to_vec(),
+                    columns,
                     &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
                 )
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
@@ -241,5 +250,36 @@ mod tests {
             error.contains("column types must match"),
             "expected a data type error, got: {error}"
         );
+    }
+}
+
+/// `array` with its type relabelled to `target`, rebuilding a struct whose
+/// children are named differently.
+///
+/// Only names differ here -- the layout is identical -- so an array whose type
+/// already matches, and any type this cannot express, is returned as it is and
+/// left for `RecordBatch::try_new` to reject.
+fn relabel_array(array: &ArrayRef, target: &DataType) -> ArrayRef {
+    if array.data_type() == target {
+        return Arc::clone(array);
+    }
+    let (DataType::Struct(_), DataType::Struct(target_fields)) = (array.data_type(), target) else {
+        return Arc::clone(array);
+    };
+    let Some(source) = array.as_any().downcast_ref::<StructArray>() else {
+        return Arc::clone(array);
+    };
+    if source.columns().len() != target_fields.len() {
+        return Arc::clone(array);
+    }
+    let children: Vec<ArrayRef> = source
+        .columns()
+        .iter()
+        .zip(target_fields)
+        .map(|(child, field)| relabel_array(child, field.data_type()))
+        .collect();
+    match StructArray::try_new(target_fields.clone(), children, source.nulls().cloned()) {
+        Ok(rebuilt) => Arc::new(rebuilt),
+        Err(_) => Arc::clone(array),
     }
 }
