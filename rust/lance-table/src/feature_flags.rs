@@ -54,14 +54,24 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// versions. Readers and writers must both understand the per-file version
 /// contract before either can safely access the dataset.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// The table uses stable row ids and carries a fragment reuse index.
+///
+/// Reserved ahead of its implementation. This build treats the bit as unknown
+/// (see `supported_flags_when`), so a build that knows the flag but not the
+/// handling behind it cannot open such a table.
+pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 9;
+pub const FLAG_UNKNOWN: u64 = 1 << 10;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
+// Same fence for the stable-row-id fragment-reuse bit: the released build's
+// boundary is bit 8, so anything at or above it is refused there.
+const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
+const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 
 /// Tagged FRI requires a reader that interprets its mappings and a writer that
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
@@ -197,6 +207,8 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
+    // Reserved, not implemented: see the flag's doc comment.
+    mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
     supported
 }
 
@@ -298,6 +310,42 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    /// Reserved ahead of its implementation: refused for reading and writing
+    /// until the handling lands, so a build from the gap cannot open the table.
+    #[test]
+    fn test_frag_reuse_with_stable_row_ids_flag_is_reserved_not_supported() {
+        use crate::format::{DataStorageFormat, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        assert!(!can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+        assert!(!can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+        manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+        assert!(matches!(
+            ensure_can_read_manifest(&manifest).unwrap_err(),
+            Error::NotSupported { .. }
+        ));
+        assert!(matches!(
+            ensure_can_write_manifest(&manifest).unwrap_err(),
+            Error::NotSupported { .. }
+        ));
+    }
 
     #[test]
     fn test_read_check() {
