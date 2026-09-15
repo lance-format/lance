@@ -463,6 +463,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
             paginated_lister: None,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         })
     }
 
