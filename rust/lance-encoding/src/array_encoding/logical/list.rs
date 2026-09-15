@@ -820,6 +820,48 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let start_index = self.rows_drained as usize;
+        let end_index = (self.rows_drained + num_rows) as usize;
+        let start_offset = self.offsets[start_index];
+        let mut safe_rows = num_rows;
+        if self.offset_type != DataType::Int64 {
+            let max_offset = start_offset.checked_add(i32::MAX as u64).ok_or_else(|| {
+                Error::invalid_input(format!("List offset overflow: start_offset={start_offset}"))
+            })?;
+            safe_rows = self.offsets[start_index + 1..=end_index]
+                .partition_point(|offset| *offset <= max_offset) as u64;
+        }
+
+        let safe_end_index = start_index + safe_rows as usize;
+        let requested_items = self.offsets[safe_end_index] - start_offset;
+        if requested_items > 0
+            && let Some(item_decoder) = &self.item_decoder
+        {
+            let safe_items = item_decoder.max_rows_to_drain(requested_items)?;
+            if safe_items < requested_items {
+                let max_item_offset = start_offset.checked_add(safe_items).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "List item offset overflow: start_offset={start_offset}, safe_items={safe_items}"
+                    ))
+                })?;
+                // An individual list may cross an item page boundary. Such a list was
+                // already representable in the source Arrow array, so retain one row
+                // when no complete list ends before the conservative page boundary.
+                safe_rows = (self.offsets[start_index + 1..=safe_end_index]
+                    .partition_point(|offset| *offset <= max_item_offset)
+                    as u64)
+                    .max(1);
+            }
+        }
+        if num_rows > 0 && safe_rows == 0 {
+            return Err(Error::not_supported_source(
+                "A single list row exceeds Arrow's i32 offset capacity".into(),
+            ));
+        }
+        Ok(safe_rows)
+    }
+
     fn num_rows(&self) -> u64 {
         self.num_rows
     }
@@ -1279,5 +1321,44 @@ impl FieldEncoder for ListFieldEncoder {
             Ok(columns)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list_page_decoder(offsets: Vec<u64>) -> ListPageDecoder {
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        ListPageDecoder {
+            unloaded: None,
+            validity: BooleanBuffer::new_set(offsets.len() - 1),
+            num_rows: offsets.len() as u64 - 1,
+            offsets: offsets.into(),
+            item_decoder: None,
+            rows_drained: 0,
+            rows_loaded: 0,
+            data_type: DataType::List(items_field.clone()),
+            items_field,
+            offset_type: DataType::Int32,
+        }
+    }
+
+    #[test]
+    fn test_list_page_limits_i32_offset_batches() {
+        let mut decoder = list_page_decoder(vec![0, i32::MAX as u64, i32::MAX as u64 + 1]);
+        assert_eq!(decoder.max_rows_to_drain(2).unwrap(), 1);
+
+        // Offsets are rebased for each output batch, so the following row is safe.
+        decoder.rows_drained = 1;
+        assert_eq!(decoder.max_rows_to_drain(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_list_page_rejects_single_row_over_i32_offset_limit() {
+        let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
+        let error = decoder.max_rows_to_drain(1).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("single list row"));
     }
 }

@@ -361,6 +361,30 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         &self.data_type
     }
 
+    fn rows_in_current_page(&self) -> Option<u64> {
+        self.children
+            .iter()
+            .filter_map(|child| child.rows_in_current_page())
+            .min()
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let safe_rows = self
+            .children
+            .iter()
+            .try_fold(num_rows, |safe_rows, child| {
+                child
+                    .max_rows_to_drain(num_rows)
+                    .map(|child_safe_rows| safe_rows.min(child_safe_rows))
+            })?;
+        if num_rows > 0 && safe_rows == 0 {
+            return Err(Error::not_supported(
+                "A single row exceeds Arrow's i32 offset capacity".to_string(),
+            ));
+        }
+        Ok(safe_rows)
+    }
+
     fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
         use crate::decoder::CANDIDATE_BATCH_SIZES;
         let mut out = [0u64; 8];

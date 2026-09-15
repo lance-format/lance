@@ -544,7 +544,7 @@ async fn test_decode(
         let batch = batch.task.await.unwrap();
         if let Some(expected) = expected.as_ref() {
             let actual = batch.column(0);
-            let expected_size = (batch_size as usize).min(expected.len() - offset);
+            let expected_size = actual.len();
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
             if expected.len() != actual.len() {

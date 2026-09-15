@@ -2761,7 +2761,10 @@ mod tests {
             let mut actual = actual.unwrap();
             let mut rows_to_verify = actual.num_rows() as u32;
             let expected_length = remaining.min(read_size);
-            assert_eq!(expected_length, rows_to_verify);
+            assert!(
+                rows_to_verify > 0 && rows_to_verify <= expected_length,
+                "decoded batch row count {rows_to_verify} must be between 1 and the requested maximum {expected_length}"
+            );
 
             while rows_to_verify > 0 {
                 let next_slice_len = (next_expected.num_rows() as u32).min(rows_to_verify);

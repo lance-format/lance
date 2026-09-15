@@ -222,6 +222,44 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
+
+    fn rows_in_current_page(&self) -> Option<u64> {
+        let DataType::FixedSizeList(_, dimension) = &self.data_type else {
+            return None;
+        };
+        let dimension = u64::try_from(*dimension).ok()?;
+        if dimension == 0 {
+            return None;
+        }
+        self.child.rows_in_current_page().map(|rows| {
+            // A child page can end in the middle of a fixed-size-list row. In
+            // that case one row must cross the boundary, but no later row may.
+            (rows / dimension).max(1)
+        })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        let DataType::FixedSizeList(_, dimension) = &self.data_type else {
+            return Err(Error::internal(
+                "FixedSizeListDecoder has non-FSL data type".to_string(),
+            ));
+        };
+        let dimension = u64::try_from(*dimension).map_err(|_| {
+            Error::invalid_input(format!(
+                "FixedSizeList dimension must be non-negative: dimension={dimension}"
+            ))
+        })?;
+        if dimension == 0 {
+            return Ok(num_rows);
+        }
+        let child_rows = num_rows.checked_mul(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "FixedSizeList row count overflow: num_rows={num_rows}, dimension={dimension}"
+            ))
+        })?;
+        let safe_child_rows = self.child.max_rows_to_drain(child_rows)?;
+        Ok(num_rows.min((safe_child_rows / dimension).max(1)))
+    }
 }
 
 #[derive(Debug)]

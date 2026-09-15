@@ -129,6 +129,10 @@ impl LogicalPageDecoder for BinaryPageDecoder {
         })
     }
 
+    fn max_rows_to_drain(&self, num_rows: u64) -> Result<u64> {
+        self.inner.max_rows_to_drain(num_rows)
+    }
+
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
