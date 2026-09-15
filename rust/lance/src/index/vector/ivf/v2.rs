@@ -3243,7 +3243,7 @@ mod tests {
         let size_without_coverage = entry.deep_size_of();
         // Memoize the chunk-budget size before the coverage exists; it must
         // still pick the coverage up once a later filter builds it.
-        assert_eq!(entry.size_bytes(), size_without_coverage);
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_without_coverage = cache.size_bytes().await;
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
@@ -3278,7 +3278,7 @@ mod tests {
         let second_rows = entry.partition_rows();
         assert!(Arc::ptr_eq(&first_rows, &second_rows));
         assert!(entry.deep_size_of() > size_without_coverage);
-        assert_eq!(entry.size_bytes(), entry.deep_size_of());
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_with_coverage = cache.size_bytes().await;
         assert!(cache_weight_with_coverage > cache_weight_without_coverage);
         assert!(cache_weight_with_coverage >= entry.deep_size_of());
