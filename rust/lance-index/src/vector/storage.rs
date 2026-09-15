@@ -278,6 +278,9 @@ impl QueryScratchCapacity {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DistanceCalculatorOptions {
     pub approx_mode: ApproxMode,
+    /// Prefer a distance calculator with minimal per-query setup when the
+    /// caller knows that the setup cost cannot be amortized over much work.
+    pub prefer_low_setup_cost: bool,
 }
 
 #[derive(Debug)]
@@ -548,6 +551,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
     distance_type: DistanceType,
+    quantizer: Option<Quantizer>,
     metadata: Q::Metadata,
 
     ivf: IvfModel,
@@ -556,7 +560,9 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
+        self.quantizer.deep_size_of_children(context)
+            + self.metadata.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
     }
 }
 
@@ -616,10 +622,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let bytes = reader.read_global_buffer(pos).await?;
             metadata.parse_buffer(bytes)?;
         }
+        let quantizer = if Q::retain_quantizer_for_partition_storage() {
+            Some(Q::from_metadata(&metadata, distance_type)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             reader,
             distance_type,
+            quantizer,
             metadata,
             ivf,
             frag_reuse_index,
@@ -648,9 +660,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
+        let quantizer = if Q::retain_quantizer_for_partition_storage() {
+            Q::from_metadata(&metadata, distance_type).ok()
+        } else {
+            None
+        };
         Self {
             reader,
             distance_type,
+            quantizer,
             metadata,
             ivf,
             frag_reuse_index,
@@ -674,8 +692,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {
-        let metadata = self.metadata();
-        Q::from_metadata(metadata, self.distance_type)
+        match &self.quantizer {
+            Some(quantizer) => Ok(quantizer.clone()),
+            None => Q::from_metadata(self.metadata(), self.distance_type),
+        }
     }
 
     pub fn metadata(&self) -> &Q::Metadata {
@@ -730,12 +750,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        Q::Storage::try_from_batch_with_remapper(
-            batch,
-            self.metadata(),
-            self.distance_type,
-            self.frag_reuse_index.clone(),
-        )
+        match &self.quantizer {
+            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                batch,
+                quantizer,
+                self.metadata(),
+                self.distance_type,
+                self.frag_reuse_index.clone(),
+            ),
+            None => Q::Storage::try_from_batch_with_remapper(
+                batch,
+                self.metadata(),
+                self.distance_type,
+                self.frag_reuse_index.clone(),
+            ),
+        }
     }
 
     /// Materialize a compact partition for the parallel prewarm path.
@@ -755,14 +784,24 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         let frag_reuse_index = self.frag_reuse_index.clone();
+        let quantizer = self.quantizer.clone();
         spawn_prewarm_materialization(move || {
             let batch = compact_prewarm_batches(batches)?;
-            Q::Storage::try_from_batch_with_remapper(
-                batch,
-                &metadata,
-                distance_type,
-                frag_reuse_index,
-            )
+            match &quantizer {
+                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                    batch,
+                    quantizer,
+                    &metadata,
+                    distance_type,
+                    frag_reuse_index,
+                ),
+                None => Q::Storage::try_from_batch_with_remapper(
+                    batch,
+                    &metadata,
+                    distance_type,
+                    frag_reuse_index,
+                ),
+            }
         })
         .await
     }
