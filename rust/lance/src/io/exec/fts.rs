@@ -2281,6 +2281,8 @@ impl Drop for SharedFtsScorerProducer {
 
 /// Owns one restricted Match plan's scorer lifecycle. Each execution gets a
 /// fresh producer/consumer pair, including after failure or child replacement.
+/// Re-execution still requires replayable children: an overlay-stale scalar
+/// prefilter can contain a consumable `OneShotExec` that this owner cannot replay.
 #[derive(Debug)]
 pub(crate) struct SharedFtsScorerExec {
     input: Arc<dyn ExecutionPlan>,
@@ -5672,9 +5674,8 @@ mod tests {
             input,
             Arc::new(SharedFtsScorer::new()),
         ));
-        let error = match owner.execute(0, Arc::new(TaskContext::default())) {
-            Ok(_) => panic!("a scorer owner without a producer must fail before execution"),
-            Err(error) => error,
+        let Err(error) = owner.execute(0, Arc::new(TaskContext::default())) else {
+            panic!("a scorer owner without a producer must fail before execution");
         };
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("got 0 and 0"));

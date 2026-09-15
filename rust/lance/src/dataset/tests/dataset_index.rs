@@ -58,6 +58,7 @@ use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
+use lance_select::IndexExprResult;
 
 use datafusion::common::{assert_contains, assert_not_contains};
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
@@ -4498,6 +4499,70 @@ async fn test_fts_9058_restricted_match_corpus_stability(
 }
 
 #[rstest]
+#[case::top(0)]
+#[case::offset(1)]
+#[tokio::test]
+async fn test_fts_9058_default_match_uses_global_corpus(#[case] offset: i64) {
+    let raw_rows: Vec<_> = [(0, "alpha"), (1, "beta")]
+        .into_iter()
+        .chain((2..12).map(|id| (id, "alpha")))
+        .collect();
+    let fragments = [&raw_rows[..2], &raw_rows[2..]]
+        .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect());
+    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let (_, mut expected) = raw_match_oracle(&raw_rows, "alpha beta");
+    expected.retain(|(id, _)| *id < 2);
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        // Exercise the reported query without explicitly resolving fuzziness
+        // or document granularity, including the scanner's top-k offset.
+        let query = MatchQuery::new("alpha beta".to_owned()).with_column(Some("text".to_owned()));
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap()
+            .prefilter(true)
+            .filter("id < 2")
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap();
+        let plan = tokio::time::timeout(Duration::from_secs(10), scanner.explain_plan(false))
+            .await
+            .unwrap()
+            .unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(10), scanner.try_into_batch())
+            .await
+            .unwrap()
+            .unwrap();
+        observations.push((stage, plan, batch));
+    }
+    for (stage, plan, batch) in observations {
+        if stage == "before_optimize" {
+            assert_contains!(&plan, "MatchCorpus");
+        }
+        assert_eq!(batch.num_rows(), 1, "{stage}: {plan}");
+        let (expected_id, expected_score) = expected[offset as usize];
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().value(0),
+            expected_id
+        );
+        let score = batch[SCORE_COL].as_primitive::<Float32Type>().value(0);
+        assert!(
+            (f64::from(score) - expected_score).abs() < 1e-5,
+            "{stage}: score {score} differs from {expected_score}; {plan}"
+        );
+    }
+}
+
+#[rstest]
 #[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 1]), &[0, 1, 2, 3, 4])]
 #[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[5, 6, 7])]
 #[case::empty_fragments(RestrictedMatchDomain::Fragments(&[]), &[])]
@@ -4508,9 +4573,10 @@ async fn test_fts_9058_restricted_match_corpus_stability(
 async fn test_fts_9058_candidate_domains(
     #[case] domain: RestrictedMatchDomain,
     #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
 ) {
     let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
-    let mut dataset = restricted_match_dataset(&fragments, 1, false).await;
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
     let observations = restricted_match_maintenance_observations(
         &mut dataset,
         domain,
@@ -4520,6 +4586,95 @@ async fn test_fts_9058_candidate_domains(
     .await;
     assert_restricted_match_oracle(
         &format!("9058-domain-{domain:?}.json"),
+        &RESTRICTED_MATCH_CORPUS,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::allow("id = 6", &[6])]
+#[case::block("id != 1", &[0, 2, 3, 4, 5, 6, 7])]
+#[tokio::test]
+async fn test_fts_9058_scalar_index_candidates(
+    #[case] filter: &'static str,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    // Build the candidate index after every append so it covers the two
+    // residual fragments as well as the fragment with the text index.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = MatchQuery::new("alpha beta".to_owned()).with_column(Some("text".to_owned()));
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .unwrap()
+        .prefilter(true)
+        .filter(filter)
+        .unwrap();
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut pending = vec![plan];
+    let mut candidate_indices = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.name() == "FlatMatchQueryExec" {
+            let children = node.children();
+            assert_eq!(children.len(), 2);
+            assert_eq!(children[1].name(), "ScalarIndexExec");
+            candidate_indices.push(children[1].clone());
+        }
+        pending.extend(node.children().into_iter().cloned());
+    }
+    assert_eq!(candidate_indices.len(), 1);
+    let batches = tokio::time::timeout(
+        Duration::from_secs(10),
+        datafusion::physical_plan::collect(
+            candidate_indices.pop().unwrap(),
+            get_session_context(&LanceExecutionOptions::default()).task_ctx(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(batches.len(), 1);
+    let (selection, covered_fragments) = IndexExprResult::deserialize(&batches[0]).unwrap();
+    assert!(selection.is_exact());
+    assert_eq!(covered_fragments.len(), 3);
+    assert_eq!(selection.upper.block_list().is_some(), filter == "id != 1");
+
+    let domain = RestrictedMatchDomain::Filter(filter);
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    for observation in &observations {
+        let plan = observation.plan.as_ref().unwrap();
+        if observation.stage == "before_optimize" {
+            assert_contains!(plan, "MatchCorpus");
+        }
+        assert_contains!(plan, "ScalarIndexQuery:");
+        assert_contains!(plan, "@id_idx(BTree)");
+    }
+    assert_restricted_match_oracle(
+        filter,
         &RESTRICTED_MATCH_CORPUS,
         domain,
         candidate_ids,
