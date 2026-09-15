@@ -1660,7 +1660,14 @@ fn conform_to_storage_schema(
         let name = field.name();
         let carried = field_id_of(field)
             .and_then(|id| by_field_id.get(&id).map(|c| (*c).clone()))
-            .or_else(|| batch.column_by_name(name).cloned());
+            .or_else(|| match batch.schema().column_with_name(name) {
+                // The entry carries this name under a different id, so it is a
+                // different column: a rename freed the name and something else
+                // took it. Absent, not carried.
+                Some((_, f)) if field_id_of(f).is_some() && field_id_of(field).is_some() => None,
+                Some((i, _)) => Some(batch.column(i).clone()),
+                None => None,
+            });
         if let Some(column) = carried {
             columns.push(if column.data_type() == field.data_type() {
                 column
