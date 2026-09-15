@@ -2017,7 +2017,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(path_str.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "transaction_id": "txn-123"
+                "transaction_id": "txn-123",
+                "num_inserted_rows": 2,
+                "version": 5
             })))
             .mount(&mock_server)
             .await;
@@ -2042,6 +2044,8 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.transaction_id, Some("txn-123".to_string()));
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.version, Some(5));
     }
 
     // Integration tests for DynamicContextProvider

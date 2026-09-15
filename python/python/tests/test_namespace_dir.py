@@ -1469,6 +1469,8 @@ class TestDataManipulation:
         )
         response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
         assert response is not None
+        assert response.num_inserted_rows == 2
+        assert response.version == 2
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
