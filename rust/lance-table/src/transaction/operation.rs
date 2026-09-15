@@ -107,6 +107,9 @@ pub enum Operation {
     /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
+        /// Rows whose values changed, for row-level `last_updated` stamping.
+        /// `None` stamps every row.
+        replaced_offsets: Option<UpdatedFragmentOffsets>,
     },
     /// Attach overlay files to fragments, supplying new values for a subset of
     /// `(physical offset, field)` cells without rewriting the fragments' base
