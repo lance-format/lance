@@ -2236,6 +2236,7 @@ struct AndWindowStats {
     candidates_returned: usize,
     score_first_rejections: usize,
     pairwise_intersections: usize,
+    windows_sliced: usize,
 }
 
 impl Eq for TailPosting {}
@@ -4248,6 +4249,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         'window: loop {
+            #[cfg(test)]
+            {
+                self.and_window_stats.windows_sliced += 1;
+            }
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
@@ -4295,6 +4300,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             wins.clear();
             let mut skip_window = false;
             let mut exhausted = false;
+            // When a clause has no document in the window, the conjunction
+            // cannot match before that clause's next document, so the next
+            // window starts there instead of at the next block boundary. A
+            // sparse lead then drives the traversal and dense followers skip
+            // whole blocks by metadata instead of being sliced block by block.
+            let mut jump_to: u64 = 0;
             for posting in &self.lead {
                 let PostingList::Compressed(ref list) = posting.list else {
                     unreachable!("bulk AND requires compressed postings");
@@ -4312,9 +4323,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // has no conjunction match. If this was the clause's last
                     // block and it is fully behind the target, the clause is
                     // exhausted and the conjunction is done.
-                    if block_idx + 1 >= list.blocks.len()
-                        && state.doc_ids.last().is_none_or(|&doc| doc < target32)
-                    {
+                    if lo < state.doc_ids.len() {
+                        jump_to = u64::from(state.doc_ids[lo]);
+                    } else if block_idx + 1 < list.blocks.len() {
+                        jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
+                    } else {
                         exhausted = true;
                     }
                     skip_window = true;
@@ -4621,7 +4634,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if win_end == TERMINATED_DOC_ID {
                 break;
             }
-            target = win_end + 1;
+            target = (win_end + 1).max(jump_to);
         }
 
         metrics.record_comparisons(num_comparisons);
@@ -10081,6 +10094,81 @@ mod tests {
                 .map(|posting| posting.impact_bound_computations())
                 .sum::<usize>(),
             0
+        );
+    }
+
+    /// A sparse lead over dense followers must drive the window traversal:
+    /// after an empty window the next one starts at the lead's next document,
+    /// so the number of sliced windows tracks the lead's documents rather than
+    /// the followers' block count. Results stay identical to the classic loop.
+    #[rstest]
+    fn bulk_and_windows_jump_to_next_lead_document(
+        #[values(2, 4)] num_clauses: usize,
+        #[values(0.0, 0.05)] initial_floor: f32,
+    ) {
+        let num_docs = MAX_POSTING_BLOCK_SIZE * 64;
+        let lead_stride = 2_000;
+        let docs = CostOnlyDocuments {
+            total_docs: num_docs,
+            visible_cost_upper_bound: num_docs,
+        };
+        let run = |mode| {
+            let postings = (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = if term == 0 {
+                        (0..num_docs as u32)
+                            .step_by(lead_stride)
+                            .collect::<Vec<_>>()
+                    } else {
+                        (0..num_docs as u32)
+                            .filter(|doc| doc % 3 != term as u32)
+                            .collect()
+                    };
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            (0..len).map(|index| 1 + (index % 5) as u32).collect(),
+                            vec![1; len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shared_floor = Arc::new(AtomicU32::new(initial_floor.to_bits()));
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_shared_threshold(shared_floor.clone());
+            let mut rows = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (
+                rows,
+                shared_floor.load(Ordering::Relaxed),
+                wand.and_window_stats.windows_sliced,
+            )
+        };
+        let (classic, classic_floor, _) = run(BulkAndMode::Off);
+        let (bulk, bulk_floor, windows) = run(BulkAndMode::On);
+        assert_eq!(bulk, classic);
+        assert_eq!(bulk_floor, classic_floor);
+        let lead_docs = num_docs / lead_stride + 1;
+        let follower_blocks = (num_docs * 2 / 3) / MAX_POSTING_BLOCK_SIZE;
+        assert!(
+            windows <= 2 * lead_docs + 2,
+            "sliced {windows} windows for {lead_docs} lead docs; followers have {follower_blocks} blocks each"
         );
     }
 
