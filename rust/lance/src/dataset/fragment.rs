@@ -2140,7 +2140,7 @@ impl FileFragment {
         for field in write_schema.fields() {
             if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
                 return Err(Error::invalid_input(format!(
-                    "Column {} is a reversed metadata column and cannot be updated",
+                    "Column {} is a reserved metadata column and cannot be updated",
                     field.name()
                 )));
             }

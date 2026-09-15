@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.compaction.CompactionOptions;
+import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -118,6 +119,31 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
     }
+  }
+
+  @Test
+  void testWriteRejectsNegativeDataCacheBytes(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("negative_data_cache_bytes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      WriteParams params =
+          new WriteParams.Builder()
+              .withFileWriteOptions(FileWriteOptions.builder().dataCacheBytes(-1).build())
+              .build();
+
+      assertThrows(
+          IllegalArgumentException.class, () -> testDataset.createDatasetWithWriteParams(params));
+    }
+  }
+
+  @Test
+  void testWriteDatasetBuilderRejectsNullFileWriteOptions() {
+    NullPointerException error =
+        assertThrows(
+            NullPointerException.class, () -> new WriteDatasetBuilder().fileWriteOptions(null));
+
+    assertEquals("fileWriteOptions must not be null", error.getMessage());
   }
 
   @Test

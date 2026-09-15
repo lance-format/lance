@@ -24,7 +24,6 @@
 //!
 //! Output is plain stdout, one line per checkpoint, captured by the runner.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::path::PathBuf;
