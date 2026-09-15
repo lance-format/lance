@@ -68,23 +68,24 @@ impl BinaryQuantization {
 /// Use the sign bit of the float vector to represent the binary vector.
 fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
     let iter = data.chunks_exact(8);
-    iter.clone()
-        .map(|c| {
-            // Auto vectorized.
-            // Before changing this code, please check the assembly output.
-            let mut bits: u8 = 0;
-            c.iter().enumerate().for_each(|(idx, v)| {
-                bits |= (v.is_sign_positive() as u8) << idx;
-            });
-            bits
-        })
-        .chain(once(0).map(move |_| {
-            let mut bits: u8 = 0;
-            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
-                bits |= (v.is_sign_positive() as u8) << idx;
-            });
-            bits
-        }))
+    // Only append a byte for the tail when a tail exists: an input whose
+    // length is a multiple of 8 must yield exactly ceil(len / 8) bytes.
+    let has_remainder = !iter.remainder().is_empty();
+    let mut remainder_bits: u8 = 0;
+    iter.remainder()
+        .iter()
+        .enumerate()
+        .for_each(|(idx, v)| remainder_bits |= (v.is_sign_positive() as u8) << idx);
+    iter.map(|c| {
+        // Auto vectorized.
+        // Before changing this code, please check the assembly output.
+        let mut bits: u8 = 0;
+        c.iter().enumerate().for_each(|(idx, v)| {
+            bits |= (v.is_sign_positive() as u8) << idx;
+        });
+        bits
+    })
+    .chain(once(remainder_bits).filter(move |_| has_remainder))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +208,10 @@ impl Default for RQBuildParams {
 mod tests {
     use super::*;
 
+    use arrow_array::types::UInt8Type;
+    use arrow_array::{FixedSizeListArray, Float32Array};
     use half::{bf16, f16};
+    use lance_arrow::FixedSizeListArrayExt;
 
     fn test_bq<T: Float>() {
         let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
@@ -225,6 +229,62 @@ mod tests {
         test_bq::<f16>();
         test_bq::<f32>();
         test_bq::<f64>();
+    }
+
+    #[test]
+    fn test_binary_quantization_length_multiple_of_eight() {
+        // A full-chunk input must produce exactly ceil(len / 8) bytes; the
+        // remainder byte may only be appended when a remainder exists.
+        let data: Vec<f32> = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+            .iter()
+            .cycle()
+            .take(16)
+            .copied()
+            .collect();
+        let result = binary_quantization(&data).collect::<Vec<_>>();
+        assert_eq!(result, vec![0b01010101, 0b01010101]);
+    }
+
+    #[test]
+    fn test_transform_packs_rows_at_ceil_dim_over_eight() {
+        // The public entry point returns a flat array, so the per-row width is
+        // the caller's ceil(dim / 8). A dimension that is a multiple of 8 used
+        // to get one extra byte per row here.
+        const DIM: usize = 8;
+        const ROWS: usize = 3;
+        let values = Float32Array::from_iter_values(
+            (0..ROWS * DIM).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }),
+        );
+        let data = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let codes = BinaryQuantization::default().transform(&data).unwrap();
+
+        assert_eq!(codes.len(), ROWS * DIM.div_ceil(8));
+        assert_eq!(
+            codes.as_primitive::<UInt8Type>().values(),
+            &[0b01010101; ROWS]
+        );
+    }
+
+    #[test]
+    fn test_transform_keeps_the_tail_byte_for_a_partial_chunk() {
+        // The other branch: a dimension that is not a multiple of 8 still gets
+        // its tail byte, so rows stay ceil(dim / 8) wide either way.
+        const DIM: usize = 12;
+        const ROWS: usize = 2;
+        let values = Float32Array::from_iter_values(
+            (0..ROWS * DIM).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }),
+        );
+        let data = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let codes = BinaryQuantization::default().transform(&data).unwrap();
+
+        assert_eq!(codes.len(), ROWS * DIM.div_ceil(8));
+        // 8 alternating bits, then the 4 that remain.
+        assert_eq!(
+            codes.as_primitive::<UInt8Type>().values(),
+            &[0b01010101, 0b00000101, 0b01010101, 0b00000101]
+        );
     }
 
     #[test]
