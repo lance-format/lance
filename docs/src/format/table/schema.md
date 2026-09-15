@@ -45,8 +45,8 @@ Data types are represented as strings in the schema and can be grouped into seve
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `string` | `Utf8` | Variable-length UTF-8 encoded string |
-| `binary` | `Binary` | Variable-length binary data |
+| `string` | `Utf8`, `Utf8View` | Variable-length UTF-8 encoded string |
+| `binary` | `Binary`, `BinaryView` | Variable-length binary data |
 | `large_string` | `LargeUtf8` | Variable-length UTF-8 string (supports large offsets) |
 | `large_binary` | `LargeBinary` | Variable-length binary data (supports large offsets) |
 
@@ -421,9 +421,9 @@ When converting between logical types and Arrow types, Lance uses the following 
 | `Arrow::Float16` | `halffloat` |
 | `Arrow::Float32` | `float` |
 | `Arrow::Float64` | `double` |
-| `Arrow::Utf8` | `string` |
+| `Arrow::Utf8`, `Arrow::Utf8View` | `string` |
 | `Arrow::LargeUtf8` | `large_string` |
-| `Arrow::Binary` | `binary` |
+| `Arrow::Binary`, `Arrow::BinaryView` | `binary` |
 | `Arrow::LargeBinary` | `large_binary` |
 | `Arrow::Decimal128(p, s)` | `decimal:128:p:s` |
 | `Arrow::Decimal256(p, s)` | `decimal:256:p:s` |
