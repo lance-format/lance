@@ -12,7 +12,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
 use lance_core::Result;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
 use tracing::instrument;
 
 use crate::dataset::mem_wal::TOMBSTONE;
@@ -63,19 +63,52 @@ pub struct LsmScanPlanner {
 /// What the base table calls each of its field ids, if a base arm is present.
 ///
 /// A rename changes a field's name and keeps its id, so this is what turns a
-/// generation's stored names into the names every other arm uses.
+/// generation's stored names into the names every other arm uses. Nested fields
+/// are included: a struct's child can be renamed on its own, which changes the
+/// parent's Arrow type without changing the parent's name.
 fn base_field_names(sources: &[LsmDataSource]) -> Option<HashMap<i32, String>> {
+    fn collect(fields: &[LanceField], into: &mut HashMap<i32, String>) {
+        for field in fields {
+            into.insert(field.id, field.name.clone());
+            collect(&field.children, into);
+        }
+    }
     sources.iter().find_map(|source| match source {
-        LsmDataSource::BaseTable { dataset } => Some(
-            dataset
-                .schema()
-                .fields
-                .iter()
-                .map(|f| (f.id, f.name.clone()))
-                .collect(),
-        ),
+        LsmDataSource::BaseTable { dataset } => {
+            let mut names = HashMap::new();
+            collect(&dataset.schema().fields, &mut names);
+            Some(names)
+        }
         _ => None,
     })
+}
+
+/// One field renamed to the base table's name for its id, recursing into a
+/// struct's children so a renamed child is matched by its own id.
+fn rename_field(
+    field: &Field,
+    generation_fields: &[LanceField],
+    base_names: &HashMap<i32, String>,
+    renamed: &mut bool,
+) -> Field {
+    let Some(source) = generation_fields.iter().find(|f| f.name == *field.name()) else {
+        return field.as_ref().clone();
+    };
+    let field = match base_names.get(&source.id).filter(|n| *n != field.name()) {
+        Some(name) => {
+            *renamed = true;
+            field.as_ref().clone().with_name(name)
+        }
+        None => field.as_ref().clone(),
+    };
+    let DataType::Struct(children) = field.data_type() else {
+        return field;
+    };
+    let children: Vec<Field> = children
+        .iter()
+        .map(|child| rename_field(child, &source.children, base_names, renamed))
+        .collect();
+    field.with_data_type(DataType::Struct(children.into()))
 }
 
 /// Rename `plan`'s output columns to the names the base table uses for the same
@@ -93,29 +126,12 @@ fn relabel_to_base_names(
     let Some(base_names) = base_names else {
         return plan;
     };
-    let ids: HashMap<&str, i32> = generation_schema
-        .fields
-        .iter()
-        .map(|f| (f.name.as_str(), f.id))
-        .collect();
     let schema = plan.schema();
     let mut renamed = false;
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|field| {
-            let base_name = ids
-                .get(field.name().as_str())
-                .and_then(|id| base_names.get(id))
-                .filter(|name| *name != field.name());
-            match base_name {
-                Some(name) => {
-                    renamed = true;
-                    field.as_ref().clone().with_name(name)
-                }
-                None => field.as_ref().clone(),
-            }
-        })
+        .map(|field| rename_field(field, &generation_schema.fields, base_names, &mut renamed))
         .collect();
     if !renamed {
         return plan;
