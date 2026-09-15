@@ -527,13 +527,19 @@ impl EncodingPipeline {
         Ok(())
     }
 
+    /// Verify each schema field's nullability against the array that will be encoded
+    /// for it.
+    ///
+    /// The array is selected by name, the same way [`Self::encode_batch`] selects it: a
+    /// batch may order its columns differently from the schema or carry extra ones, so
+    /// zipping `batch.columns()` positionally would validate an array belonging to a
+    /// different field. A column the schema names but the batch lacks is left to
+    /// `encode_batch`, which reports it.
     fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
-            .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(column.as_ref(), field)?;
+        for field in self.schema.as_ref().unwrap().fields.iter() {
+            if let Some(column) = batch.column_by_name(&field.name) {
+                Self::verify_field_nullability(column.as_ref(), field)?;
+            }
         }
         Ok(())
     }
