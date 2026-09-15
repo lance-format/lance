@@ -794,6 +794,38 @@ impl CompoundQueryExec {
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
     }
+
+    /// The same leaf with a different index-level top-k.
+    ///
+    /// Over-fetching a bounded FTS arm changes exactly one thing —
+    /// `FtsSearchParams::limit` — but these nodes have no `with_fetch`, because
+    /// the cut lives in the index params rather than in a fetch node. Callers
+    /// have therefore rebuilt through a public constructor, which silently
+    /// drops whatever that constructor does not take: the segment selection,
+    /// the overlay block, the external mask, the prepared and shared scorers.
+    /// Widening a leaf's segment or mask domain re-admits documents this plan
+    /// deliberately excluded, so the copy has to be total — and has to stay
+    /// total as fields are added, which a constructor call cannot promise.
+    ///
+    /// Metrics start fresh; the tokenized-query cache carries over because it
+    /// is a pure function of `query`, which is unchanged.
+    pub fn with_index_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
+            segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2769,6 +2801,42 @@ impl MatchQueryExec {
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
     }
+
+    /// The same leaf with a different index-level top-k.
+    ///
+    /// Over-fetching a bounded FTS arm changes exactly one thing —
+    /// `FtsSearchParams::limit` — but these nodes have no `with_fetch`, because
+    /// the cut lives in the index params rather than in a fetch node. Callers
+    /// have therefore rebuilt through a public constructor, which silently
+    /// drops whatever that constructor does not take: the segment selection,
+    /// the overlay block, the external mask, the prepared and shared scorers.
+    /// Widening a leaf's segment or mask domain re-admits documents this plan
+    /// deliberately excluded, so the copy has to be total — and has to stay
+    /// total as fields are added, which a constructor call cannot promise.
+    ///
+    /// Metrics start fresh; the tokenized-query cache carries over because it
+    /// is a pure function of `query`, which is unchanged.
+    pub fn with_index_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_query: self.prepared_query.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
+            document_granularity: self.document_granularity,
+            schema: self.schema.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl ExecutionPlan for MatchQueryExec {
@@ -4082,6 +4150,41 @@ impl PhraseQueryExec {
     /// Pre-resolved selections preserve the supplied metadata order.
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
+    }
+
+    /// The same leaf with a different index-level top-k.
+    ///
+    /// Over-fetching a bounded FTS arm changes exactly one thing —
+    /// `FtsSearchParams::limit` — but these nodes have no `with_fetch`, because
+    /// the cut lives in the index params rather than in a fetch node. Callers
+    /// have therefore rebuilt through a public constructor, which silently
+    /// drops whatever that constructor does not take: the segment selection,
+    /// the overlay block, the external mask, the prepared and shared scorers.
+    /// Widening a leaf's segment or mask domain re-admits documents this plan
+    /// deliberately excluded, so the copy has to be total — and has to stay
+    /// total as fields are added, which a constructor call cannot promise.
+    ///
+    /// Metrics start fresh; the tokenized-query cache carries over because it
+    /// is a pure function of `query`, which is unchanged.
+    pub fn with_index_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
+            document_granularity: self.document_granularity,
+            schema: self.schema.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
     }
 }
 
@@ -5588,6 +5691,63 @@ mod tests {
         assert!(
             compound_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
             "compound FTS scorer metrics missing partitions_searched: {compound_line}"
+        );
+    }
+
+    /// Changing the top-k must not change *what* a leaf searches. The hazard is
+    /// specific: rebuilding through a public constructor drops the segment
+    /// selection, so an explicitly-scoped leaf silently widens to all committed
+    /// segments and re-admits documents the plan excluded as superseded.
+    #[tokio::test]
+    async fn with_index_limit_preserves_the_execution_domain() {
+        let (dataset, segments, _fragment_ids) = create_segment_selection_fixture().await;
+        let query = MatchQuery::new("quick".to_string())
+            .with_column(Some("text".to_string()))
+            .with_document_granularity(DocumentGranularity::Row);
+        let params = FtsSearchParams::default().with_limit(Some(5));
+        let scoped_uuids = vec![segments[0].uuid];
+
+        let scoped = MatchQueryExec::new_with_segment_uuids(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            scoped_uuids.clone(),
+        )
+        .unwrap();
+        assert_eq!(scoped.explicit_segment_uuids(), Some(scoped_uuids.clone()));
+        assert_eq!(scoped.params().limit, Some(5));
+
+        let inflated = scoped.with_index_limit(20);
+        assert_eq!(inflated.params().limit, Some(20), "limit must change");
+        assert_eq!(
+            inflated.explicit_segment_uuids(),
+            Some(scoped_uuids),
+            "segment selection must survive the limit change"
+        );
+        assert_eq!(
+            inflated.query().terms,
+            scoped.query().terms,
+            "the query itself is untouched"
+        );
+
+        // A leaf resolved to explicit segment metadata keeps that form too.
+        let preset = MatchQueryExec::new_with_segments(
+            dataset,
+            query,
+            params,
+            PreFilterSource::None,
+            segments,
+        )
+        .unwrap();
+        let preset_len = preset.preset_segments().map(<[_]>::len);
+        assert_eq!(
+            preset
+                .with_index_limit(20)
+                .preset_segments()
+                .map(<[_]>::len),
+            preset_len,
+            "preset segments must survive the limit change"
         );
     }
 
