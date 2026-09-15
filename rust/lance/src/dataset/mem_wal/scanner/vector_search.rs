@@ -28,11 +28,13 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::planner::stored_names;
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::arrow_schema_with_field_ids;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -495,9 +497,24 @@ impl LsmVectorSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols =
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one, so
+                // projecting the table's names would ask for a column that is
+                // not there.
+                let stored = arrow_schema_with_field_ids(dataset.schema());
+                let names = stored_names(&stored, &self.base_schema);
+                let wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                let cols: Vec<&str> = wanted
+                    .iter()
+                    .filter_map(|name| {
+                        names
+                            .iter()
+                            .find(|(_, table_name)| *table_name == name)
+                            .map(|(stored_name, _)| stored_name.as_str())
+                    })
+                    .collect();
+                scanner.project(&cols)?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
