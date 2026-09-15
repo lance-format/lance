@@ -18,6 +18,8 @@
 //!   SPBENCH_NPROBES        default 32
 //!   SPBENCH_QUERIES        distinct query vectors, default 1024 (same seeded
 //!                          scheme as the fixture's ingest/query generator)
+//!   SPBENCH_INDEX_CACHE_MB session index-cache capacity in MiB; 0/unset keeps
+//!                          the 6 GiB default (STEP 0 diagnostic lever)
 //!
 //! Run:
 //!   SPBENCH_URI=/nvme/spbench.lance SPBENCH_VERSION=<S3> \
@@ -33,11 +35,31 @@ use std::time::{Duration, Instant};
 
 use arrow_schema::DataType;
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 /// Must match tests/sp_bench.rs so queries are in-distribution.
 const QUERY_SEED: u64 = 0x5BEC_0002;
+
+/// Open the fixture at `version`, honoring the `SPBENCH_INDEX_CACHE_MB` knob.
+///
+/// The stable-partition mapping and its row-map live in the session index
+/// cache, so shrinking that cache is the lever the STEP 0 diagnostic uses to
+/// tell block-level row-map re-reads (constant-high `_fri` regardless of cache
+/// size) apart from whole-mapping eviction (`_fri` low with a big cache, high
+/// with a tiny one). Unset / `0` keeps the 6 GiB default.
+async fn open_fixture(uri: &str, version: u64) -> lance::Result<Dataset> {
+    let mut builder = DatasetBuilder::from_uri(uri).with_version(version);
+    if let Some(mb) = std::env::var("SPBENCH_INDEX_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+    {
+        builder = builder.with_index_cache_size_bytes(mb * 1024 * 1024);
+    }
+    builder.load().await
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -199,13 +221,13 @@ async fn main() {
     let topk = env_usize("SPBENCH_TOPK", 10);
     let nprobes = env_usize("SPBENCH_NPROBES", 32);
     let num_queries = env_usize("SPBENCH_QUERIES", 1024);
+    let index_cache_mb =
+        std::env::var("SPBENCH_INDEX_CACHE_MB").unwrap_or_else(|_| "0".to_string());
+    println!("SPBENCH_READ config index_cache_mb={index_cache_mb}");
 
-    let dataset = Dataset::open(&uri)
+    let dataset = open_fixture(&uri, version)
         .await
-        .expect("failed to open dataset")
-        .checkout_version(version)
-        .await
-        .expect("failed to checkout SPBENCH_VERSION");
+        .expect("failed to open dataset at SPBENCH_VERSION");
 
     // Discover the vector dimension from the schema.
     let field = dataset
@@ -244,12 +266,7 @@ async fn main() {
 
     // COLD measurement: fresh open (fresh session caches), single query.
     {
-        let cold = Dataset::open(&uri)
-            .await
-            .expect("cold open failed")
-            .checkout_version(version)
-            .await
-            .expect("cold checkout failed");
+        let cold = open_fixture(&uri, version).await.expect("cold open failed");
         let store = cold
             .object_store(None)
             .await
