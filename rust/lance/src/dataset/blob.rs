@@ -5995,6 +5995,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            preconditions: Vec::new(),
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)
@@ -6178,6 +6179,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            preconditions: Vec::new(),
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)
