@@ -3,7 +3,7 @@
 
 //! Query planner for LSM scanner.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -89,12 +89,17 @@ fn rename_field(
     field: &Field,
     generation_fields: &[LanceField],
     base_names: &HashMap<i32, String>,
+    taken: &HashSet<&str>,
     renamed: &mut bool,
 ) -> Field {
     let Some(source) = generation_fields.iter().find(|f| f.name == *field.name()) else {
         return field.as_ref().clone();
     };
-    let field = match base_names.get(&source.id).filter(|n| *n != field.name()) {
+    let rename = base_names
+        .get(&source.id)
+        .filter(|n| *n != field.name())
+        .filter(|n| !taken.contains(n.as_str()));
+    let field = match rename {
         Some(name) => {
             *renamed = true;
             field.as_ref().clone().with_name(name)
@@ -106,7 +111,7 @@ fn rename_field(
     };
     let children: Vec<Field> = children
         .iter()
-        .map(|child| rename_field(child, &source.children, base_names, renamed))
+        .map(|child| rename_field(child, &source.children, base_names, taken, renamed))
         .collect();
     field.with_data_type(DataType::Struct(children.into()))
 }
@@ -115,9 +120,14 @@ fn rename_field(
 /// field ids.
 ///
 /// Matched by id, so a column renamed since this generation was sealed keeps
-/// its values instead of arriving under a name no other arm has. Columns the
-/// base table does not declare -- `_rowaddr`, `_tombstone` -- keep their own
-/// names, as do all of them when there is no base arm to agree with.
+/// its values instead of arriving under a name no other arm has. All of them
+/// keep their own names when there is no base arm to agree with.
+///
+/// A column the base table does not declare -- `_tombstone`, `_rowaddr` -- is
+/// never renamed onto a base name: it exists only in a generation, so its id is
+/// drawn from the generation's own numbering and can collide with the id base
+/// gave an unrelated column. A rename onto a name the arm already carries is
+/// skipped for the same reason.
 fn relabel_to_base_names(
     plan: Arc<dyn ExecutionPlan>,
     generation_schema: &LanceSchema,
@@ -127,11 +137,20 @@ fn relabel_to_base_names(
         return plan;
     };
     let schema = plan.schema();
+    let taken: HashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let mut renamed = false;
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|field| rename_field(field, &generation_schema.fields, base_names, &mut renamed))
+        .map(|field| {
+            rename_field(
+                field,
+                &generation_schema.fields,
+                base_names,
+                &taken,
+                &mut renamed,
+            )
+        })
         .collect();
     if !renamed {
         return plan;
