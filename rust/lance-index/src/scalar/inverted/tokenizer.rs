@@ -3,7 +3,7 @@
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, str::FromStr};
 
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
@@ -20,8 +20,9 @@ use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
 use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
+use crate::pbold::inverted_index_details::MaxSubDocsPerRowExceedAction as PbMaxSubDocsPerRowExceedAction;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
-    JsonTokenizer, LanceTokenizer, TextTokenizer,
+    JsonTokenizer, JsonTokenizerMode, LanceTokenizer, TextTokenizer,
 };
 use crate::scalar::inverted::{
     InvertedListFormatVersion, default_fts_format_version_for_block_size,
@@ -96,6 +97,54 @@ impl From<DocumentGranularity> for PbDocumentGranularity {
         match value {
             DocumentGranularity::Row => Self::Row,
             DocumentGranularity::ListElement => Self::ListElement,
+        }
+    }
+}
+
+/// Action taken when a JSON row exceeds [`InvertedIndexParams::max_sub_docs_per_row`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxSubDocsPerRowExceedAction {
+    /// Abort index ingestion with an error.
+    #[default]
+    Fail,
+    /// Omit the source row from the index and continue ingestion.
+    SkipRow,
+}
+
+impl FromStr for MaxSubDocsPerRowExceedAction {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "fail" => Ok(Self::Fail),
+            "skip_row" => Ok(Self::SkipRow),
+            _ => Err(Error::invalid_input(format!(
+                "unknown max_sub_docs_per_row_exceed_action {value:?}; expected 'fail' or 'skip_row'"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<i32> for MaxSubDocsPerRowExceedAction {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match PbMaxSubDocsPerRowExceedAction::try_from(value) {
+            Ok(PbMaxSubDocsPerRowExceedAction::Fail) => Ok(Self::Fail),
+            Ok(PbMaxSubDocsPerRowExceedAction::SkipRow) => Ok(Self::SkipRow),
+            Err(_) => Err(Error::invalid_input(format!(
+                "unknown max_sub_docs_per_row_exceed_action value {value}"
+            ))),
+        }
+    }
+}
+
+impl From<MaxSubDocsPerRowExceedAction> for PbMaxSubDocsPerRowExceedAction {
+    fn from(value: MaxSubDocsPerRowExceedAction) -> Self {
+        match value {
+            MaxSubDocsPerRowExceedAction::Fail => Self::Fail,
+            MaxSubDocsPerRowExceedAction::SkipRow => Self::SkipRow,
         }
     }
 }
@@ -196,6 +245,29 @@ pub struct InvertedIndexParams {
     /// Index code operators such as `::`, `->`, and `!=`.
     pub(crate) index_operators: bool,
 
+    /// JSON tokenization mode. `None` means the caller did not provide a mode.
+    /// Existing JSON indexes without this field are interpreted as `SingleDocument`;
+    /// new JSON indexes default this to `FlattenedSubDocs` during index build.
+    #[serde(default)]
+    pub(crate) json_tokenizer_mode: Option<JsonTokenizerMode>,
+
+    /// If true, flattened JSON tokenization avoids cross-array unnesting.
+    /// This reduces sub-doc explosion for JSON records with multiple sibling
+    /// arrays by indexing each array independently instead of producing their
+    /// Cartesian product. Default is false for exact query semantics.
+    #[serde(default)]
+    pub(crate) disable_cross_array_unnest: bool,
+
+    /// Maximum flattened sub-documents one JSON row may produce.
+    ///
+    /// `None` leaves the count unlimited.
+    #[serde(default)]
+    pub(crate) max_sub_docs_per_row: Option<usize>,
+
+    /// Action taken when a JSON row exceeds `max_sub_docs_per_row`.
+    #[serde(default)]
+    pub(crate) max_sub_docs_per_row_exceed_action: MaxSubDocsPerRowExceedAction,
+
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -261,6 +333,11 @@ struct RawInvertedIndexParams {
     split_on_numerics: Option<bool>,
     preserve_original: Option<bool>,
     index_operators: Option<bool>,
+    json_tokenizer_mode: Option<JsonTokenizerMode>,
+    #[serde(default)]
+    disable_cross_array_unnest: bool,
+    max_sub_docs_per_row: Option<usize>,
+    max_sub_docs_per_row_exceed_action: Option<MaxSubDocsPerRowExceedAction>,
     #[serde(rename = "memory_limit", alias = "worker_memory_limit_mb")]
     memory_limit_mb: Option<u64>,
     #[serde(rename = "num_workers")]
@@ -392,6 +469,14 @@ impl RawInvertedIndexParams {
         if let Some(index_operators) = self.index_operators {
             params.index_operators = index_operators;
         }
+        if let Some(json_tokenizer_mode) = self.json_tokenizer_mode {
+            params.json_tokenizer_mode = Some(json_tokenizer_mode);
+        }
+        params.disable_cross_array_unnest = self.disable_cross_array_unnest;
+        params.max_sub_docs_per_row = self.max_sub_docs_per_row;
+        if let Some(action) = self.max_sub_docs_per_row_exceed_action {
+            params.max_sub_docs_per_row_exceed_action = action;
+        }
         params.memory_limit_mb = self.memory_limit_mb;
         params.num_workers = self.num_workers;
         params.format_version = self.format_version;
@@ -427,6 +512,15 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             ),
             document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
             posting_format_version: Some(params.resolved_format_version().index_version()),
+            json_tokenizer_mode: params
+                .json_tokenizer_mode
+                .filter(|mode| *mode == JsonTokenizerMode::FlattenedSubDocs)
+                .map(|mode| mode.as_ref().to_string()),
+            disable_cross_array_unnest: params.disable_cross_array_unnest,
+            max_sub_docs_per_row: params.max_sub_docs_per_row.map(|value| value as u64),
+            max_sub_docs_per_row_exceed_action: PbMaxSubDocsPerRowExceedAction::from(
+                params.max_sub_docs_per_row_exceed_action,
+            ) as i32,
         })
     }
 }
@@ -446,6 +540,16 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                     Some(block_size) => validate_block_size(block_size as usize)?,
                     None => LEGACY_BLOCK_SIZE,
                 },
+                json_tokenizer_mode: details
+                    .json_tokenizer_mode
+                    .as_deref()
+                    .map(JsonTokenizerMode::from_str)
+                    .transpose()?,
+                disable_cross_array_unnest: details.disable_cross_array_unnest,
+                max_sub_docs_per_row: details.max_sub_docs_per_row.map(|value| value as usize),
+                max_sub_docs_per_row_exceed_action: details
+                    .max_sub_docs_per_row_exceed_action
+                    .try_into()?,
                 ..Self::default()
             };
             params.document_granularity = details.document_granularity.try_into()?;
@@ -498,6 +602,15 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             .posting_format_version
             .map(|version| resolve_fts_format_version(Some(&version.to_string())))
             .transpose()?;
+        params.json_tokenizer_mode = details
+            .json_tokenizer_mode
+            .as_deref()
+            .map(JsonTokenizerMode::from_str)
+            .transpose()?;
+        params.disable_cross_array_unnest = details.disable_cross_array_unnest;
+        params.max_sub_docs_per_row = details.max_sub_docs_per_row.map(|value| value as usize);
+        params.max_sub_docs_per_row_exceed_action =
+            details.max_sub_docs_per_row_exceed_action.try_into()?;
         params.validate()?;
         Ok(params)
     }
@@ -652,6 +765,10 @@ impl InvertedIndexParams {
             split_on_numerics: false,
             preserve_original: false,
             index_operators: false,
+            json_tokenizer_mode: None,
+            disable_cross_array_unnest: false,
+            max_sub_docs_per_row: None,
+            max_sub_docs_per_row_exceed_action: MaxSubDocsPerRowExceedAction::Fail,
             memory_limit_mb: None,
             num_workers: None,
             format_version: None,
@@ -747,6 +864,58 @@ impl InvertedIndexParams {
     /// Return the logical FTS document boundary.
     pub fn get_document_granularity(&self) -> DocumentGranularity {
         self.document_granularity
+    }
+
+    /// Set whether flattened JSON tokenization indexes sibling arrays independently.
+    ///
+    /// This avoids the Cartesian product of sibling arrays at the cost of accuracy
+    /// for queries that constrain values across those arrays.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default().disable_cross_array_unnest(true);
+    /// assert!(params.build().is_ok());
+    /// ```
+    pub fn disable_cross_array_unnest(mut self, disable_cross_array_unnest: bool) -> Self {
+        self.disable_cross_array_unnest = disable_cross_array_unnest;
+        self
+    }
+
+    /// Limit the number of flattened sub-documents emitted for one JSON row.
+    ///
+    /// If unset, the number of sub-documents is unlimited.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::{InvertedIndexParams, MaxSubDocsPerRowExceedAction};
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .max_sub_docs_per_row(1024)?
+    ///     .max_sub_docs_per_row_exceed_action(MaxSubDocsPerRowExceedAction::SkipRow);
+    /// assert!(params.build().is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn max_sub_docs_per_row(mut self, max_sub_docs_per_row: usize) -> Result<Self> {
+        if max_sub_docs_per_row == 0 {
+            return Err(Error::invalid_input(
+                "max_sub_docs_per_row must be greater than zero".to_string(),
+            ));
+        }
+        self.max_sub_docs_per_row = Some(max_sub_docs_per_row);
+        Ok(self)
+    }
+
+    /// Set the action taken when a JSON row exceeds `max_sub_docs_per_row`.
+    pub fn max_sub_docs_per_row_exceed_action(
+        mut self,
+        action: MaxSubDocsPerRowExceedAction,
+    ) -> Self {
+        self.max_sub_docs_per_row_exceed_action = action;
+        self
     }
 
     /// Set the lexical tokenizer implementation.
@@ -1039,7 +1208,18 @@ impl InvertedIndexParams {
 
         match self.lance_tokenizer {
             Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
+            Some(ref t) if t == "json" => Ok(Box::new(
+                JsonTokenizer::new(tokenizer)
+                    .with_mode(
+                        self.json_tokenizer_mode
+                            .unwrap_or(JsonTokenizerMode::SingleDocument),
+                    )
+                    .with_disable_cross_array_unnest(self.disable_cross_array_unnest)
+                    .with_sub_doc_limit(
+                        self.max_sub_docs_per_row,
+                        self.max_sub_docs_per_row_exceed_action,
+                    ),
+            )),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
@@ -1065,6 +1245,11 @@ impl InvertedIndexParams {
 
     fn validate(&self) -> Result<()> {
         validate_block_size(self.block_size)?;
+        if self.max_sub_docs_per_row == Some(0) {
+            return Err(Error::invalid_input(
+                "max_sub_docs_per_row must be greater than zero".to_string(),
+            ));
+        }
         if self.base_tokenizer != "code"
             && (self.split_identifiers
                 || self.split_on_numerics
@@ -1152,7 +1337,10 @@ mod tests {
     use crate::pbold;
     use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
-    use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
+    use super::{
+        DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion,
+        MaxSubDocsPerRowExceedAction,
+    };
     use lance_core::Error;
     use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
@@ -1587,6 +1775,11 @@ mod tests {
             code_config: None,
             document_granularity: PbDocumentGranularity::Row as i32,
             posting_format_version: None,
+            json_tokenizer_mode: None,
+            disable_cross_array_unnest: false,
+            max_sub_docs_per_row: None,
+            max_sub_docs_per_row_exceed_action:
+                pbold::inverted_index_details::MaxSubDocsPerRowExceedAction::Fail as i32,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
@@ -1607,6 +1800,22 @@ mod tests {
         assert_eq!(
             roundtrip.get_document_granularity(),
             DocumentGranularity::ListElement
+        );
+    }
+
+    #[test]
+    fn test_json_sub_doc_limit_details_conversion() {
+        let params = InvertedIndexParams::default()
+            .max_sub_docs_per_row(128)
+            .unwrap()
+            .max_sub_docs_per_row_exceed_action(MaxSubDocsPerRowExceedAction::SkipRow);
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        let roundtrip = InvertedIndexParams::try_from(&details).unwrap();
+
+        assert_eq!(roundtrip.max_sub_docs_per_row, Some(128));
+        assert_eq!(
+            roundtrip.max_sub_docs_per_row_exceed_action,
+            MaxSubDocsPerRowExceedAction::SkipRow
         );
     }
 

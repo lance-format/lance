@@ -51,10 +51,12 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
-use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
+use lance_index::scalar::inverted::document_tokenizer::{
+    DocType, JsonTokenizer, JsonTokenizerMode, LanceTokenizer,
+};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
-    collect_query_tokens, has_query_token, uses_fuzzy_expansion,
+    collect_query_tokens, effective_json_query_operator, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
@@ -2052,7 +2054,13 @@ fn tokenizer_for_match_query(
     let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
     match index.tokenizer().doc_type() {
         DocType::Text => Box::new(TextTokenizer::new(analyzer)),
-        DocType::Json => Box::new(JsonTokenizer::new(analyzer)),
+        DocType::Json => {
+            let index_tokenizer = index.tokenizer();
+            let mode = index_tokenizer
+                .json_tokenizer_mode()
+                .unwrap_or(JsonTokenizerMode::SingleDocument);
+            Box::new(JsonTokenizer::new(analyzer).with_mode(mode))
+        }
     }
 }
 
@@ -2928,12 +2936,17 @@ impl ExecutionPlan for MatchQueryExec {
             )))?;
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let operator = effective_json_query_operator(
+                tokenizer.json_tokenizer_mode(),
+                &tokens,
+                query.operator,
+            );
             record_tokenized_query(&tokenized_query, &tokens);
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
                     query: prepared_query,
                     params: Arc::new(params),
-                    operator: query.operator,
+                    operator,
                 })
             } else {
                 let base_scorer = match (preset_base_scorer, shared_scorer) {
@@ -2954,7 +2967,7 @@ impl ExecutionPlan for MatchQueryExec {
                         &indices,
                         tokens,
                         params,
-                        query.operator,
+                        operator,
                         metrics.as_ref(),
                         base_scorer,
                     )
@@ -3033,8 +3046,13 @@ fn document_matches_query(
     query_tokens: &Tokens,
     operator: Operator,
 ) -> bool {
-    match operator {
-        Operator::Or => has_query_token(text, tokenizer, query_tokens),
+    let Ok(sub_docs) = tokenizer.token_streams_for_doc(text) else {
+        return false;
+    };
+    sub_docs.into_iter().any(|tokens| match operator {
+        Operator::Or => tokens
+            .iter()
+            .any(|token| query_tokens.contains(&token.text)),
         Operator::And => {
             let mut remaining_positions = (0..query_tokens.len())
                 .map(|index| query_tokens.position(index))
@@ -3042,8 +3060,7 @@ fn document_matches_query(
             if remaining_positions.is_empty() {
                 return false;
             }
-            let mut stream = tokenizer.token_stream_for_doc(text);
-            while let Some(token) = stream.next() {
+            for token in tokens {
                 for index in 0..query_tokens.len() {
                     if token.text == query_tokens.get_token(index) {
                         remaining_positions.remove(&query_tokens.position(index));
@@ -3055,7 +3072,7 @@ fn document_matches_query(
             }
             false
         }
-    }
+    })
 }
 
 impl DisplayAs for FlatMatchFilterExec {
@@ -3289,6 +3306,11 @@ impl FlatMatchFilterExec {
             }
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        let query_operator = effective_json_query_operator(
+            tokenizer.json_tokenizer_mode(),
+            &query_tokens,
+            query.operator,
+        );
         record_tokenized_query(&tokenized_query, &query_tokens);
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
@@ -3299,7 +3321,6 @@ impl FlatMatchFilterExec {
             let mut tokenizer = tokenizer.box_clone();
             let elapsed_compute = elapsed_compute.clone();
             let resolved_field = resolved_field.clone();
-            let query_operator = query.operator;
             async move {
                 let batch = batch_result?;
                 let _t = elapsed_compute.timer();

@@ -85,10 +85,15 @@ impl InvertedIndex {
     }
 
     fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
+        let mut params = self.params.clone();
+        if params.lance_tokenizer.as_deref() == Some("json") && params.json_tokenizer_mode.is_none()
+        {
+            params.json_tokenizer_mode = Some(JsonTokenizerMode::SingleDocument);
+        }
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
             InvertedIndexBuilder::from_existing_index(
-                self.params.clone(),
+                params,
                 None,
                 Vec::new(),
                 self.token_set_format,
@@ -111,7 +116,7 @@ impl InvertedIndex {
             };
 
             InvertedIndexBuilder::from_existing_index(
-                self.params.clone(),
+                params,
                 Some(self.store.clone()),
                 partitions,
                 self.token_set_format,
