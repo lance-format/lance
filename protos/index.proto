@@ -229,6 +229,22 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /* Requested IVF partition count for building or rebuilding this index.
+   *
+   * The actual partition count may differ from this target and is read from the
+   * index files.
+   *
+   * A positive value takes precedence over `target_partition_size`. Absent or
+   * zero means no explicit count is available: a rebuild uses
+   * `target_partition_size` when positive, and the engine's own sizing
+   * otherwise. Absence does not imply the original build used automatic sizing,
+   * since a writer that predates this field records no count either way.
+   *
+   * Writers record only positive, representable counts, and omit a count they
+   * cannot represent rather than truncating it.
+   */
+  optional uint32 target_num_partitions = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
