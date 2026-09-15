@@ -9,9 +9,14 @@
 //! it to a WAL entry, and a scan applies it to a generation's batches.
 //!
 //! Columns are matched by **field id**. A rename changes a field's name and
-//! keeps its id, so a name is not identity; a cast keeps the name and takes a
-//! new id, so a name is not identity there either. Where the two disagree the
-//! plan refuses rather than guesses -- see [`Resolution::Ambiguous`].
+//! keeps its id, so a name is not identity: a source column of the same name
+//! under a different id is a different column, and reading it would answer with
+//! values the table no longer has. A name is matched only where identity is
+//! absent, as in a batch a caller has just handed in.
+//!
+//! Nothing here has to tell a cast from a column dropped and replaced, which no
+//! rule can: a table with a MemWAL refuses to change a column's type, so the
+//! only way for an id to disappear is a drop.
 
 use std::collections::HashMap;
 use std::sync::Arc;
