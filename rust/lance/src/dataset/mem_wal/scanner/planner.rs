@@ -3,10 +3,10 @@
 
 //! Query planner for LSM scanner.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -16,17 +16,16 @@ use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
 use datafusion_physical_expr::create_physical_expr;
 use lance_core::Result;
-use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
 use lance_core::is_system_column;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
+use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
+use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{
-    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN,
-    SchemaRelabelExec,
+    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN, ReconcileExec,
 };
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -55,6 +54,10 @@ pub struct LsmScanPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which is what resolves a
+    /// generation's columns to the table's. Supplied by the caller rather than
+    /// read off whichever source happens to be present.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -65,219 +68,8 @@ pub struct LsmScanPlanner {
     warmer: Option<Arc<dyn SsTableWarmer>>,
 }
 
-/// What the base table calls each of its field ids, if a base arm is present.
-///
-/// A rename changes a field's name and keeps its id, so this is what turns a
-/// generation's stored names into the names every other arm uses. Nested fields
-/// are included: a struct's child can be renamed on its own, which changes the
-/// parent's Arrow type without changing the parent's name.
-fn base_field_names(sources: &[LsmDataSource]) -> Option<HashMap<i32, String>> {
-    fn collect(fields: &[LanceField], into: &mut HashMap<i32, String>) {
-        for field in fields {
-            into.insert(field.id, field.name.clone());
-            collect(&field.children, into);
-        }
-    }
-    sources.iter().find_map(|source| match source {
-        LsmDataSource::BaseTable { dataset } => {
-            let mut names = HashMap::new();
-            collect(&dataset.schema().fields, &mut names);
-            Some(names)
-        }
-        _ => None,
-    })
-}
-
-/// How one generation's columns line up with the base table's.
-///
-/// A generation stores each column under the name the table had when it was
-/// sealed. Resolving that against base by field id -- which a rename keeps and
-/// a drop retires -- gives three groups: columns base still declares, under the
-/// name it uses now; columns base has dropped, which no longer belong in a read;
-/// and columns that are the generation's own, like `_tombstone`, which base
-/// never declared and which keep their names.
-struct GenerationMapping {
-    /// Generation name → the name base uses for the same field id.
-    to_base: HashMap<String, String>,
-    /// This generation's fields, for renaming a struct's children by their own
-    /// ids: a child can be renamed while its parent's name does not move.
-    fields: Vec<LanceField>,
-    /// What base calls each field id, children included.
-    base_names: HashMap<i32, String>,
-}
-
-impl GenerationMapping {
-    fn resolve(generation_schema: &LanceSchema, base_names: Option<&HashMap<i32, String>>) -> Self {
-        let mut to_base = HashMap::new();
-        let Some(base_names) = base_names else {
-            // No base arm to agree with, so this generation's own names are the
-            // names: every column maps to itself and none is retired.
-            for field in &generation_schema.fields {
-                to_base.insert(field.name.clone(), field.name.clone());
-            }
-            return Self {
-                to_base,
-                fields: generation_schema.fields.clone(),
-                base_names: HashMap::new(),
-            };
-        };
-        // The generation's own columns are not base's to name or to retire.
-        let mine = |f: &LanceField| f.name == TOMBSTONE || is_system_column(&f.name);
-
-        // By id first, which a rename keeps: these mappings are certain, and
-        // they are what makes the pass below able to tell the two remaining
-        // cases apart.
-        let mut claimed: HashSet<&str> = HashSet::new();
-        for field in generation_schema.fields.iter().filter(|f| !mine(f)) {
-            if let Some(name) = base_names.get(&field.id) {
-                to_base.insert(field.name.clone(), name.clone());
-                claimed.insert(name.as_str());
-            }
-        }
-
-        // What is left has an id base no longer declares, which happens two
-        // ways. A retype gives a column a new id while its name stays, so base
-        // still declares the name and no other column has claimed it -- the
-        // same column, matched by name. Otherwise the column is one base has
-        // dropped, and reading it would answer with data the table no longer
-        // has.
-        let base_has = |name: &str| base_names.values().any(|n| n == name);
-        for field in generation_schema.fields.iter().filter(|f| !mine(f)) {
-            if to_base.contains_key(&field.name) {
-                continue;
-            }
-            if base_has(&field.name) && !claimed.contains(field.name.as_str()) {
-                to_base.insert(field.name.clone(), field.name.clone());
-            }
-        }
-        Self {
-            to_base,
-            fields: generation_schema.fields.clone(),
-            base_names: base_names.clone(),
-        }
-    }
-
-    /// This generation's names for the base-table columns in `wanted`.
-    ///
-    /// A column the generation never had is simply absent from the result; the
-    /// union fills it in. A retired column is never returned even when its name
-    /// matches something base declares today.
-    fn generation_names_for(&self, wanted: &[String]) -> Vec<String> {
-        let from_base: HashMap<&str, &str> = self
-            .to_base
-            .iter()
-            .map(|(stored, base)| (base.as_str(), stored.as_str()))
-            .collect();
-        wanted
-            .iter()
-            .filter_map(|name| from_base.get(name.as_str()).map(|s| s.to_string()))
-            .collect()
-    }
-
-    /// Whether this generation can evaluate `expr` as written.
-    ///
-    /// True only when every column the predicate names is stored here under
-    /// that same name. Otherwise the predicate runs above the relabel, where
-    /// the columns have base's names and the ones this generation never had are
-    /// filled in.
-    fn can_evaluate(&self, expr: &Expr, generation_schema: &LanceSchema) -> bool {
-        expr.column_refs().iter().all(|column| {
-            // A positive mapping, not merely a column of that name: one base
-            // has dropped is still stored here, and answering from it would
-            // filter on data the table no longer has.
-            self.to_base
-                .get(&column.name)
-                .is_some_and(|base| base == &column.name)
-                && generation_schema.field(&column.name).is_some()
-        })
-    }
-
-    /// Rename `plan`'s output columns to the names base uses, a struct's
-    /// children included.
-    fn relabel(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        let schema = plan.schema();
-        let mut renamed = false;
-        let fields: Vec<Field> = schema
-            .fields()
-            .iter()
-            .map(|field| self.rename(field, &self.fields, &mut renamed))
-            .collect();
-        if !renamed {
-            return plan;
-        }
-        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-        Arc::new(SchemaRelabelExec::new(plan, schema))
-    }
-
-    /// One field under base's name for its id, recursing into a struct so a
-    /// renamed child is matched by its own id rather than by the parent's.
-    fn rename(&self, field: &Field, among: &[LanceField], renamed: &mut bool) -> Field {
-        let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
-            return field.as_ref().clone();
-        };
-        let field = match self.base_names.get(&source.id) {
-            Some(base) if base != field.name() => {
-                *renamed = true;
-                field.as_ref().clone().with_name(base)
-            }
-            _ => field.as_ref().clone(),
-        };
-        let DataType::Struct(children) = field.data_type() else {
-            return field;
-        };
-        let children: Vec<Field> = children
-            .iter()
-            .map(|child| self.rename(child, &source.children, renamed))
-            .collect();
-        field.with_data_type(DataType::Struct(children.into()))
-    }
-
-    /// Whether base has dropped `name`, so this generation must not read it.
-    ///
-    /// A column base still declares is mapped; one it has dropped is not, and
-    /// neither is a column that was never base's to begin with.
-    #[cfg(test)]
-    fn retires(&self, name: &str) -> bool {
-        !self.to_base.contains_key(name)
-            && name != TOMBSTONE
-            && !is_system_column(name)
-            && self.fields.iter().any(|f| f.name == name)
-    }
-}
-
-/// Add the columns `expr` names that `plan` does not carry, as typed nulls from
-/// `base_schema`.
-///
-/// A generation sealed before a column existed holds no value for it, and null
-/// is what that means — so a predicate over it can be answered rather than
-/// refused.
-fn fill_missing(
-    plan: Arc<dyn ExecutionPlan>,
-    expr: &Expr,
-    base_schema: &SchemaRef,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let schema = plan.schema();
-    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    let mut added = false;
-    for column in expr.column_refs() {
-        if schema.column_with_name(&column.name).is_some() {
-            continue;
-        }
-        let Ok(field) = base_schema.field_with_name(&column.name) else {
-            continue;
-        };
-        fields.push(field.clone().with_nullable(true));
-        added = true;
-    }
-    if !added {
-        return Ok(plan);
-    }
-    let target = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    project_to_canonical(plan, &target)
-}
-
-/// Apply `expr` above a plan whose columns have just been relabelled, for a
-/// generation whose names the predicate could not be run against directly.
+/// Apply `expr` above a source that has been reconciled, for a generation whose
+/// stored names the predicate could not be run against directly.
 fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = plan.schema();
     let df_schema = DFSchema::try_from(schema.as_ref().clone())
@@ -290,17 +82,104 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
     )?))
 }
 
+/// What the table calls each of this generation's stored columns, keyed by the
+/// stored name.
+///
+/// Matched by field id, which a rename keeps. A stored column whose id the
+/// table no longer declares is absent from the result: the table has dropped
+/// it, and reading it would answer with data the table no longer has.
+fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
+    eprintln!(
+        "DBG stored={:?} table={:?}",
+        stored
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), field_id_of(f)))
+            .collect::<Vec<_>>(),
+        table
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), field_id_of(f)))
+            .collect::<Vec<_>>()
+    );
+    let by_id: HashMap<i32, &str> = table
+        .fields()
+        .iter()
+        .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
+        .collect();
+    // A caller that supplied no ids has only names to be matched on, which is
+    // how this worked before ids were carried at all.
+    if by_id.is_empty() {
+        return stored
+            .fields()
+            .iter()
+            .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
+            .filter(|f| table.field_with_name(f.name()).is_ok())
+            .map(|f| (f.name().clone(), f.name().clone()))
+            .collect();
+    }
+    stored
+        .fields()
+        .iter()
+        // A generation's own columns are numbered in its own schema, so their
+        // ids collide with whatever the table gave those numbers. They are not
+        // the table's columns and are never resolved to one.
+        .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
+        .filter_map(|f| {
+            let id = field_id_of(f)?;
+            by_id
+                .get(&id)
+                .map(|name| (f.name().clone(), name.to_string()))
+        })
+        .collect()
+}
+
+/// `schema` with each field carrying the id `stored` gives the same name.
+///
+/// A scan's output schema is built from the dataset and carries no ids, so they
+/// are put back before identity is resolved against it.
+fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
+    fn restore(field: &Field, among: &Fields) -> Field {
+        let Some(source) = among.iter().find(|f| f.name() == field.name()) else {
+            return field.clone();
+        };
+        let mut metadata = field.metadata().clone();
+        metadata.extend(source.metadata().clone());
+        let field = field.clone().with_metadata(metadata);
+        // A struct's children carry their own ids, and a child can be renamed
+        // while its parent's name does not move.
+        match (field.data_type(), source.data_type()) {
+            (DataType::Struct(children), DataType::Struct(source_children)) => {
+                let children: Vec<Field> = children
+                    .iter()
+                    .map(|child| restore(child, source_children))
+                    .collect();
+                field.with_data_type(DataType::Struct(children.into()))
+            }
+            _ => field,
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| restore(field, stored.fields()))
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
 impl LsmScanPlanner {
     /// Create a new planner.
     pub fn new(
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
+        identity_schema: SchemaRef,
     ) -> Self {
         Self {
             collector,
             pk_columns,
             base_schema,
+            identity_schema,
             session: None,
             store_params: None,
             sstable_cache: None,
@@ -408,12 +287,6 @@ impl LsmScanPlanner {
         // down safely. The active memtable is in-memory and is never capped.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
 
-        // What the base table calls each field id today. A generation sealed
-        // under an older name still stores the column under that name, and the
-        // union below matches arms by name, so the generation's columns are
-        // relabelled to these before they meet the base arm.
-        let base_names = base_field_names(&sources);
-
         let mut source_plans = Vec::new();
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
@@ -427,7 +300,7 @@ impl LsmScanPlanner {
                 _ => None,
             };
             let scan = self
-                .build_source_scan(&source, projection, filter, fetch, base_names.as_ref())
+                .build_source_scan(&source, projection, filter, fetch)
                 .await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
@@ -558,13 +431,39 @@ impl LsmScanPlanner {
     }
 
     /// Build scan plan for a single data source.
+    /// What one generation's scan should produce once reconciled: the columns
+    /// this query needs, named as the table names them, plus the ones the
+    /// generation carries of its own.
+    ///
+    /// The same for every generation, and taken from the table rather than from
+    /// whichever source the collector ordered first.
+    fn generation_target(
+        &self,
+        wanted: &[String],
+        source: &Schema,
+        names: &HashMap<String, String>,
+    ) -> SchemaRef {
+        let mut fields: Vec<Field> = wanted
+            .iter()
+            .filter_map(|name| self.identity_schema.field_with_name(name).ok().cloned())
+            .collect();
+        // A generation's own columns are not the table's, so they pass through
+        // as the generation has them.
+        for field in source.fields() {
+            let is_the_tables = names.contains_key(field.name());
+            if !is_the_tables && fields.iter().all(|f| f.name() != field.name()) {
+                fields.push(field.as_ref().clone());
+            }
+        }
+        Arc::new(Schema::new(fields))
+    }
+
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: Option<&Expr>,
         fetch: Option<usize>,
-        base_names: Option<&HashMap<i32, String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -602,40 +501,41 @@ impl LsmScanPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
 
-                // Which of this generation's columns the base table still
-                // declares, and what it calls each of them. Resolved by field
-                // id before anything else looks at a name: a rename changes the
-                // name and keeps the id, and a column whose id base no longer
-                // declares is a column the table has dropped.
-                let mapping = GenerationMapping::resolve(dataset.schema(), base_names);
+                // What the table calls each of this generation's columns, by
+                // field id: a rename changes the name and keeps the id.
+                let stored = arrow_schema_with_field_ids(dataset.schema());
+                let names = stored_names(&stored, &self.identity_schema);
 
-                // Projected under this generation's own names, so an older file
-                // is asked only for columns it has. The caller names columns as
-                // the base table does, so those are translated first; one the
-                // generation never had is left out and filled in above the
-                // union.
-                // The predicate names columns as base does. This generation can
-                // only evaluate it when it stores every one of them under that
-                // same name: a rename moved the name, and a column added since
-                // the seal is not here at all, though `IS NULL` over it is a
-                // question about these rows that still has an answer.
-                let evaluable =
-                    filter.is_none_or(|expr| mapping.can_evaluate(expr, dataset.schema()));
-
+                // Asked of this generation under its own names, so an older
+                // file is only asked for columns it has. A column it never had
+                // is filled in after the scan.
                 let mut wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                // A filter this generation cannot evaluate runs above the
-                // relabel, reading the columns from this scan -- so they have to
-                // be in it, whether or not the caller asked for them.
-                if let Some(expr) = filter.filter(|_| !evaluable) {
+                // A predicate this generation cannot answer as written runs
+                // after reconciliation, reading its columns from this scan --
+                // so they have to be in it whether the caller asked or not.
+                let answerable = filter.is_none_or(|expr| {
+                    expr.column_refs()
+                        .iter()
+                        .all(|c| names.get(c.name.as_str()) == Some(&c.name))
+                });
+                if let Some(expr) = filter.filter(|_| !answerable) {
                     for column in expr.column_refs() {
                         if !wanted.contains(&column.name) {
                             wanted.push(column.name.clone());
                         }
                     }
                 }
-                let cols = mapping.generation_names_for(&wanted);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                let cols: Vec<&str> = wanted
+                    .iter()
+                    .filter_map(|name| {
+                        names
+                            .iter()
+                            .find(|(_, table_name)| *table_name == name)
+                            .map(|(stored_name, _)| stored_name.as_str())
+                    })
+                    .collect();
+                scanner.project(&cols)?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
@@ -643,18 +543,7 @@ impl LsmScanPlanner {
                 // The older real row a tombstone supersedes is dropped by the
                 // cross-gen block-list, not by this filter. Gen written before
                 // deletes existed lack the column → no fold, nothing to drop.
-                //
-                // A caller's predicate names columns as base does, so it can
-                // only run here when this generation agrees with base on every
-                // name. Otherwise it runs above the relabel, and the limit goes
-                // with it -- a limit under an unapplied filter would cut rows
-                // the filter has not seen.
-                // The predicate names columns as base does. This generation
-                // can only evaluate it when it stores every one of them under
-                // that same name: a rename moved the name, and a column added
-                // since the seal is not here at all, though `IS NULL` over it
-                // is a question about these rows that still has an answer.
-                let caller_filter = if evaluable { filter } else { None };
+                let caller_filter = if answerable { filter } else { None };
                 let folded;
                 let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
                     folded = fold_not_tombstone(caller_filter);
@@ -667,21 +556,22 @@ impl LsmScanPlanner {
                 }
                 // A limit under a filter that has not run would cut rows the
                 // filter never saw.
-                if let Some(fetch) = fetch.filter(|_| evaluable) {
+                if let Some(fetch) = fetch.filter(|_| answerable) {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
-                let plan = scanner.create_plan().await?;
-                let plan = mapping.relabel(plan);
+                let scan = scanner.create_plan().await?;
+                // Planned against what the scan actually produces, which is the
+                // projection plus `_rowaddr`, and carrying the ids the dataset
+                // gives those columns.
+                let source = with_ids_from(&scan.schema(), &stored);
+                let target = self.generation_target(&wanted, &source, &names);
+                let plan = Plan::resolve(&source, &target, &self.pk_columns)?;
+                let reconciled: Arc<dyn ExecutionPlan> =
+                    Arc::new(ReconcileExec::new(scan, Arc::new(plan)));
                 match filter {
-                    Some(expr) if !evaluable => {
-                        // The predicate may name a column this generation never
-                        // had, and `IS NULL` over it is a question about these
-                        // rows with a real answer. Fill those in before asking.
-                        let plan = fill_missing(plan, expr, &self.base_schema)?;
-                        filter_above(plan, expr)
-                    }
-                    _ => Ok(plan),
+                    Some(expr) if !answerable => filter_above(reconciled, expr),
+                    _ => Ok(reconciled),
                 }
             }
             LsmDataSource::ActiveMemTable {
@@ -769,104 +659,6 @@ mod tests {
 
     fn names(pairs: &[(i32, &str)]) -> HashMap<i32, String> {
         pairs.iter().map(|(id, n)| (*id, n.to_string())).collect()
-    }
-
-    fn mapping(generation: Vec<LanceField>, base: &[(i32, &str)]) -> GenerationMapping {
-        let schema = LanceSchema {
-            fields: generation,
-            metadata: Default::default(),
-        };
-        GenerationMapping::resolve(&schema, Some(&names(base)))
-    }
-
-    #[test]
-    fn a_column_takes_the_name_base_now_gives_its_id() {
-        let m = mapping(vec![lance_field("value", 1, vec![])], &[(1, "amount")]);
-        assert_eq!(m.to_base.get("value").map(String::as_str), Some("amount"));
-        assert_eq!(m.generation_names_for(&["amount".into()]), vec!["value"]);
-    }
-
-    #[test]
-    fn a_column_base_no_longer_declares_is_retired() {
-        // Dropping a column retires its id, so a generation still holding it
-        // must not contribute it -- not even to a base column that has since
-        // taken the name.
-        let m = mapping(
-            vec![
-                lance_field("value", 1, vec![]),
-                lance_field("other", 2, vec![]),
-            ],
-            &[(1, "other")],
-        );
-        assert!(m.retires("other"), "id 2 is gone from base");
-        assert_eq!(
-            m.generation_names_for(&["other".into()]),
-            vec!["value"],
-            "base's `other` is this generation's `value`, by id"
-        );
-    }
-
-    #[test]
-    fn a_generation_only_column_is_neither_renamed_nor_retired() {
-        // `_tombstone` is numbered in the generation's own schema, so its id
-        // collides with whatever base gave that id.
-        let m = mapping(
-            vec![
-                lance_field("value", 1, vec![]),
-                lance_field(TOMBSTONE, 2, vec![]),
-            ],
-            &[(1, "value"), (2, "extra")],
-        );
-        assert!(!m.retires(TOMBSTONE));
-        assert_eq!(m.to_base.get(TOMBSTONE), None);
-    }
-
-    #[test]
-    fn a_column_the_generation_never_had_is_not_projected() {
-        let m = mapping(
-            vec![lance_field("value", 1, vec![])],
-            &[(1, "value"), (2, "added")],
-        );
-        assert_eq!(
-            m.generation_names_for(&["value".into(), "added".into()]),
-            vec!["value"],
-            "the column added since is filled in above the union"
-        );
-    }
-
-    #[test]
-    fn a_renamed_struct_child_is_matched_by_its_own_id() {
-        let m = mapping(
-            vec![lance_field("info", 1, vec![lance_field("c", 2, vec![])])],
-            &[(1, "info"), (2, "d")],
-        );
-        let field = Field::new(
-            "info",
-            DataType::Struct(vec![Field::new("c", DataType::Int64, true)].into()),
-            true,
-        );
-        let mut renamed = false;
-        let out = m.rename(&field, &m.fields.clone(), &mut renamed);
-        assert!(renamed);
-        let DataType::Struct(children) = out.data_type() else {
-            panic!("expected a struct");
-        };
-        assert_eq!(
-            children[0].name(),
-            "d",
-            "the child takes base's name for its id"
-        );
-        assert_eq!(out.name(), "info", "the parent's name has not moved");
-    }
-
-    #[test]
-    fn a_column_the_generation_does_not_declare_is_left_alone() {
-        let m = mapping(vec![lance_field("value", 1, vec![])], &[(1, "amount")]);
-        let field = Field::new("_rowaddr", DataType::UInt64, true);
-        let mut renamed = false;
-        let out = m.rename(&field, &m.fields.clone(), &mut renamed);
-        assert_eq!(out.name(), "_rowaddr");
-        assert!(!renamed);
     }
 
     fn create_test_schema() -> SchemaRef {

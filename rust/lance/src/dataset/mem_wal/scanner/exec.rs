@@ -17,6 +17,7 @@ mod coalesce_first;
 mod generation_tag;
 mod pk;
 mod pk_block_filter;
+mod reconcile;
 mod schema_relabel;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
@@ -27,4 +28,5 @@ pub use pk::{
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
+pub use reconcile::ReconcileExec;
 pub use schema_relabel::SchemaRelabelExec;

@@ -12,19 +12,18 @@
 //! - [`IndexStore`] - In-memory index management
 //! - [`MemTableFlusher`] - Flush MemTable to storage as single Lance file
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
+use super::reconcile::{Plan, without_field_ids};
 use arc_swap::ArcSwap;
-use arrow::compute::CastOptions;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
-use arrow_cast::cast_with_options;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
-use lance_core::datatypes::{LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -1603,21 +1602,6 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// The lance field id an Arrow field carries, if it carries one.
-///
-/// Lance already reads this key when converting Arrow to its own schema; the
-/// memtable's storage schema carries it so that a WAL entry, which is Arrow IPC
-/// and so keeps field metadata, stays addressable by id rather than by name
-/// alone. Base data files have always been addressed this way
-/// (`DataFile.fields` is a list of ids); this brings the fresh tier alongside.
-fn field_id_of(field: &ArrowField) -> Option<i32> {
-    field
-        .metadata()
-        .get(LANCE_FIELD_ID_KEY)
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|id| *id >= 0)
-}
-
 /// Re-label `batch` to the storage schema, matching columns by **field id**
 /// where both sides carry one, and by **name** otherwise.
 ///
@@ -1646,83 +1630,11 @@ fn conform_to_storage_schema(
     storage_schema: &Arc<ArrowSchema>,
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
-    let n = batch.num_rows();
-    let by_field_id: HashMap<i32, usize> = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| field_id_of(f).map(|id| (id, i)))
-        .collect();
-
-    // An entry column an id match has already taken. A rename frees a name for
-    // something else to use, so the entry's column can answer to the schema's
-    // name without being the schema's column -- and it is the id match that
-    // says which one it really is.
-    let claimed: HashSet<usize> = storage_schema
-        .fields()
-        .iter()
-        .filter_map(|f| field_id_of(f))
-        .filter_map(|id| by_field_id.get(&id).copied())
-        .collect();
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
-    for field in storage_schema.fields() {
-        let name = field.name();
-        let carried = field_id_of(field)
-            .and_then(|id| by_field_id.get(&id).map(|i| batch.column(*i).clone()))
-            .or_else(|| {
-                // No column of this id. The entry may still carry this column
-                // under this name with an id of its own -- a cast takes a new
-                // id and keeps the name -- but only if nothing has claimed it.
-                let (i, _) = batch.schema().column_with_name(name)?;
-                (!claimed.contains(&i)).then(|| batch.column(i).clone())
-            });
-        if let Some(column) = carried {
-            columns.push(if column.data_type() == field.data_type() {
-                column
-            } else {
-                // `safe: false` so a lossy cast is an error rather than a
-                // column of nulls -- the same option `alter_columns` casts the
-                // base data under, so both halves of the table agree.
-                cast_with_options(
-                    &column,
-                    field.data_type(),
-                    &CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|e| {
-                    Error::invalid_input(format!(
-                        "column '{name}' was written as {} and the schema now declares {}, \
-                         which it cannot be cast to: {e}",
-                        column.data_type(),
-                        field.data_type(),
-                    ))
-                })?
-            });
-        } else if name == TOMBSTONE {
-            columns.push(Arc::new(BooleanArray::from(vec![false; n])));
-        } else if pk_columns.iter().any(|c| c == name) {
-            return Err(Error::invalid_input(format!(
-                "batch is missing primary key column '{}' declared by the storage schema",
-                name
-            )));
-        } else {
-            // Non-primary-key columns are nullable in the storage schema
-            // whatever the base table declares (`relax_non_pk_nullability`), so
-            // a null stands in for a value the entry never held.
-            columns.push(new_null_array(field.data_type(), n));
-        }
+    let plan = Plan::resolve(batch.schema().as_ref(), storage_schema, pk_columns)?;
+    if plan.is_identity() {
+        return Ok(batch);
     }
-    RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
-        Error::invalid_input(format!(
-            "failed to conform a batch to the storage schema \
-             (does the batch match the base table schema?): {}",
-            e
-        ))
-    })
+    plan.apply(&batch)
 }
 
 /// Build a tombstone batch from a key-only `keys` batch: primary keys carried
@@ -2200,8 +2112,11 @@ impl ShardWriter {
         // The caller's schema is the shard's logical schema; the storage schema
         // is derived below, once the primary key is known. lance owns
         // `_tombstone` and appends it here — idempotent across reopens.
-        let logical_schema = schema;
-        let tombstoned = schema_with_tombstone(&logical_schema);
+        // The stored schema carries field ids so identity survives a rename;
+        // what a caller's batch is checked against must not, since a batch
+        // carries none and Arrow compares a struct's children in full.
+        let tombstoned = schema_with_tombstone(&schema);
+        let logical_schema = Arc::new(without_field_ids(&schema));
 
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;

@@ -38,6 +38,7 @@ pub mod index;
 mod manifest;
 pub mod memtable;
 pub mod observer;
+pub(crate) mod reconcile;
 pub mod scanner;
 pub mod sharding;
 #[cfg(test)]
@@ -48,9 +49,7 @@ pub mod write;
 
 use std::sync::Arc;
 
-use std::collections::HashMap;
-
-use lance_core::datatypes::{LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
@@ -138,28 +137,39 @@ pub fn relax_non_pk_nullability(
 /// callers that compare schemas for equality.
 pub(crate) fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
     let arrow: ArrowSchema = schema.into();
-    let ids: HashMap<&str, i32> = schema
-        .fields
-        .iter()
-        .map(|f| (f.name.as_str(), f.id))
-        .collect();
     let fields: Vec<ArrowField> = arrow
         .fields()
         .iter()
-        .map(|field| {
-            let Some(id) = ids
-                .get(field.name().as_str())
-                .copied()
-                .filter(|id| *id >= 0)
-            else {
-                return field.as_ref().clone();
-            };
-            let mut metadata = field.metadata().clone();
-            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
-            field.as_ref().clone().with_metadata(metadata)
-        })
+        .map(|field| stamp_field_id(field, &schema.fields))
         .collect();
     ArrowSchema::new_with_metadata(fields, arrow.metadata().clone())
+}
+
+/// One field carrying its lance id, and its struct children carrying theirs.
+///
+/// A struct's children are fields in their own right: they have ids, a rename
+/// moves one child's name and not the parent's, and a reader that cannot see a
+/// child's id has only its name to go on.
+fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
+    let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
+        return field.clone();
+    };
+    let field = match source.id {
+        id if id >= 0 => {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.clone().with_metadata(metadata)
+        }
+        _ => field.clone(),
+    };
+    let DataType::Struct(children) = field.data_type() else {
+        return field;
+    };
+    let children: Vec<ArrowField> = children
+        .iter()
+        .map(|child| stamp_field_id(child, &source.children))
+        .collect();
+    field.with_data_type(DataType::Struct(children.into()))
 }
 
 pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
