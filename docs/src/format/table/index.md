@@ -119,12 +119,25 @@ Field ids might be replaced with `-2`, a tombstone value.
 In this case that column should be ignored. This used, for example, when rewriting a column: 
 The old data file replaces the field id with `-2` to ignore the old data, and a new data file is appended to the fragment.
 
-Negative field ids are reserved for system columns and never appear in the dataset
-schema: `-1` marks a field id that has not been assigned, `-2` is the tombstone
-above, and `-3` is the hidden `_rowid` column that holds a spilled row ID sequence
-(see [Row ID and Lineage](row_id_lineage.md)). The `_rowid` column is reached
-through a fragment's `row_id_sequence`, not through its `files`, so `-3` never
-appears in the file list that column projection walks.
+Every negative field id is reserved for system use and never names a field of the
+dataset schema. A reader MUST skip a negative id it does not recognize when it
+projects the dataset schema onto a data file, rather than treat it as a schema field
+or reject the file.
+
+| Field id | Meaning |
+|----------|---------|
+| `-1`     | Not yet assigned. Only ever exists in memory; must not be written. |
+| `-2`     | Tombstone: the field was superseded by a later data file, as above. |
+| `-3`     | Hidden `_rowid` column holding a spilled row ID sequence. |
+| `-4`     | Hidden `_row_created_at_version` column holding a spilled created-at version sequence. |
+| `-5`     | Hidden `_row_last_updated_at_version` column holding a spilled last-updated-at version sequence. |
+
+The three row lineage columns are described in [Row ID and Lineage](row_id_lineage.md).
+They are reached through a fragment's `row_id_sequence`, `created_at_version_sequence`
+and `last_updated_at_version_sequence`, each of which names the data file and locates
+the column by its field id. That file may be one of the fragment's `files`, in which
+case the negative ids also appear in that entry's `fields`, or a file that holds only
+lineage columns.
 
 ## Data Files
 

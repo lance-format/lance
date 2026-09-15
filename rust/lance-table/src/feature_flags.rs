@@ -64,27 +64,40 @@ pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// every fragment has them; a writer without it would carry the fragment
 /// forward and drop the sequence. Both must refuse the table.
 ///
-/// Spilled row lineage is not yet a released feature: in release builds this
-/// flag is treated as unknown unless [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`]
-/// is set, mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`]. Debug builds always
-/// understand it so tests exercise the path. Every released build has its
-/// unknown boundary at or below this bit, so each already refuses such a
-/// dataset without a change of its own.
-pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 10;
+pub const FLAG_UNKNOWN: u64 = 1 << 9;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
-const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
 
 /// Tagged FRI requires a reader that interprets its mappings and a writer that
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+
+/// Some fragment stores a row lineage sequence -- its row ids, or its
+/// created-at or last-updated-at versions -- as a hidden column of a data file
+/// rather than inline in the manifest (`RowIdMeta::Column`,
+/// `RowDatasetVersionMeta::Column`).
+///
+/// A reader without this bit sees an unset `row_id_sequence` oneof and would
+/// take the fragment to have no row ids at all, on a table whose manifest says
+/// every fragment has them; a writer without it would carry the fragment
+/// forward and drop the sequence. Both must refuse the table.
+///
+/// Sits above [`FLAG_UNKNOWN`] like [`FLAG_FRAGMENT_REUSE_INDEX`], so every
+/// released build already refuses such a dataset without a change of its own.
+/// Spilled row lineage is not yet a released feature: this build understands
+/// the bit only in debug builds or when
+/// [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set, mirroring
+/// [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
+pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+
+// Above the boundary on purpose: `supported_flags_when` adds it explicitly.
+const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE > FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -236,11 +249,11 @@ fn supported_flags_when(overlay_enabled: bool, spilled_row_lineage_enabled: bool
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
-    mark_supported(
-        &mut supported,
-        FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-        spilled_row_lineage_enabled,
-    );
+    // Added rather than cleared: the bit is above `FLAG_UNKNOWN`, so it is not
+    // in the base set to begin with.
+    if spilled_row_lineage_enabled {
+        supported |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    }
     supported
 }
 
@@ -382,9 +395,10 @@ mod tests {
 
     #[test]
     fn test_spilled_row_lineage_flag_release_gating() {
-        // Every released build has its unknown boundary at or below this bit,
-        // so the bit must be the one the newest such build starts refusing at.
-        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 512);
+        // Every released build has its unknown boundary below this bit (256
+        // for v11, 512 for the v12 and v13 pre-releases), so each refuses the
+        // dataset without a change of its own.
+        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 2048);
         // A build that has not opted in refuses the dataset; one that has
         // understands it, and either way the other known flags still pass.
         let supported = supported_flags_when(true, false);
@@ -429,6 +443,78 @@ mod tests {
         );
         assert_ne!(
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+            0
+        );
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_spilled_row_lineage_flag() {
+        use crate::format::{DataFile, DataStorageFormat, Fragment, ROW_ID_FIELD_ID, RowIdMeta};
+        use crate::rowids::version::RowDatasetVersionMeta;
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let spilled =
+            DataFile::new_legacy_from_fields("lineage.lance", vec![ROW_ID_FIELD_ID], None);
+        // Each of the three sequences on its own is enough to require the flag.
+        let mut spilled_fragments = Vec::new();
+        for kind in 0..3 {
+            let mut fragment = Fragment::new(kind);
+            // Every fragment of a stable-row-id table carries row ids; the
+            // version-only cases keep theirs inline.
+            fragment.row_id_meta = Some(RowIdMeta::Inline(vec![].into()));
+            match kind {
+                0 => fragment.row_id_meta = Some(RowIdMeta::Column(spilled.clone())),
+                1 => {
+                    fragment.created_at_version_meta =
+                        Some(RowDatasetVersionMeta::Column(spilled.clone()))
+                }
+                _ => {
+                    fragment.last_updated_at_version_meta =
+                        Some(RowDatasetVersionMeta::Column(spilled.clone()))
+                }
+            }
+            spilled_fragments.push(fragment);
+        }
+        for fragment in spilled_fragments {
+            let mut manifest = Manifest::new(
+                schema.clone(),
+                Arc::new(vec![fragment]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            apply_feature_flags(&mut manifest, true, false).unwrap();
+            assert_ne!(
+                manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0
+            );
+            assert_ne!(
+                manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0
+            );
+        }
+
+        // An inline sequence does not, so a table whose sequences all fit in
+        // the manifest stays readable by builds without the flag.
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(vec![].into()));
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut manifest, true, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
             0
         );
     }

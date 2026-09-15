@@ -20,14 +20,13 @@
 //!    design adds
 //! 5. compaction wall time and bytes written -- the write cost it adds
 //!
-//! The two arms differ only in `CompactionOptions::inline_row_ids_max_bytes`:
-//! `Some(usize::MAX)` never spills, which is today's behavior, and `None` takes
-//! the format's 200 KiB inline budget, which is what this change makes the
-//! default.
+//! The two arms differ only in the table config: the inline arm never opts in,
+//! which is today's behavior, and the spilled arm sets
+//! `lance.row_lineage.spill=true` and takes the format's 200 KiB inline budget.
 //!
 //! ## Running
 //!
-//! Spilled row ids are an unstable feature, so a release build -- which is what
+//! Spilled row lineage is an unstable feature, so a release build -- which is what
 //! `cargo bench` produces -- has to opt in:
 //!
 //! ```bash
@@ -52,11 +51,13 @@ use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::rowids::{get_row_id_index, load_row_id_sequence};
+use lance::dataset::rowids::{
+    SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index, load_row_id_sequence,
+};
 use lance::dataset::{Dataset, ProjectionRequest, WriteMode, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_table::feature_flags::ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV;
+use lance_table::feature_flags::ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV;
 use lance_table::format::{RowDatasetVersionMeta, RowIdMeta};
 use tokio::runtime::Runtime;
 
@@ -112,10 +113,9 @@ struct ArmResult {
     total_fragments: usize,
 }
 
-/// Encoded bytes each fragment keeps inline in the manifest, split by which of
-/// the three per-row sequence families they belong to. The row version families
-/// are the other two columns section 5.3 moves; this change only moves row ids,
-/// so the split says how much of the manifest is left behind.
+/// Encoded bytes each fragment keeps inline in the manifest, split into the
+/// row id sequence and the two row version sequences. Each sequence spills on
+/// its own size, so the split shows which of them a workload actually moves.
 fn inline_sequence_bytes(dataset: &Dataset) -> (u64, u64) {
     let mut row_ids = 0;
     let mut versions = 0;
@@ -242,9 +242,15 @@ fn manifest_bytes(dir: &str, version: u64) -> u64 {
         .unwrap_or(0)
 }
 
-async fn run_arm(dir: &str, config: Config, inline_row_ids_max_bytes: Option<usize>) -> ArmResult {
+async fn run_arm(dir: &str, config: Config, spill: bool) -> ArmResult {
     let uri = dir.to_string();
     let mut dataset = build_base(&uri, config).await;
+    if spill {
+        dataset
+            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
+            .await
+            .unwrap();
+    }
 
     let started = Instant::now();
     compact_files(
@@ -253,7 +259,6 @@ async fn run_arm(dir: &str, config: Config, inline_row_ids_max_bytes: Option<usi
             target_rows_per_fragment: config.rows_per_fragment,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.0,
-            inline_row_ids_max_bytes,
             ..Default::default()
         },
         None,
@@ -374,9 +379,11 @@ fn mib(bytes: u64) -> f64 {
 }
 
 fn bench_rowid_spill(_c: &mut Criterion) {
-    if std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV).is_none() && !cfg!(debug_assertions) {
+    if std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_none()
+        && !cfg!(debug_assertions)
+    {
         panic!(
-            "set {ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV}=1 to run this benchmark: spilled row ids \
+            "set {ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV}=1 to run this benchmark: spilled row lineage \
              are an unstable feature and a release build refuses the dataset without it"
         );
     }
@@ -391,19 +398,14 @@ fn bench_rowid_spill(_c: &mut Criterion) {
     );
     println!();
 
-    // `usize::MAX` reproduces the behavior on main, where a compacted fragment's
-    // sequence always stays inline however large it grows. `None` takes the
-    // format's documented 200 KiB inline budget, which is what this change makes
-    // the default.
+    // A table that has not opted in reproduces the behavior on main, where a
+    // compacted fragment's sequence always stays inline however large it grows.
+    // The opted-in arm takes the format's documented 200 KiB inline budget.
     let inline_dir = tempfile::tempdir().unwrap();
-    let inline = runtime.block_on(run_arm(
-        &inline_dir.path().to_string_lossy(),
-        config,
-        Some(usize::MAX),
-    ));
+    let inline = runtime.block_on(run_arm(&inline_dir.path().to_string_lossy(), config, false));
 
     let spill_dir = tempfile::tempdir().unwrap();
-    let spilled = runtime.block_on(run_arm(&spill_dir.path().to_string_lossy(), config, None));
+    let spilled = runtime.block_on(run_arm(&spill_dir.path().to_string_lossy(), config, true));
 
     println!(
         "{:<28} {:>14} {:>14} {:>10}",

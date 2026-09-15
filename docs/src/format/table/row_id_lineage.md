@@ -208,12 +208,20 @@ reserved negative field id:
 Each column holds one `uint64` per physical row, in offset order. It is located by
 the same `fields`/`column_indices` pair as a user column, so the three sequences may
 share one file with each other or with user data, or occupy a file of their own.
-Reading it uses the ordinary data file reader and its encodings. Compaction is the
-only writer that spills today: an appended fragment's sequences are single runs
-that never approach the threshold.
+Reading it uses the ordinary data file reader and its encodings.
+
+Which sequences may leave the manifest follows from when their values are known.
+A value the commit assigns -- an appended fragment's row ids, an inserted row's
+created-at version, every row's last-updated-at version -- can change when a commit
+conflict is retried, so it stays inline where the retry can rewrite it; those
+sequences are single runs and cost a few bytes. A value carried over from existing
+rows -- the row ids and created-at versions that compaction or a row rewrite
+preserves -- is fixed before the commit and may be written to a data file.
+Compaction is the only writer that spills today, and it opts in per table through
+the `lance.row_lineage.spill` config key; a table that never sets it is unchanged.
 
 A writer that emits any column arm MUST set the spilled row lineage feature flag
-(bit 9, value 512) in both the reader and writer flag words. A reader without that
+(bit 11, value 2048) in both the reader and writer flag words. A reader without that
 bit sees an unset oneof and would take the fragment to have no row IDs at all, on a
 table whose manifest says every fragment has them.
 
@@ -224,7 +232,7 @@ that current readers cannot load.
 
 !!! note
     Spilled row lineage sequences are not yet a released feature. A released build
-    treats bit 9 as an unknown feature flag and refuses the dataset.
+    treats bit 11 as an unknown feature flag and refuses the dataset.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
@@ -322,6 +330,7 @@ message DataFragment {
   oneof created_at_version_sequence {
     bytes inline_created_at_versions = 9;
     ExternalFile external_created_at_versions = 10;
+    DataFile column_created_at_versions = 14;
   }
 }
 ```
@@ -365,6 +374,7 @@ message DataFragment {
   oneof last_updated_at_version_sequence {
     bytes inline_last_updated_at_versions = 7;
     ExternalFile external_last_updated_at_versions = 8;
+    DataFile column_last_updated_at_versions = 13;
   }
 }
 ```
