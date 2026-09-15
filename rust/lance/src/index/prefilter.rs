@@ -197,43 +197,45 @@ impl DatasetPreFilter {
 
         let dataset_clone = dataset.clone();
         let restrict_for_load = restrict_to.clone();
+        let load_mask = move || async move {
+            let row_ids_and_deletions =
+                load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref()).await?;
+
+            // The process of computing the final mask is CPU-bound, so we spawn it
+            // on a blocking thread.
+            let allow_list = spawn_cpu(move || {
+                Result::Ok(row_ids_and_deletions.into_iter().fold(
+                    RowAddrTreeMap::new(),
+                    |mut allow_list, (row_ids, deletion_vector)| {
+                        let seq = if let Some(deletion_vector) = deletion_vector {
+                            let mut row_ids = row_ids.as_ref().clone();
+                            row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
+                            Cow::<RowIdSequence>::Owned(row_ids)
+                        } else {
+                            Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
+                        };
+                        let treemap = RowAddrTreeMap::from(seq.as_ref());
+                        allow_list |= treemap;
+                        allow_list
+                    },
+                ))
+            })
+            .await?;
+
+            Ok(RowAddrMask::from_allowed(allow_list))
+        };
+        let Some(e_tag) = dataset.manifest_location().e_tag.as_deref() else {
+            return load_mask().await.map(Arc::new);
+        };
         let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
+            e_tag: Some(e_tag),
             restrict_hash,
         };
         dataset
             .metadata_cache
             .as_ref()
-            .get_or_insert_with_key(key, move || {
-                async move {
-                    let row_ids_and_deletions =
-                        load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref())
-                            .await?;
-
-                    // The process of computing the final mask is CPU-bound, so we spawn it
-                    // on a blocking thread.
-                    let allow_list = spawn_cpu(move || {
-                        Result::Ok(row_ids_and_deletions.into_iter().fold(
-                            RowAddrTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
-                                    Cow::<RowIdSequence>::Owned(row_ids)
-                                } else {
-                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowAddrTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
-                    })
-                    .await?;
-
-                    Ok(RowAddrMask::from_allowed(allow_list))
-                }
-            })
+            .get_or_insert_with_key(key, load_mask)
             .await
     }
 
@@ -454,6 +456,7 @@ mod test {
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::session::Session;
 
     use super::*;
 
@@ -631,6 +634,78 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask_stable_row_ids_recreated_at_same_uri() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let session = Arc::new(Session::default());
+        let write = |num_rows| {
+            let test_data = BatchGenerator::new()
+                .col(Box::new(IncrementingInt32::new().named("x")))
+                .batch(num_rows);
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(test_data, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let mut dataset = write(10).await;
+        dataset.delete("x = 9").await.unwrap();
+        assert_eq!(dataset.manifest().version, 2);
+        let mask = DatasetPreFilter::create_deletion_mask(
+            Arc::new(dataset.clone()),
+            RoaringBitmap::from_iter(0..1),
+        )
+        .expect("stable-row-id deletion mask")
+        .await
+        .unwrap();
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(0..9)));
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        let mut dataset = write(20).await;
+        dataset.delete("x = 19").await.unwrap();
+        assert_eq!(dataset.manifest().version, 2);
+        let mask = DatasetPreFilter::create_deletion_mask(
+            Arc::new(dataset),
+            RoaringBitmap::from_iter(0..1),
+        )
+        .expect("stable-row-id deletion mask")
+        .await
+        .unwrap();
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(0..19)));
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask_without_generation_token_is_not_cached() {
+        let datasets = test_datasets(true).await;
+        let mut dataset = (*datasets.deletions_no_missing_frags).clone();
+        dataset.manifest_location.e_tag = None;
+        let dataset = Arc::new(dataset);
+
+        let load_mask = || {
+            let dataset = dataset.clone();
+            async move {
+                DatasetPreFilter::create_deletion_mask(dataset, RoaringBitmap::from_iter(0..3))
+                    .expect("stable-row-id deletion mask")
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = load_mask().await;
+        let second = load_mask().await;
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.allow_list(), Some(&RowAddrTreeMap::from_iter(0..8)));
     }
 
     // Regression test for issue #6877.
