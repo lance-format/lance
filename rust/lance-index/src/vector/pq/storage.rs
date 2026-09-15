@@ -890,39 +890,40 @@ impl PQDistCalculator {
             distance_type,
         }
     }
-
-    fn get_pq_code(&self, id: u32) -> impl Iterator<Item = usize> + '_ {
-        get_pq_code(
-            self.pq_code.values(),
-            self.num_bits,
-            self.num_sub_vectors,
-            id,
-        )
-        .map(|v| v as usize)
-    }
 }
 
 impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let num_centroids = 2_usize.pow(self.num_bits);
-        let pq_code = self.get_pq_code(id);
+        let num_bytes = if self.num_bits == 4 {
+            self.num_sub_vectors / 2
+        } else {
+            self.num_sub_vectors
+        };
+        let pq_codes = self.pq_code.values();
+        let num_vectors = pq_codes.len() / num_bytes;
+        let code_offset = id as usize;
         let diff = self.num_sub_vectors as f32 - 1.0;
         let dist = if self.num_bits == 4 {
-            pq_code
-                .enumerate()
-                .map(|(i, c)| {
-                    let current_idx = c & 0x0F;
-                    let next_idx = c >> 4;
+            let mut dist = 0.0;
+            for byte_idx in 0..num_bytes {
+                let code = pq_codes[code_offset + byte_idx * num_vectors] as usize;
+                let current_idx = code & 0x0F;
+                let next_idx = code >> 4;
+                let current_sub_vector_idx = 2 * byte_idx;
+                let next_sub_vector_idx = current_sub_vector_idx + 1;
 
-                    self.distance_table[2 * i * num_centroids + current_idx]
-                        + self.distance_table[(2 * i + 1) * num_centroids + next_idx]
-                })
-                .sum()
+                dist += self.distance_table[current_sub_vector_idx * num_centroids + current_idx]
+                    + self.distance_table[next_sub_vector_idx * num_centroids + next_idx];
+            }
+            dist
         } else {
-            pq_code
-                .enumerate()
-                .map(|(i, c)| self.distance_table[i * num_centroids + c])
-                .sum()
+            let mut dist = 0.0;
+            for sub_vector_idx in 0..self.num_sub_vectors {
+                let code = pq_codes[code_offset + sub_vector_idx * num_vectors] as usize;
+                dist += self.distance_table[sub_vector_idx * num_centroids + code];
+            }
+            dist
         };
 
         if self.distance_type == DistanceType::Dot {

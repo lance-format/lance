@@ -114,6 +114,10 @@ name = "pq_dist_table"
 harness = false
 
 [[bench]]
+name = "pq_distance_lookup"
+harness = false
+
+[[bench]]
 name = "4bitpq_dist_table"
 harness = false
 
