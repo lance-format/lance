@@ -107,8 +107,7 @@ pub(super) fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, S
         .iter()
         .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
         .collect();
-    // A caller that supplied no ids has only names to be matched on, which is
-    // how this worked before ids were carried at all.
+    // A caller that supplies no ids leaves only names to match on.
     if by_id.is_empty() {
         return stored
             .fields()
@@ -347,9 +346,8 @@ impl LsmScanPlanner {
 
         // Every arm has to agree before the union: a generation is written under
         // the schema the shard held when it was sealed, so one sealed before a
-        // column was added does not carry it, one sealed before a rename carries
-        // the old name, and one sealed before a retype carries the old type.
-        // `UnionExec` requires schema equality and does not reconcile.
+        // column was added does not carry it. `UnionExec` requires schema
+        // equality and does not reconcile.
         //
         // The base arm is the authority when it is here -- it is the only source
         // the schema change was applied to. Otherwise the newest generation is,
