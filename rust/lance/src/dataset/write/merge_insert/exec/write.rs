@@ -21,7 +21,7 @@ use datafusion::{
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::RowIdMeta;
@@ -633,7 +633,7 @@ impl FullSchemaMergeInsertExec {
         let output_schema_clone = output_schema.clone();
         let merge_state_clone = merge_state;
 
-        tokio::spawn(async move {
+        let splitter_task = tokio::spawn(async move {
             let mut input_stream = input_stream;
 
             while let Some(batch_result) = input_stream.next().await {
@@ -675,7 +675,19 @@ impl FullSchemaMergeInsertExec {
             }
         });
 
-        let update_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(update_rx);
+        // The update stream is consumed first, so it also observes the splitter
+        // task after its sender closes. Otherwise a task panic is indistinguishable
+        // from normal end-of-stream when both channel senders are dropped.
+        let splitter_result = stream::once(async move {
+            splitter_task.await.err().map(|error| {
+                Err(DataFusionError::Internal(format!(
+                    "Merge insert splitter task failed: {error}"
+                )))
+            })
+        })
+        .filter_map(future::ready);
+        let update_stream =
+            tokio_stream::wrappers::UnboundedReceiverStream::new(update_rx).chain(splitter_result);
         let update_stream = Box::pin(RecordBatchStreamAdapter::new(
             output_schema.clone(),
             update_stream,
@@ -1120,7 +1132,72 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::UInt64Array;
+    use crate::dataset::{InsertBuilder, MergeInsertBuilder};
+    use crate::io::exec::testing::TestingExec;
+    use arrow_array::{UInt64Array, record_batch};
+
+    #[tokio::test]
+    async fn test_splitter_task_panic_is_returned_as_stream_error() {
+        let initial = record_batch!(("key", Int32, [1])).unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let input_batch = record_batch!(
+            ("key", Int32, [2]),
+            (ROW_ADDR, UInt64, [0]),
+            (ROW_ID, UInt64, [0]),
+            (MERGE_ACTION_COLUMN, UInt8, [Action::UpdateAll as u8])
+        )
+        .unwrap();
+        let input = Arc::new(TestingExec::new(vec![input_batch.clone()]));
+        let params = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()])
+            .unwrap()
+            .params;
+        let exec =
+            FullSchemaMergeInsertExec::try_new(input, dataset, params, Arc::new(AtomicU64::new(0)))
+                .unwrap();
+
+        let merge_state = Arc::new(Mutex::new(MergeState::new(
+            MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            true,
+            vec!["key".to_string()],
+            Vec::new(),
+            SourceDedupeBehavior::Fail,
+        )));
+        let updating_row_ids = merge_state.lock().unwrap().updating_row_ids.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = updating_row_ids.lock().unwrap();
+                panic!("poison captured row ids");
+            })
+            .join()
+            .is_err()
+        );
+
+        let input_stream = RecordBatchStreamAdapter::new(
+            input_batch.schema(),
+            futures::stream::iter([Ok(input_batch)]),
+        );
+        let (mut update_stream, _insert_stream) = exec
+            .split_updates_and_inserts(Box::pin(input_stream), merge_state)
+            .unwrap();
+        let error = update_stream
+            .next()
+            .await
+            .expect("the splitter panic must produce a stream item")
+            .unwrap_err();
+
+        assert!(matches!(error, DataFusionError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("Merge insert splitter task failed")
+        );
+        assert!(error.to_string().contains("panicked"));
+    }
 
     #[test]
     fn test_merge_state_duplicate_rowid_detection_fail() {
