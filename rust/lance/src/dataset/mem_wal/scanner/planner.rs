@@ -88,7 +88,7 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
 /// Matched by field id, which a rename keeps. A stored column whose id the
 /// table no longer declares is absent from the result: the table has dropped
 /// it, and reading it would answer with data the table no longer has.
-fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
+pub(super) fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
     eprintln!(
         "DBG stored={:?} table={:?}",
         stored
