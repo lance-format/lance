@@ -219,7 +219,10 @@ impl SIMD<f32, 8> for f32x8 {
     unsafe fn load_unaligned(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_ps(ptr))
+            // Treat the register as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers this to an AVX move when AVX is
+            // enabled for the caller.
+            Self(ptr.cast::<__m256>().read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -622,7 +625,11 @@ impl SIMD<f32, 16> for f32x16 {
     unsafe fn load_unaligned(ptr: *const f32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_ps(ptr), _mm256_loadu_ps(ptr.add(8)))
+            // Treat the registers as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers these to AVX moves when AVX is
+            // enabled for the caller.
+            let ptr = ptr.cast::<__m256>();
+            Self(ptr.read_unaligned(), ptr.add(1).read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -962,6 +969,32 @@ mod tests {
     }
 
     #[test]
+    fn test_slice_conversion_uses_cpu_baseline() {
+        let values8 = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let values16 = [
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ];
+        let vectors = (
+            f32x8::from(&values8[..]),
+            f32x8::from(&values8),
+            f32x16::from(&values16[..]),
+            f32x16::from(&values16),
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box(vectors);
+            return;
+        }
+
+        assert_eq!(vectors.0.as_array(), values8);
+        assert_eq!(vectors.1.as_array(), values8);
+        assert_eq!(vectors.2.as_array(), values16);
+        assert_eq!(vectors.3.as_array(), values16);
+    }
+
+    #[test]
     fn test_basic_ops() {
         // Load / store / arithmetic on `f32x8` lower to AVX intrinsics, and
         // `multiply_add` lowers to `_mm256_fmadd_ps`, which needs FMA. Both
@@ -1134,12 +1167,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_gather_scalar_x86() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
         let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
         let idx = [0_i32, 4, 8, 12, 16, 20, 24, 29];
         let v = gather_scalar_x86(&a, &idx);
+
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box(v);
+            return;
+        }
+
         let expected = idx.map(|i| a[i as usize]);
         assert_eq!(v.as_array(), expected);
     }
