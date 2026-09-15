@@ -81,5 +81,13 @@ harness = false
 name = "buffer"
 harness = false
 
+[[bench]]
+name = "sparse_decode"
+harness = false
+
+[[bench]]
+name = "sparse_footprint"
+harness = false
+
 [lints]
 workspace = true
