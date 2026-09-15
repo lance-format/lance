@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
     cmp::Reverse,
@@ -125,7 +126,12 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
 }
@@ -384,8 +390,23 @@ impl BitmapIndex {
             store,
             index_cache,
             frag_reuse_index,
+            batch_remapper: None,
             lazy_reader,
         }
+    }
+
+    fn new_with_batch_remapping(
+        index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
+        null_map: Arc<RowAddrTreeMap>,
+        value_type: DataType,
+        store: Arc<dyn IndexStore>,
+        index_cache: WeakLanceCache,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Self {
+        let mut index = Self::new(index_map, null_map, value_type, store, index_cache, None);
+        index.batch_remapper = batch_remapper;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
+        index
     }
 
     pub(crate) async fn load(
@@ -464,6 +485,85 @@ impl BitmapIndex {
         )))
     }
 
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        let total_rows = page_lookup_file.num_rows();
+
+        if total_rows == 0 {
+            let schema = page_lookup_file.schema();
+            let data_type = schema.fields[0].data_type();
+            return Ok(Arc::new(Self::new_with_batch_remapping(
+                Arc::new(BTreeMap::new()),
+                Arc::new(RowAddrTreeMap::default()),
+                data_type,
+                store,
+                WeakLanceCache::from(index_cache),
+                remapping,
+            )));
+        }
+
+        let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
+        let mut null_map = Arc::new(RowAddrTreeMap::default());
+        let mut null_location: Option<usize> = None;
+        let value_type = page_lookup_file.schema().fields[0].data_type();
+
+        // Stream keys in bounded batches to avoid loading the entire keys
+        // column into memory at once.
+        let mut keys_stream = page_lookup_file
+            .read_range_stream(0..total_rows, Some(&["keys"]))
+            .await?;
+        let mut row_offset: usize = 0;
+        while let Some(keys_batch) = keys_stream.try_next().await? {
+            let dict_keys = keys_batch.column(0);
+            for idx in 0..keys_batch.num_rows() {
+                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
+                if key.0.is_null() {
+                    null_location = Some(row_offset);
+                } else {
+                    index_map.insert(key, row_offset);
+                }
+                row_offset += 1;
+            }
+        }
+
+        if let Some(null_loc) = null_location {
+            let batch = page_lookup_file
+                .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
+                .await?;
+
+            let binary_bitmaps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
+            let bitmap_bytes = binary_bitmaps.value(0);
+            let mut bitmap = deserialize_bitmap(bitmap_bytes, BITMAP_LOOKUP_NAME)?;
+
+            // Apply fragment remapping if needed
+            if let Some(remapper) = &remapping {
+                bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
+            }
+
+            null_map = Arc::new(bitmap);
+        }
+
+        Ok(Arc::new(Self::new_with_batch_remapping(
+            Arc::new(index_map),
+            null_map,
+            value_type,
+            store,
+            WeakLanceCache::from(index_cache),
+            remapping,
+        )))
+    }
+
     async fn load_bitmap(
         &self,
         key: &OrderableScalarValue,
@@ -511,7 +611,11 @@ impl BitmapIndex {
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
         if let Some(fri) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
             bitmap = fri.remap_row_addrs_tree_map(&bitmap);
+        } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
         }
 
         self.index_cache
@@ -634,7 +738,11 @@ impl Index for BitmapIndex {
                 let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                    // Legacy synchronous remapping path.
                     bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
+                } else if let Some(remapper) = self.batch_remapper.as_ref() {
+                    // Tagged asynchronous path.
+                    bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
                 }
 
                 let row_offset = start_row.checked_add(idx).ok_or_else(|| {
@@ -1861,6 +1969,20 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
 
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(BitmapIndex::load_with_remapping(index_store, remapping, cache).await?)
+    }
+
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -2933,5 +3055,43 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_with_remapping_rejects_corrupt_null_bitmap() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A single null key whose serialized bitmap is garbage.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keys", DataType::Int32, true),
+            Field::new("bitmaps", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![None::<i32>])),
+                Arc::new(BinaryArray::from_vec(vec![b"not a bitmap"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = store
+            .new_index_file(BITMAP_LOOKUP_NAME, schema)
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let error = BitmapIndex::load_with_remapping(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to deserialize bitmap"),
+            "{error}"
+        );
     }
 }
