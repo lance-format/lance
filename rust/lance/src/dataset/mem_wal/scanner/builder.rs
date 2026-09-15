@@ -197,6 +197,9 @@ pub struct LsmScanner {
     /// Derived from the base dataset when one is present, otherwise supplied
     /// explicitly by [`Self::without_base_table`].
     schema: SchemaRef,
+    /// [`Self::schema`] with each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    identity_schema: SchemaRef,
     shard_snapshots: Vec<ShardSnapshot>,
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
@@ -259,6 +262,9 @@ impl LsmScanner {
         // path-bound store binding.
         let store_params = base_table.store_params().map(derived_store_params);
         Self {
+            identity_schema: Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
+                base_table.schema(),
+            )),
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
             shard_snapshots,
@@ -302,6 +308,10 @@ impl LsmScanner {
         pk_columns: Vec<String>,
     ) -> Self {
         Self {
+            // Whatever identity the caller supplied. Pass a schema carrying
+            // field ids to have a generation's columns resolved by them; a
+            // plain one is matched by name, as it was before ids existed.
+            identity_schema: schema.clone(),
             base: BaseSource::PathOnly(base_path.into()),
             schema,
             shard_snapshots,
@@ -719,7 +729,12 @@ impl LsmScanner {
             });
         }
 
-        let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        let mut planner = LsmScanPlanner::new(
+            collector,
+            self.pk_columns.clone(),
+            base_schema,
+            Arc::clone(&self.identity_schema),
+        );
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
