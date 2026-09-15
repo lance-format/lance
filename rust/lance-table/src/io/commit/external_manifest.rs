@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
@@ -26,7 +27,92 @@ use super::{
     default_resolve_version, make_staging_manifest_path, write_version_hint,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
-use crate::io::commit::{CommitError, CommitHandler};
+use crate::io::commit::{
+    CommitError, CommitHandler, PredecessorIdentity, default_list_manifest_locations,
+    default_list_manifest_locations_since,
+};
+
+/// Copy `staging_path` to the canonical manifest path for `version`, point
+/// the store's record at it, and drop the staging object.
+#[allow(clippy::too_many_arguments)]
+pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
+    store: &S,
+    base_path: &Path,
+    version: u64,
+    staging_path: &Path,
+    size: u64,
+    object_store: &dyn OSObjectStore,
+    naming_scheme: ManifestNamingScheme,
+) -> Result<ManifestLocation> {
+    // Step 2: Copy staging to final path
+    let final_path = naming_scheme.manifest_path(base_path, version);
+    let final_e_tag =
+        copy_or_verify_final_manifest(object_store, staging_path, &final_path, version, size)
+            .await?;
+
+    let location = ManifestLocation {
+        version,
+        path: final_path.clone(),
+        size: Some(size),
+        naming_scheme,
+        e_tag: final_e_tag,
+        identity: None,
+    };
+
+    // Step 3: Update the external index to the final path.
+    //
+    // Publish only generation-independent metadata. COPY and this update
+    // are not one atomic operation, so an ETag observed above can already
+    // be stale when this call linearizes. `location` still carries that
+    // observation to the current caller for cache separation.
+    let published = store
+        .put_if_exists(base_path.as_ref(), version, final_path.as_ref(), size, None)
+        .await;
+
+    if let Err(error) = published {
+        // The canonical object is already durable and is the commit point.
+        // Keep staging so an old or new reader that still observes the
+        // reservation can retry this cache/index update. A DDB failure must
+        // not turn an S3-committed transaction into a reported conflict.
+        warn!(
+            "Final manifest '{}' is committed, but the external manifest index could not be updated; retaining staging manifest '{}' for repair: {}",
+            final_path, staging_path, error
+        );
+        return Ok(location);
+    }
+
+    // Step 4: Delete staging manifest
+    match object_store.delete(staging_path).await {
+        Ok(_) => {}
+        Err(ObjectStoreError::NotFound { .. }) => {}
+        Err(error) => {
+            // Staging is no longer authoritative after the canonical
+            // object and final index entry exist. Its deletion is garbage
+            // collection and cannot roll back the commit.
+            warn!(
+                "Failed to delete finalized staging manifest '{}': {}",
+                staging_path, error
+            );
+            return Ok(location);
+        }
+    }
+    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
+
+    Ok(location)
+}
+
+/// Outcome of [`ExternalManifestStore::put_if_predecessor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reservation {
+    /// The version is recorded at the given path, under the identity the
+    /// store minted for it.
+    Reserved { identity: String },
+    /// The version was already recorded; nothing was written.
+    Taken,
+    /// The predecessor is no longer the manifest it was judged as; nothing
+    /// was written.
+    PredecessorChanged,
+}
 
 /// External manifest store
 ///
@@ -72,6 +158,7 @@ use crate::io::commit::{CommitError, CommitHandler};
 /// reuse unconditionally safe.
 /// For a visual explanation of the commit loop see
 /// <https://github.com/lance-format/lance/assets/12615154/b0822312-0826-432a-b554-3965f8d48d04>
+
 #[async_trait]
 pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
@@ -91,6 +178,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             size: None,
             naming_scheme,
             e_tag: None,
+            identity: None,
         })
     }
 
@@ -118,6 +206,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     size: None,
                     naming_scheme,
                     e_tag: None,
+                    identity: None,
                 })
             })
             .transpose()
@@ -160,60 +249,89 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         )
         .await?;
 
-        // Step 2: Copy staging to final path
-        let final_path = naming_scheme.manifest_path(base_path, version);
-        let final_e_tag =
-            copy_or_verify_final_manifest(object_store, staging_path, &final_path, version, size)
-                .await?;
-
-        let location = ManifestLocation {
+        self.finalize(
+            base_path,
             version,
-            path: final_path.clone(),
-            size: Some(size),
+            staging_path,
+            size,
+            object_store,
             naming_scheme,
-            e_tag: final_e_tag,
-        };
+        )
+        .await
+    }
 
-        // Step 3: Update the external index to the final path.
-        //
-        // Publish only generation-independent metadata. COPY and this update
-        // are not one atomic operation, so an ETag observed above can already
-        // be stale when this call linearizes. `location` still carries that
-        // observation to the current caller for cache separation.
-        let published = self
-            .put_if_exists(base_path.as_ref(), version, final_path.as_ref(), size, None)
-            .await;
+    /// Steps 2-4 of [`Self::put`], once `version` is recorded at
+    /// `staging_path`; see [`finalize_staged`].
+    async fn finalize(
+        &self,
+        base_path: &Path,
+        version: u64,
+        staging_path: &Path,
+        size: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<ManifestLocation> {
+        finalize_staged(
+            self,
+            base_path,
+            version,
+            staging_path,
+            size,
+            object_store,
+            naming_scheme,
+        )
+        .await
+    }
 
-        if let Err(error) = published {
-            // The canonical object is already durable and is the commit point.
-            // Keep staging so an old or new reader that still observes the
-            // reservation can retry this cache/index update. A DDB failure must
-            // not turn an S3-committed transaction into a reported conflict.
-            warn!(
-                "Final manifest '{}' is committed, but the external manifest index could not be updated; retaining staging manifest '{}' for repair: {}",
-                final_path, staging_path, error
-            );
-            return Ok(location);
-        }
+    /// Whether [`Self::put_if_predecessor`] is implemented. Such a store also
+    /// fills [`ManifestLocation::identity`] on every location it returns.
+    fn supports_predecessor_condition(&self) -> bool {
+        false
+    }
 
-        // Step 4: Delete staging manifest
-        match object_store.delete(staging_path).await {
-            Ok(_) => {}
-            Err(ObjectStoreError::NotFound { .. }) => {}
-            Err(error) => {
-                // Staging is no longer authoritative after the canonical
-                // object and final index entry exist. Its deletion is garbage
-                // collection and cannot roll back the commit.
-                warn!(
-                    "Failed to delete finalized staging manifest '{}': {}",
-                    staging_path, error
-                );
-                return Ok(location);
-            }
-        }
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
+    /// A token unique to the record at `version`, minted when the record is
+    /// first written and never reused, so a recreated dataset's record at the
+    /// same version is told apart. `None` where the store keeps none.
+    async fn get_identity(&self, _base_uri: &str, _version: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
 
-        Ok(location)
+    /// Every committed record with version `> since` (all of them for `None`),
+    /// each a final location carrying its identity. A store that supports
+    /// predecessor conditions must implement this: its conditioned manifests
+    /// are not discoverable by listing the object store. `None` otherwise.
+    async fn list_versions(
+        &self,
+        _base_uri: &str,
+        _since: Option<u64>,
+    ) -> Result<Option<Vec<ManifestLocation>>> {
+        Ok(None)
+    }
+
+    /// Remove the record for `version` if it still carries `identity`, so a
+    /// recreated dataset's record at that version is left alone. Idempotent.
+    /// Only identity-bearing records are ever retired, so a store that mints
+    /// identities must implement this; the default refuses.
+    async fn forget_version(&self, _base_uri: &str, _version: u64, _identity: &str) -> Result<()> {
+        Err(Error::not_supported(
+            "this external manifest store cannot retire a version record",
+        ))
+    }
+
+    /// [`Self::put_if_not_exists`], applied only if the record at
+    /// `predecessor.version` still carries `predecessor.identity`, decided
+    /// atomically with the version reservation.
+    async fn put_if_predecessor(
+        &self,
+        _base_uri: &str,
+        _version: u64,
+        _path: &str,
+        _size: u64,
+        _predecessor: &PredecessorIdentity,
+    ) -> Result<Reservation> {
+        Err(Error::not_supported(
+            "this external manifest store cannot condition a reservation on its predecessor",
+        ))
     }
 
     /// Put the manifest path for a given base_uri and version, should fail if the version already exists.
@@ -461,6 +579,7 @@ impl ExternalManifestCommitHandler {
                     size: expected_size,
                     naming_scheme,
                     e_tag: _,
+                    identity,
                 } = location;
 
                 let size = match expected_size {
@@ -489,6 +608,7 @@ impl ExternalManifestCommitHandler {
                     size,
                     naming_scheme,
                     e_tag,
+                    identity,
                 })
             }
             Err(ObjectStoreError::NotFound { .. }) => {
@@ -535,6 +655,7 @@ impl ExternalManifestCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag: final_e_tag,
+            identity: None,
         };
 
         // Step 2: point the external index at the final location without an
@@ -585,6 +706,31 @@ impl ExternalManifestCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ExternalManifestCommitHandler {
+    async fn version_exists(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<bool> {
+        match self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::NotFound { .. }) => {
+                let path = naming_scheme.manifest_path(base_path, version);
+                match object_store.head(&path).await {
+                    Ok(_) => Ok(true),
+                    Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
@@ -597,6 +743,9 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         match location {
             Some(location) => {
+                if location.identity.is_some() {
+                    return recorded_as_final(location, object_store.inner.as_ref()).await;
+                }
                 if location.path.extension() == Some(MANIFEST_EXTENSION) {
                     return self
                         .verify_finalized_manifest_location(
@@ -613,6 +762,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     size,
                     naming_scheme,
                     e_tag: _,
+                    identity,
                 } = location;
 
                 let size = if let Some(size) = size {
@@ -632,7 +782,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     }
                 };
 
-                let final_location = self
+                let mut final_location = self
                     .finalize_manifest(
                         base_path,
                         &path,
@@ -642,7 +792,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         naming_scheme,
                     )
                     .await?;
-
+                final_location.identity = identity;
                 Ok(final_location)
             }
             // Dataset not found in the external store, this could be because the dataset did not
@@ -696,6 +846,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             size: Some(size),
                             naming_scheme,
                             e_tag,
+                            identity: None,
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
@@ -707,6 +858,9 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Err(e) => return Err(e),
         };
 
+        if location.identity.is_some() {
+            return recorded_as_final(location, object_store).await;
+        }
         if location.path.extension() == Some(MANIFEST_EXTENSION) {
             return self
                 .verify_finalized_manifest_location(base_path, location, object_store)
@@ -723,40 +877,87 @@ impl CommitHandler for ExternalManifestCommitHandler {
             meta.size
         };
 
-        self.finalize_manifest(
-            base_path,
-            &location.path,
-            version,
-            size,
-            object_store,
-            naming_scheme,
-        )
-        .await
+        let mut final_location = self
+            .finalize_manifest(
+                base_path,
+                &location.path,
+                version,
+                size,
+                object_store,
+                naming_scheme,
+            )
+            .await?;
+        final_location.identity = location.identity;
+        Ok(final_location)
     }
 
-    async fn version_exists(
+    async fn resolve_identity(
         &self,
         base_path: &Path,
+        _object_store: &ObjectStore,
         version: u64,
-        object_store: &dyn OSObjectStore,
-        naming_scheme: ManifestNamingScheme,
-    ) -> Result<bool> {
-        match self
+    ) -> Result<Option<PredecessorIdentity>> {
+        Ok(self
             .external_manifest_store
-            .get_manifest_location(base_path.as_ref(), version)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(Error::NotFound { .. }) => {
-                let path = naming_scheme.manifest_path(base_path, version);
-                match object_store.head(&path).await {
-                    Ok(_) => Ok(true),
-                    Err(ObjectStoreError::NotFound { .. }) => Ok(false),
-                    Err(e) => Err(e.into()),
+            .get_identity(base_path.as_ref(), version)
+            .await?
+            .map(|identity| PredecessorIdentity { version, identity }))
+    }
+
+    fn list_manifest_locations<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        sorted_descending: bool,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            match store.list_versions(base_path.as_ref(), None).await? {
+                Some(mut locations) => {
+                    if sorted_descending {
+                        locations.sort_by_key(|l| std::cmp::Reverse(l.version));
+                    }
+                    Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)).boxed())
                 }
+                None => Ok(default_list_manifest_locations(
+                    &base_path,
+                    object_store,
+                    sorted_descending,
+                )),
             }
-            Err(e) => Err(e),
-        }
+        })
+        .try_flatten()
+        .boxed()
+    }
+
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            match store
+                .list_versions(base_path.as_ref(), Some(since_version))
+                .await?
+            {
+                Some(mut locations) => {
+                    locations.retain(|l| l.version > since_version);
+                    locations.sort_by_key(|l| std::cmp::Reverse(l.version));
+                    Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)).boxed())
+                }
+                None => Ok(default_list_manifest_locations_since(
+                    &base_path,
+                    object_store,
+                    since_version,
+                )),
+            }
+        })
+        .try_flatten()
+        .boxed()
     }
 
     async fn commit(
@@ -797,40 +998,15 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 write_version_hint(object_store, base_path, manifest.version).await;
                 Ok(location)
             }
-            Err(error) => {
-                // A different recorded path proves this staging manifest lost
-                // the version and is safe to remove. Otherwise, the external
-                // store may have recorded our staging path before its response
-                // was lost, so retain it for outcome verification/finalization.
-                let recorded_location = self
-                    .external_manifest_store
-                    .get_manifest_location(base_path.as_ref(), manifest.version)
-                    .await;
-                if matches!(
-                    &recorded_location,
-                    Ok(location) if location.path != staging_path
-                ) {
-                    match object_store.inner.delete(&staging_path).await {
-                        Ok(()) => {
-                            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
-                        }
-                        Err(ObjectStoreError::NotFound { .. }) => {}
-                        Err(delete_error) => {
-                            warn!(
-                                "Failed to delete losing staging manifest '{}': {}",
-                                staging_path, delete_error
-                            );
-                        }
-                    }
-                    return Err(CommitError::CommitConflict);
-                }
-                warn!(
-                    "External manifest commit for version {} failed; retaining staging manifest \
-                     '{}' until the commit outcome is resolved: {}",
-                    manifest.version, staging_path, error
-                );
-                Err(CommitError::CommitConflict)
-            }
+            Err(error) => Err(self
+                .lose_or_retain(
+                    base_path,
+                    manifest.version,
+                    &staging_path,
+                    object_store,
+                    error,
+                )
+                .await),
         }
     }
 
@@ -838,6 +1014,164 @@ impl CommitHandler for ExternalManifestCommitHandler {
         self.external_manifest_store
             .delete(base_path.as_ref())
             .await
+    }
+
+    async fn forget_version(&self, base_path: &Path, version: u64, identity: &str) -> Result<()> {
+        self.external_manifest_store
+            .forget_version(base_path.as_ref(), version, identity)
+            .await
+    }
+
+    fn supports_predecessor_condition(&self) -> bool {
+        self.external_manifest_store
+            .supports_predecessor_condition()
+    }
+
+    async fn resolve_latest_identity(
+        &self,
+        base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<Option<PredecessorIdentity>> {
+        let Some((version, _)) = self
+            .external_manifest_store
+            .get_latest_version(base_path.as_ref())
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .external_manifest_store
+            .get_identity(base_path.as_ref(), version)
+            .await?
+            .map(|identity| PredecessorIdentity { version, identity }))
+    }
+
+    async fn commit_after(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: super::ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<Transaction>,
+        predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        // Written once at a staging path, which listing never discovers, and
+        // recorded as final by the reservation itself; the canonical path a
+        // recreated dataset would share is never written.
+        let path =
+            make_staging_manifest_path(&naming_scheme.manifest_path(base_path, manifest.version))?;
+        let write_res =
+            manifest_writer(object_store, manifest, indices, &path, transaction).await?;
+        let size = write_res.size as u64;
+
+        let reserved = self
+            .external_manifest_store
+            .put_if_predecessor(
+                base_path.as_ref(),
+                manifest.version,
+                path.as_ref(),
+                size,
+                predecessor,
+            )
+            .await;
+        match reserved {
+            Ok(Reservation::Reserved { identity }) => {
+                write_version_hint(object_store, base_path, manifest.version).await;
+                Ok(ManifestLocation {
+                    version: manifest.version,
+                    path,
+                    size: Some(size),
+                    naming_scheme,
+                    e_tag: write_res.e_tag,
+                    identity: Some(identity),
+                })
+            }
+            Ok(Reservation::PredecessorChanged) => {
+                // Nothing was recorded, so the object is ours to drop.
+                delete_staging(object_store, &path, "refused").await;
+                Err(CommitError::OtherError(
+                    lance_core::error::PrerequisiteFailedSnafu {
+                        message: format!(
+                            "manifest {} is no longer the predecessor this commit was judged against",
+                            predecessor.version
+                        ),
+                    }
+                    .build(),
+                ))
+            }
+            Ok(Reservation::Taken) => Err(self
+                .lose_or_retain(
+                    base_path,
+                    manifest.version,
+                    &path,
+                    object_store,
+                    Error::commit_conflict_source(
+                        manifest.version,
+                        "manifest already exists".into(),
+                    ),
+                )
+                .await),
+            Err(error) => Err(self
+                .lose_or_retain(base_path, manifest.version, &path, object_store, error)
+                .await),
+        }
+    }
+}
+
+impl ExternalManifestCommitHandler {
+    /// A different recorded path proves the staging manifest lost, so it is
+    /// removed; otherwise it is retained for outcome verification.
+    async fn lose_or_retain(
+        &self,
+        base_path: &Path,
+        version: u64,
+        staging_path: &Path,
+        object_store: &ObjectStore,
+        error: Error,
+    ) -> CommitError {
+        let recorded_location = self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await;
+        if matches!(&recorded_location, Ok(location) if location.path != *staging_path) {
+            delete_staging(object_store, staging_path, "losing").await;
+            return CommitError::CommitConflict;
+        }
+        warn!(
+            "External manifest commit for version {} failed; retaining staging manifest \
+             '{}' until the commit outcome is resolved: {}",
+            version, staging_path, error
+        );
+        CommitError::CommitConflict
+    }
+}
+
+/// A record from a store that keeps identities is final as recorded and is
+/// never repaired onto the canonical path.
+async fn recorded_as_final(
+    mut location: ManifestLocation,
+    object_store: &dyn OSObjectStore,
+) -> Result<ManifestLocation> {
+    if location.size.is_none() {
+        location.size = Some(object_store.head(&location.path).await?.size);
+    }
+    Ok(location)
+}
+
+async fn delete_staging(object_store: &ObjectStore, staging_path: &Path, why: &str) {
+    match object_store.inner.delete(staging_path).await {
+        Ok(()) => {
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_MANIFEST, path = staging_path.as_ref());
+        }
+        Err(ObjectStoreError::NotFound { .. }) => {}
+        Err(delete_error) => {
+            warn!(
+                "Failed to delete {} staging manifest '{}': {}",
+                why, staging_path, delete_error
+            );
+        }
     }
 }
 
@@ -855,7 +1189,8 @@ mod tests {
 
     use super::*;
     use crate::format::DataStorageFormat;
-    use crate::io::commit::write_manifest_file_to_path;
+    use crate::io::commit::{VERSIONS_DIR, write_manifest_file_to_path};
+    use futures::TryStreamExt;
 
     #[derive(Debug, Clone)]
     struct StoredManifest {
@@ -933,6 +1268,7 @@ mod tests {
                 path,
                 size: Some(stored.size),
                 e_tag: stored.e_tag,
+                identity: None,
             })
         }
 
@@ -1700,5 +2036,518 @@ mod tests {
             matches!(staging_error, ObjectStoreError::NotFound { .. }),
             "unexpected staging manifest error: {staging_error}"
         );
+    }
+
+    /// `(path, size, identity)` per version; identities are minted per record
+    /// and never reused.
+    #[derive(Debug, Default)]
+    struct IdentifiedStore {
+        rows: Mutex<HashMap<u64, (String, u64, String)>>,
+        next_identity: AtomicUsize,
+        hold_next_reservation: AtomicBool,
+        reservation_held: Notify,
+        release_reservation: Notify,
+    }
+
+    impl IdentifiedStore {
+        fn mint(&self) -> String {
+            format!(
+                "identity-{}",
+                self.next_identity.fetch_add(1, Ordering::SeqCst)
+            )
+        }
+
+        fn handler(self: &Arc<Self>) -> ExternalManifestCommitHandler {
+            ExternalManifestCommitHandler {
+                external_manifest_store: self.clone(),
+            }
+        }
+
+        /// Drop every record and write a replacement dataset's records at the
+        /// same versions.
+        fn recreate(&self) {
+            let mut rows = self.rows.lock().unwrap();
+            let versions: Vec<u64> = rows.keys().copied().collect();
+            rows.clear();
+            for version in versions {
+                rows.insert(version, (v2_path(version), 1, self.mint()));
+            }
+        }
+
+        fn identity_of(&self, version: u64) -> Option<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.2.clone())
+        }
+    }
+
+    #[async_trait]
+    impl ExternalManifestStore for IdentifiedStore {
+        async fn get(&self, _base_uri: &str, version: u64) -> Result<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.0.clone())
+                .ok_or_else(|| Error::not_found(format!("@{version}")))
+        }
+
+        async fn get_manifest_location(
+            &self,
+            _base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            let row = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .cloned()
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            let path = Path::parse(&row.0).unwrap();
+            Ok(ManifestLocation {
+                version,
+                naming_scheme: detect_naming_scheme_from_path(&path)?,
+                path,
+                size: Some(row.1),
+                e_tag: None,
+                identity: Some(row.2),
+            })
+        }
+
+        async fn get_latest_version(&self, _base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .max_by_key(|(version, _)| **version)
+                .map(|(version, row)| (*version, row.0.clone())))
+        }
+
+        async fn get_latest_manifest_location(
+            &self,
+            base_uri: &str,
+        ) -> Result<Option<ManifestLocation>> {
+            match self.get_latest_version(base_uri).await? {
+                Some((version, _)) => self
+                    .get_manifest_location(base_uri, version)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let identity = self.mint();
+            let mut rows = self.rows.lock().unwrap();
+            if rows.contains_key(&version) {
+                return Err(Error::commit_conflict_source(version, "exists".into()));
+            }
+            rows.insert(version, (path.to_string(), size, identity));
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&version)
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            row.0 = path.to_string();
+            row.1 = size;
+            Ok(())
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn get_identity(&self, _base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self.identity_of(version))
+        }
+
+        async fn forget_version(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            identity: &str,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(&version).is_some_and(|row| row.2 == identity) {
+                rows.remove(&version);
+            }
+            Ok(())
+        }
+
+        async fn list_versions(
+            &self,
+            base_uri: &str,
+            since: Option<u64>,
+        ) -> Result<Option<Vec<ManifestLocation>>> {
+            let versions: Vec<u64> = self.rows.lock().unwrap().keys().copied().collect();
+            let mut locations = Vec::new();
+            for version in versions {
+                if since.is_none_or(|since| version > since) {
+                    locations.push(self.get_manifest_location(base_uri, version).await?);
+                }
+            }
+            Ok(Some(locations))
+        }
+
+        async fn put_if_predecessor(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            predecessor: &PredecessorIdentity,
+        ) -> Result<Reservation> {
+            if self.hold_next_reservation.swap(false, Ordering::SeqCst) {
+                self.reservation_held.notify_one();
+                self.release_reservation.notified().await;
+            }
+            let identity = self.mint();
+            let mut rows = self.rows.lock().unwrap();
+            let held = rows
+                .get(&predecessor.version)
+                .is_some_and(|row| row.2 == predecessor.identity);
+            if !held {
+                return Ok(Reservation::PredecessorChanged);
+            }
+            if rows.contains_key(&version) {
+                return Ok(Reservation::Taken);
+            }
+            rows.insert(version, (path.to_string(), size, identity.clone()));
+            Ok(Reservation::Reserved { identity })
+        }
+    }
+
+    fn v2_path(version: u64) -> String {
+        ManifestNamingScheme::V2
+            .manifest_path(&Path::from("dataset"), version)
+            .to_string()
+    }
+
+    fn v2_names(versions: &[u64]) -> Vec<String> {
+        let mut names: Vec<String> = versions
+            .iter()
+            .map(|v| Path::from(v2_path(*v)).filename().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Version 1 committed through `store`, plus what a conditioned commit of
+    /// version 2 needs.
+    async fn identified_fixture(
+        store: &Arc<IdentifiedStore>,
+    ) -> (
+        ExternalManifestCommitHandler,
+        ObjectStore,
+        Path,
+        PredecessorIdentity,
+    ) {
+        let handler = store.handler();
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        handler
+            .commit(
+                &mut test_manifest(),
+                None,
+                &base_path,
+                &object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+            )
+            .await
+            .unwrap();
+        let predecessor = handler
+            .resolve_latest_identity(&base_path, &object_store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(predecessor.version, 1);
+        (handler, object_store, base_path, predecessor)
+    }
+
+    async fn commit_after_v2(
+        handler: &ExternalManifestCommitHandler,
+        object_store: &ObjectStore,
+        base_path: &Path,
+        predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let mut manifest = test_manifest();
+        manifest.version = 2;
+        handler
+            .commit_after(
+                &mut manifest,
+                None,
+                base_path,
+                object_store,
+                write_manifest_file_to_path,
+                ManifestNamingScheme::V2,
+                None,
+                predecessor,
+            )
+            .await
+    }
+
+    async fn versions_dir_files(object_store: &ObjectStore, base_path: &Path) -> Vec<String> {
+        let mut files: Vec<String> = object_store
+            .inner
+            .list(Some(&base_path.clone().join(VERSIONS_DIR)))
+            .map_ok(|meta| meta.location.filename().unwrap().to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn test_a_conditioned_commit_lands_under_its_minted_identity() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        let location = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+            .await
+            .unwrap();
+        // Published at a staging name: invisible to object-store listing,
+        // final only through the store's record.
+        let name = location.path.filename().unwrap();
+        assert!(name.contains(".manifest-"), "{name}");
+        assert_eq!(ManifestNamingScheme::detect_scheme(name), None);
+
+        assert!(location.identity.is_some());
+        assert_eq!(location.identity, store.identity_of(2));
+        let resolved = handler
+            .resolve_latest_location(&base_path, &object_store)
+            .await
+            .unwrap();
+        assert_eq!(resolved.path, location.path);
+        assert_eq!(resolved.identity, location.identity);
+        // The store, not the object store, is the history.
+        assert_eq!(
+            listed_versions(&handler, &object_store, &base_path).await,
+            vec![2, 1]
+        );
+        let since: Vec<u64> = handler
+            .list_manifest_locations_since(&base_path, &object_store, 1)
+            .map_ok(|l| l.version)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(since, vec![2]);
+        assert_eq!(versions_dir_files(&object_store, &base_path).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_changed_predecessor_is_refused_without_publishing() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, _) = identified_fixture(&store).await;
+        let stale = PredecessorIdentity {
+            version: 1,
+            identity: "identity-from-a-dropped-dataset".to_string(),
+        };
+        let err = commit_after_v2(&handler, &object_store, &base_path, &stale)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CommitError::OtherError(Error::PrerequisiteFailed { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(store.identity_of(2).is_none());
+        assert_eq!(
+            versions_dir_files(&object_store, &base_path).await,
+            v2_names(&[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_taken_version_is_a_conflict() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        store
+            .put_if_not_exists("dataset", 2, &v2_path(2), 1, None)
+            .await
+            .unwrap();
+        let err = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CommitError::CommitConflict), "{err:?}");
+        assert_eq!(
+            versions_dir_files(&object_store, &base_path).await,
+            v2_names(&[1])
+        );
+    }
+
+    /// A recreated dataset's records never carry the observed identity, so
+    /// the reservation refuses and nothing is published.
+    #[tokio::test]
+    async fn test_a_recreation_before_publication_is_refused() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        store.recreate();
+        let err = commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CommitError::OtherError(Error::PrerequisiteFailed { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            versions_dir_files(&object_store, &base_path).await,
+            v2_names(&[1])
+        );
+    }
+    async fn listed_versions(
+        handler: &ExternalManifestCommitHandler,
+        object_store: &ObjectStore,
+        base_path: &Path,
+    ) -> Vec<u64> {
+        handler
+            .list_manifest_locations(base_path, object_store, true)
+            .map_ok(|l| l.version)
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    /// A commit cancelled after its write but before the reservation leaves
+    /// an object nothing discovers: no record, and no listed version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_cancelled_reservation_publishes_nothing() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        store.hold_next_reservation.store(true, Ordering::SeqCst);
+        let task = {
+            let (handler, object_store, base_path) =
+                (store.handler(), object_store.clone(), base_path.clone());
+            tokio::spawn(async move {
+                commit_after_v2(&handler, &object_store, &base_path, &predecessor).await
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.reservation_held.notified(),
+        )
+        .await
+        .expect("the commit never reached its reservation");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(store.identity_of(2).is_none());
+        assert_eq!(
+            listed_versions(&handler, &object_store, &base_path).await,
+            vec![1]
+        );
+        // The orphaned object is on the object store, but not as a version.
+        assert_eq!(versions_dir_files(&object_store, &base_path).await.len(), 2);
+        let raw: Vec<u64> = default_list_manifest_locations(&base_path, &object_store, true)
+            .map_ok(|l| l.version)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(raw, vec![1]);
+    }
+    /// Forgetting retires exactly the record cleanup removed: a stale identity
+    /// leaves a recreated dataset's record alone, and repeats are no-ops.
+    #[tokio::test]
+    async fn test_forgetting_a_version_retires_only_that_record() {
+        let store = Arc::new(IdentifiedStore::default());
+        let (handler, object_store, base_path, predecessor) = identified_fixture(&store).await;
+        commit_after_v2(&handler, &object_store, &base_path, &predecessor)
+            .await
+            .unwrap();
+        handler
+            .forget_version(&base_path, 1, "identity-from-a-dropped-dataset")
+            .await
+            .unwrap();
+        assert_eq!(
+            listed_versions(&handler, &object_store, &base_path).await,
+            vec![2, 1]
+        );
+        let identity = store.identity_of(1).unwrap();
+        handler
+            .forget_version(&base_path, 1, &identity)
+            .await
+            .unwrap();
+        handler
+            .forget_version(&base_path, 1, &identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed_versions(&handler, &object_store, &base_path).await,
+            vec![2]
+        );
+    }
+    /// A store that mints identities but cannot retire records fails cleanup
+    /// loudly instead of leaving rows behind.
+    #[tokio::test]
+    async fn test_retirement_is_refused_where_the_store_cannot_forget() {
+        #[derive(Debug)]
+        struct NoForget(Arc<IdentifiedStore>);
+        #[async_trait]
+        impl ExternalManifestStore for NoForget {
+            async fn get(&self, b: &str, v: u64) -> Result<String> {
+                self.0.get(b, v).await
+            }
+            async fn get_latest_version(&self, b: &str) -> Result<Option<(u64, String)>> {
+                self.0.get_latest_version(b).await
+            }
+            async fn put_if_not_exists(
+                &self,
+                b: &str,
+                v: u64,
+                p: &str,
+                s: u64,
+                e: Option<String>,
+            ) -> Result<()> {
+                self.0.put_if_not_exists(b, v, p, s, e).await
+            }
+            async fn put_if_exists(
+                &self,
+                b: &str,
+                v: u64,
+                p: &str,
+                s: u64,
+                e: Option<String>,
+            ) -> Result<()> {
+                self.0.put_if_exists(b, v, p, s, e).await
+            }
+            fn supports_predecessor_condition(&self) -> bool {
+                true
+            }
+        }
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(NoForget(Arc::new(IdentifiedStore::default()))),
+        };
+        let err = handler
+            .forget_version(&Path::from("dataset"), 1, "identity-0")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
     }
 }

@@ -928,14 +928,14 @@ async fn test_commit_on_dataset_with_mixed_file_versions() {
     // A v0.16 dataset that has both v1 and v2 files also has two fragments with
     // id 1, because the id allocation of that era could hand out an id a caller
     // had already supplied. The mixture is the more actionable diagnosis, so the
-    // duplicate check must not preempt it.
+    // duplicate check must not preempt it during commit.
     let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
     let ids = dataset
         .manifest
         .fragments
         .iter()
-        .map(|f| f.id)
+        .map(|fragment| fragment.id)
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![0, 1, 1, 2]);
 
@@ -1300,6 +1300,21 @@ async fn test_branch() {
     assert_eq!(tag_open.version().version, 3);
     assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
 
+    // Opening a branch URI with a tag pointing to a non-latest version on that same branch must check out the tag's version.
+    main_dataset
+        .tags()
+        .create("tag_branch1_v1", ("branch1", 1))
+        .await
+        .unwrap();
+    let branch_tag_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_tag("tag_branch1_v1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_tag_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_tag_open.version().version, 1);
+    assert_eq!(branch_tag_open.count_rows(None).await.unwrap(), 50);
+
     // Malformed branch names are rejected at the boundary
     for bad_name in ["", "branch1/"] {
         let err = main_dataset
@@ -1389,6 +1404,7 @@ async fn test_branch() {
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.tags().delete("tag1").await.unwrap();
+    dataset.tags().delete("tag_branch1_v1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 

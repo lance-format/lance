@@ -24,7 +24,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
@@ -3107,11 +3109,10 @@ impl FullZipScheduler {
                 let bytes_per_value = bits_per_value / 8;
                 let total_bytes_per_value =
                     bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
-                if total_bytes_per_value == 0 {
-                    return Err(lance_core::Error::internal(
-                        "Invalid encoding: per-row byte width must be greater than 0",
-                    ));
-                }
+                // total_bytes_per_value == 0 is valid for constant-null FSL pages written by
+                // earlier encoders that produced bits_per_value=0 with no ctrl-word bytes.
+                // FixedFullZipDecoder::drain handles this case by producing AllNull output
+                // without touching the (empty) data buffer.
                 Ok(Box::new(FixedFullZipDecoder {
                     details,
                     data,
@@ -3495,6 +3496,24 @@ impl FixedFullZipDecoder {
 
 impl StructuralPageDecoder for FixedFullZipDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        if self.total_bytes_per_value == 0 {
+            // No bytes per row: constant-null page with no ctrl-word bytes.
+            // The decompressor (ConstantDecompressor) ignores its input and returns AllNull.
+            return Ok(Box::new(FixedFullZipDecodeTask {
+                details: self.details.clone(),
+                data: vec![FullZipDecodeTaskItem {
+                    data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                        data: LanceBuffer::empty(),
+                        bits_per_value: 0,
+                        num_values: num_rows,
+                        block_info: BlockInfo::new(),
+                    }),
+                    rows_in_buf: num_rows,
+                }],
+                bytes_per_value: 0,
+                num_rows: num_rows as usize,
+            }));
+        }
         let mut task_data = Vec::with_capacity(self.data.len());
         let mut remaining = num_rows;
         while remaining > 0 {
@@ -4509,6 +4528,26 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     }
 }
 
+/// Returns the total bytes consumed by validity bitmaps of nested child fields
+/// for `rows` logical rows of `data_type`.
+///
+/// Only `FixedSizeList` types have nested children that contribute additional
+/// bitmaps; all other fixed-width leaf types return 0.
+fn fsl_child_bitmap_bytes(data_type: &arrow_schema::DataType, rows: u64) -> u64 {
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(child_field, dimension) => {
+            let child_rows = rows * *dimension as u64;
+            let own = if child_field.is_nullable() {
+                child_rows.div_ceil(8)
+            } else {
+                0
+            };
+            own + fsl_child_bitmap_bytes(child_field.data_type(), child_rows)
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug)]
 pub struct StructuralPrimitiveFieldDecoder {
     field: Arc<ArrowField>,
@@ -4525,6 +4564,32 @@ impl StructuralPrimitiveFieldDecoder {
             should_validate,
             rows_drained_in_current: 0,
         }
+    }
+
+    fn decoded_bytes_for_rows(&self, rows: u64) -> lance_core::Result<u64> {
+        let mut remaining = rows;
+        let mut total = 0u64;
+        for (page_num, page) in self.page_decoders.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let available = if page_num == 0 {
+                page.num_rows().saturating_sub(self.rows_drained_in_current)
+            } else {
+                page.num_rows()
+            };
+            let take = available.min(remaining);
+            total += page.decoded_bytes(take)?;
+            remaining -= take;
+        }
+        if remaining > 0 {
+            return Err(lance_core::Error::not_supported(format!(
+                "plan_decoded_bytes: queued pages cover only {} of {} requested rows",
+                rows - remaining,
+                rows,
+            )));
+        }
+        Ok(total)
     }
 }
 
@@ -4575,6 +4640,55 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
 
     fn data_type(&self) -> &DataType {
         self.field.data_type()
+    }
+
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+        let data_type = self.field.data_type();
+        let is_nullable = self.field.is_nullable();
+
+        // Fixed-width: exact from type metadata, no page inspection needed.
+        if let Some(byte_width) = data_type.byte_width_opt() {
+            let mut out = [0u64; 8];
+            for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (c as u64).min(rows_remaining);
+                out[i] = rows * byte_width as u64;
+                if is_nullable {
+                    out[i] += rows.div_ceil(8);
+                }
+                out[i] += fsl_child_bitmap_bytes(data_type, rows);
+            }
+            return Ok(out);
+        }
+
+        // Boolean: bit-packed, 1 bit per value.
+        if matches!(data_type, DataType::Boolean) {
+            let mut out = [0u64; 8];
+            for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (c as u64).min(rows_remaining);
+                out[i] = rows.div_ceil(8);
+                if is_nullable {
+                    out[i] += rows.div_ceil(8);
+                }
+            }
+            return Ok(out);
+        }
+
+        // Null type: no data bytes.
+        if matches!(data_type, DataType::Null) {
+            return Ok([0u64; 8]);
+        }
+
+        // Variable-width: walk page decoders for exact byte counts.
+        let mut out = [0u64; 8];
+        for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (c as u64).min(rows_remaining);
+            out[i] = self.decoded_bytes_for_rows(rows)?;
+            if is_nullable {
+                out[i] += rows.div_ceil(8);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -6691,6 +6805,97 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Rebuilds dictionary chunks whose values array is empty.
+    ///
+    /// Such chunks are entirely null and retain their key validity until rep/def has been
+    /// recorded.  At flush time their keys are zeroed and attached to a neighboring non-empty
+    /// dictionary.  If every chunk is empty, one non-null placeholder value makes key zero valid.
+    /// Rep/def retains the logical nullness, so these replacement keys are never exposed.
+    fn rebuild_empty_dictionary_chunks(arrays: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if !arrays.iter().any(|array| {
+            array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+        }) {
+            return Ok(arrays);
+        }
+
+        let zeroed = |data_type: &DataType, len: usize| {
+            new_null_array(data_type, len)
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .map(make_array)
+        };
+        let rebuild =
+            |keys: Vec<ArrayRef>, data_type: &DataType, values: ArrayRef| -> Result<ArrayRef> {
+                let keys = keys.iter().map(|keys| keys.as_ref()).collect::<Vec<_>>();
+                let keys = arrow_select::concat::concat(&keys)?;
+                let data = keys
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .child_data(vec![values.to_data()])
+                    .build()?;
+                Ok(make_array(data))
+            };
+
+        let mut rebuilt = Vec::with_capacity(arrays.len());
+        let mut pending_keys = Vec::with_capacity(arrays.len());
+        let mut empty_data_type = None;
+        for array in arrays {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            if dictionary.values().is_empty() {
+                pending_keys.push(zeroed(dictionary.keys().data_type(), array.len())?);
+                empty_data_type.get_or_insert_with(|| array.data_type().clone());
+            } else if pending_keys.is_empty() {
+                rebuilt.push(array);
+            } else {
+                pending_keys.push(make_array(dictionary.keys().to_data()));
+                rebuilt.push(rebuild(
+                    std::mem::take(&mut pending_keys),
+                    array.data_type(),
+                    dictionary.values().clone(),
+                )?);
+            }
+        }
+
+        if pending_keys.is_empty() {
+            return Ok(rebuilt);
+        }
+        if let Some(array) = rebuilt.pop() {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            let mut keys = Vec::with_capacity(pending_keys.len() + 1);
+            keys.push(make_array(dictionary.keys().to_data()));
+            keys.append(&mut pending_keys);
+            rebuilt.push(rebuild(
+                keys,
+                array.data_type(),
+                dictionary.values().clone(),
+            )?);
+        } else {
+            let data_type = empty_data_type.ok_or_else(|| {
+                Error::internal("Missing data type for an empty dictionary chunk")
+            })?;
+            let DataType::Dictionary(_, value_type) = &data_type else {
+                return Err(Error::internal(format!(
+                    "Expected dictionary data type, got {data_type}"
+                )));
+            };
+            rebuilt.push(rebuild(pending_keys, &data_type, zeroed(value_type, 1)?)?);
+        }
+        Ok(rebuilt)
+    }
+
     // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -6699,6 +6904,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        let arrays = Self::rebuild_empty_dictionary_chunks(arrays)?;
         DataBlock::validate_arrays(&arrays, &self.field.name)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
@@ -6762,6 +6968,14 @@ impl PrimitiveStructuralEncoder {
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
+            // Empty dictionaries have no valid key payload.  Keep the validity until rep/def is
+            // grouped with the buffered page; `do_flush` then rebuilds the keys against either a
+            // neighboring values array or an all-empty-page placeholder.
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
+            {
+                return Ok(array);
+            }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
         } else {
@@ -6782,6 +6996,7 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 array = dict::normalize_dict_nulls(array)?;
+                array = dict::clear_out_of_range_null_keys(array)?;
                 Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
@@ -7165,10 +7380,10 @@ mod tests {
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
-        make_array,
+        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
+        PrimitiveArray, StringArray, UInt8Array, make_array, new_null_array, types::Int32Type,
     };
-    use arrow_buffer::ScalarBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -7191,6 +7406,75 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    fn valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a"])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn empty_dictionary() -> ArrayRef {
+        new_null_array(
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            1,
+        )
+    }
+
+    fn null_valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sliced_empty_dictionary_with_hidden_key_payload() -> ArrayRef {
+        let keys = PrimitiveArray::<Int32Type>::new(
+            ScalarBuffer::from(vec![5, 7, 9]),
+            Some(NullBuffer::new(BooleanBuffer::new_unset(3))),
+        );
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        Arc::new(dictionary.slice(1, 1))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_after_value(vec![valued_dictionary(), empty_dictionary()])]
+    #[case::empty_before_value(vec![empty_dictionary(), valued_dictionary()])]
+    #[case::null_value_after_value(vec![valued_dictionary(), null_valued_dictionary()])]
+    #[case::hidden_sliced_after_value(vec![
+        valued_dictionary(),
+        sliced_empty_dictionary_with_hidden_key_payload(),
+    ])]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_chunks(#[case] dictionaries: Vec<ArrayRef>) {
+        check_round_trip_encoding_of_data(
+            dictionaries,
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sliced_empty_dictionary_with_hidden_key_payload() {
+        check_round_trip_encoding_of_data(
+            vec![sliced_empty_dictionary_with_hidden_key_payload()],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
@@ -7216,6 +7500,116 @@ mod tests {
             assert!(
                 message.contains(expected),
                 "expected error to contain {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_i32() {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+
+        let field = Arc::new(ArrowField::new("x", DataType::Int32, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let rows_remaining = 100u64;
+        let bytes = decoder.plan_decoded_bytes(rows_remaining).unwrap();
+
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            assert_eq!(bytes[i], rows * 4, "candidate batch size {candidate}");
+        }
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_i32_with_nulls() {
+        use arrow_array::Int32Array;
+
+        // Use N == CANDIDATE_BATCH_SIZES[5] == 1024.  At this size both the
+        // values buffer (1024*4 = 4096 bytes) and the validity bitmap
+        // (ceil(1024/8) = 128 bytes) are naturally aligned to Arrow's 64-byte
+        // allocation boundary, so plan_decoded_bytes matches
+        // get_buffer_memory_size exactly without needing alignment arithmetic.
+        const N: i32 = 1024;
+        let array = Int32Array::from_iter((0..N).map(|i| if i % 2 == 0 { Some(i) } else { None }));
+        let expected = array.get_buffer_memory_size() as u64;
+
+        let field = Arc::new(ArrowField::new("x", DataType::Int32, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5], expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_nullable_fsl_with_nullable_items() {
+        // FixedSizeList<nullable i32, DIM> where the FSL itself is also nullable.
+        // Arrow allocates three buffers:
+        //   1. FSL null bitmap:       ceil(rows / 8)
+        //   2. Child i32 null bitmap: ceil(rows * DIM / 8)
+        //   3. Child i32 values:      rows * DIM * 4
+        //
+        // N=1024, DIM=4 keeps all three naturally 64-byte aligned so the
+        // comparison against get_buffer_memory_size() is exact.
+        use arrow_array::{FixedSizeListArray, Int32Array};
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        const DIM: i32 = 4;
+
+        let child_values = Int32Array::from_iter(
+            (0..(N as i32 * DIM)).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+        );
+        let item_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let fsl_nulls = NullBuffer::from((0..N).map(|i| i % 3 != 0).collect::<Vec<_>>());
+        let fsl_array = FixedSizeListArray::new(
+            item_field.clone(),
+            DIM,
+            Arc::new(child_values),
+            Some(fsl_nulls),
+        );
+        let expected = fsl_array.get_buffer_memory_size() as u64;
+
+        let fsl_type = DataType::FixedSizeList(item_field, DIM);
+        let field = Arc::new(ArrowField::new("v", fsl_type, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5], expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_fixed_size_list_of_f32() {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+
+        const DIMENSION: i32 = 8;
+        // Items are non-nullable, which is the typical case for vector embeddings.
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, false));
+        let fsl_type = DataType::FixedSizeList(item_field, DIMENSION);
+        let field = Arc::new(ArrowField::new("vector", fsl_type, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let rows_remaining = 100u64;
+        let bytes = decoder.plan_decoded_bytes(rows_remaining).unwrap();
+
+        // Each FSL row is DIMENSION f32 values = DIMENSION * 4 bytes, plus
+        // 1 bit of validity bitmap (the field is nullable).
+        let bytes_per_row = DIMENSION as u64 * 4;
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            assert_eq!(
+                bytes[i],
+                rows * bytes_per_row + rows.div_ceil(8),
+                "candidate batch size {candidate}"
             );
         }
     }
@@ -7375,7 +7769,7 @@ mod tests {
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!("expected fixed-size-list compression");
         };
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
         let expected_size = num_rows * dimension * size_of::<f32>();
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -7447,7 +7841,7 @@ mod tests {
             panic!("expected fixed-size-list compression");
         };
         let decompressor = NullableFslDecompressor {
-            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()).unwrap(),
         };
         assert_eq!(
             FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
@@ -9758,6 +10152,43 @@ mod tests {
             .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    fn hand_built_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{DictionaryArray, Int32Array, types::Int32Type};
+        use arrow_buffer::NullBuffer;
+
+        let keys = Int32Array::new(
+            vec![0, 7, 7].into(),
+            Some(NullBuffer::from(vec![true, false, false])),
+        );
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef
+    }
+
+    fn concatenated_dictionary_with_out_of_range_null_keys() -> ArrayRef {
+        use arrow_array::{builder::StringDictionaryBuilder, new_null_array, types::Int32Type};
+
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append_value("a");
+        for _ in 0..7 {
+            builder.append_null();
+        }
+        let valued = Arc::new(builder.finish()) as ArrayRef;
+        let all_null = new_null_array(valued.data_type(), 8);
+        arrow_select::concat::concat(&[valued.as_ref(), all_null.as_ref()]).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys())]
+    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys())]
+    #[tokio::test]
+    async fn test_dictionary_out_of_range_null_keys_round_trip(#[case] dictionary: ArrayRef) {
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_page_sizes(vec![4096]);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &test_cases, HashMap::new()).await;
     }
 
     #[test]

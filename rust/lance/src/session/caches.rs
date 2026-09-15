@@ -198,14 +198,25 @@ impl CacheKey for RowAddrMaskKey {
 }
 
 #[derive(Debug)]
-pub struct RowIdIndexKey {
+pub struct RowIdIndexKey<'a> {
     pub version: u64,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
+    /// cached index at all (see `get_row_id_index`).
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for RowIdIndexKey {
+impl CacheKey for RowIdIndexKey<'_> {
     type ValueType = RowIdIndex;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_index/{}", self.version))
+        Cow::Owned(format!(
+            "row_id_index/{}/{}",
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
     }
     fn type_name() -> &'static str {
         "RowIdIndex"
@@ -217,6 +228,13 @@ impl CacheKey for RowIdIndexKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 }
 
@@ -393,6 +411,29 @@ mod tests {
                 .get_with_key(&RowIdSequenceKey {
                     fragment_id: 0,
                     row_id_meta: &inline,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_index_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let key = RowIdIndexKey {
+            version: 5,
+            e_tag: Some("first-etag"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&RowIdIndexKey {
+                    version: 5,
+                    e_tag: Some("second-etag"),
                 })
                 .await
                 .is_none()

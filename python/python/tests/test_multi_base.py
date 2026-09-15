@@ -214,7 +214,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from initial dataset
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
@@ -236,16 +236,14 @@ class TestMultiBase:
             max_rows_per_file=50,
         )
 
-        # Overwrite without specifying target - should use primary path
-        # This clears the old base_paths and writes to primary path only
+        # Overwrite without a target writes new files to primary storage while
+        # preserving the registered base paths.
         overwrite_data = self.create_test_data(75, id_offset=200)
 
         updated_dataset = lance.write_dataset(
             overwrite_data,
             self.primary_uri,
             mode="overwrite",
-            # No target_bases specified - data goes to primary path
-            # Old bases (path1, path2) are NOT preserved
             max_rows_per_file=25,
         )
 
@@ -259,7 +257,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from previous manifest
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         # Old path1 and path2 ARE preserved in manifest
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
@@ -326,7 +324,7 @@ class TestMultiBase:
         assert actual_ids == expected_ids
 
         # Verify base_paths are preserved from previous manifest
-        base_paths = updated_dataset._ds.base_paths()
+        base_paths = updated_dataset.base_paths()
         assert len(base_paths) == 2
         assert any(bp.name == "path1" for bp in base_paths.values())
         assert any(bp.name == "path2" for bp in base_paths.values())
@@ -374,7 +372,7 @@ class TestMultiBase:
         )
 
         # Verify base_paths configuration
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         assert len(base_paths) == 2
 
         # Find path1 and path2 in base_paths
@@ -419,7 +417,7 @@ class TestMultiBase:
         )
 
         # Get the base_paths to find the actual path URI for path2
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         path2_base = None
         for base_path in base_paths.values():
             if base_path.name == "path2":
@@ -450,7 +448,7 @@ class TestMultiBase:
 
         # Verify that new fragments are in path2 (not primary or path1)
         fragments = list(updated_dataset.get_fragments())
-        base_paths_updated = updated_dataset._ds.base_paths()
+        base_paths_updated = updated_dataset.base_paths()
 
         path1_fragments = 0
         path2_fragments = 0
@@ -842,37 +840,104 @@ class TestAddBases:
         assert len(result) == 10
 
     def test_add_bases_verify_base_paths(self):
-        """Test that get_base_paths returns added bases."""
-        # Create dataset
+        """Test that base_paths exposes every registered base by ID."""
         data = pd.DataFrame({"id": range(10), "value": range(10)})
+        dataset = lance.write_dataset(data, self.primary_uri, mode="create")
+        assert dataset.base_paths() == {}
+
+        dataset.add_bases(
+            [
+                DatasetBasePath(self.new_base1, name="new_base1", is_dataset_root=True),
+                DatasetBasePath(self.new_base2),
+            ]
+        )
+
+        base_paths = dataset.base_paths()
+        assert len(base_paths) == 2
+        assert all(base_id == base.id for base_id, base in base_paths.items())
+
+        bases_by_path = {base.path: base for base in base_paths.values()}
+        assert set(bases_by_path) == {self.new_base1, self.new_base2}
+
+        named_base = bases_by_path[self.new_base1]
+        assert named_base.name == "new_base1"
+        assert named_base.is_dataset_root is True
+
+        unnamed_base = bases_by_path[self.new_base2]
+        assert unnamed_base.name is None
+        assert unnamed_base.is_dataset_root is False
+        assert all(base.path != self.primary_uri for base in base_paths.values())
+        assert all(not hasattr(base, "storage_options") for base in base_paths.values())
+
+    @pytest.mark.parametrize(
+        ("attribute", "value"),
+        [
+            pytest.param("id", 99, id="id"),
+            pytest.param("name", "changed", id="name"),
+            pytest.param("path", "changed", id="path"),
+            pytest.param("is_dataset_root", False, id="is_dataset_root"),
+        ],
+    )
+    def test_base_paths_results_are_isolated(self, attribute, value):
+        """Returned mappings are detached and base attributes are read-only."""
         dataset = lance.write_dataset(
+            pd.DataFrame({"id": range(10)}),
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(
+                    self.initial_base,
+                    name="initial_base",
+                    is_dataset_root=True,
+                )
+            ],
+        )
+
+        base_paths = dataset.base_paths()
+        assert len(base_paths) == 1
+        base = next(iter(base_paths.values()))
+        assert base_paths[base.id] is base
+        base_paths.clear()
+
+        assert len(dataset.base_paths()) == 1
+        with pytest.raises(AttributeError):
+            setattr(base, attribute, value)
+
+        del dataset
+        assert base.id == 1
+        assert base.name == "initial_base"
+        assert base.path == self.initial_base
+        assert base.is_dataset_root is True
+
+    def test_base_paths_uses_current_snapshot(self):
+        """Base enumeration does not implicitly refresh an open dataset."""
+        data = pd.DataFrame({"id": range(10)})
+        stale_dataset = lance.write_dataset(
             data,
             self.primary_uri,
             mode="create",
             initial_bases=[DatasetBasePath(self.initial_base, name="initial_base")],
-            target_bases=["initial_base"],
         )
+        old_base_paths = stale_dataset.base_paths()
 
-        # Add new bases
-        dataset = lance.dataset(self.primary_uri)
-        dataset.add_bases(
-            [
-                DatasetBasePath(self.new_base1, name="new_base1"),
-                DatasetBasePath(self.new_base2, name="new_base2"),
-            ]
-        )
+        latest_dataset = lance.dataset(self.primary_uri)
+        latest_dataset.add_bases([DatasetBasePath(self.new_base1, name="new_base1")])
 
-        # Get base paths
-        base_paths = dataset._ds.base_paths()
+        assert {base.name for base in old_base_paths.values()} == {"initial_base"}
+        assert {base.name for base in stale_dataset.base_paths().values()} == {
+            "initial_base"
+        }
+        assert {base.name for base in latest_dataset.base_paths().values()} == {
+            "initial_base",
+            "new_base1",
+        }
 
-        # Should have 3 bases now (initial + 2 new)
-        assert len(base_paths) == 3
-
-        # Check that all bases are present
-        names = [bp.name for bp in base_paths.values()]
-        assert "initial_base" in names
-        assert "new_base1" in names
-        assert "new_base2" in names
+        stale_dataset.checkout_latest()
+        assert {base.name for base in stale_dataset.base_paths().values()} == {
+            "initial_base",
+            "new_base1",
+        }
+        assert {base.name for base in old_base_paths.values()} == {"initial_base"}
 
     def test_add_bases_large_data_distribution(self):
         """Test adding bases and distributing large amounts of data."""
@@ -993,7 +1058,7 @@ class TestAddBases:
         )
 
         # Verify the base was added
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         names = [bp.name for bp in base_paths.values()]
         assert "new_base1" in names
 
@@ -1287,7 +1352,7 @@ class TestWriteFragmentsWithTargetBases:
         assert set(result["id"]) == set(range(20))
 
         # Verify base paths are registered
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         assert len(base_paths) == 2  # 2 bases (base1, base2)
         # Check that our named bases are registered
         base_names = [bp.name for bp in base_paths.values() if bp.name is not None]
@@ -1464,7 +1529,7 @@ class TestMergeInsertMultiBase:
         )
 
     def base_name_of(self, dataset, data_file):
-        base_paths = dataset._ds.base_paths()
+        base_paths = dataset.base_paths()
         if data_file.base_id is None:
             return None
         return base_paths[data_file.base_id].name

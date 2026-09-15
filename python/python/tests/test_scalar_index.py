@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import collections.abc
 import json
 import os
 import random
@@ -191,6 +192,8 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
     Index dataclasses. This characterization test guards the dict keys and
     values so the deprecated method stays backwards compatible.
     """
+    from lance.bitmap import Bitmap
+
     with pytest.warns(DeprecationWarning):
         indices = indexed_dataset.list_indices()
 
@@ -211,7 +214,13 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
         assert set(idx) == expected_keys
         assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
         assert isinstance(idx["fields"], list)
-        assert isinstance(idx["fragment_ids"], set)
+        # `fragment_ids` is a Bitmap rather than a builtin `set`, so the
+        # compatibility that matters is that it still answers the abstract
+        # check and still supports set algebra.
+        assert isinstance(idx["fragment_ids"], Bitmap)
+        assert isinstance(idx["fragment_ids"], collections.abc.Set)
+        assert idx["fragment_ids"] & {0} == {0}
+        assert idx["fragment_ids"] - {0} == set()
         assert isinstance(idx["version"], int)
         assert idx["type"] != "Unknown"
         assert idx["base_id"] is None
@@ -1543,13 +1552,22 @@ def test_indexed_filter_with_fts_index(tmp_path):
 
 
 def test_fts_ngram_tokenizer(tmp_path):
-    data = pa.table({"text": ["hello world", "lance database", "lance is cool"]})
-    ds = lance.write_dataset(data, tmp_path)
+    data = pa.table(
+        {"text": ["hello world", "lance database", "lance is cool", "theatre", "other"]}
+    )
+    ds = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
     ds.create_scalar_index("text", index_type="INVERTED", base_tokenizer="ngram")
 
     results = ds.to_table(full_text_query="lan")
     assert results.num_rows == 2
     assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    results = ds.to_table(full_text_query="the")
+    assert set(results["text"].to_pylist()) == {"theatre", "other"}
+
+    params = ds.stats.index_stats("text_idx")["indices"][0]["params"]
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is False
 
     results = ds.to_table(full_text_query="nce")  # spellchecker:disable-line
     assert results.num_rows == 2

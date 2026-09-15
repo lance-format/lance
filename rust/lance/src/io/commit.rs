@@ -84,6 +84,43 @@ mod s3_test;
 /// Wall-clock budget for conflict retry backoff when callers do not override it.
 pub(crate) const DEFAULT_COMMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Env var overriding [`DEFAULT_COMMIT_RETRY_TIMEOUT`] process-wide, in
+/// (possibly fractional) seconds. A long-running maintenance commit (index
+/// build, compaction) can start from a read version that is hours old on a
+/// write-heavy table, and catching up through the intervening versions can
+/// need far more than the default budget; this is the operational escape
+/// hatch for callers that have no explicit-timeout API of their own.
+const COMMIT_RETRY_TIMEOUT_ENV: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
+
+/// The commit conflict-retry budget used when the caller does not set one:
+/// [`COMMIT_RETRY_TIMEOUT_ENV`] if set to a valid positive number of seconds,
+/// otherwise [`DEFAULT_COMMIT_RETRY_TIMEOUT`]. Read once per process.
+pub(crate) fn default_commit_retry_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_commit_retry_timeout(std::env::var(COMMIT_RETRY_TIMEOUT_ENV).ok().as_deref())
+    })
+}
+
+/// Parse [`COMMIT_RETRY_TIMEOUT_ENV`]'s value; `None` means unset. Anything
+/// that is not a finite positive number of seconds warns and falls back to
+/// [`DEFAULT_COMMIT_RETRY_TIMEOUT`].
+fn parse_commit_retry_timeout(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw else {
+        return DEFAULT_COMMIT_RETRY_TIMEOUT;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if secs.is_finite() && secs > 0.0 => Duration::from_secs_f64(secs),
+        _ => {
+            log::warn!(
+                "ignoring invalid {COMMIT_RETRY_TIMEOUT_ENV}={raw:?}; using the {}s default",
+                DEFAULT_COMMIT_RETRY_TIMEOUT.as_secs()
+            );
+            DEFAULT_COMMIT_RETRY_TIMEOUT
+        }
+    }
+}
+
 pub(crate) fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
     Error::too_much_write_contention(format!(
         "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
@@ -349,7 +386,6 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -374,10 +410,9 @@ async fn do_commit_new_dataset(
         // from the destination store when cloning across object stores/accounts. Falls
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
-        let source_commit_handler = source_commit_handler.unwrap_or(commit_handler);
         let source_base_path =
             ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
-        let source_manifest_location = source_commit_handler
+        let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
@@ -626,7 +661,6 @@ async fn record_new_dataset_commit(
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -638,7 +672,6 @@ pub(crate) async fn commit_new_dataset(
     do_commit_new_dataset(
         object_store,
         source_store,
-        source_commit_handler,
         commit_handler,
         base_path,
         transaction,
@@ -696,6 +729,7 @@ async fn migrate_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
@@ -720,6 +754,7 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
     crate::dataset::versions::validate_column_indices(manifest)
 }
@@ -1175,10 +1210,10 @@ pub(crate) async fn do_commit_detached_transaction(
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
         migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
-        // fix_schema and check_storage_version are just for sanity-checking and consistency
+        // Validate before the fragment-id check to preserve legacy migration
+        // diagnostics. Finalization repeats this at the manifest write boundary.
         fix_schema(&mut manifest)?;
-        check_storage_version(&mut manifest)?;
-        check_column_indices(&manifest)?;
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -1536,8 +1571,7 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
-        check_storage_version(&mut manifest)?;
-        check_column_indices(&manifest)?;
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -1733,6 +1767,8 @@ mod tests {
     use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
@@ -1747,6 +1783,20 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[rstest::rstest]
+    #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::whole_seconds(Some("600"), Duration::from_secs(600))]
+    #[case::fractional_and_padded(Some(" 2.5 "), Duration::from_secs_f64(2.5))]
+    #[case::empty(Some(""), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::not_a_number(Some("abc"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::zero(Some("0"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::negative(Some("-5"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::infinite(Some("inf"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
+        assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
@@ -2927,6 +2977,255 @@ mod tests {
             DataStorageFormat::new(data_storage_version.resolve()),
             HashMap::new(),
         )
+    }
+
+    fn make_storage_contract_manifest(
+        fallback: ConcreteFileVersion,
+        file_versions: &[ConcreteFileVersion],
+    ) -> Manifest {
+        let files = file_versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| {
+                DataFile::new(
+                    format!("data-{index}.lance"),
+                    vec![],
+                    vec![],
+                    *version,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let fragment = Fragment {
+            id: 0,
+            files,
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(fallback),
+            HashMap::new(),
+        )
+    }
+
+    fn enable_mixed_file_versions(manifest: &mut Manifest) {
+        manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+    }
+
+    #[test]
+    fn storage_contract_accepts_all_exact_v2_combinations() {
+        let versions = [
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3,
+        ];
+        for fallback in versions {
+            for other in versions {
+                let mut manifest = make_storage_contract_manifest(fallback, &[fallback, other]);
+                enable_mixed_file_versions(&mut manifest);
+                check_storage_version(&mut manifest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn storage_contract_requires_capability_for_non_fallback_file() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_1]);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("not enabled"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_finalization_derives_capability() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V2_0,
+            &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_2],
+        );
+
+        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        check_storage_version(&mut manifest).unwrap();
+    }
+
+    #[test]
+    fn storage_contract_finalization_rejects_v1_non_fallback() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_1, &[ConcreteFileVersion::V1]);
+
+        let err =
+            crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("cannot be mixed"), "{err}");
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
+    #[test]
+    fn storage_contract_checks_overlay_versions() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_0]);
+        manifest.fragments = Arc::new(vec![Fragment {
+            overlays: vec![DataOverlayFile {
+                data_file: DataFile::new(
+                    "overlay.lance",
+                    vec![],
+                    vec![],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+                coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0])),
+                committed_version: 1,
+            }],
+            ..manifest.fragments[0].clone()
+        }]);
+
+        assert!(check_storage_version(&mut manifest).is_err());
+        enable_mixed_file_versions(&mut manifest);
+        check_storage_version(&mut manifest).unwrap();
+    }
+
+    #[test]
+    fn storage_contract_rejects_v1_v2_mixing_even_with_capability() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V2_0,
+            &[ConcreteFileVersion::V1, ConcreteFileVersion::V2_0],
+        );
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("mixes V1 and V2"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_rejects_unknown_file_identity() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_0]);
+        Arc::make_mut(&mut manifest.fragments)[0].files[0].file_major_version = 99;
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_preserves_uniform_legacy_repair() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V1,
+            &[ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_1],
+        );
+
+        check_storage_version(&mut manifest).unwrap();
+
+        assert_eq!(
+            manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+
+        assert_eq!(
+            manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_1
+        );
+    }
+
+    #[test]
+    fn storage_contract_does_not_extend_legacy_repair_to_mixed_v2() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V1,
+            &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_1],
+        );
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(matches!(err, Error::Internal { .. }));
+        assert!(
+            err.to_string().contains("mixture of file versions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn storage_contract_rejects_v1_files_with_capability() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V1]);
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("references V1"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_rejects_empty_v1_fallback_with_capability() {
+        let mut manifest = make_storage_contract_manifest(ConcreteFileVersion::V1, &[]);
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("requires a V2 default"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_validates_column_indices_per_file_version() {
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let mut manifest = make_manifest_with_file(
+            Schema {
+                fields: vec![struct_field],
+                metadata: Default::default(),
+            },
+            data_file,
+            LanceFileVersion::V2_0,
+        );
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("Non-leaf field"), "{err}");
     }
 
     #[test]

@@ -167,8 +167,11 @@ pub enum FtsQueryExpr {
         positive: Box<Self>,
         /// Optional query whose matches are demoted.
         negative: Option<Box<Self>>,
-        /// Multiplier applied to documents matching `negative` (typically
-        /// `< 1.0` to demote).
+        /// How strongly a document matching `negative` is demoted: its score
+        /// becomes `positive - negative_boost * negative_score`. `0.0` is no
+        /// demotion, and larger values demote harder — the same contract the
+        /// compound scorer applies to committed data, so both tiers rank a
+        /// boost query identically. Scores may go negative.
         negative_boost: f32,
     },
 }
@@ -2394,12 +2397,12 @@ impl FtsMemIndex {
         if options.wand_factor < 1.0 {
             if let Some(limit) = options.limit {
                 if results.len() > limit {
-                    let top_k_score = results[limit - 1].score;
-                    let threshold = top_k_score * options.wand_factor;
+                    let threshold =
+                        relaxed_score_threshold(results[limit - 1].score, options.wand_factor);
                     results.retain(|e| e.score >= threshold);
                 }
             } else if let Some(max_entry) = results.first() {
-                let threshold = max_entry.score * options.wand_factor;
+                let threshold = relaxed_score_threshold(max_entry.score, options.wand_factor);
                 results.retain(|e| e.score >= threshold);
             }
         }
@@ -2422,11 +2425,21 @@ impl FtsMemIndex {
             return results;
         };
         let negative_results = self.search_query_with_state(neg, st, None, include_tail, true);
-        let negative_set: HashSet<DocumentKey> =
-            negative_results.iter().map(FtsEntry::key).collect();
+        // Subtractive, matching the compound scorer's contract exactly:
+        // `positive - negative_boost * negative_score` for a document the
+        // negative clause also matches, `positive` otherwise
+        // (`BoostScorer::score`). The negative *score* is needed, not just
+        // membership, which is why this keeps a map rather than a set.
+        //
+        // Scores may go negative; only non-finite values are an error upstream
+        // (`checked_score`), so nothing is clamped here.
+        let negative_scores: HashMap<DocumentKey, f32> = negative_results
+            .iter()
+            .map(|entry| (entry.key(), entry.score))
+            .collect();
         for entry in &mut results {
-            if negative_set.contains(&entry.key()) {
-                entry.score *= negative_boost;
+            if let Some(negative) = negative_scores.get(&entry.key()) {
+                entry.score -= negative_boost * negative;
             }
         }
         results
@@ -3244,6 +3257,19 @@ fn phrase_from_position<T: AsRef<[u32]>>(positions: &[T], first_pos: u32, slop: 
         }
     }
     true
+}
+
+/// Loosen `anchor` by `factor`, in the direction that admits *more* results
+/// whatever the sign.
+///
+/// For a non-negative anchor this is exactly `anchor * factor`, the form this
+/// has always used — `|x| == x` there, so `anchor - (1 - f) * anchor == anchor *
+/// f`. The two only diverge once scores can be negative, which a boost query's
+/// `positive - negative_boost * negative` makes reachable: multiplying a
+/// negative anchor by a factor below one moves the threshold *up*, tightening
+/// the filter rather than loosening it, and can then discard the entire top-k.
+fn relaxed_score_threshold(anchor: f32, factor: f32) -> f32 {
+    anchor - (1.0 - factor) * anchor.abs()
 }
 
 fn apply_boost(results: &mut [FtsEntry], boost: f32) {
@@ -5940,7 +5966,7 @@ mod tests {
         let batch = create_boost_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
 
-        let query_no_demote = FtsQueryExpr::boosting_with_negative(
+        let query_full_demote = FtsQueryExpr::boosting_with_negative(
             FtsQueryExpr::match_query("programming"),
             FtsQueryExpr::match_query("python"),
             1.0,
@@ -5956,7 +5982,7 @@ mod tests {
             0.0,
         );
 
-        let r_no = index.search_query(&query_no_demote);
+        let r_no = index.search_query(&query_full_demote);
         let r_half = index.search_query(&query_half_demote);
         let r_zero = index.search_query(&query_zero_demote);
 
@@ -5964,8 +5990,28 @@ mod tests {
         let s_half = r_half.iter().find(|e| e.row_position == 1).unwrap().score;
         let s_zero = r_zero.iter().find(|e| e.row_position == 1).unwrap().score;
 
-        assert!((s_half - s_no * 0.5).abs() < 0.001);
-        assert!(s_zero.abs() < 0.001);
+        // Subtractive: `positive - negative_boost * negative`. `0.0` leaves the
+        // positive score untouched and larger factors demote further, so the
+        // three are evenly spaced by the negative score.
+        let positive = index
+            .search_query(&FtsQueryExpr::match_query("programming"))
+            .into_iter()
+            .find(|e| e.row_position == 1)
+            .unwrap()
+            .score;
+        let negative = index
+            .search_query(&FtsQueryExpr::match_query("python"))
+            .into_iter()
+            .find(|e| e.row_position == 1)
+            .unwrap()
+            .score;
+        assert!((s_zero - positive).abs() < 0.001, "0.0 must not demote");
+        assert!((s_half - (positive - 0.5 * negative)).abs() < 0.001);
+        assert!((s_no - (positive - negative)).abs() < 0.001);
+        assert!(
+            s_no < s_half && s_half < s_zero,
+            "larger factor demotes more"
+        );
     }
 
     #[test]
@@ -6066,6 +6112,61 @@ mod tests {
         full.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         assert_eq!(results[0].row_position, full[0].row_position);
         assert_eq!(results[1].row_position, full[1].row_position);
+    }
+
+    /// Boost makes negative scores reachable, and the factor threshold has to
+    /// stay a *relaxation* at that point. Multiplying a negative k-th score by a
+    /// factor below one moves the threshold toward zero — tightening the filter
+    /// — which can drop every result including the actual top-k.
+    #[test]
+    fn boost_negative_scores_preserve_top_k_with_wand_factor() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = create_boost_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        // Same clause on both sides with a factor above 1 drives every match
+        // negative: `positive - 2.0 * positive`.
+        let query = FtsQueryExpr::boosting_with_negative(
+            FtsQueryExpr::match_query("programming"),
+            FtsQueryExpr::match_query("programming"),
+            2.0,
+        );
+        let exhaustive = index.search_with_options(&query, SearchOptions::default());
+        assert!(
+            exhaustive.iter().all(|entry| entry.score < 0.0),
+            "fixture must actually produce negative scores"
+        );
+
+        let limited = index.search_with_options(
+            &query,
+            SearchOptions::new().with_limit(1).with_wand_factor(0.5),
+        );
+        assert_eq!(limited.len(), 1, "factor pruning removed the actual top-k");
+        // Compare scores, not keys: the fixture's two best documents tie, so
+        // which one a stable sort surfaces is not a property of pruning.
+        assert_eq!(
+            limited[0].score, exhaustive[0].score,
+            "the surviving result must be a best-scoring one"
+        );
+    }
+
+    /// The relaxation is bit-identical to the old `anchor * factor` wherever
+    /// scores are non-negative, which is every query but boost.
+    #[test]
+    fn relaxed_score_threshold_matches_multiplication_when_non_negative() {
+        for anchor in [0.0f32, 0.25, 1.0, 12.5] {
+            for factor in [0.0f32, 0.25, 0.5, 0.99] {
+                assert_eq!(
+                    relaxed_score_threshold(anchor, factor),
+                    anchor * factor,
+                    "anchor={anchor} factor={factor}"
+                );
+            }
+        }
+        // Negative anchors relax downward instead of upward.
+        assert!(relaxed_score_threshold(-0.3, 0.5) < -0.3);
+        assert_eq!(relaxed_score_threshold(-0.3, 1.0), -0.3);
     }
 
     #[test]

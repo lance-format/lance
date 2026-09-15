@@ -567,6 +567,43 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Register periodic work that is **not** driven by a message.
+    ///
+    /// Runs `work` on its own task every `every`. Use it for work only the tick
+    /// performs: a ticker registered through [`MessageHandler::tickers`] shares
+    /// the handler's message loop, where a mailbox that never empties can keep
+    /// it from running.
+    ///
+    /// Cancellation and shutdown match [`Self::add_handler`]: the task observes
+    /// the same token and is joined by [`Self::shutdown_all`].
+    pub fn add_periodic<F, Fut>(&self, name: String, every: Duration, mut work: F) -> Result<()>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let cancellation_token = self.cancellation_token.clone();
+        let task_name = name.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = interval_at(tokio::time::Instant::now() + every, every);
+            // Same reason as the dispatcher: `Burst` would replay every tick
+            // missed while `work` ran, which for a slow `work` means the timer
+            // is permanently ready and the cancellation arm never wins.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        debug!("Periodic task '{}' received cancellation", task_name);
+                        return Ok(());
+                    }
+                    _ = interval.tick() => work().await,
+                }
+            }
+        });
+        self.tasks.write().unwrap().push((name, handle));
+        Ok(())
+    }
+
     /// Cancel and join every handler registered by [`Self::add_handler`].
     ///
     /// Cancellation causes each handler's dispatcher to stop accepting messages and call
@@ -1204,7 +1241,7 @@ struct ResidentMemTables {
     /// resident by a *failed* flush, which are the ones most worth metering.
     frozen: Vec<InMemoryMemTableRef>,
     /// Sealed memtables whose flush *did* commit, lingering out
-    /// `frozen_memtable_grace` before `SweepExpired` drops them.
+    /// `frozen_memtable_grace` before [`sweep_expired_frozen`] drops them.
     ///
     /// Held apart from `frozen` rather than dropped from the view: no flush can
     /// reclaim these, so metering the flush valve on them would throttle against
@@ -1226,7 +1263,7 @@ struct ResidentMemTables {
 /// Re-derive a shard's resident-memtable set from its writer state.
 ///
 /// Call under the write lock after any change to that set: `open`,
-/// `freeze_memtable`, a flush commit, and `SweepExpired` — which changes it by
+/// `freeze_memtable`, a flush commit, and [`sweep_expired_frozen`] — which changes it by
 /// evicting grace-expired generations that are still counted until it runs.
 ///
 /// Cheap: two `Arc` clones per live memtable, no byte walk — the totals are
@@ -1264,7 +1301,8 @@ struct WriterState {
     /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
     /// Pushed in `freeze_memtable`; stamped `flushed_at_ms` by `flush_memtable`
     /// on commit success only (retained un-stamped on failure until a later
-    /// flush or WAL replay on reopen); swept after the grace by `SweepExpired`.
+    /// flush or WAL replay on reopen); swept after the grace by
+    /// [`sweep_expired_frozen`].
     frozen_memtables: VecDeque<FrozenMemTable>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
@@ -1782,7 +1820,8 @@ impl SharedWriterState {
         // dispatches below. `state.memtable` was already replaced, so a failed
         // send that returned here without this push would drop the table and its
         // accepted rows would silently vanish from every scan. Keep it queryable
-        // past its manifest commit too (swept after the grace by `SweepExpired`);
+        // past its manifest commit too (swept after the grace by
+        // `sweep_expired_frozen`);
         // Arc refcount, not a copy — the flush task holds it alive anyway.
         state.frozen_memtables.push_back(FrozenMemTable {
             memtable: frozen_memtable.clone(),
@@ -2454,6 +2493,25 @@ impl ShardWriter {
             Box::new(memtable_handler),
             memtable_flush_rx,
         )?;
+
+        // On its own task: only this sweep reclaims a frozen memtable's bytes,
+        // and a ticker on the flush handler can be starved by its mailbox. See
+        // `TaskExecutor::add_periodic`.
+        //
+        // Zero grace evicts on flush commit, so there is nothing to sweep.
+        if !config.frozen_memtable_grace.is_zero() {
+            // Sweep often enough that eviction lags the grace by at most ~1/3,
+            // so a generation lives no more than ~grace * 4/3 past its commit.
+            let tick = (config.frozen_memtable_grace / 3).max(Duration::from_millis(100));
+            let sweep_state = state.clone();
+            let sweep_memory = memory.clone();
+            let grace = config.frozen_memtable_grace;
+            task_executor.add_periodic("memtable_grace_sweeper".to_string(), tick, move || {
+                let state = sweep_state.clone();
+                let memory = sweep_memory.clone();
+                async move { sweep_expired_frozen(&state, &memory, grace).await }
+            })?;
+        }
 
         // The index-apply task. Its own channel and its own dispatcher: the
         // dispatcher awaits `handle()` inline, so sharing the WAL flusher's
@@ -3947,7 +4005,8 @@ struct MemTableFlushHandler {
     stats: SharedWriteStats,
     observer: Option<Arc<dyn WalObserver>>,
     /// How long a frozen memtable lingers in memory after its flush commits
-    /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
+    /// before [`sweep_expired_frozen`] evicts it. See
+    /// `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
 }
 
@@ -3976,41 +4035,37 @@ impl MemTableFlushHandler {
             grace,
         }
     }
+}
 
-    /// Evict frozen memtables whose post-flush grace has elapsed. Un-stamped
-    /// (not-yet-flushed) entries are always kept.
-    async fn sweep_expired_frozen(&self) {
-        let now = now_millis();
-        let grace_ms = self.grace.as_millis() as u64;
-        let mut state = self.state.write().await;
-        let before = state.frozen_memtables.len();
-        state
-            .frozen_memtables
-            .retain(|frozen| match frozen.flushed_at_ms {
-                Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
-                None => true,
-            });
-        // Eviction is the only thing that reclaims a grace-retained generation,
-        // so this is where its bytes leave the memory view.
-        if state.frozen_memtables.len() != before {
-            publish_memory(&self.memory, &state);
-        }
+/// Evict frozen memtables whose post-flush grace has elapsed. Un-stamped
+/// (not-yet-flushed) entries are always kept.
+///
+/// A free function so the sweeper task can call it without owning the flush
+/// handler — see [`TaskExecutor::add_periodic`] for why it must not run there.
+async fn sweep_expired_frozen(
+    state: &Arc<RwLock<WriterState>>,
+    memory: &Arc<ArcSwap<ResidentMemTables>>,
+    grace: Duration,
+) {
+    let now = now_millis();
+    let grace_ms = grace.as_millis() as u64;
+    let mut state = state.write().await;
+    let before = state.frozen_memtables.len();
+    state
+        .frozen_memtables
+        .retain(|frozen| match frozen.flushed_at_ms {
+            Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
+            None => true,
+        });
+    // Eviction is the only thing that reclaims a grace-retained generation,
+    // so this is where its bytes leave the memory view.
+    if state.frozen_memtables.len() != before {
+        publish_memory(memory, &state);
     }
 }
 
 #[async_trait]
 impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
-    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableFlush>)> {
-        // Zero grace evicts on commit, so no sweeper is needed.
-        if self.grace.is_zero() {
-            return vec![];
-        }
-        // Sweep often enough that eviction lags the grace by at most ~1/3, so a
-        // generation lives no more than ~grace * 4/3 past its flush commit.
-        let tick = (self.grace / 3).max(Duration::from_millis(100));
-        vec![(tick, Box::new(|| TriggerMemTableFlush::SweepExpired))]
-    }
-
     async fn handle(&mut self, message: TriggerMemTableFlush) -> Result<()> {
         match message {
             TriggerMemTableFlush::Flush { memtable, done } => {
@@ -4023,7 +4078,6 @@ impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
                     result?;
                 }
             }
-            TriggerMemTableFlush::SweepExpired => self.sweep_expired_frozen().await,
         }
         Ok(())
     }
@@ -4150,7 +4204,7 @@ impl MemTableFlushHandler {
             // Retire the frozen handle on commit success, keyed by generation
             // (non-FIFO completion is fine). Zero grace evicts here; otherwise
             // stamp the grace clock so it lingers for multi-part as-of reads
-            // until `SweepExpired`. On failure leave it un-stamped: rows stay in
+            // until the grace sweep. On failure leave it un-stamped: rows stay in
             // the read union until a later flush or WAL replay, else a transient
             // error reopens the hole.
             if flush_result.is_ok() {
@@ -5767,6 +5821,110 @@ mod tests {
     /// lingers for `frozen_memtable_grace`. A long grace therefore leaves count
     /// non-zero with bytes back at zero — and pins that the two surfaces are
     /// answering different questions, not disagreeing about one.
+    /// A saturated handler starves its own ticker; `add_periodic` does not.
+    ///
+    /// `TaskDispatcher` biases a handler's mailbox ahead of its ticker, and the
+    /// `select!` is not evaluated while `handle()` awaits, so a mailbox that
+    /// never empties leaves the ticker no instant to win. Both halves are
+    /// asserted so the distinction holds.
+    #[tokio::test(start_paused = true)]
+    async fn test_saturated_handler_starves_its_ticker_but_not_a_periodic_task() {
+        #[derive(Debug)]
+        enum Msg {
+            Work,
+            Tick,
+        }
+
+        #[derive(Debug)]
+        struct SlowHandler {
+            worked: Arc<AtomicUsize>,
+            ticked: Arc<AtomicUsize>,
+            work: Duration,
+            tick: Duration,
+        }
+
+        #[async_trait]
+        impl MessageHandler<Msg> for SlowHandler {
+            fn tickers(&mut self) -> Vec<(Duration, MessageFactory<Msg>)> {
+                vec![(self.tick, Box::new(|| Msg::Tick))]
+            }
+
+            async fn handle(&mut self, message: Msg) -> Result<()> {
+                match message {
+                    Msg::Work => {
+                        self.worked.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(self.work).await;
+                    }
+                    Msg::Tick => {
+                        self.ticked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        // One unit of work outlasts the tick interval: that is what starves a
+        // ticker sharing the handler's loop.
+        let work = Duration::from_millis(100);
+        let tick = Duration::from_millis(10);
+        let run = Duration::from_millis(1000);
+        let expected_ticks = (run.as_millis() / tick.as_millis()) as usize;
+
+        let executor = TaskExecutor::new();
+        let worked = Arc::new(AtomicUsize::new(0));
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let swept = Arc::new(AtomicUsize::new(0));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        executor
+            .add_handler(
+                "slow".to_string(),
+                Box::new(SlowHandler {
+                    worked: worked.clone(),
+                    ticked: ticked.clone(),
+                    work,
+                    tick,
+                }),
+                rx,
+            )
+            .unwrap();
+
+        // The same cadence, on its own task rather than the handler's loop.
+        let swept_by_task = swept.clone();
+        executor
+            .add_periodic("sweeper".to_string(), tick, move || {
+                let swept = swept_by_task.clone();
+                async move {
+                    swept.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+
+        // Enough queued work that the mailbox never empties during the run.
+        for _ in 0..(run.as_millis() / work.as_millis()) + 2 {
+            tx.send(Msg::Work).unwrap();
+        }
+        tokio::time::sleep(run).await;
+
+        let (worked, ticked, swept) = (
+            worked.load(Ordering::Relaxed),
+            ticked.load(Ordering::Relaxed),
+            swept.load(Ordering::Relaxed),
+        );
+        assert!(worked > 0, "the handler must have been busy");
+        assert!(
+            ticked * 10 < expected_ticks,
+            "a ticker sharing a saturated handler's loop should be starved, but \
+             it ran {ticked} of ~{expected_ticks}"
+        );
+        assert!(
+            swept * 2 >= expected_ticks,
+            "periodic task ran {swept} of ~{expected_ticks}"
+        );
+
+        executor.shutdown_all().await.ok();
+    }
+
     #[tokio::test]
     async fn test_memtable_stats_frozen_count_outlives_frozen_bytes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -8870,7 +9028,7 @@ mod tests {
     /// On a successful flush commit the sealed generation's rows land in the
     /// manifest immediately, but the in-memory handle is NOT dropped — it
     /// lingers for `frozen_memtable_grace` (so in-flight as-of reads keep
-    /// batch-resolved membership), then is swept by the `SweepExpired` ticker.
+    /// batch-resolved membership), then is swept by the grace sweep.
     #[tokio::test]
     async fn test_frozen_retained_during_grace_then_swept() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

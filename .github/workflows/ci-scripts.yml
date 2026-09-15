@@ -16,6 +16,8 @@ on:
       - ci/format_vote_gate.py
       - ci/test_format_vote_gate.py
       - ci/test_labeler_area.py
+      - ci/check_proto_comments.py
+      - ci/test_check_proto_comments.py
       - .github/labeler-area.yml
       - .github/workflows/format-vote-gate.yml
       - .github/workflows/ci-scripts.yml
@@ -37,4 +39,4 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest PyYAML
       - name: Run tests
-        run: pytest ci/test_format_vote_gate.py ci/test_labeler_area.py
+        run: pytest ci/test_format_vote_gate.py ci/test_labeler_area.py ci/test_check_proto_comments.py
