@@ -6,8 +6,6 @@ use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
@@ -1543,17 +1541,21 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8
-                    if !matches!(
-                        q.data_type(),
-                        DataType::List(_) | DataType::FixedSizeList(_, _)
-                    ) =>
-                {
-                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                DataType::UInt8 => {
+                    let query_type = match q.data_type() {
+                        DataType::List(field) => DataType::List(Arc::new(
+                            field.as_ref().clone().with_data_type(DataType::UInt8),
+                        )),
+                        DataType::FixedSizeList(field, dimension) => DataType::FixedSizeList(
+                            Arc::new(field.as_ref().clone().with_data_type(DataType::UInt8)),
+                            *dimension,
+                        ),
+                        _ => DataType::UInt8,
+                    };
+                    let q = arrow::compute::cast(&q, &query_type).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
-                    let q = q.as_primitive::<UInt8Type>();
-                    scanner.nearest(&column, q, k)
+                    scanner.nearest(&column, q.as_ref(), k)
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
