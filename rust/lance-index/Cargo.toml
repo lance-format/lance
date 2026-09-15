@@ -138,6 +138,10 @@ name = "zonemap"
 harness = false
 
 [[bench]]
+name = "bloomfilter"
+harness = false
+
+[[bench]]
 name = "inverted"
 harness = false
 
