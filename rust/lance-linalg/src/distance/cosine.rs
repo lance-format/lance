@@ -28,7 +28,7 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use super::HalfBackend;
 use super::{
     Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_equal_lengths, dot::dot, half_backend,
-    norm_l2::norm_l2, x86_half_features,
+    int8_query_to_f32, norm_l2::norm_l2, x86_half_features,
 };
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
@@ -1381,9 +1381,18 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
+///
 /// # Panics
 ///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// With debug assertions on, panics if the length of `from` is not equal to the
+/// dimension (value length) of `to`. Without them the mismatch is not reliably
+/// caught, since cosine has no always-on layout assert of its own, unlike the l2
+/// and dot equivalents.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
@@ -1393,11 +1402,7 @@ pub fn cosine_distance_arrow_batch(
         DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::InvalidArgumentError(format!(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
-use lance_core::{Result, datatypes::Schema};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::decoder::{ColumnInfo, PageEncoding};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -47,6 +47,17 @@ pub struct FileWriterOptions {
     /// Do not enable this for arrays arriving through the Arrow C data
     /// interface because a small child array can keep an entire batch alive.
     pub keep_original_array: Option<bool>,
+}
+
+impl FileWriterOptions {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_page_bytes == Some(0) {
+            return Err(Error::invalid_input(
+                "max_page_bytes must be greater than 0, got 0",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A type-erased current-format file writer.
