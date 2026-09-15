@@ -305,6 +305,14 @@ fn compute_balance_loss(cluster_sizes: &[usize], n: usize, balance_factor: f32) 
     balance_factor * (size_loss - n.pow(2) as f32 / cluster_sizes.len() as f32)
 }
 
+fn kmeans_has_converged(previous_loss: f64, loss: f64, tolerance: f64) -> bool {
+    if loss == 0.0 {
+        previous_loss == 0.0
+    } else {
+        (previous_loss - loss).abs() < tolerance * loss.abs()
+    }
+}
+
 pub trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
@@ -336,7 +344,7 @@ pub trait KMeansAlgo<T: Num> {
         );
 
         let k = centroids.len() / dimension;
-        let mut cluster_radius = vec![0.0; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(dists.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -345,6 +353,11 @@ pub trait KMeansAlgo<T: Num> {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
 
         (membership, cluster_radius, losses)
     }
@@ -881,7 +894,7 @@ impl KMeans {
     ) -> arrow::error::Result<KMeansMembershipAndLoss> {
         let (membership, distances) = self.compute_membership_and_distances(data)?;
         let k = self.centroids.len() / self.dimension;
-        let mut cluster_radius: Vec<f32> = vec![0.0_f32; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(distances.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -890,6 +903,11 @@ impl KMeans {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
         Ok((membership, cluster_radius, losses))
     }
 
@@ -1080,15 +1098,17 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
-                if (loss - last_loss).abs() < params.tolerance * last_loss {
+                // Keep `last_loss` as the scale reference to preserve the legacy
+                // convergence threshold.
+                if kmeans_has_converged(loss, last_loss, params.tolerance) {
+                    let relative_loss_diff = if last_loss == 0.0 {
+                        if loss == 0.0 { 0.0 } else { f64::INFINITY }
+                    } else {
+                        (loss - last_loss).abs() / last_loss.abs()
+                    };
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
-                        i,
-                        params.max_iters,
-                        redo,
-                        loss,
-                        last_loss,
-                        (loss - last_loss).abs() / last_loss
+                        i, params.max_iters, redo, loss, last_loss, relative_loss_diff
                     );
                     break;
                 }
@@ -2077,6 +2097,64 @@ mod tests {
         membership.iter().for_each(|cd| {
             assert!(cd.is_some());
         });
+    }
+
+    #[test]
+    fn test_dot_membership_preserves_negative_distances_and_radius() {
+        let centroids = Float32Array::from(vec![2.0, 1.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::Dot, f64::MAX);
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![2.0, 3.0]), 1).unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(0)]);
+        assert_eq!(radii, vec![-3.0, 0.0]);
+        assert_eq!(losses, vec![-8.0, 0.0]);
+    }
+
+    #[test]
+    fn test_l2_membership_preserves_positive_radii() {
+        let centroids = Float32Array::from(vec![0.0, 10.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::L2, f64::MAX);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 12.0]), 1)
+            .unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(1)]);
+        assert_eq!(radii, vec![1.0, 4.0]);
+        assert_eq!(losses, vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn test_convergence_scale_is_sign_independent() {
+        assert!(kmeans_has_converged(-10.0, -10.0005, 1e-4));
+        assert!(kmeans_has_converged(10.0, 10.0005, 1e-4));
+        assert!(!kmeans_has_converged(-10.0, -10.01, 1e-4));
+        assert!(!kmeans_has_converged(10.0, 10.01, 1e-4));
+        assert!(kmeans_has_converged(0.0, 0.0, 1e-4));
+        assert!(!kmeans_has_converged(1.0, 0.0, 1e-4));
+    }
+
+    #[test]
+    fn scaled_l2_does_not_stop_early() {
+        let scale = 1e-5_f32;
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..=100).map(|value| value as f32 * scale)),
+            1,
+        )
+        .unwrap();
+        let initial =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, scale]), 1)
+                .unwrap();
+        let params = KMeansParams::new(Some(Arc::new(initial)), 50, 1, DistanceType::L2);
+
+        let model = KMeans::new_with_params(&data, 2, &params).unwrap();
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+
+        assert!((centroids[0] - 24.5 * scale).abs() < 1e-7, "{centroids:?}");
+        assert!((centroids[1] - 75.0 * scale).abs() < 1e-7, "{centroids:?}");
     }
 
     #[tokio::test]
