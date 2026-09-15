@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
@@ -12,7 +13,7 @@ use crate::{
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
 };
-use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -400,11 +401,13 @@ impl IndexLookup {
 ///
 /// Multiple `(column, index_name)` lookups can be supplied: the operator
 /// expects one input column per lookup (in matching order) and emits the
-/// row addresses where every column's value is present in its respective
-/// index — that is, the AND of the per-column index probes. This lets a
-/// composite-key join trim the candidate row set with every available
-/// scalar index before the downstream take. A row address reached by more
-/// than one input batch is emitted only once.
+/// row addresses that could match on every column. The result is an upper
+/// bound, not an exact set — the probes are evaluated one key at a time,
+/// most-selective first, and stop as soon as the candidate set is no larger
+/// than the input batch, so a caller must still filter on the full key.
+/// This lets a composite-key join trim the candidate row set before the
+/// downstream take without paying for a probe that prunes nothing. A row
+/// address reached by more than one input batch is emitted only once.
 #[derive(Debug)]
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
@@ -451,9 +454,10 @@ impl MapIndexExec {
         )
     }
 
-    /// Build a `MapIndexExec` that probes one or more scalar indices and
-    /// emits the AND of their results. `lookups` must be non-empty and
-    /// `input` must produce one column per lookup, in the same order.
+    /// Build a `MapIndexExec` that probes one or more scalar indices and emits
+    /// an upper bound on the row addresses matching every one of them (see the
+    /// type docs). `lookups` must be non-empty and `input` must produce one
+    /// column per lookup, in the same order.
     pub fn new_multi(
         dataset: Arc<Dataset>,
         lookups: Vec<IndexLookup>,
@@ -491,6 +495,15 @@ impl MapIndexExec {
         // fragment covered by *every* index in `lookups`; restrict the
         // deletion mask to that intersection so we only filter deletes we
         // could actually see.
+        //
+        // This loop must keep covering every lookup even though `map_batch`
+        // may skip some probes. A skipped probe leaves candidates from
+        // fragments that its index does not cover, and the restricted mask is
+        // the only thing that then blocks them. Those fragments are read
+        // separately by the unindexed-fragment scan in
+        // `create_indexed_scan_joined_stream`, so letting candidates through
+        // would feed the same target row into the join twice, which the
+        // default `SourceDedupeBehavior::Fail` reports as an error.
         let mut fragment_bitmap: Option<RoaringBitmap> = None;
         for lookup in &lookups {
             let bm = scalar_index_fragment_bitmap(&dataset, &lookup.column, &lookup.index_name)
@@ -558,32 +571,43 @@ impl MapIndexExec {
         )))
     }
 
-    /// Build the AND-of-IsIn `ScalarIndexExpr` describing this batch's
-    /// composite lookup: each input column contributes one `IsIn` query
-    /// against its matching index.
-    fn build_query(
-        lookups: &[IndexLookup],
-        batch: &RecordBatch,
-    ) -> datafusion::error::Result<ScalarIndexExpr> {
-        let per_column = lookups.iter().enumerate().map(|(idx, lookup)| {
-            let column = batch.column(idx);
-            let values = (0..column.len())
-                .map(|row| ScalarValue::try_from_array(column, row))
-                .collect::<datafusion::error::Result<Vec<_>>>()?;
-            Ok::<_, datafusion::error::DataFusionError>(ScalarIndexExpr::Query(ScalarIndexSearch {
-                column: lookup.column.clone(),
-                index_name: lookup.index_name.clone(),
-                // Internal IndexedLookup-style query — type is unknown at this layer
-                index_type: String::new(),
-                query: Arc::new(SargableQuery::IsIn(values)),
-                needs_recheck: false,
-                fragment_bitmap: None,
-            }))
-        });
+    /// The values of one input column, deduped when `dedupe` is set.
+    ///
+    /// Deduping earns its keep once there is more than one key: the distinct
+    /// count doubles as the probe-ordering signal in [`Self::map_batch`], and a
+    /// repeated value only adds an `IsIn` entry that re-selects index pages
+    /// already selected. With a single key there is nothing to order, so
+    /// hashing every value would be pure overhead on the most common path.
+    ///
+    /// One NULL survives dedupe on purpose: an index reads a NULL in the list
+    /// as "also match null rows", which is a flag rather than a count.
+    fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
+        let mut values = Vec::with_capacity(column.len());
+        let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
+        for row in 0..column.len() {
+            let value = ScalarValue::try_from_array(column, row)?;
+            if dedupe {
+                if seen.contains(&value) {
+                    continue;
+                }
+                seen.insert(value.clone());
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
 
-        per_column
-            .reduce(|lhs, rhs| Ok(ScalarIndexExpr::And(Box::new(lhs?), Box::new(rhs?))))
-            .expect("MapIndexExec built with no lookups")
+    /// Build the `IsIn` query for one join key against its matching index.
+    fn build_key_query(lookup: &IndexLookup, values: Vec<ScalarValue>) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: lookup.column.clone(),
+            index_name: lookup.index_name.clone(),
+            // Internal IndexedLookup-style query — type is unknown at this layer
+            index_type: String::new(),
+            query: Arc::new(SargableQuery::IsIn(values)),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
     }
 
     async fn map_batch(
@@ -593,12 +617,89 @@ impl MapIndexExec {
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
-        let query = Self::build_query(&lookups, &batch)?;
-        let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        if !query_result.is_exact() {
-            todo!("Support for non-exact query results as input for merge_insert")
+        // The operator's contract is one input column per lookup, in order (see
+        // `new_multi`). Check it here rather than letting `batch.column` panic
+        // deep inside a DataFusion stream, and check it before the probe loop:
+        // the loop can skip the offending lookup, which would turn a broken
+        // plan into a failure that depends on the data.
+        if lookups.len() != batch.num_columns() {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "MapIndexExec has {} lookups but its input produced {} columns",
+                lookups.len(),
+                batch.num_columns()
+            )));
         }
-        let mut row_addr_mask = query_result.upper;
+
+        // Probe the keys one at a time and intersect, rather than evaluating an
+        // AND of every probe at once. A join key whose values repeat across the
+        // target (a bucket or status column) matches most of the table, so its
+        // probe materializes a candidate set the size of the dataset while
+        // pruning almost nothing: on a 10M-row table, probing a 1024-distinct
+        // key asked for 2.4 GB of candidates.
+        // With one key there is nothing to order and nothing a second probe
+        // could intersect away, so that path stays exactly as it was.
+        let several_keys = lookups.len() > 1;
+        let mut values_per_key = Vec::with_capacity(lookups.len());
+        for column in batch.columns() {
+            values_per_key.push(Self::key_values(column, several_keys)?);
+        }
+
+        // Probe the most selective key first. The key with the most distinct
+        // source values partitions the target most finely, so its probe is the
+        // one most likely to leave a candidate set small enough to skip the
+        // rest. Following the caller's `on` order instead would run the
+        // expensive probe first, because the natural way to write a composite
+        // key is coarse-to-fine (`["tenant_id", "row_id"]`). The distinct count
+        // is a source-side proxy for target-side selectivity, and it only knows
+        // how many values a probe will look up, not how many target rows each
+        // of them matches. A skewed batch — many distinct values that each
+        // match many rows, sitting next to few values that each match few —
+        // can therefore be ordered worse than the caller wrote it. The floor is
+        // the old behaviour's probe set — run sequentially, see below — because
+        // the break only ever removes probes.
+        let mut probe_order: Vec<usize> = (0..lookups.len()).collect();
+        if several_keys {
+            // Stable, so keys with equally distinct values keep `on` order.
+            probe_order.sort_by_key(|&idx| std::cmp::Reverse(values_per_key[idx].len()));
+        }
+
+        // Stop once the candidate set is no larger than the source batch. A
+        // further probe could still remove false positives, but what is left to
+        // remove is bounded by the source batch, so it cannot save more work
+        // downstream than the probe itself costs. That bound is the point: per
+        // batch the emitted set is either the full intersection or at most
+        // `batch.num_rows()` rows, which is also what keeps the cross-batch
+        // candidate set in `DistinctRowAddrs` bounded.
+        //
+        // Skipping a probe only leaves extra candidates, never drops a match:
+        // the downstream hash join filters on the full composite key (see
+        // `create_indexed_scan_joined_stream`), the same reason an unindexed
+        // `on` column is allowed to prune nothing. Extra candidates stay inside
+        // the index-covered fragments because the restricted deletion mask
+        // applied below is built from *every* lookup's fragment bitmap.
+        //
+        // The probes run in sequence where the old `ScalarIndexExpr::And` ran
+        // them concurrently. That is the price of being able to stop, and it
+        // shows up only when no probe is skipped and the index cache is cold.
+        let source_rows = batch.num_rows() as u64;
+        // `all_rows()` is the identity for `intersect`, so the first probe
+        // needs no special case.
+        let mut row_addr_mask = RowAddrMask::all_rows();
+        for idx in probe_order {
+            if row_addr_mask
+                .max_len()
+                .is_some_and(|len| len <= source_rows)
+            {
+                break;
+            }
+            let values = std::mem::take(&mut values_per_key[idx]);
+            let query = Self::build_key_query(&lookups[idx], values);
+            let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
+            if !query_result.is_exact() {
+                todo!("Support for non-exact query results as input for merge_insert")
+            }
+            row_addr_mask = row_addr_mask.intersect(query_result.upper);
+        }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
             row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();

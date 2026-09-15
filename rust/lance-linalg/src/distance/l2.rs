@@ -30,7 +30,7 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
-use crate::distance::{assert_batch_layout, assert_equal_lengths};
+use crate::distance::{assert_batch_layout, assert_equal_lengths, int8_query_to_f32};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -93,8 +93,8 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
     key.iter()
         .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
-        .sum::<u32>() as f32
+        .map(|(&x, &y)| (x.abs_diff(y) as u64).pow(2))
+        .sum::<u64>() as f32
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -144,7 +144,7 @@ impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        super::l2_u8::l2_u8(x, y) as f32
+        super::l2_u8::l2_u8_u64(x, y) as f32
     }
 }
 
@@ -969,6 +969,12 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
+///
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
@@ -981,14 +987,10 @@ pub fn l2_distance_arrow_batch(
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
-        _ => Err(Error::ComputeError(format!(
+        _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {}",
             from.data_type()
         ))),

@@ -25,9 +25,9 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
-use super::super::builder::{FtsQuery, FtsQueryType};
+use super::super::builder::FtsQuery;
 use super::newest_pk_positions;
-use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::index::SearchOptions;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -54,15 +54,15 @@ pub struct FtsIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     query: FtsQuery,
-    visible_count: usize,
+    readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Pre-computed batch ranges for O(log n) lookup.
     batch_ranges: Vec<BatchRange>,
-    /// Maximum visible row position based on visible_count (None if nothing visible).
-    max_visible_row: Option<u64>,
+    /// Last row position within `readable_count` (None if nothing is readable).
+    max_readable_row: Option<u64>,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
     /// Whether results identify element documents with `_doc_index`.
@@ -80,8 +80,8 @@ impl Debug for FtsIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FtsIndexExec")
             .field("column", &self.query.column)
-            .field("query_type", &self.query.query_type)
-            .field("visible_count", &self.visible_count)
+            .field("expr", &self.query.expr)
+            .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
     }
@@ -95,7 +95,7 @@ impl FtsIndexExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `indexes` - Index registry with FTS indexes
     /// * `query` - FTS query parameters
-    /// * `visible_count` - MVCC visibility sequence number
+    /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
     /// * `base_schema` - Schema before adding score column (and _rowid if with_row_id)
     /// * `with_row_id` - Whether to include _rowid column (row position)
@@ -103,7 +103,7 @@ impl FtsIndexExec {
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
         query: FtsQuery,
-        visible_count: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -147,10 +147,10 @@ impl FtsIndexExec {
             Boundedness::Bounded,
         ));
 
-        // Pre-compute batch ranges for O(log n) lookup and max visible row
+        // Pre-compute batch ranges for O(log n) lookup and max readable row
         let mut batch_ranges = Vec::new();
         let mut current_row = 0usize;
-        let mut max_visible_row_exclusive: u64 = 0;
+        let mut max_readable_row_exclusive: u64 = 0;
 
         for (batch_id, stored_batch) in batch_store.iter().enumerate() {
             let batch_start = current_row;
@@ -160,15 +160,15 @@ impl FtsIndexExec {
                 end: batch_end,
                 batch_id,
             });
-            if batch_id < visible_count {
-                max_visible_row_exclusive = batch_end as u64;
+            if batch_id < readable_count {
+                max_readable_row_exclusive = batch_end as u64;
             }
             current_row = batch_end;
         }
 
-        // Convert exclusive end to inclusive last position, or None if nothing visible
-        let max_visible_row = if max_visible_row_exclusive > 0 {
-            Some(max_visible_row_exclusive - 1)
+        // Convert exclusive end to inclusive last position, or None if nothing readable
+        let max_readable_row = if max_readable_row_exclusive > 0 {
+            Some(max_readable_row_exclusive - 1)
         } else {
             None
         };
@@ -177,13 +177,13 @@ impl FtsIndexExec {
             batch_store,
             indexes,
             query,
-            visible_count,
+            readable_count,
             projection,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             batch_ranges,
-            max_visible_row,
+            max_readable_row,
             with_row_id,
             with_doc_index,
             filter: None,
@@ -223,46 +223,13 @@ impl FtsIndexExec {
             return vec![];
         };
 
-        // Convert FtsQueryType to FtsQueryExpr
-        let query_expr = match &self.query.query_type {
-            FtsQueryType::Match {
-                query,
-                operator,
-                boost,
-            } => FtsQueryExpr::match_query_with_operator(query, *operator).with_boost(*boost),
-            FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
-            FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            } => {
-                let mut builder = FtsQueryExpr::boolean();
-                for term in must {
-                    builder = builder.must(FtsQueryExpr::match_query(term));
-                }
-                for term in should {
-                    builder = builder.should(FtsQueryExpr::match_query(term));
-                }
-                for term in must_not {
-                    builder = builder.must_not(FtsQueryExpr::match_query(term));
-                }
-                builder.build()
-            }
-            FtsQueryType::Fuzzy {
-                query,
-                fuzziness,
-                prefix_length,
-                max_expansions,
-                boost,
-            } => {
-                FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *prefix_length, *max_expansions)
-                    .with_boost(*boost)
-            }
-        };
+        // The scanner carries the tree the index evaluates, so there is nothing
+        // to translate here.
+        let query_expr = self.query.expr.clone();
 
         let all_rows_visible = self.batch_ranges.last().is_none_or(|last| {
-            self.max_visible_row
-                .map(|max_visible| max_visible + 1 >= last.end as u64)
+            self.max_readable_row
+                .map(|max_readable| max_readable + 1 >= last.end as u64)
                 .unwrap_or(last.end == 0)
         });
         let pk_recency_is_noop = self.pk_columns.is_none()
@@ -292,12 +259,12 @@ impl FtsIndexExec {
         &self,
         results: Vec<(u64, Option<Vec<u32>>, f32)>,
     ) -> Vec<(u64, Option<Vec<u32>>, f32)> {
-        let Some(max_visible) = self.max_visible_row else {
+        let Some(max_readable) = self.max_readable_row else {
             return vec![];
         };
         results
             .into_iter()
-            .filter(|(pos, _, _)| *pos <= max_visible)
+            .filter(|(pos, _, _)| *pos <= max_readable)
             .collect()
     }
 
@@ -521,7 +488,7 @@ impl FtsIndexExec {
                 all_doc_indices,
             ));
         }
-        let Some(max_visible_row) = self.max_visible_row else {
+        let Some(max_readable_row) = self.max_readable_row else {
             return Ok((
                 final_columns,
                 all_scores,
@@ -551,8 +518,8 @@ impl FtsIndexExec {
             Some(newest_pk_positions(
                 &self.batch_store,
                 pk_columns,
-                self.visible_count,
-                max_visible_row,
+                self.readable_count,
+                max_readable_row,
             )?)
         };
 
@@ -568,7 +535,7 @@ impl FtsIndexExec {
                             .map(|&col| ScalarValue::try_from_array(data_batch.column(col), row))
                             .collect::<DataFusionResult<_>>()?;
                         self.indexes
-                            .pk_is_newest(&values, all_row_positions[row], max_visible_row)
+                            .pk_is_newest(&values, all_row_positions[row], max_readable_row)
                     }
                 })
             })
@@ -612,14 +579,14 @@ impl DisplayAs for FtsIndexExec {
                 write!(
                     f,
                     "FtsIndexExec: column={}, query_type={:?}, with_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    self.query.column, self.query.expr, self.with_row_id
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "FtsIndexExec\ncolumn={}\nquery_type={:?}\nwith_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    self.query.column, self.query.expr, self.with_row_id
                 )
             }
         }
@@ -845,7 +812,7 @@ mod tests {
 
         let query = FtsQuery::match_query("text", "hello");
 
-        // Query with max_visible=0 should only see first batch
+        // Query with max_readable=0 should only see first batch
         let exec = FtsIndexExec::new(
             batch_store.clone(),
             indexes.clone(),
@@ -864,7 +831,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2); // "hello" in batch1 docs 0 and 2
 
-        // Query with max_visible=1 should see both batches
+        // Query with max_readable=1 should see both batches
         let exec = FtsIndexExec::new(batch_store, indexes, query, 2, None, schema, false).unwrap();
 
         let ctx = Arc::new(TaskContext::default());

@@ -2,6 +2,198 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::inverted::InvertedIndexPlugin;
+use crate::scalar::registry::ScalarIndexPlugin;
+use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+use lance_io::object_store::WrappingObjectStore;
+use object_store::list::PaginatedListStore;
+
+#[derive(Debug, Default)]
+struct RequestWrapper {
+    policy: Arc<std::sync::Mutex<ProxyObjectStorePolicy>>,
+}
+
+impl WrappingObjectStore for RequestWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn test_request_wrappers_preserve_prewarmed_index_state() {
+    let object_store = ObjectStore::memory();
+    let directory = object_store::path::Path::from("index");
+    let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(object_store.clone()),
+        directory.clone(),
+        metadata_cache.clone(),
+    ));
+    write_pair_partition(&store, 0, &[("alpha", "beta", 0)]).await;
+    write_pair_partition(&store, 1 << 32, &[("alpha", "gamma", 1 << 32)]).await;
+    write_test_metadata(&store, vec![0, 1 << 32], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let terms = vec!["alpha".to_owned(), "beta".to_owned()];
+    let mut first = None;
+    for request in 0..3 {
+        let mut wrapped = object_store.clone();
+        let wrapper = RequestWrapper::default();
+        let requests = Arc::new(AtomicU32::new(0));
+        let counted_requests = requests.clone();
+        wrapper.policy.lock().unwrap().set_before_policy(
+            "count_request_io",
+            Arc::new(move |_, _| {
+                counted_requests.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+        wrapped.apply_wrapper(&wrapper);
+        let request_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            Arc::new(wrapped),
+            directory.clone(),
+            metadata_cache.clone(),
+        ));
+        let load_store = request_store.clone();
+        let load_cache = cache.clone();
+        let index = InvertedIndexPlugin
+            .get_or_insert_in_cache(
+                request_store.clone(),
+                None,
+                &cache,
+                async move {
+                    Ok(InvertedIndex::load(load_store, None, &load_cache).await?
+                        as Arc<dyn ScalarIndex>)
+                }
+                .boxed(),
+            )
+            .await
+            .unwrap();
+        let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        assert!(request_store.is_same_storage_binding(inverted.store.as_ref()));
+        if request == 0 {
+            inverted.prewarm().await.unwrap();
+            first = Some(index.clone());
+        } else {
+            assert_eq!(
+                requests.load(Ordering::Relaxed),
+                0,
+                "a prewarmed request must not reopen partition files, even without file sizes"
+            );
+            assert!(!Arc::ptr_eq(first.as_ref().unwrap(), &index));
+            assert!(
+                first
+                    .as_ref()
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .shares_prewarm_state(inverted)
+            );
+            assert!(
+                inverted.corpus_stats.initialized(),
+                "request {request} discarded immutable prewarmed corpus statistics"
+            );
+        }
+        assert!(inverted.prewarmed_query_state_ready(false));
+        assert_eq!(
+            inverted.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+            Some((4, 2, vec![2, 1]))
+        );
+    }
+    let independently_loaded = InvertedIndex::load(store, None, &cache).await.unwrap();
+    assert!(
+        !first
+            .unwrap()
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .unwrap()
+            .shares_prewarm_state(&independently_loaded),
+        "loading the same index into a new container must not claim shared prewarm state"
+    );
+}
+
+#[tokio::test]
+async fn test_deferred_posting_reader_retries_current_credentials_and_validates_metadata() {
+    let object_store = ObjectStore::memory();
+    let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(object_store.clone()),
+        "index".into(),
+        metadata_cache.clone(),
+    ));
+    write_pair_partition(&store, 0, &[("alpha", "beta", 0)]).await;
+    let index = load_test_index(store, vec![0]).await;
+    let wrapper = RequestWrapper::default();
+    let revoked = Arc::new(AtomicBool::new(true));
+    let requests = Arc::new(AtomicU32::new(0));
+    let policy_revoked = revoked.clone();
+    let policy_requests = requests.clone();
+    wrapper.policy.lock().unwrap().set_before_policy(
+        "credentials",
+        Arc::new(move |_, _| {
+            policy_requests.fetch_add(1, Ordering::Relaxed);
+            if policy_revoked.load(Ordering::Relaxed) {
+                Err(Error::io("request credentials revoked"))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let mut wrapped = object_store;
+    wrapped.apply_wrapper(&wrapper);
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(wrapped),
+        "index".into(),
+        metadata_cache,
+    ));
+    let rebound = index.with_store(store, None).unwrap().unwrap();
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    let reader = &rebound.partitions[0].inverted_list.reader;
+    let Err(error) = reader.get().await else {
+        panic!("revoked credentials must fail when the request needs a reader");
+    };
+    assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    assert!(error.to_string().contains("request credentials revoked"));
+    revoked.store(false, Ordering::Relaxed);
+    let readers = futures::future::try_join_all((0..8).map(|_| reader.get()))
+        .await
+        .unwrap();
+    assert!(readers.iter().all(|reader| Arc::ptr_eq(reader, readers[0])));
+    assert!(requests.load(Ordering::Relaxed) > 0);
+
+    let changed_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::memory().into(),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut writer = changed_store
+        .new_index_file(&posting_file_path(0), Arc::new(Schema::empty()))
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    let changed = rebound.with_store(changed_store, None).unwrap().unwrap();
+    let Err(error) = changed.partitions[0].inverted_list.reader.get().await else {
+        panic!("changed posting metadata must be rejected before reading data");
+    };
+    assert!(matches!(error, Error::Index { .. }), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("changed while reopening an immutable index")
+    );
+}
 
 // Enough distinct tokens that `write_posting_lists` emits several posting-list
 // batches (the default batch size is 256 rows), exercising the restructured
@@ -365,6 +557,152 @@ async fn prepared_results(
     }
     results.sort_unstable();
     results
+}
+
+#[tokio::test]
+async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
+    let first_dir = TempObjDir::default();
+    let first_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        first_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(
+        &first_store,
+        0,
+        &[("alpha", "beta", 100), ("alpha", "gamma", 101)],
+    )
+    .await;
+    write_test_metadata(&first_store, vec![0], InvertedIndexParams::default()).await;
+    let first_cache = Arc::new(LanceCache::with_capacity(4096));
+    let first = InvertedIndex::load(first_store, None, first_cache.as_ref())
+        .await
+        .unwrap();
+
+    let second_dir = TempObjDir::default();
+    let second_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        second_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(&second_store, 0, &[("alpha", "beta", 200)]).await;
+    write_test_metadata(&second_store, vec![0], InvertedIndexParams::default()).await;
+    let second_cache = Arc::new(LanceCache::with_capacity(4096));
+    let second = InvertedIndex::load(second_store, None, second_cache.as_ref())
+        .await
+        .unwrap();
+
+    let indices = vec![first.clone(), second.clone()];
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(
+            &indices, &terms, false
+        )
+        .unwrap()
+        .is_none(),
+        "the kill switch must return before any readiness-dependent work"
+    );
+    assert!(first.corpus_stats.get().is_none());
+    assert!(second.corpus_stats.get().is_none());
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "non-prewarmed segments must use the asynchronous path"
+    );
+
+    first
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "one ready and one cold segment must fall back as one query"
+    );
+
+    second.aggregate_corpus_stats().await.unwrap();
+    assert!(second.corpus_stats.get().is_some());
+    assert!(!second.partitions[0].inverted_list.posting_lengths_loaded());
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "loaded corpus stats with stale posting metadata must still fall back atomically"
+    );
+
+    second
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    let fast =
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .unwrap();
+    let mut async_stats = Vec::with_capacity(indices.len());
+    for index in &indices {
+        async_stats.push(index.bm25_stats_for_terms(&terms, None).await.unwrap());
+    }
+    let slow = crate::scalar::inverted::merge_loaded_bm25_stats(&terms, async_stats)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fast.total_tokens, slow.total_tokens);
+    assert_eq!(fast.num_docs, slow.num_docs);
+    assert_eq!(fast.token_docs, slow.token_docs);
+    assert_eq!(fast.total_tokens, 6);
+    assert_eq!(fast.num_docs, 3);
+    assert_eq!(
+        fast.token_docs,
+        HashMap::from([("alpha".to_string(), 3), ("beta".to_string(), 2)])
+    );
+    for term in &terms {
+        assert_eq!(
+            fast.query_weight(term).to_bits(),
+            slow.query_weight(term).to_bits(),
+            "query weight changed for {term}"
+        );
+    }
+    for (frequency, doc_tokens) in [(1, 1), (1, 2), (3, 7)] {
+        assert_eq!(
+            fast.doc_weight(frequency, doc_tokens).to_bits(),
+            slow.doc_weight(frequency, doc_tokens).to_bits()
+        );
+    }
+
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".to_string(), "beta".to_string()],
+        DocType::Text,
+    ));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+    let fast_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(fast_prepared.scorer().token_docs, fast.token_docs);
+    let slow_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            Some(slow),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        prepared_results(&indices, fast_prepared, params.clone()).await,
+        prepared_results(&indices, slow_prepared, params).await,
+        "the synchronous scorer must preserve final score bits"
+    );
 }
 
 #[tokio::test]

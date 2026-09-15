@@ -12,8 +12,10 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
-use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type, Int8Type, UInt8Type};
+use arrow_array::{
+    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray, PrimitiveArray,
+};
 use arrow_schema::{ArrowError, DataType};
 
 pub mod cosine;
@@ -25,6 +27,24 @@ pub mod hamming;
 pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
+
+/// Widens an `Int8` query vector to `f32`, rejecting nulls.
+///
+/// The three `_arrow_batch` entry points that accept `Int8` take the query as a
+/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null
+/// element has no distance to compute, so it is rejected rather than widened.
+fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
+    if query.null_count() > 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Int8 query vector `from` must not contain nulls, found {} in {} values",
+            query.null_count(),
+            query.len()
+        )));
+    }
+    Ok(Float32Array::from(
+        query.values().iter().map(|&v| v as f32).collect::<Vec<_>>(),
+    ))
+}
 
 #[inline]
 fn assert_equal_lengths(left_len: usize, right_len: usize) {
@@ -50,6 +70,9 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
         "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
     );
 }
+
+/// Largest number of maximal u8 product terms whose sum fits in a u32.
+const U8_U32_ACCUMULATOR_MAX_LEN: usize = u32::MAX as usize / (u8::MAX as usize * u8::MAX as usize);
 
 /// Number of distances computed per call into a runtime-selected batch kernel.
 ///
@@ -497,10 +520,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::types::{Float16Type, Float32Type, Int8Type};
-    use arrow_array::{Float32Array, Int8Array, ListArray, PrimitiveArray, UInt8Array};
+    use arrow_array::{
+        Float32Array, Float64Array, Int8Array, Int32Array, ListArray, PrimitiveArray, UInt8Array,
+    };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
     use half::f16;
+    use lance_arrow::FixedSizeListArrayExt;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -519,6 +545,41 @@ mod tests {
             std::is_x86_feature_detected!("avx512vpopcntdq"),
         )
         .expect("write x86 runtime feature report");
+    }
+
+    #[test]
+    fn test_arrow_batch_type_errors_identify_the_argument() {
+        let float32_targets =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let unsupported_query = Int32Array::from(vec![1, 2]);
+
+        for distance_type in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let error =
+                distance_type.arrow_batch_func()(&unsupported_query, &float32_targets).unwrap_err();
+            assert!(
+                matches!(error, ArrowError::InvalidArgumentError(_)),
+                "{distance_type} returned a different error variant: {error}"
+            );
+        }
+
+        let unsupported_from_error =
+            cosine_distance_arrow_batch(&unsupported_query, &float32_targets).unwrap_err();
+        assert!(
+            matches!(&unsupported_from_error, ArrowError::InvalidArgumentError(message)
+                if message == "`from` has unsupported data type Int32"),
+            "unexpected unsupported `from` error: {unsupported_from_error}"
+        );
+
+        let float32_query = Float32Array::from(vec![1.0, 2.0]);
+        let float64_targets =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let mismatched_to_error =
+            cosine_distance_arrow_batch(&float32_query, &float64_targets).unwrap_err();
+        assert!(
+            matches!(&mismatched_to_error, ArrowError::InvalidArgumentError(message)
+                if message == "`to` values have data type Float64, expected Float32 to match `from`"),
+            "unexpected mismatched `to` error: {mismatched_to_error}"
+        );
     }
 
     /// Build `List<FixedSizeList<T, dim>>` rows from flattened sub-vector values.
@@ -578,6 +639,83 @@ mod tests {
             matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
             "Float32 query with hamming must be rejected for the metric, got: {err}"
         );
+    }
+
+    /// The `_arrow_batch` entry points that accept `Int8` widen the query element
+    /// by element.
+    /// A null there used to reach an `unwrap`, so a query column with a null in
+    /// its values panicked instead of returning an error, on the metrics that
+    /// accept `Int8`.
+    #[test]
+    fn test_arrow_batch_rejects_null_int8_query() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m)
+                    if m.contains("Int8 query vector `from`") && m.contains("found 1 in 2 values")),
+                "{dt} accepted a null Int8 query element, got: {err}"
+            );
+        }
+
+        // The same query without nulls goes through, so the guard is not
+        // rejecting every `Int8` query.
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![1_i8, 2]));
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            assert_eq!(
+                dt.arrow_batch_func()(query.as_ref(), &targets)
+                    .unwrap()
+                    .len(),
+                2,
+                "{dt} rejected a well-formed Int8 query"
+            );
+        }
+
+        // A sliced query reads through `values()`, which has to follow the slice:
+        // the window here holds no nulls while the full buffer does. The L2
+        // distances are asserted literally rather than against a second call,
+        // since computing the expected values by the same route would hide a bug
+        // that transformed both alike. Query [3, 4] against [[1, 2], [3, 4]]
+        // gives (3-1)^2 + (4-2)^2 = 8 and 0.
+        let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
+        let query: Arc<dyn Array> = Arc::new(sliced);
+        let got = DistanceType::L2.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+        assert_eq!(
+            got.values(),
+            &[8.0_f32, 0.0],
+            "L2 did not follow the query slice"
+        );
+        for dt in [DistanceType::Cosine, DistanceType::Dot] {
+            let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+            let want =
+                dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
+                    .unwrap();
+            assert_eq!(got, want, "{dt} did not follow the query slice");
+        }
+    }
+
+    /// An input that is both a length mismatch and a null query must reach the
+    /// null error on all three metrics. `dot` used to carry a second
+    /// `debug_assert_eq!` on the dimension in its public entry point, ahead of
+    /// the `Int8` arm's null guard.
+    #[test]
+    fn test_arrow_batch_null_and_length_mismatch_agree() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None, Some(2)]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+                "{dt} did not report the null query, got: {err}"
+            );
+        }
     }
 
     /// `Int8` is a valid vector element type elsewhere in the crate but has no

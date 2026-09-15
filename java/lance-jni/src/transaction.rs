@@ -14,16 +14,18 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
+use jni::objects::{JByteArray, JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance::table::format::{Fragment, IndexMetadata};
+use lance::table::format::key_existence::{FilterType, KeyExistenceFilter};
+use lance::table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance::table::format::{DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
@@ -33,9 +35,172 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+fn u64_to_jlong(field: &str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        Error::runtime_error(format!(
+            "Cannot convert Rust transaction field {field}={value} to Java long"
+        ))
+    })
+}
+
+fn u32_to_jint(field: &str, value: u32) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        Error::runtime_error(format!(
+            "Cannot convert Rust transaction field {field}={value} to Java int"
+        ))
+    })
+}
+
+fn checked_field_ids(field: &str, values: &[i64]) -> Result<Vec<u32>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            u32::try_from(*value).map_err(|_| {
+                Error::input_error(format!(
+                    "Java transaction field {field}[{index}] must be between 0 and {}, got {value}",
+                    u32::MAX
+                ))
+            })
+        })
+        .collect()
+}
+
+fn import_field_ids(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+    method: &str,
+    field: &str,
+) -> Result<Vec<u32>> {
+    let array = env.call_method(object, method, "()[J", &[])?.l()?;
+    let array = JLongArray::from(array);
+    let mut values = vec![0_i64; env.get_array_length(&array)? as usize];
+    env.get_long_array_region(&array, 0, &mut values)?;
+    checked_field_ids(field, &values)
+}
+
+fn nonnegative_jlong_to_u64(field: &str, value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        Error::input_error(format!(
+            "Java transaction field {field} must be non-negative, got {value}"
+        ))
+    })
+}
+
+fn import_unsigned_longs(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+    method: &str,
+    field: &str,
+) -> Result<Vec<u64>> {
+    let index = Cell::new(0_usize);
+    import_vec_from_method(env, object, method, |env, value| {
+        let position = index.get();
+        index.set(position + 1);
+        nonnegative_jlong_to_u64(
+            &format!("{field}[{position}]"),
+            env.call_method(value, "longValue", "()J", &[])?.j()?,
+        )
+    })
+}
+
+fn export_unsigned_longs<'a>(
+    env: &mut JNIEnv<'a>,
+    values: &[u64],
+    field: &str,
+) -> Result<JObject<'a>> {
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| u64_to_jlong(&format!("{field}[{index}]"), *value).map(JLance))
+        .collect::<Result<Vec<_>>>()?;
+    export_vec(env, &values)
+}
+
+impl IntoJava for &IndexFile {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let path = env.new_string(&self.path)?;
+        Ok(env.new_object(
+            "org/lance/index/IndexFile",
+            "(Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&path),
+                JValue::Long(u64_to_jlong("newIndexFiles.sizeBytes", self.size_bytes)?),
+            ],
+        )?)
+    }
+}
+
+impl FromJObjectWithEnv<IndexFile> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<IndexFile> {
+        Ok(IndexFile {
+            path: env.get_string_from_method(self, "getPath")?,
+            size_bytes: nonnegative_jlong_to_u64(
+                "newIndexFiles.sizeBytes",
+                env.call_method(self, "getSizeBytes", "()J", &[])?.j()?,
+            )?,
+        })
+    }
+}
+
+fn compacted_sstable_into_java<'a>(
+    env: &mut JNIEnv<'a>,
+    sstable: &lance_index::mem_wal::CompactedSsTable,
+) -> Result<JObject<'a>> {
+    let shard_id = env.new_string(sstable.shard_id.to_string())?;
+    Ok(env.new_object(
+        "org/lance/memwal/CompactedSsTable",
+        "(Ljava/lang/String;J)V",
+        &[
+            JValue::Object(&shard_id),
+            JValue::Long(u64_to_jlong(
+                "compactedSstables.generation",
+                sstable.generation,
+            )?),
+        ],
+    )?)
+}
+
+fn compacted_sstable_from_java(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+) -> Result<lance_index::mem_wal::CompactedSsTable> {
+    let shard_id = env.get_string_from_method(object, "getShardId")?;
+    let shard_id = Uuid::parse_str(&shard_id).map_err(|e| {
+        Error::input_error(format!(
+            "Invalid compacted SSTable shardId '{shard_id}': {e}"
+        ))
+    })?;
+    let generation = nonnegative_jlong_to_u64(
+        "compactedSstables.generation",
+        env.call_method(object, "getGeneration", "()J", &[])?.j()?,
+    )?;
+    Ok(lance_index::mem_wal::CompactedSsTable::new(
+        shard_id, generation,
+    ))
+}
+
+fn export_compacted_sstables<'a>(
+    env: &mut JNIEnv<'a>,
+    sstables: &[lance_index::mem_wal::CompactedSsTable],
+) -> Result<JObject<'a>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for sstable in sstables {
+        let object = compacted_sstable_into_java(env, sstable)?;
+        env.call_method(
+            &list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&object)],
+        )?;
+    }
+    Ok(list)
+}
 
 impl IntoJava for &RewriteGroup {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -60,16 +225,26 @@ impl IntoJava for &RewrittenIndex {
 
         let new_index_details_type_url = env.new_string(self.new_index_details.type_url.clone())?;
         let new_index_details_value = env.byte_array_from_slice(&self.new_index_details.value)?;
+        let new_index_files = match &self.new_index_files {
+            Some(files) => export_vec(env, files)?,
+            None => JObject::null(),
+        };
 
         Ok(env.new_object(
             "org/lance/operation/RewrittenIndex",
-            "(Ljava/util/UUID;Ljava/util/UUID;Ljava/lang/String;[BII)V",
+            "(Ljava/util/UUID;Ljava/util/UUID;Ljava/lang/String;[BILjava/util/List;)V",
             &[
                 JValue::Object(&old_id),
                 JValue::Object(&new_id),
                 JValue::Object(&new_index_details_type_url),
                 JValue::Object(&new_index_details_value),
-                JValue::Int(self.new_index_version as i32),
+                JValue::Int(i32::try_from(self.new_index_version).map_err(|_| {
+                    Error::runtime_error(format!(
+                        "Cannot convert Rust transaction field newIndexVersion={} to Java int",
+                        self.new_index_version
+                    ))
+                })?),
+                JValue::Object(&new_index_files),
             ],
         )?)
     }
@@ -83,7 +258,10 @@ impl IntoJava for &DataReplacementGroup {
         Ok(env.new_object(
             "org/lance/operation/DataReplacement$DataReplacementGroup",
             "(JLorg/lance/fragment/DataFile;)V",
-            &[JValue::Long(fragment_id as i64), JValue::Object(&new_file)],
+            &[
+                JValue::Long(u64_to_jlong("dataReplacement.fragmentId", fragment_id)?),
+                JValue::Object(&new_file),
+            ],
         )?)
     }
 }
@@ -144,6 +322,10 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
             env.convert_byte_array(JByteArray::from(new_index_details_value))?;
 
         let new_index_version = env.get_field(self, "newIndexVersion", "I")?.i()?;
+        let new_index_files =
+            env.get_optional_from_method(self, "getNewIndexFiles", |env, files| {
+                crate::traits::import_vec_to_rust(env, &files, |env, file| file.extract_object(env))
+            })?;
         Ok(RewrittenIndex {
             old_id: java_old_id,
             new_id: java_new_id,
@@ -151,8 +333,296 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
                 type_url: new_index_details_type_url,
                 value: new_index_details_value,
             },
-            new_index_version: new_index_version as u32,
-            new_index_files: None,
+            new_index_version: u32::try_from(new_index_version).map_err(|_| {
+                Error::input_error(format!(
+                    "Java transaction field newIndexVersion must be non-negative, got {new_index_version}"
+                ))
+            })?,
+            new_index_files,
+        })
+    }
+}
+
+fn key_existence_filter_into_java<'a>(
+    env: &mut JNIEnv<'a>,
+    filter: &KeyExistenceFilter,
+) -> Result<JObject<'a>> {
+    let field_ids = JLance(filter.field_ids.clone()).into_java(env)?;
+    match &filter.filter {
+        FilterType::ExactSet(hashes) => {
+            let hashes = JLance(hashes.iter().map(|hash| *hash as i64).collect::<Vec<_>>())
+                .into_java(env)?;
+            env.call_static_method(
+                "org/lance/operation/KeyExistenceFilter",
+                "exact",
+                "([I[J)Lorg/lance/operation/KeyExistenceFilter;",
+                &[JValue::Object(&field_ids), JValue::Object(&hashes)],
+            )?
+            .l()
+            .map_err(Into::into)
+        }
+        FilterType::Bloom {
+            bitmap,
+            num_bits,
+            number_of_items,
+            probability,
+        } => {
+            let bitmap = env.byte_array_from_slice(bitmap)?;
+            env.call_static_method(
+                "org/lance/operation/KeyExistenceFilter",
+                "bloom",
+                "([I[BIJD)Lorg/lance/operation/KeyExistenceFilter;",
+                &[
+                    JValue::Object(&field_ids),
+                    JValue::Object(&bitmap),
+                    JValue::Int(i32::try_from(*num_bits).map_err(|_| {
+                        Error::runtime_error(format!(
+                            "Cannot convert Rust transaction field insertedRowsFilter.numBits={num_bits} to Java int"
+                        ))
+                    })?),
+                    JValue::Long(u64_to_jlong(
+                        "insertedRowsFilter.numberOfItems",
+                        *number_of_items,
+                    )?),
+                    JValue::Double(*probability),
+                ],
+            )?
+            .l()
+            .map_err(Into::into)
+        }
+    }
+}
+
+fn key_existence_filter_from_java(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+) -> Result<KeyExistenceFilter> {
+    let field_ids = env.call_method(object, "getFieldIds", "()[I", &[])?.l()?;
+    let field_ids = JIntArray::from(field_ids).extract_object(env)?;
+    let filter_type = env
+        .call_method(
+            object,
+            "getType",
+            "()Lorg/lance/operation/KeyExistenceFilter$Type;",
+            &[],
+        )?
+        .l()?;
+    let filter_type = env.get_string_from_method(&filter_type, "name")?;
+    let filter = match filter_type.as_str() {
+        "EXACT" => {
+            let hashes = env
+                .call_method(object, "getExactKeyHashes", "()[J", &[])?
+                .l()?;
+            let hashes = JLongArray::from(hashes);
+            let len = env.get_array_length(&hashes)?;
+            let mut values = vec![0_i64; len as usize];
+            env.get_long_array_region(&hashes, 0, &mut values)?;
+            FilterType::ExactSet(values.into_iter().map(|value| value as u64).collect())
+        }
+        "BLOOM" => {
+            let bitmap = env
+                .call_method(object, "getBloomBitmap", "()[B", &[])?
+                .l()?;
+            let bitmap = env.convert_byte_array(JByteArray::from(bitmap))?;
+            let num_bits = u32::try_from(
+                env.call_method(object, "getBloomNumBits", "()I", &[])?
+                    .i()?,
+            )
+            .map_err(|_| {
+                Error::input_error("insertedRowsFilter.numBits must be positive".to_string())
+            })?;
+            let number_of_items = nonnegative_jlong_to_u64(
+                "insertedRowsFilter.numberOfItems",
+                env.call_method(object, "getBloomNumberOfItems", "()J", &[])?
+                    .j()?,
+            )?;
+            let probability = env
+                .call_method(object, "getBloomProbability", "()D", &[])?
+                .d()?;
+            let bitmap_bits = u32::try_from(bitmap.len())
+                .ok()
+                .and_then(|len| len.checked_mul(8))
+                .ok_or_else(|| {
+                    Error::input_error(
+                        "insertedRowsFilter.bitmap is too large to represent".to_string(),
+                    )
+                })?;
+            if num_bits == 0 || num_bits != bitmap_bits {
+                return Err(Error::input_error(format!(
+                    "insertedRowsFilter.numBits={num_bits} must equal bitmap length in bits ({bitmap_bits})"
+                )));
+            }
+            if number_of_items == 0 {
+                return Err(Error::input_error(
+                    "insertedRowsFilter.numberOfItems must be positive".to_string(),
+                ));
+            }
+            if !probability.is_finite() || !(0.0..1.0).contains(&probability) || probability == 0.0
+            {
+                return Err(Error::input_error(format!(
+                    "insertedRowsFilter.probability must be finite and between 0 and 1, got {probability}"
+                )));
+            }
+            FilterType::Bloom {
+                bitmap,
+                num_bits,
+                number_of_items,
+                probability,
+            }
+        }
+        other => {
+            return Err(Error::input_error(format!(
+                "Unknown KeyExistenceFilter.Type: {other}"
+            )));
+        }
+    };
+    Ok(KeyExistenceFilter { field_ids, filter })
+}
+
+fn serialize_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap.serialize_into(&mut bytes).map_err(|e| {
+        Error::runtime_error(format!("failed to serialize overlay coverage bitmap: {e}"))
+    })?;
+    Ok(bytes)
+}
+
+impl IntoJava for &DataOverlayFile {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let data_file = self.data_file.into_java(env)?;
+        let coverage = match &self.coverage {
+            OverlayCoverage::Shared(bitmap) => {
+                let bytes = serialize_bitmap(bitmap)?;
+                let bytes = env.byte_array_from_slice(&bytes)?;
+                env.call_static_method(
+                    "org/lance/operation/DataOverlay$OverlayCoverage",
+                    "shared",
+                    "([B)Lorg/lance/operation/DataOverlay$OverlayCoverage;",
+                    &[JValue::Object(&bytes)],
+                )?
+                .l()?
+            }
+            OverlayCoverage::PerField(bitmaps) => {
+                let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+                for bitmap in bitmaps {
+                    let bytes = serialize_bitmap(bitmap)?;
+                    let bytes = env.byte_array_from_slice(&bytes)?;
+                    env.call_method(
+                        &list,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[JValue::Object(&bytes)],
+                    )?;
+                }
+                env.call_static_method(
+                    "org/lance/operation/DataOverlay$OverlayCoverage",
+                    "perField",
+                    "(Ljava/util/List;)Lorg/lance/operation/DataOverlay$OverlayCoverage;",
+                    &[JValue::Object(&list)],
+                )?
+                .l()?
+            }
+        };
+        Ok(env.new_object(
+            "org/lance/operation/DataOverlay$DataOverlayFile",
+            "(Lorg/lance/fragment/DataFile;Lorg/lance/operation/DataOverlay$OverlayCoverage;J)V",
+            &[
+                JValue::Object(&data_file),
+                JValue::Object(&coverage),
+                JValue::Long(u64_to_jlong(
+                    "dataOverlay.committedVersion",
+                    self.committed_version,
+                )?),
+            ],
+        )?)
+    }
+}
+
+impl FromJObjectWithEnv<DataOverlayFile> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataOverlayFile> {
+        let data_file: DataFile = env
+            .call_method(self, "getDataFile", "()Lorg/lance/fragment/DataFile;", &[])?
+            .l()?
+            .extract_object(env)?;
+        let coverage = env
+            .call_method(
+                self,
+                "getCoverage",
+                "()Lorg/lance/operation/DataOverlay$OverlayCoverage;",
+                &[],
+            )?
+            .l()?;
+        let is_shared = env.call_method(&coverage, "isShared", "()Z", &[])?.z()?;
+        let bitmap_bytes: Vec<Vec<u8>> =
+            import_vec_from_method(env, &coverage, "getBitmaps", |env, bytes| {
+                env.convert_byte_array(JByteArray::from(bytes))
+                    .map_err(Into::into)
+            })?;
+        let mut bitmaps = Vec::with_capacity(bitmap_bytes.len());
+        for (position, bytes) in bitmap_bytes.into_iter().enumerate() {
+            bitmaps.push(
+                RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(|e| {
+                    Error::input_error(format!(
+                        "invalid overlay coverage RoaringBitmap at position {position}: {e}"
+                    ))
+                })?,
+            );
+        }
+        let coverage = if is_shared {
+            let [bitmap]: [RoaringBitmap; 1] = bitmaps.try_into().map_err(|bitmaps: Vec<_>| {
+                Error::input_error(format!(
+                    "shared overlay coverage requires exactly one bitmap, got {}",
+                    bitmaps.len()
+                ))
+            })?;
+            OverlayCoverage::dense(bitmap)
+        } else {
+            if bitmaps.len() != data_file.fields.len() {
+                return Err(Error::input_error(format!(
+                    "per-field overlay coverage for {} has {} bitmaps but the data file has {} fields",
+                    data_file.path,
+                    bitmaps.len(),
+                    data_file.fields.len()
+                )));
+            }
+            OverlayCoverage::sparse(bitmaps)
+        };
+        Ok(DataOverlayFile {
+            data_file,
+            coverage,
+            committed_version: nonnegative_jlong_to_u64(
+                "dataOverlay.committedVersion",
+                env.call_method(self, "getCommittedVersion", "()J", &[])?
+                    .j()?,
+            )?,
+        })
+    }
+}
+
+impl IntoJava for &DataOverlayGroup {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let overlays = export_vec(env, &self.overlays)?;
+        Ok(env.new_object(
+            "org/lance/operation/DataOverlay$DataOverlayGroup",
+            "(JLjava/util/List;)V",
+            &[
+                JValue::Long(u64_to_jlong("dataOverlay.fragmentId", self.fragment_id)?),
+                JValue::Object(&overlays),
+            ],
+        )?)
+    }
+}
+
+impl FromJObjectWithEnv<DataOverlayGroup> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataOverlayGroup> {
+        Ok(DataOverlayGroup {
+            fragment_id: nonnegative_jlong_to_u64(
+                "dataOverlay.fragmentId",
+                env.call_method(self, "getFragmentId", "()J", &[])?.j()?,
+            )?,
+            overlays: import_vec_from_method(env, self, "getOverlays", |env, overlay| {
+                overlay.extract_object(env)
+            })?,
         })
     }
 }
@@ -173,15 +643,25 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             })?;
 
         let name = env.get_string_from_method(self, "name")?;
-        let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
+        let dataset_version = nonnegative_jlong_to_u64(
+            "index.datasetVersion",
+            env.get_field(self, "datasetVersion", "J")?.j()?,
+        )?;
 
         let fragment_bitmap: Option<RoaringBitmap> =
             env.get_optional_from_method(self, "fragments", |env, fragments_obj| {
                 let frag_ids = env.get_integers(&fragments_obj)?;
                 let bitmap = frag_ids
                     .iter()
-                    .map(|val| *val as u32)
-                    .collect::<RoaringBitmap>();
+                    .enumerate()
+                    .map(|(index, value)| {
+                        u32::try_from(*value).map_err(|_| {
+                            Error::input_error(format!(
+                                "index.fragments[{index}] must be non-negative, got {value}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<RoaringBitmap>>()?;
                 Ok(bitmap)
             })?;
 
@@ -204,9 +684,46 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 let nanos = env
                     .call_method(&created_at_obj, "getNano", "()I", &[])?
                     .i()? as u32;
-                Ok(DateTime::from_timestamp(seconds, nanos).unwrap())
+                DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
+                    Error::input_error(format!(
+                        "Invalid index createdAt timestamp: seconds={seconds}, nanos={nanos}"
+                    ))
+                })
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
+        let files: Option<Vec<IndexFile>> =
+            env.get_optional_from_method(self, "getFiles", |env, files| {
+                crate::traits::import_vec_to_rust(env, &files, |env, file| file.extract_object(env))
+            })?;
+        let files_size = files
+            .as_ref()
+            .map(|files| {
+                files.iter().try_fold(0_u64, |total, file| {
+                    total.checked_add(file.size_bytes).ok_or_else(|| {
+                        Error::input_error("index file sizes overflow u64".to_string())
+                    })
+                })
+            })
+            .transpose()?;
+        if let Some(files_size) = files_size {
+            i64::try_from(files_size).map_err(|_| {
+                Error::input_error(format!(
+                    "index file sizes total {files_size}, which cannot be represented by Java long"
+                ))
+            })?;
+        }
+        if let Some(size_bytes) = env.get_optional_u64_from_method(self, "getSizeBytes")? {
+            let files_size = files_size.ok_or_else(|| {
+                Error::input_error(format!(
+                    "index sizeBytes={size_bytes} cannot be represented without files"
+                ))
+            })?;
+            if size_bytes != files_size {
+                return Err(Error::input_error(format!(
+                    "index sizeBytes={size_bytes} does not match the sum of file sizes ({files_size})"
+                )));
+            }
+        }
 
         Ok(IndexMetadata {
             uuid,
@@ -219,14 +736,17 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             index_version,
             created_at,
             base_id,
-            files: None,
+            files,
         })
     }
 }
 
 impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataReplacementGroup> {
-        let fragment_id = env.call_method(self, "fragmentId", "()J", &[])?.j()? as u64;
+        let fragment_id = nonnegative_jlong_to_u64(
+            "dataReplacement.fragmentId",
+            env.call_method(self, "fragmentId", "()J", &[])?.j()?,
+        )?;
         let new_file = env
             .call_method(self, "replacedFile", "()Lorg/lance/fragment/DataFile;", &[])?
             .l()?
@@ -242,10 +762,12 @@ impl FromJObjectWithEnv<UpdateMode> for JObject<'_> {
             .call_method(self, "toString", "()Ljava/lang/String;", &[])?
             .l()?;
         let s: String = env.get_string(&JString::from(s))?.into();
-        let t = if s == "RewriteRows" {
-            UpdateMode::RewriteRows
-        } else {
-            UpdateMode::RewriteColumns
+        let t = match s.as_str() {
+            "RewriteRows" => UpdateMode::RewriteRows,
+            "RewriteColumns" => UpdateMode::RewriteColumns,
+            _ => {
+                return Err(Error::input_error(format!("Unknown UpdateMode value: {s}")));
+            }
         };
         Ok(t)
     }
@@ -328,7 +850,10 @@ pub(crate) fn convert_to_java_transaction<'local>(
         "org/lance/Transaction",
         "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
-            JValue::Long(transaction.read_version as i64),
+            JValue::Long(u64_to_jlong(
+                "transaction.readVersion",
+                transaction.read_version,
+            )?),
             JValue::Object(&uuid),
             JValue::Object(&operation),
             JValue::Object(&tag),
@@ -372,11 +897,8 @@ fn convert_to_java_operation_inner<'local>(
         } => {
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
 
-            let deleted_ids: Vec<JLance<i64>> = deleted_fragment_ids
-                .iter()
-                .map(|x| JLance(*x as i64))
-                .collect();
-            let removed_fragment_ids_obj = export_vec(env, &deleted_ids)?;
+            let removed_fragment_ids_obj =
+                export_unsigned_longs(env, &deleted_fragment_ids, "delete.deletedFragmentIds")?;
 
             let predicate_obj = env.new_string(&predicate)?;
 
@@ -394,7 +916,7 @@ fn convert_to_java_operation_inner<'local>(
             fragments: rust_fragments,
             schema,
             config_upsert_values,
-            initial_bases: _,
+            initial_bases,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
             let java_schema = convert_to_java_schema(env, schema)?;
@@ -402,21 +924,25 @@ fn convert_to_java_operation_inner<'local>(
                 Some(config_upsert_values) => to_java_map(env, &config_upsert_values)?,
                 _ => JObject::null(),
             };
+            let java_initial_bases = match initial_bases {
+                Some(initial_bases) => export_vec(env, &initial_bases)?,
+                None => JObject::null(),
+            };
 
             Ok(env.new_object(
                 "org/lance/operation/Overwrite",
-                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Ljava/util/Map;)V",
+                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Ljava/util/Map;Ljava/util/List;)V",
                 &[
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
                     JValue::Object(&java_config),
+                    JValue::Object(&java_initial_bases),
                 ],
             )?)
         }
         Operation::CreateIndex {
             new_indices,
             removed_indices,
-            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -435,17 +961,14 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            compacted_sstables: _,
+            compacted_sstables,
             fields_for_preserving_frag_bitmap,
             update_mode,
-            inserted_rows_filter: _,
+            inserted_rows_filter,
             updated_fragment_offsets,
         } => {
-            let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
-                .iter()
-                .map(|x| JLance(*x as i64))
-                .collect();
-            let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
+            let removed_fragment_ids_obj =
+                export_unsigned_longs(env, &removed_fragment_ids, "update.removedFragmentIds")?;
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
             let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
@@ -463,6 +986,11 @@ fn convert_to_java_operation_inner<'local>(
                     &[JValue::Object(&update_mode)],
                 )?
                 .l()?;
+            let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
+            let inserted_rows_filter = match inserted_rows_filter {
+                Some(filter) => key_existence_filter_into_java(env, &filter)?,
+                None => JObject::null(),
+            };
             // Serialize updated_fragment_offsets to Java Map<Long, byte[]>.
             // Values are portable RoaringBitmap bytes so the JNI boundary stays O(bitmap size)
             // rather than O(n rows). Empty HashMap when None so the Java constructor always
@@ -486,7 +1014,10 @@ fn convert_to_java_operation_inner<'local>(
                             let java_key = env.new_object(
                                 "java/lang/Long",
                                 "(J)V",
-                                &[JValue::Long(*frag_id as i64)],
+                                &[JValue::Long(u64_to_jlong(
+                                    "update.updatedFragmentOffsets.fragmentId",
+                                    *frag_id,
+                                )?)],
                             )?;
                             let java_arr = env.new_byte_array(buf_i8.len() as i32)?;
                             env.set_byte_array_region(&java_arr, 0, buf_i8)?;
@@ -504,7 +1035,7 @@ fn convert_to_java_operation_inner<'local>(
             };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;Ljava/util/List;Lorg/lance/operation/KeyExistenceFilter;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -513,6 +1044,8 @@ fn convert_to_java_operation_inner<'local>(
                     JValueGen::Object(&fields_for_preserving_frag_bitmap),
                     JValue::Object(&update_mode_optional),
                     JValue::Object(&java_offsets_map),
+                    JValue::Object(&compacted_sstables),
+                    JValue::Object(&inserted_rows_filter),
                 ],
             )?)
         }
@@ -601,6 +1134,14 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&java_replacements)],
             )?)
         }
+        Operation::DataOverlay { groups } => {
+            let groups = export_vec(env, &groups)?;
+            Ok(env.new_object(
+                "org/lance/operation/DataOverlay",
+                "(Ljava/util/List;)V",
+                &[JValue::Object(&groups)],
+            )?)
+        }
         Operation::Merge {
             fragments: rust_fragments,
             schema,
@@ -622,14 +1163,60 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Restore { version } => Ok(env.new_object(
             "org/lance/operation/Restore",
             "(J)V",
-            &[JValue::Long(version as i64)],
+            &[JValue::Long(u64_to_jlong("restore.version", version)?)],
         )?),
         Operation::ReserveFragments { num_fragments } => Ok(env.new_object(
             "org/lance/operation/ReserveFragments",
             "(I)V",
-            &[JValue::Int(num_fragments as i32)],
+            &[JValue::Int(u32_to_jint(
+                "reserveFragments.numFragments",
+                num_fragments,
+            )?)],
         )?),
-        _ => unimplemented!(),
+        Operation::UpdateMemWalState { compacted_sstables } => {
+            let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
+            Ok(env.new_object(
+                "org/lance/operation/UpdateMemWalState",
+                "(Ljava/util/List;)V",
+                &[JValue::Object(&compacted_sstables)],
+            )?)
+        }
+        Operation::Clone {
+            is_shallow,
+            ref_name,
+            ref_version,
+            ref_path,
+            branch_name,
+        } => {
+            let ref_name = match ref_name {
+                Some(ref_name) => env.new_string(ref_name)?.into(),
+                None => JObject::null(),
+            };
+            let ref_path = env.new_string(ref_path)?;
+            let branch_name = match branch_name {
+                Some(branch_name) => env.new_string(branch_name)?.into(),
+                None => JObject::null(),
+            };
+            Ok(env.new_object(
+                "org/lance/operation/Clone",
+                "(ZLjava/lang/String;JLjava/lang/String;Ljava/lang/String;)V",
+                &[
+                    JValue::Bool(is_shallow as u8),
+                    JValue::Object(&ref_name),
+                    JValue::Long(u64_to_jlong("clone.refVersion", ref_version)?),
+                    JValue::Object(&ref_path),
+                    JValue::Object(&branch_name),
+                ],
+            )?)
+        }
+        Operation::UpdateBases { new_bases } => {
+            let new_bases = export_vec(env, &new_bases)?;
+            Ok(env.new_object(
+                "org/lance/operation/UpdateBases",
+                "(Ljava/util/List;)V",
+                &[JValue::Object(&new_bases)],
+            )?)
+        }
     }
 }
 
@@ -888,7 +1475,11 @@ fn convert_to_rust_transaction(
     allocator: Option<&JObject>,
     dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
-    let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
+    let read_ver = nonnegative_jlong_to_u64(
+        "transaction.readVersion",
+        env.call_method(&java_transaction, "readVersion", "()J", &[])?
+            .j()?,
+    )?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env
         .call_method(
@@ -1200,13 +1791,11 @@ fn convert_to_rust_operation(
                 |env, fragment| fragment.extract_object(env),
             )?;
 
-            let deleted_fragment_ids: Vec<u64> = import_vec_from_method(
+            let deleted_fragment_ids = import_unsigned_longs(
                 env,
                 java_operation,
                 "deletedFragmentIds",
-                |env, fragment_id| {
-                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
-                },
+                "delete.deletedFragmentIds",
             )?;
 
             let predicate = env.get_string_from_method(java_operation, "predicate")?;
@@ -1231,6 +1820,12 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
+            let initial_bases =
+                env.get_optional_from_method(java_operation, "getInitialBases", |env, bases| {
+                    crate::traits::import_vec_to_rust(env, &bases, |env, base| {
+                        base.extract_object(env)
+                    })
+                })?;
             // Pass None for dataset so that the new schema is not validated
             // against the old schema. Overwrite replaces the entire dataset,
             // so fields with the same name but different types are allowed.
@@ -1249,7 +1844,7 @@ fn convert_to_rust_operation(
                 fragments,
                 schema,
                 config_upsert_values,
-                initial_bases: None,
+                initial_bases,
             }
         }
         "Rewrite" => {
@@ -1276,13 +1871,11 @@ fn convert_to_rust_operation(
             }
         }
         "Update" => {
-            let removed_fragment_ids = import_vec_from_method(
+            let removed_fragment_ids = import_unsigned_longs(
                 env,
                 java_operation,
                 "removedFragmentIds",
-                |env, fragment_id| {
-                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
-                },
+                "update.removedFragmentIds",
             )?;
 
             let updated_fragments: Vec<Fragment> = import_vec_from_method(
@@ -1297,21 +1890,41 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
-            let fields_modified = env
-                .call_method(java_operation, "fieldsModified", "()[J", &[])?
-                .l()?;
-            let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
-
-            let fields_for_preserving_frag_bitmap = env
-                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
-                .l()?;
-            let fields_for_preserving_frag_bitmap =
-                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+            let fields_modified = import_field_ids(
+                env,
+                java_operation,
+                "fieldsModified",
+                "update.fieldsModified",
+            )?;
+            let fields_for_preserving_frag_bitmap = import_field_ids(
+                env,
+                java_operation,
+                "fieldsForPreservingFragBitmap",
+                "update.fieldsForPreservingFragBitmap",
+            )?;
 
             let update_mode: Option<UpdateMode> =
                 env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
                     update_mode.extract_object(env)
                 })?;
+            if update_mode.is_none() {
+                return Err(Error::input_error(
+                    "update.updateMode must be specified because the transaction format cannot \
+                     persist an absent update mode distinctly from RewriteRows"
+                        .to_string(),
+                ));
+            }
+            let compacted_sstables = import_vec_from_method(
+                env,
+                java_operation,
+                "getCompactedSstables",
+                |env, sstable| compacted_sstable_from_java(env, &sstable),
+            )?;
+            let inserted_rows_filter = env.get_optional_from_method(
+                java_operation,
+                "getInsertedRowsFilter",
+                |env, filter| key_existence_filter_from_java(env, &filter),
+            )?;
 
             let updated_fragment_offsets = {
                 let offsets_obj = env
@@ -1337,8 +1950,10 @@ fn convert_to_rust_operation(
                                 let Some((key, value)) = iter.next(env)? else {
                                     return Ok(None);
                                 };
-                                let frag_id =
-                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let frag_id = nonnegative_jlong_to_u64(
+                                    "update.updatedFragmentOffsets.fragmentId",
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()?,
+                                )?;
                                 let buf: Vec<u8> =
                                     env.convert_byte_array(JByteArray::from(value))?;
                                 let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())
@@ -1371,10 +1986,10 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                compacted_sstables: vec![],
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
-                inserted_rows_filter: None,
+                inserted_rows_filter,
                 updated_fragment_offsets,
             }
         }
@@ -1384,6 +1999,12 @@ fn convert_to_rust_operation(
                     replacement.extract_object(env)
                 })?;
             Operation::DataReplacement { replacements }
+        }
+        "DataOverlay" => {
+            let groups = import_vec_from_method(env, java_operation, "getGroups", |env, group| {
+                group.extract_object(env)
+            })?;
+            Operation::DataOverlay { groups }
         }
         "Merge" => {
             let fragments: Vec<Fragment> =
@@ -1408,15 +2029,22 @@ fn convert_to_rust_operation(
             }
         }
         "Restore" => {
-            let version: u64 = env
-                .call_method(java_operation, "version", "()J", &[])?
-                .j()? as u64;
+            let version = nonnegative_jlong_to_u64(
+                "restore.version",
+                env.call_method(java_operation, "version", "()J", &[])?
+                    .j()?,
+            )?;
             return Ok(Operation::Restore { version });
         }
         "ReserveFragments" => {
-            let num_fragments = env
+            let java_num_fragments = env
                 .call_method(java_operation, "numFragments", "()I", &[])?
-                .i()? as u32;
+                .i()?;
+            let num_fragments = u32::try_from(java_num_fragments).map_err(|_| {
+                Error::input_error(format!(
+                    "reserveFragments.numFragments must be non-negative, got {java_num_fragments}"
+                ))
+            })?;
             return Ok(Operation::ReserveFragments { num_fragments });
         }
         "CreateIndex" => {
@@ -1433,7 +2061,38 @@ fn convert_to_rust_operation(
                 removed_indices,
             });
         }
-        _ => unimplemented!(),
+        "UpdateMemWalState" => {
+            let compacted_sstables = import_vec_from_method(
+                env,
+                java_operation,
+                "getCompactedSstables",
+                |env, sstable| compacted_sstable_from_java(env, &sstable),
+            )?;
+            Operation::UpdateMemWalState { compacted_sstables }
+        }
+        "Clone" => Operation::Clone {
+            is_shallow: env.get_boolean_from_method(java_operation, "isShallow")?,
+            ref_name: env.get_optional_string_from_method(java_operation, "getRefName")?,
+            ref_version: nonnegative_jlong_to_u64(
+                "clone.refVersion",
+                env.call_method(java_operation, "getRefVersion", "()J", &[])?
+                    .j()?,
+            )?,
+            ref_path: env.get_string_from_method(java_operation, "getRefPath")?,
+            branch_name: env.get_optional_string_from_method(java_operation, "getBranchName")?,
+        },
+        "UpdateBases" => {
+            let new_bases =
+                import_vec_from_method(env, java_operation, "getNewBases", |env, base| {
+                    base.extract_object(env)
+                })?;
+            Operation::UpdateBases { new_bases }
+        }
+        _ => {
+            return Err(Error::input_error(format!(
+                "Unsupported Java transaction operation: {op_name}"
+            )));
+        }
     };
     Ok(op)
 }
@@ -2041,5 +2700,29 @@ mod tests {
         assert!(parse_storage_format("v3.0").is_err());
         assert!(parse_storage_format("").is_err());
         assert!(parse_storage_format("foo").is_err());
+    }
+
+    #[test]
+    fn test_checked_transaction_integer_conversions() {
+        assert_eq!(
+            u32_to_jint("basePath.id", i32::MAX as u32).unwrap(),
+            i32::MAX
+        );
+        assert!(u32_to_jint("basePath.id", i32::MAX as u32 + 1).is_err());
+        assert_eq!(
+            checked_field_ids("update.fieldsModified", &[0, u32::MAX as i64]).unwrap(),
+            vec![0, u32::MAX]
+        );
+        for invalid in [-1, u32::MAX as i64 + 1] {
+            let error = checked_field_ids("update.fieldsModified", &[invalid]).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("update.fieldsModified[0]"));
+            assert!(message.contains(&invalid.to_string()));
+        }
+        assert_eq!(
+            u64_to_jlong("dataOverlay.fragmentId", i64::MAX as u64).unwrap(),
+            i64::MAX
+        );
+        assert!(u64_to_jlong("dataOverlay.fragmentId", i64::MAX as u64 + 1).is_err());
     }
 }

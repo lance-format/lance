@@ -82,8 +82,10 @@ geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
+libc.workspace = true
 test-log.workspace = true
 rstest.workspace = true
+serial_test.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
@@ -168,5 +170,13 @@ required-features = ["geo"]
 name = "residual_transform"
 harness = false
 
+[[bench]]
+name = "two_file_shuffle_read"
+harness = false
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "inverted_request_cache"
+harness = false

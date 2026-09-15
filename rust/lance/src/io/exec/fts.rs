@@ -25,19 +25,24 @@ use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::future::try_join_all;
-use futures::stream::{self};
+use futures::stream::{self, FuturesUnordered};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
-    utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
+    utils::{
+        tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+        tracing::StreamTracingExt,
+    },
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
+use rustc_hash::FxHashSet;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
+use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -57,7 +62,8 @@ use lance_index::scalar::inverted::{
     MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
     compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
     compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema, prepare_bm25_query,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema, materialized_compound_top_k,
+    prepare_bm25_query,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -787,6 +793,398 @@ impl CompoundQueryExec {
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
+    }
+}
+
+#[derive(Debug)]
+struct QueryLocalResidualShard {
+    index: QueryLocalFtsIndex,
+    stats: QueryLocalFtsStats,
+}
+
+async fn index_query_local_residual_batch(
+    mut residual: QueryLocalResidualShard,
+    batch: RecordBatch,
+    allowed_terms: Arc<FxHashSet<String>>,
+) -> Result<QueryLocalResidualShard> {
+    spawn_cpu(move || {
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "hybrid compound FTS residual input is missing _rowid".to_string(),
+                )
+            })?
+            .as_primitive::<UInt64Type>();
+        let stats = residual.index.insert_with_row_ids_for_terms(
+            &batch,
+            row_ids,
+            allowed_terms.as_ref(),
+        )?;
+        residual.stats.checked_add_assign(stats)?;
+        Ok(residual)
+    })
+    .await
+}
+
+/// Build a bounded set of independent residual posting shards.
+///
+/// A single [`QueryLocalFtsIndex`] intentionally has one writer. Reusing one
+/// index per CPU worker preserves that contract while allowing different scan
+/// batches to tokenize in parallel. Completed workers immediately take the
+/// next batch, so the entire stream is never collected in memory and the
+/// number of live tokenizers/posting maps is bounded by the CPU pool size.
+async fn index_query_local_residual(
+    residual_input: SendableRecordBatchStream,
+    seed: QueryLocalFtsIndex,
+    allowed_terms: Arc<FxHashSet<String>>,
+) -> DataFusionResult<Vec<QueryLocalResidualShard>> {
+    // Match flat FTS's CPU-task sizing. Dataset scan batches are normally
+    // row-bounded (often 8,192 rows), which can leave a small residual with
+    // only one or two tokenizer tasks. Byte rechunking keeps tasks substantial
+    // while exposing enough parallelism for variable-width text.
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let input_schema = residual_input.schema();
+    let mut residual_input = Box::pin(lance_arrow::stream::rechunk_stream_by_size(
+        residual_input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    ));
+    let parallelism = get_num_compute_intensive_cpus().max(1);
+    let mut initial_batches = Vec::with_capacity(parallelism);
+    let mut is_input_exhausted = false;
+
+    while initial_batches.len() < parallelism {
+        let Some(batch) = residual_input.try_next().await? else {
+            is_input_exhausted = true;
+            break;
+        };
+        initial_batches.push(batch);
+    }
+
+    if initial_batches.is_empty() {
+        return Ok(vec![QueryLocalResidualShard {
+            index: seed,
+            stats: QueryLocalFtsStats::default(),
+        }]);
+    }
+
+    // Construct every shard from the already-loaded seed before dispatching
+    // CPU work. This keeps tokenizer model I/O out of `spawn_cpu` closures.
+    let mut initial_shards = Vec::with_capacity(initial_batches.len());
+    for _ in 1..initial_batches.len() {
+        initial_shards.push(QueryLocalResidualShard {
+            index: seed.empty_sibling(),
+            stats: QueryLocalFtsStats::default(),
+        });
+    }
+    initial_shards.push(QueryLocalResidualShard {
+        index: seed,
+        stats: QueryLocalFtsStats::default(),
+    });
+
+    let mut in_flight = FuturesUnordered::new();
+    for (shard, batch) in initial_shards.into_iter().zip(initial_batches) {
+        in_flight.push(index_query_local_residual_batch(
+            shard,
+            batch,
+            allowed_terms.clone(),
+        ));
+    }
+
+    let mut shards = Vec::with_capacity(parallelism.min(in_flight.len()));
+    while let Some(shard) = in_flight.try_next().await? {
+        if is_input_exhausted {
+            shards.push(shard);
+            continue;
+        }
+        match residual_input.try_next().await? {
+            Some(batch) => in_flight.push(index_query_local_residual_batch(
+                shard,
+                batch,
+                allowed_terms.clone(),
+            )),
+            None => {
+                is_input_exhausted = true;
+                shards.push(shard);
+            }
+        }
+    }
+    Ok(shards)
+}
+
+async fn query_local_residual_leaves(
+    shards: Vec<QueryLocalResidualShard>,
+    query: FtsQuery,
+    scorer: Arc<MemBM25Scorer>,
+) -> Result<Vec<Vec<(u64, f32)>>> {
+    let shard_leaves = stream::iter(shards.into_iter().map(|shard| {
+        let query = query.clone();
+        let scorer = scorer.clone();
+        spawn_cpu(move || shard.index.exact_leaf_results(&query, scorer.as_ref()))
+    }))
+    .buffered(get_num_compute_intensive_cpus().max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    let leaf_count = shard_leaves.first().map_or(0, Vec::len);
+    let mut merged = vec![Vec::new(); leaf_count];
+    for leaves in shard_leaves {
+        if leaves.len() != leaf_count {
+            return Err(Error::internal(format!(
+                "hybrid compound FTS residual shards produced inconsistent leaf counts: expected {leaf_count}, got {}",
+                leaves.len()
+            )));
+        }
+        for (merged, rows) in merged.iter_mut().zip(leaves) {
+            merged.extend(rows);
+        }
+    }
+    Ok(merged)
+}
+
+fn residual_bm25_scorer(
+    committed_scorer: &MemBM25Scorer,
+    shards: &[QueryLocalResidualShard],
+) -> Result<MemBM25Scorer> {
+    let mut scorer = committed_scorer.clone();
+    for shard in shards {
+        shard.stats.add_to_scorer(&mut scorer)?;
+    }
+    Ok(scorer)
+}
+
+/// Compound FTS over committed postings plus a small append-only residual scan.
+///
+/// The residual documents are tokenized once into query-local postings, rather
+/// than once for every compound leaf. The indexed arm uses committed-index
+/// BM25 statistics. The residual arm extends those statistics with the
+/// query-local materialized documents, which matches the established mixed
+/// flat-search approximation without rescanning the residual input or rebuilding
+/// exact corpus statistics.
+#[derive(Debug)]
+pub(crate) struct HybridCompoundQueryExec {
+    dataset: Arc<Dataset>,
+    query: FtsQuery,
+    params: FtsSearchParams,
+    column: String,
+    segments: Arc<[IndexMetadata]>,
+    residual_input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl HybridCompoundQueryExec {
+    pub(crate) fn new(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        column: String,
+        segments: Vec<IndexMetadata>,
+        residual_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        Self {
+            dataset,
+            query,
+            params,
+            column,
+            segments: Arc::from(segments),
+            residual_input,
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(FTS_SCHEMA.clone()),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl DisplayAs for HybridCompoundQueryExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "HybridCompoundFtsScorer: column={}, query={}",
+            self.column, self.query
+        )
+    }
+}
+
+impl ExecutionPlan for HybridCompoundQueryExec {
+    fn name(&self) -> &str {
+        "HybridCompoundQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.residual_input]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "hybrid compound FTS expected one residual child, got {}",
+                children.len()
+            )));
+        }
+        let residual_input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("hybrid compound FTS lost its residual child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(
+            self.dataset.clone(),
+            self.query.clone(),
+            self.params.clone(),
+            self.column.clone(),
+            self.segments.to_vec(),
+            residual_input,
+        )))
+    }
+
+    #[instrument(name = "hybrid_compound_fts_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let dataset = self.dataset.clone();
+        let query = self.query.clone();
+        let params = self.params.clone();
+        let column = self.column.clone();
+        let segments = self.segments.clone();
+        let residual_input = self.residual_input.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let schema = self.schema();
+
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let indices =
+                open_fts_segments(&dataset, &column, &segments, &metrics.index_metrics).await?;
+            let first_index = indices.first().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "FTS index for column {column} has no committed segments"
+                ))
+            })?;
+            let field_id = dataset.schema().field_id(&column)?;
+            let tokenizer = first_index.tokenizer();
+            let doc_type = tokenizer.doc_type();
+            let residual_seed = QueryLocalFtsIndex::try_with_loaded_tokenizer(
+                field_id,
+                column.clone(),
+                first_index.params().clone(),
+                tokenizer,
+            )?;
+            let terms = residual_seed.exact_query_terms(&query)?;
+            if terms.is_empty() {
+                metrics.baseline_metrics.record_output(0);
+                return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
+            }
+            let allowed_terms = Arc::new(terms.iter().cloned().collect::<FxHashSet<_>>());
+            let query_tokens = Tokens::new(terms.clone(), doc_type);
+            let exact_params = params
+                .clone()
+                .with_fuzziness(Some(0))
+                .with_phrase_slop(None);
+
+            let residual_context = context.clone();
+            let residual_indexing = async move {
+                let residual_input = residual_input.execute(partition, residual_context)?;
+                index_query_local_residual(residual_input, residual_seed, allowed_terms).await
+            };
+            let scorer_build = async {
+                let scorer = build_global_bm25_scorer(
+                    &indices,
+                    &query_tokens,
+                    &exact_params,
+                    Some(metrics.as_ref()),
+                )
+                .await?;
+                DataFusionResult::<Arc<MemBM25Scorer>>::Ok(Arc::new(scorer))
+            };
+            let (residual_shards, committed_scorer) =
+                futures::future::try_join(residual_indexing, scorer_build).await?;
+            let residual_scorer = Arc::new(residual_bm25_scorer(
+                committed_scorer.as_ref(),
+                &residual_shards,
+            )?);
+            let limit = params.limit.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "hybrid compound FTS requires a bounded result limit".to_string(),
+                )
+            })?;
+
+            let prefilter = build_prefilter(
+                context,
+                partition,
+                &PreFilterSource::None,
+                dataset,
+                &segments,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask: None,
+                },
+            )?;
+            let indexed_search = compound_search_with_base_scorer(
+                &indices,
+                &query,
+                &params,
+                prefilter,
+                metrics.clone(),
+                committed_scorer,
+            );
+            let residual_query = query.clone();
+            let residual_search = async move {
+                let residual_leaves = query_local_residual_leaves(
+                    residual_shards,
+                    residual_query.clone(),
+                    residual_scorer,
+                )
+                .await?;
+                spawn_cpu(move || {
+                    materialized_compound_top_k(&residual_query, residual_leaves, limit)
+                })
+                .await
+            };
+            let ((indexed_row_ids, indexed_scores), (residual_row_ids, residual_scores)) =
+                futures::future::try_join(indexed_search, residual_search).await?;
+
+            let mut documents = indexed_row_ids
+                .into_iter()
+                .zip(indexed_scores)
+                .chain(residual_row_ids.into_iter().zip(residual_scores))
+                .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+                .collect::<Vec<_>>();
+            documents.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .0
+                    .total_cmp(&left.score.0)
+                    .then_with(|| left.row_id.cmp(&right.row_id))
+            });
+            documents.truncate(limit);
+            metrics.baseline_metrics.record_output(documents.len());
+            scored_documents_batch(schema, documents).map_err(DataFusionError::from)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 }
 
