@@ -301,6 +301,9 @@ payloads = table.column("blob").to_pylist()
 
 ### Open file-like blob handles lazily
 
+`BlobFile` buffers sequential reads, 4 MiB by default. Pass `buffer_size=0`
+for unbuffered reads. `read_range` and `read_ranges` do not use this buffer.
+
 ```python
 import lance
 

@@ -32,6 +32,7 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
+DEFAULT_BLOB_BUFFER_SIZE = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -385,18 +386,116 @@ class BlobColumn:
         return BlobIterator(iter(self.blob_column))
 
 
-class BlobFile(io.RawIOBase):
-    """Represents a blob in a Lance dataset as a file-like object."""
+class BlobFile(io.BufferedIOBase):
+    """Represents a blob in a Lance dataset as a file-like object.
+
+    Sequential reads are buffered. ``read_range`` and ``read_ranges`` do not
+    use that buffer and do not change the sequential cursor.
+
+    Obtain a handle from :py:meth:`lance.dataset.Dataset.take_blobs`.
+    """
+
+    def __init__(
+        self,
+        inner: LanceBlobFile,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
+    ):
+        super().__init__()
+        self.inner = inner
+        self._buffer_size = _validate_buffer_size(buffer_size)
+        self._raw = _RawBlobFile(inner)
+        self._reader: Optional[io.BufferedReader] = None
+
+    def close(self) -> None:
+        if self._reader is not None:
+            self._reader.close()
+        else:
+            self._raw.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._raw.closed
+
+    def readable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if self._reader is not None:
+            return self._reader.seek(offset, whence)
+        return self._raw.seek(offset, whence)
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        if self._reader is not None:
+            return self._reader.tell()
+        return self._raw.tell()
+
+    def size(self) -> int:
+        """
+        Returns the size of the blob in bytes.
+        """
+        return self._raw.size()
+
+    def read(self, size: int = -1) -> bytes:
+        return self._sequential_reader().read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        reader = self._sequential_reader()
+        if self._buffer_size == 0:
+            return reader.read(size)
+        return reader.read1(size)
+
+    def readall(self) -> bytes:
+        return self._sequential_reader().read(-1)
+
+    def readinto(self, b) -> int:
+        return self._sequential_reader().readinto(b)
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        """Read a blob-local byte range without changing the current cursor."""
+        return self._raw.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read multiple blob-local byte ranges without changing the current cursor.
+
+        Each range is an ``(offset, length)`` pair, matching
+        :py:meth:`read_range`. The underlying physical reads may be reordered,
+        coalesced, or split for efficiency. For every range, offset plus length
+        must fit in an unsigned 64-bit integer and must not extend beyond the
+        blob size.
+
+        Parameters
+        ----------
+        ranges : List[Tuple[int, int]]
+            The ``(offset, length)`` byte ranges to read.
+
+        Returns
+        -------
+        data : List[bytes]
+            One payload per requested range, in input order.
+        """
+        return self._raw.read_ranges(ranges)
+
+    def __repr__(self) -> str:
+        return f"<BlobFile size={self.size()}>"
+
+    def _sequential_reader(self) -> Union[io.BufferedReader, "_RawBlobFile"]:
+        if self._buffer_size == 0:
+            return self._raw
+        if self._reader is None:
+            self._reader = io.BufferedReader(self._raw, buffer_size=self._buffer_size)
+        return self._reader
+
+
+class _RawBlobFile(io.RawIOBase):
+    """Unbuffered blob stream wrapped by :class:`BlobFile`."""
 
     def __init__(self, inner: LanceBlobFile):
-        """
-        Internal only:  To obtain a BlobFile use
-        :py:meth:`lance.dataset.Dataset.take_blobs`.
-        """
         self.inner = inner
 
-    ## Note: most methods undocumented since they are defined by
-    ## the base class.
     def close(self) -> None:
         self.inner.close()
 
@@ -426,42 +525,31 @@ class BlobFile(io.RawIOBase):
         return self.inner.tell()
 
     def size(self) -> int:
-        """
-        Returns the size of the blob in bytes.
-        """
         return self.inner.size()
 
     def readall(self) -> bytes:
         return self.inner.readall()
 
     def read_range(self, offset: int, length: int) -> bytes:
-        """Read a blob-local byte range without changing the current cursor."""
         return self.inner.read_range(offset, length)
 
     def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
-        """
-        Read multiple blob-local byte ranges without changing the current cursor.
-
-        Each range is an ``(offset, length)`` pair, matching
-        :py:meth:`read_range`. The underlying physical reads may be reordered,
-        coalesced, or split for efficiency. For every range, offset plus length
-        must fit in an unsigned 64-bit integer and must not extend beyond the
-        blob size.
-
-        Parameters
-        ----------
-        ranges : List[Tuple[int, int]]
-            The ``(offset, length)`` byte ranges to read.
-
-        Returns
-        -------
-        data : List[bytes]
-            One payload per requested range, in input order.
-        """
         return self.inner.read_ranges(ranges)
 
-    def readinto(self, b: bytearray) -> int:
-        return self.inner.read_into(b)
+    def readinto(self, b) -> int:
+        # BufferedReader passes memoryview; the Rust binding requires bytearray.
+        if isinstance(b, bytearray):
+            return self.inner.read_into(b)
+        view = memoryview(b).cast("B")
+        buffer = bytearray(len(view))
+        bytes_read = self.inner.read_into(buffer)
+        view[:bytes_read] = buffer[:bytes_read]
+        return bytes_read
 
-    def __repr__(self) -> str:
-        return f"<BlobFile size={self.size()}>"
+
+def _validate_buffer_size(buffer_size: int) -> int:
+    if isinstance(buffer_size, bool) or not isinstance(buffer_size, int):
+        raise TypeError(f"buffer_size must be an int, got {type(buffer_size).__name__}")
+    if buffer_size < 0:
+        raise ValueError("buffer_size must be non-negative")
+    return buffer_size

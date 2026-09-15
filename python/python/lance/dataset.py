@@ -43,7 +43,7 @@ from lance.log import LOGGER
 # Imported at runtime, not only for the annotations below: importing it here
 # is what registers `Bitmap` as a `collections.abc.MutableSet`.
 from .bitmap import Bitmap  # noqa: TC001
-from .blob import BlobFile
+from .blob import DEFAULT_BLOB_BUFFER_SIZE, BlobFile, _validate_buffer_size
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -2333,6 +2333,8 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
+        *,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
     ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
@@ -2344,6 +2346,10 @@ class LanceDataset(pa.dataset.Dataset):
         If you plan to read each selected blob completely with ``read()`` or
         ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
         payloads with Lance's planned batched reader.
+
+        Sequential reads are buffered, 4 MiB by default. Pass
+        ``buffer_size=0`` for unbuffered reads. ``read_range`` and
+        ``read_ranges`` do not use the sequential buffer.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2357,6 +2363,8 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to select in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
+        buffer_size : int, default 4 MiB
+            Sequential read buffer size in bytes. ``0`` disables buffering.
 
         Returns
         -------
@@ -2364,6 +2372,7 @@ class LanceDataset(pa.dataset.Dataset):
             One element per selected row. Null blob values return ``None``;
             valid empty blobs return a ``BlobFile`` with size zero.
         """
+        buffer_size = _validate_buffer_size(buffer_size)
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
         )
@@ -2379,7 +2388,9 @@ class LanceDataset(pa.dataset.Dataset):
                 selection_values, blob_column
             )
         return [
-            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            BlobFile(lance_blob_file, buffer_size=buffer_size)
+            if lance_blob_file is not None
+            else None
             for lance_blob_file in lance_blob_files
         ]
 
