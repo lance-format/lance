@@ -225,8 +225,9 @@ pub fn project_to_canonical(
             Some((idx, source)) if source.data_type() == field.data_type() => {
                 Arc::new(Column::new(name, idx))
             }
-            // A generation sealed before this column was retyped carries the
-            // type it was sealed under.
+            // Arms reaching the union are already reconciled to the table's
+            // types, so this is the base arm meeting a canonical schema that
+            // widens one -- a cast the table itself declares.
             Some((idx, _)) => Arc::new(CastExpr::new(
                 Arc::new(Column::new(name, idx)),
                 field.data_type().clone(),
@@ -238,8 +239,8 @@ pub fn project_to_canonical(
             // its rows are all live. The column is non-nullable, so a null here
             // fails the scan outright.
             None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
-            // A generation sealed before this column existed, or under the name
-            // it carried then. Typed nulls are what it holds for those rows.
+            // A source sealed before this column existed. Typed nulls are what
+            // it holds for those rows.
             None => Arc::new(Literal::new(
                 ScalarValue::try_from(field.data_type()).map_err(|e| {
                     lance_core::Error::internal(format!(
