@@ -1509,6 +1509,47 @@ mod test {
         Ok(())
     }
 
+    /// A zero batch size cannot slice the fragment read into batches, so it must be
+    /// rejected as invalid input instead of panicking in the read planner.
+    #[tokio::test]
+    async fn test_add_columns_rejects_zero_batch_size() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await?;
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema);
+
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero"),
+            "{err}"
+        );
+
+        Ok(())
+    }
+
     /// A legacy fragment whose trailing row group is entirely deleted cannot defer its
     /// blanks: that batch reaches `add_blanks` with no live row to copy, so the update
     /// is refused rather than writing a data file short of the deleted rows. Deferring
