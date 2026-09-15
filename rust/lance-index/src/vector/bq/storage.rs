@@ -2595,11 +2595,59 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let num_vectors = self.codes.len();
         let num_code_bytes = self.codes.value_length() as usize;
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
+
+        // First pass: build the relabeled row ids and detect whether any row is
+        // dropped. remap only RELABELS row ids; it never physically reorders the
+        // surviving vectors. When NO row is dropped, the surviving codes stay in
+        // the exact same physical order, so unpacking + repacking them would be a
+        // pure identity on the packed code bytes (the dominant remap cost). In
+        // that case we keep the original packed columns from `self.batch`
+        // untouched and only rewrite the ROW_ID column.
+        let row_ids = self.row_ids.values();
+        let mut new_row_ids = Vec::with_capacity(num_vectors);
+        let mut any_dropped = false;
+        for row_id in row_ids.iter() {
+            match mapping.get(*row_id) {
+                Some(Some(new_id)) => new_row_ids.push(new_id),
+                // Row's covering fragment was compacted away: a genuine drop.
+                Some(None) => any_dropped = true,
+                // Address not in the map: keep the row with its original id.
+                None => new_row_ids.push(*row_id),
+            }
+        }
+
+        if !any_dropped && !new_row_ids.is_empty() {
+            // No-drop fast path: every input vector survives in the same order.
+            // The code bytes are byte-identical to the input by construction
+            // (we never touch them), so we reuse the already-normalized
+            // `self.batch` columns (packed codes, blocked/packed ex-codes, all
+            // factors) and only replace the ROW_ID column.
+            let new_row_ids = UInt64Array::from(new_row_ids);
+            let batch = self
+                .batch
+                .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?;
+            return Ok(Self {
+                metadata: self.metadata.clone(),
+                distance_type: self.distance_type,
+                batch,
+                codes: self.codes.clone(),
+                add_factors: self.add_factors.clone(),
+                scale_factors: self.scale_factors.clone(),
+                error_factors: self.error_factors.clone(),
+                ex_codes: self.ex_codes.clone(),
+                packed_ex_codes: self.packed_ex_codes.clone(),
+                ex_add_factors: self.ex_add_factors.clone(),
+                ex_scale_factors: self.ex_scale_factors.clone(),
+                row_ids: new_row_ids,
+            });
+        }
+
+        // Drops present (or empty result): fall back to the full unpack/repack
+        // path which rebuilds block membership correctly.
         let mut indices = Vec::with_capacity(num_vectors);
         let mut new_row_ids = Vec::with_capacity(num_vectors);
         let mut new_codes = Vec::with_capacity(codes.len());
 
-        let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
             match mapping.get(*row_id) {
                 Some(Some(new_id)) => {

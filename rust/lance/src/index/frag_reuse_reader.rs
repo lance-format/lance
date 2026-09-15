@@ -312,7 +312,10 @@ impl FragmentReuseIndex {
                         })
                     })
                     .collect::<Result<_>>()?;
-                let rows = self.readers[index].remap_row_ids(&rows).await?;
+                let rows = self.readers[index]
+                    .remap_row_ids(&rows)
+                    .await
+                    .map_err(|error| self.with_missing_row_map_context(index, error))?;
                 if rows.len() != positions.len() {
                     return Err(Error::internal(
                         "mapping reader changed translation batch length",
@@ -339,6 +342,38 @@ impl FragmentReuseIndex {
             result.extend(output);
         }
         Ok(result)
+    }
+
+    /// Diagnosable failure through a stable-partition transition whose
+    /// row-map payload is gone: the payload lives outside the entry (in
+    /// `_fri/<map_id>/`), so a bare not-found error would read as
+    /// corruption. Name the map and the transition, and say what to do.
+    fn with_missing_row_map_context(&self, index: usize, error: Error) -> Error {
+        if !error.is_not_found() {
+            return error;
+        }
+        let transition = &self.ledger.transitions()[index];
+        let lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(reference) =
+            transition.mapping()
+        else {
+            return error;
+        };
+        Error::not_found(format!(
+            "fragment reuse row map _fri/{} is missing (rebuild the index to restore \
+             coverage), or the dataset is corrupt. Translating addresses through \
+             transition {:?} -> {:?} failed with: {error}",
+            reference.map_id,
+            transition
+                .sources()
+                .iter()
+                .map(|digest| digest.id)
+                .collect::<Vec<_>>(),
+            transition
+                .destinations()
+                .iter()
+                .map(|digest| digest.id)
+                .collect::<Vec<_>>(),
+        ))
     }
 }
 

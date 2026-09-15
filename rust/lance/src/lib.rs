@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The io_uring reader path pulls a deep moka cache type through async
+// `#[instrument]` blocks (e.g. mem_wal_writer); on the pinned toolchain's trait
+// solver this overflows the default recursion limit. Match lance-io's limit.
+#![recursion_limit = "512"]
+
 //! Lance Columnar Data Format
 //!
 //! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
