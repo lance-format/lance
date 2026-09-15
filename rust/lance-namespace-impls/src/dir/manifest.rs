@@ -586,6 +586,126 @@ impl ManifestStreamMutation for DeleteObjectMutation {
     }
 }
 
+/// A single-pass manifest mutation that simultaneously inserts the destination
+/// row and removes the source row. Folding both legs of a logical rename into
+/// one `rewrite_manifest` call makes the rewrite atomic at the storage layer:
+/// the manifest can never land in a state where both the source and destination
+/// `object_id` point at the same physical location, because either the whole
+/// rewrite commits or none of it does.
+struct RenameManifestMutation {
+    dest: ManifestEntry,
+    source_object_id: String,
+    /// Whether the source row was present in the manifest at all. The caller
+    /// pre-checks via `query_manifest_for_table`, but another writer can drop
+    /// or deregister the source between the pre-check and the rewrite. When
+    /// the source is missing we must NOT append the destination row from
+    /// stale metadata, so `append_rows` fails the mutation.
+    source_found: bool,
+    /// The `base_objects` carried by the source row. `query_manifest_for_table`
+    /// only surfaces `namespace`/`name`/`location`/`metadata` (it drops
+    /// `base_objects`), so we have to capture this field from the rewrite
+    /// stream and thread it through to the destination row. Otherwise a
+    /// rename would silently strip the table's dependency metadata.
+    source_base_objects: Option<Vec<String>>,
+    /// Whether the destination row was already taken. The caller pre-checks
+    /// this, but a concurrent writer could win the race between the check and
+    /// the commit, so we still need a fail-on-conflict branch.
+    dest_collision: bool,
+}
+
+impl ManifestStreamMutation for RenameManifestMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.source_object_id {
+            self.source_found = true;
+            // Capture the source's `base_objects` so `append_rows` can
+            // thread it onto the destination row. Without this, a rename
+            // would drop the table's declared dependency metadata.
+            self.source_base_objects = row.base_objects.clone();
+            // Drop the source row: do not append it to the output batch.
+            return Ok(());
+        }
+        if row.object_id == self.dest.object_id {
+            self.dest_collision = true;
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Object '{}' was concurrently created by another operation",
+                    row.object_id
+                ),
+            }
+            .into());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if !self.source_found {
+            // The source row was already gone when we scanned the manifest.
+            // That means another writer dropped or deregistered the source
+            // between the pre-check (`query_manifest_for_table`) and this
+            // rewrite. Appending the destination row would recreate the entry
+            // from the stale `table_info` we captured earlier, masking the
+            // concurrent change. Surface the conflict instead so the caller
+            // can re-evaluate the rename.
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Object '{}' was concurrently removed by another operation",
+                    self.source_object_id
+                ),
+            }
+            .into());
+        }
+        if self.dest_collision {
+            // The source row was dropped (if present) above; we cannot append
+            // the destination row because that would overwrite the concurrent
+            // entry, and `process_existing_row` already returned the error
+            // that will surface to the caller.
+            return Ok(());
+        }
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &self.dest.object_id,
+                object_type: self.dest.object_type,
+                location: self.dest.location.as_deref(),
+                metadata: self.dest.metadata.as_deref(),
+                base_objects: self.source_base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        CopyOnWriteMutation::updated(())
+    }
+
+    fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
+        // On commit conflict, re-read the manifest and re-apply the mutation.
+        // A concurrent insert into `dest_object_id` is still caught by
+        // `process_existing_row` returning `ConcurrentModification` on retry.
+        ConflictResolution::Retry
+    }
+}
+
 /// Information about a namespace stored in the manifest
 #[derive(Debug, Clone)]
 pub struct NamespaceInfo {
@@ -2385,6 +2505,113 @@ impl ManifestNamespace {
 
         self.insert_into_manifest(object_id, ObjectType::Table, Some(location))
             .await
+    }
+
+    /// Rename a table's manifest entry in place.
+    ///
+    /// The physical storage `location` and every user-visible piece of metadata
+    /// (including the containing namespace) are preserved by default. Only the
+    /// trailing name component of the object id is replaced with
+    /// `new_table_name`.
+    ///
+    /// `new_location` is an optional override for the stored `location` on the
+    /// destination row. Pass `Some` when the caller already moved the physical
+    /// data (e.g. the directory-listing rename copied `<old>.lance` to
+    /// `<new>.lance`) and the manifest must point at the new path. Pass `None`
+    /// for the metadata-only rename used when the manifest itself is the
+    /// source of truth: in that case the manifest may have recorded a
+    /// user-supplied or hashed location that is independent of `new_table_name`
+    /// and must not be rewritten.
+    ///
+    /// This is the primitive `DirectoryNamespace::rename_table` uses when the
+    /// table is tracked by the manifest, so that a rename never rewrites data
+    /// nor drops the manifest row's metadata.
+    pub async fn rename_table_entry(
+        &self,
+        source_id: &[String],
+        new_table_name: &str,
+        new_location: Option<String>,
+    ) -> Result<()> {
+        if source_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+        if new_table_name.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let (namespace, _) = Self::split_object_id(source_id);
+        let source_object_id = Self::build_object_id(&namespace, &source_id[source_id.len() - 1]);
+        let dest_object_id = Self::build_object_id(&namespace, new_table_name);
+
+        if source_object_id == dest_object_id {
+            // Nothing to do; caller asked to rename to the same name.
+            return Ok(());
+        }
+
+        // Load the existing row so we can preserve its location and metadata.
+        let table_info = self
+            .query_manifest_for_table(&source_object_id)
+            .await?
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: Self::format_table_id(source_id),
+                })
+            })?;
+
+        // Reject if the destination is already taken by a table or namespace,
+        // so the rename cannot silently overwrite an existing entry.
+        if self.manifest_contains_object(&dest_object_id).await? {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: format!("Destination table '{}' already exists", new_table_name),
+            }
+            .into());
+        }
+
+        let metadata_json = Self::serialize_metadata(
+            table_info.metadata.as_ref(),
+            ObjectType::Table.as_str(),
+            &dest_object_id,
+        )?;
+
+        // Default to preserving the existing `location`. A caller that already
+        // moved the physical data can override this with `new_location` so the
+        // manifest row tracks the new path and manifest-routed operations
+        // (e.g. `drop_table`, migration) do not see a stale pointer.
+        let dest_location = new_location.unwrap_or_else(|| table_info.location.clone());
+
+        // Replace the source row with the destination row in a single manifest
+        // rewrite. Doing this in one mutation (rather than an insert followed
+        // by a delete) keeps the manifest atomic: a crash between the two legs
+        // can no longer leave both `source_object_id` and `dest_object_id`
+        // pointing at the same physical location, because either the whole
+        // rewrite commits or none of it does.
+        let dest_object_id_for_mutation = dest_object_id.clone();
+        let source_object_id_for_mutation = source_object_id.clone();
+        self.rewrite_manifest("Failed to rename table entry", move || {
+            RenameManifestMutation {
+                dest: ManifestEntry {
+                    object_id: dest_object_id_for_mutation.clone(),
+                    object_type: ObjectType::Table,
+                    location: Some(dest_location.clone()),
+                    metadata: metadata_json.clone(),
+                },
+                source_object_id: source_object_id_for_mutation.clone(),
+                source_found: false,
+                // Captured from the rewrite stream inside `process_existing_row`
+                // and written onto the destination row in `append_rows`.
+                source_base_objects: None,
+                dest_collision: false,
+            }
+        })
+        .await?;
+
+        Ok(())
     }
 
     /// Validate that all levels of a namespace path exist
@@ -6193,5 +6420,171 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    /// If another writer drops or deregisters the source between the
+    /// `query_manifest_for_table` pre-check and the rewrite, the rewrite
+    /// must not silently recreate the destination row from the stale
+    /// `table_info` captured earlier. Drive the rewrite directly with a
+    /// manifest that is missing the source row so `process_existing_row`
+    /// never sets `source_found`, then verify `append_rows` reports a
+    /// `ConcurrentModification` conflict instead of appending.
+    #[tokio::test]
+    async fn test_rename_manifest_fails_when_source_dropped_before_rewrite() {
+        use super::RenameManifestMutation;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let manifest_ns = create_manifest_namespace(temp_path, false).await;
+
+        // Leave the source row absent — this mirrors the race where
+        // another writer has already removed the source by the time our
+        // rewrite begins scanning the manifest.
+        let source_object_id = "source_table".to_string();
+        let result = manifest_ns
+            .rewrite_manifest("test concurrent drop", move || RenameManifestMutation {
+                dest: ManifestEntry {
+                    object_id: "dest_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("dest_table.lance".to_string()),
+                    metadata: None,
+                },
+                source_object_id: source_object_id.clone(),
+                source_found: false,
+                source_base_objects: None,
+                dest_collision: false,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "rewrite must fail when the source row is gone before the rewrite sees it"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("concurrently"),
+            "expected ConcurrentModification, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("source_table"),
+            "error should mention the source object id, got: {err_msg}"
+        );
+    }
+
+    /// Positive control: when the source row IS present during the rewrite,
+    /// the destination row is appended with the requested `new_location`.
+    #[tokio::test]
+    async fn test_rename_manifest_appends_dest_with_new_location_when_source_present() {
+        use super::RenameManifestMutation;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let manifest_ns = create_manifest_namespace(temp_path, false).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("source_table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let source_object_id = "source_table".to_string();
+        let new_location = "new_table.lance".to_string();
+        manifest_ns
+            .rewrite_manifest("test happy path", move || RenameManifestMutation {
+                dest: ManifestEntry {
+                    object_id: "dest_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some(new_location.clone()),
+                    metadata: None,
+                },
+                source_object_id: source_object_id.clone(),
+                source_found: false,
+                source_base_objects: None,
+                dest_collision: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !manifest_ns
+                .manifest_contains_object("source_table")
+                .await
+                .unwrap()
+        );
+        let info = manifest_ns
+            .query_manifest_for_table("dest_table")
+            .await
+            .unwrap()
+            .expect("destination row should exist");
+        assert_eq!(info.location, "new_table.lance");
+    }
+
+    /// A rename must thread the source row's `base_objects` onto the
+    /// destination row. `query_manifest_for_table()` (used by the
+    /// high-level `rename_table_entry`) drops that field, so the
+    /// mutation has to capture it from the rewrite stream and write it
+    /// back in `append_rows`; otherwise declared tables would lose
+    /// their dependency metadata on every rename.
+    #[tokio::test]
+    async fn test_rename_manifest_preserves_base_objects() {
+        use super::RenameManifestMutation;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let manifest_ns = create_manifest_namespace(temp_path, false).await;
+
+        let original_bases = vec!["base1.lance".to_string(), "base2.lance".to_string()];
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("source_table.lance".to_string()),
+                    metadata: None,
+                }],
+                Some(original_bases.clone()),
+            )
+            .await
+            .unwrap();
+
+        let source_object_id = "source_table".to_string();
+        manifest_ns
+            .rewrite_manifest("test base_objects", move || RenameManifestMutation {
+                dest: ManifestEntry {
+                    object_id: "dest_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("dest_table.lance".to_string()),
+                    metadata: None,
+                },
+                source_object_id: source_object_id.clone(),
+                source_found: false,
+                source_base_objects: None,
+                dest_collision: false,
+            })
+            .await
+            .unwrap();
+
+        // Destination row must carry the source's `base_objects`.
+        let after = manifest_base_objects(&manifest_ns).await;
+        let dest_bases = after
+            .get("dest_table")
+            .expect("destination row should exist");
+        assert_eq!(
+            dest_bases.as_ref(),
+            Some(&original_bases),
+            "rename must preserve the source's base_objects on the destination row"
+        );
+        // And the source row must of course be gone.
+        assert!(!after.contains_key("source_table"));
     }
 }
