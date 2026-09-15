@@ -342,7 +342,7 @@ impl RawInvertedIndexParams {
             params.lance_tokenizer = Some(lance_tokenizer);
         }
         if let Some(base_tokenizer) = self.base_tokenizer {
-            params.base_tokenizer = base_tokenizer;
+            params = params.base_tokenizer(base_tokenizer);
         }
         if let Some(language) = self.language {
             params.language = language;
@@ -656,8 +656,10 @@ impl InvertedIndexParams {
             num_workers: None,
             format_version: None,
         };
-        if params.base_tokenizer == "code" {
-            params.apply_code_defaults();
+        match params.base_tokenizer.as_str() {
+            "code" => params.apply_code_defaults(),
+            "ngram" => params.apply_ngram_defaults(),
+            _ => {}
         }
         params
     }
@@ -684,6 +686,12 @@ impl InvertedIndexParams {
         self.stem = false;
         self.remove_stop_words = false;
         self.index_operators = false;
+    }
+
+    fn apply_ngram_defaults(&mut self) {
+        self.base_tokenizer = "ngram".to_string();
+        self.stem = false;
+        self.remove_stop_words = false;
     }
 
     /// Create parameters for the code analyzer profile.
@@ -743,7 +751,9 @@ impl InvertedIndexParams {
 
     /// Set the lexical tokenizer implementation.
     ///
-    /// Setting this to `"code"` selects the code analyzer defaults.
+    /// Setting this to `"code"` selects the code analyzer defaults. Setting
+    /// this to `"ngram"` disables stemming and stop-word removal by default so
+    /// all substring tokens remain searchable.
     ///
     /// # Examples
     ///
@@ -757,8 +767,10 @@ impl InvertedIndexParams {
     /// ```
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
         self.base_tokenizer = base_tokenizer;
-        if self.base_tokenizer == "code" {
-            self.apply_code_defaults();
+        match self.base_tokenizer.as_str() {
+            "code" => self.apply_code_defaults(),
+            "ngram" => self.apply_ngram_defaults(),
+            _ => {}
         }
         self
     }
@@ -991,17 +1003,11 @@ impl InvertedIndexParams {
     /// override and current creation defaults for omitted fields.
     pub(crate) fn from_training_json(params: &str) -> Result<Self> {
         let supplied = serde_json::from_str::<serde_json::Value>(params)?;
-        let mut value = serde_json::to_value(Self::default())?;
-
-        let supplied = supplied.as_object().ok_or_else(|| {
+        supplied.as_object().ok_or_else(|| {
             Error::invalid_input("FTS inverted index params must be a JSON object".to_string())
         })?;
-        let object = value
-            .as_object_mut()
-            .expect("inverted index params should serialize to a JSON object");
-        object.extend(supplied.clone());
 
-        let mut params: Self = serde_json::from_value(value)?;
+        let mut params: Self = serde_json::from_value(supplied)?;
         let default_format_version = params.resolved_format_version();
         params.format_version = Some(resolve_creation_format_version(
             params.format_version,
@@ -1249,6 +1255,28 @@ mod tests {
         assert!(!params.stem);
         assert!(!params.remove_stop_words);
         assert!(!params.index_operators);
+    }
+
+    #[test]
+    fn test_ngram_tokenizer_resolves_substring_safe_defaults() {
+        let params =
+            InvertedIndexParams::from_training_json(r#"{"base_tokenizer":"ngram"}"#).unwrap();
+        assert!(!params.stem);
+        assert!(!params.remove_stop_words);
+
+        let mut tokenizer = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the");
+        assert_eq!(stream.next().unwrap().text, "the");
+        assert!(stream.next().is_none());
+
+        let explicit_filters: InvertedIndexParams = serde_json::from_value(json!({
+            "base_tokenizer": "ngram",
+            "stem": true,
+            "remove_stop_words": true
+        }))
+        .unwrap();
+        assert!(explicit_filters.stem);
+        assert!(explicit_filters.remove_stop_words);
     }
 
     #[test]

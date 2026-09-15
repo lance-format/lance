@@ -177,6 +177,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             size: version_info.manifest_size.map(|s| s as u64),
             naming_scheme,
             e_tag: version_info.e_tag,
+            identity: None,
         })
     }
 

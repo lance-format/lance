@@ -85,10 +85,14 @@ ds = lance.dataset(
 ```
 
 Base ids are assigned when bases are registered (`initial_bases` ids are assigned
-sequentially starting at 1, in order) and can be inspected through the manifest base
-paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
-as regular storage options. Exact per-base parameter maps (`base_store_params`,
-keyed by base path URI) take precedence over base-scoped keys for that base.
+sequentially starting at 1, in order) and can be inspected with
+`ds.base_paths()`. The returned dictionary maps each base id to its registered
+`DatasetBasePath`; its iteration order is unspecified, and it does not include the
+primary storage unless that path was explicitly registered as a base.
+
+Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated as
+regular storage options. Exact per-base parameter maps (`base_store_params`, keyed
+by base path URI) take precedence over base-scoped keys for that base.
 
 ## S3 Configuration
 
@@ -393,6 +397,37 @@ parameter; explicit `storage_options` override environment variables:
     settings such as the security token (`TENCENTCLOUD_SECURITY_TOKEN`) and region
     (`TENCENTCLOUD_REGION`) must be configured via environment variables.
 
+## Hugging Face Configuration
+
+Use `hf://datasets/<owner>/<repo>/<path>` to read a Lance dataset hosted on
+Hugging Face. Pass these options through `storage_options`:
+
+| Key | Description |
+| --- | --- |
+| `hf_token` | Hugging Face access token. Falls back to `HF_TOKEN` or `HUGGINGFACE_TOKEN` when omitted. |
+| `hf_revision` | Repository revision, such as a commit ID, branch, or tag. Defaults to `main`. |
+| `hf_download_mode` | `http` (default) or `xet`. |
+| `hf_enable_resolve_cache` | `"true"` reuses resolved HTTP download URLs and XET file metadata across readers. Defaults to `"false"`. |
+
+These options also accept names without the `hf_` prefix. The prefixed name
+takes precedence when both are supplied. `hf_enable_resolve_cache` accepts only
+the strings `"true"` and `"false"`.
+
+Enable the resolve cache only when existing files will not change. Updates,
+including changes behind a moving branch or tag, may remain invisible while
+cached results are reused. HTTP download URLs refresh near expiry, and issued
+URLs may remain usable until expiry after Hub permissions change. The cache
+reduces Hub resolution requests; it does not cache file contents.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "hf://datasets/owner/repo/data.lance",
+    storage_options={"hf_enable_resolve_cache": "true"},
+)
+```
+
 ## GooseFS Configuration
 
 [GooseFS](https://cloud.tencent.com/product/goosefs) is a distributed caching
@@ -544,17 +579,19 @@ The Master address can be resolved from (in priority order):
 2. The `GOOSEFS_MASTER_ADDR` environment variable.
 3. The host and port from the URL authority.
 
-The following keys can be used as both environment variables or keys in the
-`storage_options` parameter:
+`storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
+such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
+not ignored, and they are not treated as the matching environment variable.
+Environment variables keep the `GOOSEFS_*` form.
 
-| Key | Description |
-|-----|-------------|
-| `goosefs_master_addr` / `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
-| `goosefs_write_type` / `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
-| `goosefs_block_size` / `GOOSEFS_BLOCK_SIZE` | GooseFS block size in bytes (this is the GooseFS-side block size, not Lance's I/O block size). Optional. |
-| `goosefs_chunk_size` / `GOOSEFS_CHUNK_SIZE` | Chunk size in bytes used when reading or writing files. Optional. |
-| `goosefs_auth_type` / `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
-| `goosefs_auth_username` / `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
+| storage_options key | env var | Description |
+|---------------------|---------|-------------|
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
+| `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_auth_type` | `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
+| `goosefs_auth_username` | `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
 
 !!! note "Running the GooseFS integration tests"
 

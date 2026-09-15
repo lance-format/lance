@@ -511,6 +511,9 @@ impl IndexParams for VectorIndexParams {
 /// These paths emit different file layouts, but they follow the same rules for
 /// validating the vector column, deriving the effective index type, sizing IVF
 /// partitions, and constructing the shuffler.
+///
+/// The shuffler carries only the path of its scratch directory, so the returned
+/// [`TempStdDir`] guard owns that directory: hold it until the build finishes.
 async fn prepare_vector_segment_build(
     dataset: &Dataset,
     column: &str,
@@ -519,7 +522,13 @@ async fn prepare_vector_segment_build(
     mode: &str,
     require_precomputed_ivf: bool,
     fragment_ids: Option<&[u32]>,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    TempStdDir,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -596,7 +605,7 @@ async fn prepare_vector_segment_build(
         Some(progress),
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -612,16 +621,17 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-        Some(fragment_ids),
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+            Some(fragment_ids),
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -1013,16 +1023,17 @@ async fn build_vector_index_impl(
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<Vec<IndexFile>> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
-        fragment_ids,
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+            fragment_ids,
+        )
+        .await?;
     let stages = &params.stages;
 
     match index_type {
@@ -2523,6 +2534,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
+    }
+
+    /// The scratch directory the guard owns has to be gone once the build is
+    /// over, or the OS temp dir grows by one shuffled copy of the vector column
+    /// per index build.
+    ///
+    /// The OS temp dir is process-global, so an in-process check cannot
+    /// attribute a leftover directory to our own build. This test re-executes
+    /// itself in a child process with `TMPDIR` pointed at an isolated dir we
+    /// own: the child builds, the parent asserts nothing survives. Same shape as
+    /// `index::vector::ivf::io::tests::test_hnsw_pq_scratch_dir_is_not_leaked`,
+    /// which covers the legacy partition-staging dir.
+    #[test]
+    fn test_shuffle_scratch_dir_is_not_leaked() {
+        const ROOT_VAR: &str = "LANCE_SHUFFLE_LEAK_TEST_ROOT";
+
+        // Child half: build under the root the parent handed us and let it do the
+        // leak detection. The dataset goes outside the temp dir's `.tmp*` namespace
+        // so the parent never mistakes it for a leaked scratch directory. Read the
+        // value as an `OsString`: with `env::var`, a root that is not valid UTF-8
+        // would send the child down the parent branch and have it spawn a child of
+        // its own, without end.
+        if let Some(root) = std::env::var_os(ROOT_VAR) {
+            let root = root
+                .into_string()
+                .expect("the isolated root must be valid UTF-8");
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let uri = format!("{root}/dataset");
+                    let reader = lance_datagen::gen_batch()
+                        .col("id", array::step::<Int32Type>())
+                        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+                        .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+                    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+                    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+                    for i in 0..2 {
+                        dataset
+                            .create_index(
+                                &["vector"],
+                                IndexType::Vector,
+                                Some(format!("vector_idx_{i}")),
+                                &params,
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            return;
+        }
+
+        let isolated_root = TempStdDir::default();
+        // libtest names the thread after the running test, so the child's filter
+        // cannot drift out of sync with this function's name.
+        let this_test = std::thread::current().name().unwrap().to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&this_test, "--exact", "--nocapture"])
+            .env("TMPDIR", isolated_root.as_ref())
+            .env(ROOT_VAR, isolated_root.as_ref())
+            .output()
+            .expect("failed to spawn child test process");
+        assert!(
+            output.status.success(),
+            "child build process failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {this_test:?}"
+        );
+
+        // Every scratch dir a build creates sits directly under TMPDIR and is
+        // owned by a guard, so none should survive the child process.
+        let leaked: Vec<std::path::PathBuf> = std::fs::read_dir(&isolated_root)
+            .expect("read isolated temp root")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".tmp"))
+            })
+            .collect();
+
+        assert!(
+            leaked.is_empty(),
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
+        );
     }
 
     #[tokio::test]

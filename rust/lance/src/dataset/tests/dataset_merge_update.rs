@@ -609,6 +609,7 @@ async fn test_insert_balanced_subschemas() {
     let options = WriteParams {
         enable_stable_row_ids: true,
         enable_v2_manifest_paths: true,
+        data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
     let mut dataset = Dataset::write(empty_reader, &test_uri, Some(options))
@@ -750,7 +751,7 @@ async fn test_datafile_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -858,7 +859,7 @@ async fn test_datafile_partial_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         partial_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2602,7 +2603,7 @@ async fn test_data_replacement_advances_row_lineage() {
         .create(&Path::from("data/lineage_replacement.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2708,7 +2709,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         .create(&Path::from("data/replacement.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         single_col_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2886,7 +2887,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
     let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2990,7 +2991,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         .create(&Path::from("data/replacement_inv.lance"))
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         value_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -3115,7 +3116,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -3426,7 +3427,7 @@ async fn test_vector_index_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -5207,6 +5208,82 @@ async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_c
     );
     if let Ok(committed) = result {
         committed.scan().try_into_batch().await.unwrap();
+    }
+}
+
+/// A nested cast assigns a new field id to the child. An append staged before
+/// the cast still writes the old id, and transaction rebasing does not rewrite
+/// its data through the cast. Under a required parent, accepting that append
+/// would make the replacement child unreadable, so it must conflict. Supporting
+/// that case requires smarter rebasing, not a file-format change. A nullable
+/// parent can mask the missing child, so that append remains compatible.
+#[rstest]
+#[case::nullable_child_required_parent_conflicts(false, true)]
+#[case::nullable_child_nullable_parent_commits(true, false)]
+#[tokio::test]
+async fn test_stale_append_vs_nested_cast(
+    #[case] parent_nullable: bool,
+    #[case] expect_conflict: bool,
+) {
+    let child = Arc::new(ArrowField::new("c", DataType::Int32, true));
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "b",
+        DataType::Struct(Fields::from(vec![child.clone()])),
+        parent_nullable,
+    )]));
+    let struct_batch = |values: Vec<i32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![(
+                child.clone(),
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            )]))],
+        )
+        .unwrap()
+    };
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(struct_batch(vec![1, 2]))], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let append = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![struct_batch(vec![3])])
+        .await
+        .unwrap();
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("b.c".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+
+    let result = CommitBuilder::new(Arc::new(dataset)).execute(append).await;
+    assert_eq!(
+        result.is_err(),
+        expect_conflict,
+        "parent_nullable={parent_nullable}: got {result:?}"
+    );
+    if let Ok(committed) = result {
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch["b"]
+                .as_struct()
+                .column_by_name("c")
+                .unwrap()
+                .null_count(),
+            1
+        );
     }
 }
 

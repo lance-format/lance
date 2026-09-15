@@ -146,6 +146,10 @@ fn fr_options_to_proto(
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
         materialization_readahead_bytes: options.materialization_readahead_bytes,
+        batch_size_bytes: options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes),
     })
 }
 
@@ -197,6 +201,14 @@ async fn fr_options_from_proto(
     }
     if let Some(materialization_readahead_bytes) = proto.materialization_readahead_bytes {
         options = options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+    }
+    if let Some(batch_size_bytes) = proto.batch_size_bytes {
+        // Merge the scanner-level byte budget into the dataset's existing
+        // file-reader options so that distributed execution preserves
+        // validation and I/O settings such as read_chunk_size.
+        let mut file_reader_options = dataset.file_reader_options.clone().unwrap_or_default();
+        file_reader_options.batch_size_bytes = Some(batch_size_bytes);
+        options = options.with_file_reader_options(file_reader_options);
     }
     if let Some(mode) = proto.threading_mode {
         options.threading_mode = threading_mode_from_proto(&mode)?;
@@ -498,6 +510,8 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use lance_encoding::decoder::DecoderConfig;
+    use lance_file::reader::FileReaderOptions;
 
     #[test]
     fn test_range_roundtrip() {
@@ -592,9 +606,27 @@ mod tests {
         Arc::new(dataset)
     }
 
+    /// Create a test dataset with non-default file-reader options so that
+    /// round-trip tests can verify that scanner-level overrides preserve the
+    /// dataset-level defaults.
+    async fn make_test_dataset_with_file_reader_options() -> Arc<Dataset> {
+        let mut dataset = make_test_dataset().await;
+        if let Some(ds) = Arc::get_mut(&mut dataset) {
+            ds.file_reader_options = Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                decoder_config: DecoderConfig {
+                    validate_on_decode: true,
+                    ..Default::default()
+                },
+                batch_size_bytes: None,
+            });
+        }
+        dataset
+    }
+
     #[tokio::test]
     async fn test_options_roundtrip_basic() {
-        let dataset = make_test_dataset().await;
+        let dataset = make_test_dataset_with_file_reader_options().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
         let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
@@ -603,6 +635,10 @@ mod tests {
             .with_scan_range_before_filter(10..90)
             .unwrap()
             .with_batch_size(64)
+            .with_file_reader_options(FileReaderOptions {
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            })
             .with_fragment_readahead(4)
             .with_io_buffer_size(1024 * 1024)
             .with_materialization_readahead_bytes(8 * 1024 * 1024);
@@ -623,6 +659,20 @@ mod tests {
             options.materialization_readahead_bytes,
             back.materialization_readahead_bytes
         );
+        assert_eq!(
+            options
+                .file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes),
+            back.file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes)
+        );
+        // The scanner-level byte budget must be merged into the dataset's
+        // existing file-reader options, not replace them.
+        let effective = back.file_reader_options.as_ref().unwrap();
+        assert_eq!(effective.read_chunk_size, 1234);
+        assert!(effective.decoder_config.validate_on_decode);
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
