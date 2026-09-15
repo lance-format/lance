@@ -98,6 +98,24 @@ pub fn decode_varint(buf: &[u8], offset: &mut usize) -> Result<u64> {
     }
 }
 
+/// Resolve the exclusive end of a `len`-byte run starting at `offset` in `buf`.
+///
+/// `len` comes from a varint and can reach `u64::MAX`, so the addition has to be
+/// checked: a wrapped sum would slip past a plain `offset + len > buf.len()`
+/// comparison and leave the slice that follows out of range.
+fn slice_end(buf: &[u8], offset: usize, len: u64, what: &str) -> Result<usize> {
+    usize::try_from(len)
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+        .filter(|&end| end <= buf.len())
+        .ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Invalid scalar buffer: {what} of {len} bytes exceeds the {} remaining",
+                buf.len() - offset
+            ))
+        })
+}
+
 /// Convert a [`DataType`] to its Arrow C Data Interface format string.
 ///
 /// Only non-nested types are supported (nested types are already rejected by
@@ -335,18 +353,14 @@ impl ArrowScalar {
         let data_type = match options.data_type {
             Some(dt) => dt.clone(),
             None => {
-                let fmt_len = decode_varint(buf, &mut offset)? as usize;
-                if offset + fmt_len > buf.len() {
-                    return Err(ArrowError::InvalidArgumentError(
-                        "Invalid scalar buffer: unexpected EOF reading format string".to_string(),
-                    ));
-                }
-                let fmt_str = std::str::from_utf8(&buf[offset..offset + fmt_len]).map_err(|e| {
+                let fmt_len = decode_varint(buf, &mut offset)?;
+                let fmt_end = slice_end(buf, offset, fmt_len, "format string")?;
+                let fmt_str = std::str::from_utf8(&buf[offset..fmt_end]).map_err(|e| {
                     ArrowError::InvalidArgumentError(format!(
                         "Invalid format string: not valid UTF-8: {e}"
                     ))
                 })?;
-                offset += fmt_len;
+                offset = fmt_end;
                 format_string_to_data_type(fmt_str)?
             }
         };
@@ -361,22 +375,28 @@ impl ArrowScalar {
             return Self::new_null(&data_type);
         }
 
-        let num_buffers = decode_varint(buf, &mut offset)? as usize;
+        let declared_buffers = decode_varint(buf, &mut offset)?;
+        // Every buffer contributes at least one varint byte for its length, so a
+        // count larger than what remains cannot be satisfied. Reject it before
+        // reserving for it.
+        let remaining = (buf.len() - offset) as u64;
+        if declared_buffers > remaining {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Invalid scalar buffer: {declared_buffers} buffers declared but only {remaining} bytes remain"
+            )));
+        }
+        let num_buffers = declared_buffers as usize;
 
         let mut buffer_lens = Vec::with_capacity(num_buffers);
         for _ in 0..num_buffers {
-            buffer_lens.push(decode_varint(buf, &mut offset)? as usize);
+            buffer_lens.push(decode_varint(buf, &mut offset)?);
         }
 
         let mut buffers = Vec::with_capacity(num_buffers);
         for len in &buffer_lens {
-            if offset + len > buf.len() {
-                return Err(ArrowError::InvalidArgumentError(
-                    "Invalid scalar buffer: unexpected EOF".to_string(),
-                ));
-            }
-            buffers.push(Buffer::from_vec(buf[offset..offset + len].to_vec()));
-            offset += len;
+            let end = slice_end(buf, offset, *len, "buffer")?;
+            buffers.push(Buffer::from_vec(buf[offset..end].to_vec()));
+            offset = end;
         }
 
         if offset != buf.len() {
@@ -407,6 +427,79 @@ mod tests {
 
     use super::*;
     use crate::ArrowScalar;
+
+    /// A length or count read from a varint can reach `u64::MAX`, so every one of
+    /// them has to be checked against the bytes actually present. Each shape below
+    /// used to panic instead of returning an error: the two length fields because
+    /// `offset + len` wrapped past its own bounds check, and the buffer count
+    /// because it was reserved for before anything validated it.
+    #[test]
+    fn test_decode_rejects_out_of_range_lengths() {
+        let mut format_string_length = Vec::new();
+        encode_varint(&mut format_string_length, u64::MAX);
+
+        let mut buffer_count = Vec::new();
+        encode_varint(&mut buffer_count, 1);
+        buffer_count.extend_from_slice(b"i");
+        encode_varint(&mut buffer_count, 0); // not null
+        encode_varint(&mut buffer_count, u64::MAX);
+
+        let mut buffer_length = Vec::new();
+        encode_varint(&mut buffer_length, 1);
+        buffer_length.extend_from_slice(b"i");
+        encode_varint(&mut buffer_length, 0); // not null
+        encode_varint(&mut buffer_length, 1); // one buffer
+        encode_varint(&mut buffer_length, u64::MAX);
+
+        for (name, encoded, expected) in [
+            (
+                "format string length",
+                format_string_length,
+                "format string",
+            ),
+            ("buffer count", buffer_count, "buffers declared"),
+            ("buffer length", buffer_length, "buffer of"),
+        ] {
+            let err =
+                ArrowScalar::decode(&encoded).expect_err(&format!("{name}: expected a rejection"));
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: unexpected message {err}"
+            );
+        }
+    }
+
+    /// The exclusive end must be accepted and one byte past it rejected, which is
+    /// what a wrapped addition would have blurred.
+    #[rstest]
+    #[case::exact_fit(4, false)]
+    #[case::one_byte_over(5, true)]
+    fn test_decode_buffer_length_boundary(#[case] declared: u64, #[case] expect_err: bool) {
+        let mut encoded = Vec::new();
+        encode_varint(&mut encoded, 1);
+        encoded.extend_from_slice(b"i");
+        encode_varint(&mut encoded, 0); // not null
+        encode_varint(&mut encoded, 1); // one buffer
+        encode_varint(&mut encoded, declared);
+        encoded.extend_from_slice(&7i32.to_le_bytes()); // exactly 4 payload bytes
+
+        let decoded = ArrowScalar::decode(&encoded);
+        assert_eq!(
+            decoded.is_err(),
+            expect_err,
+            "declared {declared}: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn test_slice_end_rejects_a_wrapping_length() {
+        let buf = [0u8; 8];
+        assert_eq!(slice_end(&buf, 4, 4, "buffer").unwrap(), 8);
+        assert!(slice_end(&buf, 4, 5, "buffer").is_err());
+        // usize::MAX and u64::MAX both wrap when added to a non-zero offset.
+        assert!(slice_end(&buf, 4, u64::MAX, "buffer").is_err());
+        assert!(slice_end(&buf, 4, usize::MAX as u64, "buffer").is_err());
+    }
 
     #[test]
     fn test_varint_roundtrip() {
