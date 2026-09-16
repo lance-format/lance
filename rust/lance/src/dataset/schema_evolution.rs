@@ -516,16 +516,19 @@ fn renames_onto_a_sibling(dataset: &Dataset, alteration: &ColumnAlteration) -> b
     let Some(rename) = &alteration.rename else {
         return false;
     };
-    let Some((parent, child)) = alteration.path.rsplit_once('.') else {
+    // Resolved rather than split on `.`: a field name may contain dots, in
+    // which case the path quotes it, and splitting would name the wrong parent
+    // and admit exactly the rename this refuses.
+    let Some(chain) = dataset.schema().resolve(&alteration.path) else {
         return false;
     };
-    let Some(parent) = dataset.schema().field(parent) else {
+    let [.., parent, child] = chain.as_slice() else {
         return false;
     };
     parent
         .children
         .iter()
-        .any(|sibling| sibling.name != child && sibling.name == *rename)
+        .any(|sibling| sibling.name != child.name && sibling.name == *rename)
 }
 
 async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
@@ -4629,6 +4632,47 @@ mod test {
             .await?;
         assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
 
+        Ok(())
+    }
+
+    /// A field name may contain dots, in which case the path quotes it.
+    /// Splitting on the last dot names the wrong parent, and the sibling check
+    /// then admits the rename it exists to refuse.
+    #[tokio::test]
+    async fn a_quoted_path_resolves_to_its_real_parent() -> Result<()> {
+        let child = ArrowField::new("child.with.dot", DataType::Int32, true);
+        let sibling = ArrowField::new("sibling", DataType::Int32, true);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(ArrowFields::from(vec![child.clone(), sibling.clone()])),
+            true,
+        )]));
+        let parent = StructArray::new(
+            ArrowFields::from(vec![child, sibling]),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(parent)])?;
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, &test_dir, None).await?;
+
+        let onto_sibling =
+            ColumnAlteration::new("parent.`child.with.dot`".into()).rename("sibling".into());
+        assert!(
+            renames_onto_a_sibling(&dataset, &onto_sibling),
+            "renaming onto a sibling's name must be seen"
+        );
+
+        let onto_free =
+            ColumnAlteration::new("parent.`child.with.dot`".into()).rename("free".into());
+        assert!(
+            !renames_onto_a_sibling(&dataset, &onto_free),
+            "a name no sibling holds is not a collision"
+        );
         Ok(())
     }
 }

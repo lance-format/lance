@@ -335,6 +335,11 @@ fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
                     size,
                 ))
             }
+            (DataType::Map(entries, sorted), DataType::Map(source_entries, _)) => {
+                let sorted = *sorted;
+                let one: Fields = vec![source_entries.as_ref().clone()].into();
+                field.with_data_type(DataType::Map(Arc::new(restore(entries, &one)), sorted))
+            }
             _ => field,
         }
     }

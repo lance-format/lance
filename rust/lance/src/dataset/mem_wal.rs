@@ -186,6 +186,11 @@ fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
             let element = stamp_field_id(element, &source.children);
             field.with_data_type(DataType::FixedSizeList(Arc::new(element), size))
         }
+        DataType::Map(entries, sorted) => {
+            let sorted = *sorted;
+            let entries = stamp_field_id(entries, &source.children);
+            field.with_data_type(DataType::Map(Arc::new(entries), sorted))
+        }
         _ => field,
     }
 }

@@ -115,6 +115,12 @@ pub(super) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
                     .clone()
                     .with_data_type(DataType::FixedSizeList(Arc::new(strip(element)), size))
             }
+            DataType::Map(entries, sorted) => {
+                let sorted = *sorted;
+                field
+                    .clone()
+                    .with_data_type(DataType::Map(Arc::new(strip(entries)), sorted))
+            }
             _ => field,
         }
     }
@@ -335,6 +341,7 @@ fn is_nested(data_type: &DataType) -> bool {
             | DataType::List(_)
             | DataType::LargeList(_)
             | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
     )
 }
 
@@ -348,6 +355,9 @@ fn children_of(data_type: &DataType) -> Option<arrow_schema::Fields> {
             Some(vec![element.as_ref().clone()].into())
         }
         DataType::FixedSizeList(element, _) => Some(vec![element.as_ref().clone()].into()),
+        // A map's child is its entries struct, which carries the key and value
+        // as children of its own.
+        DataType::Map(entries, _) => Some(vec![entries.as_ref().clone()].into()),
         _ => None,
     }
 }
@@ -431,6 +441,41 @@ fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -
         }
         Source::Nested(i, children, to @ DataType::LargeList(_)) => {
             rebuild_list::<i64>(&columns[*i], &children[0], to, name)
+        }
+        // A map is its entries struct behind offsets. The sortedness flag is
+        // part of the type, so it comes from the target with the rest of it.
+        Source::Nested(i, children, to @ DataType::Map(_, sorted)) => {
+            let map = columns[*i]
+                .as_any()
+                .downcast_ref::<arrow_array::MapArray>()
+                .ok_or_else(|| Error::invalid_input(format!("column `{name}` is not a map")))?;
+            let Some(entries) = children_of(to).and_then(|c| c.first().cloned()) else {
+                unreachable!("a map target has an entries field");
+            };
+            let stored_entries: ArrayRef = Arc::new(map.entries().clone());
+            let rebuilt = take_column(
+                &children[0],
+                std::slice::from_ref(&stored_entries),
+                map.entries().len(),
+                entries.name(),
+            )?;
+            let rebuilt = rebuilt
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("map column `{name}` entries are not a struct"))
+                })?
+                .clone();
+            Ok(Arc::new(
+                arrow_array::MapArray::try_new(
+                    entries,
+                    map.offsets().clone(),
+                    rebuilt,
+                    map.nulls().cloned(),
+                    *sorted,
+                )
+                .map_err(|e| Error::invalid_input(format!("rebuild map column `{name}`: {e}")))?,
+            ))
         }
         // A fixed-size list is rebuilt the same way, keeping its width.
         Source::Nested(i, children, to @ DataType::FixedSizeList(_, _)) => {
@@ -571,6 +616,80 @@ mod relabel_tests {
             .downcast_ref::<Int64Array>()
             .expect("the leaf");
         assert_eq!(values.value(0), 7);
+    }
+
+    /// A map is a nested container like any other: its entries carry field ids
+    /// of their own, so a rename inside one has to resolve by id rather than
+    /// read as a changed type.
+    #[test]
+    fn a_renamed_field_inside_a_map_resolves_by_id() {
+        let entry = |value: &str| {
+            ArrowField::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    stamped("key", DataType::Int64, 2),
+                    stamped(value, DataType::Int64, 3),
+                ])),
+                false,
+            )
+        };
+        let keys = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                stamped("key", DataType::Int64, 2),
+                stamped("old", DataType::Int64, 3),
+            ]),
+            vec![keys, values],
+            None,
+        );
+        let column = Arc::new(
+            arrow_array::MapArray::try_new(
+                Arc::new(entry("old")),
+                arrow_buffer::OffsetBuffer::new(vec![0, 2].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        let source = ArrowSchema::new(vec![stamped(
+            "m",
+            DataType::Map(Arc::new(entry("old")), false),
+            1,
+        )]);
+        let target: SchemaRef = Arc::new(ArrowSchema::new(vec![stamped(
+            "m",
+            DataType::Map(Arc::new(entry("new")), false),
+            1,
+        )]));
+        let batch = RecordBatch::try_new(Arc::new(source.clone()), vec![column]).unwrap();
+
+        let plan = Plan::resolve(&source, &target, &[]).expect("a rename inside a map resolves");
+        let out = plan.apply(&batch).expect("apply");
+        let map = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::MapArray>()
+            .expect("a map");
+        assert_eq!(
+            map.entries().column_names(),
+            vec!["key", "new"],
+            "the renamed entry arrives under its new name"
+        );
+        let vals = map
+            .entries()
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("values");
+        assert_eq!(
+            (vals.value(0), vals.value(1)),
+            (10, 20),
+            "carrying its values"
+        );
+        assert_eq!(map.value_length(0), 2, "and its offsets");
     }
 
     /// A struct whose parent is null at one row, and whose child is null at
