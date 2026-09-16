@@ -5587,7 +5587,6 @@ fn vector_query_params_from_dict(
         && !nprobes.is_none()
     {
         let extracted: usize = nprobes.extract()?;
-        minimum_nprobes = extracted;
         maximum_nprobes = Some(extracted);
     }
 

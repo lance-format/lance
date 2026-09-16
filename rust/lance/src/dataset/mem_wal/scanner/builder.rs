@@ -30,6 +30,7 @@ use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
+use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
 use crate::session::Session;
@@ -45,8 +46,8 @@ struct LsmVectorQuery {
     key: Arc<dyn Array>,
     /// Number of nearest neighbors to fetch per source before the global merge.
     k: usize,
-    /// Number of IVF partitions to probe on the base arm.
-    nprobes: usize,
+    /// IVF partition probe bounds for indexed arms.
+    probe_bounds: ProbeBounds,
     /// Re-rank base candidates with exact distances when set (refine factor is
     /// treated as a boolean; the LSM merge needs exact base distances).
     refine: bool,
@@ -186,10 +187,11 @@ fn key_to_fsl(key: &dyn Array, dim: i32) -> Result<FixedSizeListArray> {
 /// ```
 ///
 /// The query-building methods mirror [`crate::dataset::scanner::Scanner`]:
-/// [`Self::nearest`] (+ [`Self::nprobes`] / [`Self::refine`] /
-/// [`Self::distance_metric`]) for vector search and [`Self::full_text_search`]
-/// for FTS are state setters, and [`Self::create_plan`] dispatches to the right
-/// planner — so an LSM read reads like a normal scan.
+/// [`Self::nearest`] (+ [`Self::nprobes`] / [`Self::minimum_nprobes`] /
+/// [`Self::maximum_nprobes`] / [`Self::refine`] / [`Self::distance_metric`])
+/// for vector search and [`Self::full_text_search`] for FTS are state setters,
+/// and [`Self::create_plan`] dispatches to the right planner — so an LSM read
+/// reads like a normal scan.
 pub struct LsmScanner {
     // Data sources
     base: BaseSource,
@@ -451,7 +453,8 @@ impl LsmScanner {
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
     /// single Float32 query vector. When combined with an offset, the LSM path
     /// fetches `k + offset` per source before applying the final page. Tune with
-    /// [`Self::nprobes`], [`Self::refine`], and [`Self::distance_metric`].
+    /// [`Self::nprobes`], [`Self::minimum_nprobes`], [`Self::maximum_nprobes`],
+    /// [`Self::refine`], and [`Self::distance_metric`].
     pub fn nearest(mut self, column: &str, key: &dyn Array, k: usize) -> Result<Self> {
         if k == 0 {
             return Err(Error::invalid_input("k must be positive".to_string()));
@@ -465,18 +468,40 @@ impl LsmScanner {
             column: column.to_string(),
             key: key.slice(0, key.len()),
             k,
-            nprobes: 1,
+            probe_bounds: ProbeBounds::default(),
             refine: false,
             metric_type: None,
         });
         Ok(self)
     }
 
-    /// Number of IVF partitions to probe on the base arm (default 1). No-op
-    /// unless [`Self::nearest`] was called.
+    /// Search up to `nprobes` IVF partitions on indexed arms. No-op unless
+    /// [`Self::nearest`] was called. The minimum remains unchanged.
     pub fn nprobes(mut self, nprobes: usize) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.nprobes = nprobes;
+            q.probe_bounds.maximum_nprobes = Some(nprobes);
+        }
+        self
+    }
+
+    /// Set the minimum number of IVF partitions to search on indexed arms.
+    ///
+    /// When unset, the underlying Lance scanner supplies its default. No-op
+    /// unless [`Self::nearest`] was called.
+    pub fn minimum_nprobes(mut self, minimum_nprobes: usize) -> Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.probe_bounds.minimum_nprobes = Some(minimum_nprobes);
+        }
+        self
+    }
+
+    /// Set the maximum number of IVF partitions to search on indexed arms.
+    ///
+    /// When unset, all partitions may be searched if needed. No-op unless
+    /// [`Self::nearest`] was called.
+    pub fn maximum_nprobes(mut self, maximum_nprobes: usize) -> Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.probe_bounds.maximum_nprobes = Some(maximum_nprobes);
         }
         self
     }
@@ -607,10 +632,10 @@ impl LsmScanner {
         let per_source_k = nearest.k.saturating_add(self.offset.unwrap_or(0));
         let overfetch_factor = self.overfetch_factor.unwrap_or(1.0);
         let plan = planner
-            .plan_search(
+            .plan_search_with_probe_bounds(
                 &query_fsl,
                 per_source_k,
-                nearest.nprobes,
+                nearest.probe_bounds,
                 self.projection.as_deref(),
                 nearest.refine,
                 overfetch_factor,
@@ -1243,6 +1268,52 @@ mod tests {
             Field::new("id", DataType::Int32, false).with_metadata(id_meta),
             extra,
         ]))
+    }
+
+    #[test]
+    fn vector_probe_settings_preserve_adaptive_defaults() {
+        use arrow_array::Float32Array;
+        use arrow_schema::{DataType, Field};
+
+        let schema = pk_schema_with(Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ));
+        let new_scanner = || {
+            LsmScanner::without_base_table(
+                schema.clone(),
+                "memory://",
+                vec![],
+                vec!["id".to_string()],
+            )
+            .nearest(
+                "vector",
+                &Float32Array::from(vec![0.0f32, 1.0, 2.0, 3.0]),
+                1,
+            )
+            .unwrap()
+        };
+
+        let scanner = new_scanner();
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, None);
+        assert_eq!(query.probe_bounds.maximum_nprobes, None);
+
+        let scanner = new_scanner().nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, None);
+        assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
+
+        let scanner = new_scanner().minimum_nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, Some(20));
+        assert_eq!(query.probe_bounds.maximum_nprobes, None);
+
+        let scanner = new_scanner().maximum_nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, None);
+        assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
     }
 
     /// `LsmScanner::nearest(..).create_plan()` must route through the vector

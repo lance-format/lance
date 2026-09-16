@@ -633,11 +633,9 @@ impl MemTableScanner {
 
     /// Set the number of probes for IVF search.
     ///
-    /// This is a convenience method that sets both minimum and maximum nprobes
-    /// to the same value, guaranteeing exactly `n` partitions will be searched.
+    /// The minimum remains unchanged, so fewer than `n` partitions may be searched.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(ref mut q) = self.nearest {
-            q.nprobes = n;
             q.maximum_nprobes = Some(n);
         } else {
             log::warn!("nprobes is not set because nearest has not been called yet");

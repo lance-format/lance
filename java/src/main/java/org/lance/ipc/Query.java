@@ -176,16 +176,14 @@ public class Query {
     }
 
     /**
-     * Sets the number of probes to load and search.
+     * Sets the maximum number of probes to load and search.
      *
-     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
-     * the same value.
+     * <p>The minimum remains unchanged, so the search may stop before reaching this value.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.minimumNprobes = nprobes;
       this.maximumNprobes = Optional.of(nprobes);
       return this;
     }

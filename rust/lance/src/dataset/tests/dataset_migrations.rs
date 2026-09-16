@@ -285,7 +285,8 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
     let batches = scan
         .nearest("vector", &query_vec, 2000)
         .unwrap()
-        .nprobes(4)
+        .minimum_nprobes(4)
+        .maximum_nprobes(4)
         .prefilter(true)
         .try_into_stream()
         .await

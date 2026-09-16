@@ -55,6 +55,15 @@ public class JNITest {
         new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
 
+    Query nprobesQuery =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setNprobes(20)
+            .build();
+    assertEquals(1, nprobesQuery.getMinimumNprobes());
+    assertEquals(Optional.of(20), nprobesQuery.getMaximumNprobes());
+
     JniTestHelper.parseQuery(
         Optional.of(
             new Query.Builder()
