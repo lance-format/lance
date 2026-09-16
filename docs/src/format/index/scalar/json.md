@@ -22,14 +22,19 @@ type is covered:
 A document whose path is absent is indexed as a null, the same as an explicit
 JSON null.
 
-The chosen type is recorded in the index details as `target_data_type`. When it
-is `JSON_TARGET_DATA_TYPE_UNSPECIFIED` — an index written before the details
-carried the type, which a later compaction cannot always recover — the type must
-be recovered by decoding the data again, reading the type tag of the first
-non-null value at the path and falling back to
-`JSON_TARGET_DATA_TYPE_UTF8` when every value is null. That result depends on
-which rows are read, so it is not guaranteed to reproduce the type the index was
-originally built with.
+The chosen type is recorded in the index details as `target_data_type`. It is
+`JSON_TARGET_DATA_TYPE_UNSPECIFIED` for an index written before the details
+carried the type, and for one whose type a later rewrite of the details could
+not recover.
+
+Recovering the type of such an index is ordered. A reader asks the target index
+first: some target types retain the Arrow type they were trained on, and that
+answer is authoritative. Only when the target cannot report one is the type
+inferred by decoding the data again, reading the type tag of the first non-null
+value at the path and falling back to `JSON_TARGET_DATA_TYPE_UTF8` when every
+value is null. Inference depends on which rows are read, so it is not guaranteed
+to reproduce the type the index was originally built with — which is what
+`target_data_type` exists to prevent, and why it is the last resort.
 
 ## Index Details
 

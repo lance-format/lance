@@ -256,18 +256,25 @@ message HnswParameters {
  * or object LARGE_BINARY holding the re-serialized JSONB value.
  */
 enum JsonTargetDataType {
-  /* The index was built before this field existed, so the type it was trained
-   * on is not recorded and must be inferred by decoding the data again.
+  /* The type this index was trained on is not recorded here. An index built
+   * before this field existed carries UNSPECIFIED, and so does one whose type
+   * a later rewrite of these details could not recover.
    *
-   * Inference reads the type tag of the first non-null value at the path and
-   * falls back to UTF8 when every value is null, so it depends on which rows
-   * are read: inferring over a different row set, or over disjoint subsets in
-   * separate workers, can produce a different type than the original index.
+   * A reader that needs the type must first ask the target index: some target
+   * types retain the Arrow type they were trained on, and that answer is
+   * authoritative. Only a target that cannot report one leaves the type to be
+   * inferred by decoding the data again, reading the type tag of the first
+   * non-null value at the path and falling back to UTF8 when every value is
+   * null. Inference depends on which rows are read -- inferring over a
+   * different row set, or over disjoint subsets in separate workers, can
+   * produce a different type than the original index -- which is the
+   * inconsistency this field exists to prevent, so it is the last resort
+   * rather than the defined behavior for UNSPECIFIED.
    *
-   * A build that understands this field always records it when training a
-   * new index. An index built before the field existed can still carry
-   * UNSPECIFIED after a compaction, because the type it was trained on is
-   * not always recoverable from the target index.
+   * An implementation that recovers the type authoritatively while rewriting
+   * these details should record it, so the index stops being ambiguous. A
+   * build that understands this field always records it when training a new
+   * index, so UNSPECIFIED is only ever a legacy or unrecoverable state.
    */
   JSON_TARGET_DATA_TYPE_UNSPECIFIED = 0;
   JSON_TARGET_DATA_TYPE_BOOLEAN = 1;
@@ -285,10 +292,14 @@ message JsonIndexDetails {
   /* The type the extracted values were decoded to, which is also the type the
    * target index was trained on.
    *
-   * Recording it makes these details a complete description of the index:
-   * rebuilding from them reproduces the original type instead of re-inferring
-   * it from whatever rows the rebuild happens to see. See
-   * JSON_TARGET_DATA_TYPE_UNSPECIFIED for the behavior when it is absent.
+   * Recording it closes the type gap: rebuilding from these details reproduces
+   * the original type instead of re-inferring it from whatever rows the
+   * rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
+   * recover the type when it is absent.
+   *
+   * This completes the description of the extracted values only. These details
+   * still do not record the target index's format version, so they are not a
+   * general, lossless description of the index and must not be read as one.
    *
    * An implementation that rewrites these details without retraining the target
    * index -- compacting or updating it -- must copy this value through
