@@ -246,9 +246,57 @@ message HnswParameters {
   uint32 max_level = 3;
 }
 
+/* The data type a JSON index extracted its values as, before handing them to
+ * the target index.
+ *
+ * A JSON value has no fixed type, so a JSON index decodes the value at its path
+ * into a single Arrow type and trains the target index on that. The variants
+ * below are the image of the JSONB type tags: a JSON boolean becomes BOOLEAN, a
+ * JSON integer INT64, a JSON float FLOAT64, a JSON string UTF8, and a JSON array
+ * or object LARGE_BINARY holding the re-serialized JSONB value.
+ */
+enum JsonTargetDataType {
+  /* The index was built before this field existed, so the type it was trained
+   * on is not recorded and must be inferred by decoding the data again.
+   *
+   * Inference reads the type tag of the first non-null value at the path and
+   * falls back to UTF8 when every value is null, so it depends on which rows
+   * are read: inferring over a different row set, or over disjoint subsets in
+   * separate workers, can produce a different type than the original index.
+   *
+   * A build that understands this field always records it when training a
+   * new index. An index built before the field existed can still carry
+   * UNSPECIFIED after a compaction, because the type it was trained on is
+   * not always recoverable from the target index.
+   */
+  JSON_TARGET_DATA_TYPE_UNSPECIFIED = 0;
+  JSON_TARGET_DATA_TYPE_BOOLEAN = 1;
+  JSON_TARGET_DATA_TYPE_INT64 = 2;
+  JSON_TARGET_DATA_TYPE_FLOAT64 = 3;
+  JSON_TARGET_DATA_TYPE_UTF8 = 4;
+  JSON_TARGET_DATA_TYPE_LARGE_BINARY = 5;
+}
+
 message JsonIndexDetails {
+  // The JSON path whose value is indexed, e.g. `$.user.id`.
   string path = 1;
+  // Details of the index built over the extracted values.
   google.protobuf.Any target_details = 2;
+  /* The type the extracted values were decoded to, which is also the type the
+   * target index was trained on.
+   *
+   * Recording it makes these details a complete description of the index:
+   * rebuilding from them reproduces the original type instead of re-inferring
+   * it from whatever rows the rebuild happens to see. See
+   * JSON_TARGET_DATA_TYPE_UNSPECIFIED for the behavior when it is absent.
+   *
+   * An implementation that rewrites these details without retraining the target
+   * index -- compacting or updating it -- must copy this value through
+   * unchanged, including a value it does not recognize, rather than resetting
+   * it to JSON_TARGET_DATA_TYPE_UNSPECIFIED. Otherwise a variant added by a
+   * later revision is erased by any older reader that touches the index.
+   */
+  JsonTargetDataType target_data_type = 3;
 }
 message BloomFilterIndexDetails {}
 
