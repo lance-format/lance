@@ -62,16 +62,14 @@ pub struct VectorQuery {
 /// inverted index evaluates — so every shape the index supports (nested
 /// boolean, boost with a negative clause, phrase, fuzzy) reaches it without a
 /// lossy intermediate form. Everything outside the tree here is execution
-/// policy rather than the query: which columns, which document unit, and the
-/// recall/latency knobs.
+/// policy rather than the query: which document unit and the recall/latency
+/// knobs. The columns searched live on the tree's leaves — [`Self::columns`]
+/// reads them back out — so there is no second copy to fall out of step with it.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
-    /// Columns searched, in tree order. One for the ordinary query; several
-    /// when the tree's leaves name different fields, which the memtable answers
-    /// by routing each leaf to that column's index.
-    pub columns: Vec<String>,
     /// The query tree, evaluated as given by the memtable's inverted index.
-    /// Every leaf is bound to one of [`Self::columns`].
+    /// Every leaf names the column it searches; the memtable routes each leaf
+    /// to that column's index.
     pub expr: FtsQueryExpr,
     /// Logical document unit. Defaults to one document per dataset row.
     pub document_granularity: DocumentGranularity,
@@ -94,21 +92,8 @@ impl FtsQuery {
     /// Wrap an already-built query tree, binding every unbound leaf to
     /// `column`. Leaves that already name a column keep it.
     pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
-        let column = column.into();
-        let expr = expr.bind_unbound_leaves(&column);
-        let mut columns = expr
-            .columns()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        // A tree with no leaves at all (an empty boolean) names nothing; keep
-        // the requested column so the plan still resolves one index.
-        if columns.is_empty() {
-            columns.push(column);
-        }
         Self {
-            columns,
-            expr,
+            expr: expr.bind_unbound_leaves(&column.into()),
             document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
@@ -119,15 +104,11 @@ impl FtsQuery {
     /// Wrap a tree whose leaves name several columns. Every leaf must already
     /// carry its binding — there is no single column to fall back to.
     pub fn cross_column(expr: FtsQueryExpr) -> Result<Self> {
-        let columns = expr
-            .columns()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if columns.len() < 2 {
+        let num_columns = expr.columns().len();
+        if num_columns < 2 {
             return Err(Error::invalid_input(format!(
-                "cross-column MemTable full-text search needs at least two bound columns, got {}",
-                columns.len()
+                "cross-column MemTable full-text search needs at least two bound columns, \
+                 got {num_columns}"
             )));
         }
         if expr.has_unbound_leaf() {
@@ -138,7 +119,6 @@ impl FtsQuery {
             ));
         }
         Ok(Self {
-            columns,
             expr,
             document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
@@ -147,9 +127,10 @@ impl FtsQuery {
         })
     }
 
-    /// Whether the tree's leaves span more than one column.
-    pub fn is_cross_column(&self) -> bool {
-        self.columns.len() > 1
+    /// Distinct columns this query's leaves name, in tree order. A tree with
+    /// no leaves at all (an empty boolean) names none.
+    pub fn columns(&self) -> Vec<&str> {
+        self.expr.columns()
     }
 
     /// Create a simple term match query.
@@ -1279,8 +1260,8 @@ impl MemTableScanner {
         // Every queried column needs an index: a cross-column predicate is one
         // predicate, so a missing arm is a missing answer, not a smaller one.
         if !query
-            .columns
-            .iter()
+            .columns()
+            .into_iter()
             .all(|column| self.has_fts_index(column, query.document_granularity))
         {
             return self.empty_fts_plan(query.document_granularity);
@@ -1950,7 +1931,7 @@ mod tests {
             .with_column("text".to_string())
             .unwrap();
         let local = local_fts_query(q, None).unwrap();
-        assert_eq!(local.columns, ["text"]);
+        assert_eq!(local.columns(), ["text"]);
         assert!(
             matches!(local.expr, FtsQueryExpr::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)

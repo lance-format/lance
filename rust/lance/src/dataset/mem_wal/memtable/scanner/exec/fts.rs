@@ -84,7 +84,7 @@ pub struct FtsIndexExec {
 impl Debug for FtsIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FtsIndexExec")
-            .field("columns", &self.query.columns)
+            .field("columns", &self.query.columns())
             .field("expr", &self.query.expr)
             .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
@@ -116,14 +116,13 @@ impl FtsIndexExec {
         // Every queried column must resolve an index. A cross-column predicate
         // is one predicate: a column with no arm is a missing answer rather
         // than a narrower one.
-        for column in &query.columns {
+        for column in query.columns() {
             if indexes
                 .get_fts_by_column_and_granularity(column, query.document_granularity)
                 .is_none()
             {
                 return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{}'",
-                    column
+                    "No FTS index found for column '{column}'"
                 )));
             }
         }
@@ -225,10 +224,11 @@ impl FtsIndexExec {
 
     /// Query the index and return matching rows with BM25 scores.
     fn query_index(&self) -> Result<Vec<FtsHit>> {
-        if self.query.is_cross_column() {
-            return self.query_across_columns();
+        let columns = self.query.columns();
+        if columns.len() > 1 {
+            return self.query_across_columns(&columns);
         }
-        let Some(column) = self.query.columns.first() else {
+        let Some(&column) = columns.first() else {
             return Err(Error::invalid_input(
                 "full-text search names no column to search".to_string(),
             ));
@@ -278,9 +278,9 @@ impl FtsIndexExec {
     /// visibility ceiling goes *in* rather than being applied after, so leaves
     /// read from indexes whose tails have advanced differently still meet over
     /// one cut.
-    fn query_across_columns(&self) -> Result<Vec<FtsHit>> {
-        let mut indexes = HashMap::with_capacity(self.query.columns.len());
-        for column in &self.query.columns {
+    fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
+        let mut indexes = HashMap::with_capacity(columns.len());
+        for &column in columns {
             let Some(index) = self
                 .indexes
                 .get_fts_by_column_and_granularity(column, self.query.document_granularity)
@@ -289,7 +289,7 @@ impl FtsIndexExec {
                     "No FTS index found for column '{column}'"
                 )));
             };
-            indexes.insert(column.as_str(), index);
+            indexes.insert(column, index);
         }
         Ok(search_cross_column(
             &self.query.expr,
@@ -621,14 +621,18 @@ impl DisplayAs for FtsIndexExec {
                 write!(
                     f,
                     "FtsIndexExec: columns={:?}, query_type={:?}, with_row_id={}",
-                    self.query.columns, self.query.expr, self.with_row_id
+                    self.query.columns(),
+                    self.query.expr,
+                    self.with_row_id
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "FtsIndexExec\ncolumns={:?}\nquery_type={:?}\nwith_row_id={}",
-                    self.query.columns, self.query.expr, self.with_row_id
+                    self.query.columns(),
+                    self.query.expr,
+                    self.with_row_id
                 )
             }
         }
