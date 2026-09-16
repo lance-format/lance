@@ -4624,10 +4624,12 @@ mod tests {
 
     /// Past 128 code bytes (rotated dim above 1024) a row's binary sum no
     /// longer fits a `u16`, and the ranking collapses.
-    /// See https://github.com/lance-format/lance/issues/7157.
+    /// See https://github.com/lance-format/lance/issues/7157 and
+    /// https://github.com/lance-format/lance/issues/9280.
     #[rstest]
     #[case::narrow(1024, false, false)]
     #[case::wide_ragged_chunk(1536, true, false)]
+    #[case::reported_2176(2176, true, true)]
     #[case::wide_overflowing(4096, true, true)]
     fn test_binary_distances_match_exact_at_high_dim(
         #[case] code_dim: usize,
