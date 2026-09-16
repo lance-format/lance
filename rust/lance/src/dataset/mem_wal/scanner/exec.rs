@@ -31,5 +31,5 @@ pub use pk::{
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
-pub use reconcile::ReconcileExec;
+pub(crate) use reconcile::ReconcileExec;
 pub use schema_relabel::SchemaRelabelExec;
