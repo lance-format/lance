@@ -7596,6 +7596,9 @@ mod test {
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
+    // Imported through the public `io::exec` re-export rather than the crate-private
+    // `knn` module, so the tests below cover that surface too.
+    use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
@@ -10476,6 +10479,92 @@ mod test {
                 "prefiltered batch query {query_index} should match single-query search"
             );
         }
+    }
+
+    /// Finds the batch vector-search node in a physical plan.
+    fn find_ann_ivf_batch_exec(plan: &dyn ExecutionPlan) -> Option<&ANNIvfBatchExec> {
+        if let Some(batch_exec) = plan.as_any().downcast_ref::<ANNIvfBatchExec>() {
+            return Some(batch_exec);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| find_ann_ivf_batch_exec(child.as_ref()))
+    }
+
+    /// A caller that matches the batch node in a plan reads the search back out
+    /// of it through the public `io::exec` surface, so the accessors must return
+    /// what the scanner fed the constructor.
+    #[rstest]
+    #[case::no_prefilter(None)]
+    #[case::prefilter(Some("i > 100"))]
+    #[tokio::test]
+    async fn test_batch_knn_indexed_exposes_plan_inputs(#[case] filter: Option<&str>) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.nprobes(2);
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+            scan.prefilter(true);
+        }
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.create_plan().await.unwrap();
+        let batch_exec = find_ann_ivf_batch_exec(plan.as_ref())
+            .expect("indexed batch KNN should plan an ANNIvfBatchExec");
+
+        let query = batch_exec.query();
+        assert_eq!(query.column, "vec");
+        assert_eq!(query.k, 2);
+        assert_eq!(query.minimum_nprobes, 2);
+        assert_eq!(query.maximum_nprobes, Some(2));
+        assert_eq!(query.metric_type, Some(DistanceType::L2));
+        assert_eq!(
+            query.key.as_primitive::<Float32Type>().values(),
+            query_values.as_slice(),
+            "query key must hold both query vectors concatenated"
+        );
+
+        assert_eq!(batch_exec.query_count(), 2);
+        assert_eq!(
+            query.key.len() / batch_exec.query_count(),
+            32,
+            "query count must divide the key into the column's vectors"
+        );
+
+        assert_eq!(batch_exec.dataset().uri(), dataset.uri());
+        assert_eq!(
+            batch_exec.dataset().version().version,
+            dataset.version().version
+        );
+
+        let expected_indices = dataset.load_indices_by_name("idx").await.unwrap();
+        assert!(!expected_indices.is_empty());
+        assert_eq!(
+            batch_exec
+                .indices()
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>(),
+            expected_indices
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>()
+        );
+
+        match (filter, batch_exec.prefilter_source()) {
+            (None, PreFilterSource::None) => {}
+            (Some(_), PreFilterSource::FilteredRowIds(_)) => {}
+            (_, source) => panic!("unexpected prefilter source {source:?} for filter {filter:?}"),
+        }
+
+        assert_eq!(batch_exec.schema().field(0).name(), QUERY_INDEX_COL);
     }
 
     /// Batch indexed search must merge each query's top-k across multiple delta
