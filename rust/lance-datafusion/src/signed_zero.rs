@@ -175,7 +175,7 @@ fn normalize_signed_zero_array(array: &ArrayRef) -> ArrayRef {
     }
 }
 
-static NORMALIZE_SIGNED_ZERO: LazyLock<Arc<ScalarUDF>> =
+pub static NORMALIZE_SIGNED_ZERO: LazyLock<Arc<ScalarUDF>> =
     LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeSignedZero::new())));
 
 fn is_normalized_signed_zero(expr: &Expr) -> bool {
