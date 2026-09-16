@@ -25,6 +25,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, GenericListArray, RecordBatch,
     RecordBatchOptions, StructArray,
 };
+use arrow::array::ArrayData;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use lance_core::{Error, Result};
@@ -55,23 +56,39 @@ pub(crate) fn relabel_to(column: &ArrayRef, data_type: &DataType) -> Result<Arra
     if column.data_type() == data_type {
         return Ok(column.clone());
     }
-    let relabelled = column
-        .to_data()
+    relabel_data(&column.to_data(), data_type).map(arrow_array::make_array)
+}
+
+/// [`relabel_to`] over one array's data, and its children's in turn. Arrow
+/// validates a container against the child types its own type declares, so a
+/// label that moved at any depth has to move at every level below it.
+fn relabel_data(data: &ArrayData, data_type: &DataType) -> Result<ArrayData> {
+    let children = children_of(data_type);
+    let child_data = match children {
+        Some(fields) if fields.len() == data.child_data().len() => data
+            .child_data()
+            .iter()
+            .zip(fields.iter())
+            .map(|(child, field)| relabel_data(child, field.data_type()))
+            .collect::<Result<Vec<_>>>()?,
+        _ => data.child_data().to_vec(),
+    };
+    data.clone()
         .into_builder()
         .data_type(data_type.clone())
+        .child_data(child_data)
         .build()
         .map_err(|e| {
             Error::invalid_input(format!(
                 "a {} column cannot be read as {data_type}: {e}",
-                column.data_type()
+                data.data_type()
             ))
-        })?;
-    Ok(arrow_array::make_array(relabelled))
+        })
 }
 
 /// [`without_field_ids`] for a type rather than a schema, for the nested types a
 /// reconciliation builds.
-fn without_field_ids_in(data_type: &DataType) -> DataType {
+pub(crate) fn without_field_ids_in(data_type: &DataType) -> DataType {
     let one = ArrowSchema::new(vec![ArrowField::new("", data_type.clone(), true)]);
     without_field_ids(&one).field(0).data_type().clone()
 }
@@ -473,5 +490,68 @@ fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -
         }
         Source::Null(ty) => Ok(arrow_array::new_null_array(ty, rows)),
         Source::Live => Ok(Arc::new(BooleanArray::from(vec![false; rows]))),
+    }
+}
+
+#[cfg(test)]
+mod relabel_tests {
+    use super::*;
+    use arrow_array::{Int64Array, StructArray};
+    use arrow_schema::Fields;
+
+    fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
+        ArrowField::new(name, data_type, true).with_metadata(
+            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// A field id lives inside a nested column's type at every level, so the
+    /// relabel has to reach all of them: Arrow validates a struct's children
+    /// against the child types its own type declares.
+    #[test]
+    fn relabel_reaches_a_nested_child() {
+        let inner_stamped = stamped("b", DataType::Int64, 3);
+        let middle_stamped = stamped(
+            "inner",
+            DataType::Struct(Fields::from(vec![inner_stamped.clone()])),
+            2,
+        );
+        let outer_stamped = DataType::Struct(Fields::from(vec![middle_stamped.clone()]));
+
+        let leaf = Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef;
+        let middle = StructArray::new(
+            Fields::from(vec![inner_stamped]),
+            vec![Arc::clone(&leaf)],
+            None,
+        );
+        let outer = Arc::new(StructArray::new(
+            Fields::from(vec![middle_stamped]),
+            vec![Arc::new(middle) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        assert_eq!(outer.data_type(), &outer_stamped);
+
+        let plain = without_field_ids_in(&outer_stamped);
+        let relabelled = relabel_to(&outer, &plain).expect("relabel a nested column");
+        assert_eq!(relabelled.data_type(), &plain, "every level is relabelled");
+
+        // The values have to survive, not just the type.
+        let as_struct = relabelled
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a struct");
+        let middle = as_struct
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a nested struct");
+        let values = middle
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("the leaf");
+        assert_eq!(values.value(0), 7);
     }
 }

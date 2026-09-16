@@ -26,7 +26,7 @@ use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
-use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
+use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_ids_in};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 /// One sealed generation, read under the table's schema.
@@ -119,13 +119,10 @@ impl GenerationRead {
     /// generation has and the table does not. Either way the predicate belongs
     /// above the reconciliation, where the columns it names exist.
     pub(super) fn to_stored(&self, expr: &Expr) -> Option<Expr> {
-        let pushable = expr.column_refs().iter().all(|c| {
-            self.stored_name(&c.name).is_some_and(|stored| {
-                self.stored
-                    .field_with_name(stored)
-                    .is_ok_and(|f| !is_reconstructed(f.data_type()))
-            })
-        });
+        let pushable = expr
+            .column_refs()
+            .iter()
+            .all(|c| self.answers_as_written(&c.name));
         if !pushable {
             return None;
         }
@@ -141,6 +138,28 @@ impl GenerationRead {
             })
             .map(|t| t.data)
             .ok()
+    }
+
+    /// Whether the generation holds `table_name` in the shape the table
+    /// declares, so a predicate naming it means the same thing pushed down.
+    ///
+    /// A nested column is where the two can differ without the name moving: a
+    /// reference names the parent (`info.a` refers to `info`) and a parent's
+    /// name does not move when a child is renamed. Comparing the shapes rather
+    /// than assuming the worst is what keeps an ordinary predicate on an
+    /// ordinary struct pushed down — the common case, where nothing moved.
+    fn answers_as_written(&self, table_name: &str) -> bool {
+        let Some(stored) = self.stored_name(table_name) else {
+            return false;
+        };
+        let (Ok(stored), Ok(declared)) = (
+            self.stored.field_with_name(stored),
+            self.identity.field_with_name(table_name),
+        ) else {
+            return false;
+        };
+        // Field ids live inside a nested type, and are not part of the shape.
+        without_field_ids_in(stored.data_type()) == without_field_ids_in(declared.data_type())
     }
 
     /// Bring the scan's output back to the table's names and shapes: renames
@@ -186,11 +205,31 @@ impl GenerationRead {
 
     /// The schema [`Self::reconcile`] produces: the wanted columns as the table
     /// declares them, then whatever else the scan carries.
+    ///
+    /// This is the intermediate schema, not the public one: nullability comes
+    /// from the source, which is where the rows actually are.
+    ///
+    /// A generation stores every non-key column as nullable however the table
+    /// declares it — that is what lets a strict table hold a tombstone, whose
+    /// payload is null in everything but the key. A point lookup carries
+    /// tombstones through on purpose, so those rows have to survive
+    /// reconciliation. A column the generation never stored is likewise null
+    /// for its rows. The table's own nullability is restored at the public
+    /// boundary, by the canonical projection each arm passes through, once the
+    /// tombstones have been dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
         let mut fields: Vec<Field> = self
             .wanted
             .iter()
-            .filter_map(|name| self.identity.field_with_name(name).ok().cloned())
+            .filter_map(|name| {
+                let declared = self.identity.field_with_name(name).ok()?;
+                // Absent from the source means synthesized, so nullable.
+                let nullable = self
+                    .stored_name(name)
+                    .and_then(|stored| source.field_with_name(stored).ok())
+                    .is_none_or(|f| f.is_nullable());
+                Some(declared.clone().with_nullable(nullable))
+            })
             .collect();
         // A generation's own columns are not the table's, so they pass through
         // as the generation has them.
@@ -219,18 +258,6 @@ pub(super) fn filter_above(
     Ok(Arc::new(
         FilterExec::try_new(physical, plan).map_err(|e| Error::internal(format!("filter: {e}")))?,
     ))
-}
-
-/// A column the reconciliation rebuilds rather than takes as it stands, so its
-/// stored shape is not the shape a pushed-down predicate would expect.
-fn is_reconstructed(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Struct(_) => true,
-        DataType::List(e) | DataType::LargeList(e) | DataType::FixedSizeList(e, _) => {
-            is_reconstructed(e.data_type())
-        }
-        _ => false,
-    }
 }
 
 /// The generation's name for each of the table's columns, by field id: a rename
@@ -461,24 +488,6 @@ mod tests {
             &["id", "info"],
         );
         assert_eq!(read.to_stored(&col("info").is_not_null()), None);
-    }
-
-    /// A list of structs is rebuilt too, so its stored shape is not the shape a
-    /// pushed-down predicate would expect.
-    #[test]
-    fn a_list_is_reconstructed_only_when_its_element_is() {
-        let struct_element =
-            DataType::Struct(Fields::from(vec![Field::new("c", DataType::Int64, true)]));
-        assert!(is_reconstructed(&DataType::List(Arc::new(Field::new(
-            "item",
-            struct_element,
-            true
-        )))));
-        assert!(!is_reconstructed(&DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Int64,
-            true
-        )))));
     }
 
     /// With no ids to match on, the table's own names are the only link — the
