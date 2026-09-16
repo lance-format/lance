@@ -627,18 +627,6 @@ impl LsmScanner {
             .full_text_query
             .as_ref()
             .expect("plan_fts requires a full-text query");
-        let columns: Vec<String> = query.columns().into_iter().collect();
-        if columns.len() > 1 {
-            return Err(Error::invalid_input(
-                "LSM full-text search supports a single column".to_string(),
-            ));
-        }
-        let column = columns.into_iter().next().ok_or_else(|| {
-            Error::invalid_input(
-                "full_text_search requires a column; set it with `FullTextSearchQuery::with_column`"
-                    .to_string(),
-            )
-        })?;
         let base_schema = self.schema();
         let query_limit = query
             .limit
@@ -681,12 +669,7 @@ impl LsmScanner {
             planner = planner.with_overfetch_factor(factor);
         }
         let plan = planner
-            .plan_search(
-                &column,
-                query.clone(),
-                source_limit,
-                self.projection.as_deref(),
-            )
+            .plan_search(query.clone(), source_limit, self.projection.as_deref())
             .await?;
         Ok(self.apply_limit_offset(plan))
     }
@@ -1859,6 +1842,102 @@ mod tests {
         assert_eq!(
             rows, 1,
             "facade FTS should surface the memtable 'zebra' row"
+        );
+    }
+
+    /// A query naming several columns searches all of them and returns one row
+    /// per match, not one per matching field. `with_columns` on an unbound query
+    /// is the binding path a caller with out-of-band columns takes, and it
+    /// expands to the multi-match the cross-column planner decomposes.
+    #[tokio::test]
+    async fn full_text_search_spans_every_named_column() {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+
+        // id=1 matches in `title` only, id=2 in `body` only, id=3 in both — so a
+        // planner that kept one hit per field would return four rows, and one
+        // that searched only the first column would miss id=2.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["lance", "unrelated", "lance"])),
+                Arc::new(StringArray::from(vec!["unrelated", "lance", "lance"])),
+            ],
+        )
+        .unwrap();
+
+        let store = Arc::new(BatchStore::with_capacity(16));
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        index.add_fts("title_fts".to_string(), 1, "title".to_string());
+        index.add_fts("body_fts".to_string(), 2, "body".to_string());
+        store.append(batch.clone()).unwrap();
+        index
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://multi_column_fts",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store: store,
+                    index_store: Arc::new(index),
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        )
+        .full_text_search(
+            FullTextSearchQuery::new("lance".to_string())
+                .with_columns(&["title".to_string(), "body".to_string()])
+                .unwrap(),
+        )
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column_by_name("id").expect("id is projected");
+                let ids = column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                ids.values().to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "every named column must be searched and a row matching in both must collapse to one"
         );
     }
 

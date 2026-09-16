@@ -249,7 +249,7 @@ def _is_null_blob_description(description: Any) -> bool:
     return False
 
 
-def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[Dict[str, Any]]]:
     segments = _parse_field_path(path)
     values = table.column(segments[0]).to_pylist()
 
@@ -260,10 +260,10 @@ def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
 
 
 def _replace_value_at_path(
-    parent: Optional[dict],
+    parent: Optional[Dict[str, Any]],
     segments: list[str],
     value: Any,
-) -> Optional[dict]:
+) -> Optional[Dict[str, Any]]:
     if parent is None:
         return None
 
@@ -1222,11 +1222,11 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[
-            Union[str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict]
+            Union[str, Expression, FullTextQuery, VectorSearchQuery, Dict[str, Any]]
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1234,7 +1234,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1600,10 +1600,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1615,7 +1615,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -1757,10 +1757,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
@@ -1771,7 +1771,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
@@ -2174,10 +2174,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -2188,7 +2188,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any]]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -2573,7 +2573,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
 
     def count_rows(
-        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
+        self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
         """Count rows matching the scanner filter.
 
@@ -2870,7 +2870,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(
         self,
-        predicate: Union[str, pa.compute.Expression],
+        predicate: Union[str, Expression],
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
@@ -3263,6 +3263,47 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
+    def base_paths(self) -> Dict[int, DatasetBasePath]:
+        """Return the base paths registered in the current dataset snapshot.
+
+        The returned dictionary maps each base path ID to an independent
+        :class:`DatasetBasePath` object. It includes registered bases that are not
+        referenced by any data files. The primary dataset storage is not added to
+        the result unless it was explicitly registered as a base path.
+
+        This method does not refresh the dataset to the latest version. Modifying
+        the returned dictionary does not modify the dataset, and previously
+        returned values do not change when the dataset is updated or checked out
+        at another version. The dictionary iteration order is unspecified.
+
+        Returns
+        -------
+        Dict[int, DatasetBasePath]
+            Registered base paths keyed by base path ID. Each value exposes
+            ``id``, ``name``, ``path``, and ``is_dataset_root`` as read-only
+            attributes. ``is_dataset_root`` describes the base's path layout; it
+            does not identify the dataset's current primary storage. Runtime
+            storage options are not included.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"x": [1]}),
+        ...     "memory://base-paths-example",
+        ...     initial_bases=[
+        ...         lance.DatasetBasePath(
+        ...             "memory://base-paths-data", name="data"
+        ...         )
+        ...     ],
+        ... )
+        >>> base_paths = dataset.base_paths()
+        >>> all(base_id == base.id for base_id, base in base_paths.items())
+        True
+        """
+        return self._ds.base_paths()
+
     def add_bases(
         self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
     ):
@@ -3604,8 +3645,8 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
         document_granularity: DocumentGranularity = DocumentGranularity.ROW,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -4147,13 +4188,25 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
+                    if len(ivf_centroids.shape) != 2:
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if (
+                        num_partitions is not None
+                        and ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids has {ivf_centroids.shape[0]} clusters, "
+                            f"but num_partitions={num_partitions}"
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
@@ -4307,8 +4360,9 @@ class LanceDataset(pa.dataset.Dataset):
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
             :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
+            A ``num_clusters x dimension`` array of existing K-mean centroids
+            for IVF clustering. The row count determines the number of IVF
+            partitions. If not provided, a new KMeans model will be trained.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -5599,7 +5653,7 @@ class LanceDataset(pa.dataset.Dataset):
             hnsw_params=hnsw_params,
         )
 
-    def mem_wal_index_details(self) -> Optional[dict]:
+    def mem_wal_index_details(self) -> Optional[Dict[str, Any]]:
         """Return the MemWAL index details, or ``None`` if not initialized.
 
         Returns
@@ -7905,6 +7959,8 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -7958,6 +8014,13 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -8174,6 +8237,8 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
+        "data_cache_bytes": data_cache_bytes,
+        "max_page_bytes": max_page_bytes,
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,

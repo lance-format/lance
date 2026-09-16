@@ -7091,9 +7091,13 @@ impl Scanner {
             input.clone(),
             self.get_batch_size(),
         ));
-        if let Some(take_plan) =
-            TakeExec::try_new(self.dataset.clone(), coalesced, output_projection)?
-        {
+        if let Some(take_plan) = TakeExec::try_new_with_batch_size(
+            self.dataset.clone(),
+            coalesced,
+            output_projection,
+            self.resolved_file_reader_options()
+                .and_then(|o| o.batch_size_bytes),
+        )? {
             Ok(Arc::new(take_plan))
         } else {
             // No new columns needed
@@ -7591,6 +7595,7 @@ mod test {
     use rstest::rstest;
 
     use super::*;
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::WriteMode;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
@@ -8562,6 +8567,163 @@ mod test {
                 .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
             "unexpected error: {error}"
         );
+    }
+
+    // Builds a genuine `lance.blob.v2` logical array of `rows` 8KiB payloads.
+    // Payloads vary per row so they do not collapse under compression.
+    // The legacy `lance-encoding:blob` metadata marker is rejected for file
+    // version >= 2.2, so fixtures must use the v2 logical array.
+    fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
+        let mut builder = BlobArrayBuilder::new(rows);
+        for r in 0..rows {
+            let seed = (base + r).wrapping_mul(2654435761);
+            let payload: Vec<u8> = (0usize..8 * 1024)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(seed) & 0xff) as u8)
+                .collect();
+            builder.push_bytes(&payload).unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_late_materialization() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("filterme", DataType::Int32, false),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let filterme = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![filterme, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .filter("filterme < 100")
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_vector_search() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("vec", DataType::FixedSizeList(item_field.clone(), 32), true),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let i = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                let vec = Arc::new(FixedSizeListArray::new(
+                    item_field.clone(),
+                    32,
+                    Arc::new(Float32Array::from_iter_values(
+                        (0..rows_per_batch * 32).map(|v| ((base + v) % 1024) as f32),
+                    )),
+                    None,
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![i, vec, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+        let target_bytes = 8 * 1024;
+        let k = 20;
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k)
+            .unwrap()
+            .use_index(false)
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), k);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
     }
 
     #[tokio::test]
