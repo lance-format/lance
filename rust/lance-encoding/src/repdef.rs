@@ -823,7 +823,7 @@ impl SerializerContext {
         debug_assert!(
             self.current_len == 0 || self.current_len == validity.len() + self.current_num_specials
         );
-        self.current_len = validity.len();
+        self.current_len = validity.len() + self.current_num_specials;
 
         let mut def_read_itr = self.def_levels.iter().copied();
         let mut def_write_itr = self.spare_def.iter_mut();
@@ -3358,6 +3358,37 @@ mod tests {
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
+    }
+
+    #[test]
+    fn test_repdef_nullable_struct_in_null_and_empty_lists() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 0, 3, 3]),
+            Some(validity(&[false, true, true])),
+        );
+        builder.add_validity_bitmap(validity(&[false, true, true]));
+        builder.add_validity_bitmap(validity(&[true, false, true]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            repdefs.repetition_levels.map(|levels| levels.to_vec()),
+            repdefs.definition_levels.map(|levels| levels.to_vec()),
+            repdefs.def_meaning.into(),
+            3,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(3).unwrap(),
+            Some(validity(&[false, false, true]))
+        );
+        assert_eq!(
+            unraveler.unravel_validity(3).unwrap(),
+            Some(validity(&[false, true, true]))
+        );
+        let (offsets, nulls) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(offsets.inner(), offsets_32(&[0, 0, 3, 3]).inner());
+        assert_eq!(nulls, Some(validity(&[false, true, true])));
     }
 
     #[test]
