@@ -6,6 +6,7 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -49,6 +50,8 @@ pub struct Updater {
 
     allow_external_blob_outside_bases: bool,
 
+    write_version: ConcreteFileVersion,
+
     finished: bool,
 
     deletion_restorer: DeletionRestorer,
@@ -68,6 +71,7 @@ impl Updater {
         deletion_vector: DeletionVector,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        write_version: ConcreteFileVersion,
     ) -> Result<Self> {
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
@@ -75,13 +79,21 @@ impl Updater {
             (None, None)
         };
 
-        let storage_version = fragment
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
+        let source_version = fragment
+            .metadata()
+            .referenced_lance_files()
+            .next()
+            .map(|file| file.file_version())
+            .transpose()?
+            .unwrap_or_else(|| {
+                fragment
+                    .dataset()
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_format()
+            });
         let legacy_batch_size =
-            versions::row_group_size_for_rewrite(storage_version, &fragment).await?;
+            versions::row_group_size_for_rewrite(source_version, &fragment).await?;
 
         let batch_size = match (&legacy_batch_size, batch_size) {
             // If this is a v1 dataset we must use the row group size of the file
@@ -105,6 +117,7 @@ impl Updater {
             // created until after the first batch is read.
             schema_adapter: None,
             allow_external_blob_outside_bases: false,
+            write_version,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
@@ -171,14 +184,8 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        let data_storage_version = self
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
-
         versions::open_update_writer(
-            data_storage_version,
+            self.write_version,
             self.dataset(),
             &schema,
             self.allow_external_blob_outside_bases,
@@ -272,11 +279,6 @@ impl Updater {
         }
 
         let mut fragment = Fragment::new(self.fragment.id() as u64);
-        let storage_version = self
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
         // cleanup_data_fragments only needs path/base_id to remove the unfinished
         // data file and any blob sidecars. Build a minimal synthetic fragment so
         // we can reuse the shared cleanup path without fabricating full metadata.
@@ -284,7 +286,7 @@ impl Updater {
             path,
             vec![],
             vec![],
-            storage_version,
+            self.write_version,
             None,
             base_id,
         ));

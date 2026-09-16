@@ -24,6 +24,8 @@ from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
 
+LEGACY_BLOB_STORAGE_VERSION = "2.1"
+
 
 def _blob_row_ids(dataset):
     return dataset.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
@@ -213,7 +215,11 @@ def test_blob_descriptions(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
     # These positions may be surprising but lance pads buffers to 64-byte boundaries
     expected_positions = pa.array([0, 64, 128], pa.uint64())
     expected_sizes = pa.array([3, 3, 3], pa.uint64())
@@ -236,7 +242,11 @@ def test_scan_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
     assert tbl.column("blobs").to_pylist() == values
@@ -254,7 +264,11 @@ def test_sql_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     batches = (
         ds.sql("SELECT blobs FROM dataset")
@@ -312,7 +326,11 @@ def test_fragment_scan_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     fragment = ds.get_fragments()[0]
 
@@ -338,7 +356,11 @@ def dataset_with_blobs(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     values = pa.array([b"qux", b"quux", b"corge"], pa.large_binary())
     idx = pa.array([3, 4, 5], pa.uint64())
@@ -426,7 +448,11 @@ def test_blob_files_close_no_shutdown_panic(tmp_path):
                 ]
             ),
         )
-        ds = lance.write_dataset(table, {str(tmp_path / "ds")!r})
+        ds = lance.write_dataset(
+            table,
+            {str(tmp_path / "ds")!r},
+            data_storage_version={LEGACY_BLOB_STORAGE_VERSION!r},
+        )
         row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
         blobs = ds.take_blobs("blob", ids=row_ids)
         for blob in blobs:
@@ -476,6 +502,7 @@ def test_blob_files_by_address_with_stable_row_ids(tmp_path):
     ds = lance.write_dataset(
         table,
         tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
         enable_stable_row_ids=True,
     )
 
@@ -886,7 +913,11 @@ def test_null_blobs(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     blobs = ds.take_blobs("blob", ids=range(100))
     assert blobs == [None] * 100
@@ -2363,7 +2394,11 @@ def dataset_for_pandas_blob_tests(tmp_path):
             ]
         ),
     )
-    return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
+    return lance.write_dataset(
+        table,
+        tmp_path / "blob_pandas_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
 
 @pytest.fixture
@@ -2610,7 +2645,11 @@ def dataset_with_nested_blobs(tmp_path):
         [pa.array([1, 2, 3], pa.int64()), info_array],
         schema=pa.schema([pa.field("id", pa.int64()), pa.field("info", info_type)]),
     )
-    return lance.write_dataset(table, tmp_path / "nested_blob_ds")
+    return lance.write_dataset(
+        table,
+        tmp_path / "nested_blob_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
 
 def test_to_pandas_returns_blob_file_handles_for_nested_fields(

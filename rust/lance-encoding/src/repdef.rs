@@ -423,16 +423,31 @@ pub struct SerializedRepDefs {
     has_fsl: bool,
 }
 
+/// The highest definition level whose items still map to a value in the leaf array
+///
+/// `def_meaning` is ordered leaf-first, so every layer ahead of the first list layer sits
+/// underneath that list.  Once a list boundary is crossed, a null (or empty) list at any
+/// outer layer has no value in the leaf at all and its item is "invisible".
+///
+/// Both the writer and every decoder decide whether an item owns a value by comparing
+/// `def <= max_visible_level`, so the two sides must derive it the same way.  When there
+/// are no lists this sums every layer, i.e. `max_def`, which makes all items visible.
+pub fn max_visible_level(def_meaning: &[DefinitionInterpretation]) -> u16 {
+    def_meaning
+        .iter()
+        .take_while(|level| !level.is_list())
+        .map(|level| level.num_def_levels())
+        .sum()
+}
+
 impl SerializedRepDefs {
+    /// The same rule as [`max_visible_level`], but `None` when there are no lists and so
+    /// no item can be invisible in the first place.
     fn max_visible_level(def_meaning: &[DefinitionInterpretation]) -> Option<u16> {
-        let first_list = def_meaning.iter().position(|level| level.is_list());
-        first_list.map(|first_list| {
-            def_meaning
-                .iter()
-                .map(|level| level.num_def_levels())
-                .take(first_list)
-                .sum::<u16>()
-        })
+        def_meaning
+            .iter()
+            .any(|level| level.is_list())
+            .then(|| max_visible_level(def_meaning))
     }
 
     pub fn new(
@@ -823,7 +838,7 @@ impl SerializerContext {
         debug_assert!(
             self.current_len == 0 || self.current_len == validity.len() + self.current_num_specials
         );
-        self.current_len = validity.len();
+        self.current_len = validity.len() + self.current_num_specials;
 
         let mut def_read_itr = self.def_levels.iter().copied();
         let mut def_write_itr = self.spare_def.iter_mut();
@@ -2826,9 +2841,40 @@ mod tests {
     };
     use crate::repdef::{
         CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
+        max_visible_level,
     };
 
     use super::RepDefBuilder;
+
+    /// `def_meaning` is leaf-first, so only the layers ahead of the first list sit
+    /// underneath it.  Counting nullable layers *past* the list makes a decoder treat
+    /// invisible items as though they owned a leaf value.
+    #[rstest::rstest]
+    // No lists: nothing can be invisible, so every level is visible
+    #[case::no_lists(
+        &[DefinitionInterpretation::NullableItem, DefinitionInterpretation::NullableItem],
+        2
+    )]
+    // A nullable leaf under a list keeps its own level visible
+    #[case::nullable_leaf_under_list(
+        &[DefinitionInterpretation::NullableItem, DefinitionInterpretation::NullableList],
+        1
+    )]
+    // Regression: a nullable struct above the list must not raise the threshold
+    #[case::nullable_struct_above_list(
+        &[
+            DefinitionInterpretation::AllValidItem,
+            DefinitionInterpretation::NullableList,
+            DefinitionInterpretation::NullableItem,
+        ],
+        0
+    )]
+    fn test_max_visible_level(
+        #[case] def_meaning: &[DefinitionInterpretation],
+        #[case] expected: u16,
+    ) {
+        assert_eq!(max_visible_level(def_meaning), expected);
+    }
 
     fn validity(values: &[bool]) -> NullBuffer {
         NullBuffer::from_iter(values.iter().copied())
@@ -3358,6 +3404,37 @@ mod tests {
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
+    }
+
+    #[test]
+    fn test_repdef_nullable_struct_in_null_and_empty_lists() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 0, 3, 3]),
+            Some(validity(&[false, true, true])),
+        );
+        builder.add_validity_bitmap(validity(&[false, true, true]));
+        builder.add_validity_bitmap(validity(&[true, false, true]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            repdefs.repetition_levels.map(|levels| levels.to_vec()),
+            repdefs.definition_levels.map(|levels| levels.to_vec()),
+            repdefs.def_meaning.into(),
+            3,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(3).unwrap(),
+            Some(validity(&[false, false, true]))
+        );
+        assert_eq!(
+            unraveler.unravel_validity(3).unwrap(),
+            Some(validity(&[false, true, true]))
+        );
+        let (offsets, nulls) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(offsets.inner(), offsets_32(&[0, 0, 3, 3]).inner());
+        assert_eq!(nulls, Some(validity(&[false, true, true])));
     }
 
     #[test]

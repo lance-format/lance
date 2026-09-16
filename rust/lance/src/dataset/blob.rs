@@ -48,7 +48,6 @@ use lance_core::datatypes::{
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
-use lance_io::utils::CachedFileSize;
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -1350,7 +1349,6 @@ enum BlobFileState {
 struct BlobSource {
     object_store: Arc<ObjectStore>,
     path: Path,
-    file_size: CachedFileSize,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
 }
@@ -1361,7 +1359,6 @@ impl BlobSource {
         Self {
             object_store,
             path,
-            file_size: CachedFileSize::unknown(),
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
         }
@@ -1381,12 +1378,12 @@ impl BlobSource {
         let scheduler = self
             .scheduler
             .get_or_try_init(|| async {
-                ScanScheduler::new(
+                let reader = self.object_store.open(&self.path).await?;
+                let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
-                )
-                .open_file(&self.path, &self.file_size)
-                .await
+                );
+                Ok::<_, Error>(scheduler.open_reader(reader.into()))
             })
             .await?;
 
@@ -2677,7 +2674,10 @@ impl BlobMaterializationContext {
 /// A materialized batch that retains its byte-budget reservation until yielded.
 pub struct MaterializedBlobBatch {
     batch: RecordBatch,
-    _reservations: Vec<BlobMaterializationReservation>,
+    /// Reservations are reference-counted so that splitting a batch into
+    /// multiple chunks keeps the original memory reservation alive until the
+    /// last chunk is dropped.
+    _reservations: Vec<Arc<BlobMaterializationReservation>>,
 }
 
 impl MaterializedBlobBatch {
@@ -2685,6 +2685,17 @@ impl MaterializedBlobBatch {
         Self {
             batch,
             _reservations: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reservations(
+        batch: RecordBatch,
+        reservations: Vec<Arc<BlobMaterializationReservation>>,
+    ) -> Self {
+        Self {
+            batch,
+            _reservations: reservations,
         }
     }
 
@@ -2710,6 +2721,27 @@ impl MaterializedBlobBatch {
             batch: arrow::compute::concat_batches(schema, record_batches.iter())?,
             _reservations: reservations,
         })
+    }
+
+    /// Split the batch into chunks of at most `max_bytes` array memory.
+    ///
+    /// The original materialization reservation is shared across all chunks so
+    /// that the memory remains accounted for until every chunk has been
+    /// dropped, preserving the `materialization_readahead_bytes` bound while
+    /// the split chunks are queued.
+    pub(crate) fn split_by_bytes(self, max_bytes: usize) -> Result<Vec<Self>> {
+        let Self {
+            batch,
+            _reservations,
+        } = self;
+        let chunks = split_batch_by_bytes(batch, max_bytes)?;
+        Ok(chunks
+            .into_iter()
+            .map(|batch| Self {
+                batch,
+                _reservations: _reservations.clone(),
+            })
+            .collect())
     }
 
     pub(crate) fn into_batch(self) -> RecordBatch {
@@ -3119,9 +3151,10 @@ async fn execute_blob_read_plan(
     let mut bytes = vec![Bytes::new(); task.reads.len()];
     if let Some(first_range) = physical_ranges.first() {
         let scheduler = execution.scheduler_for(&task.source);
-        let file_scheduler = scheduler
-            .open_file(&task.source.path, &task.source.file_size)
-            .await?;
+        // The plan already bounds physical reads; probing the backing object's
+        // size would add a metadata request without validating the blob slice.
+        let reader = task.source.object_store.open(&task.source.path).await?;
+        let file_scheduler = scheduler.open_reader(reader.into());
         let priority = first_range.start;
         let physical_range_count = physical_ranges.len();
         let returned = file_scheduler
@@ -3702,6 +3735,50 @@ pub async fn materialize_blob_v2_binary_batch(
     )
 }
 
+/// Split `batch` into row-aligned chunks whose total array memory size is at
+/// most `max_bytes`.
+///
+/// The split estimates chunk boundaries from average bytes per row and then
+/// recursively re-checks each deep-copied slice. Because `RecordBatch::slice`
+/// shares backing buffers, each slice is deep-copied so that
+/// `get_array_memory_size` reflects the true chunk size. Splitting stops when
+/// a chunk is within budget or contains a single indivisible row.
+pub fn split_batch_by_bytes(batch: RecordBatch, max_bytes: usize) -> Result<Vec<RecordBatch>> {
+    split_batch_by_bytes_recursive(batch, max_bytes)
+}
+
+fn split_batch_by_bytes_recursive(
+    batch: RecordBatch,
+    max_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let total_bytes = batch.get_array_memory_size();
+    let num_rows = batch.num_rows();
+    if total_bytes <= max_bytes || num_rows == 1 {
+        return Ok(vec![batch]);
+    }
+    let bytes_per_row = total_bytes / num_rows;
+    let rows_per_chunk = (max_bytes / bytes_per_row.max(1)).max(1);
+    // Make sure we make progress: never take all rows in one slice.
+    let rows_per_chunk = rows_per_chunk.min(num_rows - 1).max(1);
+
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < num_rows {
+        let rows = (offset + rows_per_chunk).min(num_rows) - offset;
+        let sliced = batch.slice(offset, rows);
+        // Deep-copy so that `get_array_memory_size()` reports the slice's own
+        // size rather than the parent buffer's size, allowing recursion to
+        // catch skewed rows that still exceed the budget.
+        let copied = lance_arrow::deepcopy::deep_copy_batch_sliced(&sliced)?;
+        chunks.extend(split_batch_by_bytes_recursive(copied, max_bytes)?);
+        offset += rows;
+    }
+    Ok(chunks)
+}
+
 pub fn materialize_blob_v2_binary_batch_with_context<'a>(
     dataset: &'a Arc<Dataset>,
     output_schema: &'a Schema,
@@ -3782,7 +3859,7 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation.into_iter().collect(),
+            _reservations: reservation.into_iter().map(Arc::new).collect(),
         })
     }
     .boxed()
@@ -4429,7 +4506,7 @@ async fn resolve_blob_read_location(
     Ok(location)
 }
 
-fn data_file_key_from_path(path: &str) -> &str {
+pub(super) fn data_file_key_from_path(path: &str) -> &str {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename.strip_suffix(".lance").unwrap_or(filename)
 }
@@ -4500,7 +4577,9 @@ mod tests {
     };
     use crate::{
         Dataset,
-        blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, PackedBlobWriter, blob_field},
+        blob::{
+            BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobRange, PackedBlobWriter, blob_field,
+        },
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
             scanner::MaterializationStyle,
@@ -4799,6 +4878,7 @@ mod tests {
     struct RecordingRangeObjectStore {
         data: Bytes,
         gate: Option<Arc<Semaphore>>,
+        head_requests: AtomicUsize,
         requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
         started_blob_requests: AtomicUsize,
         active_blob_requests: AtomicUsize,
@@ -4811,6 +4891,7 @@ mod tests {
             Self {
                 data,
                 gate: None,
+                head_requests: AtomicUsize::new(0),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
                 started_blob_requests: AtomicUsize::new(0),
                 active_blob_requests: AtomicUsize::new(0),
@@ -4823,6 +4904,7 @@ mod tests {
             Self {
                 data,
                 gate: Some(gate),
+                head_requests: AtomicUsize::new(0),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
                 started_blob_requests: AtomicUsize::new(0),
                 active_blob_requests: AtomicUsize::new(0),
@@ -4898,6 +4980,9 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if options.head {
+                self.head_requests.fetch_add(1, Ordering::Relaxed);
+            }
             let range = match options.range {
                 Some(GetRange::Bounded(range)) => range,
                 None => 0..self.data.len() as u64,
@@ -4931,6 +5016,7 @@ mod tests {
                 meta: self.object_meta(location),
                 range,
                 attributes: Attributes::default(),
+                extensions: Default::default(),
             })
         }
 
@@ -5053,7 +5139,7 @@ mod tests {
                 .unwrap();
 
             let dataset = Arc::new(
-                TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
+                TestDatasetGenerator::new(data.clone(), LanceFileVersion::V2_1)
                     .make_hostile(&test_dir)
                     .await,
             );
@@ -5353,7 +5439,18 @@ mod tests {
         };
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let dataset = Arc::new(Dataset::write(reader, &test_dir, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
 
         let blobs = dataset
             .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
@@ -5544,6 +5641,7 @@ mod tests {
 
         // Write with enable_stable_row_ids=true and force multiple fragments
         let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
             enable_stable_row_ids: true,
             max_rows_per_file: 3, // Force 2 fragments with 3 rows each
             ..Default::default()
@@ -5602,8 +5700,8 @@ mod tests {
     /// `Dataset` (and therefore a single cache scope) with different
     /// `BlobHandling` values must not panic in the structural decoder.
     ///
-    /// Background: `FieldDataCacheKey` previously keyed cached page data only
-    /// by `column_index`. A blob column has two valid decoder shapes — the
+    /// Background: the page-data cache key previously keyed cached page data
+    /// only by `column_index`. A blob column has two valid decoder shapes — the
     /// descriptor view (`Struct<position, size>`) used when scanning with
     /// `BlobHandling::BlobsDescriptions`, and the bytes view (`LargeBinary`)
     /// used when scanning with `BlobHandling::AllBinary`. Both views go through
@@ -5666,17 +5764,24 @@ mod tests {
             .unwrap();
         assert!(descriptors.column(0).data_type().is_struct());
 
+        let read_payload = || {
+            let dataset = dataset.clone();
+            async move {
+                let mut scanner = dataset.scan();
+                scanner.blob_handling(BlobHandling::AllBinary);
+                scanner
+                    .project(&["blobs"])
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap()
+            }
+        };
+
         // Pass 2: bytes view (LargeBinary). Used by compact_files.
         // Without the fix this used to panic in BlobPageScheduler::load
         // when it downcast the cached BlobDescriptionPageScheduler state.
-        let mut scanner = dataset.scan();
-        scanner.blob_handling(BlobHandling::AllBinary);
-        let bytes = scanner
-            .project(&["blobs"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let bytes = read_payload().await;
         assert_eq!(bytes.column(0).data_type(), &DataType::LargeBinary);
         let blobs = bytes.column(0).as_binary::<i64>();
         assert_eq!(blobs.value(0), b"foo");
@@ -5693,6 +5798,13 @@ mod tests {
             .await
             .unwrap();
         assert!(descriptors.column(0).data_type().is_struct());
+
+        // Pass 4: repeat the bytes view to exercise the payload cache hit.
+        let bytes = read_payload().await;
+        let blobs = bytes.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        assert_eq!(blobs.value(2), b"baz");
     }
 
     #[tokio::test]
@@ -6796,17 +6908,64 @@ mod tests {
         assert_eq!(chunks[1].as_ref(), b"bc");
         assert_eq!(chunks[2].as_ref(), b"de");
         assert!(chunks[3].is_empty());
-        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn test_blob_file_read_range_rejects_out_of_bounds() {
-        let (store, _) = recording_range_store(Bytes::from_static(b"abcdef"));
+        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdef"));
         let path = Path::from("blobs/test.bin");
         let blob = BlobFile::new_packed(store, path, 0, 4);
 
         let err = blob.read_range(1..5).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("exceeds blob size"));
+        assert!(inner.requested_ranges().is_empty());
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::partial(3)]
+    #[case::empty(0)]
+    #[tokio::test]
+    async fn test_blob_range_reads_reject_truncated_backing_object(#[case] truncated_size: u64) {
+        let test_dir = TempDir::default();
+        let file_path = test_dir.std_path().join("blob.bin");
+        std::fs::write(&file_path, b"abcdefgh").unwrap();
+        let path = Path::from_absolute_path(&file_path).unwrap();
+        let blob = BlobFile::new_packed(Arc::new(ObjectStore::local()), path, 2, 4);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_len(truncated_size)
+            .unwrap();
+
+        let error = blob.read_range(0..4).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("failed to fill whole buffer"),
+            "{error}"
+        );
+
+        let error = execute_blob_entries(
+            vec![BlobEntry {
+                selection_index: 0,
+                row_address: 0,
+                file: blob,
+                requested_range: Some(BlobReadRange::new(0, 4)),
+            }],
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("failed to fill whole buffer"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -7563,9 +7722,6 @@ mod tests {
 
         let (store, inner) = recording_range_store(Bytes::from(vec![7; WINDOW_SIZE as usize]));
         let source = Arc::new(BlobSource::new(store, Path::from("blobs/large.bin")));
-        source
-            .file_size
-            .set(std::num::NonZeroU64::new(VALUE_SIZE).unwrap());
         let entries = vec![BlobEntry {
             selection_index: 0,
             row_address: 10,
@@ -7582,7 +7738,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].data.len(), WINDOW_SIZE as usize);
-        let physical_ranges = inner.requested_blob_ranges();
+        let physical_ranges = inner.requested_ranges();
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
         assert_eq!(physical_ranges, vec![0..WINDOW_SIZE]);
         assert_eq!(
             physical_ranges
@@ -7594,19 +7751,34 @@ mod tests {
         assert!(!physical_ranges.contains(&(0..VALUE_SIZE)));
     }
 
+    #[rstest]
+    #[case::inline(BlobKind::Inline, 1024 * 1024, 1024 * 1024)]
+    #[case::packed(BlobKind::Packed, 0, 1024 * 1024)]
+    #[case::dedicated(BlobKind::Dedicated, 0, 1)]
     #[tokio::test]
-    async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end() {
-        const VALUE_SIZE: usize = 8 * 1024 * 1024;
-        const WINDOW_SIZE: u64 = 100 * 1024;
+    async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end(
+        #[case] kind: BlobKind,
+        #[case] inline_threshold: usize,
+        #[case] dedicated_threshold: usize,
+    ) {
+        const VALUE_SIZE: usize = 256 * 1024;
+        const WINDOW_SIZE: u64 = 4 * 1024;
+        const OFFSET: u64 = 64 * 1024;
 
         let test_dir = TempStrDir::default();
-        let mut blob_builder = BlobArrayBuilder::new(1);
-        blob_builder.push_bytes(vec![0xA5; VALUE_SIZE]).unwrap();
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        for value in 0xA5..0xA9 {
+            blob_builder.push_bytes(vec![value; VALUE_SIZE]).unwrap();
+        }
         let mut blob_field = blob_field("blob", false);
         let mut metadata = blob_field.metadata().clone();
         metadata.insert(
             BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
-            "1".to_string(),
+            dedicated_threshold.to_string(),
+        );
+        metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            inline_threshold.to_string(),
         );
         blob_field = blob_field.with_metadata(metadata);
         let schema = Arc::new(Schema::new(vec![blob_field]));
@@ -7621,6 +7793,7 @@ mod tests {
                 &test_dir,
                 Some(WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 2,
                     ..Default::default()
                 }),
             )
@@ -7628,30 +7801,46 @@ mod tests {
             .unwrap(),
         );
 
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let indices = [3, 0, 2, 1];
+        let blobs = dataset
+            .take_blobs_by_indices(&indices, "blob")
+            .await
+            .unwrap();
+        for blob in &blobs {
+            assert_eq!(blob.as_ref().unwrap().kind(), kind);
+        }
         let _ = dataset.object_store.io_stats_incremental();
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
-            .with_row_indices([BlobRangeRequest::new(0, 4 * 1024 * 1024, WINDOW_SIZE)])
+            .with_row_indices(indices.map(|row| BlobRangeRequest::new(row, OFFSET, WINDOW_SIZE)))
             .execute()
             .await
             .unwrap();
         let stats = dataset.object_store.io_stats_incremental();
 
-        assert_eq!(results.len(), 1);
-        let data = results[0].data.as_ref().unwrap();
-        assert_eq!(data.len(), WINDOW_SIZE as usize);
-        assert!(data.iter().all(|byte| *byte == 0xA5));
-        let blob_payload_ranges = stats
-            .requests
-            .iter()
-            .filter(|request| request.path.as_ref().ends_with(".blob"))
-            .filter_map(|request| request.range.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            blob_payload_ranges,
-            vec![4 * 1024 * 1024..4 * 1024 * 1024 + WINDOW_SIZE]
-        );
+        assert_eq!(results.len(), indices.len());
+        for ((result, row), blob) in results.iter().zip(indices).zip(blobs) {
+            let data = result.data.as_ref().unwrap();
+            assert_eq!(data.as_ref(), vec![0xA5 + row as u8; WINDOW_SIZE as usize]);
+            let blob = blob.unwrap();
+            let range = blob.position + OFFSET..blob.position + OFFSET + WINDOW_SIZE;
+            assert!(
+                stats.requests.iter().any(|request| {
+                    request.path == blob.source.path && request.range.as_ref() == Some(&range)
+                }),
+                "{stats:?}"
+            );
+            assert!(
+                stats
+                    .requests
+                    .iter()
+                    .filter(|request| request.path == blob.source.path)
+                    .all(|request| request.method != "get_opts" || request.range.is_some()),
+                "{stats:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7981,8 +8170,14 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::whole_object(None, b"mapped")]
+    #[case::slice(Some(BlobRange { offset: 1, size: 4 }), b"appe")]
     #[tokio::test]
-    async fn test_blob_v2_external_mapped_to_registered_base() {
+    async fn test_blob_v2_external_mapped_to_registered_base(
+        #[case] range: Option<BlobRange>,
+        #[case] expected: &[u8],
+    ) {
         let test_dir = TempDir::default();
         let dataset_uri = test_dir.std_path().join("dataset");
         let external_base = test_dir.std_path().join("external_base");
@@ -7993,10 +8188,14 @@ mod tests {
         let external_uri = format!("file://{}", external_path.display());
         let base_uri = format!("file://{}", external_base.display());
 
-        let mut blob_builder = BlobArrayBuilder::new(1);
-        blob_builder.push_uri(external_uri).unwrap();
-        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
-        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let blob_array = complete_blob_v2_array(
+            vec![None],
+            vec![Some(external_uri)],
+            vec![range.map(|r| r.offset)],
+            vec![range.map(|r| r.size)],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
@@ -8039,12 +8238,35 @@ mod tests {
             "objects/mapped.bin"
         );
 
+        let external_store = dataset.object_store(Some(1)).await.unwrap();
+        let _ = external_store.io_stats_incremental();
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"mapped"
+            expected
         );
+        let results = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices([BlobRangeRequest::new(0, 1, 2)])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(results[0].data.as_deref(), Some(&expected[1..3]));
+        let stats = external_store.io_stats_incremental();
+        let size_queries = stats
+            .requests
+            .iter()
+            .filter(|request| request.method == "get_opts" && request.range.is_none())
+            .count();
+        // A descriptor without a length still needs one size query per selection.
+        let expected_size_queries = if desc.column(2).as_primitive::<UInt64Type>().value(0) == 0 {
+            2
+        } else {
+            0
+        };
+        assert_eq!(size_queries, expected_size_queries, "{stats:?}");
     }
 
     #[tokio::test]
@@ -9283,6 +9505,116 @@ mod tests {
             distinct.len(),
             3,
             "write-param override should force one pack file per blob: {blob_ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_split_batch_by_bytes_skewed_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let small = vec![0u8; 1];
+        let large = vec![0u8; 10_000];
+        let values: Vec<Option<&[u8]>> = (0..100)
+            .map(|_| Some(small.as_slice()))
+            .chain(std::iter::once(Some(large.as_slice())))
+            .collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let max_bytes = 200;
+        let chunks = super::split_batch_by_bytes(batch.clone(), max_bytes).unwrap();
+        let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+        assert_eq!(total_rows, batch.num_rows());
+
+        for chunk in &chunks {
+            if chunk.num_rows() > 1 {
+                assert!(
+                    chunk.get_array_memory_size() <= max_bytes,
+                    "chunk with {} rows has {} bytes, max is {}",
+                    chunk.num_rows(),
+                    chunk.get_array_memory_size(),
+                    max_bytes
+                );
+            }
+        }
+    }
+
+    // Regression: multiple medium rows that individually fit the budget can
+    // still be grouped into a chunk above it by the average-based split; the
+    // recursive re-check must split them apart (bot reproducer: 10 rows × 900 B
+    // plus 90 rows × 1 B, budget 1024 B).
+    #[test]
+    fn test_split_batch_by_bytes_grouped_oversized_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let small = vec![0u8; 1];
+        let medium = vec![0u8; 900];
+        let values: Vec<Option<&[u8]>> = (0..10)
+            .map(|_| Some(medium.as_slice()))
+            .chain((0..90).map(|_| Some(small.as_slice())))
+            .collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let max_bytes = 1024;
+        let chunks = super::split_batch_by_bytes(batch.clone(), max_bytes).unwrap();
+        let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+        assert_eq!(total_rows, batch.num_rows());
+
+        for chunk in &chunks {
+            if chunk.num_rows() > 1 {
+                assert!(
+                    chunk.get_array_memory_size() <= max_bytes,
+                    "chunk with {} rows has {} bytes, max is {}",
+                    chunk.num_rows(),
+                    chunk.get_array_memory_size(),
+                    max_bytes
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_split_materialized_batch_retains_reservation_until_chunks_drop() {
+        let budget = Arc::new(super::BlobMaterializationBudget {
+            limit: 1024,
+            state: std::sync::Mutex::new(super::BlobMaterializationBudgetState::default()),
+            notify: Notify::new(),
+        });
+        let reservation = budget.reserve(800).await;
+        assert_eq!(budget.state.lock().unwrap().reserved, 800);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let value = [0u8; 100];
+        let values: Vec<Option<&[u8]>> = (0..10).map(|_| Some(value.as_slice())).collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let materialized =
+            super::MaterializedBlobBatch::with_reservations(batch, vec![Arc::new(reservation)]);
+        let chunks = materialized.split_by_bytes(200).unwrap();
+        assert!(!chunks.is_empty());
+        assert_eq!(
+            budget.state.lock().unwrap().reserved,
+            800,
+            "reservation should be held while chunks are alive"
+        );
+
+        drop(chunks);
+        assert_eq!(
+            budget.state.lock().unwrap().reserved,
+            0,
+            "reservation should be released after chunks drop"
         );
     }
 }

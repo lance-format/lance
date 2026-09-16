@@ -19,6 +19,7 @@ use lance_linalg::distance::{Dot, L2, Normalize};
 
 use super::ProductQuantizer;
 use super::utils::divide_to_subvectors;
+use super::validate_supplied_codebook;
 use crate::vector::kmeans::{KMeansParams, train_kmeans};
 
 /// Parameters for building product quantizer.
@@ -204,6 +205,25 @@ impl PQBuildParams {
             data.data_type()
         )))?;
 
+        if let Some(codebook) = self.codebook.as_ref() {
+            // build_from_fsl slices this buffer with offsets derived from the
+            // column dimension, so a size that disagrees with the column reads
+            // the sub-vector boundaries at the wrong offsets or slices out of
+            // bounds.
+            let codebook = codebook.as_fixed_size_list_opt().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "PQ builder: codebook is not a FixedSizeList: {}",
+                    codebook.data_type()
+                ))
+            })?;
+            validate_supplied_codebook(
+                codebook.values().len(),
+                fsl.value_length() as usize,
+                self.num_sub_vectors,
+                self.num_bits,
+            )?;
+        }
+
         let num_centroids = self.num_centroids()?;
         if data.len() < num_centroids {
             return Err(Error::unprocessable(format!(
@@ -336,5 +356,40 @@ mod tests {
         );
         assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    /// A supplied codebook is sliced with offsets derived from the column, so a
+    /// size that disagrees with the column used to pass through here: oversized
+    /// read the sub-vector boundaries at the wrong offsets and trained a garbage
+    /// quantizer, undersized sliced out of bounds and panicked.
+    #[test]
+    fn test_build_rejects_mismatched_codebook() {
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+
+        let values = Float32Array::from_iter((0..64 * DIM).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook = |num_centroids: usize| -> ArrayRef {
+            let values = Float32Array::from_iter((0..num_centroids * DIM).map(|v| v as f32));
+            Arc::new(FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap())
+        };
+
+        PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, codebook(K))
+            .build(&fsl, DistanceType::L2)
+            .expect("a codebook sized for the column must still be accepted");
+
+        for supplied in [K * 2, K / 2] {
+            let error = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, codebook(supplied))
+                .build(&fsl, DistanceType::L2)
+                .unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(&(supplied * DIM).to_string())
+                    && error.to_string().contains(&(K * DIM).to_string()),
+                "the error must give the supplied and the required size: {error}"
+            );
+        }
     }
 }

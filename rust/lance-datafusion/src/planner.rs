@@ -1170,8 +1170,6 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 #[cfg(test)]
 mod tests {
 
-    use crate::logical_expr::ExprExt;
-
     use super::*;
 
     use arrow::datatypes::Float64Type;
@@ -1207,7 +1205,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st").field_newstyle("x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))

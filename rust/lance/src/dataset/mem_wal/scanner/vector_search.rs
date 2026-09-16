@@ -106,6 +106,11 @@ pub struct LsmVectorSearchPlanner {
     /// Optional `lower <= _distance < upper` bound, applied inside every source
     /// arm's KNN so an out-of-range row never consumes a top-k slot.
     distance_range: (Option<f32>, Option<f32>),
+    /// Optional HNSW search-list size, forwarded to every arm. It bites on the
+    /// HNSW-backed ones — the active memtable's graph and each flushed
+    /// generation's `IVF_HNSW_SQ` — and is ignored by an arm whose index is not
+    /// a graph. `None` leaves each arm at its own default.
+    ef: Option<usize>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -138,6 +143,7 @@ impl LsmVectorSearchPlanner {
             warmer: None,
             filter: None,
             distance_range: (None, None),
+            ef: None,
         }
     }
 
@@ -155,6 +161,16 @@ impl LsmVectorSearchPlanner {
     /// row can't displace an in-range one.
     pub fn with_distance_range(mut self, lower: Option<f32>, upper: Option<f32>) -> Self {
         self.distance_range = (lower, upper);
+        self
+    }
+
+    /// Set the HNSW search-list size — the fresh tier's recall/latency knob.
+    ///
+    /// Not `nprobes`: flushed generations are written as single-partition IVF
+    /// and the memtable graph has no partitions at all, so a probe count has
+    /// nothing to probe on the fresh tier. `ef` is what widens the search.
+    pub fn with_ef(mut self, ef: Option<usize>) -> Self {
+        self.ef = ef;
         self
     }
 
@@ -457,6 +473,9 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
                 // Re-rank base candidates with exact distances so they're
@@ -491,6 +510,9 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 scanner.fast_search();
                 scanner.create_plan().await
             }
@@ -521,6 +543,9 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 scanner.create_plan().await
             }
         }
@@ -793,6 +818,93 @@ mod tests {
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
+    }
+
+    /// `ef` is the fresh tier's only meaningful recall knob — its arms are
+    /// HNSW-backed, and probe counts have nothing to probe here. Before
+    /// `with_ef` the planner had no way to express it at all, so every
+    /// fresh-tier search ran at the graph default while the base arm honored
+    /// whatever the caller asked for.
+    #[tokio::test]
+    async fn with_ef_reaches_the_memtable_arm() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_dataset =
+            Arc::new(create_dataset(&base_uri, vec![create_test_batch(&schema, &[10, 20])]).await);
+
+        let build_planner = || {
+            let batch_store = Arc::new(BatchStore::with_capacity(16));
+            let mut index_store = IndexStore::new();
+            index_store.enable_pk_index(&[("id".to_string(), 0)]);
+            index_store.add_hnsw(
+                "vector_hnsw".to_string(),
+                1,
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+                64,
+                8,
+            );
+            let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+            batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(&batch, 0, Some(0))
+                .unwrap();
+            let collector = LsmDataSourceCollector::new(base_dataset.clone(), vec![])
+                .with_in_memory_memtables(
+                    uuid::Uuid::new_v4(),
+                    InMemoryMemTables {
+                        active: InMemoryMemTableRef {
+                            batch_store,
+                            index_store: Arc::new(index_store),
+                            schema: schema.clone(),
+                            generation: 1,
+                        },
+                        frozen: vec![],
+                    },
+                );
+            LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+            )
+        };
+
+        let query = create_query_vector();
+        let render = |plan: Arc<dyn ExecutionPlan>| {
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+            )
+        };
+
+        let defaulted = render(
+            build_planner()
+                .plan_search(&query, 3, 1, None, false, 1.0)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !defaulted.contains("ef="),
+            "unset ef must leave each arm at its own default: {defaulted}"
+        );
+
+        let widened = render(
+            build_planner()
+                .with_ef(Some(97))
+                .plan_search(&query, 3, 1, None, false, 1.0)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            widened.contains("ef=97"),
+            "with_ef must reach the memtable HNSW arm: {widened}"
+        );
     }
 
     #[tokio::test]
