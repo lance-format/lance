@@ -116,12 +116,6 @@ pub fn relax_non_pk_nullability(
     ))
 }
 
-/// Extend the logical schema with the trailing `_tombstone` column — the
-/// intermediate [`relax_non_pk_nullability`] widens into the storage schema.
-///
-/// Idempotent: a schema that already carries `_tombstone` (a reopen/replay
-/// path) is returned unchanged. Schema-level metadata and per-field metadata
-/// (e.g. the `lance-schema:unenforced-primary-key` marker) are preserved.
 /// The schema's Arrow form, with each field's id carried in its metadata.
 ///
 /// `From<&Field> for ArrowField` drops the id, which leaves everything
@@ -195,6 +189,12 @@ fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
     }
 }
 
+/// Extend the logical schema with the trailing `_tombstone` column — the
+/// intermediate [`relax_non_pk_nullability`] widens into the storage schema.
+///
+/// Idempotent: a schema that already carries `_tombstone` (a reopen/replay
+/// path) is returned unchanged. Schema-level metadata and per-field metadata
+/// (e.g. the `lance-schema:unenforced-primary-key` marker) are preserved.
 pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
     if base.column_with_name(TOMBSTONE).is_some() {
         return Arc::new(base.clone());

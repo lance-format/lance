@@ -470,7 +470,6 @@ impl LsmFtsSearchPlanner {
         self
     }
 
-    /// Set the session used to open SSTables.
     /// The table's schema carrying each field's id, which is what resolves a
     /// generation's stored columns to the table's.
     ///
@@ -481,6 +480,7 @@ impl LsmFtsSearchPlanner {
         self
     }
 
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
@@ -699,8 +699,8 @@ impl LsmFtsSearchPlanner {
                     // offers no granularity.
                     let generation = GenerationRead::new(
                         dataset.schema(),
-                        Arc::clone(&self.identity_schema),
-                        self.pk_columns.clone(),
+                        &self.identity_schema,
+                        &self.pk_columns,
                         Vec::new(),
                     );
                     match generation.stored_name(column) {
@@ -946,12 +946,12 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 // Asked of this generation under its own names: a rename moved
                 // the table's name while the file still holds the old one.
-                let wanted = self.fts_scanner_projection(projection);
+                let asked_for = self.fts_scanner_projection(projection);
                 let mut generation = GenerationRead::new(
                     dataset.schema(),
-                    Arc::clone(&self.identity_schema),
-                    self.pk_columns.clone(),
-                    wanted,
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
                 );
                 // The index is on this generation's own column, under the name
                 // it had when the generation was sealed.
@@ -966,16 +966,7 @@ impl LsmFtsSearchPlanner {
                 // The BM25 top-k has already run by then, so the arm can come
                 // back short — which is right: those rows have no value for a
                 // column sealed before it existed.
-                let stored_filter = self
-                    .filter
-                    .as_ref()
-                    .and_then(|expr| generation.to_stored(expr));
-                let above = self.filter.as_ref().filter(|_| stored_filter.is_none());
-                if let Some(expr) = above {
-                    for column in expr.column_refs() {
-                        generation.also_produce(&column.name);
-                    }
-                }
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 scanner.project(&generation.stored_projection())?;
                 if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
@@ -998,7 +989,7 @@ impl LsmFtsSearchPlanner {
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
                 let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match above {
+                match &above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),
                 }

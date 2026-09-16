@@ -1602,29 +1602,6 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// Re-label `batch` to the storage schema, matching columns by **field id**
-/// where both sides carry one, and by **name** otherwise.
-///
-/// A column the schema declares and the batch does not carry is filled with
-/// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
-/// and the schema does not declare is dropped.
-///
-/// Ids are tried first because a rename keeps the id and changes the name: a
-/// name match would null the new name and drop the old one, losing the column's
-/// values. An entry carrying no ids falls back to the name match.
-///
-/// Both cases are what a replayed WAL entry looks like after the table's schema
-/// moved: an entry predates a column added since, and carries one dropped
-/// since. Live writes reach here already checked against the logical schema, so
-/// for them every column is present and this only appends `_tombstone`.
-///
-/// A column whose type changed is cast, the same way `alter_columns` casts the
-/// base data, so a replayed row lands in the state it would have had if it had
-/// been written after the change. A cast that would lose information is an
-/// error, not a silent null.
-///
-/// A primary key the batch does not carry stays an error — there is no value to
-/// invent.
 /// A batch a caller just handed in, under the storage schema.
 ///
 /// Live input is trusted for its values and not for its identity: it has been
@@ -1650,6 +1627,27 @@ fn conform_live_batch(
     conform_to_storage_schema(batch, storage_schema, pk_columns)
 }
 
+/// Re-label `batch` to the storage schema, matching columns by **field id**
+/// where both sides carry one, and by **name** otherwise.
+///
+/// A column the schema declares and the batch does not carry is filled with
+/// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
+/// and the schema does not declare is dropped.
+///
+/// Ids are tried first: a name match would null the new name and drop the old
+/// one, losing the column's values. An entry carrying no ids falls back to the
+/// name match.
+///
+/// Both are what a replayed WAL entry looks like after the table's schema
+/// moved: it predates a column added since, and carries one dropped since. A
+/// live write arrives already checked against the logical schema, so for it
+/// every column is present and this only appends `_tombstone`.
+///
+/// A column whose scalar type has moved is an error rather than a cast: a table
+/// with a MemWAL refuses a retype, so a disagreement here is one to surface.
+///
+/// A primary key the batch does not carry is an error — there is no value to
+/// invent.
 fn conform_to_storage_schema(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -2137,10 +2135,9 @@ impl ShardWriter {
         // The caller's schema is the shard's logical schema; the storage schema
         // is derived below, once the primary key is known. lance owns
         // `_tombstone` and appends it here — idempotent across reopens.
-        // The stored schema carries field ids so identity survives a rename;
-        // what a caller's batch is checked against must not, since a batch
-        // carries none and Arrow compares a struct's children in full.
         let tombstoned = schema_with_tombstone(&schema);
+        // What a caller's batch is checked against carries no ids: a batch has
+        // none, and Arrow compares a struct's children in full.
         let logical_schema = Arc::new(without_field_ids(&schema));
 
         let base_uri = base_uri.into();
@@ -4877,11 +4874,12 @@ mod tests {
         );
     }
 
-    /// A struct column is matched whole, by the id on the column itself.
+    /// A struct column renamed at the top level is matched by the id on the
+    /// column itself, and taken whole.
     ///
-    /// Ids are carried for top-level fields, which is the granularity conform
-    /// works at: a column is taken or it is not. A change inside the struct
-    /// changes the column's type, and is handled as a type change.
+    /// Only the parent moves here. Reconciliation is recursive — a child
+    /// carries its own id and is resolved on its own — which the nested cases
+    /// in `reconcile` cover.
     #[test]
     fn test_conform_matches_a_struct_column_by_its_own_id() {
         fn with_id(field: ArrowField, id: i32) -> ArrowField {

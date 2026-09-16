@@ -706,8 +706,8 @@ impl LsmPointLookupPlanner {
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 let generation = GenerationRead::new(
                     dataset.schema(),
-                    Arc::clone(&self.identity_schema),
-                    self.pk_columns.clone(),
+                    &self.identity_schema,
+                    &self.pk_columns,
                     cols,
                 );
                 // Every generation stores every primary key column — a key

@@ -33,6 +33,10 @@ use lance_core::{Error, Result};
 use super::TOMBSTONE;
 
 /// The lance field id an Arrow field carries, if it carries one.
+///
+/// Lance writes `-1` for a field it has not assigned an id to yet. Treating
+/// that as an id would pair every unassigned column with every other, so a
+/// negative id counts as none at all.
 pub(super) fn field_id_of(field: &ArrowField) -> Option<i32> {
     field
         .metadata()
@@ -41,17 +45,12 @@ pub(super) fn field_id_of(field: &ArrowField) -> Option<i32> {
         .filter(|id| *id >= 0)
 }
 
-/// `schema` without the field ids, for comparing against what a caller sends.
+/// `column` under `data_type`, which differs from its own only in the field
+/// ids it carries.
 ///
-/// Ids belong to the stored schema, where identity has to survive a rename. A
-/// caller's batch carries none, and Arrow compares a struct's children by their
-/// full field — metadata included — so a stamped schema would reject it.
-/// One stored column under the type the caller declared.
-///
-/// A field id lives inside a nested column's own Arrow type, so the memtable's
-/// id-carrying storage schema and the table's plain one describe the same
-/// values as two different types. Only the labels differ, so this relabels the
-/// array rather than converting it.
+/// The two describe the same values as two different Arrow types, because the
+/// ids sit inside the type. Only the labels differ, so this relabels the array
+/// rather than converting it.
 pub(super) fn relabel_to(column: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
     if column.data_type() == data_type {
         return Ok(column.clone());
@@ -93,11 +92,21 @@ pub(super) fn without_field_ids_in(data_type: &DataType) -> DataType {
     without_field_ids(&one).field(0).data_type().clone()
 }
 
+/// `field` without its Lance field id, keeping the rest of its metadata.
+pub(super) fn without_field_id(field: &ArrowField) -> ArrowField {
+    let mut field = field.clone();
+    field.metadata_mut().remove(LANCE_FIELD_ID_KEY);
+    field
+}
+
+/// `schema` without the field ids, for comparing against what a caller sends.
+///
+/// Ids belong to the stored schema, where identity has to survive a rename. A
+/// caller's batch carries none, and Arrow compares a struct's children by their
+/// full field — metadata included — so a stamped schema would reject it.
 pub(super) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
     fn strip(field: &ArrowField) -> ArrowField {
-        let mut metadata = field.metadata().clone();
-        metadata.remove(LANCE_FIELD_ID_KEY);
-        let field = field.clone().with_metadata(metadata);
+        let field = without_field_id(field);
         match field.data_type() {
             DataType::Struct(children) => {
                 let children: Vec<ArrowField> = children.iter().map(|c| strip(c)).collect();
@@ -155,12 +164,11 @@ pub struct Plan {
 impl Plan {
     /// The same plan emitting the table's plain Arrow schema.
     ///
-    /// Resolution needs field ids on the target — a rename keeps the id and
-    /// moves the name — but a reader is handed the table's schema, which does
-    /// not carry them. They live inside a nested column's own type, so a struct
+    /// Resolution needs ids on the target, but a reader is handed the table's
+    /// plain schema. Since the ids sit inside a nested column's type, a struct
     /// built to the id-carrying target is a different Arrow type from the one
-    /// the caller declared. Only replay, which writes back into the memtable's
-    /// id-carrying storage schema, keeps them.
+    /// the caller declared. Only replay keeps them, writing back into the
+    /// memtable's id-carrying storage schema.
     pub(crate) fn emitting_plain_schema(mut self) -> Self {
         fn strip(source: &mut Source) {
             match source {
@@ -189,7 +197,7 @@ impl Plan {
         // An id match takes its source column; a name match may then only take
         // one nothing has claimed. A rename frees a name for another column to
         // use, and it is the id that says which column is really which.
-        let claimed = claimed_by_id(source, target);
+        let claimed = claimed_by_id(source.fields(), target.fields());
         let sources = target
             .fields()
             .iter()
@@ -232,23 +240,6 @@ impl Plan {
     }
 }
 
-/// Source columns an id match has taken, which a name match may not take again.
-fn claimed_by_id(source: &ArrowSchema, target: &SchemaRef) -> Vec<bool> {
-    let by_id: HashMap<i32, usize> = source
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| field_id_of(f).map(|id| (id, i)))
-        .collect();
-    let mut claimed = vec![false; source.fields().len()];
-    for field in target.fields() {
-        if let Some(i) = field_id_of(field).and_then(|id| by_id.get(&id)) {
-            claimed[*i] = true;
-        }
-    }
-    claimed
-}
-
 fn resolve_field(
     field: &ArrowField,
     source_fields: &arrow_schema::Fields,
@@ -261,14 +252,9 @@ fn resolve_field(
             .iter()
             .position(|f| field_id_of(f) == Some(id))
     });
-    // Identity is the field id where both sides carry one. A name is not: a
-    // rename moves the name and leaves the id, so a source column of the same
-    // name under a *different* id is a different column — one dropped and
-    // another added under its name, whose values the table no longer has.
-    //
-    // A name match is right only where identity is absent: a batch a caller has
-    // just handed in carries no ids, and neither does a schema supplied by a
-    // caller who has none to give.
+    // Ids first. The name fallback is asymmetric on purpose: it fires for a
+    // target field carrying no id, and for one whose id no source field has --
+    // an id-bearing target against an unstamped source still matches by name.
     let by_name = || {
         source_fields
             .iter()
@@ -335,14 +321,7 @@ fn resolve_field(
 /// Whether this type carries its children inside its own type, so an array of
 /// it has to be rebuilt rather than taken as it stands.
 fn is_nested(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Struct(_)
-            | DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-    )
+    children_of(data_type).is_some()
 }
 
 /// The child fields of a nested type, if it has them.
@@ -376,14 +355,15 @@ fn resolve_children(source: &ArrowField, field: &ArrowField) -> Result<Vec<Sourc
             field.data_type()
         )));
     };
-    let claimed = claimed_children(&source_children, &target_children);
+    let claimed = claimed_by_id(&source_children, &target_children);
     target_children
         .iter()
         .map(|child| resolve_field(child, &source_children, &claimed, &[]))
         .collect()
 }
 
-fn claimed_children(source: &arrow_schema::Fields, target: &arrow_schema::Fields) -> Vec<bool> {
+/// Source columns an id match has taken, which a name match may not take again.
+fn claimed_by_id(source: &arrow_schema::Fields, target: &arrow_schema::Fields) -> Vec<bool> {
     let by_id: HashMap<i32, usize> = source
         .iter()
         .enumerate()
@@ -429,6 +409,7 @@ fn rebuild_list<O: arrow_array::OffsetSizeTrait>(
     ))
 }
 
+/// One stored column under the type the caller declared.
 fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -> Result<ArrayRef> {
     match source {
         Source::Take(i) => Ok(Arc::clone(&columns[*i])),
@@ -547,6 +528,57 @@ mod relabel_tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::Fields;
 
+    /// A nested column resolves by the field ids Lance puts on its children.
+    /// If Lance starts giving children to a type [`is_nested`] does not know,
+    /// those ids go unrestored and the column falls back to matching by name --
+    /// the failure this module exists to prevent. So every type Lance gives
+    /// children to has to be one we recurse into.
+    #[test]
+    fn every_type_lance_gives_children_to_is_one_we_recurse_into() {
+        let item = || Arc::new(ArrowField::new("item", DataType::Int64, true));
+        let a_struct = || Fields::from(vec![ArrowField::new("a", DataType::Int64, true)]);
+        let entries = Arc::new(ArrowField::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Int64, false),
+                ArrowField::new("value", DataType::Int64, true),
+            ])),
+            false,
+        ));
+        let candidates = [
+            DataType::Int64,
+            DataType::Struct(a_struct()),
+            DataType::List(item()),
+            DataType::LargeList(item()),
+            DataType::FixedSizeList(item(), 2),
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Struct(a_struct()), true)),
+                2,
+            ),
+            DataType::Map(entries, false),
+            DataType::ListView(item()),
+            DataType::LargeListView(item()),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            DataType::RunEndEncoded(
+                Arc::new(ArrowField::new("run_ends", DataType::Int32, false)),
+                item(),
+            ),
+        ];
+        for data_type in candidates {
+            let field = ArrowField::new("c", data_type.clone(), true);
+            // A type Lance refuses outright can never reach a MemWAL.
+            let Ok(lance) = lance_core::datatypes::Field::try_from(&field) else {
+                continue;
+            };
+            if !lance.children.is_empty() {
+                assert!(
+                    is_nested(&data_type),
+                    "Lance gives {data_type:?} children, so reconcile must recurse into it"
+                );
+            }
+        }
+    }
+
     fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
         ArrowField::new(name, data_type, true).with_metadata(
             [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
@@ -570,9 +602,8 @@ mod relabel_tests {
         out
     }
 
-    /// A field id lives inside a nested column's type at every level, so the
-    /// relabel has to reach all of them: Arrow validates a struct's children
-    /// against the child types its own type declares.
+    /// Arrow validates a struct against the child types its own type declares,
+    /// so a relabel that stops at the outer level produces a rejected array.
     #[test]
     fn relabel_reaches_a_nested_child() {
         let inner_stamped = stamped("b", DataType::Int64, 3);

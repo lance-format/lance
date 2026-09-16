@@ -21,12 +21,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
-use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
-use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
+use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_id};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 /// One sealed generation, read under the table's schema.
@@ -39,58 +38,65 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 /// ([`Self::reconcile`]).
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
-    stored: Schema,
-    /// The generation's name for a column → the table's name for it. Columns
-    /// the table no longer has are absent.
+    stored_schema: Schema,
+    /// The generation's name for a column → the table's name for it, matched
+    /// by field id. Carried as names because everything downstream is
+    /// name-addressed: a scan projection takes names, and so do the column
+    /// references in a DataFusion predicate. Columns the table no longer has
+    /// are absent.
     names: HashMap<String, String>,
-    /// The table's schema, carrying field ids.
-    identity: SchemaRef,
+    /// The table's schema, also carrying field ids.
+    table_schema: SchemaRef,
     pk_columns: Vec<String>,
-    /// Table names this read produces, in order.
-    wanted: Vec<String>,
+    /// The columns this read produces, in order, each under the name the
+    /// table gives it. Not only what the caller asked for --
+    /// [`Self::also_produce`] adds what a deferred predicate needs.
+    projection: Vec<String>,
 }
 
 impl GenerationRead {
-    /// `wanted` is what the caller asks for, in the table's names.
+    /// `projection` is what the caller asks for, under the table's names.
     pub(super) fn new(
         dataset_schema: &lance_core::datatypes::Schema,
-        identity: SchemaRef,
-        pk_columns: Vec<String>,
-        wanted: Vec<String>,
+        table_schema: &SchemaRef,
+        pk_columns: &[String],
+        projection: Vec<String>,
     ) -> Self {
-        let stored = arrow_schema_with_field_ids(dataset_schema);
-        let names = stored_names(&stored, &identity);
+        let stored_schema = arrow_schema_with_field_ids(dataset_schema);
+        let names = stored_names(&stored_schema, table_schema);
+        let (table_schema, pk_columns) = (Arc::clone(table_schema), pk_columns.to_vec());
         Self {
-            stored,
+            stored_schema,
             names,
-            identity,
+            table_schema,
             pk_columns,
-            wanted,
+            projection,
         }
     }
 
-    /// The generation's name for one of the table's columns.
-    pub(super) fn stored_name(&self, table_name: &str) -> Option<&str> {
+    /// The generation's name for `column`. `column` is the table's name for it.
+    pub(super) fn stored_name(&self, column: &str) -> Option<&str> {
         self.names
             .iter()
-            .find(|(_, table)| *table == table_name)
-            .map(|(stored, _)| stored.as_str())
+            .find(|(_, in_table)| *in_table == column)
+            .map(|(in_generation, _)| in_generation.as_str())
     }
 
     /// Also produce `column`, which the caller needs even though it did not ask
     /// for it — a predicate that runs after reconciliation reads its columns
     /// from this scan.
     pub(super) fn also_produce(&mut self, column: &str) {
-        if !self.wanted.iter().any(|w| w == column) {
-            self.wanted.push(column.to_string());
+        if !self.projection.iter().any(|w| w == column) {
+            self.projection.push(column.to_string());
         }
     }
 
-    /// What to project from the file: the wanted columns under the names it has.
+    /// What to project from the file: the projected columns under the names it
+    /// has.
     /// A column it never stored is dropped here and filled in by
     /// [`Self::reconcile`].
     pub(super) fn stored_projection(&self) -> Vec<&str> {
-        self.wanted
+        self.projection
             .iter()
             .filter_map(|name| {
                 self.stored_name(name)
@@ -104,7 +110,7 @@ impl GenerationRead {
     /// asked for, or not at all.
     fn stored_system_column(&self, name: &str) -> Option<&str> {
         (is_system_column(name) || name == TOMBSTONE)
-            .then(|| self.stored.field_with_name(name).ok())
+            .then(|| self.stored_schema.field_with_name(name).ok())
             .flatten()
             .map(|f| f.name().as_str())
     }
@@ -112,17 +118,18 @@ impl GenerationRead {
     /// `expr` with each column reference moved to the name this generation
     /// stores it under, so it can be pushed into the generation's own scan.
     ///
-    /// `None` when it cannot be: a column the generation does not store, or a
-    /// nested one. A nested reference names the parent (`info.a` refers to
-    /// `info`) and a parent's name does not move when a child is renamed, so a
-    /// pushed-down predicate would be evaluated against child names this
-    /// generation has and the table does not. Either way the predicate belongs
-    /// above the reconciliation, where the columns it names exist.
+    /// `None` when a referenced column is one this generation does not store,
+    /// or stores under a different shape. A nested reference names the parent
+    /// (`info.a` refers to `info`), and a parent's name does not move when a
+    /// child is renamed — so the parent's whole type is compared, not its name.
+    /// A nested column nothing moved inside is pushed down like any other.
+    /// Otherwise the predicate belongs above the reconciliation, where the
+    /// columns it names exist.
     pub(super) fn to_stored(&self, expr: &Expr) -> Option<Expr> {
         let pushable = expr
             .column_refs()
             .iter()
-            .all(|c| self.answers_as_written(&c.name));
+            .all(|c| self.stored_as_declared(&c.name));
         if !pushable {
             return None;
         }
@@ -130,8 +137,7 @@ impl GenerationRead {
             .transform(|e| match e {
                 Expr::Column(mut c) => {
                     // `stored_name` is total over the refs, checked above.
-                    let stored = self.stored_name(&c.name).expect("checked").to_string();
-                    c.name = stored;
+                    c.name = self.stored_name(&c.name).expect("checked").to_string();
                     Ok(Transformed::yes(Expr::Column(c)))
                 }
                 other => Ok(Transformed::no(other)),
@@ -140,30 +146,48 @@ impl GenerationRead {
             .ok()
     }
 
-    /// Whether the generation holds `table_name` in the shape the table
-    /// declares, so a predicate naming it means the same thing pushed down.
+    /// Split `filter` into the part this generation can answer under its own
+    /// names and the part that has to run above the reconciliation.
+    ///
+    /// The deferred part reads its columns from this scan, so they are added to
+    /// what the scan produces whether the caller asked for them or not. At most
+    /// one of the two is `Some`: a predicate is pushed whole or deferred whole.
+    pub(super) fn split_filter(&mut self, filter: Option<&Expr>) -> (Option<Expr>, Option<Expr>) {
+        let pushed = filter.and_then(|expr| self.to_stored(expr));
+        let deferred = filter.filter(|_| pushed.is_none()).cloned();
+        if let Some(expr) = &deferred {
+            for column in expr.column_refs() {
+                self.also_produce(&column.name);
+            }
+        }
+        (pushed, deferred)
+    }
+
+    /// Whether the generation stores `column` exactly as the table declares
+    /// it, so a predicate naming it means the same thing pushed down.
     ///
     /// A nested column is where the two can differ without the name moving: a
     /// reference names the parent (`info.a` refers to `info`) and a parent's
     /// name does not move when a child is renamed. Comparing the shapes rather
     /// than assuming the worst is what keeps an ordinary predicate on an
     /// ordinary struct pushed down — the common case, where nothing moved.
-    fn answers_as_written(&self, table_name: &str) -> bool {
-        let Some(stored) = self.stored_name(table_name) else {
+    fn stored_as_declared(&self, column: &str) -> bool {
+        let Some(stored_column) = self.stored_name(column) else {
             return false;
         };
-        let (Ok(stored), Ok(declared)) = (
-            self.stored.field_with_name(stored),
-            self.identity.field_with_name(table_name),
+        let (Ok(stored_field), Ok(declared)) = (
+            self.stored_schema.field_with_name(stored_column),
+            self.table_schema.field_with_name(column),
         ) else {
             return false;
         };
-        // Compared with their field ids, not just their shapes. A nested child
-        // that was dropped and added back under the same name and type is a
-        // different column wearing the old one's shape, and pushing a predicate
-        // down against it would filter on the retired child's values while the
-        // reconciliation above synthesizes nulls for the new one.
-        stored.data_type() == declared.data_type()
+        // The top-level ids matched already: `stored_name` resolved through a
+        // map keyed by them. This compares the children, whose ids live inside
+        // the parent's own type -- so a child dropped and added back under the
+        // same name and type is caught as the different column it is, rather
+        // than filtering on the retired child's values while the reconciliation
+        // above synthesizes nulls for the new one.
+        stored_field.data_type() == declared.data_type()
     }
 
     /// Bring the scan's output back to the table's names and shapes: renames
@@ -174,7 +198,8 @@ impl GenerationRead {
     /// those pass through untouched, as does anything the generation has that
     /// the table does not.
     pub(super) fn reconcile(&self, scan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = self.only_the_tables_ids(with_ids_from(&scan.schema(), &self.stored));
+        let source =
+            self.with_only_table_field_ids(with_ids_from(&scan.schema(), &self.stored_schema));
         let target = self.target(&source);
         let plan = Plan::resolve(&source, &target, &self.pk_columns)?.emitting_plain_schema();
         if plan.is_identity() {
@@ -183,31 +208,27 @@ impl GenerationRead {
         Ok(Arc::new(ReconcileExec::new(scan, Arc::new(plan))))
     }
 
-    /// `source` with the field ids of everything that is not one of the
-    /// table's columns removed.
+    /// `source` keeping a field id only where the column is one of the
+    /// table's, and stripping it everywhere else.
     ///
     /// A generation numbers its own columns in its own schema — `_tombstone`,
     /// and anything it holds that the table has since dropped — so those ids
     /// collide with whatever the table gave those numbers. Left in place, a
     /// column added to the table resolves to whichever of them happens to share
     /// its id.
-    fn only_the_tables_ids(&self, source: Schema) -> Schema {
+    fn with_only_table_field_ids(&self, source: Schema) -> Schema {
         let fields: Vec<Field> = source
             .fields()
             .iter()
             .map(|field| match self.names.contains_key(field.name()) {
                 true => field.as_ref().clone(),
-                false => {
-                    let mut metadata = field.metadata().clone();
-                    metadata.remove(LANCE_FIELD_ID_KEY);
-                    field.as_ref().clone().with_metadata(metadata)
-                }
+                false => without_field_id(field),
             })
             .collect();
         Schema::new_with_metadata(fields, source.metadata().clone())
     }
 
-    /// The schema [`Self::reconcile`] produces: the wanted columns as the table
+    /// The schema [`Self::reconcile`] produces: the projected columns as the table
     /// declares them, then whatever else the scan carries.
     ///
     /// Nullability comes from the source, not the table: a generation stores
@@ -218,14 +239,14 @@ impl GenerationRead {
     /// tombstones are dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
         let mut fields: Vec<Field> = self
-            .wanted
+            .projection
             .iter()
             .filter_map(|name| {
-                let declared = self.identity.field_with_name(name).ok()?;
+                let declared = self.table_schema.field_with_name(name).ok()?;
                 // Absent from the source means synthesized, so nullable.
                 let nullable = self
                     .stored_name(name)
-                    .and_then(|stored| source.field_with_name(stored).ok())
+                    .and_then(|stored_column| source.field_with_name(stored_column).ok())
                     .is_none_or(|f| f.is_nullable());
                 Some(declared.clone().with_nullable(nullable))
             })
@@ -250,7 +271,7 @@ pub(super) fn filter_above(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = plan.schema();
     let df_schema = DFSchema::try_from(schema.as_ref().clone())
-        .map_err(|e| Error::internal(format!("filter schema: {e}")))?;
+        .map_err(|e| Error::internal(format!("build a filter schema for `{expr}`: {e}")))?;
     let props = ExecutionProps::new();
     let physical = create_physical_expr(expr, &df_schema, &props)
         .map_err(|e| Error::internal(format!("plan filter `{expr}`: {e}")))?;
@@ -259,25 +280,26 @@ pub(super) fn filter_above(
     ))
 }
 
-/// The generation's name for each of the table's columns, by field id: a rename
+/// Each column the generation stores, keyed by the name it stores it under,
+/// mapped to the table's name for it. Paired by field id, since a rename
 /// changes the name and keeps the id.
-fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
-    let by_id: HashMap<i32, &str> = table
+fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String, String> {
+    let by_id: HashMap<i32, &str> = table_schema
         .fields()
         .iter()
         .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
         .collect();
     // A caller that supplies no ids leaves only names to match on.
     if by_id.is_empty() {
-        return stored
+        return stored_schema
             .fields()
             .iter()
             .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
-            .filter(|f| table.field_with_name(f.name()).is_ok())
+            .filter(|f| table_schema.field_with_name(f.name()).is_ok())
             .map(|f| (f.name().clone(), f.name().clone()))
             .collect();
     }
-    stored
+    stored_schema
         .fields()
         .iter()
         // A generation's own columns are numbered in its own schema, so their
@@ -295,7 +317,7 @@ fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
 
 /// Put back the field ids a scan's output schema drops, so the reconciliation
 /// can resolve its columns by id.
-fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
+fn with_ids_from(schema: &Schema, stored_schema: &Schema) -> Schema {
     fn restore(field: &Field, among: &Fields) -> Field {
         let Some(source) = among.iter().find(|f| f.name() == field.name()) else {
             return field.clone();
@@ -346,7 +368,7 @@ fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|field| restore(field, stored.fields()))
+        .map(|field| restore(field, stored_schema.fields()))
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
 }
@@ -356,6 +378,7 @@ mod tests {
     use super::*;
     use arrow_schema::Fields;
     use datafusion::prelude::{col, lit};
+    use lance_core::datatypes::LANCE_FIELD_ID_KEY;
     use lance_core::datatypes::Schema as LanceSchema;
 
     /// An Arrow field carrying a Lance field id, as a generation's schema and
@@ -374,13 +397,17 @@ mod tests {
 
     /// `GenerationRead` resolves against a generation's *Lance* schema, which
     /// is where the stored ids come from.
-    fn generation(stored: SchemaRef, table: SchemaRef, wanted: &[&str]) -> GenerationRead {
-        let lance = LanceSchema::try_from(stored.as_ref()).expect("a lance schema");
+    fn generation(
+        stored_schema: SchemaRef,
+        table_schema: SchemaRef,
+        projection: &[&str],
+    ) -> GenerationRead {
+        let lance = LanceSchema::try_from(stored_schema.as_ref()).expect("a lance schema");
         GenerationRead::new(
             &lance,
-            table,
-            vec!["id".to_string()],
-            wanted.iter().map(|s| s.to_string()).collect(),
+            &table_schema,
+            &["id".to_string()],
+            projection.iter().map(|s| s.to_string()).collect(),
         )
     }
 
@@ -478,7 +505,7 @@ mod tests {
     /// when a child is renamed — so pushing it down would evaluate it against
     /// child names the table does not have.
     #[test]
-    fn a_predicate_on_a_nested_column_is_never_pushed_down() {
+    fn a_predicate_on_a_struct_whose_child_was_renamed_is_not_pushed_down() {
         let nested = |child: &str| {
             with_id(
                 "info",
@@ -494,20 +521,60 @@ mod tests {
         assert_eq!(read.to_stored(&col("info").is_not_null()), None);
     }
 
+    /// The common case: a struct nothing moved is pushed down like any other
+    /// column. Deferring these was the bug -- a search takes its top-k first,
+    /// so a predicate applied afterwards loses a lower-ranked row that should
+    /// have won.
+    #[test]
+    fn a_predicate_on_a_struct_that_did_not_move_is_pushed_down() {
+        let unmoved = with_id(
+            "info",
+            DataType::Struct(Fields::from(vec![with_id("c", DataType::Int64, 2)])),
+            1,
+        );
+        let read = generation(
+            schema(vec![with_id("id", DataType::Int64, 0), unmoved.clone()]),
+            schema(vec![with_id("id", DataType::Int64, 0), unmoved]),
+            &["id", "info"],
+        );
+        let expr = col("info").is_not_null();
+        assert_eq!(read.to_stored(&expr), Some(expr));
+    }
+
+    /// Same name, same type, different field id: a child dropped and added
+    /// back is a different column wearing the old one's shape, so a predicate
+    /// on it must not reach the retired values.
+    #[test]
+    fn a_predicate_on_a_struct_whose_child_was_replaced_is_not_pushed_down() {
+        let child = |id: i32| {
+            with_id(
+                "info",
+                DataType::Struct(Fields::from(vec![with_id("c", DataType::Int64, id)])),
+                1,
+            )
+        };
+        let read = generation(
+            schema(vec![with_id("id", DataType::Int64, 0), child(2)]),
+            schema(vec![with_id("id", DataType::Int64, 0), child(9)]),
+            &["id", "info"],
+        );
+        assert_eq!(read.to_stored(&col("info").is_not_null()), None);
+    }
+
     /// With no ids to match on, the table's own names are the only link — the
     /// behaviour a caller that supplies no identity schema gets.
     #[test]
     fn a_table_without_ids_matches_by_name() {
-        let stored = Schema::new(vec![
+        let stored_schema = Schema::new(vec![
             with_id("id", DataType::Int64, 0),
             with_id("value", DataType::Int64, 1),
             with_id(TOMBSTONE, DataType::Boolean, 2),
         ]);
-        let table = Schema::new(vec![
+        let table_schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("value", DataType::Int64, true),
         ]);
-        let names = stored_names(&stored, &table);
+        let names = stored_names(&stored_schema, &table_schema);
         assert_eq!(names.get("value"), Some(&"value".to_string()));
         assert_eq!(names.get(TOMBSTONE), None, "not one of the table's columns");
     }

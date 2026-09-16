@@ -179,7 +179,6 @@ impl LsmVectorSearchPlanner {
         self
     }
 
-    /// Set the session used to open SSTables.
     /// The table's schema carrying each field's id, which is what resolves a
     /// generation's stored columns to the table's.
     ///
@@ -190,6 +189,7 @@ impl LsmVectorSearchPlanner {
         self
     }
 
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
@@ -519,13 +519,13 @@ impl LsmVectorSearchPlanner {
                 // the table's name while the file still holds the old one, so
                 // projecting the table's names would ask for a column that is
                 // not there.
-                let wanted =
+                let asked_for =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 let mut generation = GenerationRead::new(
                     dataset.schema(),
-                    Arc::clone(&self.identity_schema),
-                    self.pk_columns.clone(),
-                    wanted,
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
                 );
                 // The index is on this generation's own column, under the name
                 // it had when the generation was sealed.
@@ -537,19 +537,7 @@ impl LsmVectorSearchPlanner {
                 let vector_column = vector_column.to_string();
                 // A predicate this generation cannot answer as written runs
                 // above the reconciliation, where the columns it names exist.
-                // The search's own top-k has already run by then, so the arm
-                // can come back short — which is right: those rows have no
-                // value for a column sealed before it existed.
-                let stored_filter = self
-                    .filter
-                    .as_ref()
-                    .and_then(|expr| generation.to_stored(expr));
-                let above = self.filter.as_ref().filter(|_| stored_filter.is_none());
-                if let Some(expr) = above {
-                    for column in expr.column_refs() {
-                        generation.also_produce(&column.name);
-                    }
-                }
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 scanner.project(&generation.stored_projection())?;
                 if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
@@ -582,7 +570,7 @@ impl LsmVectorSearchPlanner {
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
                 let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match above {
+                match &above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),
                 }

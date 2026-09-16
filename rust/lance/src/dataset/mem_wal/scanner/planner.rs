@@ -326,6 +326,7 @@ impl LsmScanPlanner {
         Arc::new(Schema::new(fields))
     }
 
+    /// Build scan plan for a single data source.
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
@@ -372,13 +373,13 @@ impl LsmScanPlanner {
                 // Asked of this generation under its own names, so an older
                 // file is only asked for columns it has. A column it never had
                 // is filled in after the scan.
-                let wanted =
+                let asked_for =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 let mut generation = GenerationRead::new(
                     dataset.schema(),
-                    Arc::clone(&self.identity_schema),
-                    self.pk_columns.clone(),
-                    wanted,
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
                 );
                 // A predicate the generation can answer is pushed into its scan
                 // under the names it has. One it cannot — because it names a
@@ -386,13 +387,7 @@ impl LsmScanPlanner {
                 // the reconciliation instead, reading its columns from this
                 // scan, so they have to be in it whether the caller asked or
                 // not.
-                let stored_filter = filter.and_then(|expr| generation.to_stored(expr));
-                let above = filter.filter(|_| stored_filter.is_none());
-                if let Some(expr) = above {
-                    for column in expr.column_refs() {
-                        generation.also_produce(&column.name);
-                    }
-                }
+                let (stored_filter, above) = generation.split_filter(filter);
                 scanner.project(&generation.stored_projection())?;
                 scanner.with_row_address();
 
@@ -423,7 +418,7 @@ impl LsmScanPlanner {
                 // this future inlined pushes the `Send` proof past rustc's
                 // recursion limit for callers stacked above it.
                 let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match above {
+                match &above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),
                 }

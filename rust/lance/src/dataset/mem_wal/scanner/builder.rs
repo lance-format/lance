@@ -348,12 +348,8 @@ impl LsmScanner {
         self
     }
 
-    /// Register a shard's in-memory memtables (active + frozen-awaiting-
-    /// flush) captured atomically by `ShardWriter::in_memory_memtable_refs`.
-    /// The read path's entry point — closes the concurrent-read-vs-flush
-    /// hole by carrying frozen-undrained generations into the scan.
-    /// Supply `schema` with each field's id, so a sealed generation's columns
-    /// are resolved to the table's by id rather than by name. A rename keeps
+    /// Supply [`Self::schema`] with each field's id, so a sealed generation's
+    /// columns resolve to the table's by id rather than by name. A rename keeps
     /// the id and moves the name, so without this a renamed column reads as
     /// absent. Built with
     /// [`arrow_schema_with_field_ids`](crate::dataset::mem_wal::arrow_schema_with_field_ids).
@@ -364,6 +360,10 @@ impl LsmScanner {
         self
     }
 
+    /// Register a shard's in-memory memtables (active + frozen-awaiting-
+    /// flush) captured atomically by `ShardWriter::in_memory_memtable_refs`.
+    /// The read path's entry point — closes the concurrent-read-vs-flush
+    /// hole by carrying frozen-undrained generations into the scan.
     pub fn with_in_memory_memtables(
         mut self,
         shard_id: Uuid,

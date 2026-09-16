@@ -8,11 +8,16 @@
 //!
 //! # Limitations
 //!
-//! MemWAL does not track dataset changes made after it is initialized: dropping
-//! or replacing a maintained index, or projecting away its column, leaves
-//! `maintained_indexes` naming something the writer cannot build. A change that
-//! races the initialization commit lands the same way. Both surface as a failing
-//! `mem_wal_writer`; handling them is follow-up work.
+//! MemWAL does not track dataset changes made after it is initialized. The set
+//! named by `maintained_indexes` is fixed, so an index created later is not
+//! maintained over the fresh tier; it covers a row once that row reaches the
+//! base table.
+//!
+//! An index the set names but the dataset no longer has -- dropped, replaced, or
+//! carried away with the column it covered -- is skipped when a shard opens, so
+//! the table keeps serving without the fresh tier's copy of it. Naming one that
+//! does not exist is still rejected at initialization, which is the last moment
+//! it can be corrected.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -714,11 +719,6 @@ impl DatasetMemWalExt for Dataset {
     }
 }
 
-/// Build the in-memory index configurations for `index_names`.
-///
-/// Shared by [`DatasetMemWalExt::mem_wal_writer`] and
-/// [`validate_maintained_indexes`], so a set that validates is one the writer
-/// can build.
 /// Whether an index the set names but the dataset does not have is fatal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnMissingIndex {
@@ -732,6 +732,11 @@ enum OnMissingIndex {
     Skip,
 }
 
+/// Build the in-memory index configurations for `index_names`.
+///
+/// Shared by [`DatasetMemWalExt::mem_wal_writer`] and
+/// [`validate_maintained_indexes`], so a set that validates is one the writer
+/// can build.
 async fn build_index_configs(
     dataset: &Dataset,
     index_names: &[String],
