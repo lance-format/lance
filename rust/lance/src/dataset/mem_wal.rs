@@ -230,8 +230,25 @@ pub fn reconcile_batches(
     pk_columns: &[String],
     batches: Vec<RecordBatch>,
 ) -> lance_core::Result<Vec<RecordBatch>> {
+    // A generation numbers its own columns -- `_tombstone`, and anything the
+    // table has since dropped -- in its own schema, so those ids collide with
+    // whatever the table gave those numbers. Stripped before resolution, or a
+    // column added to the table resolves to whichever of them shares its id.
+    let source = ArrowSchema::new_with_metadata(
+        source_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                match field.name() != TOMBSTONE && !lance_core::is_system_column(field.name()) {
+                    true => field.as_ref().clone(),
+                    false => reconcile::without_field_id(field),
+                }
+            })
+            .collect::<Vec<_>>(),
+        source_schema.metadata().clone(),
+    );
     let plan =
-        reconcile::Plan::resolve(source_schema, target_schema, pk_columns)?.emitting_plain_schema();
+        reconcile::Plan::resolve(&source, target_schema, pk_columns)?.emitting_plain_schema();
     if plan.is_identity() {
         return Ok(batches);
     }
@@ -272,6 +289,47 @@ mod tests {
                 .into_iter()
                 .collect(),
         )
+    }
+
+    /// A generation numbers `_tombstone` in its own schema, so its id is
+    /// whatever that generation reached -- and the table has given that same
+    /// number to a column of its own. Honouring it would resolve the two to
+    /// each other and refuse the merge on their types.
+    #[test]
+    fn a_generations_tombstone_does_not_answer_for_a_column_sharing_its_id() {
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped(TOMBSTONE, DataType::Boolean, 1),
+        ]);
+        // The table gave id 1 to a column added after that generation sealed.
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("extra", DataType::Int64, 1),
+            ArrowField::new(TOMBSTONE, DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(arrow_array::BooleanArray::from(vec![false])),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("the tombstone's id must not be honoured");
+        let out = &out[0];
+        assert!(
+            out.column_by_name("extra").expect("extra").is_null(0),
+            "the added column has no value in a generation sealed before it"
+        );
+        let tombstone = out
+            .column_by_name(TOMBSTONE)
+            .expect("_tombstone")
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("boolean");
+        assert!(!tombstone.value(0), "and the row is still live");
     }
 
     /// Two children exchanging names is the case a name match cannot survive:
