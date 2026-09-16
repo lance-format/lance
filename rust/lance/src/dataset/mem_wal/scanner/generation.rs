@@ -210,17 +210,12 @@ impl GenerationRead {
     /// The schema [`Self::reconcile`] produces: the wanted columns as the table
     /// declares them, then whatever else the scan carries.
     ///
-    /// This is the intermediate schema, not the public one: nullability comes
-    /// from the source, which is where the rows actually are.
-    ///
-    /// A generation stores every non-key column as nullable however the table
-    /// declares it — that is what lets a strict table hold a tombstone, whose
-    /// payload is null in everything but the key. A point lookup carries
-    /// tombstones through on purpose, so those rows have to survive
-    /// reconciliation. A column the generation never stored is likewise null
-    /// for its rows. The table's own nullability is restored at the public
-    /// boundary, by the canonical projection each arm passes through, once the
-    /// tombstones have been dropped.
+    /// Nullability comes from the source, not the table: a generation stores
+    /// every non-key column as nullable, which is what lets a strict table hold
+    /// a tombstone. A point lookup carries tombstones through on purpose, so
+    /// those rows have to survive this. The table's own nullability is restored
+    /// by the canonical projection each arm passes through, after the
+    /// tombstones are dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
         let mut fields: Vec<Field> = self
             .wanted
@@ -266,7 +261,7 @@ pub(super) fn filter_above(
 
 /// The generation's name for each of the table's columns, by field id: a rename
 /// changes the name and keeps the id.
-pub(super) fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
+fn stored_names(stored: &Schema, table: &Schema) -> HashMap<String, String> {
     let by_id: HashMap<i32, &str> = table
         .fields()
         .iter()

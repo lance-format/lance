@@ -496,7 +496,10 @@ fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -
 #[cfg(test)]
 mod relabel_tests {
     use super::*;
-    use arrow_array::{Int64Array, StructArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, Int64Array, LargeListArray, ListArray, StructArray,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::Fields;
 
     fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
@@ -505,6 +508,21 @@ mod relabel_tests {
                 .into_iter()
                 .collect(),
         )
+    }
+
+    /// Relabel `column` to its own type with the field ids stripped, and check
+    /// that nothing but the labels moved.
+    fn strip_and_check(column: ArrayRef) -> ArrayRef {
+        let plain = without_field_ids_in(column.data_type());
+        let out = relabel_to(&column, &plain).expect("relabel");
+        assert_eq!(out.data_type(), &plain, "every level is relabelled");
+        assert_eq!(out.len(), column.len(), "row count is preserved");
+        assert_eq!(
+            out.null_count(),
+            column.null_count(),
+            "validity is preserved"
+        );
+        out
     }
 
     /// A field id lives inside a nested column's type at every level, so the
@@ -553,39 +571,6 @@ mod relabel_tests {
             .downcast_ref::<Int64Array>()
             .expect("the leaf");
         assert_eq!(values.value(0), 7);
-    }
-}
-
-#[cfg(test)]
-mod nested_relabel_tests {
-    use super::*;
-    use arrow_array::{
-        Array, FixedSizeListArray, Int64Array, LargeListArray, ListArray, StructArray,
-    };
-    use arrow_buffer::{NullBuffer, OffsetBuffer};
-    use arrow_schema::Fields;
-
-    fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
-        ArrowField::new(name, data_type, true).with_metadata(
-            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
-                .into_iter()
-                .collect(),
-        )
-    }
-
-    /// Relabel `column` to its own type with the field ids stripped, and check
-    /// that nothing but the labels moved.
-    fn strip_and_check(column: ArrayRef) -> ArrayRef {
-        let plain = without_field_ids_in(column.data_type());
-        let out = relabel_to(&column, &plain).expect("relabel");
-        assert_eq!(out.data_type(), &plain, "every level is relabelled");
-        assert_eq!(out.len(), column.len(), "row count is preserved");
-        assert_eq!(
-            out.null_count(),
-            column.null_count(),
-            "validity is preserved"
-        );
-        out
     }
 
     /// A struct whose parent is null at one row, and whose child is null at
