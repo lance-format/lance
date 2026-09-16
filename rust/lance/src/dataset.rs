@@ -2459,7 +2459,7 @@ impl Dataset {
             .manifest
             .base_paths
             .values()
-            .filter(|base| base.path == self.uri)
+            .filter(|base| base.path == self.uri && base.is_dataset_root)
             .min_by_key(|base| base.id)
         {
             return Ok(base.clone());

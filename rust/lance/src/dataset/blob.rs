@@ -5012,6 +5012,67 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn managed_append_preserves_primary_base_root_semantics(
+        #[values(false, true)] is_dataset_root: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let payload = vec![7; 100 * 1024];
+        let make_reader = || {
+            let mut blobs = BlobArrayBuilder::new(1);
+            blobs.push_bytes(&payload).unwrap();
+            let schema = Arc::new(Schema::new(vec![blob_field("blob", false)]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema)
+        };
+        Dataset::write(
+            make_reader(),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(
+                    7,
+                    test_dir.to_string(),
+                    None,
+                    is_dataset_root,
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                make_reader(),
+                &test_dir,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        for blob in blobs {
+            assert_eq!(blob.unwrap().read().await.unwrap().as_ref(), payload);
+        }
+        let base = dataset.managed_default_base().unwrap();
+        assert!(base.is_dataset_root);
+        assert_eq!(base.id, if is_dataset_root { 7 } else { 0 });
+        assert_eq!(
+            dataset.manifest.base_paths[&7].is_dataset_root,
+            is_dataset_root
+        );
+        assert_eq!(dataset.manifest.base_paths[&base.id], base);
+    }
+
     #[tokio::test]
     async fn managed_empty_range_does_not_discover_object_length() {
         let (store, recording) = recording_range_store(Bytes::from_static(b"not empty"));

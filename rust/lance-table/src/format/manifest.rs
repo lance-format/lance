@@ -189,10 +189,14 @@ impl Manifest {
             return Ok(());
         }
         if let Some(existing) = self.base_paths.get(&base.id) {
-            if existing.path != base.path {
+            if existing.path != base.path || existing.is_dataset_root != base.is_dataset_root {
                 return Err(Error::invalid_input(format!(
-                    "Managed base ID {} is bound to {:?}; descriptors require {:?}",
-                    base.id, existing.path, base.path
+                    "Managed base ID {} is bound to {:?} (is_dataset_root={}); descriptors require {:?} (is_dataset_root={})",
+                    base.id,
+                    existing.path,
+                    existing.is_dataset_root,
+                    base.path,
+                    base.is_dataset_root
                 )));
             }
         } else {
@@ -1202,8 +1206,37 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Field;
+    use lance_core::datatypes::{BLOB_V2_DESC_LANCE_FIELD, Field};
     use roaring::RoaringBitmap;
+
+    #[rstest::rstest]
+    #[case::different_path("memory://other", true)]
+    #[case::data_only("memory://dataset", false)]
+    fn managed_base_binding_preserves_address_contract(
+        #[case] path: &str,
+        #[case] is_dataset_root: bool,
+    ) {
+        let schema = Schema {
+            fields: vec![BLOB_V2_DESC_LANCE_FIELD.clone()],
+            ..Default::default()
+        };
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_3),
+            HashMap::new(),
+        );
+        let base = BasePath::new(7, "memory://dataset".to_string(), None, true);
+        manifest.bind_managed_base(base.clone()).unwrap();
+        manifest.bind_managed_base(base.clone()).unwrap();
+        let error = manifest
+            .bind_managed_base(BasePath::new(7, path.to_string(), None, is_dataset_root))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Managed base ID 7 is bound"));
+        assert!(error.to_string().contains("is_dataset_root="));
+        assert_eq!(manifest.base_paths[&7], base);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
