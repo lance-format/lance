@@ -491,6 +491,13 @@ enum Unsupported {
     /// A cast takes a new field id, which rows still in the WAL cannot be
     /// matched to.
     Retype,
+    /// Renaming a nested child onto a name one of its siblings currently holds.
+    /// Compaction matches a struct's children by name, so both sides would
+    /// carry the same two names and the merge could not tell which child is
+    /// which -- it would write each one's values under the other's name.
+    /// Resolving nested children by id there is more machinery than this case
+    /// is worth; a rename that does not collide with a sibling is unaffected.
+    SiblingNameReuse,
     /// Tightening a column to non-null is validated against base, and a write
     /// admitted into the WAL while that runs is not in base to be validated.
     /// Draining first does not close it: the drain waits for the generations it
@@ -499,6 +506,27 @@ enum Unsupported {
     /// in a table whose schema forbids it, and the compaction that would fold
     /// it into base fails from then on.
     Tightening,
+}
+
+/// Whether `alteration` renames a nested field onto a name one of its siblings
+/// currently holds. See [`Unsupported::SiblingNameReuse`].
+///
+/// Top-level renames are exempt: compaction resolves those by field id, so a
+/// pair of them can exchange names safely.
+fn renames_onto_a_sibling(dataset: &Dataset, alteration: &ColumnAlteration) -> bool {
+    let Some(rename) = &alteration.rename else {
+        return false;
+    };
+    let Some((parent, child)) = alteration.path.rsplit_once('.') else {
+        return false;
+    };
+    let Some(parent) = dataset.schema().field(parent) else {
+        return false;
+    };
+    parent
+        .children
+        .iter()
+        .any(|sibling| sibling.name != child && sibling.name == *rename)
 }
 
 async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
@@ -518,6 +546,12 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
             "cannot make a column non-nullable on a table with a MemWAL attached: the check \
              runs against the base table, and a write admitted into the WAL while it runs is \
              not there to be checked. Drop the MemWAL first."
+        }
+        Unsupported::SiblingNameReuse => {
+            "cannot rename a nested field onto a name one of its siblings holds on a table \
+             with a MemWAL attached: rows still in the WAL would have the two children \
+             matched by name and their values exchanged. Rename the sibling out of the way \
+             first, or drop the MemWAL."
         }
     }))
 }
@@ -784,6 +818,11 @@ pub(super) async fn alter_columns(
         Some(Unsupported::Retype)
     } else if alterations.iter().any(|a| a.nullable == Some(false)) {
         Some(Unsupported::Tightening)
+    } else if alterations
+        .iter()
+        .any(|a| renames_onto_a_sibling(dataset, a))
+    {
+        Some(Unsupported::SiblingNameReuse)
     } else {
         None
     };
