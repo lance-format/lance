@@ -1171,12 +1171,13 @@ impl<'a> CleanupTask<'a> {
                         &manifest_location.path,
                         manifest_location.size,
                     )
-                    .await?;
-                    ensure_can_read_manifest(&manifest)?;
-                    ensure_can_write_manifest(&manifest)?;
-
-                    if policy.should_clean(&manifest) {
-                        referenced_branches.insert(branch_name.clone());
+                    .await;
+                    if let Ok(manifest) = manifest {
+                        ensure_can_read_manifest(&manifest)?;
+                        ensure_can_write_manifest(&manifest)?;
+                        if policy.should_clean(&manifest) {
+                            referenced_branches.insert(branch_name.clone());
+                        }
                     }
                     Ok::<(), Error>(())
                 }
