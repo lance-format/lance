@@ -2030,7 +2030,7 @@ impl DatasetIndexExt for Dataset {
         // historical staleness pruning. Scalar merge helpers load their sources
         // through the FRI row-address remapper, so they must filter and report
         // coverage in that same current fragment space.
-        let remapped_source_coverage = if !all_vector && !all_rtree {
+        let has_remapped_source_coverage = if !all_vector && !all_rtree {
             remap_merged_segment_coverage(self, &mut source_segments).await?
         } else {
             false
@@ -2047,7 +2047,7 @@ impl DatasetIndexExt for Dataset {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
             self.manifest.version
-        } else if remapped_source_coverage {
+        } else if has_remapped_source_coverage {
             self.manifest.version
         } else {
             source_dataset_version
@@ -2058,7 +2058,12 @@ impl DatasetIndexExt for Dataset {
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                has_remapped_source_coverage,
+            )
+            .await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
         } else if all_bloomfilter {
