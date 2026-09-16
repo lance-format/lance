@@ -155,6 +155,15 @@ impl ZoneMapIndex {
         }
     }
 
+    fn scalar_is_negative_infinity(value: &ScalarValue) -> bool {
+        match value {
+            ScalarValue::Float16(Some(value)) => *value == half::f16::NEG_INFINITY,
+            ScalarValue::Float32(Some(value)) => *value == f32::NEG_INFINITY,
+            ScalarValue::Float64(Some(value)) => *value == f64::NEG_INFINITY,
+            _ => false,
+        }
+    }
+
     /// Returns true if the zone has a non-null, non-NaN min value.
     fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
         !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
@@ -294,6 +303,20 @@ impl ZoneMapIndex {
                 Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
+                // NaN counts do not preserve the sign bit. A range below negative
+                // infinity is how the planner retrieves sign-bit-set NaNs, so any
+                // NaN-bearing zone is a conservative candidate for that range.
+                if zone.nan_count > 0
+                    && matches!(start, Bound::Unbounded)
+                    && matches!(
+                        end,
+                        Bound::Included(value) | Bound::Excluded(value)
+                            if Self::scalar_is_negative_infinity(value)
+                    )
+                {
+                    return Ok(true);
+                }
+
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
                 if Self::zone_has_missing_extrema(zone) {
@@ -2653,6 +2676,18 @@ mod tests {
         // Should match all zones since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every zone
+        assert_eq!(result, SearchResult::at_most(expected));
+
+        // The planner uses this raw total-order range to retrieve negative NaNs.
+        // ZoneMap stores only a NaN count, not signs, so every NaN-bearing zone
+        // must remain a conservative candidate.
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a specific finite value that exists in the data
