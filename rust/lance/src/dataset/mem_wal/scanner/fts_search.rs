@@ -981,10 +981,14 @@ impl LsmFtsSearchPlanner {
                     scanner.prefilter(true);
                 }
                 let mut bound_query = query.clone().with_column(stored_column)?;
-                if let Some(limit) = limit {
-                    bound_query = bound_query.limit(Some(limit as i64));
-                } else {
-                    bound_query = bound_query.limit(None);
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the query has taken its top-k
+                // by score. Cutting first would drop rows that pass the
+                // predicate behind rows that do not, so a generation with a
+                // deferred predicate does not cut.
+                match limit.filter(|_| above.is_none()) {
+                    Some(limit) => bound_query = bound_query.limit(Some(limit as i64)),
+                    None => bound_query = bound_query.limit(None),
                 }
                 scanner.full_text_search(bound_query)?;
                 let reconciled = generation.reconcile(scanner.create_plan().await?)?;

@@ -554,6 +554,17 @@ impl LsmVectorSearchPlanner {
                 }
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has chosen its
+                // top-k. Cutting to `k` first would drop rows that pass the
+                // predicate behind rows that do not, so this arm does not cut:
+                // it ranks everything it holds and lets the filter, and then
+                // the union's own top-k, decide. Only a generation the
+                // predicate cannot be translated against pays for this.
+                let k = match above {
+                    None => k,
+                    Some(_) => dataset.count_rows(None).await?.max(1),
+                };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);

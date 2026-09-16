@@ -26,7 +26,7 @@ use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
-use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_ids_in};
+use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 /// One sealed generation, read under the table's schema.
@@ -158,8 +158,12 @@ impl GenerationRead {
         ) else {
             return false;
         };
-        // Field ids live inside a nested type, and are not part of the shape.
-        without_field_ids_in(stored.data_type()) == without_field_ids_in(declared.data_type())
+        // Compared with their field ids, not just their shapes. A nested child
+        // that was dropped and added back under the same name and type is a
+        // different column wearing the old one's shape, and pushing a predicate
+        // down against it would filter on the retired child's values while the
+        // reconciliation above synthesizes nulls for the new one.
+        stored.data_type() == declared.data_type()
     }
 
     /// Bring the scan's output back to the table's names and shapes: renames
