@@ -991,6 +991,9 @@ impl LsmFtsSearchPlanner {
                     None => bound_query = bound_query.limit(None),
                 }
                 scanner.full_text_search(bound_query)?;
+                // Boxed for the reason the scan planner's arm gives: a
+                // generation resolves its own schema before scanning, and
+                // the inlined future is too deep for the `Send` proof.
                 let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
                 match above {
                     Some(expr) => filter_above(reconciled, expr),
