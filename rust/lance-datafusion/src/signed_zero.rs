@@ -534,14 +534,6 @@ fn rewrite_ordered_comparison(
     bound: ScalarValue,
     metadata: Option<&FieldMetadata>,
 ) -> Expr {
-    if !matches!(other, Expr::Column(_)) {
-        return comparison(
-            normalize_nan_expr(other),
-            op,
-            raw_float_literal(bound, metadata),
-        );
-    }
-
     let Some(negative_infinity) = negative_infinity(&bound) else {
         return comparison(other.clone(), op, raw_float_literal(bound, metadata));
     };
@@ -804,6 +796,21 @@ mod tests {
         assert_eq!(
             rewrite(col("x").lt_eq(lit(1.0))),
             expected_ordered("x", Operator::LtEq, Float64(Some(1.0)))
+        );
+    }
+
+    #[test]
+    fn computed_literal_comparison_uses_indexable_ranges() {
+        let computed = col("x") * lit(2.0);
+        let primary = compare(computed.clone(), Operator::Gt, raw(Float64(Some(1.0))));
+        let negative_nan_range = compare(
+            computed.clone(),
+            Operator::Lt,
+            raw(Float64(Some(f64::NEG_INFINITY))),
+        );
+        assert_eq!(
+            rewrite(computed.gt(lit(1.0))),
+            primary.or(negative_nan_range)
         );
     }
 
