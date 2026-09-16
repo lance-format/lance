@@ -783,14 +783,33 @@ impl Dataset {
 
         let offset = read_metadata_offset(&last_block)?;
 
-        // If manifest is in the last block, we can decode directly from memory.
+        // A manifest cut short mid-write still ends in a footer whose offset
+        // may point past the object; refuse it rather than index by it.
         let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
+        let corrupt = |reason: &str| {
+            Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "manifest footer is unreadable ({reason}): object size {manifest_size}, metadata offset {offset}"
+                ),
+            )
+        };
+        if offset >= manifest_size {
+            return Err(corrupt("metadata offset is past the end of the object"));
+        }
+        let manifest_len = manifest_size - offset;
+        // If manifest is in the last block, we can decode directly from memory.
+        let mut manifest = if manifest_len <= last_block.len() {
             let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+            let Some(len_bytes) = last_block.get(offset_in_block..offset_in_block + 4) else {
+                return Err(corrupt("metadata shorter than its length prefix"));
+            };
+            let message_len = LittleEndian::read_u32(len_bytes) as usize;
+            let Some(message_data) =
+                last_block.get(offset_in_block + 4..offset_in_block + 4 + message_len)
+            else {
+                return Err(corrupt("metadata length exceeds the footer"));
+            };
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
             read_struct(object_reader.as_ref(), offset).await

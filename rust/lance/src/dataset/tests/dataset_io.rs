@@ -4029,3 +4029,47 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
         .expect("removing the offending rows must not be blocked under MemWAL");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 }
+
+/// A manifest torn mid-write (a crash on a local filesystem) must open as an
+/// error, not panic on a footer offset that lies past the object.
+#[tokio::test]
+async fn opening_a_truncated_manifest_is_an_error_not_a_panic() {
+    use std::io::Write;
+
+    let test_dir = TempStrDir::default();
+    let uri = test_dir.as_str();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow_array::Int32Array::from_iter_values(0..64))],
+    )
+    .unwrap();
+    Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let manifest = std::fs::read_dir(std::path::Path::new(uri).join("_versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "manifest"))
+        .unwrap();
+    let bytes = std::fs::read(&manifest).unwrap();
+    std::fs::File::create(&manifest)
+        .unwrap()
+        .write_all(&bytes[..bytes.len() / 2])
+        .unwrap();
+
+    let error = Dataset::open(uri).await.unwrap_err();
+    assert!(
+        matches!(error, Error::CorruptFile { .. } | Error::IO { .. }),
+        "unexpected error: {error}"
+    );
+}
