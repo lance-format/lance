@@ -401,37 +401,29 @@ impl ScalarQueryParser for JsonQueryParser {
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                // Support multiple JSON extraction functions
-                let json_functions = [
-                    "json_extract",
-                    "json_get",
-                    "json_get_int",
-                    "json_get_float",
-                    "json_get_bool",
-                    "json_get_string",
-                ];
-                if !json_functions.contains(&udf.name()) {
-                    return None;
-                }
+                // Only the typed accessors are routable. `json_extract` evaluates to
+                // serialized JSON text (`"click"`, `2`) while index keys hold decoded
+                // native values (`click`, `2`), so an indexed `json_extract` predicate
+                // would answer a different question than the unindexed one. Quoting is
+                // also not order-preserving (`ab` < `ab!` but `"ab"` > `"ab!"`), so even
+                // a Utf8 index cannot serve `json_extract` ranges. Let these fall back
+                // to a full scan until literals are transcoded into the index's
+                // representation. See https://github.com/lance-format/lance/issues/8806.
+                let value_type = match udf.name() {
+                    "json_get_int" => DataType::Int64,
+                    "json_get_float" => DataType::Float64,
+                    "json_get_bool" => DataType::Boolean,
+                    "json_get_string" => DataType::Utf8,
+                    _ => return None,
+                };
                 if udf.args.len() != 2 {
                     return None;
                 }
                 // We already know index 0 is a column reference to the column so we just need to
                 // ensure that index 1 matches our path
                 match &udf.args[1] {
-                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
-                        if path == &self.path {
-                            // Return the appropriate type based on the function
-                            match udf.name() {
-                                "json_get_int" => Some(DataType::Int64),
-                                "json_get_float" => Some(DataType::Float64),
-                                "json_get_bool" => Some(DataType::Boolean),
-                                "json_get_string" | "json_extract" => Some(DataType::Utf8),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
+                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) if path == &self.path => {
+                        Some(value_type)
                     }
                     _ => None,
                 }

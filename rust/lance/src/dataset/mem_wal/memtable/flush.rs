@@ -1199,8 +1199,6 @@ pub enum TriggerMemTableFlush {
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
-    /// Periodic tick: evict frozen memtables whose post-flush grace has elapsed.
-    SweepExpired,
 }
 
 impl std::fmt::Debug for TriggerMemTableFlush {
@@ -1212,7 +1210,6 @@ impl std::fmt::Debug for TriggerMemTableFlush {
                 .field("memtable_rows", &memtable.row_count())
                 .field("has_done", &done.is_some())
                 .finish(),
-            Self::SweepExpired => f.write_str("TriggerMemTableFlush::SweepExpired"),
         }
     }
 }

@@ -688,9 +688,8 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
         let mut base_versions: Vec<u64> = Vec::with_capacity(row_count_u64 as usize);
         if let Some(meta) = fragment.last_updated_at_version_meta.as_ref() {
             if let Ok(base_seq) = meta.load_sequence() {
-                for pos in 0..(row_count_u64 as usize) {
-                    base_versions.push(base_seq.version_at(pos).unwrap_or(prev_version));
-                }
+                base_versions.extend(base_seq.versions().take(row_count_u64 as usize));
+                base_versions.resize(row_count_u64 as usize, prev_version);
             } else {
                 base_versions.resize(row_count_u64 as usize, prev_version);
             }
@@ -800,6 +799,42 @@ mod tests {
         assert_eq!(seq.version_at(4), Some(2));
         assert_eq!(seq.version_at(5), Some(3));
         assert_eq!(seq.version_at(6), None);
+    }
+
+    #[test]
+    fn test_partial_refresh_streams_many_lineage_runs() {
+        const ROWS: usize = 10_000;
+        let prior_sequence = RowDatasetVersionSequence {
+            runs: (0..ROWS)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position as u64..position as u64 + 1),
+                    version: (position % 2 + 1) as u64,
+                })
+                .collect(),
+        };
+        let mut fragment = Fragment::new(1);
+        fragment.physical_rows = Some(ROWS);
+        fragment.last_updated_at_version_meta =
+            Some(RowDatasetVersionMeta::from_sequence(&prior_sequence).unwrap());
+
+        refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+            &mut fragment,
+            &[ROWS - 1],
+            3,
+            1,
+        )
+        .unwrap();
+
+        let refreshed = fragment
+            .last_updated_at_version_meta
+            .unwrap()
+            .load_sequence()
+            .unwrap();
+        assert_eq!(refreshed.len(), ROWS as u64);
+        assert_eq!(refreshed.version_at(0), Some(1));
+        assert_eq!(refreshed.version_at(1), Some(2));
+        assert_eq!(refreshed.version_at(ROWS - 2), Some(1));
+        assert_eq!(refreshed.version_at(ROWS - 1), Some(3));
     }
 
     #[test]

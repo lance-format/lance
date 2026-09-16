@@ -265,8 +265,7 @@ impl U64Segment {
         match self {
             Self::Range(range) => (range.end - range.start) as usize,
             Self::RangeWithHoles { range, holes } => {
-                let holes = holes.iter().count();
-                (range.end - range.start) as usize - holes
+                (range.end - range.start) as usize - holes.len()
             }
             Self::RangeWithBitmap { range, bitmap } => {
                 let holes = bitmap.count_zeros();
@@ -1118,6 +1117,27 @@ mod test {
         );
         assert_eq!(segment.len(), 5);
         assert_eq!(segment.iter().collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn test_range_with_holes_len_counts_holes_without_iterating() {
+        // Many holes: `len` must equal the range span minus the hole count and
+        // agree with the iterator, for every hole encoding width.
+        let holes: Vec<u64> = (0..50_000_u64).map(|i| 3 * i + 1).collect();
+        let segment = U64Segment::RangeWithHoles {
+            range: 0..150_000,
+            holes: holes.clone().into(),
+        };
+        assert_eq!(segment.len(), 150_000 - holes.len());
+        assert_eq!(segment.len(), segment.iter().count());
+
+        let wide_holes: Vec<u64> = vec![1 << 40, (1 << 40) + 7];
+        let wide = U64Segment::RangeWithHoles {
+            range: (1 << 40)..((1 << 40) + 10),
+            holes: wide_holes.into(),
+        };
+        assert_eq!(wide.len(), 8);
+        assert_eq!(wide.len(), wide.iter().count());
     }
 
     #[test]

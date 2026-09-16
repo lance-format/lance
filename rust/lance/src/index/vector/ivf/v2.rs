@@ -9,9 +9,10 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::{BinaryHeap, HashMap},
+    ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -27,7 +28,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
-use futures::{StreamExt, TryFutureExt};
+use futures::stream::FuturesUnordered;
+use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -42,7 +44,7 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
@@ -161,6 +163,329 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     batch_size
 });
 
+/// Prepared partition storage (bytes) handed to a single `spawn_cpu` dispatch on the
+/// global-top-k search path.
+///
+/// That path scores every probed partition into one heap, so it streams prepared
+/// partitions through scoring in chunks; the chunk is what bounds resident partition
+/// memory (together with the prepare window) independently of `nprobes`, see
+/// [`PreparedPartitionTracker`]. Chunking by bytes rather than by partition count
+/// keeps both the memory bound and the dispatch overhead predictable whatever the
+/// partition size: a dispatch costs two thread hops (~100µs), so on a warm cache
+/// the 16-partition streaming batch would spend ~40% of a 1024-probe query on
+/// dispatch overhead for ~800 KiB partitions, while a fixed large partition count
+/// would pin GiBs for the multi-MiB partitions of a billion-row RQ index. 64 MiB is
+/// a few milliseconds of scoring per dispatch across those sizes. Override with the
+/// `LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES` environment variable.
+pub(crate) const DEFAULT_GLOBAL_TOPK_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let chunk_bytes = std::env::var("LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        })
+        .unwrap_or(DEFAULT_GLOBAL_TOPK_CHUNK_BYTES);
+    assert!(
+        chunk_bytes > 0,
+        "LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES must be greater than 0, got {chunk_bytes}"
+    );
+    chunk_bytes
+});
+
+/// Upper bound on partitions per global-top-k scoring chunk, so that tiny partitions
+/// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
+/// expressible as a partition count: at most the prepare window plus two chunks.
+pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Largest global-top-k heap converted to the result batch on the async task
+/// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
+const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
+
+const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
+/// Default encoded-byte target of one prewarm read window.
+///
+/// Measured on one 1B-row IVF_RQ 1-bit segment (147 GB) read from S3 on
+/// r8i.8xlarge with 192 GiB of index cache: 16 MiB windows filled the cache at
+/// 500-526 MB/s regardless of how many windows were in flight (30, 128 or 512)
+/// or of `LANCE_IO_THREADS` (64, 256, 1024), while 64 MiB windows reached
+/// 935 MB/s with the same peak RSS (+1 GB) because the reader issues fewer,
+/// larger object-store requests (3.96 MB vs 2.47 MB average).
+const DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitionWindow {
+    partitions: Range<usize>,
+    estimated_encoded_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PrewarmFileLayout<'a> {
+    ivf: &'a IvfModel,
+    encoded_bytes: u64,
+    num_rows: u64,
+}
+
+fn parse_prewarm_window_size_bytes(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES);
+    };
+    let size = value.parse::<u64>().map_err(|error| {
+        Error::invalid_input(format!(
+            "{IVF_PREWARM_WINDOW_SIZE_ENV} must be a positive byte count, got {value:?}: {error}"
+        ))
+    })?;
+    if size == 0 {
+        return Err(Error::invalid_input(format!(
+            "{IVF_PREWARM_WINDOW_SIZE_ENV} must be a positive byte count, got {value:?}"
+        )));
+    }
+    Ok(size)
+}
+
+fn prewarm_window_size_bytes() -> Result<u64> {
+    let value = std::env::var(IVF_PREWARM_WINDOW_SIZE_ENV).ok();
+    parse_prewarm_window_size_bytes(value.as_deref())
+}
+
+fn estimate_encoded_bytes(num_data_bytes: u64, num_rows: u64, row_count: usize) -> u64 {
+    if row_count == 0 || num_rows == 0 || num_data_bytes == 0 {
+        return 0;
+    }
+    let numerator = u128::from(num_data_bytes) * row_count as u128;
+    numerator
+        .div_ceil(u128::from(num_rows))
+        .min(u64::MAX as u128) as u64
+}
+
+/// Plan adjacent partition windows by a metadata-estimated encoded-I/O target.
+///
+/// The target is measured in bytes, not partition count. It is not a hard
+/// decoded-memory cap: compression/page skew can make a window larger, and a
+/// single oversized partition is deliberately admitted as a singleton.
+fn plan_partition_windows(
+    index: PrewarmFileLayout<'_>,
+    storage: PrewarmFileLayout<'_>,
+    target_bytes: u64,
+    max_partitions: usize,
+) -> Result<Vec<PartitionWindow>> {
+    if target_bytes == 0 {
+        return Err(Error::invalid_input(
+            "IVF prewarm window target must be positive",
+        ));
+    }
+    if index.ivf.num_partitions() != storage.ivf.num_partitions() {
+        return Err(Error::index(format!(
+            "IVF index has {} partitions but auxiliary storage has {}",
+            index.ivf.num_partitions(),
+            storage.ivf.num_partitions()
+        )));
+    }
+    if max_partitions == 0 {
+        return Err(Error::invalid_input(
+            "IVF prewarm window partition cap must be positive",
+        ));
+    }
+
+    let mut windows = Vec::new();
+    let mut start = 0;
+    let mut window_bytes = 0_u64;
+    for partition_id in 0..index.ivf.num_partitions() {
+        let partition_bytes = estimate_encoded_bytes(
+            index.encoded_bytes,
+            index.num_rows,
+            index.ivf.partition_size(partition_id),
+        )
+        .checked_add(estimate_encoded_bytes(
+            storage.encoded_bytes,
+            storage.num_rows,
+            storage.ivf.partition_size(partition_id),
+        ))
+        .ok_or_else(|| Error::index("IVF prewarm partition byte estimate overflowed u64"))?;
+
+        let exceeds_target = window_bytes
+            .checked_add(partition_bytes)
+            .is_none_or(|bytes| bytes > target_bytes);
+        let is_discontinuous = partition_id > start
+            && (index.ivf.row_range(partition_id - 1).end
+                != index.ivf.row_range(partition_id).start
+                || storage.ivf.row_range(partition_id - 1).end
+                    != storage.ivf.row_range(partition_id).start);
+        let reached_partition_cap = partition_id - start >= max_partitions;
+        if partition_id > start && (exceeds_target || is_discontinuous || reached_partition_cap) {
+            windows.push(PartitionWindow {
+                partitions: start..partition_id,
+                estimated_encoded_bytes: window_bytes,
+            });
+            start = partition_id;
+            window_bytes = 0;
+        }
+        window_bytes = window_bytes
+            .checked_add(partition_bytes)
+            .ok_or_else(|| Error::index("IVF prewarm window byte estimate overflowed u64"))?;
+        if window_bytes > target_bytes {
+            windows.push(PartitionWindow {
+                partitions: start..partition_id + 1,
+                estimated_encoded_bytes: window_bytes,
+            });
+            start = partition_id + 1;
+            window_bytes = 0;
+        }
+    }
+    if start < index.ivf.num_partitions() {
+        windows.push(PartitionWindow {
+            partitions: start..index.ivf.num_partitions(),
+            estimated_encoded_bytes: window_bytes,
+        });
+    }
+    Ok(windows)
+}
+
+fn split_window_batches(
+    schema: &arrow_schema::SchemaRef,
+    partition_lengths: &[usize],
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    let expected_rows = partition_lengths
+        .iter()
+        .try_fold(0_usize, |total, length| {
+            total
+                .checked_add(*length)
+                .ok_or_else(|| Error::index("IVF prewarm window row count overflowed usize"))
+        })?;
+    let actual_rows = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| Error::index("IVF prewarm decoded row count overflowed usize"))
+    })?;
+    if actual_rows != expected_rows {
+        return Err(Error::index(format!(
+            "IVF prewarm window decoded {actual_rows} rows, expected {expected_rows}"
+        )));
+    }
+
+    let mut output = Vec::with_capacity(partition_lengths.len());
+    let mut batch_id = 0;
+    let mut batch_offset = 0;
+    for &partition_length in partition_lengths {
+        if partition_length == 0 {
+            output.push(vec![RecordBatch::new_empty(schema.clone())]);
+            continue;
+        }
+        let mut remaining = partition_length;
+        let mut slices = Vec::new();
+        while remaining > 0 {
+            let batch = batches.get(batch_id).ok_or_else(|| {
+                Error::index("IVF prewarm window ended before its partition boundary")
+            })?;
+            let available = batch.num_rows() - batch_offset;
+            let slice_length = available.min(remaining);
+            slices.push(batch.slice(batch_offset, slice_length));
+            batch_offset += slice_length;
+            remaining -= slice_length;
+            if batch_offset == batch.num_rows() {
+                batch_id += 1;
+                batch_offset = 0;
+            }
+        }
+        output.push(slices);
+    }
+    Ok(output)
+}
+
+fn compact_partition_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal("IVF prewarm partition has no decoded batches"))?
+        .schema();
+    if batches.len() == 1 {
+        let batch = batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::internal("IVF prewarm partition batch unexpectedly missing"))?;
+        if batch.num_rows() == 0 {
+            Ok(batch)
+        } else {
+            Ok(batch.shrink_to_fit()?)
+        }
+    } else {
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
+
+struct PartitionPrewarmBatches {
+    index: Vec<RecordBatch>,
+    storage: Vec<RecordBatch>,
+}
+
+async fn read_partition_window_batches(
+    reader: &FileReader,
+    projection: Option<&ReaderProjection>,
+    schema: &arrow_schema::SchemaRef,
+    ivf: &IvfModel,
+    partitions: Range<usize>,
+    io_stats: Option<IoStats>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    if partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let partition_lengths = if reader.num_rows() == 0 {
+        vec![0; partitions.len()]
+    } else {
+        partitions
+            .clone()
+            .map(|partition_id| ivf.partition_size(partition_id))
+            .collect::<Vec<_>>()
+    };
+    let row_start = if reader.num_rows() == 0 {
+        0
+    } else {
+        ivf.row_range(partitions.start).start
+    };
+    let row_end = if reader.num_rows() == 0 {
+        0
+    } else {
+        ivf.row_range(partitions.end - 1).end
+    };
+    let batches = if row_start == row_end {
+        Vec::new()
+    } else {
+        let reader = match &io_stats {
+            Some(io_stats) => Cow::Owned(reader.with_io_stats(io_stats.recorder())),
+            None => Cow::Borrowed(reader),
+        };
+        let params = ReadBatchParams::Range(row_start..row_end);
+        let stream = match projection {
+            Some(projection) => {
+                reader
+                    .read_stream_projected(
+                        params,
+                        u32::MAX,
+                        1,
+                        projection.clone(),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+            }
+            None => {
+                reader
+                    .read_stream(params, u32::MAX, 1, FilterExpression::no_filter())
+                    .await?
+            }
+        };
+        stream.try_collect::<Vec<_>>().await?
+    };
+    split_window_batches(schema, &partition_lengths, batches)
+}
+
+/// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
+/// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
+/// the window size is the lever.
+fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
+    io_parallelism.max(1).min(cpu_parallelism.max(1))
+}
+
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
     pre_filter: Arc<dyn PreFilter>,
@@ -169,7 +494,54 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<PartitionEntry<S, Q>>,
+    /// Released together with `part_entry`, so the tracker's live count is the
+    /// number of partitions whose storage is pinned by in-flight searches.
+    _in_flight: PreparedPartitionGuard,
     _marker: PhantomData<(S, Q)>,
+}
+
+/// Live count and high-water mark of [`PreparedPartitionSearch`] values for one
+/// index.
+///
+/// A prepared partition holds a strong reference to its [`PartitionEntry`] — the
+/// partition's whole quantized storage — until it has been scored and dropped, so
+/// the index cache cannot evict it in the meantime. The count is therefore the
+/// partition memory a query holds *outside* the cache's budget. Every search path
+/// must keep it bounded by its prepare window and scoring chunk size rather than
+/// by `nprobes`: a query that probes thousands of partitions of a large RQ index
+/// would otherwise pin hundreds of GiB before scoring the first one.
+#[derive(Debug, Default)]
+pub(crate) struct PreparedPartitionTracker {
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl PreparedPartitionTracker {
+    fn track(self: &Arc<Self>) -> PreparedPartitionGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        PreparedPartitionGuard(self.clone())
+    }
+
+    /// Prepared partitions currently alive.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Most prepared partitions alive at once over the index's lifetime.
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+struct PreparedPartitionGuard(Arc<PreparedPartitionTracker>);
+
+impl Drop for PreparedPartitionGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -545,6 +917,17 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
+    /// Memoized size of the immutable parts (this struct, the sub-index and the
+    /// quantized storage): every query that prepares this partition needs its
+    /// size to budget scoring chunks, and the walk over the storage's arrays
+    /// costs a few microseconds per partition — measurable on a warm
+    /// probe-everything query — while these never change once loaded.
+    immutable_bytes: OnceLock<usize>,
+    /// Memoized size of `partition_rows`, set when the coverage is built. Kept
+    /// apart from `immutable_bytes` because the coverage can appear after an
+    /// earlier query already memoized the size; folding it in later keeps
+    /// [`Self::size_bytes`] equal to [`DeepSizeOf::deep_size_of`].
+    coverage_bytes: OnceLock<usize>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
@@ -554,13 +937,31 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
+            immutable_bytes: OnceLock::new(),
+            coverage_bytes: OnceLock::new(),
         }
     }
 
+    /// Bytes this entry pins in memory, equal to [`DeepSizeOf::deep_size_of`]
+    /// but memoized: the immutable parts are computed on first use and the
+    /// lazily built partition coverage is added once it exists.
+    fn size_bytes(&self) -> usize {
+        let immutable = *self.immutable_bytes.get_or_init(|| {
+            let mut context = lance_core::deepsize::Context::new();
+            std::mem::size_of::<Self>()
+                + self.index.deep_size_of_children(&mut context)
+                + self.storage.deep_size_of_children(&mut context)
+        });
+        immutable + self.coverage_bytes.get().copied().unwrap_or_default()
+    }
+
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
-        self.partition_rows
-            .get_or_init(|| Arc::new(self.storage.row_ids().collect()))
-            .clone()
+        let rows = self
+            .partition_rows
+            .get_or_init(|| Arc::new(self.storage.row_ids().collect()));
+        self.coverage_bytes
+            .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
+        rows.clone()
     }
 }
 
@@ -668,6 +1069,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_query_residual: bool,
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
+    prepared_partitions: Arc<PreparedPartitionTracker>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -836,6 +1238,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -860,6 +1263,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -879,6 +1283,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -914,6 +1319,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(batch)
     }
 
+    /// Pull prepared partitions off `prepared` until their pinned storage reaches
+    /// `chunk_bytes` or the chunk holds [`GLOBAL_TOPK_CHUNK_MAX_PARTITIONS`],
+    /// always taking at least one. `None` once the stream is exhausted; a failed
+    /// prepare ends the chunk (and the search) immediately.
+    async fn next_scoring_chunk<St>(
+        prepared: &mut St,
+        chunk_bytes: usize,
+    ) -> Option<Result<Vec<PreparedPartitionSearch<S, Q>>>>
+    where
+        St: Stream<Item = Result<PreparedPartitionSearch<S, Q>>> + Unpin,
+    {
+        let mut chunk = Vec::new();
+        let mut bytes = 0;
+        while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
+            match prepared.next().await {
+                Some(Ok(prepared)) => {
+                    bytes += prepared.part_entry.size_bytes();
+                    chunk.push(prepared);
+                }
+                Some(Err(err)) => return Some(Err(err)),
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(Ok(chunk))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
         use_query_residual: bool,
@@ -931,6 +1366,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -1200,6 +1636,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
             open_io_stats,
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
     }
@@ -1243,8 +1680,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // the open-time I/O is not attributed here (it is a one-time cost,
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
+    }
+
+    /// Prepared-partition accounting for this index instance; see
+    /// [`PreparedPartitionTracker`].
+    #[cfg(test)]
+    pub(crate) fn prepared_partitions(&self) -> &PreparedPartitionTracker {
+        &self.prepared_partitions
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -1358,6 +1803,152 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(PartitionEntry::new(idx, storage))
     }
 
+    async fn materialize_prewarm_partition(
+        &self,
+        partition_id: usize,
+        batches: PartitionPrewarmBatches,
+    ) -> Result<PartitionEntry<S, Q>>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let sub_index_metadata = self.sub_index_metadata[partition_id].clone();
+        if batches.index.iter().all(|batch| batch.num_rows() == 0) {
+            // IVF-Flat/RQ stores no per-partition sub-index rows. Keep this
+            // trivial construction inline instead of dispatching one CPU task
+            // per partition (hundreds of thousands on large indexes).
+            let batch = compact_partition_batches(batches.index)?
+                .add_metadata(S::metadata_key().to_owned(), sub_index_metadata)?;
+            let index = S::load(batch)?;
+            let storage = self
+                .storage
+                .materialize_partition_for_prewarm(batches.storage)
+                .await?;
+            return Ok(PartitionEntry::new(index, storage));
+        }
+        let index = spawn_cpu(move || {
+            let batch = compact_partition_batches(batches.index)?
+                .add_metadata(S::metadata_key().to_owned(), sub_index_metadata)?;
+            S::load(batch)
+        });
+        let storage = self
+            .storage
+            .materialize_partition_for_prewarm(batches.storage);
+        let (index, storage) = tokio::try_join!(index, storage)?;
+        Ok(PartitionEntry::new(index, storage))
+    }
+
+    async fn prewarm_partition_window(&self, partitions: Range<usize>) -> Result<()>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let index_schema = Arc::new(match &self.read_projection {
+            Some(projection) => projection.schema.as_ref().into(),
+            None => self.reader.schema().as_ref().into(),
+        });
+        let storage_schema = Arc::new(self.storage.reader().schema().as_ref().into());
+        let mut partition_id = partitions.start;
+        while partition_id < partitions.end {
+            let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
+            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+                partition_id += 1;
+                continue;
+            }
+
+            // Stop at a cached hole. This prevents a warm partition from being
+            // included in a larger contiguous read merely because later
+            // partitions are cold.
+            let mut run_end = partition_id + 1;
+            while run_end < partitions.end {
+                let key = IVFPartitionKey::<S, Q>::new(run_end);
+                if self.index_cache.get_with_key(&key).await.is_some() {
+                    break;
+                }
+                run_end += 1;
+            }
+            let run = partition_id..run_end;
+            let (_, was_cached) = self
+                .index_cache
+                .get_or_insert_with_key_hit(leader_key, || async {
+                    let (index_batches, storage_batches) = tokio::try_join!(
+                        read_partition_window_batches(
+                            &self.reader,
+                            self.read_projection.as_ref(),
+                            &index_schema,
+                            &self.ivf,
+                            run.clone(),
+                            None,
+                        ),
+                        read_partition_window_batches(
+                            self.storage.reader(),
+                            None,
+                            &storage_schema,
+                            self.storage.ivf(),
+                            run.clone(),
+                            None,
+                        )
+                    )?;
+                    if index_batches.len() != run.len() || storage_batches.len() != run.len() {
+                        return Err(Error::internal(format!(
+                            "IVF prewarm run {:?} produced {} index and {} storage partitions",
+                            run,
+                            index_batches.len(),
+                            storage_batches.len()
+                        )));
+                    }
+
+                    let mut payloads = index_batches
+                        .into_iter()
+                        .zip(storage_batches)
+                        .map(|(index, storage)| PartitionPrewarmBatches { index, storage });
+                    let leader_batches = payloads.next().ok_or_else(|| {
+                        Error::internal(format!(
+                            "IVF prewarm run {:?} did not produce its leader partition",
+                            run
+                        ))
+                    })?;
+                    let mut follower_loads = FuturesUnordered::new();
+                    for (offset, batches) in payloads.enumerate() {
+                        let follower_id = run.start + offset + 1;
+                        follower_loads.push(async move {
+                            let key = IVFPartitionKey::<S, Q>::new(follower_id);
+                            self.index_cache
+                                .get_or_insert_with_key(key, || async move {
+                                    self.materialize_prewarm_partition(follower_id, batches)
+                                        .await
+                                })
+                                .await
+                                .map(|_| ())
+                        });
+                    }
+                    let mut first_error = None;
+                    while let Some(result) = follower_loads.next().await {
+                        if let Err(error) = result
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                    self.materialize_prewarm_partition(partition_id, leader_batches)
+                        .await
+                })
+                .await?;
+            partition_id = if was_cached {
+                // A query or another prewarm owned this key. It may not have
+                // populated the remainder of our planned window, so resume at
+                // the next partition instead of skipping the full run.
+                partition_id + 1
+            } else {
+                run_end
+            };
+        }
+        Ok(())
+    }
+
     pub async fn load_partition_storage(
         &self,
         partition_id: usize,
@@ -1411,13 +2002,49 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        futures::stream::iter(0..self.ivf.num_partitions())
+        let cpu_parallelism = get_num_compute_intensive_cpus();
+        let target_bytes = prewarm_window_size_bytes()?;
+        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
+        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+        let windows = plan_partition_windows(
+            PrewarmFileLayout {
+                ivf: &self.ivf,
+                encoded_bytes: self.reader.metadata().num_data_bytes,
+                num_rows: self.reader.num_rows(),
+            },
+            PrewarmFileLayout {
+                ivf: self.storage.ivf(),
+                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
+                num_rows: self.storage.reader().num_rows(),
+            },
+            target_bytes,
+            max_partitions,
+        )?;
+        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+        info!(
+            uuid = %self.uuid,
+            windows = windows.len(),
+            planned_bytes,
+            window_bytes = target_bytes,
+            parallelism,
+            io_parallelism = self.io_parallelism,
+            "prewarming IVF partitions in byte windows"
+        );
+        let started = std::time::Instant::now();
+        stream::iter(windows)
             .map(Ok)
-            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
-                self.load_partition(part_id, true, &NoOpMetricsCollector)
-                    .map_ok(|_| ())
+            .try_for_each_concurrent(Some(parallelism), |window| async move {
+                self.prewarm_partition_window(window.partitions).await
             })
-            .await
+            .await?;
+        let elapsed = started.elapsed();
+        info!(
+            uuid = %self.uuid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+            "prewarmed IVF partitions"
+        );
+        Ok(())
     }
 
     fn index_type(&self) -> IndexType {
@@ -1685,7 +2312,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
-            let prepared = stream::iter(start_idx..end_idx)
+            // Stream prepared partitions through scoring in chunks rather than
+            // collecting all of them first. A prepared partition pins its whole
+            // quantized storage, so collecting `nprobes` of them before scoring
+            // makes peak memory scale with `nprobes` (a 4096-probe query over a
+            // large RQ index pinned hundreds of GiB per index segment). Chunking
+            // bounds resident partitions to the prepare window plus two chunks:
+            // one being assembled by `next_scoring_chunk` while another is scored.
+            // `buffered` preserves the probe order, so the heap accumulates
+            // partitions in the same order as before (which decides which of
+            // several rows tied at the k-th distance the capped heap keeps).
+            let mut prepared = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -1707,32 +2344,54 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     }
                 })
                 .buffered(prepare_parallelism)
-                .try_collect::<Vec<_>>()
-                .await?;
+                .fuse();
+            let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
             let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
-            let search_metrics = metrics.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
-                let mut heap = BinaryHeap::with_capacity(heap_capacity);
-                scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
-                    for prepared in prepared {
-                        Self::accumulate_prepared_partition_search(
-                            use_query_residual,
-                            use_residual_scratch,
-                            prepared,
-                            &mut heap,
-                            scratch,
-                            search_metrics.as_ref(),
-                        )
-                        .map_err(DataFusionError::from)?;
-                    }
-                    Ok(())
-                })?;
-                Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
-            })
-            .await?;
+            let mut heap = BinaryHeap::with_capacity(heap_capacity);
+            // Score each chunk on the CPU pool while the next chunk prepares (the
+            // same overlap `search_partitions_batch` uses): `spawn_cpu` starts the
+            // scoring immediately and the async task, never a CPU-pool thread, does
+            // the waiting (#7642). The heap is threaded through each dispatch so
+            // scoring stays sequential, and a scored chunk is dropped before the
+            // next one is scored.
+            let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
+            while let Some(chunk) = pending {
+                let chunk = chunk?;
+                let search_metrics = metrics.clone();
+                let scratch_pool = self.scratch_pool.clone();
+                let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    scratch_pool.with_scratch(|scratch| -> Result<()> {
+                        for prepared in chunk {
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heap,
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    Ok(heap)
+                });
+                let (scored, next) =
+                    futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
+                heap = scored?;
+                pending = next;
+            }
+
+            // Turning the heap into the result batch is a sort of `k * refine_factor`
+            // entries. Below a few thousand that is well under the ~100µs where a
+            // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
+            // common small-k query at one dispatch (as before the chunked scoring).
+            let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
+                Self::global_heap_to_batch(heap)?
+            } else {
+                spawn_cpu(move || Self::global_heap_to_batch(heap)).await?
+            };
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
@@ -1928,6 +2587,187 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         )))
     }
 
+    fn supports_batch_partition_search(&self) -> bool {
+        S::supports_global_topk_heap()
+    }
+
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>> {
+        if !S::supports_global_topk_heap() {
+            return Err(Error::not_supported(
+                "batch partition search requires a global top-k heap sub-index",
+            ));
+        }
+        let query_count = partitions_per_query.len();
+        if q_c_dists_per_query.len() != query_count {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: {query_count} query partition lists but {} distance lists",
+                q_c_dists_per_query.len()
+            )));
+        }
+        if query_count == 0 {
+            return Ok(Vec::new());
+        }
+        if !query.key.len().is_multiple_of(query_count) {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: query key length {} is not divisible by query count {query_count}",
+                query.key.len()
+            )));
+        }
+        let dim = query.key.len() / query_count;
+
+        // Per-query immutable search state: the query vector slice and the
+        // optional Rabit raw-query context both depend only on the query vector,
+        // so compute them once up front rather than per probed partition.
+        let mut base_queries = Vec::with_capacity(query_count);
+        let mut raw_query_contexts = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
+                return Err(Error::invalid_input(format!(
+                    "batch partition search: query {query_index} has {} partitions but {} distances",
+                    partitions_per_query[query_index].len(),
+                    q_c_dists_per_query[query_index].len()
+                )));
+            }
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
+            base_queries.push(single_query);
+        }
+        // Shared across every chunk's scoring dispatch below, so wrap once in an
+        // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = Arc::new(base_queries);
+        let raw_query_contexts = Arc::new(raw_query_contexts);
+
+        // Invert the per-query partition lists so each distinct partition is
+        // loaded once and scored against every query that probes it.
+        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+        for (query_index, (parts, dists)) in partitions_per_query
+            .iter()
+            .zip(q_c_dists_per_query.iter())
+            .enumerate()
+        {
+            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
+                assignments
+                    .entry(*part_id)
+                    .or_default()
+                    .push((query_index, *dist_q_c));
+            }
+        }
+
+        pre_filter.wait_for_ready().await?;
+
+        // Score partitions in a deterministic order. `assignments` is a HashMap,
+        // so its iteration order (and hence the order partitions accumulate into
+        // each per-query heap) is otherwise arbitrary. When several rows tie at
+        // the k-th distance, which one the capped heap keeps depends on insertion
+        // order, so a stable partition order is what makes the selected top-k
+        // deterministic across runs. (Any of the tied rows is an equally valid
+        // k-th neighbor, so this does not affect recall.)
+        let mut assignment_list: Vec<(u32, Vec<(usize, f32)>)> = assignments.into_iter().collect();
+        assignment_list.sort_by_key(|(part_id, _)| *part_id);
+
+        // Load each distinct partition's storage exactly once (the shared I/O
+        // that batch search exists to save), but *stream* the loaded partitions
+        // through scoring in chunks rather than materializing them all. A wide
+        // batch probes up to `min(query_count * nprobes, num_partitions)` distinct
+        // partitions, so collecting every loaded partition before scoring would
+        // make peak memory scale with the batch width — up to the whole index.
+        // Streaming bounds resident partition storage to the load window plus one
+        // chunk. `buffered` preserves the sorted load order above, so scoring order
+        // (and thus the k-th-distance tie-break) stays deterministic.
+        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_index = self.clone();
+        let load_metrics = metrics.clone();
+        let mut loaded_chunks = stream::iter(assignment_list)
+            .map(move |(part_id, probing_queries)| {
+                let index = load_index.clone();
+                let metrics = load_metrics.clone();
+                async move {
+                    let part_entry = index
+                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .await?;
+                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                }
+            })
+            .buffered(load_parallelism)
+            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
+            .map(|_| BinaryHeap::with_capacity(heap_capacity))
+            .collect();
+
+        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
+        // dispatches the scoring immediately and only touches CPU-bound state, so
+        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
+        // flight during scoring: the async task, never a CPU-pool thread, does the
+        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
+        // docs recommend with `buffered`). Scoring stays sequential across chunks —
+        // each mutates the same per-query heaps — so a step costs about
+        // max(load, score) rather than their sum, and a scored chunk's storage is
+        // dropped before the next is scored, keeping peak memory bounded.
+        let mut pending = loaded_chunks.next().await;
+        while let Some(chunk) = pending {
+            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+            let index = self.clone();
+            let pre_filter = pre_filter.clone();
+            let base_queries = base_queries.clone();
+            let raw_query_contexts = raw_query_contexts.clone();
+            let scratch_pool = self.scratch_pool.clone();
+            let search_metrics = metrics.clone();
+            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                scratch_pool.with_scratch(|scratch| -> Result<()> {
+                    for (part_id, part_entry, probing_queries) in &chunk {
+                        let partition_centroid = index.ivf.centroid(*part_id);
+                        for (query_index, dist_q_c) in probing_queries {
+                            let mut single_query = base_queries[*query_index].clone();
+                            single_query.dist_q_c = *dist_q_c;
+                            let prepared = PreparedPartitionSearch::<S, Q> {
+                                query: single_query,
+                                pre_filter: pre_filter.clone(),
+                                partition_id: *part_id,
+                                partition_centroid: partition_centroid.clone(),
+                                rq_search_cache: index.rq_search_cache.clone(),
+                                raw_query_context: raw_query_contexts[*query_index].clone(),
+                                part_entry: part_entry.clone(),
+                                _in_flight: index.prepared_partitions.track(),
+                                _marker: PhantomData,
+                            };
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heaps[*query_index],
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(heaps)
+            });
+            // Load the next chunk while this one is scored on the CPU pool.
+            let (scored, next) = futures::join!(score, loaded_chunks.next());
+            heaps = scored?;
+            pending = next;
+        }
+
+        heaps
+            .into_iter()
+            .map(Self::global_heap_to_batch)
+            .collect::<Result<Vec<_>>>()
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -2117,6 +2957,7 @@ mod tests {
         storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
+    use lance_index::vector::ivf::storage::IvfModel;
     use lance_index::vector::storage::VectorStore;
     use lance_index::vector::v3::subindex::IvfSubIndex;
 
@@ -2135,16 +2976,18 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
+    use futures::TryStreamExt;
     use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache, WeakLanceCache};
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tokio::get_num_compute_intensive_cpus;
     use lance_core::{ROW_ID, Result};
     use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::prefilter::PreFilter;
+    use lance_index::prefilter::{NoFilter, PreFilter};
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -2157,6 +3000,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -2191,6 +3035,162 @@ mod tests {
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    #[test]
+    fn test_prewarm_parallelism_is_bounded_by_io_and_cpu() {
+        assert_eq!(super::prewarm_parallelism(8, 4), 4);
+        assert_eq!(super::prewarm_parallelism(2, 4), 2);
+        assert_eq!(super::prewarm_parallelism(0, 0), 1);
+    }
+
+    #[test]
+    fn test_prewarm_window_size_config() {
+        assert_eq!(
+            super::parse_prewarm_window_size_bytes(None).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            super::parse_prewarm_window_size_bytes(Some("1048576")).unwrap(),
+            1_048_576
+        );
+        for value in ["0", "not-a-byte-count"] {
+            let error = super::parse_prewarm_window_size_bytes(Some(value)).unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES"));
+            assert!(message.contains(value));
+        }
+    }
+
+    fn ivf_with_lengths(lengths: &[u32]) -> IvfModel {
+        let mut ivf = IvfModel::empty();
+        for &length in lengths {
+            ivf.add_partition(length);
+        }
+        ivf
+    }
+
+    fn prewarm_layout(
+        ivf: &IvfModel,
+        encoded_bytes: u64,
+        num_rows: u64,
+    ) -> super::PrewarmFileLayout<'_> {
+        super::PrewarmFileLayout {
+            ivf,
+            encoded_bytes,
+            num_rows,
+        }
+    }
+
+    #[test]
+    fn test_plan_prewarm_windows_uses_combined_encoded_bytes() {
+        let ivf = ivf_with_lengths(&[2, 0, 4, 20, 0, 2]);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&ivf, 112, 28),
+            prewarm_layout(&ivf, 168, 28),
+            50,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            windows,
+            vec![
+                super::PartitionWindow {
+                    partitions: 0..2,
+                    estimated_encoded_bytes: 20,
+                },
+                super::PartitionWindow {
+                    partitions: 2..3,
+                    estimated_encoded_bytes: 40,
+                },
+                super::PartitionWindow {
+                    partitions: 3..4,
+                    estimated_encoded_bytes: 200,
+                },
+                super::PartitionWindow {
+                    partitions: 4..6,
+                    estimated_encoded_bytes: 20,
+                },
+            ]
+        );
+        assert_eq!(windows.first().unwrap().partitions.start, 0);
+        assert_eq!(windows.last().unwrap().partitions.end, ivf.num_partitions());
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].partitions.end, pair[1].partitions.start);
+        }
+    }
+
+    #[test]
+    fn test_plan_prewarm_windows_caps_empty_partitions_and_splits_gaps() {
+        let empty_ivf = ivf_with_lengths(&[0, 0, 0, 0, 0]);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&empty_ivf, 0, 0),
+            prewarm_layout(&empty_ivf, 0, 0),
+            1024,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.partitions.clone())
+                .collect::<Vec<_>>(),
+            vec![0..2, 2..4, 4..5]
+        );
+
+        let index_ivf = ivf_with_lengths(&[2, 2, 2]);
+        let mut storage_ivf = IvfModel::empty();
+        storage_ivf.add_partition_with_offset(0, 2);
+        storage_ivf.add_partition_with_offset(20, 2);
+        storage_ivf.add_partition_with_offset(22, 2);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&index_ivf, 6, 6),
+            prewarm_layout(&storage_ivf, 6, 6),
+            1024,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.partitions.clone())
+                .collect::<Vec<_>>(),
+            vec![0..1, 1..3]
+        );
+    }
+
+    #[test]
+    fn test_split_prewarm_window_compacts_partition_buffers() {
+        let parent = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let parent_ptr = parent["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        let parent_size = parent["value"].get_array_memory_size();
+        let mut partitions =
+            super::split_window_batches(&parent.schema(), &[10, 0, 90], vec![parent]).unwrap();
+
+        let shared_ptr = partitions[0][0]["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        assert_eq!(shared_ptr, parent_ptr);
+        let compact = super::compact_partition_batches(partitions.remove(0)).unwrap();
+        let compact_ptr = compact["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        assert_ne!(compact_ptr, parent_ptr);
+        assert_lt!(compact["value"].get_array_memory_size(), parent_size);
+        assert_eq!(compact.num_rows(), 10);
+        assert_eq!(partitions[0][0].num_rows(), 0);
+        assert_eq!(partitions[1][0].num_rows(), 90);
+    }
 
     struct PartitionCoverageTestFilter {
         needs_partition_rows: bool,
@@ -2241,6 +3241,9 @@ mod tests {
             .await;
         let weak_cache = WeakLanceCache::from(&cache);
         let size_without_coverage = entry.deep_size_of();
+        // Memoize the chunk-budget size before the coverage exists; it must
+        // still pick the coverage up once a later filter builds it.
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_without_coverage = cache.size_bytes().await;
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
@@ -2275,6 +3278,7 @@ mod tests {
         let second_rows = entry.partition_rows();
         assert!(Arc::ptr_eq(&first_rows, &second_rows));
         assert!(entry.deep_size_of() > size_without_coverage);
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_with_coverage = cache.size_bytes().await;
         assert!(cache_weight_with_coverage > cache_weight_without_coverage);
         assert!(cache_weight_with_coverage >= entry.deep_size_of());
@@ -2566,11 +3570,15 @@ mod tests {
         (batch, schema)
     }
 
+    /// Rows of `vectors_per_row` vectors around their cluster's centroid. The
+    /// `straddling_row`, if any, spreads its vectors over the centroids instead,
+    /// one per vector, so it belongs to several partitions at once.
     fn generate_clustered_multivec_batch(
         cluster_sizes: &[usize],
         centroids: &[(f32, f32)],
         vectors_per_row: usize,
         start_id: u64,
+        straddling_row: Option<u64>,
     ) -> (RecordBatch, SchemaRef) {
         assert_eq!(
             cluster_sizes.len(),
@@ -2585,9 +3593,14 @@ mod tests {
         let mut current_id = start_id;
         for (&rows, &(x, y)) in cluster_sizes.iter().zip(centroids.iter()) {
             for _ in 0..rows {
-                ids.push(current_id);
+                let row_id = current_id;
+                ids.push(row_id);
                 current_id += 1;
-                for _ in 0..vectors_per_row {
+                for vector_idx in 0..vectors_per_row {
+                    let (x, y) = match straddling_row {
+                        Some(id) if id == row_id => centroids[vector_idx % centroids.len()],
+                        _ => (x, y),
+                    };
                     for dim in 0..DIM {
                         let base = match dim {
                             0 => x,
@@ -2796,11 +3809,13 @@ mod tests {
         num_partitions: usize,
         refine_factor: u32,
         ef: usize,
+        distance_type: DistanceType,
     ) -> RecordBatch {
         dataset
             .scan()
             .nearest("vector", query, k)
             .unwrap()
+            .distance_metric(distance_type)
             .minimum_nprobes(num_partitions)
             .ef(ef)
             .refine(refine_factor)
@@ -2877,30 +3892,57 @@ mod tests {
             assert_eq!(hnsw_params["ef_construction"], 16);
         }
 
+        // A single k=10 query of 4-bit PQ + Dot sits near the 0.5 bar: Windows
+        // CI has landed at 0.4 (4/10). Average over several queries so one
+        // platform-dependent ranking does not fail the contract.
+        const NUM_QUERIES: usize = 10;
+        // 4-bit PQ ranking is coarser; rescoring more candidates is cheap on
+        // this 256-row fixture and keeps mean recall clear of 0.5.
+        let refine_factor = if num_bits == 4 { 8 } else { 4 };
+        // HNSW requires ef >= k * refine. IVF_PQ ignores ef.
+        let ef = 64.max(K * refine_factor as usize);
+        let mut hits = 0usize;
         let query = vectors.value(0);
-        let ground_truth = ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
         let before_reopen = search_lightweight_pq_index(
             &dataset,
             query.as_ref(),
             K,
             LIGHTWEIGHT_PQ_PARTITIONS,
-            4,
-            64,
+            refine_factor,
+            ef,
+            distance_type,
         )
         .await;
-        assert_eq!(before_reopen.num_rows(), K);
-        let row_ids = before_reopen[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
-        let distances = before_reopen[DIST_COL]
-            .as_primitive::<Float32Type>()
-            .values();
-        assert!(distances.iter().all(|distance| distance.is_finite()));
-        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
-        let recall = row_ids
-            .iter()
-            .filter(|row_id| ground_truth.contains(row_id))
-            .count() as f32
-            / K as f32;
+        for query_idx in 0..NUM_QUERIES {
+            let query = vectors.value(query_idx);
+            let ground_truth =
+                ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
+            let result = if query_idx == 0 {
+                before_reopen.clone()
+            } else {
+                search_lightweight_pq_index(
+                    &dataset,
+                    query.as_ref(),
+                    K,
+                    LIGHTWEIGHT_PQ_PARTITIONS,
+                    refine_factor,
+                    ef,
+                    distance_type,
+                )
+                .await
+            };
+            assert_eq!(result.num_rows(), K);
+            let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+            assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+            let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+            assert!(distances.iter().all(|distance| distance.is_finite()));
+            assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+            hits += row_ids
+                .iter()
+                .filter(|row_id| ground_truth.contains(row_id))
+                .count();
+        }
+        let recall = hits as f32 / (NUM_QUERIES * K) as f32;
         assert_ge!(recall, 0.5, "recall: {recall}");
 
         drop(dataset);
@@ -2914,8 +3956,9 @@ mod tests {
                 query.as_ref(),
                 K,
                 LIGHTWEIGHT_PQ_PARTITIONS,
-                4,
-                64,
+                refine_factor,
+                ef,
+                distance_type,
             )
             .await,
             before_reopen
@@ -2987,7 +4030,7 @@ mod tests {
         delete_ids(dataset, &ids[1..]).await;
         compact_after_deletions(dataset).await;
 
-        append_constant_vector_with_start_id(
+        append_template_vector_with_start_id(
             dataset,
             ROWS_TO_APPEND_FOR_JOIN,
             &template_values,
@@ -3019,13 +4062,13 @@ mod tests {
         (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
-    async fn append_constant_vector_with_start_id(
+    async fn append_template_vector_with_start_id(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         next_id: &mut u64,
     ) {
-        append_constant_vector_batch(dataset, rows, template, *next_id, None).await;
+        append_template_vector_batch(dataset, rows, template, *next_id, None).await;
         *next_id += rows as u64;
     }
 
@@ -3052,10 +4095,15 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + total_rows as u64,
         ));
+        // A tiny per-row drift keeps the appended rows distinct (identical rows
+        // cannot be split by clustering) without moving them off their template's
+        // partition.
         let mut appended_values = Vec::with_capacity(total_rows * DIM);
         for template in templates {
-            for _ in 0..rows_per_template {
-                appended_values.extend_from_slice(template);
+            for row in 0..rows_per_template {
+                let mut values = template.clone();
+                values[0] += row as f32 * 0.0001;
+                appended_values.extend_from_slice(&values);
             }
         }
         let vectors = Arc::new(
@@ -3074,17 +4122,17 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
     }
 
-    async fn append_constant_vector_with_params(
+    async fn append_template_vector_with_params(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         write_params: Option<WriteParams>,
     ) {
         let start_id = dataset.count_all_rows().await.unwrap() as u64;
-        append_constant_vector_batch(dataset, rows, template, start_id, write_params).await;
+        append_template_vector_batch(dataset, rows, template, start_id, write_params).await;
     }
 
-    async fn append_constant_vector_batch(
+    async fn append_template_vector_batch(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
@@ -3101,9 +4149,14 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + rows as u64,
         ));
+        // The same tiny per-row drift as `append_partition_templates`: a split
+        // into `ceil(rows / target)` pieces needs that many distinct rows, and
+        // identical rows would leave some pieces empty at random.
         let mut appended_values = Vec::with_capacity(rows * DIM);
-        for _ in 0..rows {
-            appended_values.extend_from_slice(template);
+        for row in 0..rows {
+            let mut values = template.to_vec();
+            values[0] += row as f32 * 0.0001;
+            appended_values.extend_from_slice(&values);
         }
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(
@@ -3137,7 +4190,7 @@ mod tests {
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        append_constant_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
+        append_template_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -5302,11 +6355,15 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        // Multivector search ranks the final candidates by PQ-approximated
+        // scores before refining, so the M4 code of `lightweight_pq_params`
+        // (unseeded KMeans) drops recall below the threshold in a few percent
+        // of runs. The 4-bit M32 code keeps recall at 1.0.
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
             lightweight_hnsw_params(),
-            lightweight_pq_params(),
+            lightweight_pq_params_with_bits(4),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -5316,7 +6373,16 @@ mod tests {
         let query = vectors.value(0);
         // Three vectors per query amplify the internal candidate k. This
         // bounded budget covers all 64 * 3 vector entries in the fixture.
-        let result = search_lightweight_pq_index(&dataset, query.as_ref(), K, 1, 2, 256).await;
+        let result = search_lightweight_pq_index(
+            &dataset,
+            query.as_ref(),
+            K,
+            1,
+            2,
+            256,
+            DistanceType::Cosine,
+        )
+        .await;
         assert_eq!(result.num_rows(), K);
         let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
         assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
@@ -5686,6 +6752,120 @@ mod tests {
             .unwrap();
         let v3_index = index.as_any().downcast_ref::<super::IvfPq>();
         assert!(v3_index.is_some());
+    }
+
+    /// The global-top-k path (flat sub-index, no early-stop control) must not
+    /// pin every probed partition before scoring: a prepared partition holds the
+    /// partition's whole quantized storage, so with a high explicit `nprobes`
+    /// that made peak memory scale with `nprobes` instead of with the prepare
+    /// window. Probe every partition of an index with more partitions than the
+    /// window and check the in-flight high-water mark stays within it.
+    #[tokio::test]
+    async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const ROWS_PER_PARTITION: usize = 16;
+
+        // Resident partitions are bounded by the prepare window plus two scoring
+        // chunks (one being scored, one being assembled). The partitions here are
+        // far smaller than the chunk byte budget, so the partition cap is what
+        // ends a chunk. Size the index so that the old collect-everything
+        // behavior would clearly exceed the bound.
+        let in_flight_bound =
+            get_num_compute_intensive_cpus().max(1) + 2 * super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS;
+        let num_partitions = 2 * in_flight_bound;
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(num_partitions * ROWS_PER_PARTITION);
+        let query_vector = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let mut ivf_params = IvfBuildParams::new(num_partitions);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let tracker = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index")
+            .prepared_partitions();
+
+        let query = Query {
+            column: "vector".to_string(),
+            key: query_vector,
+            k: K,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: num_partitions,
+            maximum_nprobes: Some(num_partitions),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
+        assert_eq!(partitions.len(), num_partitions);
+        let results = index
+            .clone()
+            .search_partitions(
+                query,
+                Arc::new(partitions),
+                Arc::new(q_c_dists),
+                0,
+                num_partitions,
+                Arc::new(NoFilter),
+                None,
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let num_results: usize = results.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(num_results, K);
+        assert_eq!(
+            tracker.in_flight(),
+            0,
+            "every prepared partition must be released once the search completes"
+        );
+        assert!(
+            tracker.peak() >= 1,
+            "the search must have gone through prepared partitions"
+        );
+        assert!(
+            tracker.peak() <= in_flight_bound,
+            "peak in-flight prepared partitions {} exceeds the bound {} (probed {} partitions)",
+            tracker.peak(),
+            in_flight_bound,
+            num_partitions
+        );
     }
 
     #[rstest]
@@ -6377,7 +7557,7 @@ mod tests {
             ..Default::default()
         };
         append_params.mode = WriteMode::Append;
-        append_constant_vector_with_params(
+        append_template_vector_with_params(
             &mut dataset,
             SMALL_APPEND_ROWS,
             &template_values,
@@ -6570,14 +7750,17 @@ mod tests {
         .await;
         expected_rows += NO_SPLIT_APPEND_ROWS;
 
+        // The oversized partition is split straight to the target size in one
+        // optimize: ceil(rows / target) pieces instead of a single halving.
+        let split_rows = expected_rows + SPLIT_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
             &mut next_id,
             SPLIT_APPEND_ROWS,
-            2,
-            expected_rows + SPLIT_APPEND_ROWS,
+            split_rows.div_ceil(IndexType::IvfPq.target_partition_size()),
+            split_rows,
             1,
             true,
         )
@@ -6623,17 +7806,21 @@ mod tests {
             .unwrap();
 
         let expected_rows = NUM_ROWS + APPEND_ROWS;
+        // Every vector of a row counts towards the partition size, and the split
+        // goes straight to the target size: ceil(vectors / target) pieces.
+        let expected_partitions =
+            (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            2,
-            "Expected one oversized multivector partition to split, stats: {}",
+            expected_partitions,
+            "Expected the oversized multivector partition to split into {expected_partitions}, stats: {}",
             final_ctx.stats_json()
         );
         let partitions = final_ctx.stats()["indices"][0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions.len(), expected_partitions);
         assert_eq!(
             partitions
                 .iter()
@@ -6724,10 +7911,14 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
+        // Both partitions hold BASE + APPEND rows and are split straight to the
+        // target size in one optimize: ceil(rows / target) pieces each.
+        let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
+            .div_ceil(IndexType::IvfFlat.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            4,
+            2 * pieces_per_partition,
             "Expected both original partitions to split in one optimize, stats: {}",
             final_ctx.stats_json()
         );
@@ -6745,7 +7936,7 @@ mod tests {
         let partitions = indices[0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions.len(), 2 * pieces_per_partition);
         let expected_rows = 2 * BASE_ROWS_PER_PARTITION + 2 * APPEND_ROWS_PER_PARTITION;
         let total_partition_rows = partitions
             .iter()
@@ -6800,9 +7991,17 @@ mod tests {
         // distinct directions avoid the collinear assignment in the old fixture.
         let centroids = [(-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)];
         let total_rows = cluster_sizes.iter().sum::<usize>();
+        // Row 1600, the one retained below, has one vector in each partition.
+        // Joining the partition that holds one of them must reassign only that
+        // vector, not re-add the two the other partitions keep.
         let mut dataset = {
-            let (batch, schema) =
-                generate_clustered_multivec_batch(&cluster_sizes, &centroids, MULTIVEC_PER_ROW, 0);
+            let (batch, schema) = generate_clustered_multivec_batch(
+                &cluster_sizes,
+                &centroids,
+                MULTIVEC_PER_ROW,
+                0,
+                Some(1600),
+            );
             let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
             Dataset::write(
                 batches,
@@ -6874,6 +8073,7 @@ mod tests {
             &centroids[2..],
             MULTIVEC_PER_ROW,
             total_rows as u64,
+            None,
         );
         dataset
             .append(
@@ -7053,12 +8253,12 @@ mod tests {
     async fn test_optimize_join_after_delete_with_stable_row_ids() {
         // Regression test for https://github.com/lance-format/lance/issues/7701:
         // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
-        // so optimize joins the smallest after a scattered delete.
+        // so one optimize joins all of them but the largest after a scattered delete.
         let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
 
         assert_eq!(
-            run.num_partitions_after, 3,
-            "optimize should have joined the smallest partition, got stats: {}",
+            run.num_partitions_after, 1,
+            "optimize should have joined every undersized partition but one, got stats: {}",
             run.stats_json
         );
 
@@ -7099,8 +8299,19 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::ivf_pq(VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        PQBuildParams::new(4, 4),
+    ))]
+    #[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    ))]
     #[tokio::test]
-    async fn test_prewarm_ivf_pq() {
+    async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         use lance_io::assert_io_eq;
 
         const INDEX_NAME: &str = "my_idx";
@@ -7108,11 +8319,6 @@ mod tests {
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::new(4, 4),
-        );
         dataset
             .create_index(
                 &["vector"],
@@ -7140,8 +8346,18 @@ mod tests {
         // Reset IO stats after index creation.
         dataset.object_store.as_ref().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache.
-        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        // Concurrent prewarms should single-flight each partition through the
+        // cache loader and leave a complete warm cache for both callers.
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dataset.prewarm_index(INDEX_NAME),
+                dataset.prewarm_index(INDEX_NAME)
+            )
+        })
+        .await
+        .expect("concurrent prewarms deadlocked");
+        first.unwrap();
+        second.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
