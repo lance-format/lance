@@ -804,17 +804,20 @@ impl LsmFtsSearchPlanner {
                 (source, is_active, blocked, fetch_limit)
             })
             .collect();
+        // Type-erased for the reason the vector planner's arm gives.
         let built =
             futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
-                Box::pin(self.build_source_plan(
-                    source,
-                    column,
-                    &query,
-                    *fetch_limit,
-                    projection,
-                    index_params.as_ref(),
-                    &target_schema,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_source_plan(
+                        source,
+                        column,
+                        &query,
+                        *fetch_limit,
+                        projection,
+                        index_params.as_ref(),
+                        &target_schema,
+                    ));
+                arm
             }))
             .await?;
 

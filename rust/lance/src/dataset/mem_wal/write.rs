@@ -2098,7 +2098,7 @@ impl ShardWriter {
     /// The `base_path` should come from `ObjectStore::from_uri()` to ensure
     /// WAL files are written inside the dataset directory.
     ///
-    /// `schema` carrying each field's id under [`LANCE_FIELD_ID_KEY`] in its
+    /// `schema` carrying each field's id under `lance:field_id` in its
     /// field metadata is what lets a replayed entry be matched to a column that
     /// has since been renamed. Without them, a replayed entry is matched by
     /// name, and a renamed column reads as null for every row the memtable

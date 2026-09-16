@@ -328,16 +328,21 @@ impl LsmVectorSearchPlanner {
                 (source, is_base, is_active, blocked, fetch_k)
             })
             .collect();
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object, and an arm
+        // resolves a generation's schema before it searches.
         let built = futures::future::try_join_all(arm_inputs.iter().map(
             |(source, is_base, _, _, fetch_k)| {
-                Box::pin(self.build_knn_plan(
-                    source,
-                    query_vector,
-                    *fetch_k,
-                    nprobes,
-                    projection,
-                    *is_base && refine_base,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_knn_plan(
+                        source,
+                        query_vector,
+                        *fetch_k,
+                        nprobes,
+                        projection,
+                        *is_base && refine_base,
+                    ));
+                arm
             },
         ))
         .await?;
