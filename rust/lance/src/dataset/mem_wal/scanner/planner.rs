@@ -192,9 +192,11 @@ impl LsmScanPlanner {
                 (Some(n), false, false) => Some(n),
                 _ => None,
             };
-            let scan = self
-                .build_source_scan(&source, projection, filter, fetch)
-                .await?;
+            // Boxed per arm, as the vector and full-text planners box theirs:
+            // an arm resolves a generation's schema before scanning, and
+            // leaving its future inlined here puts the whole scan chain's
+            // `Send` proof past rustc's recursion limit.
+            let scan = Box::pin(self.build_source_scan(&source, projection, filter, fetch)).await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
             // Plain scans refill exactly, so keep the approximate-search
