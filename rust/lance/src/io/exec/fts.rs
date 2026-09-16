@@ -790,6 +790,32 @@ impl CompoundQueryExec {
         self.base_scorer.as_ref()
     }
 
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
+            segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
@@ -1827,6 +1853,30 @@ impl CrossColumnCompoundQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
     }
 }
 

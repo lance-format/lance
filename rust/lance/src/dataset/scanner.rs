@@ -7091,9 +7091,13 @@ impl Scanner {
             input.clone(),
             self.get_batch_size(),
         ));
-        if let Some(take_plan) =
-            TakeExec::try_new(self.dataset.clone(), coalesced, output_projection)?
-        {
+        if let Some(take_plan) = TakeExec::try_new_with_batch_size(
+            self.dataset.clone(),
+            coalesced,
+            output_projection,
+            self.resolved_file_reader_options()
+                .and_then(|o| o.batch_size_bytes),
+        )? {
             Ok(Arc::new(take_plan))
         } else {
             // No new columns needed
@@ -7591,11 +7595,15 @@ mod test {
     use rstest::rstest;
 
     use super::*;
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::WriteMode;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
+    // Imported through the public `io::exec` re-export rather than the crate-private
+    // `knn` module, so the tests below cover that surface too.
+    use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
@@ -8562,6 +8570,163 @@ mod test {
                 .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
             "unexpected error: {error}"
         );
+    }
+
+    // Builds a genuine `lance.blob.v2` logical array of `rows` 8KiB payloads.
+    // Payloads vary per row so they do not collapse under compression.
+    // The legacy `lance-encoding:blob` metadata marker is rejected for file
+    // version >= 2.2, so fixtures must use the v2 logical array.
+    fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
+        let mut builder = BlobArrayBuilder::new(rows);
+        for r in 0..rows {
+            let seed = (base + r).wrapping_mul(2654435761);
+            let payload: Vec<u8> = (0usize..8 * 1024)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(seed) & 0xff) as u8)
+                .collect();
+            builder.push_bytes(&payload).unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_late_materialization() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("filterme", DataType::Int32, false),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let filterme = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![filterme, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .filter("filterme < 100")
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_vector_search() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("vec", DataType::FixedSizeList(item_field.clone(), 32), true),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let i = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                let vec = Arc::new(FixedSizeListArray::new(
+                    item_field.clone(),
+                    32,
+                    Arc::new(Float32Array::from_iter_values(
+                        (0..rows_per_batch * 32).map(|v| ((base + v) % 1024) as f32),
+                    )),
+                    None,
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![i, vec, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+        let target_bytes = 8 * 1024;
+        let k = 20;
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k)
+            .unwrap()
+            .use_index(false)
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), k);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
     }
 
     #[tokio::test]
@@ -10476,6 +10641,92 @@ mod test {
                 "prefiltered batch query {query_index} should match single-query search"
             );
         }
+    }
+
+    /// Finds the batch vector-search node in a physical plan.
+    fn find_ann_ivf_batch_exec(plan: &dyn ExecutionPlan) -> Option<&ANNIvfBatchExec> {
+        if let Some(batch_exec) = plan.downcast_ref::<ANNIvfBatchExec>() {
+            return Some(batch_exec);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| find_ann_ivf_batch_exec(child.as_ref()))
+    }
+
+    /// A caller that matches the batch node in a plan reads the search back out
+    /// of it through the public `io::exec` surface, so the accessors must return
+    /// what the scanner fed the constructor.
+    #[rstest]
+    #[case::no_prefilter(None)]
+    #[case::prefilter(Some("i > 100"))]
+    #[tokio::test]
+    async fn test_batch_knn_indexed_exposes_plan_inputs(#[case] filter: Option<&str>) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.nprobes(2);
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+            scan.prefilter(true);
+        }
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.create_plan().await.unwrap();
+        let batch_exec = find_ann_ivf_batch_exec(plan.as_ref())
+            .expect("indexed batch KNN should plan an ANNIvfBatchExec");
+
+        let query = batch_exec.query();
+        assert_eq!(query.column, "vec");
+        assert_eq!(query.k, 2);
+        assert_eq!(query.minimum_nprobes, 2);
+        assert_eq!(query.maximum_nprobes, Some(2));
+        assert_eq!(query.metric_type, Some(DistanceType::L2));
+        assert_eq!(
+            query.key.as_primitive::<Float32Type>().values(),
+            query_values.as_slice(),
+            "query key must hold both query vectors concatenated"
+        );
+
+        assert_eq!(batch_exec.query_count(), 2);
+        assert_eq!(
+            query.key.len() / batch_exec.query_count(),
+            32,
+            "query count must divide the key into the column's vectors"
+        );
+
+        assert_eq!(batch_exec.dataset().uri(), dataset.uri());
+        assert_eq!(
+            batch_exec.dataset().version().version,
+            dataset.version().version
+        );
+
+        let expected_indices = dataset.load_indices_by_name("idx").await.unwrap();
+        assert!(!expected_indices.is_empty());
+        assert_eq!(
+            batch_exec
+                .indices()
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>(),
+            expected_indices
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>()
+        );
+
+        match (filter, batch_exec.prefilter_source()) {
+            (None, PreFilterSource::None) => {}
+            (Some(_), PreFilterSource::FilteredRowIds(_)) => {}
+            (_, source) => panic!("unexpected prefilter source {source:?} for filter {filter:?}"),
+        }
+
+        assert_eq!(batch_exec.schema().field(0).name(), QUERY_INDEX_COL);
     }
 
     /// Batch indexed search must merge each query's top-k across multiple delta
