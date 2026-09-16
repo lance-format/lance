@@ -275,9 +275,13 @@ impl LsmPointLookupPlanner {
         for source in sources {
             let generation = source.generation().as_u64();
 
-            let scan = self
-                .build_source_scan(&source, projection, &filter_expr)
-                .await?;
+            // Type-erased, not merely boxed: the `Send` proof recurses
+            // through a boxed future's concrete type but stops at a trait
+            // object. An arm resolves a generation's schema before it
+            // scans, which nests deeply enough to need that.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, &filter_expr));
+            let scan = arm.await?;
 
             // Data is stored in reverse order, so first match is newest
             let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(scan, 0, Some(1)));

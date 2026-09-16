@@ -192,11 +192,13 @@ impl LsmScanPlanner {
                 (Some(n), false, false) => Some(n),
                 _ => None,
             };
-            // Boxed per arm, as the vector and full-text planners box theirs:
-            // an arm resolves a generation's schema before scanning, and
-            // leaving its future inlined here puts the whole scan chain's
-            // `Send` proof past rustc's recursion limit.
-            let scan = Box::pin(self.build_source_scan(&source, projection, filter, fetch)).await?;
+            // Type-erased, not merely boxed: the `Send` proof recurses
+            // through a boxed future's concrete type but stops at a trait
+            // object. An arm resolves a generation's schema before it
+            // scans, which nests deeply enough to need that.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, filter, fetch));
+            let scan = arm.await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
             // Plain scans refill exactly, so keep the approximate-search
