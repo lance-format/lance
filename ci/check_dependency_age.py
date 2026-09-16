@@ -12,6 +12,11 @@ the index lines it has downloaded in `$CARGO_HOME/registry/index/*/.cache`, whic
 lets a full scan run without any network calls; anything not found there is
 fetched from index.crates.io, and anything the index has not published yet is
 looked up through the crates.io API, which is authoritative and never lags.
+
+The same floor is enforced on developer machines by Aikido endpoint protection,
+which filters the index it serves them. A security fix that has to land sooner
+therefore needs an Aikido allowlist entry as well as one in
+ci/dependency-age-allowlist.toml; the entry here only unblocks CI.
 """
 
 import argparse
@@ -27,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_LOCKFILES = ("Cargo.lock", "python/Cargo.lock", "java/lance-jni/Cargo.lock")
+DEFAULT_ALLOWLIST = "ci/dependency-age-allowlist.toml"
 DEFAULT_MIN_AGE_HOURS = 48
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 INDEX_URL = "https://index.crates.io"
@@ -37,7 +43,7 @@ FETCH_THREADS = 16
 # index CDN has not caught up with, so it gets a much smaller pool.
 API_THREADS = 4
 FETCH_TIMEOUT_SECONDS = 30
-FETCH_ATTEMPTS = 3
+FETCH_ATTEMPTS = 4
 
 # The cache file is a cargo internal: a format byte, an index-format u32, an
 # `etag: ...` line, then a NUL-separated run of alternating version and index
@@ -94,6 +100,22 @@ def crates_io_packages(lock_text):
         for package in lock.get("package", [])
         if package.get("source") == CRATES_IO_SOURCE
     ]
+
+
+def load_allowlist(path):
+    """Map (crate, version) -> reason for the exemptions in an allowlist file."""
+    if not Path(path).is_file():
+        return {}
+    entries = tomllib.loads(Path(path).read_text()).get("allow", [])
+    allowed = {}
+    for entry in entries:
+        missing = {"crate", "version", "reason"} - entry.keys()
+        if missing:
+            raise SystemExit(
+                f"{path}: allow entry {entry} is missing {sorted(missing)}"
+            )
+        allowed[(entry["crate"], entry["version"])] = entry["reason"]
+    return allowed
 
 
 def cache_dirs(cargo_home):
@@ -195,7 +217,7 @@ def too_new(dated, cutoff):
     return violations
 
 
-def check_lockfile(path, cutoff, cargo_home):
+def check_lockfile(path, cutoff, cargo_home, allowed):
     """Print this lockfile's findings and return whether it passed."""
     packages = crates_io_packages(Path(path).read_text())
     dated, undated, absent = resolve_pubtimes(packages, cargo_home)
@@ -205,7 +227,13 @@ def check_lockfile(path, cutoff, cargo_home):
         # field. Those are years old, so treating them as passing is safe.
         print(f"{path}: {len(undated)} of {len(packages)} versions predate `pubtime`")
 
-    violations = too_new(dated, cutoff)
+    violations = [
+        violation
+        for violation in too_new(dated, cutoff)
+        if (violation[0], violation[1]) not in allowed
+    ]
+    absent = [package for package in absent if package not in allowed]
+
     for name, version, published in sorted(violations):
         short_by = (published - cutoff).total_seconds() / 3600
         print(
@@ -222,13 +250,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lockfiles", nargs="*", default=list(DEFAULT_LOCKFILES))
     parser.add_argument("--min-age-hours", type=int, default=DEFAULT_MIN_AGE_HOURS)
+    parser.add_argument("--allowlist", default=DEFAULT_ALLOWLIST)
     parser.add_argument(
         "--cargo-home", default=os.environ.get("CARGO_HOME", Path.home() / ".cargo")
     )
     args = parser.parse_args(argv)
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=args.min_age_hours)
-    passed = [check_lockfile(path, cutoff, args.cargo_home) for path in args.lockfiles]
+    allowed = load_allowlist(args.allowlist)
+    for (name, version), reason in sorted(allowed.items()):
+        print(f"{args.allowlist} exempts {name} {version}: {reason}")
+
+    passed = [
+        check_lockfile(path, cutoff, args.cargo_home, allowed)
+        for path in args.lockfiles
+    ]
     if all(passed):
         return 0
 

@@ -12,6 +12,7 @@ from check_dependency_age import (
     check_lockfile,
     crates_io_packages,
     index_path,
+    load_allowlist,
     parse_api_response,
     parse_cache_file,
     parse_index_response,
@@ -122,12 +123,32 @@ def cargo_home_with(tmp_path, crates):
     return home
 
 
+def test_load_allowlist_is_empty_when_the_file_is_absent(tmp_path):
+    assert load_allowlist(tmp_path / "nope.toml") == {}
+
+
+def test_load_allowlist_reads_entries(tmp_path):
+    path = tmp_path / "allow.toml"
+    path.write_text(
+        '[[allow]]\ncrate = "serde"\nversion = "1.0.0"\nreason = "RUSTSEC-0"\n'
+    )
+    assert load_allowlist(path) == {("serde", "1.0.0"): "RUSTSEC-0"}
+
+
+def test_load_allowlist_rejects_an_entry_without_a_reason(tmp_path):
+    """An exemption with no rationale is not reviewable, so refuse to run."""
+    path = tmp_path / "allow.toml"
+    path.write_text('[[allow]]\ncrate = "serde"\nversion = "1.0.0"\n')
+    with pytest.raises(SystemExit, match="reason"):
+        load_allowlist(path)
+
+
 def test_check_lockfile_passes_when_every_version_is_old_enough(tmp_path, capsys):
     lock = tmp_path / "Cargo.lock"
     lock.write_text(lockfile([("serde", "1.0.0", CRATES_IO)]))
     home = cargo_home_with(tmp_path, {"serde": {"1.0.0": "2026-09-01T00:00:00Z"}})
 
-    assert check_lockfile(lock, CUTOFF, home) is True
+    assert check_lockfile(lock, CUTOFF, home, {}) is True
     assert capsys.readouterr().out == ""
 
 
@@ -136,7 +157,7 @@ def test_check_lockfile_reports_a_too_new_version(tmp_path, capsys):
     lock.write_text(lockfile([("serde", "1.0.0", CRATES_IO)]))
     home = cargo_home_with(tmp_path, {"serde": {"1.0.0": "2026-09-16T00:00:00Z"}})
 
-    assert check_lockfile(lock, CUTOFF, home) is False
+    assert check_lockfile(lock, CUTOFF, home, {}) is False
     assert "serde 1.0.0 is too new" in capsys.readouterr().out
 
 
@@ -145,7 +166,7 @@ def test_check_lockfile_accepts_versions_predating_pubtime(tmp_path, capsys):
     lock.write_text(lockfile([("serde", "1.0.0", CRATES_IO)]))
     home = cargo_home_with(tmp_path, {"serde": {"1.0.0": None}})
 
-    assert check_lockfile(lock, CUTOFF, home) is True
+    assert check_lockfile(lock, CUTOFF, home, {}) is True
     assert "1 of 1 versions predate `pubtime`" in capsys.readouterr().out
 
 
@@ -159,5 +180,29 @@ def test_check_lockfile_fails_when_the_index_does_not_list_the_version(
     lock.write_text(lockfile([("serde", "9.9.9", CRATES_IO)]))
     home = cargo_home_with(tmp_path, {"serde": {"1.0.0": "2026-09-01T00:00:00Z"}})
 
-    assert check_lockfile(lock, CUTOFF, home) is False
+    assert check_lockfile(lock, CUTOFF, home, {}) is False
     assert "serde 9.9.9 is not in the index" in capsys.readouterr().out
+
+
+def test_check_lockfile_honours_an_allowlisted_version(tmp_path, capsys):
+    lock = tmp_path / "Cargo.lock"
+    lock.write_text(lockfile([("serde", "1.0.0", CRATES_IO)]))
+    home = cargo_home_with(tmp_path, {"serde": {"1.0.0": "2026-09-16T00:00:00Z"}})
+    allowed = {("serde", "1.0.0"): "RUSTSEC-0"}
+
+    assert check_lockfile(lock, CUTOFF, home, allowed) is True
+    assert "too new" not in capsys.readouterr().out
+
+
+def test_check_lockfile_allowlist_also_covers_an_undatable_version(
+    tmp_path, capsys, monkeypatch
+):
+    """Aikido hides allowlisted-but-young versions from the index it serves."""
+    monkeypatch.setattr("check_dependency_age.pubtimes_from_index", lambda names: {})
+    monkeypatch.setattr("check_dependency_age.pubtimes_from_api", lambda names: {})
+    lock = tmp_path / "Cargo.lock"
+    lock.write_text(lockfile([("serde", "9.9.9", CRATES_IO)]))
+    home = cargo_home_with(tmp_path, {"serde": {"1.0.0": "2026-09-01T00:00:00Z"}})
+
+    assert check_lockfile(lock, CUTOFF, home, {("serde", "9.9.9"): "RUSTSEC-0"}) is True
+    assert capsys.readouterr().out == ""
