@@ -21,12 +21,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
+use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
 use crate::dataset::mem_wal::reconcile::{Plan, field_id_of};
-use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 /// One sealed generation, read under the table's schema.
@@ -34,7 +34,7 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 /// Built from the generation's own schema and the table's id-carrying schema.
 /// It answers three questions, in the order a scan needs them: what to project
 /// from the file ([`Self::stored_projection`]), whether a predicate can be
-/// pushed into it ([`Self::can_answer`] / [`Self::to_stored`]), and how to
+/// pushed into it and under which names ([`Self::to_stored`]), and how to
 /// bring the result back to the table's names and shapes
 /// ([`Self::reconcile`]).
 pub(super) struct GenerationRead {
@@ -92,7 +92,10 @@ impl GenerationRead {
     pub(super) fn stored_projection(&self) -> Vec<&str> {
         self.wanted
             .iter()
-            .filter_map(|name| self.stored_name(name).or_else(|| self.stored_system_column(name)))
+            .filter_map(|name| {
+                self.stored_name(name)
+                    .or_else(|| self.stored_system_column(name))
+            })
             .collect()
     }
 
@@ -106,26 +109,15 @@ impl GenerationRead {
             .map(|f| f.name().as_str())
     }
 
-    /// Whether `expr` can be pushed into this generation's scan.
-    ///
-    /// It can when every column it names is stored under the table's own name
-    /// and shape. A nested column fails the shape half: a reference names the
-    /// parent (`info.a` refers to `info`) and a parent's name does not move
-    /// when a child is renamed, so the pushed-down predicate would be evaluated
-    /// against child names this generation has and the table does not.
-    pub(super) fn can_answer(&self, expr: &Expr) -> bool {
-        expr.column_refs().iter().all(|c| {
-            self.names.get(c.name.as_str()) == Some(&c.name)
-                && self
-                    .stored
-                    .field_with_name(&c.name)
-                    .is_ok_and(|f| !is_reconstructed(f.data_type()))
-        })
-    }
-
     /// `expr` with each column reference moved to the name this generation
-    /// stores it under. `None` when a column it names is not stored here at
-    /// all, or is reconstructed — then the predicate belongs above the scan.
+    /// stores it under, so it can be pushed into the generation's own scan.
+    ///
+    /// `None` when it cannot be: a column the generation does not store, or a
+    /// nested one. A nested reference names the parent (`info.a` refers to
+    /// `info`) and a parent's name does not move when a child is renamed, so a
+    /// pushed-down predicate would be evaluated against child names this
+    /// generation has and the table does not. Either way the predicate belongs
+    /// above the reconciliation, where the columns it names exist.
     pub(super) fn to_stored(&self, expr: &Expr) -> Option<Expr> {
         let pushable = expr.column_refs().iter().all(|c| {
             self.stored_name(&c.name).is_some_and(|stored| {
@@ -171,8 +163,8 @@ impl GenerationRead {
     /// `source` with the field ids of everything that is not one of the
     /// table's columns removed.
     ///
-    /// A generation numbers its own columns in its own schema -- `_tombstone`,
-    /// and anything it holds that the table has since dropped -- so those ids
+    /// A generation numbers its own columns in its own schema — `_tombstone`,
+    /// and anything it holds that the table has since dropped — so those ids
     /// collide with whatever the table gave those numbers. Left in place, a
     /// column added to the table resolves to whichever of them happens to share
     /// its id.
@@ -212,8 +204,8 @@ impl GenerationRead {
     }
 }
 
-/// Run `expr` above `plan`, for a predicate the generation could not answer
-/// as written.
+/// Run `expr` above `plan`, for a predicate that could not be pushed into the
+/// generation's own scan.
 pub(super) fn filter_above(
     plan: Arc<dyn ExecutionPlan>,
     expr: &Expr,
@@ -422,10 +414,6 @@ mod tests {
     #[test]
     fn a_predicate_naming_a_renamed_column_is_rewritten_to_the_stored_name() {
         let read = renamed();
-        assert!(
-            !read.can_answer(&col("amount").eq(lit(1i64))),
-            "the generation has no `amount`"
-        );
         assert_eq!(
             read.to_stored(&col("amount").eq(lit(1i64))),
             Some(col("value").eq(lit(1i64))),
@@ -433,10 +421,9 @@ mod tests {
     }
 
     #[test]
-    fn a_predicate_the_generation_can_answer_as_written_is_left_alone() {
+    fn a_predicate_naming_a_column_that_did_not_move_is_left_alone() {
         let read = renamed();
         let expr = col("id").eq(lit(1i64));
-        assert!(read.can_answer(&expr));
         assert_eq!(read.to_stored(&expr), Some(expr));
     }
 
@@ -453,13 +440,11 @@ mod tests {
             ]),
             &["id", "added"],
         );
-        let expr = col("added").eq(lit(1i64));
-        assert!(!read.can_answer(&expr));
-        assert_eq!(read.to_stored(&expr), None);
+        assert_eq!(read.to_stored(&col("added").eq(lit(1i64))), None);
     }
 
     /// A nested reference names the parent, and a parent's name does not move
-    /// when a child is renamed -- so pushing it down would evaluate it against
+    /// when a child is renamed — so pushing it down would evaluate it against
     /// child names the table does not have.
     #[test]
     fn a_predicate_on_a_nested_column_is_never_pushed_down() {
@@ -475,20 +460,15 @@ mod tests {
             schema(vec![with_id("id", DataType::Int64, 0), nested("d")]),
             &["id", "info"],
         );
-        let expr = col("info").is_not_null();
-        assert!(!read.can_answer(&expr));
-        assert_eq!(read.to_stored(&expr), None);
+        assert_eq!(read.to_stored(&col("info").is_not_null()), None);
     }
 
     /// A list of structs is rebuilt too, so its stored shape is not the shape a
     /// pushed-down predicate would expect.
     #[test]
     fn a_list_is_reconstructed_only_when_its_element_is() {
-        let struct_element = DataType::Struct(Fields::from(vec![Field::new(
-            "c",
-            DataType::Int64,
-            true,
-        )]));
+        let struct_element =
+            DataType::Struct(Fields::from(vec![Field::new("c", DataType::Int64, true)]));
         assert!(is_reconstructed(&DataType::List(Arc::new(Field::new(
             "item",
             struct_element,
@@ -501,7 +481,7 @@ mod tests {
         )))));
     }
 
-    /// With no ids to match on, the table's own names are the only link -- the
+    /// With no ids to match on, the table's own names are the only link — the
     /// behaviour a caller that supplies no identity schema gets.
     #[test]
     fn a_table_without_ids_matches_by_name() {

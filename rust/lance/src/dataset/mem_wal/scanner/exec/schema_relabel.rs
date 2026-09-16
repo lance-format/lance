@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::dataset::mem_wal::reconcile::relabel_to;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -18,7 +19,6 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::{Stream, StreamExt};
-use crate::dataset::mem_wal::reconcile::relabel_to;
 
 /// Re-labels every batch to an exact target schema, leaving the arrays
 /// untouched. `ProjectionExec` cannot: DataFusion derives output nullability

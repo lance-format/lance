@@ -961,16 +961,20 @@ impl LsmFtsSearchPlanner {
                 // A predicate this generation cannot answer as written runs
                 // above the reconciliation, where the columns it names exist.
                 // The BM25 top-k has already run by then, so the arm can come
-                // back short -- which is right: those rows have no value for a
+                // back short — which is right: those rows have no value for a
                 // column sealed before it existed.
-                let pushed = self.filter.as_ref().map(|f| (f, generation.to_stored(f)));
-                if let Some((expr, None)) = pushed {
+                let stored_filter = self
+                    .filter
+                    .as_ref()
+                    .and_then(|expr| generation.to_stored(expr));
+                let above = self.filter.as_ref().filter(|_| stored_filter.is_none());
+                if let Some(expr) = above {
                     for column in expr.column_refs() {
                         generation.also_produce(&column.name);
                     }
                 }
                 scanner.project(&generation.stored_projection())?;
-                if let Some((_, Some(ref stored))) = pushed {
+                if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
                     scanner.filter_expr(stored.clone());
@@ -984,9 +988,9 @@ impl LsmFtsSearchPlanner {
                 }
                 scanner.full_text_search(bound_query)?;
                 let reconciled = generation.reconcile(scanner.create_plan().await?)?;
-                match pushed {
-                    Some((expr, None)) => filter_above(reconciled, expr),
-                    _ => Ok(reconciled),
+                match above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
                 }
             }
             LsmDataSource::ActiveMemTable {

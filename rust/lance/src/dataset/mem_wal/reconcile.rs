@@ -44,7 +44,7 @@ pub(crate) fn field_id_of(field: &ArrowField) -> Option<i32> {
 ///
 /// Ids belong to the stored schema, where identity has to survive a rename. A
 /// caller's batch carries none, and Arrow compares a struct's children by their
-/// full field -- metadata included -- so a stamped schema would reject it.
+/// full field — metadata included — so a stamped schema would reject it.
 /// One stored column under the type the caller declared.
 ///
 /// A field id lives inside a nested column's own Arrow type, so the memtable's
@@ -132,8 +132,8 @@ pub struct Plan {
 impl Plan {
     /// The same plan emitting the table's plain Arrow schema.
     ///
-    /// Resolution needs field ids on the target -- a rename keeps the id and
-    /// moves the name -- but a reader is handed the table's schema, which does
+    /// Resolution needs field ids on the target — a rename keeps the id and
+    /// moves the name — but a reader is handed the table's schema, which does
     /// not carry them. They live inside a nested column's own type, so a struct
     /// built to the id-carrying target is a different Arrow type from the one
     /// the caller declared. Only replay, which writes back into the memtable's
@@ -240,7 +240,7 @@ fn resolve_field(
     });
     // Identity is the field id where both sides carry one. A name is not: a
     // rename moves the name and leaves the id, so a source column of the same
-    // name under a *different* id is a different column -- one dropped and
+    // name under a *different* id is a different column — one dropped and
     // another added under its name, whose values the table no longer has.
     //
     // A name match is right only where identity is absent: a batch a caller has
@@ -280,7 +280,7 @@ fn resolve_field(
     let source = &source_fields[index];
     // A nested column's children are part of the array's own type, metadata
     // included, so the array is rebuilt under the target's children even when
-    // nothing about them moved -- otherwise the batch disagrees with the schema
+    // nothing about them moved — otherwise the batch disagrees with the schema
     // it is built under. The leaves are reused, so it costs a pointer copy.
     if is_nested(field.data_type()) {
         return Ok(Source::Nested(

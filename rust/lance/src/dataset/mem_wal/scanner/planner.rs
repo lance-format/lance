@@ -17,9 +17,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{
-    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN,
-};
+use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
 use super::generation::{GenerationRead, filter_above};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -245,7 +243,7 @@ impl LsmScanPlanner {
         // column was added does not carry it. `UnionExec` requires schema
         // equality and does not reconcile.
         //
-        // The base arm is the authority when it is here -- it is the only source
+        // The base arm is the authority when it is here — it is the only source
         // the schema change was applied to. Otherwise the newest generation is,
         // and sources arrive generation-DESC, so it is the first of them.
         let target = source_plans
@@ -378,11 +376,15 @@ impl LsmScanPlanner {
                     self.pk_columns.clone(),
                     wanted,
                 );
-                // A predicate this generation cannot answer as written runs
-                // after reconciliation, reading its columns from this scan --
-                // so they have to be in it whether the caller asked or not.
-                let answerable = filter.is_none_or(|expr| generation.can_answer(expr));
-                if let Some(expr) = filter.filter(|_| !answerable) {
+                // A predicate the generation can answer is pushed into its scan
+                // under the names it has. One it cannot — because it names a
+                // column sealed before it existed, or a nested one — runs above
+                // the reconciliation instead, reading its columns from this
+                // scan, so they have to be in it whether the caller asked or
+                // not.
+                let stored_filter = filter.and_then(|expr| generation.to_stored(expr));
+                let above = filter.filter(|_| stored_filter.is_none());
+                if let Some(expr) = above {
                     for column in expr.column_refs() {
                         generation.also_produce(&column.name);
                     }
@@ -393,29 +395,29 @@ impl LsmScanPlanner {
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
                 // it runs before the pushdown limit (counting only live rows).
                 // The older real row a tombstone supersedes is dropped by the
-                // cross-gen block-list, not by this filter. Gen written before
-                // deletes existed lack the column -> no fold, nothing to drop.
-                let caller_filter = if answerable { filter } else { None };
+                // cross-gen block-list, not by this filter. A generation written
+                // before deletes existed lacks the column, so nothing is folded
+                // and there is nothing to drop.
                 let folded;
                 let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(caller_filter);
+                    folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
-                    caller_filter
+                    stored_filter.as_ref()
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
                 // A limit under a filter that has not run would cut rows the
                 // filter never saw.
-                if let Some(fetch) = fetch.filter(|_| answerable) {
+                if let Some(fetch) = fetch.filter(|_| above.is_none()) {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
                 let reconciled = generation.reconcile(scanner.create_plan().await?)?;
-                match filter {
-                    Some(expr) if !answerable => filter_above(reconciled, expr),
-                    _ => Ok(reconciled),
+                match above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
                 }
             }
             LsmDataSource::ActiveMemTable {

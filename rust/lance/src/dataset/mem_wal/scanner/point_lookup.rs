@@ -34,13 +34,13 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::generation::GenerationRead;
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
-use super::generation::GenerationRead;
-use crate::dataset::mem_wal::reconcile::relabel_to;
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::reconcile::relabel_to;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -706,8 +706,8 @@ impl LsmPointLookupPlanner {
                     self.pk_columns.clone(),
                     cols,
                 );
-                // Every generation stores every primary key column -- a key
-                // cannot be added or dropped -- so the key filter always moves.
+                // Every generation stores every primary key column — a key
+                // cannot be added or dropped — so the key filter always moves.
                 let stored_filter = generation.to_stored(filter).ok_or_else(|| {
                     lance_core::Error::internal(format!(
                         "point lookup: `{filter}` names a column generation {} does not store",
