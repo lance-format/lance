@@ -33,7 +33,7 @@ use lance_core::{Error, Result};
 use super::TOMBSTONE;
 
 /// The lance field id an Arrow field carries, if it carries one.
-pub(crate) fn field_id_of(field: &ArrowField) -> Option<i32> {
+pub(super) fn field_id_of(field: &ArrowField) -> Option<i32> {
     field
         .metadata()
         .get(LANCE_FIELD_ID_KEY)
@@ -52,7 +52,7 @@ pub(crate) fn field_id_of(field: &ArrowField) -> Option<i32> {
 /// id-carrying storage schema and the table's plain one describe the same
 /// values as two different types. Only the labels differ, so this relabels the
 /// array rather than converting it.
-pub(crate) fn relabel_to(column: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+pub(super) fn relabel_to(column: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
     if column.data_type() == data_type {
         return Ok(column.clone());
     }
@@ -88,12 +88,12 @@ fn relabel_data(data: &ArrayData, data_type: &DataType) -> Result<ArrayData> {
 
 /// [`without_field_ids`] for a type rather than a schema, for the nested types a
 /// reconciliation builds.
-pub(crate) fn without_field_ids_in(data_type: &DataType) -> DataType {
+pub(super) fn without_field_ids_in(data_type: &DataType) -> DataType {
     let one = ArrowSchema::new(vec![ArrowField::new("", data_type.clone(), true)]);
     without_field_ids(&one).field(0).data_type().clone()
 }
 
-pub(crate) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
+pub(super) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
     fn strip(field: &ArrowField) -> ArrowField {
         let mut metadata = field.metadata().clone();
         metadata.remove(LANCE_FIELD_ID_KEY);
@@ -129,7 +129,7 @@ enum Source {
     Take(usize),
     /// The source column at this index, whose struct children need their own
     /// resolution.
-    Nested(usize, Vec<Source>, DataType),
+    Nested(usize, Vec<Self>, DataType),
     /// The source does not have this column: rows written before it existed
     /// hold no value for it.
     Null(DataType),
