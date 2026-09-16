@@ -484,15 +484,42 @@ pub(super) async fn add_columns(
 ///
 /// Takes the decision as a bool rather than the alterations themselves: a
 /// reference to them held across an await would have to be `Sync`.
-async fn reject_cast_on_mem_wal(dataset: &Dataset, casts: bool) -> Result<()> {
-    if !casts || dataset.mem_wal_index_details().await?.is_none() {
+/// What `alter_columns` refuses on a table with a MemWAL, and why.
+///
+/// Both are alterations whose meaning depends on rows the commit cannot see.
+enum Unsupported {
+    /// A cast takes a new field id, which rows still in the WAL cannot be
+    /// matched to.
+    Retype,
+    /// Tightening a column to non-null is validated against base, and a write
+    /// admitted into the WAL while that runs is not in base to be validated.
+    /// Draining first does not close it: the drain waits for the generations it
+    /// sealed, and writes keep being admitted into the next one, so a null can
+    /// be acknowledged after the check and before the commit. The row is then
+    /// in a table whose schema forbids it, and the compaction that would fold
+    /// it into base fails from then on.
+    Tightening,
+}
+
+async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
+    let Some(unsupported) = unsupported else {
+        return Ok(());
+    };
+    if dataset.mem_wal_index_details().await?.is_none() {
         return Ok(());
     }
-    Err(Error::invalid_input(
-        "cannot change a column's type on a table with a MemWAL attached: a cast takes a \
-         new field id, which rows still in the WAL cannot be matched to. Drop the MemWAL, \
-         or add a column of the new type and backfill it.",
-    ))
+    Err(Error::invalid_input(match unsupported {
+        Unsupported::Retype => {
+            "cannot change a column's type on a table with a MemWAL attached: a cast takes a \
+             new field id, which rows still in the WAL cannot be matched to. Drop the MemWAL, \
+             or add a column of the new type and backfill it."
+        }
+        Unsupported::Tightening => {
+            "cannot make a column non-nullable on a table with a MemWAL attached: the check \
+             runs against the base table, and a write admitted into the WAL while it runs is \
+             not there to be checked. Drop the MemWAL first."
+        }
+    }))
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
@@ -753,7 +780,14 @@ pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
 ) -> Result<()> {
-    reject_cast_on_mem_wal(dataset, alterations.iter().any(|a| a.data_type.is_some())).await?;
+    let unsupported = if alterations.iter().any(|a| a.data_type.is_some()) {
+        Some(Unsupported::Retype)
+    } else if alterations.iter().any(|a| a.nullable == Some(false)) {
+        Some(Unsupported::Tightening)
+    } else {
+        None
+    };
+    reject_on_mem_wal(dataset, unsupported).await?;
 
     // Validate referenced columns exist and enforce NOT NULL when tightening
     // a column from nullable to non-nullable.
