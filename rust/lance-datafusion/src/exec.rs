@@ -346,6 +346,7 @@ impl LanceExecutionOptions {
         if !self.use_spilling {
             return false;
         }
+        // Presence enables the bypass; the value is not parsed as a boolean.
         std::env::var("LANCE_BYPASS_SPILLING")
             .map(|_| {
                 info!("Bypassing spilling because LANCE_BYPASS_SPILLING is set");
@@ -362,10 +363,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
-        // The default 10MB sort spill reservation seems to be too small for many common cases.
-        //
-        // There currently is no reasonable guidance provided by DataFusion for setting this value.
-        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
+        // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
+        // to leave room for input batches in small pools. This reservation comes
+        // out of the same pool; it does not guarantee that every batch will fit.
         let sort_spill_reservation_bytes =
             (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
         session_config =
@@ -379,6 +380,8 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
                 NonZero::try_from(16).unwrap(),
             )));
     }
+    // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
+    // reservations. This bypasses the configured pool limit, not actual RAM limits.
     let runtime_env = runtime_env_builder.build_arc().unwrap();
 
     let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
@@ -1104,13 +1107,15 @@ impl ExecutionPlan for StrictBatchSizeExec {
 ///
 /// # Why this exists
 ///
-/// DataFusion's sort operator cannot handle batches larger than the memory
-/// pool size.  When upstream operators produce very large batches this can
-/// cause the sort to fail.  This node caps batch sizes
-/// *before* the sort so the operation succeeds.  The trade-off is a
-/// potentially expensive deep copy of the batch data — see below — but that
-/// is preferable to failing the operation entirely.  This workaround may
-/// become unnecessary if a fix is upstreamed to DataFusion.
+/// DataFusion's sort operator must reserve memory for an entire input batch,
+/// including estimated sort/merge overhead. It can spill buffered batches and
+/// retry, but still fails if the new batch's reservation cannot fit. This is
+/// separate from the historical allocation issues fixed by DataFusion PR #14644
+/// (<https://github.com/apache/datafusion/pull/14644>).
+///
+/// This node bounds input batch sizes before sorting, at the cost of potentially
+/// expensive deep copies. It does not guarantee success for every memory pool:
+/// spill/merge reservations and other consumers also need room in the pool.
 ///
 /// # Deep copy
 ///

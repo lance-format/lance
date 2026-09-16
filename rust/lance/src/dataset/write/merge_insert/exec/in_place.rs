@@ -453,6 +453,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 patch_stream,
                 current_version,
                 target_bases_info,
+                params.write_version(&dataset),
             )
             .await?;
 

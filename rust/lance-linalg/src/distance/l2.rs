@@ -30,7 +30,12 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
-use crate::distance::{assert_batch_layout, assert_equal_lengths};
+#[cfg(feature = "fp16kernels")]
+use crate::distance::HalfBackend;
+use crate::distance::{
+    HALF_KERNELS_COMPILED, HalfType, U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout,
+    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
+};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -91,9 +96,24 @@ pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
-    key.iter()
-        .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u64).pow(2))
+    // Keep the common path on a u32 accumulator so LLVM can auto-vectorize it
+    // efficiently. Longer inputs are widened between overflow-safe chunks.
+    if key.len() <= U8_U32_ACCUMULATOR_MAX_LEN {
+        return key
+            .iter()
+            .zip(target.iter())
+            .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+            .sum::<u32>() as f32;
+    }
+
+    key.chunks(U8_U32_ACCUMULATOR_MAX_LEN)
+        .zip(target.chunks(U8_U32_ACCUMULATOR_MAX_LEN))
+        .map(|(key, target)| {
+            key.iter()
+                .zip(target.iter())
+                .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+                .sum::<u32>() as u64
+        })
         .sum::<u64>() as f32
 }
 
@@ -172,9 +192,15 @@ impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::Bf16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 bf16_kernel::l2_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -182,19 +208,19 @@ impl L2 for bf16 {
                 kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 bf16_kernel::l2_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 bf16_kernel::l2_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 bf16_kernel::l2_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 bf16_kernel::l2_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
@@ -229,9 +255,15 @@ impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::F16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -239,24 +271,24 @@ impl L2 for f16 {
                 kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the f16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
+            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+            // route; this fallback only extends the tiers the C kernel already
+            // served to Avx512FP16 after checking F16C and FMA.
             _ => l2_scalar::<Self, f32, 16>(x, y),
         }
     }
@@ -969,6 +1001,12 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
+///
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
@@ -981,11 +1019,7 @@ pub fn l2_distance_arrow_batch(
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::InvalidArgumentError(format!(

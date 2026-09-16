@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, '$.name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -2090,7 +2090,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, '$.name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
@@ -2670,6 +2670,10 @@ mod tests {
         parser: Box<MultiQueryParser>,
     }
 
+    fn f16_scalar(value: f32) -> ScalarValue {
+        ScalarValue::Float16(Some(half::f16::from_f32(value)))
+    }
+
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
             Self {
@@ -2931,6 +2935,68 @@ mod tests {
         assert!(plan.refine_expr.is_none());
     }
 
+    /// A `Float16` column must reach its scalar index like any other numeric
+    /// column. This is the second, quieter face of the coercion gap: `maybe_scalar`
+    /// runs `safe_coerce_scalar` on a literal the planner has *already* coerced,
+    /// so without a `ScalarValue::Float16` source arm the whole predicate silently
+    /// becomes a refine filter. The rows stay correct, which is why only the plan
+    /// catches it.
+    ///
+    /// This drives `Planner::parse_filter` rather than `check_with_schema` on
+    /// purpose. `check_with_schema` builds the expression with
+    /// `create_logical_expr`, which does no type coercion, so the literal would
+    /// still be `Float64` here and would exercise the `Float64` to `Float16`
+    /// target arm instead. Production coerces first, in `resolve_value`, and only
+    /// this order needs the source arm.
+    #[rstest]
+    #[case("temp = 1.0", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case(
+        "temp < 1.0",
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+    )]
+    #[case(
+        // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
+        // alone; at three or fewer over a bare column it becomes an `OR` chain and
+        // stops exercising `maybe_scalar_list`.
+        "temp IN (1.0, 2.5, 3.0, 4.0)",
+        SargableQuery::IsIn(vec![
+            f16_scalar(1.0),
+            f16_scalar(2.5),
+            f16_scalar(3.0),
+            f16_scalar(4.0),
+        ])
+    )]
+    fn test_float16_column_reaches_its_index(#[case] expr: &str, #[case] expected: SargableQuery) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "temp",
+            ColInfo::new(
+                DataType::Float16,
+                Box::new(SargableQueryParser::new(
+                    "temp_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("temp", DataType::Float16, true)]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter(expr).unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let wanted = IndexedExpression::index_query(
+            "temp".to_string(),
+            "temp_idx".to_string(),
+            "BTree".to_string(),
+            Arc::new(expected),
+        );
+
+        assert_eq!(plan.index_query, wanted.scalar_query, "predicate: {expr}");
+        assert!(plan.refine_expr.is_none(), "predicate: {expr}");
+    }
+
     #[test]
     fn test_expressions() {
         let index_info = MockIndexInfoProvider::new(vec![
@@ -2994,9 +3060,11 @@ mod tests {
             ),
         ]);
 
+        // The typed accessors decode the path value, matching the representation
+        // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, '$.name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
@@ -3005,6 +3073,14 @@ mod tests {
                 "$.name".to_string(),
             ),
         );
+        // `json_extract` evaluates to serialized JSON text, which does not match the
+        // decoded keys in the index, so it must not route.
+        // https://github.com/lance-format/lance/issues/8806
+        check_no_index(&index_info, "json_extract(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, '$.name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, '$.name') < 'foo'");
+        // A typed accessor on a path the index was not built for still declines.
+        check_no_index(&index_info, "json_get_string(json, '$.other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -4196,7 +4272,7 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, '$.b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4215,13 +4291,13 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, '$.a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, '$.c') = 'foo'");
     }
 
     #[test]

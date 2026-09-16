@@ -582,6 +582,53 @@ pub(crate) async fn indexed_fts_document_granularities(
     Ok(by_name.into_iter().collect())
 }
 
+/// The effective [`InvertedIndexParams`] of every persisted FTS index on
+/// `column`, paired with the document granularity it was built for.
+///
+/// The analyzer and positional settings are part of the query contract, not an
+/// implementation detail: a phrase query needs positions, and a stemming or
+/// n-gram tokenizer changes which terms a document produces. Anything that
+/// evaluates the same query over rows an index does not cover — an unindexed
+/// fragment, or a MemWAL active memtable — has to analyze them the same way or
+/// the two disagree about what matches.
+///
+/// Keyed by granularity rather than flattened, because row and list-element
+/// indexes may coexist on one column with *different* settings, and
+/// `load_segments` selects between them by the query's resolved granularity.
+/// Picking the first match instead would rebuild against the wrong contract —
+/// a list-element phrase query could be analyzed with the row index's
+/// positionless settings and silently match nothing.
+pub(crate) async fn indexed_fts_index_params(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Vec<(DocumentGranularity, InvertedIndexParams)>> {
+    let resolved = resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    let mut found = Vec::new();
+    for index in dataset.load_indices().await?.iter() {
+        if index.keyed_field() != Some(resolved.final_field_id) {
+            continue;
+        }
+        let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
+        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+            continue;
+        }
+        let details =
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                Error::corrupt_file(
+                    dataset.indices_dir().join(index.uuid.to_string()),
+                    format!(
+                        "failed to decode InvertedIndexDetails for FTS index '{}': {error}",
+                        index.name
+                    ),
+                )
+            })?;
+        let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+        found.push((document_granularity, params));
+    }
+    Ok(found)
+}
+
 /// Resolve an optional query granularity against persisted FTS index metadata.
 ///
 /// A unique indexed granularity is authoritative and also controls flat search

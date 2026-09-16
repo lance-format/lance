@@ -965,7 +965,7 @@ fn residual_bm25_scorer(
 /// flat-search approximation without rescanning the residual input or rebuilding
 /// exact corpus statistics.
 #[derive(Debug)]
-pub(crate) struct HybridCompoundQueryExec {
+pub struct HybridCompoundQueryExec {
     dataset: Arc<Dataset>,
     query: FtsQuery,
     params: FtsSearchParams,
@@ -977,7 +977,7 @@ pub(crate) struct HybridCompoundQueryExec {
 }
 
 impl HybridCompoundQueryExec {
-    pub(crate) fn new(
+    pub fn new(
         dataset: Arc<Dataset>,
         query: FtsQuery,
         params: FtsSearchParams,
@@ -1000,6 +1000,35 @@ impl HybridCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// The indexed segments this scorer reads. Paired with
+    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
+    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// fetch node, so changing it means reconstruction.
+    pub fn segments(&self) -> &[IndexMetadata] {
+        &self.segments
+    }
+
+    /// The scan over the fragments no segment covers.
+    pub fn residual_input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.residual_input
     }
 }
 
