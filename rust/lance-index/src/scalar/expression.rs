@@ -2953,7 +2953,10 @@ mod tests {
     #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
     #[case(
         "temp < 1.0",
-        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+        SargableQuery::Range(
+            Bound::Included(f16_scalar(f32::NEG_INFINITY)),
+            Bound::Excluded(f16_scalar(1.0))
+        )
     )]
     #[case(
         // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
