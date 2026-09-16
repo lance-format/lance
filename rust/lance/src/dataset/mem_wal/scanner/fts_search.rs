@@ -991,7 +991,7 @@ impl LsmFtsSearchPlanner {
                     None => bound_query = bound_query.limit(None),
                 }
                 scanner.full_text_search(bound_query)?;
-                let reconciled = generation.reconcile(scanner.create_plan().await?)?;
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
                 match above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),

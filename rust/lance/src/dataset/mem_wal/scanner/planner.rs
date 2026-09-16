@@ -414,7 +414,11 @@ impl LsmScanPlanner {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
-                let reconciled = generation.reconcile(scanner.create_plan().await?)?;
+                // Boxed at the call site, as the point-lookup arms are: the
+                // generation's own planning nests deeply enough that leaving
+                // this future inlined pushes the `Send` proof past rustc's
+                // recursion limit for callers stacked above it.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
                 match above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),

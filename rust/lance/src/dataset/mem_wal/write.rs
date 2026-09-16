@@ -4580,7 +4580,7 @@ pub fn new_shared_stats() -> SharedWriteStats {
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
-    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, Int64Array, StringArray};
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, StringArray};
     use arrow_schema::Field as ArrowField;
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;

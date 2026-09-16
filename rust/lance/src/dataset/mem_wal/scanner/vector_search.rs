@@ -563,7 +563,7 @@ impl LsmVectorSearchPlanner {
                 // predicate cannot be translated against pays for this.
                 let k = match above {
                     None => k,
-                    Some(_) => dataset.count_rows(None).await?.max(1),
+                    Some(_) => Box::pin(dataset.count_rows(None)).await?.max(1),
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
@@ -573,7 +573,7 @@ impl LsmVectorSearchPlanner {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
-                let reconciled = generation.reconcile(scanner.create_plan().await?)?;
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
                 match above {
                     Some(expr) => filter_above(reconciled, expr),
                     None => Ok(reconciled),
