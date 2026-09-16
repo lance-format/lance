@@ -431,12 +431,12 @@ impl LsmScanPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
-                // Asked for under the table's own names, which a memtable
-                // stores them under: a memtable is rebuilt with the claim, so
-                // its schema is the schema this read was planned against. That
-                // is the invariant this arm rests on instead of resolving one,
-                // and what `a_frozen_memtable_reads_the_same_before_and_after_
-                // its_flush` and the lifecycle equivalence tests enforce.
+                // Asked for under the table's own names, which is what a
+                // memtable stores them under: a memtable is created from the
+                // schema its writer holds, so a reader planning against that
+                // same schema needs no resolution. A caller pairing a memtable
+                // with a newer schema is outside this contract -- pass the
+                // memtable its own schema, or reopen the writer.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;

@@ -498,13 +498,12 @@ enum Unsupported {
     /// Resolving nested children by id there is more machinery than this case
     /// is worth; a rename that does not collide with a sibling is unaffected.
     SiblingNameReuse,
-    /// Tightening a column to non-null is validated against base, and a write
-    /// admitted into the WAL while that runs is not in base to be validated.
-    /// Draining first does not close it: the drain waits for the generations it
-    /// sealed, and writes keep being admitted into the next one, so a null can
-    /// be acknowledged after the check and before the commit. The row is then
-    /// in a table whose schema forbids it, and the compaction that would fold
-    /// it into base fails from then on.
+    /// Tightening a column to non-null is validated against the committed
+    /// fragments, and a row still in the MemWAL is not among them. Flushing
+    /// first does not close the window: a flush covers the generations open
+    /// when it starts, and writes keep arriving into the next one, so a null
+    /// can be accepted after the check and before the commit. That row is then
+    /// in a table whose schema forbids it, and every later merge of it fails.
     Tightening,
 }
 
