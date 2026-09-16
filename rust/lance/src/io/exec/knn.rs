@@ -2531,6 +2531,32 @@ impl ANNIvfBatchExec {
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+
+    /// Returns a reference to the vector query. Its `key` holds all
+    /// [`Self::query_count`] vectors concatenated.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Returns the number of query vectors packed into [`Self::query`].
+    pub fn query_count(&self) -> usize {
+        self.query_count
+    }
+
+    /// Returns a reference to the dataset.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Returns a reference to the index metadata.
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
 }
 
 impl DisplayAs for ANNIvfBatchExec {
