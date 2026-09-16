@@ -1288,6 +1288,30 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::shift("u = (1 << 63)", [true, false, false])]
+    #[case::string_concat("s = ('a' || 'b')", [true, false, false])]
+    fn test_parse_comparison_to_same_type_literal_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("u", UInt64, [1_u64 << 63, 3, 0]),
+            ("s", LargeUtf8, ["ab", "a", "b"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
     #[test]
     fn test_parse_filter_uint64_literal_above_i64_max() {
         let value = u64::MAX - 1;
