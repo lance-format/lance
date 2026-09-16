@@ -57,10 +57,9 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::planner::stored_names;
+use super::generation::{GenerationRead, filter_above};
 use super::projection::{project_to_canonical, validate_projection_names};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
-use crate::dataset::mem_wal::arrow_schema_with_field_ids;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
@@ -440,13 +439,12 @@ impl LsmFtsSearchPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
-        identity_schema: SchemaRef,
     ) -> Self {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
-            identity_schema,
             session: None,
             store_params: None,
             sstable_cache: None,
@@ -473,6 +471,16 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Set the session used to open SSTables.
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
+        self
+    }
+
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
@@ -789,6 +797,7 @@ impl LsmFtsSearchPlanner {
                     *fetch_limit,
                     projection,
                     index_params.as_ref(),
+                    &target_schema,
                 ))
             }))
             .await?;
@@ -881,6 +890,9 @@ impl LsmFtsSearchPlanner {
         limit: Option<usize>,
         projection: Option<&[String]>,
         index_params: Option<&InvertedIndexParams>,
+        // What every arm is normalized to, so an arm with nothing to offer can
+        // stand in for itself.
+        target_schema: &SchemaRef,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -915,33 +927,51 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 // Asked of this generation under its own names: a rename moved
                 // the table's name while the file still holds the old one.
-                let stored = arrow_schema_with_field_ids(dataset.schema());
-                let names = stored_names(&stored, &self.identity_schema);
                 let wanted = self.fts_scanner_projection(projection);
-                let cols: Vec<&str> = wanted
-                    .iter()
-                    .filter_map(|name| {
-                        names
-                            .iter()
-                            .find(|(_, table_name)| *table_name == name)
-                            .map(|(stored_name, _)| stored_name.as_str())
-                    })
-                    .collect();
-                scanner.project(&cols)?;
-                if let Some(ref filter) = self.filter {
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    Arc::clone(&self.identity_schema),
+                    self.pk_columns.clone(),
+                    wanted,
+                );
+                // The index is on this generation's own column, under the name
+                // it had when the generation was sealed.
+                let Some(stored_column) = generation.stored_name(column) else {
+                    // The generation was sealed before the searched column
+                    // existed, so it has nothing to match.
+                    return self.empty_plan(target_schema);
+                };
+                let stored_column = stored_column.to_string();
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                // The BM25 top-k has already run by then, so the arm can come
+                // back short -- which is right: those rows have no value for a
+                // column sealed before it existed.
+                let pushed = self.filter.as_ref().map(|f| (f, generation.to_stored(f)));
+                if let Some((expr, None)) = pushed {
+                    for column in expr.column_refs() {
+                        generation.also_produce(&column.name);
+                    }
+                }
+                scanner.project(&generation.stored_projection())?;
+                if let Some((_, Some(ref stored))) = pushed {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                let mut bound_query = query.clone().with_column(column.to_string())?;
+                let mut bound_query = query.clone().with_column(stored_column)?;
                 if let Some(limit) = limit {
                     bound_query = bound_query.limit(Some(limit as i64));
                 } else {
                     bound_query = bound_query.limit(None);
                 }
                 scanner.full_text_search(bound_query)?;
-                scanner.create_plan().await
+                let reconciled = generation.reconcile(scanner.create_plan().await?)?;
+                match pushed {
+                    Some((expr, None)) => filter_above(reconciled, expr),
+                    _ => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,

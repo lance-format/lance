@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, RecordBatch, RecordBatchOptions,
-    StructArray,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, GenericListArray, RecordBatch,
+    RecordBatchOptions, StructArray,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use lance_core::datatypes::LANCE_FIELD_ID_KEY;
@@ -45,6 +45,37 @@ pub(crate) fn field_id_of(field: &ArrowField) -> Option<i32> {
 /// Ids belong to the stored schema, where identity has to survive a rename. A
 /// caller's batch carries none, and Arrow compares a struct's children by their
 /// full field -- metadata included -- so a stamped schema would reject it.
+/// One stored column under the type the caller declared.
+///
+/// A field id lives inside a nested column's own Arrow type, so the memtable's
+/// id-carrying storage schema and the table's plain one describe the same
+/// values as two different types. Only the labels differ, so this relabels the
+/// array rather than converting it.
+pub(crate) fn relabel_to(column: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+    if column.data_type() == data_type {
+        return Ok(column.clone());
+    }
+    let relabelled = column
+        .to_data()
+        .into_builder()
+        .data_type(data_type.clone())
+        .build()
+        .map_err(|e| {
+            Error::invalid_input(format!(
+                "a {} column cannot be read as {data_type}: {e}",
+                column.data_type()
+            ))
+        })?;
+    Ok(arrow_array::make_array(relabelled))
+}
+
+/// [`without_field_ids`] for a type rather than a schema, for the nested types a
+/// reconciliation builds.
+fn without_field_ids_in(data_type: &DataType) -> DataType {
+    let one = ArrowSchema::new(vec![ArrowField::new("", data_type.clone(), true)]);
+    without_field_ids(&one).field(0).data_type().clone()
+}
+
 pub(crate) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
     fn strip(field: &ArrowField) -> ArrowField {
         let mut metadata = field.metadata().clone();
@@ -99,6 +130,30 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The same plan emitting the table's plain Arrow schema.
+    ///
+    /// Resolution needs field ids on the target -- a rename keeps the id and
+    /// moves the name -- but a reader is handed the table's schema, which does
+    /// not carry them. They live inside a nested column's own type, so a struct
+    /// built to the id-carrying target is a different Arrow type from the one
+    /// the caller declared. Only replay, which writes back into the memtable's
+    /// id-carrying storage schema, keeps them.
+    pub(crate) fn emitting_plain_schema(mut self) -> Self {
+        fn strip(source: &mut Source) {
+            match source {
+                Source::Nested(_, children, data_type) => {
+                    *data_type = without_field_ids_in(data_type);
+                    children.iter_mut().for_each(strip);
+                }
+                Source::Null(data_type) => *data_type = without_field_ids_in(data_type),
+                _ => {}
+            }
+        }
+        self.sources.iter_mut().for_each(strip);
+        self.target = Arc::new(without_field_ids(&self.target));
+        self
+    }
+
     /// Resolve `source` against `target`, or say why it cannot be done.
     ///
     /// `pk_columns` may not be filled with nulls: a row with no primary key
@@ -316,34 +371,49 @@ fn claimed_children(source: &arrow_schema::Fields, target: &arrow_schema::Fields
     claimed
 }
 
+/// One list column rebuilt around a reconciled element, for either offset width.
+fn rebuild_list<O: arrow_array::OffsetSizeTrait>(
+    column: &ArrayRef,
+    element_source: &Source,
+    target: &DataType,
+    name: &str,
+) -> Result<ArrayRef> {
+    let list = column
+        .as_any()
+        .downcast_ref::<GenericListArray<O>>()
+        .ok_or_else(|| Error::invalid_input(format!("column `{name}` is not a list")))?;
+    let Some(element) = children_of(target).and_then(|c| c.first().cloned()) else {
+        unreachable!("a list target has an element");
+    };
+    let child = take_column(
+        element_source,
+        std::slice::from_ref(list.values()),
+        list.values().len(),
+        element.name(),
+    )?;
+    Ok(Arc::new(
+        GenericListArray::<O>::try_new(
+            element,
+            list.offsets().clone(),
+            child,
+            list.nulls().cloned(),
+        )
+        .map_err(|e| Error::invalid_input(format!("rebuild list column `{name}`: {e}")))?,
+    ))
+}
+
 fn take_column(source: &Source, columns: &[ArrayRef], rows: usize, name: &str) -> Result<ArrayRef> {
     match source {
         Source::Take(i) => Ok(Arc::clone(&columns[*i])),
-        // A list is rebuilt around its element: the offsets and the validity
-        // say which rows hold what, and only the element's own type moves.
-        Source::Nested(i, children, to @ (DataType::List(_) | DataType::LargeList(_))) => {
-            let list = columns[*i]
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::invalid_input(format!("column `{name}` is not a list")))?;
-            let Some(element) = children_of(to).and_then(|c| c.first().cloned()) else {
-                unreachable!("a list target has an element");
-            };
-            let child = take_column(
-                &children[0],
-                std::slice::from_ref(list.values()),
-                list.values().len(),
-                element.name(),
-            )?;
-            Ok(Arc::new(
-                ListArray::try_new(
-                    element,
-                    list.offsets().clone(),
-                    child,
-                    list.nulls().cloned(),
-                )
-                .map_err(|e| Error::invalid_input(format!("rebuild list column `{name}`: {e}")))?,
-            ))
+        // A list is rebuilt around its element: the offsets and the validity say
+        // which rows hold what, and only the element's own type moves. The two
+        // offset widths are different array types and neither downcasts to the
+        // other.
+        Source::Nested(i, children, to @ DataType::List(_)) => {
+            rebuild_list::<i32>(&columns[*i], &children[0], to, name)
+        }
+        Source::Nested(i, children, to @ DataType::LargeList(_)) => {
+            rebuild_list::<i64>(&columns[*i], &children[0], to, name)
         }
         // A fixed-size list is rebuilt the same way, keeping its width.
         Source::Nested(i, children, to @ DataType::FixedSizeList(_, _)) => {

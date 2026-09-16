@@ -135,7 +135,7 @@ pub fn relax_non_pk_nullability(
 /// Scoped to the memtable path deliberately: emitting the id from the global
 /// Arrow conversion would change every schema Lance hands out, including for
 /// callers that compare schemas for equality.
-pub(crate) fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
+pub fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
     let arrow: ArrowSchema = schema.into();
     let fields: Vec<ArrowField> = arrow
         .fields()
@@ -162,14 +162,32 @@ fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
         }
         _ => field.clone(),
     };
-    let DataType::Struct(children) = field.data_type() else {
-        return field;
-    };
-    let children: Vec<ArrowField> = children
-        .iter()
-        .map(|child| stamp_field_id(child, &source.children))
-        .collect();
-    field.with_data_type(DataType::Struct(children.into()))
+    // A container carries its children inside its own type, and each of them is
+    // a field with an id of its own: a list's element, and that element's
+    // children in turn.
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let children: Vec<ArrowField> = children
+                .iter()
+                .map(|child| stamp_field_id(child, &source.children))
+                .collect();
+            field.with_data_type(DataType::Struct(children.into()))
+        }
+        DataType::List(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::List(Arc::new(element)))
+        }
+        DataType::LargeList(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::LargeList(Arc::new(element)))
+        }
+        DataType::FixedSizeList(element, size) => {
+            let size = *size;
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::FixedSizeList(Arc::new(element), size))
+        }
+        _ => field,
+    }
 }
 
 pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {

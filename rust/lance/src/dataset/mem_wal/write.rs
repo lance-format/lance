@@ -4581,8 +4581,10 @@ mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, Int64Array, StringArray};
+    use arrow_schema::Field as ArrowField;
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
+    use lance_core::datatypes::LANCE_FIELD_ID_KEY;
     use rstest::rstest;
     use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
@@ -4812,11 +4814,10 @@ mod tests {
             "the error should name the missing key: {error}"
         );
     }
-
-    /// A widened type is cast, matching what `alter_columns` did to the rows
-    /// already in the base table.
+    /// A column whose type has moved is refused rather than cast: a table with a
+    /// MemWAL does not accept a retype, so this is a disagreement to surface.
     #[test]
-    fn test_conform_casts_a_widened_column() {
+    fn test_conform_refuses_a_column_whose_type_moved() {
         let widened = ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
@@ -4838,15 +4839,12 @@ mod tests {
         )
         .unwrap();
 
-        let out = conform_to_storage_schema(narrow, &storage, &["id".to_string()]).unwrap();
-        assert_eq!(out.schema(), storage);
-        let counts = out
-            .column_by_name("count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(counts.value(0), 7, "the value survives the widening");
+        let err = conform_to_storage_schema(narrow, &storage, &["id".to_string()])
+            .expect_err("a column's type cannot change");
+        assert!(
+            err.to_string().contains("count"),
+            "the refusal should name the column, got: {err}"
+        );
     }
 
     /// A cast that would lose the value is an error, not a column of nulls.

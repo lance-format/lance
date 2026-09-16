@@ -28,13 +28,12 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::planner::stored_names;
+use super::generation::{GenerationRead, filter_above};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
-use crate::dataset::mem_wal::arrow_schema_with_field_ids;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -132,15 +131,14 @@ impl LsmVectorSearchPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
-        identity_schema: SchemaRef,
         vector_column: String,
         distance_type: lance_linalg::distance::DistanceType,
     ) -> Self {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
-            identity_schema,
             vector_column,
             distance_type,
             dataset: None,
@@ -182,6 +180,16 @@ impl LsmVectorSearchPlanner {
     }
 
     /// Set the session used to open SSTables.
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
+        self
+    }
+
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
@@ -506,29 +514,43 @@ impl LsmVectorSearchPlanner {
                 // the table's name while the file still holds the old one, so
                 // projecting the table's names would ask for a column that is
                 // not there.
-                let stored = arrow_schema_with_field_ids(dataset.schema());
-                let names = stored_names(&stored, &self.identity_schema);
                 let wanted =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                let cols: Vec<&str> = wanted
-                    .iter()
-                    .filter_map(|name| {
-                        names
-                            .iter()
-                            .find(|(_, table_name)| *table_name == name)
-                            .map(|(stored_name, _)| stored_name.as_str())
-                    })
-                    .collect();
-                scanner.project(&cols)?;
-                if let Some(ref filter) = self.filter {
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    Arc::clone(&self.identity_schema),
+                    self.pk_columns.clone(),
+                    wanted,
+                );
+                // The index is on this generation's own column, under the name
+                // it had when the generation was sealed.
+                let Some(vector_column) = generation.stored_name(&self.vector_column) else {
+                    // The table dropped the column the search names, so this
+                    // generation has no candidates to offer.
+                    return self.empty_plan(projection);
+                };
+                let vector_column = vector_column.to_string();
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                // The search's own top-k has already run by then, so the arm
+                // can come back short -- which is right: those rows have no
+                // value for a column sealed before it existed.
+                let pushed = self.filter.as_ref().map(|f| (f, generation.to_stored(f)));
+                if let Some((expr, None)) = pushed {
+                    for column in expr.column_refs() {
+                        generation.also_produce(&column.name);
+                    }
+                }
+                scanner.project(&generation.stored_projection())?;
+                if let Some((_, Some(ref stored))) = pushed {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
-                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
+                scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
@@ -536,7 +558,11 @@ impl LsmVectorSearchPlanner {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
-                scanner.create_plan().await
+                let reconciled = generation.reconcile(scanner.create_plan().await?)?;
+                match pushed {
+                    Some((expr, None)) => filter_above(reconciled, expr),
+                    _ => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,

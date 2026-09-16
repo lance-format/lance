@@ -308,9 +308,8 @@ impl LsmScanner {
         pk_columns: Vec<String>,
     ) -> Self {
         Self {
-            // Whatever identity the caller supplied. Pass a schema carrying
-            // field ids to have a generation's columns resolved by them; a
-            // plain one is matched by name, as it was before ids existed.
+            // Name matching until the caller supplies ids, as it was before
+            // ids existed. See [`Self::with_identity_schema`].
             identity_schema: schema.clone(),
             base: BaseSource::PathOnly(base_path.into()),
             schema,
@@ -353,6 +352,18 @@ impl LsmScanner {
     /// flush) captured atomically by `ShardWriter::in_memory_memtable_refs`.
     /// The read path's entry point — closes the concurrent-read-vs-flush
     /// hole by carrying frozen-undrained generations into the scan.
+    /// Supply `schema` with each field's id, so a sealed generation's columns
+    /// are resolved to the table's by id rather than by name. A rename keeps
+    /// the id and moves the name, so without this a renamed column reads as
+    /// absent. Built with
+    /// [`arrow_schema_with_field_ids`](crate::dataset::mem_wal::arrow_schema_with_field_ids).
+    ///
+    /// Set for you by [`Self::new`], which has the dataset to read them from.
+    pub fn with_identity_schema(mut self, identity_schema: SchemaRef) -> Self {
+        self.identity_schema = identity_schema;
+        self
+    }
+
     pub fn with_in_memory_memtables(
         mut self,
         shard_id: Uuid,
@@ -592,10 +603,10 @@ impl LsmScanner {
             collector,
             self.pk_columns.clone(),
             base_schema,
-            Arc::clone(&self.identity_schema),
             nearest.column.clone(),
             distance_type,
         )
+        .with_identity_schema(Arc::clone(&self.identity_schema))
         .with_filter(self.filter.clone());
         if let BaseSource::Table(dataset) = &self.base {
             planner = planner.with_dataset(dataset.clone());
@@ -661,13 +672,10 @@ impl LsmScanner {
         };
 
         let collector = self.build_collector();
-        let mut planner = super::LsmFtsSearchPlanner::new(
-            collector,
-            self.pk_columns.clone(),
-            base_schema,
-            Arc::clone(&self.identity_schema),
-        )
-        .with_filter(self.filter.clone());
+        let mut planner =
+            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
+                .with_identity_schema(Arc::clone(&self.identity_schema))
+                .with_filter(self.filter.clone());
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -712,7 +720,8 @@ impl LsmScanner {
                 extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
             let mut planner =
-                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
+                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)
+                    .with_identity_schema(Arc::clone(&self.identity_schema));
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
