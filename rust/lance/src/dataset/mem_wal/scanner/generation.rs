@@ -327,3 +327,195 @@ fn with_ids_from(schema: &Schema, stored: &Schema) -> Schema {
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Fields;
+    use datafusion::prelude::{col, lit};
+    use lance_core::datatypes::Schema as LanceSchema;
+
+    /// An Arrow field carrying a Lance field id, as a generation's schema and
+    /// the table's both do.
+    fn with_id(name: &str, data_type: DataType, id: i32) -> Field {
+        Field::new(name, data_type, true).with_metadata(
+            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn schema(fields: Vec<Field>) -> SchemaRef {
+        Arc::new(Schema::new(fields))
+    }
+
+    /// `GenerationRead` resolves against a generation's *Lance* schema, which
+    /// is where the stored ids come from.
+    fn generation(stored: SchemaRef, table: SchemaRef, wanted: &[&str]) -> GenerationRead {
+        let lance = LanceSchema::try_from(stored.as_ref()).expect("a lance schema");
+        GenerationRead::new(
+            &lance,
+            table,
+            vec!["id".to_string()],
+            wanted.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    /// The generation was sealed as `value`; the table has since renamed it.
+    fn renamed() -> GenerationRead {
+        generation(
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("value", DataType::Int64, 1),
+            ]),
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("amount", DataType::Int64, 1),
+            ]),
+            &["id", "amount"],
+        )
+    }
+
+    #[test]
+    fn a_renamed_column_is_asked_for_under_the_name_the_generation_has() {
+        assert_eq!(renamed().stored_projection(), vec!["id", "value"]);
+        assert_eq!(renamed().stored_name("amount"), Some("value"));
+    }
+
+    #[test]
+    fn a_column_the_generation_never_stored_is_left_out_of_the_projection() {
+        let read = generation(
+            schema(vec![with_id("id", DataType::Int64, 0)]),
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("added", DataType::Int64, 7),
+            ]),
+            &["id", "added"],
+        );
+        assert_eq!(read.stored_projection(), vec!["id"]);
+        assert_eq!(read.stored_name("added"), None);
+    }
+
+    /// A generation numbers its own columns in its own schema, so `_tombstone`
+    /// carries an id that collides with whatever the table gave that number.
+    #[test]
+    fn a_system_column_never_answers_for_one_of_the_tables() {
+        let read = generation(
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id(TOMBSTONE, DataType::Boolean, 7),
+            ]),
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("added", DataType::Int64, 7),
+            ]),
+            &["id", "added", TOMBSTONE],
+        );
+        assert_eq!(read.stored_name("added"), None, "not the tombstone's id");
+        assert_eq!(
+            read.stored_projection(),
+            vec!["id", TOMBSTONE],
+            "the tombstone is still asked for, under its own name"
+        );
+    }
+
+    #[test]
+    fn a_predicate_naming_a_renamed_column_is_rewritten_to_the_stored_name() {
+        let read = renamed();
+        assert!(
+            !read.can_answer(&col("amount").eq(lit(1i64))),
+            "the generation has no `amount`"
+        );
+        assert_eq!(
+            read.to_stored(&col("amount").eq(lit(1i64))),
+            Some(col("value").eq(lit(1i64))),
+        );
+    }
+
+    #[test]
+    fn a_predicate_the_generation_can_answer_as_written_is_left_alone() {
+        let read = renamed();
+        let expr = col("id").eq(lit(1i64));
+        assert!(read.can_answer(&expr));
+        assert_eq!(read.to_stored(&expr), Some(expr));
+    }
+
+    /// A predicate on a column the generation never stored cannot be pushed
+    /// down; it belongs above the reconciliation, where the column exists as
+    /// nulls.
+    #[test]
+    fn a_predicate_naming_a_column_the_generation_lacks_is_not_pushable() {
+        let read = generation(
+            schema(vec![with_id("id", DataType::Int64, 0)]),
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("added", DataType::Int64, 7),
+            ]),
+            &["id", "added"],
+        );
+        let expr = col("added").eq(lit(1i64));
+        assert!(!read.can_answer(&expr));
+        assert_eq!(read.to_stored(&expr), None);
+    }
+
+    /// A nested reference names the parent, and a parent's name does not move
+    /// when a child is renamed -- so pushing it down would evaluate it against
+    /// child names the table does not have.
+    #[test]
+    fn a_predicate_on_a_nested_column_is_never_pushed_down() {
+        let nested = |child: &str| {
+            with_id(
+                "info",
+                DataType::Struct(Fields::from(vec![with_id(child, DataType::Int64, 2)])),
+                1,
+            )
+        };
+        let read = generation(
+            schema(vec![with_id("id", DataType::Int64, 0), nested("c")]),
+            schema(vec![with_id("id", DataType::Int64, 0), nested("d")]),
+            &["id", "info"],
+        );
+        let expr = col("info").is_not_null();
+        assert!(!read.can_answer(&expr));
+        assert_eq!(read.to_stored(&expr), None);
+    }
+
+    /// A list of structs is rebuilt too, so its stored shape is not the shape a
+    /// pushed-down predicate would expect.
+    #[test]
+    fn a_list_is_reconstructed_only_when_its_element_is() {
+        let struct_element = DataType::Struct(Fields::from(vec![Field::new(
+            "c",
+            DataType::Int64,
+            true,
+        )]));
+        assert!(is_reconstructed(&DataType::List(Arc::new(Field::new(
+            "item",
+            struct_element,
+            true
+        )))));
+        assert!(!is_reconstructed(&DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true
+        )))));
+    }
+
+    /// With no ids to match on, the table's own names are the only link -- the
+    /// behaviour a caller that supplies no identity schema gets.
+    #[test]
+    fn a_table_without_ids_matches_by_name() {
+        let stored = Schema::new(vec![
+            with_id("id", DataType::Int64, 0),
+            with_id("value", DataType::Int64, 1),
+            with_id(TOMBSTONE, DataType::Boolean, 2),
+        ]);
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Int64, true),
+        ]);
+        let names = stored_names(&stored, &table);
+        assert_eq!(names.get("value"), Some(&"value".to_string()));
+        assert_eq!(names.get(TOMBSTONE), None, "not one of the table's columns");
+    }
+}

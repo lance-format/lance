@@ -693,14 +693,30 @@ impl LsmFtsSearchPlanner {
                         self.warmer.as_ref(),
                     )
                     .await?;
-                    if index_params.is_empty() {
-                        index_params = indexed_fts_index_params(&dataset, column).await?;
+                    // The index is on this generation's own column, under the
+                    // name it had when the generation was sealed. A generation
+                    // sealed before the column existed has no index on it and
+                    // offers no granularity.
+                    let generation = GenerationRead::new(
+                        dataset.schema(),
+                        Arc::clone(&self.identity_schema),
+                        self.pk_columns.clone(),
+                        Vec::new(),
+                    );
+                    match generation.stored_name(column) {
+                        None => Vec::new(),
+                        Some(stored_column) => {
+                            if index_params.is_empty() {
+                                index_params =
+                                    indexed_fts_index_params(&dataset, stored_column).await?;
+                            }
+                            indexed_fts_document_granularities(&dataset, stored_column)
+                                .await?
+                                .into_iter()
+                                .map(|(_, document_granularity)| document_granularity)
+                                .collect::<Vec<_>>()
+                        }
                     }
-                    indexed_fts_document_granularities(&dataset, column)
-                        .await?
-                        .into_iter()
-                        .map(|(_, document_granularity)| document_granularity)
-                        .collect::<Vec<_>>()
                 }
                 LsmDataSource::ActiveMemTable { index_store, .. } => {
                     index_store.fts_document_granularities_by_column(column)
