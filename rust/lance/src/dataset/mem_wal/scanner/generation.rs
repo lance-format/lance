@@ -426,6 +426,49 @@ mod tests {
         )
     }
 
+    /// A predicate naming a struct can only be pushed down when the generation
+    /// stores that struct exactly as the table declares it. A nested reference
+    /// names the parent, and a parent's name does not move when one of its
+    /// children does, so the parent's name alone cannot say whether pushing
+    /// down is safe.
+    #[test]
+    fn a_struct_predicate_is_pushed_down_only_when_its_children_did_not_move() {
+        // The child as the generation stored it, as the table now declares it,
+        // and whether a predicate on the parent may reach the stored data.
+        let cases = [
+            // Deferring this one was the bug: a search takes its top-k first,
+            // so a predicate applied afterwards loses a lower-ranked row that
+            // should have won.
+            ("nothing moved", ("c", 2), ("c", 2), true),
+            ("the child was renamed", ("c", 2), ("d", 2), false),
+            // Same name, same type, different field id: a child dropped and
+            // added back is a different column wearing the old one's shape, so
+            // a predicate on it must not reach the retired values.
+            ("the child was replaced", ("c", 2), ("c", 9), false),
+        ];
+        for (case, stored_child, table_child, pushed_down) in cases {
+            let info = |(name, id): (&str, i32)| {
+                with_id(
+                    "info",
+                    DataType::Struct(Fields::from(vec![with_id(name, DataType::Int64, id)])),
+                    1,
+                )
+            };
+            let read = generation(
+                schema(vec![with_id("id", DataType::Int64, 0), info(stored_child)]),
+                schema(vec![with_id("id", DataType::Int64, 0), info(table_child)]),
+                &["id", "info"],
+            );
+            let expr = col("info").is_not_null();
+            let got = read.to_stored(&expr);
+            assert_eq!(
+                got,
+                pushed_down.then_some(expr),
+                "{case}: the predicate was pushed down when it should not have been, or the reverse"
+            );
+        }
+    }
+
     #[test]
     fn a_renamed_column_is_asked_for_under_the_name_the_generation_has() {
         assert_eq!(renamed().stored_projection(), vec!["id", "value"]);
@@ -499,66 +542,6 @@ mod tests {
             &["id", "added"],
         );
         assert_eq!(read.to_stored(&col("added").eq(lit(1i64))), None);
-    }
-
-    /// A nested reference names the parent, and a parent's name does not move
-    /// when a child is renamed — so pushing it down would evaluate it against
-    /// child names the table does not have.
-    #[test]
-    fn a_predicate_on_a_struct_whose_child_was_renamed_is_not_pushed_down() {
-        let nested = |child: &str| {
-            with_id(
-                "info",
-                DataType::Struct(Fields::from(vec![with_id(child, DataType::Int64, 2)])),
-                1,
-            )
-        };
-        let read = generation(
-            schema(vec![with_id("id", DataType::Int64, 0), nested("c")]),
-            schema(vec![with_id("id", DataType::Int64, 0), nested("d")]),
-            &["id", "info"],
-        );
-        assert_eq!(read.to_stored(&col("info").is_not_null()), None);
-    }
-
-    /// The common case: a struct nothing moved is pushed down like any other
-    /// column. Deferring these was the bug -- a search takes its top-k first,
-    /// so a predicate applied afterwards loses a lower-ranked row that should
-    /// have won.
-    #[test]
-    fn a_predicate_on_a_struct_that_did_not_move_is_pushed_down() {
-        let unmoved = with_id(
-            "info",
-            DataType::Struct(Fields::from(vec![with_id("c", DataType::Int64, 2)])),
-            1,
-        );
-        let read = generation(
-            schema(vec![with_id("id", DataType::Int64, 0), unmoved.clone()]),
-            schema(vec![with_id("id", DataType::Int64, 0), unmoved]),
-            &["id", "info"],
-        );
-        let expr = col("info").is_not_null();
-        assert_eq!(read.to_stored(&expr), Some(expr));
-    }
-
-    /// Same name, same type, different field id: a child dropped and added
-    /// back is a different column wearing the old one's shape, so a predicate
-    /// on it must not reach the retired values.
-    #[test]
-    fn a_predicate_on_a_struct_whose_child_was_replaced_is_not_pushed_down() {
-        let child = |id: i32| {
-            with_id(
-                "info",
-                DataType::Struct(Fields::from(vec![with_id("c", DataType::Int64, id)])),
-                1,
-            )
-        };
-        let read = generation(
-            schema(vec![with_id("id", DataType::Int64, 0), child(2)]),
-            schema(vec![with_id("id", DataType::Int64, 0), child(9)]),
-            &["id", "info"],
-        );
-        assert_eq!(read.to_stored(&col("info").is_not_null()), None);
     }
 
     /// With no ids to match on, the table's own names are the only link — the
