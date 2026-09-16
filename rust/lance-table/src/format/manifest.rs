@@ -170,17 +170,9 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
-    /// Whether this snapshot can contain Managed descriptors from unstable 2.3.
+    /// Whether this table requires independently addressed Managed Blob support.
     pub fn has_managed_blobs(&self) -> bool {
-        self.schema
-            .fields_pre_order()
-            .any(|field| field.is_blob_v2())
-            && (self.data_storage_format.version == ConcreteFileVersion::V2_3
-                || self
-                    .fragments
-                    .iter()
-                    .flat_map(|fragment| fragment.referenced_lance_files())
-                    .any(|file| file.file_major_version == 2 && file.file_minor_version == 3))
+        self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
     }
 
     /// Register the writer's explicit base without rebinding encoded references.
@@ -1226,6 +1218,8 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_3),
             HashMap::new(),
         );
+        manifest.reader_feature_flags |= crate::feature_flags::FLAG_MANAGED_BLOBS;
+        manifest.writer_feature_flags |= crate::feature_flags::FLAG_MANAGED_BLOBS;
         let base = BasePath::new(7, "memory://dataset".to_string(), None, true);
         manifest.bind_managed_base(base.clone()).unwrap();
         manifest.bind_managed_base(base.clone()).unwrap();

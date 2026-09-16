@@ -229,7 +229,6 @@ impl FieldEncoder for BlobStructuralEncoder {
 /// Blob v2 structural encoder
 pub struct BlobV2StructuralEncoder {
     descriptor_encoder: Box<dyn FieldEncoder>,
-    managed: bool,
 }
 
 impl BlobV2StructuralEncoder {
@@ -249,17 +248,7 @@ impl BlobV2StructuralEncoder {
 
         let descriptor_encoder = make_descriptor_encoder(descriptor_field)?;
 
-        Ok(Self {
-            descriptor_encoder,
-            managed: false,
-        })
-    }
-
-    /// Enable independently addressed Managed descriptors for a file grammar
-    /// that explicitly supports them. Stable Blob v2 grammars must not opt in.
-    pub fn with_managed(mut self) -> Self {
-        self.managed = true;
-        self
+        Ok(Self { descriptor_encoder })
     }
 }
 
@@ -349,12 +338,6 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                 let kind_val = BlobKind::try_from(kind_col.value(i))?;
                 match kind_val {
                     BlobKind::Managed => {
-                        if !self.managed {
-                            return Err(Error::not_supported(
-                                "Managed blobs require a file format with Managed support"
-                                    .to_string(),
-                            ));
-                        }
                         if uri_col.is_null(i)
                             || blob_id_col.is_null(i)
                             || packed_position_col.is_null(i)

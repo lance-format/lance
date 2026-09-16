@@ -23,7 +23,8 @@ use lance_encoding::{
         FieldEncodingStrategy,
         structural::{
             PrimitiveFieldEncoding, PrimitivePageEncoding, try_create_binary_blob, try_create_list,
-            try_create_map, try_create_struct, try_create_structural_fixed_size_list,
+            try_create_map, try_create_struct, try_create_structural_blob,
+            try_create_structural_fixed_size_list,
         },
     },
 };
@@ -83,17 +84,10 @@ impl FieldEncodingStrategy for FieldStrategy {
         {
             return Ok(encoder);
         }
-        if field.is_blob() && matches!(field.data_type(), arrow_schema::DataType::Struct(_)) {
-            let descriptor_column = column_index.next_column_index(field.id as u32);
-            let encoder = lance_encoding::encodings::logical::blob::BlobV2StructuralEncoder::new(
-                field,
-                |descriptor| {
-                    self.primitive
-                        .create_at(descriptor, descriptor_column, context)
-                },
-            )?
-            .with_managed();
-            return Ok(Box::new(encoder));
+        if let Some(encoder) =
+            try_create_structural_blob(&self.primitive, field, column_index, context)?
+        {
+            return Ok(encoder);
         }
         if field.is_blob() {
             return Err(Error::invalid_input_source(

@@ -593,12 +593,19 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let managed_paths = if in_working_set && manifest.has_managed_blobs() {
+        let managed_paths = if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
                 .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
                 .await?;
-            super::blob::managed_paths(&snapshot, self.dataset).await?
+            match super::blob::managed_paths(&snapshot, self.dataset).await {
+                Ok(paths) => paths,
+                // A concurrent cleanup may already have removed expired data
+                // files. Losing deletion proof is safe; losing retained references
+                // is not. Other failures still stop cleanup before any deletion.
+                Err(error) if !in_working_set && error.is_not_found() => HashSet::new(),
+                Err(error) => return Err(error),
+            }
         } else {
             HashSet::new()
         };
@@ -771,6 +778,10 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            build_listing_stream(
+                self.dataset.base.clone().join("_blobs"),
+                data_unmodified_since,
+            ),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -1003,6 +1014,26 @@ impl<'a> CleanupTask<'a> {
                     .contains(&relative_path)
                 {
                     return Ok(None);
+                }
+                if relative_path
+                    .parts()
+                    .next()
+                    .is_some_and(|part| part.as_ref() == "_blobs")
+                {
+                    let verified = inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path);
+                    return if verified || !maybe_in_progress {
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Data,
+                            !verified,
+                            size_bytes,
+                        ))
+                    } else {
+                        Ok(None)
+                    };
                 }
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
@@ -2816,6 +2847,13 @@ mod tests {
             fixture.create_some_data().await.unwrap();
             fixture.block_commits();
             assert!(fixture.append_some_data().await.is_err());
+            let dataset = fixture.open().await.unwrap();
+            let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
+            dataset
+                .object_store
+                .put(&blob_path, b"orphan")
+                .await
+                .unwrap();
 
             let age = if old_files {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
@@ -2841,6 +2879,11 @@ mod tests {
             let should_delete = override_opt.unwrap_or(false) || old_files;
 
             let after_count = fixture.count_files().await.unwrap();
+            assert_eq!(
+                dataset.object_store.exists(&blob_path).await.unwrap(),
+                !should_delete,
+                "override={override_opt:?}, old_files={old_files}"
+            );
             assert_eq!(removed.old_versions, 0);
             assert_eq!(
                 removed.bytes_removed,

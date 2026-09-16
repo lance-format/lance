@@ -2469,7 +2469,10 @@ async fn rewrite_files(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
-                write_version == ConcreteFileVersion::V2_3,
+                matches!(
+                    write_version,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ),
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {

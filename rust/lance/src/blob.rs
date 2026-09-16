@@ -872,6 +872,14 @@ impl PackedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -1013,6 +1021,14 @@ impl DedicatedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,

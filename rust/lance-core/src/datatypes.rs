@@ -600,7 +600,7 @@ pub enum BlobKind {
     /// `blob_id` is the exact manifest base ID (including zero); `blob_uri` is
     /// relative to that base root. `position`/`size` select a known range, and
     /// zero size is an empty value rather than a request to discover its length.
-    /// This kind is supported by unstable file format 2.3.
+    /// Tables containing this kind require the Managed Blob reader and writer feature flags.
     Managed = 4,
 }
 

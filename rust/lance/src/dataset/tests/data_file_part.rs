@@ -838,14 +838,12 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     let mut invalid = serde_json::to_value(&first).unwrap();
     invalid["blob_ids"] = serde_json::json!({"start": 20, "end": 30});
     let invalid: DataFilePart = serde_json::from_value(invalid).unwrap();
-    let error = dataset
+    // Managed references use base IDs, so their identity is independent of the
+    // file-local sidecar lease recorded in the checkpoint.
+    dataset
         .concat_data_file_parts(&target, &[invalid])
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("outside declared range"),
-        "{error}"
-    );
+        .unwrap();
     let second = write_part(
         &dataset,
         &target,

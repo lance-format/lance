@@ -118,19 +118,19 @@ impl Dataset {
     /// Encode one managed part and return its serializable description.
     ///
     /// Lance generates a unique staging name in the target's base. Managed Blob
-    /// payloads are written directly beneath the sidecar directory selected by the final
-    /// target using IDs from `blob_ids`; every non-empty logical Inline value is
-    /// spilled to Packed or Dedicated storage so final concatenation never copies
-    /// Blob payload bytes.
+    /// payloads use independent `_blobs/<uuid>.blob` objects in that base. Every
+    /// non-empty logical Inline value is spilled so final concatenation never
+    /// copies Blob payload bytes. Parts still require disjoint `blob_ids`
+    /// reservations; Managed descriptors encode base IDs rather than these IDs.
     /// Every use of `target` must refer to the same dataset and resolved base;
     /// associating a target with that storage context is the caller's
     /// responsibility.
     /// Persist the target before writing. A failed write may leave files; after
-    /// stopping all users of the target, [`DataFileTarget::cleanup`] can
-    /// remove them without a completed part description. Retries must use fresh,
-    /// disjoint Blob ID ranges, including ranges from failed writes. Staging
-    /// `.part` files are only explicitly cleaned; ordinary dataset GC rules still
-    /// apply to uncommitted Blob sidecars and must be coordinated with checkpoints.
+    /// stopping all users of the target, [`DataFileTarget::cleanup`] removes
+    /// staging files and file-relative sidecars without a completed part description.
+    /// Retries must use fresh, disjoint Blob ID ranges, including ranges from
+    /// failed writes. Independent Managed objects follow ordinary dataset GC
+    /// rules, which must be coordinated with uncommitted writes and checkpoints.
     ///
     /// # Example
     ///
@@ -198,9 +198,7 @@ impl Dataset {
         } else {
             None
         };
-        if target.version == ConcreteFileVersion::V2_3
-            && let Some(writer) = preprocessor.take()
-        {
+        if let Some(writer) = preprocessor.take() {
             let base = if let Some(id) = target.base_id {
                 self.manifest.base_paths.get(&id).cloned().ok_or_else(|| {
                     Error::invalid_input(format!("Managed part target has unknown base ID {id}"))
@@ -961,8 +959,32 @@ where
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
-    // Keep a copy so failure paths can clean up files written to target bases.
-    let cleanup_bases = target_bases_info.clone();
+    let default_blob_base = if schema.fields_pre_order().any(|field| field.is_blob_v2()) {
+        Some(if let Some(dataset) = dataset {
+            dataset.managed_default_base()?.id
+        } else {
+            lance_table::format::BasePath::unused_id(
+                params.initial_bases.iter().flatten().map(|base| base.id),
+            )?
+        })
+    } else {
+        None
+    };
+    // Keep all physical write destinations, including the explicit primary
+    // alias used by Managed descriptors, available to failed-write cleanup.
+    let mut cleanup_bases = target_bases_info.clone().unwrap_or_default();
+    if let Some(base_id) = default_blob_base {
+        cleanup_bases.push(TargetBaseInfo {
+            base_id,
+            object_store: object_store.clone(),
+            base_dir: base_dir.clone(),
+            is_dataset_root: true,
+        });
+    }
+    let open_writer = move |object_store, schema, base_dir, mut options: WriterOptions| {
+        options.base_id = options.base_id.or(default_blob_base);
+        open_writer(object_store, schema, base_dir, options)
+    };
     let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
@@ -1163,13 +1185,7 @@ where
         // Drop the writer so its in-progress file is cleaned up (LocalWriter
         // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_data_fragments(
-            &object_store,
-            base_dir,
-            cleanup_bases.as_deref(),
-            &fragments,
-        )
-        .await;
+        cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments).await;
         return Err(e);
     }
 
@@ -1177,13 +1193,7 @@ where
     if let Some(mut writer) = writer.take() {
         if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
             drop(writer);
-            cleanup_data_fragments(
-                &object_store,
-                base_dir,
-                cleanup_bases.as_deref(),
-                &fragments,
-            )
-            .await;
+            cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments).await;
             return Err(e);
         }
         match writer.finish().await {
@@ -1205,13 +1215,8 @@ where
             }
             Err(e) => {
                 drop(writer);
-                cleanup_data_fragments(
-                    &object_store,
-                    base_dir,
-                    cleanup_bases.as_deref(),
-                    &fragments,
-                )
-                .await;
+                cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments)
+                    .await;
                 return Err(e);
             }
         }
@@ -2215,7 +2220,10 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
-    if version == ConcreteFileVersion::V2_3 {
+    if matches!(
+        version,
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+    ) {
         let base_id = base_id
             .ok_or_else(|| Error::invalid_input("Managed writer requires an explicit base ID"))?;
         preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());

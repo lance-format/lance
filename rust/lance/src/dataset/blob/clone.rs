@@ -230,10 +230,7 @@ pub async fn copy_blob_columns(
             &source_base.extract_path(source.session.store_registry())?,
             &uri,
         )?;
-        let target_uri = format!(
-            "data/{}/00000000000000000000000000000000.blob",
-            Uuid::new_v4()
-        );
+        let target_uri = format!("_blobs/{}.blob", Uuid::new_v4());
         let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
         source
             .object_store(Some(id))

@@ -361,16 +361,22 @@ impl RollingPackedBlobWriter {
     async fn start_new_pack(
         &mut self,
         object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
+        data_file_path: Path,
+        managed_base: Option<&(u32, Path)>,
         blob_id_allocator: BlobIdAllocator,
         max_pack_size: usize,
     ) -> Result<()> {
         self.finish().await?;
         let blob_id = blob_id_allocator.next()?;
-        let data_file_path = data_dir.join(format!("{data_file_key}.lance"));
-        self.current =
-            Some(PackedBlobWriter::try_new(object_store, data_file_path, blob_id).await?);
+        self.current = Some(if let Some((_, root)) = managed_base {
+            let path = root
+                .clone()
+                .join("_blobs")
+                .join(format!("{}.blob", uuid::Uuid::new_v4()));
+            PackedBlobWriter::try_new_at(object_store, path, blob_id).await?
+        } else {
+            PackedBlobWriter::try_new(object_store, data_file_path, blob_id).await?
+        });
         self.current_size = 0;
         self.current_max_pack_size = Some(max_pack_size);
         Ok(())
@@ -379,8 +385,8 @@ impl RollingPackedBlobWriter {
     async fn write(
         &mut self,
         object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
+        data_file_path: Path,
+        managed_base: Option<&(u32, Path)>,
         blob_id_allocator: BlobIdAllocator,
         max_pack_size: usize,
         source: BlobWriteSource<'_>,
@@ -396,8 +402,8 @@ impl RollingPackedBlobWriter {
         if needs_new_pack {
             self.start_new_pack(
                 object_store,
-                data_dir,
-                data_file_key,
+                data_file_path,
+                managed_base,
                 blob_id_allocator,
                 max_pack_size,
             )
@@ -414,7 +420,7 @@ impl RollingPackedBlobWriter {
             }
         };
         self.current_size += len;
-        Ok(value)
+        BlobPreprocessor::managed_descriptor(value, managed_base, writer.path())
     }
 
     async fn finish(&mut self) -> Result<()> {
@@ -436,7 +442,7 @@ impl RollingPackedBlobWriter {
 /// Preprocesses blob v2 columns on the write path so the encoder only sees lightweight descriptors:
 ///
 /// - Spills large blobs to sidecar files before encoding, reducing memory/CPU and avoiding copying huge payloads through page builders.
-/// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a stable path independent of temporary fragment IDs assigned during write.
+/// - Emits explicit Managed addresses when a base is bound; low-level sidecar writers retain their existing descriptors.
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     managed_base: Option<(u32, Path)>,
@@ -674,20 +680,19 @@ impl BlobPreprocessor {
         self
     }
 
-    fn managed_descriptor(&self, descriptor: BlobDescriptor) -> Result<BlobDescriptor> {
-        let Some((base_id, root)) = &self.managed_base else {
+    fn managed_descriptor(
+        descriptor: BlobDescriptor,
+        managed_base: Option<&(u32, Path)>,
+        path: &Path,
+    ) -> Result<BlobDescriptor> {
+        let Some((base_id, root)) = managed_base else {
             return Ok(descriptor);
         };
-        let (blob_id, offset, size) = match descriptor {
-            BlobDescriptor::Packed {
-                blob_id,
-                offset,
-                size,
-            } => (blob_id, offset, size),
-            BlobDescriptor::Dedicated { blob_id, size } => (blob_id, 0, size),
+        let (offset, size) = match descriptor {
+            BlobDescriptor::Packed { offset, size, .. } => (offset, size),
+            BlobDescriptor::Dedicated { size, .. } => (0, size),
             other => return Ok(other),
         };
-        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
         let relative = path
             .prefix_match(root)
             .ok_or_else(|| {
@@ -721,18 +726,27 @@ impl BlobPreprocessor {
         BlobDescriptorArrayBuilder::new_with_metadata(field.name(), field.is_nullable(), metadata)
     }
 
-    async fn write_dedicated(
-        object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
-        blob_id_allocator: BlobIdAllocator,
-        source: BlobWriteSource<'_>,
-    ) -> Result<BlobDescriptor> {
-        let blob_id = blob_id_allocator.next()?;
-        let data_file_path = data_dir.join(format!("{data_file_key}.lance"));
-        let mut writer =
-            crate::blob::DedicatedBlobWriter::try_new(object_store, data_file_path, blob_id)
-                .await?;
+    async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
+        let blob_id = self.blob_id_allocator.next()?;
+        let mut writer = if let Some((_, root)) = &self.managed_base {
+            let path = root
+                .clone()
+                .join("_blobs")
+                .join(format!("{}.blob", uuid::Uuid::new_v4()));
+            crate::blob::DedicatedBlobWriter::try_new_at(self.object_store.clone(), path, blob_id)
+                .await?
+        } else {
+            let data_file_path = self
+                .data_dir
+                .clone()
+                .join(format!("{}.lance", self.data_file_key));
+            crate::blob::DedicatedBlobWriter::try_new(
+                self.object_store.clone(),
+                data_file_path,
+                blob_id,
+            )
+            .await?
+        };
         match source {
             BlobWriteSource::Bytes(data) => writer.write(data).await?,
             BlobWriteSource::External(source) => {
@@ -741,7 +755,8 @@ impl BlobPreprocessor {
                     .await?;
             }
         }
-        writer.finish().await
+        let path = writer.path().clone();
+        Self::managed_descriptor(writer.finish().await?, self.managed_base.as_ref(), &path)
     }
 
     async fn write_packed(
@@ -755,8 +770,10 @@ impl BlobPreprocessor {
         self.pack_writer
             .write(
                 self.object_store.clone(),
-                self.data_dir.clone(),
-                self.data_file_key.clone(),
+                self.data_dir
+                    .clone()
+                    .join(format!("{}.lance", self.data_file_key)),
+                self.managed_base.as_ref(),
                 self.blob_id_allocator.clone(),
                 max_pack_size,
                 source,
@@ -831,7 +848,7 @@ impl BlobPreprocessor {
                         let descriptor = self
                             .write_packed(pack_file_threshold, BlobWriteSource::Bytes(value))
                             .await?;
-                        output.push(self.managed_descriptor(descriptor)?)?;
+                        output.push(descriptor)?;
                     }
                 }
                 BlobKind::Packed => {
@@ -1249,15 +1266,10 @@ impl BlobPreprocessor {
             let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
             if has_data && data_len > dedicated_threshold {
-                let value = Self::write_dedicated(
-                    self.object_store.clone(),
-                    self.data_dir.clone(),
-                    self.data_file_key.clone(),
-                    self.blob_id_allocator.clone(),
-                    BlobWriteSource::Bytes(data_col.value(i)),
-                )
-                .await?;
-                blob_writer.push(self.managed_descriptor(value)?)?;
+                let value = self
+                    .write_dedicated(BlobWriteSource::Bytes(data_col.value(i)))
+                    .await?;
+                blob_writer.push(value)?;
                 continue;
             }
 
@@ -1268,7 +1280,7 @@ impl BlobPreprocessor {
                         BlobWriteSource::Bytes(data_col.value(i)),
                     )
                     .await?;
-                blob_writer.push(self.managed_descriptor(value)?)?;
+                blob_writer.push(value)?;
                 continue;
             }
 
@@ -1294,15 +1306,10 @@ impl BlobPreprocessor {
                     let data_len = source.size();
 
                     if data_len > dedicated_threshold as u64 {
-                        let value = Self::write_dedicated(
-                            self.object_store.clone(),
-                            self.data_dir.clone(),
-                            self.data_file_key.clone(),
-                            self.blob_id_allocator.clone(),
-                            BlobWriteSource::External(&source),
-                        )
-                        .await?;
-                        blob_writer.push(self.managed_descriptor(value)?)?;
+                        let value = self
+                            .write_dedicated(BlobWriteSource::External(&source))
+                            .await?;
+                        blob_writer.push(value)?;
                         continue;
                     }
 
@@ -1310,7 +1317,7 @@ impl BlobPreprocessor {
                         let value = self
                             .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
                             .await?;
-                        blob_writer.push(self.managed_descriptor(value)?)?;
+                        blob_writer.push(value)?;
                         continue;
                     }
 
@@ -4938,6 +4945,7 @@ mod tests {
         #[case] kind: BlobKind,
         #[values(false, true)] maximum_base_id: bool,
         #[values(false, true)] primary_write: bool,
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     ) {
         let test_dir = TempStrDir::default();
         let payload = vec![42u8; size];
@@ -4952,7 +4960,7 @@ mod tests {
                 RecordBatchIterator::new(vec![Ok(batch)], schema),
                 &test_dir,
                 Some(WriteParams {
-                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    data_storage_version: Some(version),
                     initial_bases: maximum_base_id.then(|| {
                         vec![BasePath::new(
                             u32::MAX,
@@ -4968,6 +4976,14 @@ mod tests {
             .await
             .unwrap(),
         );
+        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
+        assert_ne!(dataset.manifest.reader_feature_flags & flag, 0);
+        assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
+        for (_, uri) in super::managed_references(&dataset).await.unwrap() {
+            assert!(uri.starts_with("_blobs/"), "{uri}");
+            assert_eq!(uri.split('/').count(), 2);
+            Uuid::parse_str(uri.trim_start_matches("_blobs/").trim_end_matches(".blob")).unwrap();
+        }
         let id = if maximum_base_id && !primary_write {
             u32::MAX
         } else {
@@ -5065,7 +5081,9 @@ mod tests {
         }
         let base = dataset.managed_default_base().unwrap();
         assert!(base.is_dataset_root);
-        assert_eq!(base.id, if is_dataset_root { 7 } else { 0 });
+        if !is_dataset_root {
+            assert_eq!(base.id, 0);
+        }
         assert_eq!(
             dataset.manifest.base_paths[&7].is_dataset_root,
             is_dataset_root
@@ -5085,11 +5103,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::adopt_stable(LanceFileVersion::V2_2)]
-    #[case::reuse_managed(LanceFileVersion::V2_3)]
+    #[case::adopt_stable(true)]
+    #[case::reuse_managed(false)]
     #[tokio::test]
     async fn managed_compaction_preserves_sidecars_after_source_gc(
-        #[case] version: LanceFileVersion,
+        #[case] released: bool,
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     ) {
         mock_instant::thread_local::MockClock::set_system_time(
             std::time::SystemTime::now()
@@ -5097,31 +5116,57 @@ mod tests {
                 .unwrap(),
         );
         let test_dir = TempStrDir::default();
-        let payload = vec![7; 100 * 1024];
+        let payload = vec![b'p'; 16];
+        let dedicated = vec![b'd'; 32];
         let mut blobs = BlobArrayBuilder::new(6);
         blobs.push_bytes(&payload).unwrap();
         blobs.push_bytes(b"inline").unwrap();
         blobs.push_null().unwrap();
         blobs.push_bytes(b"").unwrap();
-        blobs.push_bytes(&payload).unwrap();
+        blobs.push_bytes(&dedicated).unwrap();
         blobs.push_bytes(b"inline").unwrap();
-        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.extend(HashMap::from([
+            (
+                BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+                "8".to_string(),
+            ),
+            (
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                "24".to_string(),
+            ),
+        ]));
+        field = field.with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            &test_dir,
-            Some(WriteParams {
-                max_rows_per_file: 3,
-                data_storage_version: Some(version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let old_data = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let mut dataset = if released {
+            let mut dataset = Dataset::open(old_data.path_str().as_str()).await.unwrap();
+            assert!(!dataset.manifest.has_managed_blobs());
+            dataset
+                .update_config([("test", "metadata-only")])
+                .await
+                .unwrap();
+            assert!(!dataset.manifest.has_managed_blobs());
+            dataset
+        } else {
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        };
         assert_eq!(dataset.manifest.fragments.len(), 2);
         let before = dataset
             .object_store
-            .read_dir_all(&dataset.data_dir(), None)
+            .read_dir_all(&dataset.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -5139,7 +5184,7 @@ mod tests {
         crate::dataset::optimize::compact_files(
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
-                data_storage_version: Some(LanceFileVersion::V2_3),
+                data_storage_version: Some(version),
                 ..Default::default()
             },
             None,
@@ -5147,6 +5192,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert!(dataset.manifest.has_managed_blobs());
         let cleanup_stats = crate::dataset::cleanup::cleanup_old_versions(
             &dataset,
             crate::dataset::cleanup::CleanupPolicy {
@@ -5158,7 +5204,7 @@ mod tests {
         .unwrap();
         let after = dataset
             .object_store
-            .read_dir_all(&dataset.data_dir(), None)
+            .read_dir_all(&dataset.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -5194,7 +5240,7 @@ mod tests {
                     .await
                     .unwrap()
                     .as_ref(),
-                payload
+                if index == 0 { &payload } else { &dedicated }.as_slice()
             );
         }
         for index in [1, 5] {
@@ -5212,6 +5258,34 @@ mod tests {
         }
         assert!(values[2].is_none());
         assert!(values[3].as_ref().unwrap().read().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_flag_survives_restore_of_unflagged_snapshot() {
+        let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let mut old = dataset.checkout_version(1).await.unwrap();
+        assert!(!old.manifest.has_managed_blobs());
+        crate::dataset::optimize::compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+        assert!(dataset.manifest.has_managed_blobs());
+        old.restore().await.unwrap();
+        assert!(old.manifest.has_managed_blobs());
+        assert_ne!(
+            old.manifest.writer_feature_flags & lance_table::feature_flags::FLAG_MANAGED_BLOBS,
+            0
+        );
+        let values = Arc::new(old)
+            .take_blobs_by_indices(&[0, 4], "blob")
+            .await
+            .unwrap();
+        assert_eq!(values[0].as_ref().unwrap().kind(), BlobKind::Packed);
+        assert_eq!(values[1].as_ref().unwrap().kind(), BlobKind::Dedicated);
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"pppppppppppppppp"
+        );
     }
 
     #[rstest]
@@ -7138,11 +7212,7 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(1),
-            (if version == LanceFileVersion::V2_3 {
-                BlobKind::Managed
-            } else {
-                BlobKind::Packed
-            }) as u8
+            BlobKind::Managed as u8
         );
 
         let blobs = dataset
@@ -7238,11 +7308,7 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(1),
-            (if version == LanceFileVersion::V2_3 {
-                BlobKind::Managed
-            } else {
-                BlobKind::Packed
-            }) as u8
+            BlobKind::Managed as u8
         );
 
         let blobs = dataset
@@ -7364,14 +7430,7 @@ mod tests {
             .unwrap()
             .as_primitive::<UInt8Type>();
         assert_eq!(kinds.value(0), BlobKind::Inline as u8);
-        assert_eq!(
-            kinds.value(2),
-            (if version == LanceFileVersion::V2_3 {
-                BlobKind::Managed
-            } else {
-                BlobKind::Packed
-            }) as u8
-        );
+        assert_eq!(kinds.value(2), BlobKind::Managed as u8);
         assert_eq!(kinds.value(3), BlobKind::Inline as u8);
 
         let filtered = dataset
@@ -8489,8 +8548,8 @@ mod tests {
 
     #[rstest]
     #[case::inline(BlobKind::Inline, 1024 * 1024, 1024 * 1024)]
-    #[case::packed(BlobKind::Packed, 0, 1024 * 1024)]
-    #[case::dedicated(BlobKind::Dedicated, 0, 1)]
+    #[case::packed(BlobKind::Managed, 0, 1024 * 1024)]
+    #[case::dedicated(BlobKind::Managed, 0, 1)]
     #[tokio::test]
     async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end(
         #[case] kind: BlobKind,
@@ -8684,7 +8743,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -8703,7 +8762,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Dedicated);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -8724,7 +8783,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -9416,13 +9475,13 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(0),
-            BlobKind::Packed as u8
+            BlobKind::Managed as u8
         );
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
@@ -9467,7 +9526,7 @@ mod tests {
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
@@ -9516,13 +9575,13 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(0),
-            BlobKind::Dedicated as u8
+            BlobKind::Managed as u8
         );
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Dedicated);
+        assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 

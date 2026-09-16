@@ -240,19 +240,6 @@ pub async fn write_fragments_direct(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
-    let default_blob_base = if version == ConcreteFileVersion::V2_3
-        && schema.fields_pre_order().any(Field::is_blob_v2)
-    {
-        Some(if let Some(dataset) = dataset {
-            dataset.managed_default_base()?.id
-        } else {
-            lance_table::format::BasePath::unused_id(
-                params.initial_bases.iter().flatten().map(|base| base.id),
-            )?
-        })
-    } else {
-        None
-    };
     write::do_write_fragments_impl(
         dataset,
         object_store,
@@ -260,8 +247,7 @@ pub async fn write_fragments_direct(
         schema,
         buffered_reader,
         params,
-        move |object_store, schema, base_dir, mut options| async move {
-            options.base_id = options.base_id.or(default_blob_base);
+        move |object_store, schema, base_dir, options| async move {
             open_writer(version, &object_store, &schema, &base_dir, options).await
         },
         external_base_resolver,
@@ -671,7 +657,11 @@ pub async fn open_update_writer(
         external_base_resolver,
         allow_external_blob_outside_bases,
     );
-    if version == ConcreteFileVersion::V2_3 && schema.fields_pre_order().any(Field::is_blob_v2) {
+    if matches!(
+        version,
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+    ) && schema.fields_pre_order().any(Field::is_blob_v2)
+    {
         options.base_id = Some(dataset.managed_default_base()?.id);
     }
     open_writer(
