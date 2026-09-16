@@ -901,6 +901,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     self.dataset.schema(),
                     input_schema.as_ref(),
                     true,
+                    false,
                 )
                 .map_err(|error| DataFusionError::External(Box::new(error)))?,
             );

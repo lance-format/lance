@@ -51,6 +51,7 @@ use lance_core::{
     },
 };
 use lance_table::{
+    feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
     format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
@@ -74,6 +75,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    managed_blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -555,6 +557,8 @@ impl<'a> CleanupTask<'a> {
         let manifest_and_indexes = async {
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            ensure_can_read_manifest(&manifest)?;
+            ensure_can_write_manifest(&manifest)?;
             let indexes =
                 read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
             Ok::<_, Error>((manifest, indexes))
@@ -589,7 +593,26 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let managed_paths = if in_working_set && manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            super::blob::managed_paths(&snapshot, self.dataset).await?
+        } else {
+            HashSet::new()
+        };
         let mut inspection = inspection.lock().unwrap();
+        let references = if in_working_set {
+            &mut inspection.referenced_files
+        } else {
+            &mut inspection.verified_files
+        };
+        references.managed_blob_paths.extend(
+            managed_paths
+                .into_iter()
+                .map(|path| remove_prefix(&path, &self.dataset.base)),
+        );
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -974,6 +997,13 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("blob") => {
+                if inspection
+                    .referenced_files
+                    .managed_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
@@ -1034,6 +1064,10 @@ impl<'a> CleanupTask<'a> {
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
+                    || inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1137,11 +1171,11 @@ impl<'a> CleanupTask<'a> {
                         &manifest_location.path,
                         manifest_location.size,
                     )
-                    .await;
+                    .await?;
+                    ensure_can_read_manifest(&manifest)?;
+                    ensure_can_write_manifest(&manifest)?;
 
-                    if let Ok(manifest) = manifest
-                        && policy.should_clean(&manifest)
-                    {
+                    if policy.should_clean(&manifest) {
                         referenced_branches.insert(branch_name.clone());
                     }
                     Ok::<(), Error>(())
@@ -1253,10 +1287,33 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        ensure_can_read_manifest(&manifest)?;
+        ensure_can_write_manifest(&manifest)?;
+        let managed_paths = if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            super::blob::managed_paths(&snapshot, self.dataset).await?
+        } else {
+            HashSet::new()
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
+        for path in managed_paths {
+            let relative = remove_prefix(&path, &self.dataset.base);
+            inspection
+                .verified_files
+                .managed_blob_paths
+                .remove(&relative);
+            inspection
+                .referenced_files
+                .managed_blob_paths
+                .insert(relative);
+            is_referenced = true;
+        }
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {

@@ -364,6 +364,7 @@ impl UpdateJob {
                 self.dataset.schema(),
                 scan_schema.as_ref(),
                 false,
+                false,
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
             let dataset = self.dataset.clone();

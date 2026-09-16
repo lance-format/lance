@@ -198,6 +198,21 @@ impl Dataset {
         } else {
             None
         };
+        if target.version == ConcreteFileVersion::V2_3
+            && let Some(writer) = preprocessor.take()
+        {
+            let base = if let Some(id) = target.base_id {
+                self.manifest.base_paths.get(&id).cloned().ok_or_else(|| {
+                    Error::invalid_input(format!("Managed part target has unknown base ID {id}"))
+                })?
+            } else {
+                self.managed_default_base()?
+            };
+            preprocessor = Some(
+                writer
+                    .with_managed_base(base.id, base.extract_path(self.session.store_registry())?),
+            );
+        }
 
         let file_name = format!("{}.part", generate_random_filename());
         let path = target
@@ -2059,7 +2074,7 @@ impl GenericWriter for V2WriterAdapter {
 #[derive(Default)]
 pub(crate) struct WriterOptions {
     add_data_dir: bool,
-    base_id: Option<u32>,
+    pub(super) base_id: Option<u32>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
@@ -2151,6 +2166,7 @@ where
 }
 
 pub(in crate::dataset) async fn open_current_blob_v2_writer<F>(
+    version: ConcreteFileVersion,
     create_file_writer: F,
     object_store: &ObjectStore,
     schema: &Schema,
@@ -2187,7 +2203,7 @@ where
         base_id,
         file_writer_options,
     )?;
-    let preprocessor = BlobPreprocessor::new(
+    let mut preprocessor = BlobPreprocessor::new(
         object_store.clone(),
         data_dir,
         data_file_key,
@@ -2199,6 +2215,11 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
+    if version == ConcreteFileVersion::V2_3 {
+        let base_id = base_id
+            .ok_or_else(|| Error::invalid_input("Managed writer requires an explicit base ID"))?;
+        preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
+    }
     Ok(Box::new(V2WriterAdapter {
         writer: file_writer,
         data_file: Some(data_file),

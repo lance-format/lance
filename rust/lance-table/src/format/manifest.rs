@@ -170,6 +170,37 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Whether this snapshot can contain Managed descriptors from unstable 2.3.
+    pub fn has_managed_blobs(&self) -> bool {
+        self.schema
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2())
+            && (self.data_storage_format.version == ConcreteFileVersion::V2_3
+                || self
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.referenced_lance_files())
+                    .any(|file| file.file_major_version == 2 && file.file_minor_version == 3))
+    }
+
+    /// Register the writer's explicit base without rebinding encoded references.
+    pub fn bind_managed_base(&mut self, base: BasePath) -> Result<()> {
+        if !self.has_managed_blobs() {
+            return Ok(());
+        }
+        if let Some(existing) = self.base_paths.get(&base.id) {
+            if existing.path != base.path {
+                return Err(Error::invalid_input(format!(
+                    "Managed base ID {} is bound to {:?}; descriptors require {:?}",
+                    base.id, existing.path, base.path
+                )));
+            }
+        } else {
+            self.base_paths.insert(base.id, base);
+        }
+        Ok(())
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -611,6 +642,25 @@ pub struct BasePath {
 }
 
 impl BasePath {
+    /// Choose an unused exact base ID without reserving zero or overflowing at
+    /// `u32::MAX`. The caller must publish the binding with its references and
+    /// reject a concurrent attempt to bind the chosen ID to another location.
+    pub fn unused_id(bases: impl IntoIterator<Item = u32>) -> Result<u32> {
+        let mut ids = bases.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut candidate = 0u32;
+        for id in ids {
+            if id != candidate {
+                break;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("All u32 base IDs are already registered"))?;
+        }
+        Ok(candidate)
+    }
+
     /// Create a new BasePath
     ///
     /// # Arguments

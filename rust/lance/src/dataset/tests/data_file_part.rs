@@ -507,6 +507,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
 #[case::blob_registered(true, Some(7))]
 #[tokio::test]
 async fn restores_target_and_completed_parts_from_checkpoint(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     #[case] has_blob: bool,
     #[case] base_id: Option<u32>,
 ) {
@@ -538,7 +539,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
             RecordBatchIterator::new([Ok(original.clone())], original.schema()),
             dataset_uri.as_str(),
             Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::V2_2),
+                data_storage_version: Some(version),
                 max_rows_per_file: 2,
                 initial_bases: base_id.map(|id| {
                     vec![BasePath {

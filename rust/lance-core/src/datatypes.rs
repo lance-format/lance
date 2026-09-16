@@ -596,6 +596,12 @@ pub enum BlobKind {
     /// External blobs can have a position and a size. If the position is not set,
     /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
+    /// A Lance-owned immutable object, independently of the descriptor's data file.
+    /// `blob_id` is the exact manifest base ID (including zero); `blob_uri` is
+    /// relative to that base root. `position`/`size` select a known range, and
+    /// zero size is an empty value rather than a request to discover its length.
+    /// This kind is supported by unstable file format 2.3.
+    Managed = 4,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -607,6 +613,7 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
+            4 => Ok(Self::Managed),
             other => Err(Error::invalid_input_source(
                 format!("Unknown blob kind {other:?}").into(),
             )),

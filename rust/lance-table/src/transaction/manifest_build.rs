@@ -1534,13 +1534,20 @@ impl Transaction {
                 // Assign a new ID if not already assigned
                 let mut base_to_add = new_base.clone();
                 if base_to_add.id == 0 {
-                    let next_id = manifest
-                        .base_paths
-                        .keys()
-                        .max()
-                        .map(|&id| id + 1)
-                        .unwrap_or(1);
-                    base_to_add.id = next_id;
+                    base_to_add.id = crate::format::BasePath::unused_id(
+                        manifest
+                            .base_paths
+                            .keys()
+                            .copied()
+                            .chain(std::iter::once(0)),
+                    )?;
+                } else if manifest.has_managed_blobs()
+                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot replace base ID {} bound to {:?} with {:?}",
+                        base_to_add.id, existing.path, base_to_add.path
+                    )));
                 }
 
                 manifest.base_paths.insert(base_to_add.id, base_to_add);
