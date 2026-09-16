@@ -21,11 +21,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::ArrayData;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, GenericListArray, RecordBatch,
     RecordBatchOptions, StructArray,
 };
-use arrow::array::ArrayData;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use lance_core::datatypes::LANCE_FIELD_ID_KEY;
 use lance_core::{Error, Result};
@@ -616,7 +616,11 @@ mod nested_relabel_tests {
     /// values: an empty list, a null list and a null element in one column.
     #[test]
     fn a_lists_offsets_and_validity_survive() {
-        let element = stamped("item", DataType::Struct(Fields::from(vec![stamped("b", DataType::Int64, 4)])), 3);
+        let element = stamped(
+            "item",
+            DataType::Struct(Fields::from(vec![stamped("b", DataType::Int64, 4)])),
+            3,
+        );
         let leaf = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
         let inner = Arc::new(StructArray::new(
             Fields::from(vec![stamped("b", DataType::Int64, 4)]),

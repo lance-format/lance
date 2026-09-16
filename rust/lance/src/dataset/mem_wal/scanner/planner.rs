@@ -431,6 +431,12 @@ impl LsmScanPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
+                // Asked for under the table's own names, which a memtable
+                // stores them under: a memtable is rebuilt with the claim, so
+                // its schema is the schema this read was planned against. That
+                // is the invariant this arm rests on instead of resolving one,
+                // and what `a_frozen_memtable_reads_the_same_before_and_after_
+                // its_flush` and the lifecycle equivalence tests enforce.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
