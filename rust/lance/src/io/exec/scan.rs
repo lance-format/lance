@@ -322,6 +322,11 @@ impl LanceStream {
                                 config.with_row_last_updated_at_version,
                             )
                             .with_row_created_at_version(config.with_row_created_at_version);
+                        // Extract the budget before the options are moved into frag_config.
+                        let budget_bytes = config
+                            .file_reader_options
+                            .as_ref()
+                            .and_then(|o| o.batch_size_bytes);
                         if let Some(file_reader_options) = config.file_reader_options {
                             frag_config = frag_config.with_file_reader_options(file_reader_options);
                         }
@@ -333,23 +338,48 @@ impl LanceStream {
                             Some((scan_scheduler, priority as u32)),
                         )
                         .await?;
-                        let batch_stream = if let Some(range) = file_fragment.range {
-                            reader
-                                .read_range(range, config.batch_size as u32)
-                                .await?
-                                .boxed()
-                        } else {
-                            reader.read_all(config.batch_size as u32).await?.boxed()
-                        };
                         let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
-                            batch_stream
-                                .map(|fut| {
-                                    Result::Ok(
-                                        fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                            if let Some(budget) = budget_bytes {
+                                // Exact byte-budget path: plan batch sizes across all file
+                                // readers in the fragment, then read exactly that many rows.
+                                let replace_null = config.replace_oversized_with_null;
+                                let budget_stream = reader
+                                    .scan_with_byte_budget(budget, replace_null)
+                                    .await
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                budget_stream
+                                    .map(|res| {
+                                        Result::Ok(
+                                            futures::future::ready(res.map_err(|e| {
+                                                DataFusionError::External(Box::new(e))
+                                            }))
                                             .boxed(),
-                                    )
-                                })
-                                .boxed();
+                                        )
+                                    })
+                                    .boxed()
+                            } else if let Some(range) = file_fragment.range {
+                                reader
+                                    .read_range(range, config.batch_size as u32)
+                                    .await?
+                                    .map(|fut| {
+                                        Result::Ok(
+                                            fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                                .boxed(),
+                                        )
+                                    })
+                                    .boxed()
+                            } else {
+                                reader
+                                    .read_all(config.batch_size as u32)
+                                    .await?
+                                    .map(|fut| {
+                                        Result::Ok(
+                                            fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                                .boxed(),
+                                        )
+                                    })
+                                    .boxed()
+                            };
                         Result::Ok(batch_stream)
                     })
                     .in_current_span(),
@@ -578,6 +608,9 @@ pub struct LanceScanConfig {
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
     pub file_reader_options: Option<FileReaderOptions>,
+    /// When the byte-budget path is active and a single row exceeds the budget,
+    /// replace that row with a null batch of 1 row. Defaults to `false`.
+    pub replace_oversized_with_null: bool,
     /// Upper bound on frag_parallelism and CPU decode concurrency. Set from
     /// DataFusion's `target_partitions` session config in `LanceScanExec::execute`.
     pub parallelism_cap: Option<usize>,
@@ -600,6 +633,7 @@ impl Default for LanceScanConfig {
             with_make_deletions_null: false,
             ordered_output: false,
             file_reader_options: None,
+            replace_oversized_with_null: false,
             parallelism_cap: None,
         }
     }
@@ -823,6 +857,7 @@ impl ExecutionPlan for LanceScanExec {
         false
     }
 }
+
 
 #[cfg(test)]
 mod tests {
