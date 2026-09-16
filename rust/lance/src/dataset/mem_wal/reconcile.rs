@@ -555,3 +555,176 @@ mod relabel_tests {
         assert_eq!(values.value(0), 7);
     }
 }
+
+#[cfg(test)]
+mod nested_relabel_tests {
+    use super::*;
+    use arrow_array::{
+        Array, FixedSizeListArray, Int64Array, LargeListArray, ListArray, StructArray,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::Fields;
+
+    fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
+        ArrowField::new(name, data_type, true).with_metadata(
+            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Relabel `column` to its own type with the field ids stripped, and check
+    /// that nothing but the labels moved.
+    fn strip_and_check(column: ArrayRef) -> ArrayRef {
+        let plain = without_field_ids_in(column.data_type());
+        let out = relabel_to(&column, &plain).expect("relabel");
+        assert_eq!(out.data_type(), &plain, "every level is relabelled");
+        assert_eq!(out.len(), column.len(), "row count is preserved");
+        assert_eq!(
+            out.null_count(),
+            column.null_count(),
+            "validity is preserved"
+        );
+        out
+    }
+
+    /// A struct whose parent is null at one row, and whose child is null at
+    /// another: both levels of validity have to survive the relabel.
+    #[test]
+    fn a_null_parent_and_a_null_child_both_survive() {
+        let child = stamped("b", DataType::Int64, 3);
+        let values = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
+        let column = Arc::new(StructArray::new(
+            Fields::from(vec![child]),
+            vec![values],
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+
+        let out = strip_and_check(column);
+        let out = out.as_any().downcast_ref::<StructArray>().expect("struct");
+        assert!(out.is_null(2), "the null parent stays null");
+        let inner = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("the child");
+        assert_eq!(inner.value(0), 1);
+        assert!(inner.is_null(1), "the null child stays null");
+    }
+
+    /// A list carries offsets and its own validity, and the element carries
+    /// values: an empty list, a null list and a null element in one column.
+    #[test]
+    fn a_lists_offsets_and_validity_survive() {
+        let element = stamped("item", DataType::Struct(Fields::from(vec![stamped("b", DataType::Int64, 4)])), 3);
+        let leaf = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef;
+        let inner = Arc::new(StructArray::new(
+            Fields::from(vec![stamped("b", DataType::Int64, 4)]),
+            vec![leaf],
+            None,
+        )) as ArrayRef;
+        // Rows: [two elements], [], null.
+        let column = Arc::new(ListArray::new(
+            Arc::new(element),
+            OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+            inner,
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+
+        let out = strip_and_check(column);
+        let out = out.as_any().downcast_ref::<ListArray>().expect("list");
+        assert_eq!(out.value_length(0), 2, "the first row keeps two elements");
+        assert_eq!(out.value_length(1), 0, "the empty list stays empty");
+        assert!(out.is_null(2), "the null list stays null");
+    }
+
+    /// `LargeList` is a different offset width, and neither array downcasts to
+    /// the other.
+    #[test]
+    fn a_large_lists_offsets_survive() {
+        let element = stamped("item", DataType::Int64, 3);
+        let values = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
+        let column = Arc::new(LargeListArray::new(
+            Arc::new(element),
+            OffsetBuffer::new(vec![0i64, 2, 3].into()),
+            values,
+            None,
+        )) as ArrayRef;
+
+        let out = strip_and_check(column);
+        let out = out
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .expect("a large list, not a list");
+        assert_eq!(out.value_length(0), 2);
+        assert_eq!(out.value_length(1), 1);
+    }
+
+    /// A fixed-size list's width lives in its type, so a relabel must carry it.
+    #[test]
+    fn a_fixed_size_lists_width_survives() {
+        let element = stamped("item", DataType::Int64, 3);
+        let values = Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+        let column =
+            Arc::new(FixedSizeListArray::new(Arc::new(element), 2, values, None)) as ArrayRef;
+
+        let out = strip_and_check(column);
+        assert!(
+            matches!(out.data_type(), DataType::FixedSizeList(_, 2)),
+            "the width is part of the type, got {:?}",
+            out.data_type()
+        );
+    }
+
+    /// A sliced array carries a non-zero offset into its buffers. Relabelling
+    /// must not reinterpret that as a full array.
+    #[test]
+    fn a_slice_keeps_its_offset() {
+        let child = stamped("b", DataType::Int64, 3);
+        let values = Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+        let whole = StructArray::new(Fields::from(vec![child]), vec![values], None);
+        let column = Arc::new(whole.slice(2, 2)) as ArrayRef;
+
+        let out = strip_and_check(column);
+        let out = out.as_any().downcast_ref::<StructArray>().expect("struct");
+        let inner = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("the child");
+        assert_eq!(
+            (0..out.len()).map(|i| inner.value(i)).collect::<Vec<_>>(),
+            vec![3, 4],
+            "the slice reads its own rows, not the array's first ones"
+        );
+    }
+
+    /// An empty batch has no values to check, so the schema is the whole
+    /// contract.
+    #[test]
+    fn an_empty_column_is_still_relabelled() {
+        let child = stamped("b", DataType::Int64, 3);
+        let column = Arc::new(StructArray::new(
+            Fields::from(vec![child]),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let out = strip_and_check(column);
+        assert_eq!(out.len(), 0);
+    }
+
+    /// Nothing to change is the fast path, and it has to return the same
+    /// arrays rather than a rebuilt approximation of them.
+    #[test]
+    fn a_column_already_in_the_target_shape_is_returned_as_it_stands() {
+        let plain = ArrowField::new("b", DataType::Int64, true);
+        let column = Arc::new(StructArray::new(
+            Fields::from(vec![plain]),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let out = relabel_to(&column, column.data_type()).expect("relabel");
+        assert_eq!(out.data_type(), column.data_type());
+        assert_eq!(out.len(), 2);
+    }
+}
