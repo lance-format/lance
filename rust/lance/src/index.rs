@@ -138,6 +138,46 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+/// Move a caller-defined segment group's coverage into the current fragment space.
+///
+/// A deferred compaction can combine several independently built segments into one
+/// new fragment. Remapping each segment bitmap separately would treat every segment
+/// as only partially covering the rewrite group and drop the new fragment. The
+/// merge owns the whole caller-defined group, so remap its union and use that
+/// representable group coverage while materializing every source.
+async fn remap_merged_segment_coverage(
+    dataset: &Dataset,
+    segments: &mut [IndexMetadata],
+) -> Result<bool> {
+    let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
+        return Ok(false);
+    };
+    if !append::fragment_reuse_affects_segments(&frag_reuse_index, segments.iter()) {
+        return Ok(false);
+    }
+
+    let mut merged_coverage = segments
+        .iter()
+        .map(|segment| {
+            segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+    frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
+    merged_coverage &= dataset.fragment_bitmap.as_ref();
+
+    for segment in segments {
+        segment.fragment_bitmap = Some(merged_coverage.clone());
+    }
+    Ok(true)
+}
+
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
@@ -1986,6 +2026,16 @@ impl DatasetIndexExt for Dataset {
             ));
         }
 
+        // Vector merging reads physical files directly and RTree performs its own
+        // historical staleness pruning. Scalar merge helpers load their sources
+        // through the FRI row-address remapper, so they must filter and report
+        // coverage in that same current fragment space.
+        let remapped_source_coverage = if !all_vector && !all_rtree {
+            remap_merged_segment_coverage(self, &mut source_segments).await?
+        } else {
+            false
+        };
+
         let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
                 .iter()
@@ -1996,6 +2046,8 @@ impl DatasetIndexExt for Dataset {
             for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
+            self.manifest.version
+        } else if remapped_source_coverage {
             self.manifest.version
         } else {
             source_dataset_version
