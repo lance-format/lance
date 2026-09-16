@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
 
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
@@ -207,6 +208,36 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
     ))
 }
 
+/// `batches`, written under `source_schema`, brought to `target_schema`.
+///
+/// Columns are matched by field id where both sides carry one, and by name
+/// otherwise. A column `target_schema` declares and the batches do not carry is
+/// filled with typed nulls; `_tombstone` is filled with `false`. A column the
+/// batches carry and `target_schema` does not declare is dropped. A primary key
+/// the batches do not carry is an error, since no value can stand in for it.
+///
+/// This is the same resolution a read of a sealed generation applies, offered
+/// to a caller that reads one for itself. Matching nested children by name
+/// cannot follow a rename: a struct's children carry ids of their own, and only
+/// those relate a generation's copy of a column to the table's.
+///
+/// `batches` must be in `source_schema`'s column order, as a scan of the
+/// dataset it describes returns them. The result is in `target_schema`'s order,
+/// under a schema carrying no field ids.
+pub fn reconcile_batches(
+    source_schema: &ArrowSchema,
+    target_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
+    batches: Vec<RecordBatch>,
+) -> lance_core::Result<Vec<RecordBatch>> {
+    let plan =
+        reconcile::Plan::resolve(source_schema, target_schema, pk_columns)?.emitting_plain_schema();
+    if plan.is_identity() {
+        return Ok(batches);
+    }
+    batches.iter().map(|batch| plan.apply(batch)).collect()
+}
+
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
 pub use index::{MemIndexKind, MemTableVisibility};
 pub use manifest::ShardManifestStore;
@@ -233,6 +264,82 @@ mod tests {
             ArrowField::new("count", DataType::Int64, false),
             ArrowField::new("note", DataType::Utf8, true),
         ])
+    }
+
+    fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
+        ArrowField::new(name, data_type, true).with_metadata(
+            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Two children exchanging names is the case a name match cannot survive:
+    /// both sides carry the same two names, so only the ids say which values
+    /// belong to which. Each child's values must follow its id to the name the
+    /// target now gives it.
+    #[test]
+    fn a_pair_of_children_that_swapped_names_follow_their_ids() {
+        let struct_of = |first: &str, second: &str, ids: (i32, i32)| {
+            DataType::Struct(Fields::from(vec![
+                stamped(first, DataType::Int64, ids.0),
+                stamped(second, DataType::Int64, ids.1),
+            ]))
+        };
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("info", struct_of("a", "b", (1, 2)), 3),
+        ]);
+        // The table has since exchanged the two children's names; the ids stay.
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("info", struct_of("b", "a", (1, 2)), 3),
+        ]));
+
+        let info = arrow_array::StructArray::new(
+            match source.field(1).data_type() {
+                DataType::Struct(fields) => fields.clone(),
+                _ => unreachable!("info is a struct"),
+            },
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10])) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Int64Array::from(vec![20])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(info),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("reconcile");
+        let info = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .expect("info is a struct");
+
+        // `b` is the name id 1 now wears, so it must hold id 1's value.
+        let b = info
+            .column_by_name("b")
+            .expect("b")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        assert_eq!(b.value(0), 10, "id 1's value follows its id to `b`");
+
+        let a = info
+            .column_by_name("a")
+            .expect("a")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
     }
 
     #[test]

@@ -479,24 +479,6 @@ enum Unsupported {
     /// A cast takes a new field id, which rows still in the WAL cannot be
     /// matched to.
     Retype,
-    /// Renaming a field inside a struct.
-    ///
-    /// Compaction relabels a generation's columns by field id at the top level
-    /// only, so a struct's children are merged under the names the generation
-    /// stored. A generation sealed before the rename still carries the old
-    /// child name, and the merge has no id to follow.
-    ///
-    /// One rename makes the two shapes disagree, which the merge refuses. Two
-    /// that exchange a pair of names -- reachable in three commits through a
-    /// free name -- leave the shapes identical and the identities crossed, and
-    /// the merge writes each child's values under the other's name with the API
-    /// reporting success throughout.
-    ///
-    /// Refused as a whole rather than only on a collision: a collision check
-    /// sees the schema as it stands and cannot see the history that reaches the
-    /// same place. Re-enabling this needs compaction to resolve a struct's
-    /// children by id.
-    NestedRename,
     /// Tightening a column to non-null is validated against the committed
     /// fragments, and a row still in the MemWAL is not among them. Flushing
     /// first does not close the window: a flush covers the generations open
@@ -504,23 +486,6 @@ enum Unsupported {
     /// can be accepted after the check and before the commit. That row is then
     /// in a table whose schema forbids it, and every later merge of it fails.
     Tightening,
-}
-
-/// Whether `alteration` renames a field inside a struct.
-/// See [`Unsupported::NestedRename`].
-///
-/// Top-level renames are exempt: compaction resolves those by field id, so a
-/// pair of them can exchange names safely.
-fn renames_a_nested_field(dataset: &Dataset, alteration: &ColumnAlteration) -> bool {
-    if alteration.rename.is_none() {
-        return false;
-    }
-    // Resolved rather than split on `.`: a field name may contain dots, in
-    // which case the path quotes it, and a split would misjudge the depth.
-    let Some(chain) = dataset.schema().resolve(&alteration.path) else {
-        return false;
-    };
-    chain.len() > 1
 }
 
 /// Refuse `unsupported` when the table has a MemWAL attached.
@@ -547,11 +512,6 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
             "cannot make a column non-nullable on a table with a MemWAL attached: the check \
              runs against the base table, and a write admitted into the WAL while it runs is \
              not there to be checked. Drop the MemWAL first."
-        }
-        Unsupported::NestedRename => {
-            "cannot rename a field inside a struct on a table with a MemWAL attached: \
-             compaction matches a struct's children by name, and rows still in the WAL \
-             carry the old one. Drop the MemWAL first."
         }
     }))
 }
@@ -818,11 +778,6 @@ pub(super) async fn alter_columns(
         Some(Unsupported::Retype)
     } else if alterations.iter().any(|a| a.nullable == Some(false)) {
         Some(Unsupported::Tightening)
-    } else if alterations
-        .iter()
-        .any(|a| renames_a_nested_field(dataset, a))
-    {
-        Some(Unsupported::NestedRename)
     } else {
         None
     };
@@ -4630,101 +4585,6 @@ mod test {
             .await?;
         assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
 
-        Ok(())
-    }
-
-    /// A swap reached through a free name is refused at its first step.
-    ///
-    /// Each step looks harmless against the schema as it stands, so a collision
-    /// check admits all three and the pair ends up exchanged -- while a
-    /// generation sealed beforehand still has them the other way round, and
-    /// compaction would merge each child's values under the other's name.
-    #[tokio::test]
-    async fn a_swap_through_a_free_name_is_refused_with_a_mem_wal() -> Result<()> {
-        let a = ArrowField::new("a", DataType::Int32, true);
-        let b = ArrowField::new("b", DataType::Int32, true);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "parent",
-            DataType::Struct(ArrowFields::from(vec![a.clone(), b.clone()])),
-            true,
-        )]));
-        let parent = StructArray::new(
-            ArrowFields::from(vec![a, b]),
-            vec![
-                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![2])) as ArrayRef,
-            ],
-            None,
-        );
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(parent)])?;
-        let test_dir = TempStrDir::default();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(reader, &test_dir, None).await?;
-        dataset.initialize_mem_wal().execute().await?;
-
-        // The first step of the detour targets a free name and is still refused.
-        let err = dataset
-            .alter_columns(&[ColumnAlteration::new("parent.a".into()).rename("tmp".into())])
-            .await
-            .expect_err("a nested rename must be refused while a MemWAL is attached");
-        assert!(
-            err.to_string().contains("rename a field inside a struct"),
-            "unexpected error: {err}"
-        );
-
-        // The schema is untouched, so no later step can reach the swap.
-        let DataType::Struct(children) = dataset.schema().field("parent").unwrap().data_type()
-        else {
-            panic!("parent is a struct");
-        };
-        let names: Vec<&str> = children.iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "the refusal left the pair as it was");
-
-        // A top-level rename is unaffected: compaction resolves those by id.
-        dataset
-            .alter_columns(&[ColumnAlteration::new("parent".into()).rename("outer".into())])
-            .await?;
-        assert!(dataset.schema().field("outer").is_some());
-        Ok(())
-    }
-
-    /// A field name may contain dots, in which case the path quotes it.
-    /// Splitting on the last dot names the wrong parent, and the sibling check
-    /// then admits the rename it exists to refuse.
-    #[tokio::test]
-    async fn a_quoted_path_resolves_to_its_real_parent() -> Result<()> {
-        let child = ArrowField::new("child.with.dot", DataType::Int32, true);
-        let sibling = ArrowField::new("sibling", DataType::Int32, true);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "parent",
-            DataType::Struct(ArrowFields::from(vec![child.clone(), sibling.clone()])),
-            true,
-        )]));
-        let parent = StructArray::new(
-            ArrowFields::from(vec![child, sibling]),
-            vec![
-                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![2])) as ArrayRef,
-            ],
-            None,
-        );
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(parent)])?;
-        let test_dir = TempStrDir::default();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let dataset = Dataset::write(reader, &test_dir, None).await?;
-
-        let onto_sibling =
-            ColumnAlteration::new("parent.`child.with.dot`".into()).rename("sibling".into());
-        assert!(
-            renames_a_nested_field(&dataset, &onto_sibling),
-            "a rename inside a struct must be seen through a quoted path"
-        );
-
-        let top_level = ColumnAlteration::new("parent".into()).rename("free".into());
-        assert!(
-            !renames_a_nested_field(&dataset, &top_level),
-            "a top-level rename is not a nested one"
-        );
         Ok(())
     }
 }
