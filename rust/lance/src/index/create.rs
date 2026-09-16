@@ -3074,12 +3074,27 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 2);
 
         let params = ScalarIndexParams::for_builtin(index_type.try_into().unwrap());
-        let mut segments = Vec::with_capacity(2);
-        for fragment in dataset.get_fragments() {
+        let fragment_groups = if index_type == IndexType::Fm {
+            vec![
+                dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|fragment| fragment.id() as u32)
+                    .collect(),
+            ]
+        } else {
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| vec![fragment.id() as u32])
+                .collect()
+        };
+        let mut segments = Vec::with_capacity(fragment_groups.len());
+        for fragment_group in fragment_groups {
             segments.push(
                 CreateIndexBuilder::new(&mut dataset, &[column], index_type, &params)
                     .name("in_flight".to_string())
-                    .fragments(vec![fragment.id() as u32])
+                    .fragments(fragment_group)
                     .execute_uncommitted()
                     .await
                     .unwrap(),
@@ -3151,10 +3166,17 @@ mod tests {
                 }
                 other => panic!("unexpected {index_type:?} search result: {other:?}"),
             };
+            let row_addrs = rows.true_rows().row_addrs().unwrap().collect::<Vec<_>>();
             assert_eq!(
-                rows.true_rows().row_addrs().unwrap().count(),
+                row_addrs.len(),
                 4,
                 "{index_type:?} merge lost rows (compacted: {compact})"
+            );
+            assert!(
+                row_addrs.iter().all(|row_addr| dataset
+                    .fragment_bitmap
+                    .contains(RowAddress::from(u64::from(*row_addr)).fragment_id())),
+                "{index_type:?} merge returned retired row addresses (compacted: {compact})"
             );
         }
     }
