@@ -4641,11 +4641,17 @@ mod tests {
         // Not `make_test_codes`: its per-row ramp is nearly parallel to the
         // all-ones vector, leaving every row sharing over 80% of its bits.
         let mut rng = SmallRng::seed_from_u64(7157);
-        let codes = FixedSizeListArray::try_new_from_values(
-            UInt8Array::from_iter_values((0..num_rows * code_len).map(|_| rng.random::<u8>())),
-            code_len as i32,
-        )
-        .unwrap();
+        let is_reported_case = code_dim == 2176;
+        let code_values = if is_reported_case {
+            vec![u8::MAX; num_rows * code_len]
+        } else {
+            (0..num_rows * code_len)
+                .map(|_| rng.random::<u8>())
+                .collect()
+        };
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(code_values), code_len as i32)
+                .unwrap();
         let metadata = make_test_metadata(code_dim);
         let storage = RabitQuantizationStorage::try_from_batch(
             make_test_batch(codes),
@@ -4657,7 +4663,16 @@ mod tests {
         let query = Arc::new(Float32Array::from_iter_values(
             (0..code_dim).map(|idx| ((idx % 17) as f32 - 8.0) / 8.0),
         )) as ArrayRef;
-        let calc = storage.dist_calculator(query, 4.0);
+        let mut calc = storage.dist_calculator(query, 4.0);
+        if is_reported_case {
+            // A repeated [1, 2, 4, 8] rotated query produces LUT entries
+            // 0..=15. Combined with 0xff codes, every lookup quantizes to 255,
+            // guaranteeing a 2 * code_len * 255 sum on every platform.
+            let rotated_query = (0..code_dim)
+                .map(|idx| (1u8 << (idx % SEGMENT_LENGTH)) as f32)
+                .collect::<Vec<_>>();
+            calc.dist_table = Cow::Owned(build_dist_table_direct::<Float32Type>(&rotated_query));
+        }
 
         let mut binary_ips = Vec::new();
         let mut u16_scratch = Vec::new();
@@ -4700,6 +4715,9 @@ mod tests {
 
         // Or the case quietly stops exercising the overflow it was written for.
         let widest = expected_sums.iter().copied().max().unwrap_or(0);
+        if is_reported_case {
+            assert_eq!(widest, 2 * code_len as u32 * u8::MAX as u32);
+        }
         assert_eq!(
             widest > u16::MAX as u32,
             expect_u16_overflow,
