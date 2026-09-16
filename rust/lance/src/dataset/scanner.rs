@@ -10483,7 +10483,7 @@ mod test {
 
     /// Finds the batch vector-search node in a physical plan.
     fn find_ann_ivf_batch_exec(plan: &dyn ExecutionPlan) -> Option<&ANNIvfBatchExec> {
-        if let Some(batch_exec) = plan.as_any().downcast_ref::<ANNIvfBatchExec>() {
+        if let Some(batch_exec) = plan.downcast_ref::<ANNIvfBatchExec>() {
             return Some(batch_exec);
         }
         plan.children()

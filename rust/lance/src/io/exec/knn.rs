@@ -2475,7 +2475,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via [`build_dataset_prefilter`],
+/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
