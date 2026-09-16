@@ -271,9 +271,14 @@ enum JsonTargetDataType {
    * inconsistency this field exists to prevent, so it is the last resort
    * rather than the defined behavior for UNSPECIFIED.
    *
-   * An implementation that recovers the type authoritatively while rewriting
-   * these details should record it, so the index stops being ambiguous. A
-   * build that understands this field always records it when training a new
+   * Because UNSPECIFIED records no type, there is nothing for a rewrite to
+   * preserve, and it is the one value the preservation rule on field 3 does
+   * not cover: an implementation rewriting these details may replace
+   * UNSPECIFIED with a type it recovered authoritatively, and should, so the
+   * index stops being ambiguous. It must not replace it with an inferred type,
+   * which would persist a row-dependent guess as though it were recorded fact.
+   *
+   * A build that understands this field always records it when training a new
    * index, so UNSPECIFIED is only ever a legacy or unrecoverable state.
    */
   JSON_TARGET_DATA_TYPE_UNSPECIFIED = 0;
@@ -302,10 +307,15 @@ message JsonIndexDetails {
    * general, lossless description of the index and must not be read as one.
    *
    * An implementation that rewrites these details without retraining the target
-   * index -- compacting or updating it -- must copy this value through
-   * unchanged, including a value it does not recognize, rather than resetting
-   * it to JSON_TARGET_DATA_TYPE_UNSPECIFIED. Otherwise a variant added by a
-   * later revision is erased by any older reader that touches the index.
+   * index -- compacting or updating it -- must preserve a recorded type
+   * exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
+   * copied through unchanged, including one the implementation does not
+   * recognize; otherwise a variant added by a later revision is erased by any
+   * older reader that touches the index.
+   *
+   * JSON_TARGET_DATA_TYPE_UNSPECIFIED is the sole exception, because it
+   * records no type to preserve. See its own documentation for when a rewrite
+   * may replace it.
    */
   JsonTargetDataType target_data_type = 3;
 }
