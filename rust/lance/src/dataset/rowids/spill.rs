@@ -100,6 +100,146 @@ pub fn inline_row_lineage_max_bytes(dataset: &Dataset) -> Result<Option<usize>> 
     })
 }
 
+/// Which of a compaction task's sequences leave the manifest, decided for all
+/// its output fragments together so that every data file the task writes
+/// carries the same hidden columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowLineageSpill {
+    pub row_ids: bool,
+    pub created_at: bool,
+    pub last_updated_at: bool,
+}
+
+impl RowLineageSpill {
+    pub fn any(&self) -> bool {
+        self.row_ids || self.created_at || self.last_updated_at
+    }
+
+    /// The reserved field ids of the columns that spill, in column order.
+    pub fn field_ids(&self) -> impl Iterator<Item = i32> {
+        [
+            (self.row_ids, ROW_ID_FIELD_ID),
+            (self.created_at, ROW_CREATED_AT_VERSION_FIELD_ID),
+            (self.last_updated_at, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID),
+        ]
+        .into_iter()
+        .filter(|(spilled, _)| *spilled)
+        .map(|(_, field_id)| field_id)
+    }
+
+    /// The hidden columns to write, as `(field id, column name, values)`,
+    /// concatenated over `lineages` in order.
+    pub fn columns(&self, lineages: &[RowLineage]) -> Vec<(i32, &'static str, Vec<u64>)> {
+        let mut columns = Vec::with_capacity(3);
+        if self.row_ids {
+            let values = lineages.iter().flat_map(|l| l.row_ids.iter()).collect();
+            columns.push((ROW_ID_FIELD_ID, ROW_ID, values));
+        }
+        if self.created_at {
+            let values = lineages
+                .iter()
+                .flat_map(|l| l.created_at.versions())
+                .collect();
+            columns.push((
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+                ROW_CREATED_AT_VERSION,
+                values,
+            ));
+        }
+        if self.last_updated_at {
+            let values = lineages
+                .iter()
+                .flat_map(|l| l.last_updated_at.versions())
+                .collect();
+            columns.push((
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+                ROW_LAST_UPDATED_AT_VERSION,
+                values,
+            ));
+        }
+        columns
+    }
+
+    /// The hidden columns as write-schema fields, under their reserved ids.
+    pub fn schema_fields(&self) -> Result<Vec<lance_core::datatypes::Field>> {
+        [
+            (self.row_ids, ROW_ID, ROW_ID_FIELD_ID),
+            (
+                self.created_at,
+                ROW_CREATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+            ),
+            (
+                self.last_updated_at,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+            ),
+        ]
+        .into_iter()
+        .filter(|(spilled, _, _)| *spilled)
+        .map(|(_, name, id)| {
+            let mut field = lance_core::datatypes::Field::try_from(&ArrowField::new(
+                name,
+                DataType::UInt64,
+                false,
+            ))?;
+            field.id = id;
+            Ok(field)
+        })
+        .collect()
+    }
+
+    /// The placement for one fragment whose own data file was written with
+    /// the spilled columns: those sequences are marked as spilled, the rest
+    /// are placed inline. There is no lineage file to add to the fragment.
+    pub fn place_in_file(&self, lineage: &RowLineage) -> PlacedRowLineage {
+        PlacedRowLineage {
+            row_ids: if self.row_ids {
+                RowIdMeta::Column
+            } else {
+                RowIdMeta::Inline(write_row_ids(&lineage.row_ids).into())
+            },
+            created_at: if self.created_at {
+                RowDatasetVersionMeta::Column
+            } else {
+                RowDatasetVersionMeta::Inline(write_dataset_versions(&lineage.created_at).into())
+            },
+            last_updated_at: if self.last_updated_at {
+                RowDatasetVersionMeta::Column
+            } else {
+                RowDatasetVersionMeta::Inline(
+                    write_dataset_versions(&lineage.last_updated_at).into(),
+                )
+            },
+            file: None,
+        }
+    }
+}
+
+/// Decide which sequence types of `lineages` spill: each one whose encoding
+/// exceeds the table's inline budget in any of them. Nothing spills on a
+/// table that has not opted in.
+pub fn plan_row_lineage_spill(
+    dataset: &Dataset,
+    lineages: &[RowLineage],
+) -> Result<RowLineageSpill> {
+    let Some(limit) = inline_row_lineage_max_bytes(dataset)? else {
+        return Ok(RowLineageSpill::default());
+    };
+    let over = |encoded: usize| encoded > limit;
+    Ok(RowLineageSpill {
+        row_ids: lineages
+            .iter()
+            .any(|l| over(write_row_ids(&l.row_ids).len())),
+        created_at: lineages
+            .iter()
+            .any(|l| over(write_dataset_versions(&l.created_at).len())),
+        last_updated_at: lineages
+            .iter()
+            .any(|l| over(write_dataset_versions(&l.last_updated_at).len())),
+    })
+}
+
 /// The per-row lineage of one fragment, in row offset order.
 pub struct RowLineage {
     pub row_ids: RowIdSequence,
@@ -709,22 +849,23 @@ mod tests {
                 ),
             "compaction must spill every sequence under a zero inline budget, got {metadata:?}"
         );
-        // The three sequences share one lineage file, listed after the user
-        // data file among the fragment's files and found by field id.
-        assert_eq!(metadata.files.len(), 2);
-        let lineage_file = &metadata.files[1];
+        // The three columns ride in the fragment's own data file, after the
+        // user column, so the fragment has no extra file to reference.
+        assert_eq!(metadata.files.len(), 1);
+        let data_file = &metadata.files[0];
         assert_eq!(
-            lineage_file.fields.as_ref(),
+            data_file.fields.as_ref(),
             [
+                0,
                 ROW_ID_FIELD_ID,
                 ROW_CREATED_AT_VERSION_FIELD_ID,
                 ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
             ]
         );
-        for field_id in lineage_file.fields.iter() {
+        for field_id in data_file.fields.iter().filter(|id| **id < 0) {
             assert_eq!(
                 metadata.row_lineage_file(*field_id).unwrap(),
-                Some(lineage_file)
+                Some(data_file)
             );
         }
         assert_ne!(
@@ -760,6 +901,52 @@ mod tests {
                 .unwrap()
                 .expect("a compacted fragment carries created-at versions");
         assert_eq!(versions_of(&created_at), before.1);
+    }
+
+    /// Binary-copy compaction copies the input files page by page and cannot
+    /// add columns to them, so its spilled lineage goes to a separate file.
+    #[tokio::test]
+    async fn binary_copy_compaction_spills_to_a_separate_file() {
+        use crate::dataset::optimize::CompactionMode;
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        let before = collect_lineage(&dataset).await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+                ..one_fragment()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let metadata = fragments[0].metadata();
+        assert!(
+            matches!(metadata.row_id_meta, Some(RowIdMeta::Column)),
+            "compaction must spill the row ids under a zero inline budget, got {metadata:?}"
+        );
+        // The copied data file carries only the user column; the lineage
+        // follows it as a file of its own.
+        assert_eq!(metadata.files.len(), 2);
+        assert!(metadata.files[0].fields.iter().all(|field| *field >= 0));
+        assert_eq!(
+            metadata.files[1].fields.as_ref(),
+            [
+                ROW_ID_FIELD_ID,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+            ]
+        );
+        assert_eq!(collect_lineage(&dataset).await, before);
+        dataset.validate().await.unwrap();
     }
 
     /// Cleanup decides what to delete by walking
