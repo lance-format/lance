@@ -145,6 +145,14 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
         .await
         .unwrap();
 
+    let rebound_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = index.with_store(rebound_store, None).unwrap().unwrap();
+    assert!(index.prewarmed_query_state_ready(true));
+
     let inverted_list = &index.partitions[0].inverted_list;
     // The posting cache entry is grouped (issue #7040); the group holds
     // positions-free lists while positions live in their own per-token

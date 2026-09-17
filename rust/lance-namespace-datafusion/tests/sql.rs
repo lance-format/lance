@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![recursion_limit = "256"]
-
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};

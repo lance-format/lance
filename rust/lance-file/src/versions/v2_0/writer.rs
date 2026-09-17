@@ -322,6 +322,7 @@ impl Writer {
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
+        self.options.validate()?;
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64
         } else {
