@@ -557,6 +557,30 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
+    /// Replace the set of base-table indexes the MemTables maintain.
+    ///
+    /// Everything else the MemWAL index carries -- the sharding specs, the
+    /// writer config defaults, the shard snapshots, and the compaction and
+    /// catch-up progress -- is preserved: this is the maintained set alone, not
+    /// a re-initialization. Sharding is deliberately not changeable, because the
+    /// generations already written were assigned to shards under the current
+    /// spec and nothing re-homes them.
+    ///
+    /// Validated before the commit, the same way initialization validates it: a
+    /// set the writer cannot open leaves the table unwritable, so a name that
+    /// does not resolve to an index on this table is refused rather than
+    /// persisted.
+    ///
+    /// Takes effect for MemTables opened after the commit. A generation already
+    /// sealed keeps whatever it was written with, and the readers that need an
+    /// index a generation lacks build a transient one for the query, so the two
+    /// sets coexist without a drain.
+    async fn update_mem_wal_maintained_indexes(&mut self, _indexes: Vec<String>) -> Result<()> {
+        Err(Error::not_supported(
+            "update_mem_wal_maintained_indexes on this dataset type",
+        ))
+    }
+
     /// List current MemWAL shard IDs from object storage directory listing.
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         Ok(Vec::new())
@@ -638,6 +662,43 @@ impl DatasetMemWalExt for Dataset {
         };
 
         load_mem_wal_index_details(index_meta).map(Some)
+    }
+
+    async fn update_mem_wal_maintained_indexes(&mut self, indexes: Vec<String>) -> Result<()> {
+        let Some(existing_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? else {
+            return Err(Error::invalid_input(
+                "MemWAL is not initialized on this dataset.",
+            ));
+        };
+        let details = load_mem_wal_index_details(existing_meta.clone())?;
+        if details.maintained_indexes == indexes {
+            return Ok(());
+        }
+
+        // Gate the commit, not just a preflight a caller may skip: a set the
+        // writer cannot open leaves the table unwritable.
+        validate_maintained_indexes(self, &indexes).await?;
+
+        let details = MemWalIndexDetails {
+            maintained_indexes: indexes,
+            ..details
+        };
+        let index_meta = new_mem_wal_index_meta(self.manifest.version, details)?;
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_meta],
+                removed_indices: vec![existing_meta],
+            },
+            None,
+        );
+
+        let new_dataset = CommitBuilder::new(Arc::new(self.clone()))
+            .execute(transaction)
+            .await?;
+        *self = new_dataset;
+
+        Ok(())
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
@@ -1233,6 +1294,118 @@ mod tests {
             dataset.mem_wal_index_details().await.unwrap().is_none(),
             "a rejected maintained set must not be committed"
         );
+    }
+
+    /// The maintained set can be replaced on a live MemWAL, and only that: the
+    /// sharding spec and the progress the index carries survive untouched,
+    /// because the generations already written were homed under that spec and
+    /// nothing re-homes them.
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_replaces_only_that_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Installed maintaining nothing, which is the state a table is in when
+        // an index is built after the MemWAL.
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(Vec::<String>::new())
+            .execute()
+            .await
+            .unwrap();
+        let before = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+        assert!(before.maintained_indexes.is_empty());
+
+        dataset
+            .update_mem_wal_maintained_indexes(vec!["id_idx".to_string()])
+            .await
+            .expect("an index that exists is maintainable");
+
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized");
+        assert_eq!(after.maintained_indexes, vec!["id_idx".to_string()]);
+        assert_eq!(
+            after.sharding_specs, before.sharding_specs,
+            "the sharding spec must survive the update"
+        );
+        assert_eq!(
+            after.num_shards, before.num_shards,
+            "the shard count must survive the update"
+        );
+
+        // Idempotent: the same set again is a no-op rather than a commit.
+        let version = dataset.manifest.version;
+        dataset
+            .update_mem_wal_maintained_indexes(vec!["id_idx".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.version, version,
+            "an unchanged set must not commit"
+        );
+
+        // And a name that resolves to nothing is refused before the commit.
+        let error = dataset
+            .update_mem_wal_maintained_indexes(vec!["nope".to_string()])
+            .await
+            .expect_err("an unknown index must be refused");
+        assert!(error.to_string().contains("nope"), "unexpected: {error}");
+        assert_eq!(
+            dataset
+                .mem_wal_index_details()
+                .await
+                .unwrap()
+                .expect("still initialized")
+                .maintained_indexes,
+            vec!["id_idx".to_string()],
+            "a rejected set must leave the committed one alone"
+        );
+    }
+
+    /// Updating before initializing is a caller error, not a silent install.
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_requires_an_initialized_mem_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let error = dataset
+            .update_mem_wal_maintained_indexes(vec!["id_idx".to_string()])
+            .await
+            .expect_err("no MemWAL to update");
+        assert!(
+            error.to_string().contains("not initialized"),
+            "unexpected: {error}"
+        );
+        assert!(dataset.mem_wal_index_details().await.unwrap().is_none());
     }
 
     #[tokio::test]
