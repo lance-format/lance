@@ -334,6 +334,7 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
+- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
 
 ### ReserveFragments
 
@@ -431,6 +432,7 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
+- Restore (only if the UpdateConfig updates schema or field metadata)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement
