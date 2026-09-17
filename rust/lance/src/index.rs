@@ -6193,10 +6193,11 @@ mod tests {
         assert_eq!(trained_partitions(&dataset).await, vec![4]);
     }
 
-    /// A definition keeps the partition count it asked for, so the index the
-    /// table grows into is the one that was requested.
+    /// A definition records no partition count, so the index the table grows
+    /// into is sized from the data present when it finally trains. A count
+    /// asked for on a table too small to train it does not survive the wait.
     #[tokio::test]
-    async fn test_deferred_index_trains_the_requested_partitions() {
+    async fn test_deferred_index_sizes_from_the_data_it_trains_on() {
         let test_dir = tempfile::tempdir().unwrap();
         let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
 
@@ -6214,14 +6215,15 @@ mod tests {
             "100 vectors cannot train a 256-code quantizer, so nothing is covered yet"
         );
 
-        // 3100 vectors clear 8 * 256, so the requested count is trainable.
+        // 3100 vectors would clear 8 * 256, but the request was not recorded:
+        // training derives the count from the data instead, 3100 / 8192 -> 1.
         let mut dataset = append_vectors(test_dir.path(), 3000).await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
 
-        assert_eq!(trained_partitions(&dataset).await, vec![8]);
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
     }
 
     /// Appending to an index that is still a definition, on a table that still
