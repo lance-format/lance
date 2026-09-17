@@ -1561,7 +1561,11 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
-    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+    fn try_new(
+        field: &LanceField,
+        input_field: &ArrowField,
+        preserve_managed: bool,
+    ) -> Result<Self> {
         if !field_contains_blob_v2(field) {
             return Ok(Self::passthrough(input_field));
         }
@@ -1582,9 +1586,14 @@ impl BlobV2FieldRewritePlan {
             };
             let output_field = match BlobV2Layout::classify(input_children) {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
-                Some(BlobV2Layout::Descriptor) => {
-                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
-                }
+                Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
+                    field,
+                    if preserve_managed {
+                        lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone()
+                    } else {
+                        BLOB_V2_LOGICAL_TYPE.clone()
+                    },
+                ),
                 Some(actual) => {
                     return Err(Error::invalid_input(format!(
                         "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
@@ -1619,7 +1628,7 @@ impl BlobV2FieldRewritePlan {
                     .children
                     .iter()
                     .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -1641,7 +1650,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::List {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1658,7 +1667,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::LargeList {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1697,12 +1706,15 @@ impl BlobV2FieldRewritePlan {
                 Self::Blob {
                     field_id,
                     field_name,
-                    ..
+                    output_field,
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
+                            if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
+                                return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                            }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
                             let classification =
@@ -1868,6 +1880,7 @@ impl BlobV2BatchRewritePlan {
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
+        preserve_managed: bool,
     ) -> Result<Self> {
         let row_addr_idx = input_schema
             .column_with_name(lance_core::ROW_ADDR)
@@ -1889,7 +1902,7 @@ impl BlobV2BatchRewritePlan {
                 continue;
             }
             let field_plan = if let Some(field) = schema.field(input_field.name()) {
-                BlobV2FieldRewritePlan::try_new(field, input_field)?
+                BlobV2FieldRewritePlan::try_new(field, input_field, preserve_managed)?
             } else {
                 BlobV2FieldRewritePlan::passthrough(input_field)
             };
@@ -1949,7 +1962,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    let plan =
+        BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr, false)?;
     plan.transform_batch(dataset, batch).await
 }
 
@@ -2455,6 +2469,10 @@ async fn rewrite_files(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
+                matches!(
+                    write_version,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ),
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
@@ -9232,8 +9250,8 @@ mod tests {
         input_schema.fields[0].unload_blobs_recursive();
         let input_field = Field::from(&input_schema.fields[0]);
 
-        let plan =
-            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let plan = BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field, false)
+            .unwrap();
         let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
             panic!("nested blob field should produce a struct rewrite plan");
         };

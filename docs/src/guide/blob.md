@@ -61,6 +61,29 @@ source of truth for which scheme is supported at each `data_storage_version`.
 | `0.1`, `2.0`, `2.1` | Supported for write/read | Not supported |
 | `2.2+` | Not supported for write | Supported for write/read (recommended) |
 
+### Managed objects and client compatibility
+
+Current writers store out-of-line Blob v2 payloads in independently named
+`_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
+capability on the table. This works with file formats 2.2 and 2.3; it does not
+require choosing 2.3. Clients that do not understand the capability must refuse
+to open a flagged snapshot. Updating an existing table with Blob data files can
+activate it, even if that batch contains only inline values. The capability
+remains set across later writes and restores.
+
+Compaction preserves Managed payload objects and can adopt existing Packed or
+Dedicated sidecars in place. It records their complete addresses, so deleting
+the original data file does not require copying its sidecars. Cleanup retains
+objects referenced by protected snapshots; a partially live packed object is
+retained as a whole. Blob reads continue to return the same bytes, while raw
+descriptor scans can now report `kind = 4` for Managed values.
+
+After activation, use a client that supports Managed Blobs for all table
+maintenance. Older clients, including v11.0.0, can bypass capability checks when
+running cleanup from an unflagged historical snapshot or a cached handle. Such
+cleanup can delete adopted sidecars by treating their original data file as
+their owner. The table flag does not retrofit those old maintenance paths.
+
 ## Blob v2: Write Patterns
 
 Use `blob_field` and `blob_array` to build blob v2 columns.

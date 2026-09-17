@@ -170,6 +170,33 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Whether this table requires independently addressed Managed Blob support.
+    pub fn has_managed_blobs(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
+    }
+
+    /// Register the writer's explicit base without rebinding encoded references.
+    pub fn bind_managed_base(&mut self, base: BasePath) -> Result<()> {
+        if !self.has_managed_blobs() {
+            return Ok(());
+        }
+        if let Some(existing) = self.base_paths.get(&base.id) {
+            if existing.path != base.path || existing.is_dataset_root != base.is_dataset_root {
+                return Err(Error::invalid_input(format!(
+                    "Managed base ID {} is bound to {:?} (is_dataset_root={}); descriptors require {:?} (is_dataset_root={})",
+                    base.id,
+                    existing.path,
+                    existing.is_dataset_root,
+                    base.path,
+                    base.is_dataset_root
+                )));
+            }
+        } else {
+            self.base_paths.insert(base.id, base);
+        }
+        Ok(())
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -611,6 +638,25 @@ pub struct BasePath {
 }
 
 impl BasePath {
+    /// Choose an unused exact base ID without reserving zero or overflowing at
+    /// `u32::MAX`. The caller must publish the binding with its references and
+    /// reject a concurrent attempt to bind the chosen ID to another location.
+    pub fn unused_id(bases: impl IntoIterator<Item = u32>) -> Result<u32> {
+        let mut ids = bases.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut candidate = 0u32;
+        for id in ids {
+            if id != candidate {
+                break;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("All u32 base IDs are already registered"))?;
+        }
+        Ok(candidate)
+    }
+
     /// Create a new BasePath
     ///
     /// # Arguments
@@ -1152,8 +1198,39 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Field;
+    use lance_core::datatypes::{BLOB_V2_DESC_LANCE_FIELD, Field};
     use roaring::RoaringBitmap;
+
+    #[rstest::rstest]
+    #[case::different_path("memory://other", true)]
+    #[case::data_only("memory://dataset", false)]
+    fn managed_base_binding_preserves_address_contract(
+        #[case] path: &str,
+        #[case] is_dataset_root: bool,
+    ) {
+        let schema = Schema {
+            fields: vec![BLOB_V2_DESC_LANCE_FIELD.clone()],
+            ..Default::default()
+        };
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_3),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags |= crate::feature_flags::FLAG_MANAGED_BLOBS;
+        manifest.writer_feature_flags |= crate::feature_flags::FLAG_MANAGED_BLOBS;
+        let base = BasePath::new(7, "memory://dataset".to_string(), None, true);
+        manifest.bind_managed_base(base.clone()).unwrap();
+        manifest.bind_managed_base(base.clone()).unwrap();
+        let error = manifest
+            .bind_managed_base(BasePath::new(7, path.to_string(), None, is_dataset_root))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Managed base ID 7 is bound"));
+        assert!(error.to_string().contains("is_dataset_root="));
+        assert_eq!(manifest.base_paths[&7], base);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

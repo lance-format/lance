@@ -38,6 +38,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
 use lance_namespace::LanceNamespace;
+use lance_table::format::BasePath;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
     ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
@@ -889,7 +890,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn checkout_manifest(
+    pub(crate) fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
@@ -2453,10 +2454,35 @@ impl Dataset {
         }
     }
 
+    pub(crate) fn managed_default_base(&self) -> Result<BasePath> {
+        if let Some(base) = self
+            .manifest
+            .base_paths
+            .values()
+            .filter(|base| base.path == self.uri && base.is_dataset_root)
+            .min_by_key(|base| base.id)
+        {
+            return Ok(base.clone());
+        }
+        let id = BasePath::unused_id(self.manifest.base_paths.keys().copied())?;
+        Ok(BasePath::new(id, self.uri.clone(), None, true))
+    }
+
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
+        if base_path.path == self.uri
+            && !self
+                .base_store_params
+                .as_ref()
+                .is_some_and(|params| params.contains_key(&base_path.path))
+            && self.store_params.as_ref().is_none_or(|params| {
+                matches!(params.scoped_to_base(Some(base_id)), Cow::Borrowed(_))
+            })
+        {
+            return Ok(self.object_store.clone());
+        }
         let store_params = self.store_params_for_base(Some(base_path));
 
         let cell = {

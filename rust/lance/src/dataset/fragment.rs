@@ -1803,6 +1803,7 @@ impl FileFragment {
                 projection,
                 stream.schema().as_ref(),
                 false,
+                false,
             )?);
             Ok(stream
                 .map(move |batch_result| {

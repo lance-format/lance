@@ -514,10 +514,23 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
         })
         .collect::<Vec<_>>();
 
+    let dataset = first_fragment.dataset();
+    let cleanup_bases = match dataset.managed_default_base() {
+        Ok(base) => vec![super::write::TargetBaseInfo {
+            base_id: base.id,
+            object_store: dataset.object_store.clone(),
+            base_dir: dataset.base.clone(),
+            is_dataset_root: true,
+        }],
+        Err(error) => {
+            log::warn!("Cannot resolve primary base for failed column write cleanup: {error}");
+            Vec::new()
+        }
+    };
     cleanup_data_fragments(
-        &first_fragment.dataset().object_store,
-        &first_fragment.dataset().base,
-        None,
+        &dataset.object_store,
+        &dataset.base,
+        Some(&cleanup_bases),
         &fragments_to_cleanup,
     )
     .await;
@@ -1839,6 +1852,17 @@ mod test {
             baseline_files,
             "add_columns should clean files written by the current unfinished writer"
         );
+        let blob_dir = StdPath::new(test_uri).join("_blobs");
+        assert!(!file_paths_in(&blob_dir).is_empty());
+        // Failed uploads use the existing orphan policy. There is no concurrent
+        // writer in this test, so explicit unverified cleanup can reclaim them.
+        dataset
+            .cleanup_with_policy(super::super::cleanup::CleanupPolicy {
+                delete_unverified: true,
+                ..Default::default()
+            })
+            .await?;
+        assert!(file_paths_in(&blob_dir).is_empty());
 
         Ok(())
     }
@@ -1936,15 +1960,13 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri)
-            .join("data")
-            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"
         );
         assert!(
-            new_blob_dir.exists(),
+            !file_paths_in(&new_blob_dir).is_empty(),
             "cleanup must not delete blob sidecars after checkpoint takes ownership"
         );
 
@@ -2185,15 +2207,13 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri)
-            .join("data")
-            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"
         );
         assert!(
-            new_blob_dir.exists(),
+            !file_paths_in(&new_blob_dir).is_empty(),
             "cleanup must not delete blob sidecars after checkpoint takes ownership"
         );
 

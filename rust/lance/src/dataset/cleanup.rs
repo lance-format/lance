@@ -51,6 +51,7 @@ use lance_core::{
     },
 };
 use lance_table::{
+    feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
     format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
@@ -74,6 +75,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    managed_blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -555,6 +557,8 @@ impl<'a> CleanupTask<'a> {
         let manifest_and_indexes = async {
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            ensure_can_read_manifest(&manifest)?;
+            ensure_can_write_manifest(&manifest)?;
             let indexes =
                 read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
             Ok::<_, Error>((manifest, indexes))
@@ -589,7 +593,33 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let managed_paths = if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            match super::blob::managed_paths(&snapshot, self.dataset).await {
+                Ok(paths) => paths,
+                // A concurrent cleanup may already have removed expired data
+                // files. Losing deletion proof is safe; losing retained references
+                // is not. Other failures still stop cleanup before any deletion.
+                Err(error) if !in_working_set && error.is_not_found() => HashSet::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            HashSet::new()
+        };
         let mut inspection = inspection.lock().unwrap();
+        let references = if in_working_set {
+            &mut inspection.referenced_files
+        } else {
+            &mut inspection.verified_files
+        };
+        references.managed_blob_paths.extend(
+            managed_paths
+                .into_iter()
+                .map(|path| remove_prefix(&path, &self.dataset.base)),
+        );
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -748,6 +778,10 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            build_listing_stream(
+                self.dataset.base.clone().join("_blobs"),
+                data_unmodified_since,
+            ),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -974,6 +1008,33 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("blob") => {
+                if inspection
+                    .referenced_files
+                    .managed_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+                if relative_path
+                    .parts()
+                    .next()
+                    .is_some_and(|part| part.as_ref() == "_blobs")
+                {
+                    let verified = inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path);
+                    return if verified || !maybe_in_progress {
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Data,
+                            !verified,
+                            size_bytes,
+                        ))
+                    } else {
+                        Ok(None)
+                    };
+                }
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
@@ -1034,6 +1095,10 @@ impl<'a> CleanupTask<'a> {
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
+                    || inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1123,26 +1188,38 @@ impl<'a> CleanupTask<'a> {
                 let referenced_branches = &referenced_branches;
 
                 async move {
-                    let manifest_location = dataset
-                        .commit_handler
-                        .resolve_version_location(
-                            &dataset.base,
-                            *referenced_version,
-                            &dataset.object_store.inner,
+                    let manifest = async {
+                        let manifest_location = dataset
+                            .commit_handler
+                            .resolve_version_location(
+                                &dataset.base,
+                                *referenced_version,
+                                &dataset.object_store.inner,
+                            )
+                            .await?;
+
+                        read_manifest(
+                            &dataset.object_store,
+                            &manifest_location.path,
+                            manifest_location.size,
                         )
-                        .await?;
-
-                    let manifest = read_manifest(
-                        &dataset.object_store,
-                        &manifest_location.path,
-                        manifest_location.size,
-                    )
+                        .await
+                    }
                     .await;
-
-                    if let Ok(manifest) = manifest
-                        && policy.should_clean(&manifest)
-                    {
-                        referenced_branches.insert(branch_name.clone());
+                    match manifest {
+                        Ok(manifest) => {
+                            ensure_can_read_manifest(&manifest)?;
+                            ensure_can_write_manifest(&manifest)?;
+                            if policy.should_clean(&manifest) {
+                                referenced_branches.insert(branch_name.clone());
+                            }
+                        }
+                        Err(error) if error.is_not_found() => {
+                            // The source may be gone while descendants still use its files.
+                            // Scan their manifests before deleting any parent data.
+                            referenced_branches.insert(branch_name.clone());
+                        }
+                        Err(error) => return Err(error),
                     }
                     Ok::<(), Error>(())
                 }
@@ -1253,10 +1330,33 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        ensure_can_read_manifest(&manifest)?;
+        ensure_can_write_manifest(&manifest)?;
+        let managed_paths = if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            super::blob::managed_paths(&snapshot, self.dataset).await?
+        } else {
+            HashSet::new()
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
+        for path in managed_paths {
+            let relative = remove_prefix(&path, &self.dataset.base);
+            inspection
+                .verified_files
+                .managed_blob_paths
+                .remove(&relative);
+            inspection
+                .referenced_files
+                .managed_blob_paths
+                .insert(relative);
+            is_referenced = true;
+        }
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {
@@ -1695,7 +1795,10 @@ fn tagged_old_versions_cleanup_error(
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -1723,6 +1826,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -2743,6 +2847,13 @@ mod tests {
             fixture.create_some_data().await.unwrap();
             fixture.block_commits();
             assert!(fixture.append_some_data().await.is_err());
+            let dataset = fixture.open().await.unwrap();
+            let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
+            dataset
+                .object_store
+                .put(&blob_path, b"orphan")
+                .await
+                .unwrap();
 
             let age = if old_files {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
@@ -2768,6 +2879,11 @@ mod tests {
             let should_delete = override_opt.unwrap_or(false) || old_files;
 
             let after_count = fixture.count_files().await.unwrap();
+            assert_eq!(
+                dataset.object_store.exists(&blob_path).await.unwrap(),
+                !should_delete,
+                "override={override_opt:?}, old_files={old_files}"
+            );
             assert_eq!(removed.old_versions, 0);
             assert_eq!(
                 removed.bytes_removed,
@@ -2780,6 +2896,80 @@ mod tests {
                 assert_eq!(removed.bytes_removed, 0);
             }
         }
+    }
+
+    #[rstest]
+    #[case::head_error(Some(0))]
+    #[case::read_error(Some(1))]
+    #[case::missing_source(None)]
+    #[tokio::test]
+    async fn cleanup_preserves_child_after_source_manifest_failure(
+        #[case] fail_request: Option<usize>,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut parent = fixture.open().await.unwrap();
+        let source_manifest = parent.manifest_location.path.clone();
+        let child = fixture
+            .create_branch_and_load(&mut parent, "child", (None, None))
+            .await
+            .unwrap();
+        let expected = child.scan().try_into_batch().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let source_reads = Arc::new(AtomicUsize::new(0));
+        if let Some(fail_request) = fail_request {
+            let source_reads = source_reads.clone();
+            fixture.mock_store.policy.lock().unwrap().set_before_policy(
+                "fail_branch_source",
+                Arc::new(move |operation, path| {
+                    // get_opts serves both HEAD (first) and the subsequent range read.
+                    if operation == "get_opts"
+                        && path == &source_manifest
+                        && source_reads.fetch_add(1, Ordering::SeqCst) == fail_request
+                    {
+                        return Err(Error::internal("transient branch source read"));
+                    }
+                    Ok(())
+                }),
+            );
+        } else {
+            parent
+                .object_store
+                .inner
+                .delete(&source_manifest)
+                .await
+                .unwrap();
+        }
+        let before = fixture.count_files().await.unwrap();
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let result = fixture.run_cleanup_with_policy(policy.clone()).await;
+        if let Some(fail_request) = fail_request {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert_contains!(error.to_string(), "transient branch source read");
+            assert_eq!(source_reads.load(Ordering::SeqCst), fail_request + 1);
+            let after = fixture.count_files().await.unwrap();
+            assert_eq!(after.num_data_files, before.num_data_files);
+            assert_eq!(after.num_manifest_files, before.num_manifest_files);
+            fixture
+                .mock_store
+                .policy
+                .lock()
+                .unwrap()
+                .clear_before_policy("fail_branch_source");
+            let retried = fixture.run_cleanup_with_policy(policy).await.unwrap();
+            assert_eq!(retried.data_files_removed, 0);
+        } else {
+            assert_eq!(result.unwrap().data_files_removed, 0);
+        }
+        assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
     }
 
     #[tokio::test]

@@ -329,67 +329,91 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
 
         for i in 0..row_count {
-            let (kind_value, position_value, size_value, blob_id_value, uri_value) =
-                if struct_arr.is_null(i) || kind_col.is_null(i) {
-                    (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
-                } else {
-                    let kind_val = BlobKind::try_from(kind_col.value(i))?;
-                    match kind_val {
-                        BlobKind::Dedicated => (
-                            BlobKind::Dedicated as u8,
-                            0,
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::External => {
-                            let uri = uri_col.value(i).to_string();
-                            let position = if packed_position_col.is_null(i) {
-                                0
-                            } else {
-                                packed_position_col.value(i)
-                            };
-                            let size = if blob_size_col.is_null(i) {
-                                0
-                            } else {
-                                blob_size_col.value(i)
-                            };
-                            let external_base_id = if blob_id_col.is_null(i) {
-                                0
-                            } else {
-                                blob_id_col.value(i)
-                            };
-                            (
-                                BlobKind::External as u8,
-                                position,
-                                size,
-                                external_base_id,
-                                uri,
-                            )
+            let (kind_value, position_value, size_value, blob_id_value, uri_value) = if struct_arr
+                .is_null(i)
+                || kind_col.is_null(i)
+            {
+                (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
+            } else {
+                let kind_val = BlobKind::try_from(kind_col.value(i))?;
+                match kind_val {
+                    BlobKind::Managed => {
+                        if uri_col.is_null(i)
+                            || blob_id_col.is_null(i)
+                            || packed_position_col.is_null(i)
+                            || blob_size_col.is_null(i)
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "Managed blob row {i} requires URI, base ID, position, and size"
+                            )));
                         }
-                        BlobKind::Packed => (
-                            BlobKind::Packed as u8,
-                            packed_position_col.value(i),
-                            blob_size_col.value(i),
+                        let uri = uri_col.value(i);
+                        let position = packed_position_col.value(i);
+                        let size = blob_size_col.value(i);
+                        lance_core::utils::blob::validate_managed_reference(uri, position, size)?;
+                        (
+                            BlobKind::Managed as u8,
+                            position,
+                            size,
                             blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::Inline => {
-                            let data_val = data_col.value(i);
-                            let blob_len = data_val.len() as u64;
-                            let position = external_buffers
-                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
-
-                            (
-                                BlobKind::Inline as u8,
-                                position,
-                                blob_len,
-                                0,
-                                "".to_string(),
-                            )
-                        }
+                            uri.to_string(),
+                        )
                     }
-                };
+                    BlobKind::Dedicated => (
+                        BlobKind::Dedicated as u8,
+                        0,
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::External => {
+                        let uri = uri_col.value(i).to_string();
+                        let position = if packed_position_col.is_null(i) {
+                            0
+                        } else {
+                            packed_position_col.value(i)
+                        };
+                        let size = if blob_size_col.is_null(i) {
+                            0
+                        } else {
+                            blob_size_col.value(i)
+                        };
+                        let external_base_id = if blob_id_col.is_null(i) {
+                            0
+                        } else {
+                            blob_id_col.value(i)
+                        };
+                        (
+                            BlobKind::External as u8,
+                            position,
+                            size,
+                            external_base_id,
+                            uri,
+                        )
+                    }
+                    BlobKind::Packed => (
+                        BlobKind::Packed as u8,
+                        packed_position_col.value(i),
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::Inline => {
+                        let data_val = data_col.value(i);
+                        let blob_len = data_val.len() as u64;
+                        let position =
+                            external_buffers.add_buffer(LanceBuffer::from(Buffer::from(data_val)));
+
+                        (
+                            BlobKind::Inline as u8,
+                            position,
+                            blob_len,
+                            0,
+                            "".to_string(),
+                        )
+                    }
+                }
+            };
 
             kind_builder.append_value(kind_value);
             position_builder.append_value(position_value);
