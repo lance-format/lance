@@ -227,6 +227,28 @@ sift1m.to_table(
 - `nprobes` => how many partitions (in the coarse quantizer) to probe
 - `refine_factor` => controls "re-ranking". If k=10 and refine_factor=5 then retrieve 50 nearest neighbors by ANN and re-sort using actual distances then return top 10. This improves recall without sacrificing performance too much
 
+Pass a two-dimensional query array to refine several queries together:
+
+```python
+sift1m.to_table(
+    nearest={
+        "column": "vector",
+        "q": samples[:8],
+        "k": 10,
+        "nprobes": 10,
+        "refine_factor": 5,
+    }
+)
+```
+
+Results include a `query_index` column identifying each query. With fixed,
+positive `nprobes` and fully indexed IVF_FLAT/PQ/SQ/RQ data, Lance shares index
+partition scans and reads duplicate refinement candidates once per input batch.
+Each query still ranks only its own candidates. Vector reads are split into
+chunks targeting 32 MiB of decoded vector data; candidate metadata and per-query
+top-k results consume additional memory. Adaptive probes, HNSW, incomplete index
+coverage, stale vector overlays, and external row masks use per-query execution.
+
 !!! note "Memory Usage"
     The latencies above include file I/O as Lance currently doesn't hold anything in memory. Along with index building speed, creating a purely in-memory version of the dataset would make the biggest impact on performance.
 
