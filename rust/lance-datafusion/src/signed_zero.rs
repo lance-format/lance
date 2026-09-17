@@ -13,6 +13,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
+use datafusion::functions_nested::expr_fn::array_has_any;
 use datafusion::logical_expr::{
     BinaryExpr, ColumnarValue, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
     ScalarUDFImpl, Signature, Volatility,
@@ -45,7 +46,7 @@ use lance_core::Result;
 /// | `x IS NOT DISTINCT FROM 0`   | `(x IN (-0.0, 0.0)) IS TRUE` |
 /// | `x IS DISTINCT FROM 0`       | `(x IN (-0.0, 0.0)) IS NOT TRUE` |
 /// | `x <op> y`                   | normalize zeros in both operands before `<op>` |
-/// | `array_has(xs, 0)`           | `array_has(xs, -0.0) OR array_has(xs, 0.0)` |
+/// | `array_has(xs, 0)`           | `array_has_any(xs, [-0.0, 0.0])` |
 ///
 /// Equality has to name both encodings because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
@@ -352,19 +353,6 @@ fn is_zero_pair_over_column(expr: &Expr) -> bool {
         .is_some_and(|(negative, positive)| list_is_pair(list, &negative, &positive))
 }
 
-/// True for either `array_has` probe this rewrite emits for a floating point
-/// zero. A later optimization pass expands each probe into the complete pair,
-/// so duplicate terms have to be removed from the enclosing `OR` chain.
-fn is_array_has_zero_probe(expr: &Expr) -> bool {
-    let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
-        return false;
-    };
-    let [_, Expr::Literal(value, _)] = args.as_slice() else {
-        return false;
-    };
-    func.name() == "array_has" && zero_encodings(value).is_some()
-}
-
 /// True when `list` is exactly the two encodings of a zero, negative first.
 fn list_is_pair(list: &[Expr], negative: &ScalarValue, positive: &ScalarValue) -> bool {
     let [Expr::Literal(first, _), Expr::Literal(second, _)] = list else {
@@ -393,18 +381,15 @@ fn rewrite_bound(bound: &Expr, op: Operator) -> Option<Expr> {
 fn rewrite_node(expr: &Expr) -> Option<Expr> {
     match expr {
         // DataFusion's simplifier expands an `IN` list of three or fewer values
-        // over a bare column back into an OR chain of equalities, and each
-        // `array_has` zero probe expands into the same pair on a second pass.
-        // Dropping only those repeated terms makes the rewrite survive both round
-        // trips without deduplicating arbitrary user expressions.
+        // over a bare column back into an OR chain of equalities. Dropping only
+        // those repeated terms makes the rewrite survive that round trip without
+        // deduplicating arbitrary user expressions.
         Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
             let mut kept: Vec<&Expr> = Vec::new();
             flatten_chain(expr, *op, &mut kept);
             let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
             for term in kept.iter() {
-                if (is_zero_pair_over_column(term) || is_array_has_zero_probe(term))
-                    && deduped.contains(term)
-                {
+                if is_zero_pair_over_column(term) && deduped.contains(term) {
                     continue;
                 }
                 deduped.push(term);
@@ -485,13 +470,16 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                 return None;
             };
             let (negative, positive) = zero_encodings(value)?;
-            let probe = |value| {
-                Expr::ScalarFunction(ScalarFunction {
-                    func: Arc::clone(func),
-                    args: vec![array.clone(), Expr::Literal(value, metadata.clone())],
-                })
-            };
-            Some(probe(negative).or(probe(positive)))
+            let element_type = negative.data_type();
+            let zero_encodings = ScalarValue::List(ScalarValue::new_list(
+                &[negative, positive],
+                &element_type,
+                true,
+            ));
+            Some(array_has_any(
+                array.clone(),
+                Expr::Literal(zero_encodings, metadata.clone()),
+            ))
         }
         // `BETWEEN` normally reaches this rewrite already expanded into `>=` and
         // `<=` by the simplifier. It survives unexpanded when every operand is
@@ -597,6 +585,12 @@ fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow_array::{ListArray, RecordBatch, RecordBatchOptions};
+    use arrow_schema::{Field, Schema};
+    use datafusion::functions_nested::expr_fn::array_has;
+    use datafusion::logical_expr::create_udf;
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
 
@@ -876,6 +870,62 @@ mod tests {
             normalize_signed_zero_scalar(&Float64(Some(-0.0))),
             Float64(Some(0.0))
         );
+    }
+
+    #[test]
+    fn array_has_zero_evaluates_a_volatile_haystack_once() {
+        let schema = Arc::new(Schema::empty());
+        let planner = crate::planner::Planner::new(Arc::clone(&schema));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_udf = Arc::clone(&calls);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+        let volatile_zeros = create_udf(
+            "volatile_zeros",
+            vec![],
+            list_type,
+            Volatility::Volatile,
+            Arc::new(move |_| {
+                let value = if calls_in_udf
+                    .fetch_add(1, Ordering::SeqCst)
+                    .is_multiple_of(2)
+                {
+                    0.0
+                } else {
+                    -0.0
+                };
+                let list =
+                    ListArray::from_iter_primitive::<Float64Type, _, _>([Some(vec![Some(value)])]);
+                Ok(ColumnarValue::Scalar(ScalarValue::List(Arc::new(list))))
+            }),
+        );
+        let optimized = planner
+            .optimize_expr(array_has(volatile_zeros.call(vec![]), lit(0.0)))
+            .unwrap();
+        assert!(matches!(
+            &optimized,
+            Expr::ScalarFunction(ScalarFunction { func, .. })
+                if func.name() == "array_has_any"
+        ));
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .unwrap();
+        let values = planner
+            .create_physical_expr(&optimized)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(1)
+            .unwrap();
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(values.true_count(), 1);
     }
 
     #[rstest]
