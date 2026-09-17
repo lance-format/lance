@@ -424,7 +424,13 @@ fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
     }
 }
 
-fn validate_vector_query_compatibility(
+/// Reject vector index segments that cannot serve one logical index query.
+///
+/// All segments of a logical vector index are planned and ranked together, so
+/// they must agree on the distance metric, vector dimension, sub-index type,
+/// and quantizer kind. Independently trained IVF centroids and PQ codebooks
+/// may differ; those only affect recall, not the query contract.
+pub(crate) fn validate_vector_query_compatibility(
     indices: &[Arc<dyn VectorIndex>],
     operation: &str,
 ) -> Result<()> {
