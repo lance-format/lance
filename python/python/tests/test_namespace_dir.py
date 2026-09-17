@@ -14,6 +14,7 @@ and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -1696,3 +1697,16 @@ class TestIndexOperations:
         assert len(list_response.indexes) == 1
         assert list_response.indexes[0].index_name == "vector_idx"
         assert list_response.indexes[0].columns == ["vector"]
+
+
+def test_import_lance_does_not_load_namespace_client():
+    # The generated REST client is expensive to import and only needed when a
+    # namespace is actually used, so `import lance` must not pull it in.
+    code = (
+        "import sys, lance; "
+        "assert 'lance_namespace' not in sys.modules, sorted(sys.modules); "
+        "assert 'lance.namespace' not in sys.modules; "
+        "lance.LanceNamespace; lance.DescribeTableRequest; "
+        "assert 'lance_namespace' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

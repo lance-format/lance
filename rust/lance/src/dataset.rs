@@ -793,7 +793,9 @@ impl Dataset {
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(object_reader.as_ref(), offset).await
+            let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+            manifest.detach_sparse_inline_row_ids(manifest_size - offset);
+            Ok(manifest)
         }?;
 
         ensure_can_read_manifest(&manifest)?;

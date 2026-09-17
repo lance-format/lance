@@ -30,7 +30,10 @@ pub mod testing;
 pub mod utils;
 
 pub use filter::LanceFilterExec;
-pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
+pub use knn::{
+    ANNIvfBatchExec, ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec,
+    QUERY_INDEX_COL,
+};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;

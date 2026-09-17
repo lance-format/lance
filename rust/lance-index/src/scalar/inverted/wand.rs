@@ -1185,6 +1185,10 @@ impl PostingIterator {
     }
 
     fn position_cursor(&self) -> Result<PositionCursor<'_>> {
+        #[cfg(test)]
+        {
+            POSITION_CURSOR_CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
         match self.list {
             PostingList::Plain(ref list) => {
                 let positions = list.positions.as_ref().ok_or_else(|| {
@@ -5294,106 +5298,223 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Allocation-free exact-phrase check for the bulk conjunction path,
-    /// where every clause is a parked `lead` iterator. Semantically identical
-    /// to [`Self::check_exact_positions`] — some base position must align all
-    /// clauses at their query offsets — without the per-candidate cursor vec
-    /// and sort.
+    /// Exact-phrase check for the bulk conjunction path, where every clause
+    /// is a parked `lead` iterator. Semantically identical to
+    /// [`Self::check_exact_positions`].
     fn check_exact_positions_bulk(&self) -> Result<bool> {
         #[cfg(test)]
         {
             self.phrase_position_checks
                 .set(self.phrase_position_checks.get() + 1);
         }
-        const MAX_INLINE_CLAUSES: usize = 16;
-        let num_clauses = self.lead.len();
-        if num_clauses > MAX_INLINE_CLAUSES {
-            return self.check_exact_positions();
-        }
-        // Cursors stay alive in the stack array so owned position buffers
-        // (legacy per-doc storage) remain valid while we scan.
-        let mut cursors: [Option<PositionCursor<'_>>; MAX_INLINE_CLAUSES] =
-            std::array::from_fn(|_| None);
-        let mut anchor_idx = 0usize;
-        let mut anchor_len = usize::MAX;
-        for (index, (slot, posting)) in cursors.iter_mut().zip(self.lead.iter()).enumerate() {
-            let cursor = posting.position_cursor()?;
-            if cursor.len() < anchor_len {
-                anchor_len = cursor.len();
-                anchor_idx = index;
-            }
-            *slot = Some(cursor);
-        }
-
-        let anchor = cursors[anchor_idx]
-            .as_ref()
-            .expect("anchor cursor was just populated");
-        let anchor_offset = anchor.position_in_query as u32;
-        'anchor: for &anchor_position in anchor.positions.as_slice() {
-            let Some(base) = anchor_position.checked_sub(anchor_offset) else {
-                continue;
-            };
-            for (index, slot) in cursors[..num_clauses].iter().enumerate() {
-                if index == anchor_idx {
-                    continue;
-                }
-                let cursor = slot.as_ref().expect("clause cursor was just populated");
-                let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                if cursor.positions.as_slice().binary_search(&target).is_err() {
-                    continue 'anchor;
-                }
-            }
-            return Ok(true);
-        }
-        Ok(false)
+        exact_phrase_positions_match(
+            self.lead.len(),
+            |index| {
+                self.lead[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            },
+            |index| self.lead[index].position_cursor(),
+        )
     }
 
     fn check_exact_positions(&self) -> Result<bool> {
-        let mut position_iters = self
-            .current_doc_postings()
-            .into_iter()
-            .map(PostingIterator::position_cursor)
-            .collect::<Result<Vec<_>>>()?;
-        position_iters.sort_unstable_by_key(|iter| iter.len());
-        let Some(lead) = position_iters.first() else {
-            return Ok(false);
-        };
-        let lead_position = lead.position_in_query;
+        let postings = self.current_doc_postings();
+        exact_phrase_positions_match(
+            postings.len(),
+            |index| {
+                postings[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            },
+            |index| postings[index].position_cursor(),
+        )
+    }
+}
 
-        loop {
-            let Some(anchor) = position_iters[0].absolute_position() else {
+/// Decode exact-phrase position lists in current-doc frequency order.
+///
+/// Term frequency equals the position count, so a stopword on this document
+/// is decoded last. If the two rarest lists share no phrase base, the rest
+/// (typically `"the"` / `"of"`) are never unpacked.
+fn exact_phrase_positions_match<'a>(
+    num_clauses: usize,
+    frequency: impl Fn(usize) -> u32,
+    decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
+) -> Result<bool> {
+    const MAX_INLINE_CLAUSES: usize = 16;
+    if num_clauses == 0 {
+        return Ok(false);
+    }
+    if num_clauses > MAX_INLINE_CLAUSES {
+        let mut order: Vec<usize> = (0..num_clauses).collect();
+        order.sort_unstable_by_key(|&index| frequency(index));
+        let mut cursors: Vec<Option<PositionCursor<'a>>> = (0..num_clauses).map(|_| None).collect();
+        return exact_phrase_scan(&order, &mut cursors, decode);
+    }
+    let mut order = [0usize; MAX_INLINE_CLAUSES];
+    for (index, slot) in order.iter_mut().enumerate().take(num_clauses) {
+        *slot = index;
+    }
+    order[..num_clauses].sort_unstable_by_key(|&index| frequency(index));
+    let mut cursors: [Option<PositionCursor<'a>>; MAX_INLINE_CLAUSES] =
+        std::array::from_fn(|_| None);
+    exact_phrase_scan(&order[..num_clauses], &mut cursors, decode)
+}
+
+fn exact_phrase_scan<'a>(
+    order: &[usize],
+    cursors: &mut [Option<PositionCursor<'a>>],
+    mut decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
+) -> Result<bool> {
+    let num_clauses = order.len();
+    if num_clauses == 0 {
+        return Ok(false);
+    }
+    let rarest = order[0];
+    cursors[rarest] = Some(decode(rarest)?);
+    let (n_pos, anchor_offset) = {
+        let cursor = cursors[rarest]
+            .as_ref()
+            .expect("rarest clause cursor was just populated");
+        (cursor.len(), cursor.position_in_query as u32)
+    };
+    if num_clauses == 1 {
+        return Ok(n_pos > 0);
+    }
+
+    // Every clause's target is `anchor_position - anchor_offset + query_offset`,
+    // which is strictly increasing in the anchor. Two consequences the loop
+    // below exploits:
+    //
+    //   * a follower is never searched from the start. Each cursor keeps its own
+    //     index and only moves forward, so a failed probe leaves it sitting on
+    //     the first position above the target - which is also the smallest
+    //     position any *later* anchor can align with.
+    //   * the anchor can therefore be jumped straight to that position instead
+    //     of stepping over every candidate in between. None of them can match:
+    //     their targets all land in the gap the follower was just shown to have.
+    //
+    // Both moves start from the current index and only move forward, so the
+    // per-document cost is bounded by the decoded position counts rather than
+    // by their product. The jump is taken only when it skips at least one
+    // anchor position, which needs no counter, budget or mode switch: the two
+    // regimes (far-apart lists vs interleaved lists) separate themselves.
+    let mut anchor_idx = 0usize;
+    'anchor: while anchor_idx < n_pos {
+        #[cfg(test)]
+        {
+            count_anchor_steps();
+        }
+        let anchor_position = cursors[rarest]
+            .as_ref()
+            .expect("rarest clause cursor was just populated")
+            .positions
+            .as_slice()[anchor_idx];
+        let Some(base) = anchor_position.checked_sub(anchor_offset) else {
+            anchor_idx += 1;
+            continue 'anchor;
+        };
+        for &index in &order[1..num_clauses] {
+            if cursors[index].is_none() {
+                cursors[index] = Some(decode(index)?);
+            }
+            let query_offset = cursors[index]
+                .as_ref()
+                .expect("phrase clause cursor was just populated")
+                .position_in_query as u32;
+            let Some(target) = base.checked_add(query_offset) else {
                 return Ok(false);
             };
-            let Some(base) = anchor.checked_sub(lead_position as u32) else {
-                position_iters[0].advance_next();
-                continue;
+            let Some(position) = cursors[index]
+                .as_mut()
+                .expect("phrase clause cursor was just populated")
+                .advance_to_at_least(target)
+            else {
+                // No follower position reaches `target`, and every later anchor
+                // only raises it, so no remaining base can align either.
+                return Ok(false);
             };
-
-            let mut next_lead_relative = None;
-            let mut matched = true;
-            for follower in position_iters.iter_mut().skip(1) {
-                let Some(target) = base.checked_add(follower.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                let Some(position) = follower.advance_to_absolute(target) else {
-                    return Ok(false);
-                };
-                if position != target {
-                    next_lead_relative = Some(position as i32 - follower.position_in_query);
-                    matched = false;
-                    break;
+            if position == target {
+                continue;
+            }
+            let next_anchor = position
+                .saturating_sub(query_offset)
+                .saturating_add(anchor_offset);
+            anchor_idx = {
+                let anchor_positions = cursors[rarest]
+                    .as_ref()
+                    .expect("rarest clause cursor was just populated")
+                    .positions
+                    .as_slice();
+                // Only pay for the jump when it actually skips something. If the
+                // very next anchor position is already below the bound, the jump
+                // would land one step ahead anyway, and a plain step gets there
+                // without the extra binary search. This is what separates the
+                // two regimes: on disjoint lists the first jump crosses the whole
+                // anchor, while on interleaved lists every bound lands one
+                // position ahead and the scan degrades to stepping.
+                match anchor_positions.get(anchor_idx + 1) {
+                    Some(&next_position) if next_position < next_anchor => {
+                        anchor_idx
+                            + anchor_positions[anchor_idx..].partition_point(|&p| p < next_anchor)
+                    }
+                    _ => anchor_idx + 1,
                 }
-            }
-
-            if matched {
-                return Ok(true);
-            }
-
-            position_iters[0].advance_to_relative(next_lead_relative.unwrap());
+            };
+            continue 'anchor;
         }
+        return Ok(true);
     }
+    Ok(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static POSITION_CURSOR_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHRASE_ANCHOR_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-only: counting anchor steps is off unless a test arms it, because the
+    // scan loop runs it once per anchor position. Rustdoc does not document
+    // macro invocations, so this is a plain comment.
+    static COUNT_ANCHOR_STEPS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Armed per test thread: a process-wide flag would let one parallel test that
+/// finishes early switch counting off for another still running.
+#[cfg(test)]
+fn count_anchor_steps() {
+    if COUNT_ANCHOR_STEPS.with(|armed| armed.get()) {
+        PHRASE_ANCHOR_STEPS.with(|steps| steps.set(steps.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn take_position_cursor_calls() -> usize {
+    POSITION_CURSOR_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Anchor positions visited by the last `exact_phrase_scan`. Test-only: it is
+/// the only way to assert that the scan skips without a timing threshold.
+#[cfg(test)]
+fn take_anchor_steps() -> usize {
+    PHRASE_ANCHOR_STEPS.with(|steps| steps.replace(0))
+}
+
+/// Run an exact-phrase check with anchor-step counting armed.
+#[cfg(test)]
+fn counted_anchor_steps<F: FnOnce() -> bool>(check: F) -> (bool, usize) {
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(true));
+    let _ = take_anchor_steps();
+    let matched = check();
+    let steps = take_anchor_steps();
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(false));
+    (matched, steps)
 }
 
 #[derive(Debug)]
@@ -5469,15 +5590,47 @@ impl<'a> PositionCursor<'a> {
         self.positions.len()
     }
 
-    fn absolute_position(&self) -> Option<u32> {
-        self.positions.as_slice().get(self.index).copied()
-    }
-
     fn relative_position(&self) -> Option<i32> {
         self.positions
             .as_slice()
             .get(self.index)
             .map(|position| *position as i32 - self.position_in_query)
+    }
+
+    /// Advance to the first position at or above `target` and return it, or
+    /// `None` once the cursor is exhausted.
+    ///
+    /// `target` must be non-decreasing across calls: the search is confined to
+    /// the not-yet-consumed suffix, so the cursor never rewinds and a returned
+    /// position is never below `target`. When the cursor already sits past
+    /// `target` the search is skipped entirely.
+    fn advance_to_at_least(&mut self, target: u32) -> Option<u32> {
+        if self.index >= self.len() {
+            return None;
+        }
+        let values = self.positions.as_slice();
+        // The cursor has reached `target`, or is already past it. Every earlier
+        // position is below the previous target and hence below this one, so the
+        // insertion point has not moved: no search is needed, and the current
+        // position is either the match or the bound the caller wants.
+        if values[self.index] >= target {
+            return Some(values[self.index]);
+        }
+        // Targets only grow, so the next position is a frequent answer. Check it
+        // before paying for a search: a suffix binary search costs a dependent
+        // load per level and its landmarks move as `index` advances, which is
+        // what makes interleaved lists slow. On a mismatch here the cursor ends
+        // up one position short of the target on every step.
+        if let Some(next) = values
+            .get(self.index + 1)
+            .copied()
+            .filter(|&next| next >= target)
+        {
+            self.index += 1;
+            return Some(next);
+        }
+        self.index += values[self.index..].partition_point(|&pos| pos < target);
+        values.get(self.index).copied()
     }
 
     fn advance_to_relative(&mut self, least_relative_pos: i32) {
@@ -5488,19 +5641,6 @@ impl<'a> PositionCursor<'a> {
         let least_pos = least_pos.max(0) as u32;
         let values = self.positions.as_slice();
         self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-    }
-
-    fn advance_to_absolute(&mut self, least_pos: u32) -> Option<u32> {
-        if self.index >= self.len() {
-            return None;
-        }
-        let values = self.positions.as_slice();
-        self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-        self.absolute_position()
-    }
-
-    fn advance_next(&mut self) {
-        self.index = self.index.saturating_add(1).min(self.len());
     }
 }
 
@@ -9788,6 +9928,568 @@ mod tests {
         let second = wand.next().unwrap().unwrap();
         assert_eq!(second.0.doc_id(), 1);
         assert!(wand.check_positions(0).unwrap());
+    }
+
+    #[rstest]
+    fn exact_phrase_skips_stopword_decode_when_rare_pair_misses(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..100_u32).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![50_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![99_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(!wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 2);
+        assert!(!wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 2);
+    }
+
+    #[rstest]
+    fn exact_phrase_decodes_stopword_when_rare_pair_aligns(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let hit_the: Vec<u32> = (0..100).collect();
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(vec![0], vec![hit_the], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![11_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![12_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+        assert!(wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    #[rstest]
+    fn exact_phrase_rejects_when_stopword_misses_aligned_pair(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        // "news journal" aligns at base 10, but "the" has no position 10.
+        let the_positions: Vec<u32> = (0..10).chain(11..100).collect();
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![the_positions],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![11_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![12_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(!wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+        assert!(!wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The follower sits entirely past the anchor, so the very first probe
+    /// proves no base can align: the scan must jump instead of walking.
+    #[rstest]
+    fn exact_phrase_scan_skips_anchor_past_disjoint_follower(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(2 * n..3 * n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase");
+        assert!(steps <= 2, "anchor was walked ({steps} steps), not skipped");
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase (bulk)");
+        assert!(
+            steps <= 2,
+            "bulk anchor was walked ({steps} steps), not skipped"
+        );
+    }
+
+    /// The only match sits at the far end of a long anchor. Reaching it in a
+    /// couple of steps is what proves the jump lands on the right candidate
+    /// instead of over-shooting it.
+    #[rstest]
+    fn exact_phrase_scan_jumps_to_a_late_match(#[values(false, true)] is_compressed: bool) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(n / 2 + 1..n + 1).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(matched, "the late match must be found");
+        assert!(
+            steps <= 3,
+            "late match took {steps} steps; the jump missed it"
+        );
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(matched, "the late match must be found (bulk)");
+        assert!(steps <= 3, "bulk late match took {steps} steps");
+    }
+
+    /// Interleaved lists: no bound can skip anything, so the scan must fall back
+    /// to stepping and still visit every candidate exactly once (and terminate).
+    #[rstest]
+    fn exact_phrase_scan_steps_when_no_bound_can_skip(#[values(false, true)] is_compressed: bool) {
+        let n = 1024u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k + 2).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "interleaved lists cannot form a phrase");
+        assert!(
+            (1..=n as usize).contains(&steps),
+            "expected a single walk of {n} anchors, got {steps}"
+        );
+    }
+
+    /// The anchor jumps over a candidate before the last clause has ever been
+    /// probed, so that clause is decoded with a target already far into its
+    /// list: the lazy decode and the monotone probe have to agree.
+    #[rstest]
+    fn exact_phrase_scan_decodes_a_follower_after_the_anchor_jumps(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut middle = vec![300_u32, 901];
+        middle.extend(1000..1050);
+        let mut last = vec![902_u32];
+        last.extend(3000..3100);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![100_u32, 200, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(vec![0], vec![middle], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(
+            matched,
+            "the clause decoded after the jump must still align"
+        );
+        assert_eq!(
+            steps, 2,
+            "the anchor must jump straight to 900, got {steps} steps"
+        );
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The anchor clause is not the first word of the phrase, so the jump has to
+    /// account for `anchor_offset`. Without it the bound lands one position
+    /// short and the scan needs an extra step.
+    #[rstest]
+    fn exact_phrase_scan_jumps_with_a_nonzero_anchor_offset(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut first = vec![100_u32, 497, 899];
+        first.extend(1000..1050);
+        let mut last = vec![500_u32];
+        last.extend(2000..2050);
+        last.push(5000);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(vec![0], vec![first], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![101_u32, 498, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "the last clause never reaches the phrase");
+        assert_eq!(
+            steps, 2,
+            "the jump must carry anchor_offset (bound 499, not 498), got {steps} steps"
+        );
+    }
+
+    /// The compound-phrase request from review: drive the exact-phrase check the
+    /// way `WandCursor::matches()` does - a phrase leaf inside a compound query -
+    /// instead of calling the entries directly.
+    #[rstest]
+    fn wand_cursor_confirmation_rejects_disjoint_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(2 * n..3 * n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(!matched, "disjoint positions cannot form a phrase");
+        assert!(
+            steps <= 2,
+            "the compound path must skip too, took {steps} steps"
+        );
+    }
+
+    /// Same path, but the phrase really is present: the confirmation has to
+    /// survive the jump instead of over-shooting the match.
+    #[rstest]
+    fn wand_cursor_confirmation_accepts_aligned_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(1..n + 1).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(matched, "the phrase is present at base 0");
+        assert!(
+            steps <= 2,
+            "took {steps} steps to confirm a first-position match"
+        );
+    }
+
+    #[rstest]
+    fn exact_phrase_heap_path_matches_wide_clause_count(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 32);
+        let num_clauses = 17usize;
+        let postings = (0..num_clauses)
+            .map(|index| {
+                PostingIterator::new(
+                    format!("t{index}"),
+                    index as u32,
+                    index as u32,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![vec![index as u32]],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        assert!(wand.check_exact_positions().unwrap());
+        assert!(wand.check_exact_positions_bulk().unwrap());
     }
 
     /// The bulk conjunction path must return exactly the classic loop's

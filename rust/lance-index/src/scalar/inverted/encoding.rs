@@ -842,7 +842,13 @@ pub(super) fn seek_packed_doc_positions(
         Ok(())
     };
 
-    for index in delta_range.start..delta_range.end.min(packed_deltas_end) {
+    // Group-outer / position-inner: the group only changes once every
+    // BLOCK_SIZE positions, so hoisting the group check out of the inner loop
+    // removes a load-compare and a division from every single position. The
+    // per-position inner loop then only decodes and accumulates.
+    let full_end = delta_range.end.min(packed_deltas_end);
+    let mut index = delta_range.start;
+    while index < full_end {
         let group = index / BLOCK_SIZE;
         if *unpacked_group_idx != Some(group) {
             let offset = *group_offsets.get(group).ok_or_else(|| {
@@ -855,7 +861,13 @@ pub(super) fn seek_packed_doc_positions(
             BitPacker4x::new().decompress(payload, unpacked_group, num_bits);
             *unpacked_group_idx = Some(group);
         }
-        push_delta(unpacked_group[index % BLOCK_SIZE], dst)?;
+        let group_end = ((group + 1) * BLOCK_SIZE).min(full_end);
+        let first_in_group = index % BLOCK_SIZE;
+        let run = &unpacked_group[first_in_group..first_in_group + (group_end - index)];
+        for delta in run {
+            push_delta(*delta, dst)?;
+        }
+        index = group_end;
     }
 
     if delta_range.end > packed_deltas_end {
