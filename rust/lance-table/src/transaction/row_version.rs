@@ -169,14 +169,25 @@ pub(super) fn resolve_update_version_metadata(
     }
 
     for fragment in new_fragments.iter_mut() {
+        // A writer that read the rewritten rows already knows their created-at
+        // versions and may place them itself, spilled or inline. The
+        // last-updated-at version is this commit's, which only the commit
+        // knows (a conflict retry moves it), so it is stamped here regardless
+        // of what the writer left.
+        if fragment.created_at_version_meta.is_some() {
+            fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+            continue;
+        }
         let row_ids = match &fragment.row_id_meta {
             Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
             Some(RowIdMeta::Column) => {
                 // Resolving the versions needs the row ids, which this
-                // commit-time path cannot read back from a data file.
+                // commit-time path cannot read back from a data file; a writer
+                // that spills them has to place the created-at versions too.
                 return Err(Error::not_supported(format!(
-                    "fragment {} stores its row ids outside the manifest; committing it \
-                     through an update is not supported yet",
+                    "fragment {} stores its row ids outside the manifest but carries no \
+                     created-at version metadata; a writer that spills row ids must place \
+                     the created-at versions with them",
                     fragment.id
                 )));
             }
@@ -402,6 +413,33 @@ mod tests {
 
         assert_eq!(next_row_id, 100);
         assert_eq!(fragments[0].row_id_meta, Some(spilled));
+    }
+
+    #[test]
+    fn test_resolve_update_versions_keeps_writer_placed_created_at() {
+        // A writer that placed a new fragment's created-at versions, spilled
+        // or inline, keeps them; the commit only stamps last-updated-at with
+        // its own version, which the writer could not know.
+        let mut new_fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(50, 7)),
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+
+        resolve_update_version_metadata(&[], &mut new_fragments, 9, &Default::default()).unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(50, 9))
+        );
     }
 
     #[test]

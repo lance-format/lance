@@ -1064,4 +1064,116 @@ mod tests {
         }
         patched.validate().await.unwrap();
     }
+    /// With the table opted in, an update spills the lineage of the rows it
+    /// rewrote at write time: their ids and created-at versions are known
+    /// before the commit and cannot change on a retry. The commit stamps the
+    /// last-updated-at version; the writer's placeholder is replaced.
+    #[tokio::test]
+    async fn update_on_an_opted_in_table_spills_the_rewritten_rows_lineage() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        let before = by_key(&collect_rows(&dataset).await);
+
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i >= 500")
+            .unwrap()
+            .set("i", "i + 10000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let updated = updated.new_dataset.as_ref();
+        let update_version = updated.version().version;
+
+        let rewritten = updated
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .find(|metadata| matches!(metadata.row_id_meta, Some(RowIdMeta::Column)))
+            .expect("the rewritten rows' fragment must spill its row ids");
+        assert!(
+            matches!(
+                rewritten.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            ),
+            "the created-at versions must spill with the row ids"
+        );
+        // The lineage file is one of the fragment's files, after its data.
+        assert_eq!(rewritten.files.len(), 2);
+        assert!(
+            rewritten.files[1].fields.iter().all(|field| *field < 0),
+            "the lineage file holds only lineage columns: {:?}",
+            rewritten.files[1].fields
+        );
+        assert!(
+            matches!(
+                rewritten.last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Inline(_))
+            ),
+            "the commit stamps last-updated-at inline, got {:?}",
+            rewritten.last_updated_at_version_meta
+        );
+
+        let after = by_key(&collect_rows(updated).await);
+        for (key, (id, created, updated_at)) in before.iter() {
+            if *key >= 500 {
+                assert_eq!(
+                    after[&(key + 10000)],
+                    (*id, *created, update_version),
+                    "row {key}"
+                );
+            } else {
+                assert_eq!(after[key], (*id, *created, *updated_at), "row {key}");
+            }
+        }
+        updated.validate().await.unwrap();
+    }
+
+    /// Without the opt-in the same update places everything inline, as every
+    /// release has, and the lineage it carries is the same.
+    #[tokio::test]
+    async fn update_on_a_table_that_did_not_opt_in_keeps_lineage_inline() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let dataset = appended_dataset(uri, 4, 250).await;
+        let before = by_key(&collect_rows(&dataset).await);
+
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i >= 500")
+            .unwrap()
+            .set("i", "i + 10000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let updated = updated.new_dataset.as_ref();
+        let update_version = updated.version().version;
+
+        for fragment in updated.get_fragments() {
+            assert!(
+                !fragment.metadata().has_spilled_row_lineage(),
+                "fragment {} spilled without the table opting in",
+                fragment.id()
+            );
+        }
+        let after = by_key(&collect_rows(updated).await);
+        for (key, (id, created, updated_at)) in before.iter() {
+            if *key >= 500 {
+                assert_eq!(
+                    after[&(key + 10000)],
+                    (*id, *created, update_version),
+                    "row {key}"
+                );
+            } else {
+                assert_eq!(after[key], (*id, *created, *updated_at), "row {key}");
+            }
+        }
+        updated.validate().await.unwrap();
+    }
 }
