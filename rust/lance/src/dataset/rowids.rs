@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
@@ -29,6 +29,7 @@ pub async fn load_row_id_sequence(
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
         .metadata_cache
@@ -53,6 +54,11 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
                 .await?;
             read_row_ids(&data)
         }
+        Some(RowIdMeta::Column) => Err(Error::not_supported(format!(
+            "row ids of fragment {} are spilled to a data file column, which this build \
+             cannot read",
+            fragment.id
+        ))),
     }
 }
 
