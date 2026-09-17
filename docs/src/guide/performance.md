@@ -509,6 +509,17 @@ stores additional bits. Set `num_bits=1` explicitly to minimize index size and b
 100M-row example uses about 10.8 GiB, but searches cannot use the multi-bit distance estimate and
 may have lower recall.
 
+!!! warning "High-dimensional IVF_RQ on Lance 11.0.0 and earlier"
+
+    Stable releases through 11.0.0 have a FastScan accumulator overflow for IVF_RQ queries above
+    1,024 dimensions. With `num_bits=1`, the `normal` and `fast` approximation modes can silently
+    return incorrect rankings; recall may begin to degrade around 1,500 dimensions. The fix first
+    shipped in 12.0.0-beta.15.
+
+    On an affected release that supports it, query the existing index with
+    `approx_mode="accurate"`; no index rebuild is needed. Releases without `accurate` mode must use
+    another index type or upgrade.
+
 #### AMX Acceleration
 
 On Linux x86_64 with an AMX-FP16 CPU (Intel Granite Rapids / Xeon 6 and newer), a `float16`
