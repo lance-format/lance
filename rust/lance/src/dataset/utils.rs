@@ -14,37 +14,42 @@ use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
-use lance_core::ROW_ID;
+use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+fn u64_values<'a>(batch: &'a RecordBatch, column: usize, what: &str) -> &'a [u64] {
+    let array = batch.column(column);
+    array
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap_or_else(|| panic!("{what} had an unexpected type: {}", array.data_type()))
+        .values()
+}
+
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
     batch: RecordBatch,
     row_id_idx: usize,
-    non_row_id_projection: &[usize],
+    created_at_idx: Option<usize>,
+    data_projection: &[usize],
 ) -> DFResult<RecordBatch> {
-    let row_ids_arr = batch.column(row_id_idx);
-    let row_ids_itr = row_ids_arr
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap_or_else(|| {
-            panic!(
-                "Row ids had an unexpected type: {}",
-                row_ids_arr.data_type()
-            )
-        })
-        .values();
-    row_ids.capture(row_ids_itr)?;
-    Ok(batch.project(non_row_id_projection)?)
+    row_ids.capture(u64_values(&batch, row_id_idx, "Row ids"))?;
+    if let Some(created_at_idx) = created_at_idx {
+        row_ids.capture_created_at(u64_values(&batch, created_at_idx, "Created-at versions"));
+    }
+    Ok(batch.project(data_projection)?)
 }
 
 /// Given a stream that includes a row id column, return a stream that will
 /// capture the row id. At completion of the stream, the captured row ids can
 /// be received from the returned receiver.
+///
+/// A `_row_created_at_version` column, if the stream carries one, is captured
+/// alongside the row ids and removed from the output the same way.
 pub fn make_rowid_capture_stream(
     mut target: SendableRecordBatchStream,
     stable_row_ids: bool,
@@ -57,14 +62,17 @@ pub fn make_rowid_capture_stream(
     let (row_id_idx, _) = schema
         .column_with_name(ROW_ID)
         .expect("Received a batch without row ids");
-    let non_row_ids_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx)
+    let created_at_idx = schema
+        .column_with_name(ROW_CREATED_AT_VERSION)
+        .map(|(idx, _)| idx);
+    let data_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_id_idx && Some(*col) != created_at_idx)
         .collect::<Vec<_>>();
-    let output_schema = Arc::new(schema.project(&non_row_ids_cols)?);
+    let output_schema = Arc::new(schema.project(&data_cols)?);
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
-            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, &non_row_ids_cols);
+            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, created_at_idx, &data_cols);
             std::task::Poll::Ready(Some(res))
         }
         std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
@@ -84,13 +92,21 @@ pub fn make_rowid_capture_stream(
 #[derive(Debug)]
 pub enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
-    SequenceStyle(RowIdSequence),
+    SequenceStyle {
+        row_ids: RowIdSequence,
+        /// The created-at version of each captured row, in capture order, when
+        /// the stream carried them; empty otherwise.
+        created_at: Vec<u64>,
+    },
 }
 
 impl CapturedRowIds {
     pub fn new(stable_row_ids: bool) -> Self {
         if stable_row_ids {
-            Self::SequenceStyle(RowIdSequence::new())
+            Self::SequenceStyle {
+                row_ids: RowIdSequence::new(),
+                created_at: Vec::new(),
+            }
         } else {
             Self::AddressStyle(RoaringTreemap::new())
         }
@@ -103,16 +119,39 @@ impl CapturedRowIds {
                 ids.append(row_ids.iter().cloned())
                     .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
             }
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle {
+                row_ids: sequence, ..
+            } => {
                 sequence.extend(row_ids.into());
             }
         }
         Ok(())
     }
 
+    /// Record the created-at versions of the rows just passed to [`Self::capture`].
+    pub fn capture_created_at(&mut self, versions: &[u64]) {
+        if let Self::SequenceStyle { created_at, .. } = self {
+            created_at.extend_from_slice(versions);
+        }
+    }
+
     pub fn row_id_sequence(&self) -> Option<&RowIdSequence> {
         match self {
-            Self::SequenceStyle(sequence) => Some(sequence),
+            Self::SequenceStyle { row_ids, .. } => Some(row_ids),
+            _ => None,
+        }
+    }
+
+    /// The captured rows' created-at versions, one per captured row id, when
+    /// the stream carried them.
+    pub fn created_at_versions(&self) -> Option<&[u64]> {
+        match self {
+            Self::SequenceStyle {
+                row_ids,
+                created_at,
+            } if created_at.len() as u64 == row_ids.len() && !created_at.is_empty() => {
+                Some(created_at)
+            }
             _ => None,
         }
     }
@@ -120,7 +159,9 @@ impl CapturedRowIds {
     pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
             Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle {
+                row_ids: sequence, ..
+            } => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
                     panic!("RowIdIndex required for sequence style row ids")

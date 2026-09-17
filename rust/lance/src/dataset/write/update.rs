@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::{RowLineage, get_row_id_index, place_row_lineage};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
@@ -28,10 +28,10 @@ use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
@@ -336,6 +336,28 @@ impl UpdateJob {
             scanner.with_row_address();
         }
         scanner.with_row_id();
+        // The rewritten rows keep their created-at versions, so read them here
+        // where the source rows are in hand rather than have the commit look
+        // them up again. The legacy file reader does not serve the version
+        // columns; those datasets keep leaving the lookup to the commit.
+        if self.dataset.manifest.uses_stable_row_ids()
+            && self
+                .dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format()
+                != ConcreteFileVersion::V1
+        {
+            let columns = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .chain([ROW_CREATED_AT_VERSION])
+                .collect::<Vec<_>>();
+            scanner.project(&columns)?;
+        }
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -471,23 +493,18 @@ impl UpdateJob {
             .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
-            let fragment_sizes = new_fragments
-                .iter()
-                .map(|f| f.physical_rows.unwrap() as u64);
-            let sequences = lance_table::rowids::rechunk_sequences(
-                [row_id_sequence.clone()],
-                fragment_sizes,
-                false,
-            )
-            .map_err(|e| {
-                Error::internal(format!(
-                    "Captured row ids not equal to number of rows written: {}",
-                    e
-                ))
-            })?;
-            for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
+            let placed = self
+                .place_rewritten_lineage(&mut new_fragments, &removed_row_ids, row_id_sequence)
+                .await;
+            if let Err(e) = placed {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    None,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
             }
         }
 
@@ -522,6 +539,65 @@ impl UpdateJob {
             affected_rows,
             num_updated_rows,
         })
+    }
+
+    /// Give each new fragment the row ids and created-at versions its rows
+    /// carried before the rewrite, placed inline or spilled as the table's
+    /// policy calls for. The last-updated-at version is the commit's to stamp;
+    /// a single-run placeholder keeps the metadata complete until then.
+    async fn place_rewritten_lineage(
+        &self,
+        new_fragments: &mut [Fragment],
+        captured: &crate::dataset::utils::CapturedRowIds,
+        row_id_sequence: &lance_table::rowids::RowIdSequence,
+    ) -> Result<()> {
+        let fragment_sizes = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap() as u64)
+            .collect::<Vec<_>>();
+        let sequences = lance_table::rowids::rechunk_sequences(
+            [row_id_sequence.clone()],
+            fragment_sizes.iter().copied(),
+            false,
+        )
+        .map_err(|e| {
+            Error::internal(format!(
+                "Captured row ids not equal to number of rows written: {}",
+                e
+            ))
+        })?;
+        // Without the created-at versions in hand the commit resolves them from
+        // the existing fragments, as it always has; the row ids stay inline so
+        // it can read them.
+        let Some(created_at) = captured.created_at_versions() else {
+            for (fragment, row_ids) in new_fragments.iter_mut().zip(sequences) {
+                let serialized = lance_table::rowids::write_row_ids(&row_ids);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
+            }
+            return Ok(());
+        };
+        let placeholder_version = self.dataset.manifest.version + 1;
+        let mut offset = 0;
+        for ((fragment, row_ids), size) in
+            new_fragments.iter_mut().zip(sequences).zip(fragment_sizes)
+        {
+            let size = size as usize;
+            let lineage = RowLineage {
+                row_ids,
+                created_at: RowDatasetVersionSequence::from_versions(
+                    &created_at[offset..offset + size],
+                ),
+                last_updated_at: RowDatasetVersionSequence::from_uniform_row_count(
+                    size as u64,
+                    placeholder_version,
+                ),
+            };
+            offset += size;
+            place_row_lineage(&self.dataset, &lineage)
+                .await?
+                .apply(fragment);
+        }
+        Ok(())
     }
 
     async fn commit_impl(
