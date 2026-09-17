@@ -29,15 +29,42 @@ use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transacti
 
 use super::commit::ManifestLocation;
 
-/// Read Manifest on URI.
+/// Read the raw Manifest protobuf from a URI.
 ///
-/// This only reads manifest files. It does not read data files.
+/// This only reads manifest files. It does not read data files or translate the
+/// protobuf into the semantic [`Manifest`] type.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> lance_core::Result<()> {
+/// use lance_io::object_store::ObjectStore;
+/// use lance_table::format::pb;
+/// use lance_table::io::manifest::read_manifest_proto;
+/// use object_store::path::Path;
+///
+/// let object_store = ObjectStore::local();
+/// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
+/// let manifest: pb::Manifest = read_manifest_proto(&object_store, &path, None).await?;
+/// println!("manifest version: {}", manifest.version);
+/// # Ok(())
+/// # }
+/// ```
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(
+pub async fn read_manifest_proto(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
-) -> Result<Manifest> {
+) -> Result<pb::Manifest> {
+    let buf = read_manifest_bytes(object_store, path, known_size).await?;
+    Ok(pb::Manifest::decode(buf)?)
+}
+
+async fn read_manifest_bytes(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Bytes> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
@@ -54,7 +81,7 @@ pub async fn read_manifest(
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
     if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest(object_store, path, None)).await;
+        return Box::pin(read_manifest_bytes(object_store, path, None)).await;
     }
 
     if buf.len() < 16 {
@@ -108,7 +135,38 @@ pub async fn read_manifest(
         )));
     }
 
-    let proto = pb::Manifest::decode(buf)?;
+    Ok(buf)
+}
+
+/// Read the semantic [`Manifest`] from a URI.
+///
+/// This only reads manifest files. It does not read data files. Use
+/// [`Manifest::summary`] to inspect aggregate fragment and row counts after
+/// loading.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> lance_core::Result<()> {
+/// use lance_io::object_store::ObjectStore;
+/// use lance_table::format::Manifest;
+/// use lance_table::io::manifest::read_manifest;
+/// use object_store::path::Path;
+///
+/// let object_store = ObjectStore::local();
+/// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
+/// let manifest: Manifest = read_manifest(&object_store, &path, None).await?;
+/// println!("fragments: {}", manifest.summary().total_fragments);
+/// # Ok(())
+/// # }
+/// ```
+#[instrument(level = "debug", skip(object_store))]
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let proto = read_manifest_proto(object_store, path, known_size).await?;
     Manifest::try_from(proto)
 }
 
@@ -251,7 +309,10 @@ mod test {
 
     use super::*;
 
-    async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
+    async fn write_test_manifest(
+        prefix_size: usize,
+        manifest_min_size: usize,
+    ) -> (ObjectStore, Path, Manifest) {
         let store = ObjectStore::memory();
         let path = Path::from("/read_large_manifest");
 
@@ -289,6 +350,11 @@ mod test {
             .unwrap();
         Writer::shutdown(writer.as_mut()).await.unwrap();
 
+        (store, path, manifest)
+    }
+
+    async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
+        let (store, path, manifest) = write_test_manifest(prefix_size, manifest_min_size).await;
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 
         assert_eq!(manifest, roundtripped_manifest);
@@ -301,6 +367,32 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_proto_roundtrip() {
+        let (store, path, manifest) = write_test_manifest(1000, 1000).await;
+        let expected = pb::Manifest::from(&manifest);
+
+        let roundtripped_manifest = read_manifest_proto(&store, &path, None).await.unwrap();
+
+        assert_eq!(expected, roundtripped_manifest);
+        store.inner.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_proto_retries_stale_known_size() {
+        let (store, path, manifest) = write_test_manifest(1000, 1000).await;
+        let expected = pb::Manifest::from(&manifest);
+        let actual_size = store.inner.head(&path).await.unwrap().size;
+        let stale_known_size = actual_size - 1;
+
+        let roundtripped_manifest = read_manifest_proto(&store, &path, Some(stale_known_size))
+            .await
+            .unwrap();
+
+        assert_eq!(expected, roundtripped_manifest);
+        store.inner.delete(&path).await.unwrap();
     }
 
     #[tokio::test]

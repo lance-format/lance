@@ -16,10 +16,13 @@ name = "lance-tools"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
 lance-core.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
+lance-table.workspace = true
 object_store.workspace = true
+prost.workspace = true
 tokio.workspace = true
 url.workspace = true
