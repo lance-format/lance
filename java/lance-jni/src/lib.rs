@@ -103,6 +103,83 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// Process-wide [`lance_io::object_store::ObjectStoreRegistry`] used for JNI
+/// default-open paths.
+///
+/// When the Java caller does not supply an explicit session, the JNI open
+/// path constructs a per-call session that shares this registry. Sharing the
+/// registry across calls allows the registry's per-key single-flight to
+/// coalesce concurrent cold builds for the same URI, and lets long-lived
+/// `ObjectStore` strong references be reused across opens — both of which
+/// turn what would otherwise be a thundering herd into a cheap weak-Arc
+/// upgrade.
+///
+/// # Why the registry is shared but the `Session` is not
+///
+/// The JNI default-open path is intentionally asymmetric: the
+/// `ObjectStoreRegistry` is process-global, but each open builds a fresh
+/// `Session` (which owns the metadata/index caches). This shape is chosen
+/// because the two layers cache fundamentally different things:
+///
+/// - **Registry → `Arc<ObjectStore>`**: an HTTP/S3 client, credential chain,
+///   and connection pool. Building one is the *expensive* operation
+///   (credential probe, IMDS round-trip, TLS handshake) — so this is what
+///   the 144-concurrent-open regression was made of, and what the global
+///   registry exists to coalesce.
+///
+///   The cache key is derived from the provider-specific store prefix
+///   (typically scheme + authority — e.g. `s3://bucket` — but providers
+///   such as Hugging Face fold `repo_id` in instead) plus the relevant
+///   fields of `ObjectStoreParams` (block size, dynamic
+///   `storage_options_accessor`'s `provider_id()`, etc.). It does **not**
+///   incorporate auth headers, STS tokens, namespace identity, or any
+///   bearer credentials.
+///
+///   A `provider_id()` cannot be assumed to carry principal identity, so
+///   provider-backed default opens do not use this registry at all: they get
+///   a per-call one. `StorageOptionsAccessor::accessor_id()` returns just the
+///   `provider_id()` when a provider is present, and a namespace provider
+///   derives that from the namespace id plus table id while a REST namespace
+///   id holds only the endpoint and delimiter, so two principals opening the
+///   same table would otherwise share one entry and the second would receive
+///   the first's credential-bearing store. Static `storage_options` are safe
+///   to key on: with no provider, `accessor_id()` hashes the option values
+///   themselves. See `blocking_dataset::select_default_open_registry`.
+///
+///   Bare-URI opens (empty `storage_options`, no provider, no namespace
+///   commit-handler) collapse onto a single cache entry per URI: the first
+///   caller's resolved default-credential chain becomes the credentials
+///   used by every subsequent caller for the lifetime of that
+///   `Arc<ObjectStore>`. Callers who need cross-tenant isolation under
+///   bare URIs MUST opt out via
+///   `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING=1`; the resolved bool is
+///   consulted on every default-open path.
+///
+/// - **Session → metadata/index caches**: query-shaped, sized by
+///   `index_cache_size_bytes` and `metadata_cache_size_bytes` from each
+///   open's `ReadParams`. Sharing a Session across opens would force every
+///   caller to pick the same cache size, would make eviction policy a
+///   cross-tenant policy decision, and would let one tenant's hot dataset
+///   evict another's. None of those are problems we want to take on inside
+///   the JNI bridge — Java callers that want metadata-cache reuse can build
+///   their own [`lance::session::Session`] and pass it in explicitly via
+///   `BlockingDataset::open` with `session: Some(...)`.
+///
+/// # Lifetime
+///
+/// This static lives for the lifetime of the process. JVM unload (e.g. via
+/// `System.exit`) on most platforms exits the host process, so the
+/// registry is dropped along with it; the JNI library is not designed to
+/// be unloaded and re-loaded within a single process. Embedders that
+/// genuinely need per-JVM isolation — multiple JVMs in one address space
+/// or hot-reload of the Lance native library — should construct their own
+/// `Session` per JVM and pass it explicitly via
+/// `BlockingDataset::open(..., session: Some(...))`, bypassing this
+/// static entirely.
+pub(crate) static GLOBAL_OBJECT_STORE_REGISTRY: LazyLock<
+    Arc<lance_io::object_store::ObjectStoreRegistry>,
+> = LazyLock::new(|| Arc::new(lance_io::object_store::ObjectStoreRegistry::default()));
+
 fn set_timestamp_precision(builder: &mut env_logger::Builder) {
     if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
         match timestamp_precision.as_str() {
