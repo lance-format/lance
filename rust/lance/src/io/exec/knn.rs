@@ -2475,7 +2475,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via [`build_dataset_prefilter`],
+/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
@@ -2530,6 +2530,32 @@ impl ANNIvfBatchExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Returns a reference to the vector query. Its `key` holds all
+    /// [`Self::query_count`] vectors concatenated.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Returns the number of query vectors packed into [`Self::query`].
+    pub fn query_count(&self) -> usize {
+        self.query_count
+    }
+
+    /// Returns a reference to the dataset.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Returns a reference to the index metadata.
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
     }
 }
 

@@ -573,9 +573,9 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        // A Delete only changes deletion files. Keep the current
-                        // fragment so a rebase cannot undo a concurrent Project
-                        // that pruned data files from the staged post-image.
+                        // The post-image was built at the transaction's read
+                        // version. Only its deletion file is new; retain all
+                        // other state from the current fragment when rebasing.
                         f.deletion_file = updated.deletion_file.clone();
                     }
                 });
@@ -1612,7 +1612,9 @@ mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
-    use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+    use crate::format::{
+        DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+    };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
         default_build_config, last_updated_at_versions, make_stable_row_id_manifest,
@@ -1811,29 +1813,39 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_build_manifest_updates_deletion_file_and_removes_fragments() {
+    fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
         let mut manifest = sample_manifest_with_fragments(0..5);
+        manifest.version = 2;
         let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
-        Arc::make_mut(&mut manifest.fragments)[2].files = vec![projected_file.clone()];
+        let current_fragment = &mut Arc::make_mut(&mut manifest.fragments)[2];
+        current_fragment.files = vec![projected_file.clone()];
+        current_fragment.physical_rows = Some(42);
+        current_fragment.overlays = vec![overlay_with_field(0, 2)];
+        current_fragment.last_updated_at_version_meta = Some(
+            RowDatasetVersionMeta::from_sequence(
+                &RowDatasetVersionSequence::from_uniform_row_count(42, 2),
+            )
+            .unwrap(),
+        );
 
         // Model a delete staged before a projection removed field 1's file.
-        let mut updated2 = manifest.fragments[2].clone();
-        updated2.files.push(DataFile::new_legacy_from_fields(
-            "dropped.lance",
-            vec![1],
-            None,
-        ));
-        let deletion_file = crate::format::DeletionFile {
-            read_version: manifest.version,
-            id: 0,
-            file_type: crate::format::DeletionFileType::Array,
+        let mut updated2 = Fragment::new(2);
+        updated2.physical_rows = Some(42);
+        updated2.files = vec![
+            projected_file.clone(),
+            DataFile::new_legacy_from_fields("dropped.lance", vec![1], None),
+        ];
+        let deletion_file = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
 
         let transaction = Transaction::new(
-            manifest.version,
+            1,
             Operation::Delete {
                 updated_fragments: vec![updated2],
                 deleted_fragment_ids: vec![1, 3],
@@ -1855,7 +1867,11 @@ mod tests {
             .unwrap();
         assert_eq!(fragment2.files, vec![projected_file]);
         assert_eq!(fragment2.deletion_file, Some(deletion_file));
+        assert_eq!(fragment2.overlays.len(), 1);
+        assert_eq!(fragment2.overlays[0].committed_version, 2);
+        assert_eq!(fragment2.physical_rows, Some(42));
         assert_eq!(new_manifest.max_field_id(), 0);
+        assert_eq!(last_updated_at_versions(&new_manifest, 2), vec![2; 42]);
     }
 
     #[test]

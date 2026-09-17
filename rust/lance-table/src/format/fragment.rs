@@ -733,7 +733,7 @@ impl From<&Fragment> for pb::DataFragment {
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
             RowIdMeta::Inline(data) => {
-                pb::data_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.bytes().clone())
             }
             RowIdMeta::External(file) => {
                 pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
