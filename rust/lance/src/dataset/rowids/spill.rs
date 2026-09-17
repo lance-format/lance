@@ -413,11 +413,17 @@ async fn read_spilled_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
+    use crate::dataset::{WriteMode, WriteParams};
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Field;
+    use chrono::Utc;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
+    use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
 
     /// A sequence with no runs to exploit, which is what a globally shuffled
     /// table produces and what forces the spill path.
@@ -608,5 +614,210 @@ mod tests {
             ])
             .await
             .unwrap();
+    }
+    /// A stable-row-id dataset built from `chunks` separate appends, so
+    /// compacting it has several sequences to concatenate.
+    async fn appended_dataset(uri: &str, chunks: i32, rows_per_chunk: i32) -> Dataset {
+        let schema = test_schema();
+        let mut dataset: Option<Dataset> = None;
+        for chunk in 0..chunks {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    (chunk * rows_per_chunk)..((chunk + 1) * rows_per_chunk),
+                ))],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            dataset = Some(
+                Dataset::write(
+                    reader,
+                    uri,
+                    Some(WriteParams {
+                        enable_stable_row_ids: true,
+                        mode: if chunk == 0 {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        dataset.unwrap()
+    }
+
+    fn one_fragment() -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        }
+    }
+
+    /// The lineage columns of every row, in scan order.
+    async fn collect_lineage(dataset: &Dataset) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[ROW_ID, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        (
+            column(ROW_ID),
+            column(ROW_CREATED_AT_VERSION),
+            column(ROW_LAST_UPDATED_AT_VERSION),
+        )
+    }
+
+    #[tokio::test]
+    async fn compaction_spills_and_reads_back_row_lineage() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        // Four appends at four versions, so the compacted created-at sequence
+        // has four runs rather than one.
+        let before = collect_lineage(&dataset).await;
+        assert_eq!(
+            before
+                .1
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let metadata = fragments[0].metadata();
+        assert!(
+            matches!(metadata.row_id_meta, Some(RowIdMeta::Column))
+                && matches!(
+                    metadata.created_at_version_meta,
+                    Some(RowDatasetVersionMeta::Column)
+                )
+                && matches!(
+                    metadata.last_updated_at_version_meta,
+                    Some(RowDatasetVersionMeta::Column)
+                ),
+            "compaction must spill every sequence under a zero inline budget, got {metadata:?}"
+        );
+        // The three sequences share one lineage file, listed after the user
+        // data file among the fragment's files and found by field id.
+        assert_eq!(metadata.files.len(), 2);
+        let lineage_file = &metadata.files[1];
+        assert_eq!(
+            lineage_file.fields.as_ref(),
+            [
+                ROW_ID_FIELD_ID,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+            ]
+        );
+        for field_id in lineage_file.fields.iter() {
+            assert_eq!(
+                metadata.row_lineage_file(*field_id).unwrap(),
+                Some(lineage_file)
+            );
+        }
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            0,
+            "a spilled sequence must set the reader feature flag"
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            0,
+            "a spilled sequence must set the writer feature flag"
+        );
+
+        // The lineage survives the rewrite and is still served through the
+        // ordinary scan path, now from the data file columns.
+        assert_eq!(collect_lineage(&dataset).await, before);
+        // `validate_stable_row_ids` reads every fragment's sequences back and
+        // checks them against the fragment length, so this covers the loaders
+        // independently of the scan.
+        dataset.validate().await.unwrap();
+
+        // Re-opened cold, so nothing is served from this process's caches.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(collect_lineage(&reopened).await, before);
+        let fragment = &reopened.get_fragments()[0];
+        let row_ids = load_row_id_sequence(&reopened, fragment.metadata())
+            .await
+            .unwrap();
+        assert_eq!(row_ids.iter().collect::<Vec<_>>(), before.0);
+        let created_at =
+            load_row_version_sequence(&reopened, fragment.metadata(), RowVersionKind::CreatedAt)
+                .await
+                .unwrap()
+                .expect("a compacted fragment carries created-at versions");
+        assert_eq!(versions_of(&created_at), before.1);
+    }
+
+    /// Cleanup decides what to delete by walking
+    /// [`Fragment::referenced_lance_files`], so a spilled sequence has to be
+    /// reachable from there. If it were not, an ordinary cleanup would delete a
+    /// live file and leave the fragment claiming row ids it can no longer read.
+    #[tokio::test]
+    async fn cleanup_keeps_a_live_spilled_file() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        let before = collect_lineage(&dataset).await;
+
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+
+        let spilled = dataset.get_fragments()[0]
+            .metadata()
+            .row_lineage_file(ROW_ID_FIELD_ID)
+            .unwrap()
+            .expect("compaction must spill under a zero inline budget")
+            .path
+            .clone();
+        let on_disk = std::path::Path::new(uri).join("data").join(&spilled);
+        assert!(on_disk.exists(), "no spilled file written at {on_disk:?}");
+
+        // Everything written so far is older than this instant, so the
+        // pre-compaction versions and their data files are all candidates.
+        let removed = cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(Utc::now())
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            removed.old_versions > 0,
+            "expected the pre-compaction versions to be cleaned up"
+        );
+        assert!(
+            on_disk.exists(),
+            "cleanup deleted the live spilled row lineage file at {on_disk:?}"
+        );
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(collect_lineage(&reopened).await, before);
     }
 }
