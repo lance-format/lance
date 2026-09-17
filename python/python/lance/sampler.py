@@ -452,12 +452,23 @@ class ShardedBatchSampler(Sampler):
             filter=filter,
             scan_in_order=True,
         ).to_batches():
-            batch = batch.slice(rows_to_skip, batch.num_rows - rows_to_skip)
-            # Take every Nth row
-            indices = list(range(0, batch.num_rows, self._world_size))
-            rows_to_skip = (
-                self._world_size - (batch.num_rows % self._world_size)
-            ) % self._world_size
+            # Take this rank's rows by their global round-robin position. The
+            # scan is in order, so concatenating every batch reproduces the full
+            # filtered row sequence; this rank owns positions rank, rank + N,
+            # rank + 2N, ... (N = world size). `rows_to_skip` is the offset of
+            # this rank's next row within the current batch.
+            indices = list(range(rows_to_skip, batch.num_rows, self._world_size))
+            # Carry the offset into the next batch from the *full* batch length,
+            # not a sliced view. A filtered scan can split matches across many
+            # small batches/fragments, and computing the carry from a truncated
+            # batch would desync the round-robin and mis-assign rows.
+            rows_to_skip = (rows_to_skip - batch.num_rows) % self._world_size
+            # This rank may own no row in this batch (sparse matches with
+            # world_size > 1). Skip it: batch.take([]) infers a null-typed index
+            # array and PyArrow has no array_take(int64, null) kernel, so an empty
+            # take raises instead of yielding nothing.
+            if not indices:
+                continue
             batch = batch.take(indices)
 
             # Add to our collection
@@ -481,10 +492,16 @@ class ShardedBatchSampler(Sampler):
                     accumulated_batches.append(big_batch)
         # deliver any batches left over, they will be <= batch
         # size but that is ok because we are done
-        last_batch = (
-            pa.Table.from_batches(accumulated_batches).combine_chunks().to_batches()[0]
-        )
-        yield last_batch
+        # A filter matching zero rows (or a rank that receives no rows after
+        # round-robin) must yield an empty stream, not crash. The unfiltered
+        # _sample_all path already handles emptiness; this mirrors that contract.
+        if accumulated_batches:
+            last_batch = (
+                pa.Table.from_batches(accumulated_batches)
+                .combine_chunks()
+                .to_batches()[0]
+            )
+            yield last_batch
 
     def _sample_filtered(
         self,
