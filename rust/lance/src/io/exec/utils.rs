@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, Time,
@@ -33,6 +34,7 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::future::{BoxFuture, Shared};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use lance_arrow::DataTypeExt as _;
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
@@ -1008,14 +1010,87 @@ impl MetricsCollector for IndexMetrics {
     }
 }
 
+/// Minimum estimated row width, matching DataFusion's default collect thresholds:
+/// 1 MiB / 128 Ki rows = 8 bytes per row. DataFusion uses the byte threshold instead
+/// of the row threshold whenever a byte estimate is available. This floor keeps
+/// narrow schemas from admitting more rows than the default row threshold allows.
+///
+/// Custom threshold ratios can break that agreement. This is a planning estimate,
+/// not a bound on runtime memory, which also includes allocation and join overhead.
+const MIN_BYTES_PER_ROW: f64 = 8.0;
+
+/// Estimated value and validity bytes per row for fixed-width fields and their
+/// nested children. Variable-width fields return `None`: their schema cannot
+/// determine the payload size, and underestimates can change the join build side.
+/// Returning no estimate preserves DataFusion's fallback to row counts.
+fn arrow_bytes_per_row(field: &arrow_schema::Field) -> Option<f64> {
+    // A `NullArray` is a row count and nothing else: no values buffer and no
+    // validity bitmap whatever the field's nullability says, so it returns ahead
+    // of the validity term below.
+    if matches!(field.data_type(), DataType::Null) {
+        return Some(0.0);
+    }
+    // Estimate one validity bit per nullable value, including nested children.
+    // Arrays with no nulls can omit the bitmap, so this can overestimate validity
+    // storage; it does not include bitmap padding or spare capacity.
+    let validity = if field.is_nullable() { 1.0 / 8.0 } else { 0.0 };
+    let data = match field.data_type() {
+        DataType::Boolean => 1.0 / 8.0,
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| arrow_bytes_per_row(field))
+            .sum::<Option<f64>>()?,
+        // Fixed-size lists store child values without an offset buffer.
+        DataType::FixedSizeList(child, dim) => *dim as f64 * arrow_bytes_per_row(child)?,
+        other => other.byte_width_opt()? as f64,
+    };
+    Some(validity + data)
+}
+
+/// Estimated Arrow bytes per row, floored at [`MIN_BYTES_PER_ROW`].
+///
+/// Returns `None` if any field has an unknown width or the schema has no buffers
+/// to size. A partial estimate could understate the output width. Callers cache
+/// this schema-only estimate when constructing an execution node.
+pub(crate) fn estimated_bytes_per_row(schema: &arrow_schema::Schema) -> Option<f64> {
+    let bytes_per_row: f64 = schema
+        .fields()
+        .iter()
+        .map(|field| arrow_bytes_per_row(field))
+        .sum::<Option<f64>>()?;
+    if bytes_per_row <= 0.0 {
+        return None;
+    }
+    Some(bytes_per_row.max(MIN_BYTES_PER_ROW))
+}
+
+/// A row count scaled by a width from [`estimated_bytes_per_row`], always inexact.
+///
+/// `Absent` in, `Absent` out: a size derived from a row count we do not have would
+/// be an invention rather than an estimate, and so would one derived from a width
+/// that does not describe the rows.
+pub(crate) fn estimated_total_byte_size(
+    num_rows: Precision<usize>,
+    bytes_per_row: Option<f64>,
+) -> Precision<usize> {
+    let (Some(rows), Some(bytes_per_row)) = (num_rows.get_value(), bytes_per_row) else {
+        return Precision::Absent;
+    };
+    // A float-to-int cast saturates at `usize::MAX` rather than wrapping, so a
+    // huge row count degrades to an enormous estimate instead of a tiny one.
+    Precision::Inexact((*rows as f64 * bytes_per_row).ceil() as usize)
+}
+
 #[cfg(test)]
 mod tests {
 
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
-    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use arrow_schema::{DataType, Field, Fields, Schema, SortOptions};
     use datafusion::common::NullEquality;
+    use datafusion::common::stats::Precision;
+    use datafusion::config::ConfigOptions;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{
@@ -1560,5 +1635,165 @@ mod tests {
                 "partition {partition}: MarkerError not found in source chain: {err}"
             );
         }
+    }
+
+    #[rstest]
+    // The estimate is inexact whatever the row count's precision.
+    #[case::exact_row_count(Precision::Exact(10), Some(72.0), Precision::Inexact(720))]
+    #[case::inexact_row_count(Precision::Inexact(10), Some(72.0), Precision::Inexact(720))]
+    // No row count means no size: scaling a number we do not have would be an
+    // invention rather than an estimate.
+    #[case::no_row_count(Precision::Absent, Some(72.0), Precision::Absent)]
+    // No width means no size either, however many rows there are.
+    #[case::no_width(Precision::Exact(1_000_000_000), None, Precision::Absent)]
+    fn estimated_byte_size_needs_both_a_row_count_and_a_width(
+        #[case] num_rows: Precision<usize>,
+        #[case] bytes_per_row: Option<f64>,
+        #[case] expected: Precision<usize>,
+    ) {
+        assert_eq!(
+            super::estimated_total_byte_size(num_rows, bytes_per_row),
+            expected
+        );
+    }
+
+    #[test]
+    fn row_width_requires_a_nonempty_fully_sizeable_schema() {
+        let mut fields = vec![
+            Arc::new(Field::new("a", DataType::UInt32, false)),
+            Arc::new(Field::new("b", DataType::Float64, false)),
+        ];
+        assert_eq!(
+            super::estimated_bytes_per_row(&Schema::new(fields.clone())),
+            Some(12.0)
+        );
+
+        // Empty and null-only schemas have no value or validity buffers.
+        assert_eq!(super::estimated_bytes_per_row(&Schema::empty()), None);
+        assert_eq!(
+            super::estimated_bytes_per_row(&Schema::new(vec![Field::new(
+                "null",
+                DataType::Null,
+                true
+            )])),
+            None
+        );
+
+        // Neither does one that is only partly measurable.
+        fields.push(Arc::new(Field::new("note", DataType::Utf8, true)));
+        assert_eq!(super::estimated_bytes_per_row(&Schema::new(fields)), None);
+    }
+
+    /// The width model: the values plus the validity around them, for the types a
+    /// schema actually fixes -- and nothing at all for the types it does not.
+    #[rstest]
+    #[case::fixed_width(Field::new("a", DataType::Int64, false), Some(8.0))]
+    // A nullable field pays one validity bit a row.
+    #[case::fixed_width_nullable(Field::new("a", DataType::Int64, true), Some(8.125))]
+    // Boolean values are a bit a row as well, so validity doubles the column.
+    #[case::boolean_nullable(Field::new("a", DataType::Boolean, true), Some(0.25))]
+    #[case::fixed_size_binary(Field::new("a", DataType::FixedSizeBinary(12), false), Some(12.0))]
+    // Children pay their own validity once per value, not once per row: a 4-dim
+    // vector of nullable floats carries four bits a row.
+    #[case::fixed_size_list(
+        Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ),
+        Some(16.5)
+    )]
+    #[case::nested_struct(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Float32, false),
+            ])),
+            false,
+        ),
+        Some(12.125)
+    )]
+    #[case::null(Field::new("a", DataType::Null, true), Some(0.0))]
+    // Below: everything whose per-row cost the schema is silent about. The decoder
+    // answers each of these with a seed for its own feedback loop; a planner has
+    // no loop to correct it, so it reports nothing instead.
+    #[case::utf8(Field::new("a", DataType::Utf8, false), None)]
+    #[case::large_binary(Field::new("a", DataType::LargeBinary, false), None)]
+    #[case::utf8_view(Field::new("a", DataType::Utf8View, false), None)]
+    #[case::list(
+        Field::new(
+            "a",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+        None
+    )]
+    // The key width is fixed but the shared values buffer is not, and the schema
+    // does not say how many distinct values a batch holds.
+    #[case::dictionary(
+        Field::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        None
+    )]
+    // A struct is only as sizeable as its least sizeable child.
+    #[case::struct_with_a_string(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("y", DataType::Utf8, false),
+            ])),
+            false,
+        ),
+        None
+    )]
+    fn width_counts_only_what_the_schema_determines(
+        #[case] field: Field,
+        #[case] expected: Option<f64>,
+    ) {
+        assert_eq!(super::arrow_bytes_per_row(&field), expected);
+    }
+
+    /// With DataFusion's default thresholds, the floored estimate rejects
+    /// collection at the same row count as the row guard.
+    #[test]
+    fn a_narrow_row_is_floored_to_the_row_guard() {
+        // Read DataFusion's guards rather than copy them. The floor is derived from
+        // both, so an upgrade that moves either default has to fail here instead of
+        // leaving behind a floor that no longer reproduces the row cap.
+        let optimizer = ConfigOptions::default().optimizer;
+        let collect_bytes = optimizer.hash_join_single_partition_threshold;
+        let collect_rows = optimizer.hash_join_single_partition_threshold_rows;
+        assert_eq!(
+            super::MIN_BYTES_PER_ROW,
+            collect_bytes as f64 / collect_rows as f64,
+            "the floor is the byte guard spread across the row guard"
+        );
+
+        // A quarter byte a row: a bit of value and a bit of validity. Unfloored,
+        // four million rows of this would still pass for less than 1 MiB.
+        let narrow = Schema::new(vec![Field::new("flag", DataType::Boolean, true)]);
+
+        let width = super::estimated_bytes_per_row(&narrow);
+        assert_eq!(width, Some(super::MIN_BYTES_PER_ROW), "the floor applies");
+
+        let under = super::estimated_total_byte_size(Precision::Exact(collect_rows - 1), width);
+        assert!(
+            under
+                .get_value()
+                .is_some_and(|bytes| *bytes < collect_bytes),
+            "a row short of the row guard has to stay under the byte guard: {under:?}"
+        );
+
+        let over = super::estimated_total_byte_size(Precision::Exact(collect_rows), width);
+        assert!(
+            over.get_value()
+                .is_some_and(|bytes| *bytes >= collect_bytes),
+            "the row count the row guard rejects has to fail the byte guard too: {over:?}"
+        );
     }
 }

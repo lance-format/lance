@@ -217,6 +217,14 @@ async fn fr_options_from_proto(
     // Filters — require filter_schema_ipc when filters are present
     let has_filters =
         proto.refine_filter_substrait.is_some() || proto.full_filter_substrait.is_some();
+    // The same pairing `FilteredReadOptions::with_filter` rejects. The two fields
+    // are assigned independently below, so without this a wire message carrying a
+    // refine filter alone would build options that setter would have refused.
+    if proto.refine_filter_substrait.is_some() && proto.full_filter_substrait.is_none() {
+        return Err(Error::invalid_input_source(
+            "refine_filter is set but full_filter is not".into(),
+        ));
+    }
     if has_filters {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
@@ -721,6 +729,35 @@ mod tests {
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
         assert!(back.projection.with_row_id);
+    }
+
+    /// Proto decoding must enforce the same filter pairing as `with_filter`.
+    #[tokio::test]
+    async fn test_options_from_proto_reject_refine_without_full_filter() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap();
+        let mut options = FilteredReadOptions::new(projection);
+        options.full_filter = Some(datafusion_expr::col("x").gt(datafusion_expr::lit(5i32)));
+        options.refine_filter = Some(datafusion_expr::col("x").lt(datafusion_expr::lit(100i32)));
+
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        proto.full_filter_substrait = None;
+
+        let err = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .expect_err("a refine filter without a full filter is not a readable plan");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("refine_filter"),
+            "the error should name the field, got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -44,7 +44,9 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::{IoMetrics, buffered_fragment_opens};
+use super::utils::{
+    IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
+};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -633,6 +635,9 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
+    /// Estimated once here: it depends only on the output schema, and
+    /// `partition_statistics` is called repeatedly by the optimizer.
+    bytes_per_row: Option<f64>,
     properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
@@ -708,6 +713,7 @@ impl LanceScanExec {
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref());
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -721,6 +727,7 @@ impl LanceScanExec {
             range,
             projection,
             output_schema,
+            bytes_per_row,
             properties,
             config,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -809,13 +816,25 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        // `with_make_deletions_null` keeps a row for every deleted row too -- its row
+        // id comes back null and callers use that as a selection vector -- so the node
+        // produces the fragment's physical rows rather than the live ones `num_rows`
+        // reports. `FilteredReadExec` draws the same distinction for its own
+        // `with_deleted_rows`.
+        let rows_produced = |fragment: &Fragment| {
+            if self.config.with_make_deletions_null {
+                fragment.physical_rows
+            } else {
+                fragment.num_rows()
+            }
+        };
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
                 .iter()
                 .fold(
                     (0, true),
-                    |(row_count, is_exact), fragment| match fragment.num_rows() {
+                    |(row_count, is_exact), fragment| match rows_produced(fragment) {
                         Some(num_rows) => (row_count + num_rows, is_exact),
                         None => (row_count, false),
                     },
@@ -830,22 +849,33 @@ impl ExecutionPlan for LanceScanExec {
             ConcreteFileVersion::V1
         );
 
-        let num_rows = match is_exact {
-            true => Precision::Exact(match self.range.as_ref().filter(|_| honors_range) {
-                // The range slices the fragments concatenated end to end, so the scan
-                // emits the part of it overlapping rows that exist. A range reaching
-                // past the last row yields the rows up to it, not its full width.
-                Some(range) => {
-                    let end = range.end.min(row_count as u64);
-                    end.saturating_sub(range.start) as usize
-                }
-                None => row_count,
-            }),
-            false => Precision::Absent,
+        // Keeping deleted rows counts the fragment's physical rows, but the v2
+        // stream slices a range against live ones, so the two disagree about which
+        // rows a range spans. An `Exact` count is what `AggregateStatistics` folds
+        // `COUNT(*)` to, so the pairing reports an estimate instead.
+        let counts_a_different_row_space =
+            self.config.with_make_deletions_null && self.range.is_some() && honors_range;
+        // The range slices the fragments concatenated end to end, so the scan emits
+        // the part of it overlapping rows that exist. A range reaching past the last
+        // row yields the rows up to it, not its full width.
+        let rows_in_range = match self.range.as_ref().filter(|_| honors_range) {
+            Some(range) => {
+                let end = range.end.min(row_count as u64);
+                end.saturating_sub(range.start) as usize
+            }
+            None => row_count,
+        };
+        let num_rows = match (is_exact, counts_a_different_row_space) {
+            // A fragment without row-count metadata leaves the fold short, so there
+            // is no count to report at all -- estimate or otherwise.
+            (false, _) => Precision::Absent,
+            (true, false) => Precision::Exact(rows_in_range),
+            (true, true) => Precision::Inexact(rows_in_range),
         };
 
         Ok(Arc::new(Statistics {
             num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -980,6 +1010,201 @@ mod tests {
         let stats = scan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
+    }
+
+    // 4 bytes for the nullable int32 and a validity bit, 16 for the 4-dim vector
+    // plus a bit for it and one per float: 20.75 bytes a row.
+    const ALL_ROWS_BYTES: usize = 8300;
+    const TEN_ROWS_BYTES: usize = 208;
+
+    /// Statistics must match the rows emitted: v2 applies the range internally,
+    /// while v1 leaves limiting to a parent execution node.
+    #[rstest]
+    #[case::v2_ranged(LanceFileVersion::Stable, Some(0..10), 10, TEN_ROWS_BYTES)]
+    // A v1 scan does not apply the range -- `LanceStream::try_new_v1` ignores the
+    // offsets it is handed and a `GlobalLimitExec` above does the limiting -- so its
+    // unclamped count is correct and must stay that way.
+    #[case::v1_range_is_not_applied(LanceFileVersion::Legacy, Some(0..10), 400, ALL_ROWS_BYTES)]
+    #[tokio::test]
+    async fn test_partition_statistics_follow_a_v2_scan_range(
+        #[case] version: LanceFileVersion,
+        #[case] range: Option<Range<u64>>,
+        #[case] expected_rows: usize,
+        #[case] expected_bytes: usize,
+    ) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::{Dimension, array};
+
+        use crate::dataset::WriteParams;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "v",
+                array::rand_vec::<arrow_array::types::Float32Type>(Dimension::from(4)),
+            )
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    data_storage_version: Some(version),
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            range,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+
+        let stats = exec.partition_statistics(None).unwrap();
+        let emitted = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_fold(0, |rows, batch| async move { Ok(rows + batch.num_rows()) })
+            .await
+            .unwrap();
+        assert_eq!(emitted, expected_rows);
+        assert_eq!(stats.num_rows, Precision::Exact(emitted));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(expected_bytes));
+    }
+
+    /// Keeping deleted rows means emitting them, so the statistics have to count
+    /// the fragment's physical rows. `num_rows` reports the live ones, which
+    /// understates both the count and the byte size scaled from it -- and an
+    /// `Exact` count that is wrong is what `AggregateStatistics` folds `COUNT(*)`
+    /// to.
+    #[rstest]
+    #[case::deletions_dropped(false, 60)]
+    #[case::deletions_kept_as_null(true, 100)]
+    #[tokio::test]
+    async fn test_partition_statistics_count_the_rows_a_scan_emits(
+        #[case] with_make_deletions_null: bool,
+        #[case] expected_rows: usize,
+    ) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        dataset.delete("x < 40").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig {
+                with_row_id: true,
+                with_make_deletions_null,
+                ..Default::default()
+            },
+        );
+
+        let stats = exec.partition_statistics(None).unwrap();
+        let stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let emitted: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+        assert_eq!(
+            emitted, expected_rows,
+            "fixture no longer emits what it claims"
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(emitted));
+        // 4 bytes of int32 and a validity bit, plus 8 of nullable row id and a bit
+        // of its own: 12.25 bytes per row.
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Inexact((expected_rows as f64 * 12.25).ceil() as usize)
+        );
+    }
+
+    /// Keeping deleted rows counts a fragment's physical rows, while the v2 stream
+    /// slices a range against its live ones. The two disagree about which rows a
+    /// range spans, so the count must not be `Exact`: DataFusion folds an exact
+    /// count straight into `COUNT(*)`.
+    #[tokio::test]
+    async fn test_deleted_rows_with_a_range_do_not_promise_an_exact_count() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        dataset.delete("x < 40").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let ranged = |with_make_deletions_null| {
+            LanceScanExec::new(
+                dataset.clone(),
+                dataset.fragments().clone(),
+                Some(0..80),
+                Arc::new(dataset.schema().clone()),
+                LanceScanConfig {
+                    with_make_deletions_null,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Without the pairing the count is a promise, and it holds.
+        let live = ranged(false).partition_statistics(None).unwrap().num_rows;
+        assert_eq!(live, Precision::Exact(60));
+
+        // With it, the range spans a different row space than the count does, so
+        // the reported figure must not be a promise -- and it is not one: the scan
+        // emits a different number of rows than the statistic claims.
+        let kept = ranged(true);
+        let physical = kept.partition_statistics(None).unwrap().num_rows;
+        assert!(
+            matches!(physical, Precision::Inexact(_)),
+            "a count over a different row space must not be exact, got {physical:?}"
+        );
+
+        let emitted: usize = kept
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert_ne!(
+            Precision::Exact(emitted),
+            physical,
+            "the disagreement is the reason this cannot be exact: reported \
+             {physical:?}, emitted {emitted}"
+        );
     }
 
     /// Verify that executing with target_partitions=1 produces the same row count as the
