@@ -556,7 +556,19 @@ impl LsmVectorSearchPlanner {
                 // predicate cannot be translated against pays for this.
                 let k = match above {
                     None => k,
-                    Some(_) => Box::pin(dataset.count_rows(None)).await?.max(1),
+                    Some(_) => {
+                        let all = Box::pin(dataset.count_rows(None)).await?.max(1);
+                        // Logged because it is invisible otherwise: the query
+                        // is correct and simply slow, and the cause -- one
+                        // column this generation cannot be asked about under
+                        // its current name -- is not something an operator can
+                        // read off the query. It clears when compaction folds
+                        // the generation into base.
+                        log::warn!(
+                            "mem_wal vector search: ranking all {all} rows of a generation                              because a predicate could not be translated against it;                              requested k was {k}"
+                        );
+                        all
+                    }
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);

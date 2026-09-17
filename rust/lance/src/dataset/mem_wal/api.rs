@@ -13,6 +13,31 @@
 //! maintained over the fresh tier; it covers a row once that row reaches the
 //! base table.
 //!
+//! # No upgrade guarantee across the field-id read
+//!
+//! A generation is read by matching the field ids it stores against the table's.
+//! Generations flushed before that was introduced were written under a schema
+//! with the ids dropped, so they carry ids assigned positionally (`0..n`) rather
+//! than the table's own. Where the two disagree -- any table that had evolved
+//! before its MemWAL was initialized, leaving gaps in its ids -- those
+//! generations are mispaired: a column reads as null, or, if the types happen to
+//! agree, one column's values are served under another's name. No schema change
+//! is needed to reach it, and nothing in a generation says which scheme numbered
+//! it. Durable WAL entries are unaffected; they carry no ids, so they take the
+//! name-matching path.
+//!
+//! MemWAL carries no upgrade guarantee: a deployment predating this read must
+//! compact its generations into base before upgrading, and this is a statement
+//! of that requirement rather than a mechanism enforcing it. Closing it properly
+//! means marking generations written under the current scheme and name-matching
+//! the ones without the mark.
+//!
+//! A rename reaches the sealed generations and the replay, but not the active
+//! MemTable: it is created from the schema its writer holds, so it keeps
+//! serving under the names it was created with until the writer reopens. A
+//! reader planning against a schema a MemTable was not created from is outside
+//! the contract.
+//!
 //! An index the set names but the dataset no longer has -- dropped, replaced, or
 //! carried away with the column it covered -- is skipped when a shard opens, so
 //! the table keeps serving without the fresh tier's copy of it. Naming one that
@@ -758,7 +783,7 @@ async fn build_index_configs(
         // An index the maintained set names and the dataset does not have:
         // dropped outright, or carried away with the column it covered. Serve
         // without it -- the base index is gone for everyone, so the fresh tier
-        // has nothing to keep in step with. See `MissingIndex::Skip`.
+        // has nothing to keep in step with. See `OnMissingIndex::Skip`.
         let Some(index_meta) = index_meta else {
             if on_missing == OnMissingIndex::Reject {
                 return Err(Error::invalid_input(format!(

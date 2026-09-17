@@ -201,7 +201,7 @@ impl Plan {
         let sources = target
             .fields()
             .iter()
-            .map(|field| resolve_field(field, source.fields(), &claimed, pk_columns))
+            .map(|field| resolve_field(field, source.fields(), &claimed, pk_columns, true))
             .collect::<Result<Vec<_>>>()?;
         let identity = source.fields() == target.fields();
         Ok(Self {
@@ -245,6 +245,11 @@ fn resolve_field(
     source_fields: &arrow_schema::Fields,
     claimed: &[bool],
     pk_columns: &[String],
+    // `_tombstone` is a column of the batch, not a name that means anything
+    // inside one. A struct child may legitimately be called that, and at depth
+    // it is an ordinary field: absent from the source it is null, like any
+    // other. `pk_columns` is emptied at depth for the same reason.
+    top_level: bool,
 ) -> Result<Source> {
     let name = field.name();
     let by_id = field_id_of(field).and_then(|id| {
@@ -275,7 +280,7 @@ fn resolve_field(
     };
 
     let Some(index) = index else {
-        if name == TOMBSTONE {
+        if top_level && name == TOMBSTONE {
             return Ok(Source::Live);
         }
         if pk_columns.iter().any(|c| c == name) {
@@ -358,7 +363,7 @@ fn resolve_children(source: &ArrowField, field: &ArrowField) -> Result<Vec<Sourc
     let claimed = claimed_by_id(&source_children, &target_children);
     target_children
         .iter()
-        .map(|child| resolve_field(child, &source_children, &claimed, &[]))
+        .map(|child| resolve_field(child, &source_children, &claimed, &[], false))
         .collect()
 }
 
@@ -725,6 +730,68 @@ mod relabel_tests {
 
     /// A struct whose parent is null at one row, and whose child is null at
     /// another: both levels of validity have to survive the relabel.
+    /// `_tombstone` names a column of the batch, not a field inside one. A
+    /// struct child may legitimately carry that name, and at depth it is an
+    /// ordinary field: absent from the source it is null like any other, not
+    /// the live-row marker. Treating it as the marker also fails outright when
+    /// the child is not Boolean.
+    #[test]
+    fn a_struct_child_named_like_the_tombstone_is_an_ordinary_field() {
+        let kept = stamped("kept", DataType::Int64, 2);
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped(
+                "info",
+                DataType::Struct(Fields::from(vec![kept.clone()])),
+                1,
+            ),
+        ]);
+        // The table declares a child with the tombstone's name that the
+        // generation never stored -- and typed Int64, which the live marker
+        // could not be built as.
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped(
+                "info",
+                DataType::Struct(Fields::from(vec![
+                    kept.clone(),
+                    stamped(TOMBSTONE, DataType::Int64, 3),
+                ])),
+                1,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StructArray::new(
+                    Fields::from(vec![kept]),
+                    vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
+                    None,
+                )),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = Plan::resolve(&source, &target, &["id".to_string()])
+            .expect("a nested field named like the tombstone resolves")
+            .emitting_plain_schema()
+            .apply(&batch)
+            .expect("and applies");
+        let info = out
+            .column_by_name("info")
+            .expect("info")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a struct");
+        assert!(
+            info.column_by_name(TOMBSTONE)
+                .expect("the child")
+                .is_null(0),
+            "a child the generation never stored is null, whatever it is called"
+        );
+    }
+
     #[test]
     fn a_null_parent_and_a_null_child_both_survive() {
         let child = stamped("b", DataType::Int64, 3);
