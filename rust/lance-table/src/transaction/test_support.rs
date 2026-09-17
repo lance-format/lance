@@ -30,6 +30,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
         storage_format: None,
         disable_transaction_file: false,
         migration_next_row_id: None,
+        spilled_row_lineage: Default::default(),
     }
 }
 
