@@ -342,6 +342,103 @@ fn plan_partition_windows(
     Ok(windows)
 }
 
+/// Group a sparse, sorted set of partition IDs into I/O batches.
+///
+/// Unlike [`plan_partition_windows`], this does not fill gaps between selected
+/// IDs. Query nprobes are typically scattered, so the reader issues one
+/// `Ranges` request per group (or one `Range` when the IDs happen to be
+/// adjacent). The byte/partition caps match prewarm so a prepare chunk cannot
+/// pin an unbounded decoded window.
+fn plan_query_load_groups(
+    partition_ids: &[usize],
+    index: PrewarmFileLayout<'_>,
+    storage: PrewarmFileLayout<'_>,
+    target_bytes: u64,
+    max_partitions: usize,
+) -> Result<Vec<Vec<usize>>> {
+    if target_bytes == 0 {
+        return Err(Error::invalid_input(
+            "IVF query load window target must be positive",
+        ));
+    }
+    if max_partitions == 0 {
+        return Err(Error::invalid_input(
+            "IVF query load window partition cap must be positive",
+        ));
+    }
+    if partition_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut window_bytes = 0_u64;
+    for &partition_id in partition_ids {
+        if partition_id >= index.ivf.num_partitions()
+            || partition_id >= storage.ivf.num_partitions()
+        {
+            return Err(Error::index(format!(
+                "partition id {} is out of range of {} index / {} storage partitions",
+                partition_id,
+                index.ivf.num_partitions(),
+                storage.ivf.num_partitions()
+            )));
+        }
+        let partition_bytes = estimate_encoded_bytes(
+            index.encoded_bytes,
+            index.num_rows,
+            index.ivf.partition_size(partition_id),
+        )
+        .checked_add(estimate_encoded_bytes(
+            storage.encoded_bytes,
+            storage.num_rows,
+            storage.ivf.partition_size(partition_id),
+        ))
+        .ok_or_else(|| Error::index("IVF query load partition byte estimate overflowed u64"))?;
+
+        let exceeds_target = !current.is_empty()
+            && window_bytes
+                .checked_add(partition_bytes)
+                .is_none_or(|bytes| bytes > target_bytes);
+        let reached_partition_cap = current.len() >= max_partitions;
+        if exceeds_target || reached_partition_cap {
+            groups.push(std::mem::take(&mut current));
+            window_bytes = 0;
+        }
+        window_bytes = window_bytes
+            .checked_add(partition_bytes)
+            .ok_or_else(|| Error::index("IVF query load window byte estimate overflowed u64"))?;
+        current.push(partition_id);
+        if window_bytes > target_bytes && current.len() == 1 {
+            // A single oversized partition is admitted as a singleton, matching
+            // prewarm window planning.
+            groups.push(std::mem::take(&mut current));
+            window_bytes = 0;
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
+
+/// Row span of `partition_ids` when they form one contiguous on-disk range.
+///
+/// `None` means the IDs are gapped or their IVF row ranges are discontinuous,
+/// so the caller must issue `ReadBatchParams::Ranges` instead of one `Range`.
+fn selected_partition_row_span(ivf: &IvfModel, partition_ids: &[usize]) -> Option<Range<usize>> {
+    let (&first, rest) = partition_ids.split_first()?;
+    let mut prev = first;
+    for &partition_id in rest {
+        if partition_id != prev + 1 || ivf.row_range(prev).end != ivf.row_range(partition_id).start
+        {
+            return None;
+        }
+        prev = partition_id;
+    }
+    Some(ivf.row_range(first).start..ivf.row_range(prev).end)
+}
+
 fn split_window_batches(
     schema: &arrow_schema::SchemaRef,
     partition_lengths: &[usize],
@@ -427,6 +524,24 @@ async fn read_partition_window_batches(
     partitions: Range<usize>,
     io_stats: Option<IoStats>,
 ) -> Result<Vec<Vec<RecordBatch>>> {
+    let partition_ids: Vec<usize> = partitions.collect();
+    read_selected_partition_batches(reader, projection, schema, ivf, &partition_ids, io_stats).await
+}
+
+/// Read the selected partitions in one decoder invocation.
+///
+/// Adjacent IDs with a continuous IVF row layout use a single `Range`. Scattered
+/// nprobes use `Ranges` so the I/O scheduler sees every needed page at once
+/// (page-metadata init and nearby GETs can coalesce) instead of one
+/// `read_stream` per partition.
+async fn read_selected_partition_batches(
+    reader: &FileReader,
+    projection: Option<&ReaderProjection>,
+    schema: &arrow_schema::SchemaRef,
+    ivf: &IvfModel,
+    partitions: &[usize],
+    io_stats: Option<IoStats>,
+) -> Result<Vec<Vec<RecordBatch>>> {
     if partitions.is_empty() {
         return Ok(Vec::new());
     }
@@ -434,28 +549,41 @@ async fn read_partition_window_batches(
         vec![0; partitions.len()]
     } else {
         partitions
-            .clone()
-            .map(|partition_id| ivf.partition_size(partition_id))
+            .iter()
+            .map(|&partition_id| ivf.partition_size(partition_id))
             .collect::<Vec<_>>()
     };
-    let row_start = if reader.num_rows() == 0 {
-        0
+    let params = if reader.num_rows() == 0 || partition_lengths.iter().all(|&length| length == 0) {
+        None
+    } else if let Some(row_range) = selected_partition_row_span(ivf, partitions) {
+        if row_range.start == row_range.end {
+            None
+        } else {
+            Some(ReadBatchParams::Range(row_range))
+        }
     } else {
-        ivf.row_range(partitions.start).start
+        let ranges = partitions
+            .iter()
+            .filter_map(|&partition_id| {
+                let row_range = ivf.row_range(partition_id);
+                if row_range.is_empty() {
+                    None
+                } else {
+                    Some(row_range.start as u64..row_range.end as u64)
+                }
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            None
+        } else {
+            Some(ReadBatchParams::Ranges(ranges.into()))
+        }
     };
-    let row_end = if reader.num_rows() == 0 {
-        0
-    } else {
-        ivf.row_range(partitions.end - 1).end
-    };
-    let batches = if row_start == row_end {
-        Vec::new()
-    } else {
+    let batches = if let Some(params) = params {
         let reader = match &io_stats {
             Some(io_stats) => Cow::Owned(reader.with_io_stats(io_stats.recorder())),
             None => Cow::Borrowed(reader),
         };
-        let params = ReadBatchParams::Range(row_start..row_end);
         let stream = match projection {
             Some(projection) => {
                 reader
@@ -475,6 +603,8 @@ async fn read_partition_window_batches(
             }
         };
         stream.try_collect::<Vec<_>>().await?
+    } else {
+        Vec::new()
     };
     split_window_batches(schema, &partition_lengths, batches)
 }
@@ -484,6 +614,13 @@ async fn read_partition_window_batches(
 /// the window size is the lever.
 fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
     io_parallelism.max(1).min(cpu_parallelism.max(1))
+}
+
+fn flatten_result_vec<T>(result: Result<Vec<T>>) -> impl Stream<Item = Result<T>> {
+    stream::iter(match result {
+        Ok(items) => items.into_iter().map(Ok).collect(),
+        Err(error) => vec![Err(error)],
+    })
 }
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
@@ -1215,6 +1352,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )))
     }
 
+    async fn prepared_from_entry(
+        &self,
+        partition_id: usize,
+        part_entry: Arc<PartitionEntry<S, Q>>,
+        query: Query,
+        pre_filter: Arc<dyn PreFilter>,
+        raw_query_context: Option<Arc<RabitRawQueryContext>>,
+    ) -> Result<PreparedPartitionSearch<S, Q>> {
+        let pre_filter =
+            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
+                .await?;
+        Ok(PreparedPartitionSearch {
+            query,
+            pre_filter,
+            partition_id,
+            partition_centroid: self.ivf.centroid(partition_id),
+            rq_search_cache: self.rq_search_cache.clone(),
+            raw_query_context,
+            part_entry,
+            _in_flight: self.prepared_partitions.track(),
+            _marker: PhantomData,
+        })
+    }
+
     async fn prepare_partition(
         &self,
         partition_id: usize,
@@ -1227,45 +1388,53 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             self.load_partition(partition_id, true, metrics),
             pre_filter.wait_for_ready(),
         )?;
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
-        Ok(PreparedPartitionSearch {
-            query: query.clone(),
-            pre_filter,
+        self.prepared_from_entry(
             partition_id,
-            partition_centroid: self.ivf.centroid(partition_id),
-            rq_search_cache: self.rq_search_cache.clone(),
-            raw_query_context,
             part_entry,
-            _in_flight: self.prepared_partitions.track(),
-            _marker: PhantomData,
-        })
+            query.clone(),
+            pre_filter,
+            raw_query_context,
+        )
+        .await
     }
 
-    async fn prepare_partition_without_prefilter_wait(
+    async fn prepare_partition_chunk(
         &self,
-        partition_id: usize,
-        query: &Query,
+        items: Vec<(usize, Query)>,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
-    ) -> Result<PreparedPartitionSearch<S, Q>> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
-        Ok(PreparedPartitionSearch {
-            query: query.clone(),
-            pre_filter,
-            partition_id,
-            partition_centroid: self.ivf.centroid(partition_id),
-            rq_search_cache: self.rq_search_cache.clone(),
-            raw_query_context,
-            part_entry,
-            _in_flight: self.prepared_partitions.track(),
-            _marker: PhantomData,
-        })
+        wait_prefilter: bool,
+    ) -> Result<Vec<PreparedPartitionSearch<S, Q>>>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let ids = items
+            .iter()
+            .map(|(partition_id, _)| *partition_id)
+            .collect::<Vec<_>>();
+        let load = self.load_partitions(&ids, metrics);
+        let entries = if wait_prefilter {
+            let (entries, ()) = tokio::try_join!(load, pre_filter.wait_for_ready())?;
+            entries
+        } else {
+            load.await?
+        };
+        let mut prepared = Vec::with_capacity(items.len());
+        for ((partition_id, query), part_entry) in items.into_iter().zip(entries) {
+            prepared.push(
+                self.prepared_from_entry(
+                    partition_id,
+                    part_entry,
+                    query,
+                    pre_filter.clone(),
+                    raw_query_context.clone(),
+                )
+                .await?,
+            );
+        }
+        Ok(prepared)
     }
 
     fn run_prepared_partition_search(
@@ -1957,6 +2126,216 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self.storage.load_partition(partition_id, io_stats).await
     }
 
+    fn partition_file_layouts(&self) -> (PrewarmFileLayout<'_>, PrewarmFileLayout<'_>) {
+        (
+            PrewarmFileLayout {
+                ivf: &self.ivf,
+                encoded_bytes: self.reader.metadata().num_data_bytes,
+                num_rows: self.reader.num_rows(),
+            },
+            PrewarmFileLayout {
+                ivf: self.storage.ivf(),
+                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
+                num_rows: self.storage.reader().num_rows(),
+            },
+        )
+    }
+
+    /// Load `partition_ids` in query-sized I/O groups.
+    ///
+    /// Cached partitions are returned immediately. Uncached IDs are sorted and
+    /// grouped by the same encoded-byte / partition caps as prewarm, then each
+    /// group is read in one decoder invocation (a contiguous `Range` or a
+    /// sparse `Ranges` request). Callers must pass a bounded chunk so resident
+    /// partition storage stays within the prepare window.
+    pub(crate) async fn load_partitions(
+        &self,
+        partition_ids: &[usize],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<Arc<PartitionEntry<S, Q>>>>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        if partition_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries: Vec<Option<Arc<PartitionEntry<S, Q>>>> =
+            Vec::with_capacity(partition_ids.len());
+        let mut uncached = Vec::new();
+        for (index, &partition_id) in partition_ids.iter().enumerate() {
+            if partition_id >= self.ivf.num_partitions() {
+                return Err(Error::index(format!(
+                    "partition id {} is out of range of {} partitions",
+                    partition_id,
+                    self.ivf.num_partitions()
+                )));
+            }
+            let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
+            if let Some(entry) = self.index_cache.get_with_key(&cache_key).await {
+                metrics.record_index_cache_hit();
+                entries.push(Some(entry));
+            } else {
+                uncached.push((index, partition_id));
+                entries.push(None);
+            }
+        }
+        if !uncached.is_empty() {
+            let mut unique_ids = uncached
+                .iter()
+                .map(|(_, partition_id)| *partition_id)
+                .collect::<Vec<_>>();
+            unique_ids.sort_unstable();
+            unique_ids.dedup();
+            let cpu_parallelism = get_num_compute_intensive_cpus();
+            let target_bytes = prewarm_window_size_bytes()?;
+            let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+            let (index_layout, storage_layout) = self.partition_file_layouts();
+            let groups = plan_query_load_groups(
+                &unique_ids,
+                index_layout,
+                storage_layout,
+                target_bytes,
+                max_partitions,
+            )?;
+            let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
+            stream::iter(groups)
+                .map(Ok)
+                .try_for_each_concurrent(Some(parallelism), |group| async move {
+                    self.load_uncached_partition_group(&group, metrics).await
+                })
+                .await?;
+        }
+
+        for (slot, partition_id) in uncached {
+            let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
+            let entry = if let Some(entry) = self.index_cache.get_with_key(&cache_key).await {
+                metrics.record_index_cache_miss();
+                entry
+            } else {
+                // Another task raced the leader key or the cache evicted the
+                // just-inserted entry; fall back to the single-partition path.
+                self.load_partition(partition_id, true, metrics).await?
+            };
+            entries[slot] = Some(entry);
+        }
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                entry.ok_or_else(|| Error::internal("IVF query load left a partition slot empty"))
+            })
+            .collect()
+    }
+
+    async fn load_uncached_partition_group(
+        &self,
+        partition_ids: &[usize],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let mut remaining = partition_ids.to_vec();
+        while !remaining.is_empty() {
+            let leader_id = remaining[0];
+            let leader_key = IVFPartitionKey::<S, Q>::new(leader_id);
+            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+                remaining.remove(0);
+                continue;
+            }
+
+            let group = remaining.clone();
+            let (_, was_cached) = self
+                .index_cache
+                .get_or_insert_with_key_hit(leader_key, || async {
+                    for &partition_id in &group {
+                        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+                        metrics.record_part_load();
+                    }
+                    let index_schema = Arc::new(match &self.read_projection {
+                        Some(projection) => projection.schema.as_ref().into(),
+                        None => self.reader.schema().as_ref().into(),
+                    });
+                    let storage_schema = Arc::new(self.storage.reader().schema().as_ref().into());
+                    let io_stats = metrics.io_stats();
+                    let (index_batches, storage_batches) = tokio::try_join!(
+                        read_selected_partition_batches(
+                            &self.reader,
+                            self.read_projection.as_ref(),
+                            &index_schema,
+                            &self.ivf,
+                            &group,
+                            io_stats.clone(),
+                        ),
+                        read_selected_partition_batches(
+                            self.storage.reader(),
+                            None,
+                            &storage_schema,
+                            self.storage.ivf(),
+                            &group,
+                            io_stats,
+                        )
+                    )?;
+                    if index_batches.len() != group.len() || storage_batches.len() != group.len() {
+                        return Err(Error::internal(format!(
+                            "IVF query load group {:?} produced {} index and {} storage partitions",
+                            group,
+                            index_batches.len(),
+                            storage_batches.len()
+                        )));
+                    }
+
+                    let mut payloads = index_batches
+                        .into_iter()
+                        .zip(storage_batches)
+                        .map(|(index, storage)| PartitionPrewarmBatches { index, storage });
+                    let leader_batches = payloads.next().ok_or_else(|| {
+                        Error::internal(format!(
+                            "IVF query load group {:?} did not produce its leader partition",
+                            group
+                        ))
+                    })?;
+                    let mut follower_loads = FuturesUnordered::new();
+                    for (offset, batches) in payloads.enumerate() {
+                        let follower_id = group[offset + 1];
+                        follower_loads.push(async move {
+                            let key = IVFPartitionKey::<S, Q>::new(follower_id);
+                            self.index_cache
+                                .get_or_insert_with_key(key, || async move {
+                                    self.materialize_prewarm_partition(follower_id, batches)
+                                        .await
+                                })
+                                .await
+                                .map(|_| ())
+                        });
+                    }
+                    let mut first_error = None;
+                    while let Some(result) = follower_loads.next().await {
+                        if let Err(error) = result
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                    self.materialize_prewarm_partition(leader_id, leader_batches)
+                        .await
+                })
+                .await?;
+            if was_cached {
+                remaining.remove(0);
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
@@ -2006,20 +2385,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
         let target_bytes = prewarm_window_size_bytes()?;
         let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
         let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
-        let windows = plan_partition_windows(
-            PrewarmFileLayout {
-                ivf: &self.ivf,
-                encoded_bytes: self.reader.metadata().num_data_bytes,
-                num_rows: self.reader.num_rows(),
-            },
-            PrewarmFileLayout {
-                ivf: self.storage.ivf(),
-                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
-                num_rows: self.storage.reader().num_rows(),
-            },
-            target_bytes,
-            max_partitions,
-        )?;
+        let (index_layout, storage_layout) = self.partition_file_layouts();
+        let windows =
+            plan_partition_windows(index_layout, storage_layout, target_bytes, max_partitions)?;
         let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
         info!(
             uuid = %self.uuid,
@@ -2322,29 +2690,46 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // `buffered` preserves the probe order, so the heap accumulates
             // partitions in the same order as before (which decides which of
             // several rows tied at the k-th distance the capped heap keeps).
-            let mut prepared = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
+            // Load upcoming probes in prepare-window chunks so uncached
+            // partitions share one decoder/I/O group (the prewarm window
+            // path). `buffered(1)` keeps the in-flight prepared set inside
+            // the existing prepare-window + scoring-chunk bound; the next
+            // window starts while the current chunk is scored.
+            let mut prepared = stream::iter((start_idx..end_idx).step_by(prepare_parallelism).map(
+                |chunk_start| {
+                    (
+                        chunk_start,
+                        (chunk_start + prepare_parallelism).min(end_idx),
+                    )
+                },
+            ))
+            .map(move |(chunk_start, chunk_end)| {
+                let mut items = Vec::with_capacity(chunk_end - chunk_start);
+                for idx in chunk_start..chunk_end {
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    let raw_query_context = prepare_raw_query_context.clone();
-                    async move {
-                        index
-                            .prepare_partition_without_prefilter_wait(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await
-                    }
-                })
-                .buffered(prepare_parallelism)
-                .fuse();
+                    items.push((partitions.value(idx) as usize, query));
+                }
+                let index = prepare_index.clone();
+                let pre_filter = pre_filter.clone();
+                let metrics = prepare_metrics.clone();
+                let raw_query_context = prepare_raw_query_context.clone();
+                async move {
+                    index
+                        .prepare_partition_chunk(
+                            items,
+                            pre_filter,
+                            metrics.as_ref(),
+                            raw_query_context,
+                            false,
+                        )
+                        .await
+                }
+            })
+            .buffered(1)
+            .map(flatten_result_vec)
+            .flatten()
+            .fuse();
             let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
             let use_query_residual = self.use_query_residual;
@@ -2410,28 +2795,41 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_metrics = metrics.clone();
         let prepare_raw_query_context = raw_query_context.clone();
         tokio::spawn(async move {
-            let prepare_stream = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
+            let prepare_stream =
+                stream::iter((start_idx..end_idx).step_by(prepare_parallelism).map(
+                    |chunk_start| {
+                        (
+                            chunk_start,
+                            (chunk_start + prepare_parallelism).min(end_idx),
+                        )
+                    },
+                ))
+                .map(move |(chunk_start, chunk_end)| {
+                    let mut items = Vec::with_capacity(chunk_end - chunk_start);
+                    for idx in chunk_start..chunk_end {
+                        let mut query = query.clone();
+                        query.dist_q_c = q_c_dists.value(idx);
+                        items.push((partitions.value(idx) as usize, query));
+                    }
                     let index = prepare_index.clone();
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
                     async move {
                         index
-                            .prepare_partition(
-                                part_id as usize,
-                                &query,
+                            .prepare_partition_chunk(
+                                items,
                                 pre_filter,
                                 metrics.as_ref(),
                                 raw_query_context,
+                                true,
                             )
                             .await
                     }
                 })
-                .buffered(prepare_parallelism);
+                .buffered(1)
+                .map(flatten_result_vec)
+                .flatten();
 
             futures::pin_mut!(prepare_stream);
             while let Some(prepared) = prepare_stream.next().await {
@@ -2685,18 +3083,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
-        let mut loaded_chunks = stream::iter(assignment_list)
-            .map(move |(part_id, probing_queries)| {
+        let load_windows = assignment_list
+            .chunks(load_parallelism)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut loaded_chunks = stream::iter(load_windows)
+            .map(move |chunk| {
                 let index = load_index.clone();
                 let metrics = load_metrics.clone();
                 async move {
-                    let part_entry = index
-                        .load_partition(part_id as usize, true, metrics.as_ref())
-                        .await?;
-                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                    let ids = chunk
+                        .iter()
+                        .map(|(part_id, _)| *part_id as usize)
+                        .collect::<Vec<_>>();
+                    let entries = index.load_partitions(&ids, metrics.as_ref()).await?;
+                    Result::Ok(
+                        chunk
+                            .into_iter()
+                            .zip(entries)
+                            .map(|((part_id, probing_queries), part_entry)| {
+                                (part_id as usize, part_entry, probing_queries)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 }
             })
-            .buffered(load_parallelism)
+            .buffered(1)
+            .map(flatten_result_vec)
+            .flatten()
             .chunks(*STREAMING_SEARCH_BATCH_SIZE);
 
         let use_query_residual = self.use_query_residual;
@@ -3158,6 +3572,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..1, 1..3]
         );
+    }
+
+    #[test]
+    fn test_plan_query_load_groups_keeps_sparse_ids_and_caps_bytes() {
+        let ivf = ivf_with_lengths(&[2, 2, 4, 2, 2]);
+        let layout = prewarm_layout(&ivf, 120, 12);
+
+        let groups = super::plan_query_load_groups(&[0, 2, 4], layout, layout, 1024, 100).unwrap();
+        assert_eq!(groups, vec![vec![0, 2, 4]]);
+
+        let groups = super::plan_query_load_groups(&[0, 2, 4], layout, layout, 120, 100).unwrap();
+        assert_eq!(groups, vec![vec![0, 2], vec![4]]);
+
+        let groups = super::plan_query_load_groups(&[0, 2, 4], layout, layout, 1024, 2).unwrap();
+        assert_eq!(groups, vec![vec![0, 2], vec![4]]);
+    }
+
+    #[test]
+    fn test_selected_partition_row_span_requires_contiguous_rows() {
+        let ivf = ivf_with_lengths(&[2, 0, 4]);
+        assert_eq!(
+            super::selected_partition_row_span(&ivf, &[0, 1, 2]),
+            Some(0..6)
+        );
+        assert_eq!(super::selected_partition_row_span(&ivf, &[0, 2]), None);
+        assert_eq!(super::selected_partition_row_span(&ivf, &[1]), Some(2..2));
+
+        let mut gapped = IvfModel::empty();
+        gapped.add_partition_with_offset(0, 2);
+        gapped.add_partition_with_offset(10, 2);
+        assert_eq!(super::selected_partition_row_span(&gapped, &[0, 1]), None);
     }
 
     #[test]
@@ -8387,6 +8832,139 @@ mod tests {
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_query_partition_load_uses_windowed_io() {
+        use lance_io::assert_io_eq;
+
+        const INDEX_NAME: &str = "query_window_idx";
+        const NUM_PARTITIONS: usize = 16;
+        const ROWS_PER_PARTITION: usize = 16;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (batch, schema) = make_seeded_vector_batch(NUM_PARTITIONS * ROWS_PER_PARTITION);
+        let query_vector = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let mut ivf_params = IvfBuildParams::new(NUM_PARTITIONS);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index");
+        assert_eq!(ivf.ivf.num_partitions(), NUM_PARTITIONS);
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        let one = ivf
+            .load_partition(0, true, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let single_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert!(
+            single_stats.read_iops > 0,
+            "cold single-partition load should read from disk"
+        );
+
+        drop(dataset);
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index");
+
+        dataset.object_store.as_ref().io_stats_incremental();
+        let ids = (0..NUM_PARTITIONS).collect::<Vec<_>>();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                ivf.load_partitions(&ids, &NoOpMetricsCollector),
+                ivf.load_partitions(&ids, &NoOpMetricsCollector)
+            )
+        })
+        .await
+        .expect("concurrent query partition loads deadlocked");
+        let loaded = first.unwrap();
+        second.unwrap();
+        let batch_stats = dataset.object_store.as_ref().io_stats_incremental();
+
+        assert_eq!(loaded.len(), NUM_PARTITIONS);
+        assert_eq!(loaded[0].storage.len(), one.storage.len());
+        assert!(
+            batch_stats.read_iops < single_stats.read_iops * NUM_PARTITIONS as u64,
+            "windowed load of {NUM_PARTITIONS} partitions issued {} IOPS; single partition issued {}",
+            batch_stats.read_iops,
+            single_stats.read_iops
+        );
+        // Adjacent partitions share one decoder/I/O group. A per-partition path
+        // would issue about N times the single-partition IOPS.
+        assert!(
+            batch_stats.read_iops
+                <= single_stats
+                    .read_iops
+                    .saturating_mul(4)
+                    .max(single_stats.read_iops + 4),
+            "expected a small multiple of one-partition IOPS, got {} vs {}",
+            batch_stats.read_iops,
+            single_stats.read_iops
+        );
+
+        ivf.load_partitions(&ids, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let warm_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_eq!(
+            warm_stats,
+            read_iops,
+            0,
+            "cached grouped load should not perform IO"
+        );
+
+        dataset
+            .scan()
+            .nearest("vector", &query_vector, 10)
+            .unwrap()
+            .nprobes(NUM_PARTITIONS)
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let query_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_eq!(
+            query_stats,
+            read_iops,
+            0,
+            "query should not perform IO after grouped partition load"
+        );
     }
 
     /// Index-cache backend that can drop partition entries on demand.
