@@ -47,7 +47,7 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
@@ -1889,11 +1889,16 @@ impl MergeInsertJob {
                         updated_offsets.sort_unstable();
                         updated_offsets.dedup();
 
+                        // The fragment's existing versions may be spilled to a
+                        // data file, which the refresh cannot read itself.
+                        let spilled_lineage =
+                            load_spilled_row_lineage(&dataset, [&updated_fragment]).await?;
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                             &mut updated_fragment,
                             &updated_offsets,
                             current_version,
                             dataset.manifest.version,
+                            &spilled_lineage,
                         )?;
                     }
 

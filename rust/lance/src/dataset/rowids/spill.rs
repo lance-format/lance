@@ -407,7 +407,7 @@ mod tests {
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Field;
     use chrono::Utc;
@@ -810,5 +810,258 @@ mod tests {
 
         let reopened = Dataset::open(uri).await.unwrap();
         assert_eq!(collect_lineage(&reopened).await, before);
+    }
+    /// Every row's key, row id, created-at and last-updated-at version.
+    async fn collect_rows(dataset: &Dataset) -> Vec<(i32, u64, u64, u64)> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[
+                "i",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let u64s = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let keys = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        let (ids, created, updated) = (
+            u64s(ROW_ID),
+            u64s(ROW_CREATED_AT_VERSION),
+            u64s(ROW_LAST_UPDATED_AT_VERSION),
+        );
+        keys.into_iter()
+            .zip(ids)
+            .zip(created)
+            .zip(updated)
+            .map(|(((key, id), created), updated)| (key, id, created, updated))
+            .collect()
+    }
+
+    fn by_key(rows: &[(i32, u64, u64, u64)]) -> std::collections::BTreeMap<i32, (u64, u64, u64)> {
+        rows.iter()
+            .map(|(key, id, created, updated)| (*key, (*id, *created, *updated)))
+            .collect()
+    }
+
+    /// Resolving the rewritten rows' original created-at versions happens at
+    /// commit time, inside `lance-table`, which cannot read a data file. The
+    /// commit path reads the spilled sequences ahead of the build, so an
+    /// update on a spilled table keeps every row's lineage the way it does on
+    /// an inline one.
+    #[tokio::test]
+    async fn updating_rows_with_spilled_lineage_keeps_their_created_at() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        let before = by_key(&collect_rows(&dataset).await);
+        // Row 700 came in the third append, so its created-at is not the
+        // default a reader would fall back to.
+        let (id_700, created_700, _) = before[&700];
+        assert_eq!(created_700, 3);
+
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 700")
+            .unwrap()
+            .set("i", "7000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let updated = updated.new_dataset.as_ref();
+        let update_version = updated.version().version;
+        let after = by_key(&collect_rows(updated).await);
+
+        // The rewritten row keeps its id and its created-at, and is stamped
+        // with the update's version; every other row is untouched.
+        assert_eq!(after[&7000], (id_700, created_700, update_version));
+        assert!(!after.contains_key(&700));
+        for (key, lineage) in before.iter().filter(|(key, _)| **key != 700) {
+            assert_eq!(after[key], *lineage, "row {key} must be untouched");
+        }
+        updated.validate().await.unwrap();
+    }
+
+    /// merge_insert rewrites the matched rows and appends the inserted ones in
+    /// one fragment; the former keep their lineage, the latter start at the
+    /// commit version. Both resolve through the read-ahead spilled sequences.
+    #[tokio::test]
+    async fn merge_insert_on_spilled_table_keeps_matched_lineage() {
+        use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        let before = by_key(&collect_rows(&dataset).await);
+
+        // Keys 300 and 700 exist and were appended at different versions;
+        // 5000 does not exist and is inserted.
+        let schema = test_schema();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![300, 700, 5000]))],
+        )
+        .unwrap();
+        let (merged, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["i".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new([Ok(source)], schema)))
+            .await
+            .unwrap();
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (2, 1));
+        let merge_version = merged.version().version;
+        let after = by_key(&collect_rows(&merged).await);
+
+        for key in [300, 700] {
+            let (id, created, _) = before[&key];
+            assert_eq!(after[&key], (id, created, merge_version), "row {key}");
+        }
+        let (_, created, updated) = after[&5000];
+        assert_eq!((created, updated), (merge_version, merge_version));
+        for (key, lineage) in before.iter().filter(|(key, _)| ![300, 700].contains(key)) {
+            assert_eq!(after[key], *lineage, "row {key} must be untouched");
+        }
+        merged.validate().await.unwrap();
+    }
+
+    /// A partial column rewrite patches an existing fragment in place and
+    /// stamps only the patched rows' last-updated-at, which means overlaying
+    /// the fragment's existing sequence; on a spilled fragment that sequence
+    /// is read ahead of the commit and the refreshed one goes back inline.
+    #[tokio::test]
+    async fn partial_column_rewrite_on_spilled_fragment_stamps_only_matched_rows() {
+        use crate::dataset::{
+            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+        };
+        use arrow_array::StringArray;
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        // A third column keeps the patch source a strict subset of the schema,
+        // which is what makes this an in-place column rewrite.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("tag", DataType::Utf8, true),
+            Field::new("other", DataType::Utf8, true),
+        ]));
+        let mut dataset: Option<Dataset> = None;
+        for chunk in 0..4 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        (chunk * 250)..((chunk + 1) * 250),
+                    )),
+                    Arc::new(StringArray::from(vec!["t"; 250])),
+                    Arc::new(StringArray::from(vec!["o"; 250])),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            dataset = Some(
+                Dataset::write(
+                    reader,
+                    uri,
+                    Some(WriteParams {
+                        enable_stable_row_ids: true,
+                        mode: if chunk == 0 {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut dataset = dataset.unwrap();
+        spill_everything(&mut dataset).await;
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                dataset.get_fragments()[0]
+                    .metadata()
+                    .last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            ),
+            "the fixture must start with spilled last-updated-at versions"
+        );
+        let before = by_key(&collect_rows(&dataset).await);
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![300, 700])),
+                Arc::new(StringArray::from(vec!["patched"; 2])),
+            ],
+        )
+        .unwrap();
+        let (patched, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["i".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source)],
+                source_schema,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(
+            patched.get_fragments().len(),
+            1,
+            "in-place patches add no fragment"
+        );
+        let patch_version = patched.version().version;
+        let after = by_key(&collect_rows(&patched).await);
+
+        for key in [300, 700] {
+            let (id, created, _) = before[&key];
+            assert_eq!(after[&key], (id, created, patch_version), "row {key}");
+        }
+        for (key, lineage) in before.iter().filter(|(key, _)| ![300, 700].contains(key)) {
+            assert_eq!(after[key], *lineage, "row {key} must be untouched");
+        }
+        patched.validate().await.unwrap();
     }
 }

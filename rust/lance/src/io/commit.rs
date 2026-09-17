@@ -36,8 +36,9 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
+    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -50,6 +51,7 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -1211,7 +1213,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Some(dataset.manifest.as_ref()),
                 load_all_indices(dataset).await?.as_ref().clone(),
                 &transaction_file,
-                &write_config.to_build_config(),
+                &build_config_for_attempt(dataset, transaction, write_config).await?,
             )?,
         };
 
@@ -1369,6 +1371,28 @@ pub(crate) async fn commit_detached_transaction(
 }
 
 /// Load new transactions and sort them by version in ascending order (oldest to newest)
+/// The build config for one commit attempt against `dataset`'s current manifest.
+///
+/// An operation that carries rows' lineage over from existing fragments needs
+/// their sequences at build time, and the build cannot read the ones spilled to
+/// data files; they are read here, per attempt, so a rebase onto a newer
+/// manifest sees that manifest's fragments.
+async fn build_config_for_attempt(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+) -> Result<ManifestBuildConfig> {
+    let mut config = write_config.to_build_config();
+    if matches!(
+        transaction.operation,
+        Operation::Update { .. } | Operation::DataOverlay { .. }
+    ) {
+        config.spilled_row_lineage =
+            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+    }
+    Ok(config)
+}
+
 async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
@@ -1563,7 +1587,7 @@ pub(crate) async fn commit_transaction(
                 Some(dataset.manifest.as_ref()),
                 load_all_indices(&dataset).await?.as_ref().clone(),
                 transaction_file,
-                &write_config.to_build_config(),
+                &build_config_for_attempt(&dataset, &transaction, write_config).await?,
                 read_version_state,
             )?,
         };
