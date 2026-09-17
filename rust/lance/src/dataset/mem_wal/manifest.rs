@@ -92,7 +92,7 @@ impl ShardManifestStore {
     /// Create a manifest store using the internal adaptive scan policy.
     ///
     /// Manifest discovery starts with two parallel HEAD requests, doubles the
-    /// batch size after each successful scan, and caps concurrency at 64.
+    /// batch size after each full batch, and caps concurrency at 64.
     ///
     /// # Example
     ///
@@ -276,8 +276,8 @@ impl ShardManifestStore {
     ///
     /// Callers derive `manifest.version` from a manifest they just read, which
     /// is what keeps the sequence gap-free — the cache treats a landed write as
-    /// proof of the tip, and `find_latest_version` stops at the first absent
-    /// batch, so a gap hides every version past it. Whoever holds that
+    /// proof of the tip, and `find_latest_version` stops at the first miss past
+    /// the highest hit, so a gap hides every version past it. Whoever holds that
     /// predecessor checks the successor; see [`Self::commit_update`].
     ///
     /// A version at or below this store's position is reported as the collision
@@ -345,8 +345,10 @@ impl ShardManifestStore {
 
     /// Find the latest manifest version.
     ///
-    /// Uses HEAD requests starting from version hint, scanning forward
-    /// until a version is not found.
+    /// Uses HEAD requests starting from version hint, scanning forward in
+    /// doubling batches until a batch probes past the tip: versions are
+    /// created gap-free, so the first batch that does not fill — partially or
+    /// at all — confirms the highest hit it found.
     async fn find_latest_version(&self) -> Result<u64> {
         // Start from version hint or 1
         let hint = self.read_version_hint().await.unwrap_or(1);
@@ -367,21 +369,24 @@ impl ShardManifestStore {
         // Parallel scan forward with exponentially growing batches of HEAD requests.
         let mut batch_size = INITIAL_MANIFEST_SCAN_BATCH_SIZE;
         loop {
+            let batch_start = latest_found;
             let mut futures = FuturesUnordered::new();
             for offset in 0..batch_size {
-                let version = latest_found + 1 + offset as u64;
+                let version = batch_start + 1 + offset as u64;
                 futures.push(async move { (version, self.version_exists(version).await) });
             }
 
-            let mut found_any = false;
             while let Some((version, result)) = futures.next().await {
                 if result? && version > latest_found {
                     latest_found = version;
-                    found_any = true;
                 }
             }
 
-            if !found_any {
+            // A batch that did not fill — partially or at all — probed past the
+            // tip, and versions are created gap-free: the misses above the
+            // highest hit already rule out anything beyond, so no confirmation
+            // batch is needed.
+            if latest_found < batch_start + batch_size as u64 {
                 break;
             }
             batch_size = next_manifest_scan_batch_size(batch_size);
@@ -987,26 +992,24 @@ mod tests {
     /// HEADs a cold `refresh_latest` issues for each version-hint lag.
     ///
     /// After reading the hint and confirming it with one HEAD, the scan walks
-    /// forward in batches that double from 2 up to the cap of 64 until a whole
-    /// batch comes back empty. The growth buys fewer round trips at the price
-    /// of more speculative HEADs on a stale hint, and these counts are the
-    /// executable record of that trade-off:
+    /// forward in batches that double from 2 up to the cap of 64. The first
+    /// batch that does not fill — partially or at all — ends the walk:
+    /// versions are created gap-free, so its misses above the highest hit
+    /// already confirm the tip, with no terminal batch re-probing them. The
+    /// growth buys fewer round trips at the price of more speculative HEADs
+    /// on a stale hint, and these counts are the executable record of that
+    /// trade-off:
     ///
     /// - precise hint (tip 3, hint 3): one empty batch of 2 → 2 HEADs
-    /// - one-version lag (tip 3, hint 2): 2, then an empty 4 → 6 HEADs (a
-    ///   fixed batch of 2 would issue 4)
-    /// - ten-version lag (tip 12, hint 2): 2 + 4 + 8 catch up, empty 16 → 30
-    /// - hundred-version lag (tip 102, hint 2): 2 + 4 + 8 + 16 + 32 + 64 catch
-    ///   up; the cap holds the final empty batch at 64 → 190
-    ///
-    /// The first missing version is probed twice — speculatively beside the
-    /// tip, then again leading the empty batch that ends the scan — which the
-    /// counts include.
+    /// - one-version lag (tip 3, hint 2): one partial batch of 2 → 2 HEADs
+    /// - ten-version lag (tip 12, hint 2): 2 + 4 + a partial 8 → 14 HEADs
+    /// - hundred-version lag (tip 102, hint 2): 2 + 4 + 8 + 16 + 32 + a
+    ///   partial 64 → 126 HEADs
     #[rstest]
     #[case::precise_hint(3, 3, 2)]
-    #[case::one_version_lag(3, 2, 6)]
-    #[case::ten_version_lag(12, 2, 30)]
-    #[case::hundred_version_lag_caps_at_64(102, 2, 190)]
+    #[case::one_version_lag(3, 2, 2)]
+    #[case::ten_version_lag(12, 2, 14)]
+    #[case::hundred_version_lag(102, 2, 126)]
     #[tokio::test]
     async fn cold_scan_successor_head_requests_by_hint_lag(
         #[case] tip: u64,
