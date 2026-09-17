@@ -5385,35 +5385,88 @@ fn exact_phrase_scan<'a>(
         return Ok(n_pos > 0);
     }
 
-    for pos_i in 0..n_pos {
-        let anchor_position = {
-            let cursor = cursors[rarest]
-                .as_ref()
-                .expect("rarest clause cursor was just populated");
-            cursor.positions.as_slice()[pos_i]
-        };
+    // Every clause's target is `anchor_position - anchor_offset + query_offset`,
+    // which is strictly increasing in the anchor. Two consequences the loop
+    // below exploits:
+    //
+    //   * a follower is never searched from the start. Each cursor keeps its own
+    //     index and only moves forward, so a failed probe leaves it sitting on
+    //     the first position above the target - which is also the smallest
+    //     position any *later* anchor can align with.
+    //   * the anchor can therefore be jumped straight to that position instead
+    //     of stepping over every candidate in between. None of them can match:
+    //     their targets all land in the gap the follower was just shown to have.
+    //
+    // Both moves start from the current index and only move forward, so the
+    // per-document cost is bounded by the decoded position counts rather than
+    // by their product. The jump is taken only when it skips at least one
+    // anchor position, which needs no counter, budget or mode switch: the two
+    // regimes (far-apart lists vs interleaved lists) separate themselves.
+    let mut anchor_idx = 0usize;
+    'anchor: while anchor_idx < n_pos {
+        #[cfg(test)]
+        {
+            count_anchor_steps();
+        }
+        let anchor_position = cursors[rarest]
+            .as_ref()
+            .expect("rarest clause cursor was just populated")
+            .positions
+            .as_slice()[anchor_idx];
         let Some(base) = anchor_position.checked_sub(anchor_offset) else {
-            continue;
+            anchor_idx += 1;
+            continue 'anchor;
         };
-        let mut matched = true;
         for &index in &order[1..num_clauses] {
             if cursors[index].is_none() {
                 cursors[index] = Some(decode(index)?);
             }
-            let cursor = cursors[index]
+            let query_offset = cursors[index]
                 .as_ref()
-                .expect("phrase clause cursor was just populated");
-            let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
+                .expect("phrase clause cursor was just populated")
+                .position_in_query as u32;
+            let Some(target) = base.checked_add(query_offset) else {
                 return Ok(false);
             };
-            if cursor.positions.as_slice().binary_search(&target).is_err() {
-                matched = false;
-                break;
+            let Some(position) = cursors[index]
+                .as_mut()
+                .expect("phrase clause cursor was just populated")
+                .advance_to_at_least(target)
+            else {
+                // No follower position reaches `target`, and every later anchor
+                // only raises it, so no remaining base can align either.
+                return Ok(false);
+            };
+            if position == target {
+                continue;
             }
+            let next_anchor = position
+                .saturating_sub(query_offset)
+                .saturating_add(anchor_offset);
+            anchor_idx = {
+                let anchor_positions = cursors[rarest]
+                    .as_ref()
+                    .expect("rarest clause cursor was just populated")
+                    .positions
+                    .as_slice();
+                // Only pay for the jump when it actually skips something. If the
+                // very next anchor position is already below the bound, the jump
+                // would land one step ahead anyway, and a plain step gets there
+                // without the extra binary search. This is what separates the
+                // two regimes: on disjoint lists the first jump crosses the whole
+                // anchor, while on interleaved lists every bound lands one
+                // position ahead and the scan degrades to stepping.
+                match anchor_positions.get(anchor_idx + 1) {
+                    Some(&next_position) if next_position < next_anchor => {
+                        anchor_idx
+                            + anchor_positions[anchor_idx..].partition_point(|&p| p < next_anchor)
+                    }
+                    _ => anchor_idx + 1,
+                }
+            };
+            continue 'anchor;
         }
-        if matched {
-            return Ok(true);
-        }
+        return Ok(true);
     }
     Ok(false)
 }
@@ -5421,11 +5474,47 @@ fn exact_phrase_scan<'a>(
 #[cfg(test)]
 thread_local! {
     static POSITION_CURSOR_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHRASE_ANCHOR_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-only: counting anchor steps is off unless a test arms it, because the
+    // scan loop runs it once per anchor position. Rustdoc does not document
+    // macro invocations, so this is a plain comment.
+    static COUNT_ANCHOR_STEPS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Armed per test thread: a process-wide flag would let one parallel test that
+/// finishes early switch counting off for another still running.
+#[cfg(test)]
+fn count_anchor_steps() {
+    if COUNT_ANCHOR_STEPS.with(|armed| armed.get()) {
+        PHRASE_ANCHOR_STEPS.with(|steps| steps.set(steps.get() + 1));
+    }
 }
 
 #[cfg(test)]
 fn take_position_cursor_calls() -> usize {
     POSITION_CURSOR_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Anchor positions visited by the last `exact_phrase_scan`. Test-only: it is
+/// the only way to assert that the scan skips without a timing threshold.
+#[cfg(test)]
+fn take_anchor_steps() -> usize {
+    PHRASE_ANCHOR_STEPS.with(|steps| steps.replace(0))
+}
+
+/// Run an exact-phrase check with anchor-step counting armed.
+#[cfg(test)]
+fn counted_anchor_steps<F: FnOnce() -> bool>(check: F) -> (bool, usize) {
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(true));
+    let _ = take_anchor_steps();
+    let matched = check();
+    let steps = take_anchor_steps();
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(false));
+    (matched, steps)
 }
 
 #[derive(Debug)]
@@ -5506,6 +5595,42 @@ impl<'a> PositionCursor<'a> {
             .as_slice()
             .get(self.index)
             .map(|position| *position as i32 - self.position_in_query)
+    }
+
+    /// Advance to the first position at or above `target` and return it, or
+    /// `None` once the cursor is exhausted.
+    ///
+    /// `target` must be non-decreasing across calls: the search is confined to
+    /// the not-yet-consumed suffix, so the cursor never rewinds and a returned
+    /// position is never below `target`. When the cursor already sits past
+    /// `target` the search is skipped entirely.
+    fn advance_to_at_least(&mut self, target: u32) -> Option<u32> {
+        if self.index >= self.len() {
+            return None;
+        }
+        let values = self.positions.as_slice();
+        // The cursor has reached `target`, or is already past it. Every earlier
+        // position is below the previous target and hence below this one, so the
+        // insertion point has not moved: no search is needed, and the current
+        // position is either the match or the bound the caller wants.
+        if values[self.index] >= target {
+            return Some(values[self.index]);
+        }
+        // Targets only grow, so the next position is a frequent answer. Check it
+        // before paying for a search: a suffix binary search costs a dependent
+        // load per level and its landmarks move as `index` advances, which is
+        // what makes interleaved lists slow. On a mismatch here the cursor ends
+        // up one position short of the target on every step.
+        if let Some(next) = values
+            .get(self.index + 1)
+            .copied()
+            .filter(|&next| next >= target)
+        {
+            self.index += 1;
+            return Some(next);
+        }
+        self.index += values[self.index..].partition_point(|&pos| pos < target);
+        values.get(self.index).copied()
     }
 
     fn advance_to_relative(&mut self, least_relative_pos: i32) {
@@ -9963,6 +10088,379 @@ mod tests {
         assert_eq!(take_position_cursor_calls(), 3);
         assert!(!wand.check_exact_positions_bulk().unwrap());
         assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The follower sits entirely past the anchor, so the very first probe
+    /// proves no base can align: the scan must jump instead of walking.
+    #[rstest]
+    fn exact_phrase_scan_skips_anchor_past_disjoint_follower(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(2 * n..3 * n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase");
+        assert!(steps <= 2, "anchor was walked ({steps} steps), not skipped");
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase (bulk)");
+        assert!(
+            steps <= 2,
+            "bulk anchor was walked ({steps} steps), not skipped"
+        );
+    }
+
+    /// The only match sits at the far end of a long anchor. Reaching it in a
+    /// couple of steps is what proves the jump lands on the right candidate
+    /// instead of over-shooting it.
+    #[rstest]
+    fn exact_phrase_scan_jumps_to_a_late_match(#[values(false, true)] is_compressed: bool) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(n / 2 + 1..n + 1).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(matched, "the late match must be found");
+        assert!(
+            steps <= 3,
+            "late match took {steps} steps; the jump missed it"
+        );
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(matched, "the late match must be found (bulk)");
+        assert!(steps <= 3, "bulk late match took {steps} steps");
+    }
+
+    /// Interleaved lists: no bound can skip anything, so the scan must fall back
+    /// to stepping and still visit every candidate exactly once (and terminate).
+    #[rstest]
+    fn exact_phrase_scan_steps_when_no_bound_can_skip(#[values(false, true)] is_compressed: bool) {
+        let n = 1024u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k + 2).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "interleaved lists cannot form a phrase");
+        assert!(
+            (1..=n as usize).contains(&steps),
+            "expected a single walk of {n} anchors, got {steps}"
+        );
+    }
+
+    /// The anchor jumps over a candidate before the last clause has ever been
+    /// probed, so that clause is decoded with a target already far into its
+    /// list: the lazy decode and the monotone probe have to agree.
+    #[rstest]
+    fn exact_phrase_scan_decodes_a_follower_after_the_anchor_jumps(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut middle = vec![300_u32, 901];
+        middle.extend(1000..1050);
+        let mut last = vec![902_u32];
+        last.extend(3000..3100);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![100_u32, 200, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(vec![0], vec![middle], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(
+            matched,
+            "the clause decoded after the jump must still align"
+        );
+        assert_eq!(
+            steps, 2,
+            "the anchor must jump straight to 900, got {steps} steps"
+        );
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The anchor clause is not the first word of the phrase, so the jump has to
+    /// account for `anchor_offset`. Without it the bound lands one position
+    /// short and the scan needs an extra step.
+    #[rstest]
+    fn exact_phrase_scan_jumps_with_a_nonzero_anchor_offset(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut first = vec![100_u32, 497, 899];
+        first.extend(1000..1050);
+        let mut last = vec![500_u32];
+        last.extend(2000..2050);
+        last.push(5000);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(vec![0], vec![first], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![101_u32, 498, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "the last clause never reaches the phrase");
+        assert_eq!(
+            steps, 2,
+            "the jump must carry anchor_offset (bound 499, not 498), got {steps} steps"
+        );
+    }
+
+    /// The compound-phrase request from review: drive the exact-phrase check the
+    /// way `WandCursor::matches()` does - a phrase leaf inside a compound query -
+    /// instead of calling the entries directly.
+    #[rstest]
+    fn wand_cursor_confirmation_rejects_disjoint_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(2 * n..3 * n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(!matched, "disjoint positions cannot form a phrase");
+        assert!(
+            steps <= 2,
+            "the compound path must skip too, took {steps} steps"
+        );
+    }
+
+    /// Same path, but the phrase really is present: the confirmation has to
+    /// survive the jump instead of over-shooting the match.
+    #[rstest]
+    fn wand_cursor_confirmation_accepts_aligned_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(1..n + 1).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(matched, "the phrase is present at base 0");
+        assert!(
+            steps <= 2,
+            "took {steps} steps to confirm a first-position match"
+        );
     }
 
     #[rstest]
