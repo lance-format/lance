@@ -2002,14 +2002,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_cloud_paths() {
+        // Provide a region for the S3 cases so opening the URL does not make a
+        // live network call to resolve the bucket region, which is flaky and
+        // fails without network access (see `resolve_s3_region`).
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let s3_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(String::from("region"), String::from("us-east-1"))]),
+            ))),
+            ..ObjectStoreParams::default()
+        };
+
         let uri = "s3://bucket/foo.lance";
-        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+        let (store, path) = ObjectStore::from_uri_and_params(registry.clone(), uri, &s3_params)
+            .await
+            .unwrap();
         assert_eq!(store.scheme, "s3");
         assert_eq!(path.to_string(), "foo.lance");
 
-        let (store, path) = ObjectStore::from_uri("s3+ddb://bucket/foo.lance")
-            .await
-            .unwrap();
+        let (store, path) = ObjectStore::from_uri_and_params(
+            registry.clone(),
+            "s3+ddb://bucket/foo.lance",
+            &s3_params,
+        )
+        .await
+        .unwrap();
         assert_eq!(store.scheme, "s3");
         assert_eq!(path.to_string(), "foo.lance");
 
@@ -2060,7 +2077,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case("s3://bucket/foo.lance", None)]
+    // Provide a region for S3 to avoid a live bucket-region lookup (see `test_cloud_paths`).
+    #[case("s3://bucket/foo.lance",
+      Some(HashMap::from([(String::from("region"), String::from("us-east-1"))])))]
     #[case("gs://bucket/foo.lance", None)]
     #[case("az://account/bucket/foo.lance",
       Some(HashMap::from([
