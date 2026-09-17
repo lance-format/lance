@@ -27,7 +27,7 @@ use lance_index::{
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
-        LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
+        BuiltinIndexType, LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
         inverted::tokenizer::InvertedIndexParams, table_files_to_index,
     },
 };
@@ -64,6 +64,47 @@ fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexP
 
 fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
     Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
+}
+
+/// Refuse a row-id-domain index while a fragment-reuse index is live on a
+/// stable-row-id dataset.
+///
+/// The FRI remaps row addresses and is applied to every index on load. With
+/// stable row ids the address and row-id domains diverge, and a stable row id is
+/// numerically indistinguishable from an address into fragment 0, so the FRI
+/// would silently rewrite this index's row ids rather than fail. Compaction
+/// refuses the mirror image: it will not write an FRI while such an index
+/// exists.
+///
+/// An unclassifiable type is refused rather than allowed: a plugin index is not
+/// one of the address-domain builtins, and guessing wrong here corrupts data
+/// silently.
+///
+/// Drops out once every index stores row addresses.
+async fn reject_row_id_domain_index_under_frag_reuse(
+    dataset: &Dataset,
+    index_type: IndexType,
+    builtin: Option<BuiltinIndexType>,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_row_ids()
+        || builtin.is_some_and(|builtin| builtin.results_are_row_addrs())
+    {
+        return Ok(());
+    }
+    let Some(frag_reuse) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
+        return Ok(());
+    };
+    // A drained FRI remaps nothing, so it cannot corrupt anything.
+    if frag_reuse.is_empty() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "cannot create a {index_type} index on a dataset with stable row IDs while a \
+         fragment-reuse index is present: that index reports matches as row ids, which a rewrite \
+         leaves valid, but the fragment-reuse index remaps row addresses and would be applied to \
+         it. Drain the fragment-reuse index first (merge the address-domain index segments, then \
+         clean it up), or create this index before compacting with defer_index_remap."
+    )))
 }
 
 pub struct CreateIndexBuilder<'a> {
@@ -159,7 +200,17 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+        let builtin = if self.index_type == IndexType::Scalar {
+            self.params
+                .as_any()
+                .downcast_ref::<ScalarIndexParams>()
+                .and_then(|params| BuiltinIndexType::from_name(&params.index_type))
+        } else {
+            BuiltinIndexType::try_from(self.index_type).ok()
+        };
+        let index_type = self.index_type;
         async move {
+        reject_row_id_domain_index_under_frag_reuse(self.dataset, index_type, builtin).await?;
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),

@@ -922,10 +922,15 @@ impl Transaction {
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
+                    // An FRI in this commit is what lets an address-domain index
+                    // follow its data: the rewrite records the address moves, and
+                    // the index applies them lazily on load. Without one there is
+                    // nothing to repair those addresses with.
+                    let deferred_remap = frag_reuse_index.is_some();
                     for index in final_indices.iter_mut() {
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs {
+                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
                                 // address-domain index cannot: its stored addresses point into
