@@ -3225,6 +3225,28 @@ def test_label_list_index(tmp_path: Path):
     assert indices[0].index_type == "LabelList"
 
 
+@pytest.mark.parametrize("stable_row_ids", [False, True])
+def test_label_list_update_removes_old_labels(tmp_path: Path, stable_row_ids):
+    dataset = lance.write_dataset(
+        pa.table({"labels": [["old"], ["keep"]]}),
+        tmp_path,
+        enable_stable_row_ids=stable_row_ids,
+        max_rows_per_file=1,
+        max_rows_per_group=1,
+    )
+    dataset.create_scalar_index("labels", "LABEL_LIST")
+    predicate = "array_has_any(labels, ['old'])"
+    dataset.update({"labels": "['new']"}, where=predicate)
+    assert dataset.to_table(filter=predicate).num_rows == 0
+
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter=predicate, use_scalar_index=False).num_rows == 0
+    assert dataset.to_table(filter=predicate).num_rows == 0
+    assert dataset.to_table(filter="array_has_any(labels, ['new'])").num_rows == 1
+    assert dataset.to_table(filter="array_has_any(labels, ['keep'])").num_rows == 1
+
+
 def test_label_list_index_array_contains(tmp_path: Path):
     # Include lists with NULL items to ensure NULL needle behavior matches
     # non-index execution.
