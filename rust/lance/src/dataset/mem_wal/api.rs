@@ -8,10 +8,13 @@
 //!
 //! # Limitations
 //!
-//! MemWAL does not track dataset changes made after it is initialized. The set
-//! named by `maintained_indexes` is fixed, so an index created later is not
-//! maintained over the fresh tier; it covers a row once that row reaches the
-//! base table.
+//! MemWAL does not track dataset changes made after it is initialized. An index
+//! created later is not maintained over the fresh tier until the set names it --
+//! until then it covers a row once that row reaches the base table. The set is
+//! replaceable on a live MemWAL through
+//! [`DatasetMemWalExt::update_mem_wal_maintained_indexes`], which takes effect
+//! for MemTables opened after the commit; the sharding spec is not, because the
+//! generations already written were homed under it.
 //!
 //! # No upgrade guarantee across the field-id read
 //!
