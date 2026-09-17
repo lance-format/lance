@@ -36,6 +36,21 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 /// pushed into it and under which names ([`Self::to_stored`]), and how to
 /// bring the result back to the table's names and shapes
 /// ([`Self::reconcile`]).
+///
+/// # The invariant this rests on
+///
+/// A field id identifies a column for as long as any generation holds it.
+/// Lance does not enforce that: `max_field_id` is the maximum over the current
+/// schema and the fields the base fragments reference, so dropping a column can
+/// lower it and let the next added column take the id back -- while a retained
+/// generation still holds the dropped column under it. Resolving by id then
+/// reads the retired values as the column that took the id, and nothing in
+/// either schema tells the two apart from a rename.
+///
+/// Keeping it is therefore the caller's: a consumer that retains generations
+/// must drain them before a drop/add sequence can reuse an id they still hold.
+/// `a_field_id_taken_back_after_a_drop_is_read_as_the_column_that_took_it`
+/// pins what happens when it is not kept.
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
     stored_schema: Schema,
@@ -473,6 +488,46 @@ mod tests {
     fn a_renamed_column_is_asked_for_under_the_name_the_generation_has() {
         assert_eq!(renamed().stored_projection(), vec!["id", "value"]);
         assert_eq!(renamed().stored_name("amount"), Some("value"));
+    }
+
+    /// A KNOWN LIMITATION, pinned so a fix is visible when it lands.
+    ///
+    /// Lance's `max_field_id` is not a permanent high-water mark: it is the
+    /// maximum over the current schema and the fields the base fragments
+    /// reference, so dropping a column can lower it and let the next added
+    /// column take the id back. A generation retained across that sequence
+    /// still holds the dropped column under that id, and this resolution --
+    /// which follows ids, by design -- then reads it as the column that took
+    /// the id. Nothing in either schema distinguishes that from a rename, and
+    /// when the types agree the values are returned under the new name rather
+    /// than as null. `reconcile_batches` makes the same pairing, so a merge
+    /// persists them.
+    ///
+    /// The invariant this rests on is therefore the caller's to keep: a
+    /// consumer that retains generations must not let a field id be reused
+    /// while one still holds it -- draining the retained generations before a
+    /// drop/add sequence is what establishes that.
+    #[test]
+    fn a_field_id_taken_back_after_a_drop_is_read_as_the_column_that_took_it() {
+        let read = generation(
+            // Sealed while id 1 was `retired`.
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("retired", DataType::Int64, 1),
+            ]),
+            // `retired` was dropped and `added` took its id back.
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("added", DataType::Int64, 1),
+            ]),
+            &["id", "added"],
+        );
+        assert_eq!(
+            read.stored_name("added"),
+            Some("retired"),
+            "today the reused id pairs them; a fix makes this `None`, and the \
+             generation contributes null for `added` instead"
+        );
     }
 
     #[test]
