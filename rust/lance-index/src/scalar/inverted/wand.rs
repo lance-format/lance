@@ -1402,9 +1402,17 @@ impl PostingIterator {
                     if new_offset < compressed.doc_ids.len() {
                         self.index = (block_idx << shift) + new_offset;
                         self.block_idx = block_idx;
+                        // Frequencies stay lazy, but once this block's stream is
+                        // decoded every later candidate in it can carry its
+                        // frequency for free instead of re-materializing in `doc`.
+                        let frequency = if compressed.frequency_block_idx == Some(block_idx) {
+                            compressed.freqs[new_offset]
+                        } else {
+                            0
+                        };
                         self.current_doc = Some(DocInfo::Raw(RawDocInfo {
                             doc_id: compressed.doc_ids[new_offset],
-                            frequency: 0,
+                            frequency,
                         }));
                         return;
                     }
