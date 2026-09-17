@@ -3841,6 +3841,26 @@ pub fn schema_has_blob_v2_binary_view(schema: &Schema) -> bool {
     schema.fields.iter().any(field_has_blob_v2_binary_view)
 }
 
+fn field_has_binary_blob_payload(field: &LanceField) -> bool {
+    (field.is_blob() && matches!(field.data_type(), ArrowDataType::LargeBinary))
+        || field.children.iter().any(field_has_binary_blob_payload)
+}
+
+/// Return true if the schema carries a blob payload materialized as binary,
+/// whichever blob generation wrote it.
+///
+/// [`schema_has_blob_v2_binary_view`] answers a narrower question -- it drives
+/// the v2 descriptor-read machinery, which legacy blobs do not use -- so it
+/// deliberately misses a v1 blob. `Field::binary_blob_mut` turns a v1 blob into
+/// `LargeBinary` too but leaves it marked only by `BLOB_META_KEY`, never the v2
+/// extension name. For anything sizing a row that distinction does not matter:
+/// both are a payload that can be megabytes where the ordinary binary estimate
+/// says 72 bytes. Descriptor views are excluded by the `LargeBinary` test, and
+/// they really are small.
+pub fn schema_has_binary_blob_payload(schema: &Schema) -> bool {
+    schema.fields.iter().any(field_has_binary_blob_payload)
+}
+
 fn blob_v2_descriptor_field(mut field: LanceField) -> LanceField {
     if is_blob_v2_binary_view(&field) {
         field.unloaded_mut();

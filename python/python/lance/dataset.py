@@ -786,18 +786,20 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
                   RepartitionExec: ...
-                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
                         DataSourceExec: ..., metrics=[]
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
 
         The reported plan follows how the source was passed. `new_data` above is a
         `pa.Table`, so it is wrapped in an in-memory table that reports exact
-        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
-        which side of the join to collect from those statistics and from the two
-        sides' sizes, so the same merge can plan differently depending on which one
-        you hand it. Use `explain_plan` only for the streaming shape: it takes a
-        schema rather than data, so it cannot know how the source would be wrapped.
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion picks
+        the side it collects from those statistics and from the two sides' sizes.
+        The target here is three rows, so it is the collected side either way; with
+        a larger target the same merge can plan differently depending on which
+        source you hand it. Use `explain_plan` only for the streaming shape: it
+        takes a schema rather than data, so it cannot know how the source would be
+        wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes

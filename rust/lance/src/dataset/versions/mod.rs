@@ -93,6 +93,23 @@ pub fn create_scan_stream(
     }
 }
 
+/// Whether a scan stream of `version` applies the offset range it is handed.
+///
+/// [`LanceStream::try_new_v1`] takes the range as `_offsets` and reads every row,
+/// leaving a `GlobalLimitExec` above it to apply the limit; only the v2 readers
+/// restrict the read themselves. A caller reasoning about how many rows a scan
+/// produces has to know which of the two it built, so this sits beside
+/// [`create_scan_stream`], the match that decides.
+pub fn scan_applies_its_own_range(version: ConcreteFileVersion) -> bool {
+    match version {
+        ConcreteFileVersion::V1 => false,
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => true,
+    }
+}
+
 pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOptions {
     match version {
         ConcreteFileVersion::V1 => SchemaCompareOptions {
