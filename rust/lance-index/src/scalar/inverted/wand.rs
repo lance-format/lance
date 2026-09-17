@@ -1801,6 +1801,82 @@ fn score_sum_cannot_compete(
 
 type ScoreContribution = ((u32, u32), f32);
 
+/// Largest `f32` partial score that `score_sum_cannot_compete` still rejects
+/// under the exclusive floor, given the other clauses' upper bound. The
+/// rejection predicate is monotone in the partial score, so every score at or
+/// below the returned limit is rejected and every score above it competes.
+/// Returns `None` when no finite score is rejected.
+fn exclusive_partial_score_limit(
+    remaining_upper_bound: f64,
+    floor: f32,
+    upper_bound_factor: f64,
+) -> Option<f32> {
+    let rejects = |score: f32| {
+        score_sum_cannot_compete(
+            score,
+            remaining_upper_bound,
+            floor,
+            upper_bound_factor,
+            CompetitiveFloorMode::Exclusive,
+        )
+    };
+    if !remaining_upper_bound.is_finite() || !floor.is_finite() {
+        return None;
+    }
+    // Start from the real-valued boundary and walk at most a few ULPs to the
+    // exact f32 boundary of the (monotone) predicate.
+    let mut limit = ((f64::from(floor) / upper_bound_factor) - remaining_upper_bound) as f32;
+    if !limit.is_finite() {
+        return None;
+    }
+    if rejects(limit) {
+        for _ in 0..8 {
+            let up = next_up_f32(limit);
+            if up == limit || !rejects(up) {
+                return Some(limit);
+            }
+            limit = up;
+        }
+    } else {
+        for _ in 0..8 {
+            let down = next_down_f32(limit);
+            if down == limit {
+                return None;
+            }
+            if rejects(down) {
+                return Some(down);
+            }
+            limit = down;
+        }
+    }
+    // The walk did not converge (pathological inputs); fall back to an exact
+    // binary search over the ordered f32 bit patterns.
+    let mut lo = f32::MIN;
+    let mut hi = f32::MAX;
+    if !rejects(lo) {
+        return None;
+    }
+    if rejects(hi) {
+        return Some(hi);
+    }
+    for _ in 0..64 {
+        let mid = f32::from_bits(((lo.to_bits() as i64 + hi.to_bits() as i64) / 2) as u32);
+        if mid == lo || mid == hi {
+            break;
+        }
+        if rejects(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
+fn next_down_f32(value: f32) -> f32 {
+    -next_up_f32(-value)
+}
+
 #[inline]
 fn score_contributions_in_query_order(mut contributions: SmallVec<[ScoreContribution; 8]>) -> f32 {
     if !contributions
@@ -4237,6 +4313,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // candidate still goes through the exact per-candidate prune below.
         const FREQ_LUT_BUCKETS: usize = 64;
         let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
+        // Exclusive limit on the first clause's partial score for the current
+        // window: scores at or below it cannot beat the floor. Recomputed only
+        // when the floor or the followers' block maxes change.
+        let mut first_score_limit: Option<f32> = None;
+        let mut first_score_limit_key: Option<(u32, u64)> = None;
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
@@ -4363,15 +4444,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     let freq_bound_lut = freq_bound_lut
                         .as_ref()
                         .expect("positive threshold should initialize the frequency bound LUT");
-                    std::array::from_fn(|frequency| {
-                        score_sum_cannot_compete(
-                            freq_bound_lut[frequency],
-                            others_block_max.expect("positive floor should initialize bounds"),
+                    let others_block_max =
+                        others_block_max.expect("positive floor should initialize bounds");
+                    let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                    if first_score_limit_key != Some(key) {
+                        first_score_limit = exclusive_partial_score_limit(
+                            others_block_max,
                             self.threshold,
                             score_sum_upper_bound_factor(num_lists),
-                            CompetitiveFloorMode::Exclusive,
-                        )
-                    })
+                        );
+                        first_score_limit_key = Some(key);
+                    }
+                    match first_score_limit {
+                        Some(limit) => {
+                            std::array::from_fn(|frequency| freq_bound_lut[frequency] <= limit)
+                        }
+                        None => [false; FREQ_LUT_BUCKETS],
+                    }
                 } else {
                     [false; FREQ_LUT_BUCKETS]
                 };
@@ -4522,13 +4611,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             None => self.lead[0].score(&self.scorer, first_freq, doc_length),
                         };
-                        if score_sum_cannot_compete(
-                            first_score,
-                            others_block_max,
-                            self.threshold,
-                            score_sum_upper_bound_factor(num_lists),
-                            CompetitiveFloorMode::Exclusive,
-                        ) {
+                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                        if first_score_limit_key != Some(key) {
+                            first_score_limit = exclusive_partial_score_limit(
+                                others_block_max,
+                                self.threshold,
+                                score_sum_upper_bound_factor(num_lists),
+                            );
+                            first_score_limit_key = Some(key);
+                        }
+                        if first_score_limit.is_some_and(|limit| first_score <= limit) {
                             continue;
                         }
                     }
@@ -5891,6 +5983,100 @@ fn next_up_f64(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `exclusive_partial_score_limit` must agree with `score_sum_cannot_compete`
+    /// for every f32 partial score: scores at or below the limit are rejected,
+    /// scores above it compete. Sweeps ULP neighbourhoods of the boundary plus
+    /// coarse samples, over floors, remaining bounds and clause counts.
+    #[test]
+    fn exclusive_partial_score_limit_matches_predicate() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0usize;
+        for case in 0..2_000 {
+            let floor = if case % 7 == 0 {
+                f32::from_bits((next() as u32) & 0x7F7F_FFFF)
+            } else {
+                (next() % 10_000) as f32 / 37.0 + 1e-6
+            };
+            let remaining = if case % 5 == 0 {
+                f64::from(f32::from_bits((next() as u32) & 0x7F7F_FFFF))
+            } else {
+                (next() % 10_000) as f64 / 41.0
+            };
+            let num_lists = 2 + (next() % 6) as usize;
+            let factor = score_sum_upper_bound_factor(num_lists);
+            let rejects = |score: f32| {
+                score_sum_cannot_compete(
+                    score,
+                    remaining,
+                    floor,
+                    factor,
+                    CompetitiveFloorMode::Exclusive,
+                )
+            };
+            let limit = exclusive_partial_score_limit(remaining, floor, factor);
+            let mut probes = vec![
+                0.0_f32,
+                f32::MIN_POSITIVE,
+                floor,
+                f32::MAX,
+                f32::MIN,
+                ((f64::from(floor) / factor) - remaining) as f32,
+            ];
+            if let Some(limit) = limit {
+                let mut up = limit;
+                let mut down = limit;
+                for _ in 0..4 {
+                    probes.push(up);
+                    probes.push(down);
+                    up = next_up_f32(up);
+                    down = next_down_f32(down);
+                }
+            }
+            for _ in 0..16 {
+                probes.push(f32::from_bits((next() as u32) & 0x7F7F_FFFF));
+            }
+            for score in probes {
+                let expected = rejects(score);
+                let actual = limit.is_some_and(|limit| score <= limit);
+                assert_eq!(
+                    expected, actual,
+                    "score={score:?} limit={limit:?} floor={floor:?} remaining={remaining:?} num_lists={num_lists}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50_000);
+    }
+
+    #[test]
+    fn exclusive_partial_score_limit_handles_non_finite_inputs() {
+        let factor = score_sum_upper_bound_factor(3);
+        assert_eq!(
+            exclusive_partial_score_limit(f64::INFINITY, 1.0, factor),
+            None
+        );
+        assert_eq!(exclusive_partial_score_limit(1.0, f32::NAN, factor), None);
+        assert_eq!(
+            exclusive_partial_score_limit(1.0, f32::INFINITY, factor),
+            None
+        );
+        // A floor no partial score can fail to beat rejects nothing.
+        let limit = exclusive_partial_score_limit(1.0e30, 1.0, factor);
+        assert!(limit.is_none_or(|limit| !score_sum_cannot_compete(
+            next_up_f32(limit),
+            1.0e30,
+            1.0,
+            factor,
+            CompetitiveFloorMode::Exclusive
+        )));
+    }
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
