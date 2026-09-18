@@ -11,7 +11,7 @@ use arrow_array::{
 
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use log::trace;
 
 use crate::{
@@ -152,7 +152,7 @@ pub struct BinaryArrayDecoder {
 }
 
 impl BinaryArrayDecoder {
-    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef {
+    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> Result<ArrayRef> {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
@@ -160,11 +160,16 @@ impl BinaryArrayDecoder {
             .inner()
             .clone();
         let offsets = array.offsets().clone();
-        Arc::new(GenericByteArray::<T>::new(
-            offsets,
-            values,
-            array.nulls().cloned(),
-        ))
+        let array = GenericByteArray::<T>::try_new(offsets, values, array.nulls().cloned())
+            .map_err(|err| {
+                Error::not_supported(format!(
+                    "Could not create array with more than 2GiB of string/binary data in a \
+                     single batch. Please reduce the batch_size, set LANCE_DEFAULT_BATCH_SIZE \
+                     to a smaller value, or convert the column to large_string/large_binary. \
+                     Arrow error: {err}"
+                ))
+            })?;
+        Ok(Arc::new(array))
     }
 }
 
@@ -173,10 +178,12 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         let data_type = self.data_type;
         let (arr, _) = self.inner.decode()?;
         let result = match data_type {
-            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>()),
-            DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
-            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
-            DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
+            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>())?,
+            DataType::LargeBinary => {
+                Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>())?
+            }
+            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())?,
+            DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>())?,
             _ => panic!("Binary decoder does not support this data type"),
         };
         // data_size is only tracked in the v2.1 structural decode path; the v2.0 array

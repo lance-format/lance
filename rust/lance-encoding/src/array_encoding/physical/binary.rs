@@ -30,7 +30,7 @@ use crate::{
 
 use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
-use lance_core::Result;
+use lance_core::{Error, Result};
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -315,14 +315,36 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         // Normalize and cast (TODO: could fuse these into one pass for micro-optimization)
         let target_vec = target_offsets.values();
         let start = target_vec[0];
-        let offsets_buffer =
-            match bytes_per_offset {
-                4 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i32))
-                    .into_inner(),
-                8 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i64))
-                    .into_inner(),
-                _ => panic!("Unsupported offsets type"),
-            };
+        let end = *target_vec.last().unwrap();
+        let offsets_buffer = match bytes_per_offset {
+            4 => {
+                let num_bytes = end - start;
+                if num_bytes > i32::MAX as u64 {
+                    return Err(Error::not_supported(format!(
+                        "Could not create array with more than 2GiB of string/binary data in a \
+                         single batch ({} rows would require {} bytes). Please reduce the \
+                         batch_size, set LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert \
+                         the column to large_string/large_binary.",
+                        num_rows, num_bytes
+                    )));
+                }
+                ScalarBuffer::from(
+                    target_vec
+                        .iter()
+                        .map(|&offset| i32::try_from(offset - start).expect("checked above"))
+                        .collect::<Vec<_>>(),
+                )
+                .into_inner()
+            }
+            8 => ScalarBuffer::from(
+                target_vec
+                    .iter()
+                    .map(|&offset| i64::try_from(offset - start).expect("u64 offsets fit in i64"))
+                    .collect::<Vec<_>>(),
+            )
+            .into_inner(),
+            _ => panic!("Unsupported offsets type"),
+        };
 
         let bytes_to_skip = self.decoded_indices.value(rows_to_skip as usize);
         let num_bytes = self
@@ -538,6 +560,20 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct EmptyBytesDecoder;
+
+    impl PrimitivePageDecoder for EmptyBytesDecoder {
+        fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 8,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
     #[test]
     fn test_encode_indices_adjusts_nulls() {
         // Null entries in string arrays should be adjusted
@@ -567,5 +603,27 @@ mod tests {
             LanceBuffer::reinterpret_vec(vec![7_u64, 3, 6, 13, 13, 13])
         );
         assert_eq!(null_adjustment, 7);
+    }
+
+    #[test]
+    fn test_binary_overflow_error_is_actionable() {
+        let num_rows = 1;
+        let start = 100_u64;
+        let end = start + i32::MAX as u64 + 1;
+        let decoded_indices = UInt64Array::from(vec![start, end]);
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true]),
+            offsets_type: DataType::Int32,
+            bytes_decoder: Box::new(EmptyBytesDecoder),
+        };
+
+        let error = decoder.decode(0, num_rows).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains("more than 2GiB of string/binary data"));
+        assert!(message.contains("batch_size"));
+        assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
+        assert!(message.contains("large_string/large_binary"));
     }
 }
