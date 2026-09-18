@@ -1849,6 +1849,33 @@ def test_knn_with_deletions(tmp_path):
     assert expected == [r.as_py() for r in results]
 
 
+@pytest.mark.parametrize("uncommitted", [False, True], ids=["committed", "uncommitted"])
+def test_create_index_warns_for_ignored_index_cache_size(tmp_path, uncommitted):
+    dataset = lance.write_dataset(create_table(nvec=64, ndim=4), tmp_path / "test")
+
+    with pytest.warns(
+        DeprecationWarning, match="index_cache_size.*ignored"
+    ) as warning_records:
+        if uncommitted:
+            fragment_id = dataset.get_fragments()[0].fragment_id
+            dataset.create_index_uncommitted(
+                "id",
+                index_type="BTREE",
+                fragment_ids=[fragment_id],
+                index_cache_size=10,
+            )
+        else:
+            dataset.create_index(
+                "vector",
+                index_type="IVF_FLAT",
+                num_partitions=1,
+                index_cache_size=10,
+            )
+
+    assert len(warning_records) == 1
+    assert warning_records[0].filename == __file__
+
+
 def test_index_cache_size(tmp_path):
     rng = np.random.default_rng(seed=42)
 
