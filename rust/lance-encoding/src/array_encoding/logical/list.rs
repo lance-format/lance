@@ -1361,6 +1361,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_list_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::Int32, false),
+            8..32,
+            16,
+            i32::MAX as u64 + 1,
+        );
+        let message = error.to_string();
+        assert!(message.contains("list array"));
+        assert!(message.contains("more than i32::MAX items"));
+        assert!(message.contains("rows 8..16 fit"));
+        assert!(message.contains("requesting rows 8..32"));
+    }
+
+    #[test]
     fn list_decoder_overflow_reports_row_span() {
         let mut decoder = ListPageDecoder {
             unloaded: None,
