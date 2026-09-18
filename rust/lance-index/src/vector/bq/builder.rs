@@ -27,7 +27,7 @@ use crate::vector::bq::transform::{
 use crate::vector::bq::{
     RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
     rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
-    validate_rq_num_bits,
+    validate_rq_distance_type, validate_rq_num_bits,
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
@@ -748,9 +748,10 @@ impl Quantization for RabitQuantizer {
 
     fn build(
         data: &dyn Array,
-        _: lance_linalg::distance::DistanceType,
+        distance_type: lance_linalg::distance::DistanceType,
         params: &Self::BuildParams,
     ) -> Result<Self> {
+        validate_rq_distance_type(distance_type)?;
         validate_rq_num_bits(params.num_bits)?;
 
         let dim = data.as_fixed_size_list().value_length() as usize;
@@ -1186,6 +1187,24 @@ mod tests {
                 .contains("vector dimension must be divisible by 8 for IVF_RQ"),
             "{}",
             err
+        );
+    }
+
+    #[test]
+    fn test_rabit_quantizer_rejects_hamming_distance() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+
+        let err =
+            RabitQuantizer::build(&fsl, DistanceType::Hamming, &RQBuildParams::new(1)).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("IVF_RQ does not support distance_type=hamming"),
+            "{err}"
         );
     }
 
