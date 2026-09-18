@@ -697,13 +697,7 @@ async fn rebuild_vector_segment(
 }
 
 /// True when a segment carries only its definition, so there is nothing to open
-/// and nothing to append to.
-///
-/// Both fields have to say so themselves: an absent file list or bitmap records
-/// that the segment was never measured, not that it is empty, and such a
-/// segment may still have an index file on disk.
-/// Whether a segment has no index data behind it, so training is the work it
-/// is waiting for.
+/// and nothing to append to: training is the work it is waiting for.
 ///
 /// Both halves carry weight. Coverage alone is not enough: a segment
 /// initialized from another dataset's model holds centroids while covering no
