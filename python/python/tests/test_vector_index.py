@@ -213,26 +213,6 @@ def test_flat(dataset):
 )
 def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     k = 5
-    query_count = queries.shape[0]
-
-    batch = dataset.to_table(
-        columns=["id"],
-        nearest={
-            "column": "vector",
-            "q": queries,
-            "k": k,
-            "use_index": False,
-        },
-    )
-
-    assert batch.num_rows == query_count * k
-    assert batch.column_names == ["query_index", "id", "_distance"]
-    query_index_field = batch.schema.field("query_index")
-    assert query_index_field.type == pa.int32()
-    assert not query_index_field.nullable
-    expected_query_index = sum([[i] * k for i in range(query_count)], [])
-    assert batch["query_index"].to_pylist() == expected_query_index
-
     _assert_batch_matches_single_queries(
         dataset,
         queries,
@@ -263,18 +243,42 @@ def test_batch_indexed_query_matches_repeated_single_queries(
     # nprobes covers every partition so the shared-scan batch path and the
     # repeated single-query path search the same partitions deterministically.
     nearest_kwargs = {"use_index": True, "nprobes": 4}
-    batch = indexed.to_table(
-        columns=["id"],
-        nearest={"column": "vector", "q": queries, "k": k, **nearest_kwargs},
-    )
-
-    assert batch.column_names == ["query_index", "id", "_distance"]
-    assert batch["query_index"].to_pylist() == sum(
-        [[i] * k for i in range(query_count)], []
-    )
-
     _assert_batch_matches_single_queries(
         indexed,
+        queries,
+        k=k,
+        nearest_kwargs=nearest_kwargs,
+    )
+
+
+@pytest.mark.parametrize("query_count", [1, 2])
+@pytest.mark.parametrize("use_index", [False, True])
+def test_batch_binary_query_matches_repeated_single_queries(
+    tmp_path, query_count, use_index
+):
+    vectors = np.array([[0, 0], [255, 0], [0, 255], [255, 255]], dtype=np.uint8)
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(len(vectors)), type=pa.int32()),
+                "vector": pa.array(vectors.tolist(), type=pa.list_(pa.uint8(), 2)),
+            }
+        ),
+        tmp_path,
+    )
+    if use_index:
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_FLAT",
+            num_partitions=1,
+            metric="hamming",
+        )
+
+    queries = np.array([[0, 0], [255, 255]], dtype=np.uint8)[:query_count]
+    k = 2
+    nearest_kwargs = {"metric": "hamming", "use_index": use_index}
+    _assert_batch_matches_single_queries(
+        dataset,
         queries,
         k=k,
         nearest_kwargs=nearest_kwargs,
@@ -291,6 +295,16 @@ def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
             **nearest_kwargs,
         },
     )
+    query_count = len(queries)
+    assert batch.num_rows == query_count * k
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    query_index_field = batch.schema.field("query_index")
+    assert query_index_field.type == pa.int32()
+    assert not query_index_field.nullable
+    assert batch["query_index"].to_pylist() == sum(
+        [[i] * k for i in range(query_count)], []
+    )
+
     if "distance_range" in nearest_kwargs:
         lo, hi = nearest_kwargs["distance_range"]
         assert all(lo <= d < hi for d in batch["_distance"].to_pylist())
