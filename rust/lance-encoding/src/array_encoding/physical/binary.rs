@@ -642,4 +642,26 @@ mod tests {
         assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
         assert!(message.contains("large_string/large_binary"));
     }
+
+    #[test]
+    fn test_large_binary_overflow_error_is_actionable() {
+        let num_rows = 1;
+        let start = 100_u64;
+        let end = start + i64::MAX as u64 + 1;
+        let decoded_indices = UInt64Array::from(vec![start, end]);
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true]),
+            offsets_type: DataType::Int64,
+            bytes_decoder: Box::new(EmptyBytesDecoder),
+        };
+
+        let error = decoder.decode(0, num_rows).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains("large_string/large_binary"));
+        assert!(message.contains("exceeds i64::MAX"));
+        assert!(message.contains("batch_size"));
+        assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
+    }
 }
