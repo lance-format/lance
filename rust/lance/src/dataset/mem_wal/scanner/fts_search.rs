@@ -214,10 +214,9 @@ fn validate_source_document_granularities(
 
 /// Reject the query shapes the active memtable arm cannot evaluate.
 ///
-/// Only two remain. A fuzzy Match cannot also require every term: the fuzzy
-/// path expands each term independently and unions the expansions. And
-/// multi-match spans columns, while the memtable holds one inverted index per
-/// column, so there is no single index to search.
+/// Only one remains: a fuzzy Match cannot also require every term, because the
+/// fuzzy path expands each term independently and unions the expansions. A
+/// multi-match is checked leaf by leaf under the same rule.
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     fn visit(query: &IndexFtsQuery) -> Result<()> {
         match query {
@@ -379,23 +378,29 @@ enum FtsPlanShape {
     /// One predicate, evaluated whole by every source against these columns.
     /// Usually one; several when the tree's leaves name different fields.
     Bound(Vec<String>),
-    /// A top-level multi-match: one independent search per leaf, unioned and
-    /// collapsed to the best hit per row.
+    /// A top-level multi-match spanning columns: one independent search per
+    /// leaf, unioned and collapsed to the best hit per row.
     PerColumn(Vec<(String, IndexFtsQuery)>),
 }
 
 /// Decide how `query` reaches the columns it names.
 ///
-/// A top-level multi-match decomposes: its leaves are independent matches —
-/// usually one per column, but a column may carry several — which is exactly
-/// what the base-table path scores separately before taking the best per row.
-/// Every other shape spanning columns is *one* predicate over several fields —
-/// `must: [a in title, b in body]` is a conjunction, not a union of per-column
-/// results — so it stays whole and each source evaluates it across all of them.
+/// A top-level multi-match spanning columns decomposes: its leaves are
+/// independent matches — usually one per column, but a column may carry
+/// several — which is exactly what the base-table path scores separately
+/// before taking the best per row. Naming one column, it is a single-index
+/// query like any other and stays bound: the memtable scores it as a
+/// best-child node and the dataset scanner keeps it on its compound scorer, so
+/// it needs no primary key to collapse by. Every other shape spanning columns
+/// is *one* predicate over several fields — `must: [a in title, b in body]` is
+/// a conjunction, not a union of per-column results — so it stays whole and
+/// each source evaluates it across all of them.
 fn fts_plan_shape(query: &IndexFtsQuery) -> Result<FtsPlanShape> {
+    let columns = collect_query_columns(query);
     if let IndexFtsQuery::MultiMatch(multi) = query {
-        // Collapsing the arms to one row per primary key drops list elements,
-        // however many columns the leaves name.
+        // Row documents only, whatever the column count: the dataset scanner
+        // refuses element documents for any multi-match, and collapsing arms
+        // per primary key would drop elements anyway.
         if requested_query_document_granularity(query)?
             .is_some_and(|granularity| granularity.is_list_element())
         {
@@ -403,6 +408,9 @@ fn fts_plan_shape(query: &IndexFtsQuery) -> Result<FtsPlanShape> {
                 "multi-match full-text search supports row documents only, not list elements"
                     .to_string(),
             ));
+        }
+        if columns.len() <= 1 {
+            return Ok(FtsPlanShape::Bound(columns));
         }
         return multi
             .match_queries
@@ -419,7 +427,6 @@ fn fts_plan_shape(query: &IndexFtsQuery) -> Result<FtsPlanShape> {
             .collect::<Result<Vec<_>>>()
             .map(FtsPlanShape::PerColumn);
     }
-    let columns = collect_query_columns(query);
     if columns.len() <= 1 {
         return Ok(FtsPlanShape::Bound(columns));
     }
@@ -2168,9 +2175,18 @@ mod tests {
         );
     }
 
+    /// A single-column multi-match takes the same bound path as a plain match:
+    /// without a primary key there is nothing to collapse by, and nothing that
+    /// needs collapsing.
+    #[rstest::rstest]
+    #[case::match_query(false)]
+    #[case::single_column_multi_match(true)]
     #[tokio::test]
-    async fn active_filtered_search_without_pk_applies_small_limit_after_filter() {
+    async fn active_filtered_search_without_pk_applies_small_limit_after_filter(
+        #[case] multi_match: bool,
+    ) {
         use datafusion::prelude::{col, lit};
+        use lance_index::scalar::inverted::query::MultiMatchQuery;
 
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
@@ -2205,14 +2221,17 @@ mod tests {
 
         let planner = LsmFtsSearchPlanner::new(collector, vec![], schema)
             .with_filter(Some(col("id").gt_eq(lit(1i32))));
+        let query = if multi_match {
+            FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+                MultiMatchQuery::try_new("lance".to_string(), vec!["text".to_string()]).unwrap(),
+            ))
+        } else {
+            FullTextSearchQuery::new("lance".to_string())
+                .with_column("text".to_string())
+                .unwrap()
+        };
         let plan = planner
-            .plan_search(
-                FullTextSearchQuery::new("lance".to_string())
-                    .with_column("text".to_string())
-                    .unwrap(),
-                Some(2),
-                None,
-            )
+            .plan_search(query, Some(2), None)
             .await
             .expect("planner should produce an active-only filtered plan");
 
@@ -2945,30 +2964,45 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
-    /// A multi-match decomposes per leaf whatever columns its leaves name — a
-    /// column may carry several — rather than taking the single-column bound
-    /// path, which evaluates the query whole.
-    #[test]
-    fn multi_match_plans_one_arm_per_leaf_even_on_one_column() {
+    /// A multi-match decomposes per leaf only when its leaves span columns.
+    /// Naming one column — through however many leaves — it is a single-index
+    /// query and stays on the bound path, which needs no primary key.
+    #[rstest::rstest]
+    #[case::one_leaf(vec!["text"], false)]
+    #[case::two_leaves_one_column(vec!["text", "text"], false)]
+    #[case::one_leaf_per_column(vec!["title", "body"], true)]
+    #[case::mixed(vec!["title", "title", "body"], true)]
+    fn multi_match_decomposes_only_when_it_spans_columns(
+        #[case] leaves: Vec<&str>,
+        #[case] spans_columns: bool,
+    ) {
         use lance_index::scalar::inverted::query::MultiMatchQuery;
 
         let multi = MultiMatchQuery::try_new(
             "lance".to_string(),
-            vec!["text".to_string(), "text".to_string()],
+            leaves.iter().map(|leaf| leaf.to_string()).collect(),
         )
-        .unwrap()
-        .try_with_boosts(vec![1.0, 2.0])
         .unwrap();
-        let shape = fts_plan_shape(&IndexFtsQuery::MultiMatch(multi)).unwrap();
-        let FtsPlanShape::PerColumn(arms) = shape else {
-            panic!("expected one arm per leaf");
-        };
-        assert_eq!(arms.len(), 2);
-        assert!(arms.iter().all(|(column, _)| column == "text"));
+        match fts_plan_shape(&IndexFtsQuery::MultiMatch(multi)).unwrap() {
+            FtsPlanShape::Bound(columns) => {
+                assert!(!spans_columns, "expected one arm per leaf for {leaves:?}");
+                assert_eq!(columns, vec![leaves[0].to_string()]);
+            }
+            FtsPlanShape::PerColumn(arms) => {
+                assert!(spans_columns, "expected the bound path for {leaves:?}");
+                assert_eq!(
+                    arms.iter()
+                        .map(|(column, _)| column.as_str())
+                        .collect::<Vec<_>>(),
+                    leaves
+                );
+            }
+        }
     }
 
-    /// Two leaves on one column plan as two arms whose hits collapse to the
-    /// best per row — the same rows and scores as the dominating leaf alone.
+    /// Two leaves on one column evaluate whole on the bound path, each row
+    /// scored by its best leaf — the same rows and scores as the dominating
+    /// leaf alone.
     #[tokio::test]
     async fn single_column_multi_match_scores_each_row_by_its_best_leaf() {
         use lance_index::scalar::inverted::query::MultiMatchQuery;
