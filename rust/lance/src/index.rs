@@ -6353,12 +6353,7 @@ mod tests {
         // 256-code quantizer, so there is nothing to cover yet.
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(segment_covers_nothing(&indices[0]));
         // Every fragment is still unindexed, which is what optimize will pick
         // up once the column can train.
         let unindexed = dataset.unindexed_fragments("vector_idx").await.unwrap();
@@ -6384,18 +6379,22 @@ mod tests {
         // Trained, not degraded: 300 rows clear the 256-code PQ floor.
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert!(
-            !indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(!segment_covers_nothing(&indices[0]));
 
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
     }
 
     /// Partition counts for a trained logical vector index, one per segment.
+    /// Whether a segment covers no rows, which is how a definition reads back
+    /// from the manifest.
+    fn segment_covers_nothing(index: &IndexMetadata) -> bool {
+        index
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(roaring::RoaringBitmap::is_empty)
+    }
+
     async fn trained_partitions(dataset: &Dataset) -> Vec<usize> {
         dataset
             .open_logical_vector_index("vector", "vector_idx")
@@ -6430,10 +6429,7 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3000);
         let indices = dataset.load_indices().await.unwrap();
         assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            segment_covers_nothing(&indices[0]),
             "writing rows leaves the index a definition"
         );
 
@@ -6449,10 +6445,7 @@ mod tests {
             "training supersedes the definition rather than adding a delta to it"
         );
         assert!(
-            !indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            !segment_covers_nothing(&indices[0]),
             "3,000 vectors clear the floor, so the append trains the column"
         );
         // Sized from the 3,000 vectors present, not the 2 the request named.
@@ -6543,10 +6536,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            segment_covers_nothing(&indices[0]),
             "100 vectors cannot train a 256-code quantizer, so nothing is covered yet"
         );
 
@@ -6586,10 +6576,7 @@ mod tests {
             let indices = dataset.load_indices().await.unwrap();
             assert_eq!(indices.len(), 1);
             assert!(
-                indices[0]
-                    .fragment_bitmap
-                    .as_ref()
-                    .is_some_and(roaring::RoaringBitmap::is_empty),
+                segment_covers_nothing(&indices[0]),
                 "100 vectors still cannot train a 256-code quantizer"
             );
         }
@@ -6629,10 +6616,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            segment_covers_nothing(&indices[0]),
             "the index should still be a definition covering nothing"
         );
     }
@@ -6722,10 +6706,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            segment_covers_nothing(&indices[0]),
             "100 vectors cannot train a 256-code quantizer"
         );
     }
@@ -6762,12 +6743,7 @@ mod tests {
 
         // Degraded: 100 rows cannot train a 256-code quantizer.
         let indices = dataset.load_indices().await.unwrap();
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(segment_covers_nothing(&indices[0]));
 
         // 100 -> 500 across two fragments, clearing the floor.
         let mut dataset = append_vectors(test_dir.path(), 400).await;
@@ -6813,12 +6789,9 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
-        assert!(
-            dataset.load_indices().await.unwrap()[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(segment_covers_nothing(
+            &dataset.load_indices().await.unwrap()[0]
+        ));
 
         let query = vec![0.0_f32; 16];
         let results = dataset
@@ -6904,10 +6877,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert!(
-            !indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
+            !segment_covers_nothing(&indices[0]),
             "should have trained and covered the table"
         );
     }
@@ -6944,10 +6914,7 @@ mod tests {
 
             let indices = dataset.load_indices().await.unwrap();
             assert_eq!(indices.len(), 1, "{why}");
-            let covers_nothing = indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty);
+            let covers_nothing = segment_covers_nothing(&indices[0]);
             assert_eq!(!covers_nothing, trains, "{why}");
         }
     }
@@ -7094,12 +7061,7 @@ mod tests {
         // Still 100 vectors, so still a definition.
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(segment_covers_nothing(&indices[0]));
     }
 
     /// A table that shrinks below the training threshold keeps working.
@@ -7191,12 +7153,7 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
+        assert!(segment_covers_nothing(&indices[0]));
 
         // Reopening has to find the same definition: it is carried by the
         // manifest, not by a file on disk.
