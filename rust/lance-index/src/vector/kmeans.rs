@@ -3,10 +3,11 @@
 
 //! KMeans implementation for Apache Arrow Arrays.
 //!
-//! Support ``l2``, ``cosine`` and ``dot`` distances, see [DistanceType].
+//! Supports ``l2`` and ``dot`` over float vectors and ``hamming`` over
+//! ``uint8`` vectors, see [DistanceType].
 //!
-//! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
-//! and run ``l2`` distance on the unit vectors.
+//! ``Cosine`` is not supported: callers normalize the vectors to unit length
+//! and train with ``l2``.
 //!
 
 use core::f32;
@@ -906,18 +907,36 @@ impl KMeans {
             )));
         }
 
+        // Before the optional centroid index is built, not after: the index is
+        // built from `self.distance_type`, and HNSW construction panics on a
+        // metric its kernels do not implement, which would beat the dispatch
+        // below to the rejection.
+        let combination = (
+            data.value_type(),
+            self.centroids.data_type().clone(),
+            self.distance_type,
+        );
+        match &combination {
+            (DataType::Float16, DataType::Float16, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::Float32, DataType::Float32, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::Float64, DataType::Float64, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::UInt8, DataType::UInt8, DistanceType::Hamming) => {}
+            (value_type, centroid_type, distance_type) => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "KMeans: can not compute membership for data type {} with centroid type {} and distance type {}",
+                    value_type, centroid_type, distance_type
+                )));
+            }
+        }
+
         let index = SimpleIndex::may_train_index(
             self.centroids.clone(),
             self.dimension,
             self.distance_type,
         )
         .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-        match (
-            data.value_type(),
-            self.centroids.data_type(),
-            self.distance_type,
-        ) {
-            (DataType::Float16, DataType::Float16, _) => {
+        match combination {
+            (DataType::Float16, DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float16Type>().values();
                 let centroids = self.centroids.as_primitive::<Float16Type>().values();
                 Ok(KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
@@ -930,7 +949,7 @@ impl KMeans {
                     index.as_ref(),
                 ))
             }
-            (DataType::Float32, DataType::Float32, _) => {
+            (DataType::Float32, DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float32Type>().values();
                 let centroids = self.centroids.as_primitive::<Float32Type>().values();
                 Ok(KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
@@ -943,7 +962,7 @@ impl KMeans {
                     index.as_ref(),
                 ))
             }
-            (DataType::Float64, DataType::Float64, _) => {
+            (DataType::Float64, DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float64Type>().values();
                 let centroids = self.centroids.as_primitive::<Float64Type>().values();
                 Ok(KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
@@ -1522,7 +1541,8 @@ impl KMeans {
 
     /// Train a [`KMeans`] model with full parameters.
     ///
-    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
+    /// `Cosine` is not supported here: callers must normalize the input
+    /// vectors themselves and train with [`DistanceType::L2`].
     pub fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
@@ -1543,18 +1563,21 @@ impl KMeans {
         if k > 256 && params.hierarchical_k > 1 {
             log::debug!("Using hierarchical clustering for k={}", k);
             return match (data.value_type(), params.distance_type) {
-                (DataType::Float16, _) => Self::train_hierarchical_kmeans::<
-                    Float16Type,
-                    KMeansAlgoFloat<Float16Type>,
-                >(data, k, params),
-                (DataType::Float32, _) => Self::train_hierarchical_kmeans::<
-                    Float32Type,
-                    KMeansAlgoFloat<Float32Type>,
-                >(data, k, params),
-                (DataType::Float64, _) => Self::train_hierarchical_kmeans::<
-                    Float64Type,
-                    KMeansAlgoFloat<Float64Type>,
-                >(data, k, params),
+                (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(
+                        data, k, params,
+                    )
+                }
                 (DataType::UInt8, DistanceType::Hamming) => {
                     Self::train_hierarchical_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
                 }
@@ -1567,14 +1590,14 @@ impl KMeans {
         }
 
         match (data.value_type(), params.distance_type) {
-            (DataType::Float16, _) => {
+            (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
             }
 
-            (DataType::Float32, _) => {
+            (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
             }
-            (DataType::Float64, _) => {
+            (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
             }
             (DataType::UInt8, DistanceType::Hamming) => {
@@ -2001,6 +2024,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_kmeans_rejects_cosine_and_hamming_for_floats() {
+        // Cosine/Hamming used to be accepted by the float dispatch arms and
+        // then hit a panic in the first membership pass; they must be
+        // rejected up front (callers normalize cosine input and train L2).
+        let dimension = 8;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        for distance_type in [DistanceType::Cosine, DistanceType::Hamming] {
+            let params = KMeansParams {
+                distance_type,
+                max_iters: 1,
+                ..KMeansParams::default()
+            };
+            let err = KMeans::new_with_params(&data, 2, &params).unwrap_err();
+            assert!(
+                err.to_string().contains("can not train"),
+                "expected rejection for {distance_type}, got: {err}"
+            );
+        }
+
+        // The hierarchical dispatch (k > 256 with default hierarchical_k)
+        // is a separate match that used to keep the wildcard arms.
+        let dimension = 8;
+        let values: Vec<f32> = (0..257 * dimension).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        let params = KMeansParams {
+            distance_type: DistanceType::Cosine,
+            max_iters: 1,
+            ..KMeansParams::default()
+        };
+        let err = KMeans::new_with_params(&data, 257, &params).unwrap_err();
+        assert!(err.to_string().contains("can not train"), "got: {err}");
+    }
+
+    /// Assignment dispatches on the same triple as training, so it has to
+    /// reject the same combinations: a caller that builds a cosine model with
+    /// `with_centroids` used to reach the panic through this path instead.
+    ///
+    /// The rejection has to happen before the optional centroid index is built.
+    /// This test only covers that ordering when the index is actually built,
+    /// which the default `Auto` mode does not do at this size: run it with
+    /// `LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled` to exercise that path, where
+    /// validating after the build panics in the HNSW kernels instead.
+    #[test]
+    fn test_compute_membership_rejects_cosine_and_hamming_for_floats() {
+        let dimension = 8;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), dimension)
+                .unwrap();
+        let centroids = Arc::new(Float32Array::from(values));
+
+        for distance_type in [DistanceType::Cosine, DistanceType::Hamming] {
+            let kmeans = KMeans::with_centroids(
+                centroids.clone(),
+                dimension as usize,
+                distance_type,
+                f64::MAX,
+            );
+            let err = kmeans.compute_membership_and_distances(&data).unwrap_err();
+            assert!(
+                err.to_string().contains("can not compute membership"),
+                "expected rejection for {distance_type}, got: {err}"
+            );
+        }
+
+        let kmeans =
+            KMeans::with_centroids(centroids, dimension as usize, DistanceType::L2, f64::MAX);
+        kmeans
+            .compute_membership_and_distances(&data)
+            .expect("l2 must still be assigned");
     }
 
     #[test]

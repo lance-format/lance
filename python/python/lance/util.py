@@ -123,7 +123,9 @@ class KMeans:
             The number of clusters to create.
         metric_type: str, default="l2"
             The metric to use for calculating distances between vectors.
-            Supported distance metrics: "l2", "cosine", "dot"
+            Supported distance metrics: "l2", "cosine", "dot". "cosine"
+            normalizes the vectors to unit length and clusters them with "l2",
+            so ``predict`` normalizes its input the same way.
         max_iters: int
             The maximum number of iterations to run the KMeans algorithm. Default: 50.
         centroids (pyarrow.FixedSizeListArray, optional.) – Provide existing centroids.
