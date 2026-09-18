@@ -364,19 +364,32 @@ async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
     assert_eq!(actual, expected);
 }
 
-#[test]
-fn test_block_max_scores_capacity_matches_block_count() {
+/// `Vec::with_capacity(num_blocks)` is what this guards, but `Vec<f32>` allocates a
+/// minimum of four elements, so a four-block fixture satisfies the capacity assertion
+/// even with no hint at all. Size the fixture past that minimum, and cover both valid
+/// block sizes: the block count comes from the `block_size` argument, and only the
+/// 128 path was exercised.
+#[rstest::rstest]
+#[case::legacy_block_size(LEGACY_BLOCK_SIZE)]
+#[case::v3_block_size(256)]
+fn test_block_max_scores_capacity_matches_block_count(#[case] block_size: usize) {
     let mut docs = DocSet::default();
-    let num_docs = BLOCK_SIZE * 3 + 7;
+    let num_docs = block_size * 5 + 7;
     let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
     for doc_id in &doc_ids {
         docs.append(*doc_id as u64, 1);
     }
 
     let freqs = vec![1_u32; doc_ids.len()];
-    let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
-    let expected_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+    let block_max_scores =
+        docs.calculate_block_max_scores_with_block_size(doc_ids.iter(), freqs.iter(), block_size);
+    let expected_blocks = doc_ids.len().div_ceil(block_size);
 
+    assert!(
+        expected_blocks > 4,
+        "fixture must exceed the minimum Vec allocation for the capacity assertion to bite, \
+         got {expected_blocks} blocks"
+    );
     assert_eq!(block_max_scores.len(), expected_blocks);
     assert_eq!(block_max_scores.capacity(), expected_blocks);
 }
