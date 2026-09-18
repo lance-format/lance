@@ -4574,6 +4574,7 @@ dependencies = [
  "num_cpus",
  "object_store 0.14.1",
  "pin-project",
+ "proptest",
  "prost",
  "quick_cache",
  "rand 0.9.5",
