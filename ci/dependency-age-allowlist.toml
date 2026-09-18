@@ -1,0 +1,15 @@
+# Versions exempt from the minimum publish age enforced by
+# ci/check_dependency_age.py.
+#
+# Only add an entry once the same version has been allowlisted in Aikido
+# endpoint protection. Aikido filters the crates.io index it serves to
+# developer machines, so an entry here on its own unblocks CI while leaving
+# every developer unable to build.
+#
+# Entries become inert once the version passes the minimum age, so pruning
+# them is housekeeping rather than urgent.
+
+# [[allow]]
+# crate = "some-crate"
+# version = "1.2.3"
+# reason = "RUSTSEC-2026-0000, allowlisted in Aikido 2026-09-16"

@@ -24,9 +24,7 @@ use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
-// Named tiers are only matched on x86_64, or by the fp16 kernels on the other
-// architectures; without either, nothing below names a `SimdSupport` variant.
-#[cfg(any(feature = "fp16kernels", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 

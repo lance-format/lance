@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{cmp::min, num::NonZero, ops::Range, sync::atomic::AtomicU64};
+use std::{cmp::min, collections::VecDeque, num::NonZero, ops::Range, sync::atomic::AtomicU64};
 
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
@@ -44,6 +44,120 @@ pub fn read_range_in_chunks(
         .buffered(reader.io_parallelism().max(1))
 }
 
+/// A [`Buf`] over a sequence of [`Bytes`] chunks in file order.
+///
+/// Lets a protobuf message fetched as concurrent range requests be decoded
+/// without first copying the chunks into one contiguous buffer. A copy of a
+/// large message is not free: the destination pages are touched for the first
+/// time, so the copy costs a page fault per 4 KiB on top of the `memmove`
+/// (measured at ~0.5 s and ~1 GiB of peak memory for a 945 MiB manifest).
+/// `copy_to_bytes` hands out a slice of the underlying chunk when the request
+/// lies within one, so `bytes`-typed fields decode zero-copy as well.
+#[derive(Debug, Default)]
+pub struct ChunkedBuf {
+    chunks: VecDeque<Bytes>,
+    remaining: usize,
+}
+
+impl ChunkedBuf {
+    /// Append `chunk` after the chunks pushed so far. Empty chunks are dropped
+    /// so `chunk()` never reports an empty slice while data remains.
+    pub fn push(&mut self, chunk: Bytes) {
+        if !chunk.is_empty() {
+            self.remaining += chunk.len();
+            self.chunks.push_back(chunk);
+        }
+    }
+
+    /// Keep only the first `len` bytes.
+    ///
+    /// Prost decodes until the buffer is exhausted, so a message followed by
+    /// trailing bytes (a footer, the next section) must be cut to its exact
+    /// length before decoding.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.remaining {
+            return;
+        }
+        let mut to_drop = self.remaining - len;
+        while to_drop > 0 {
+            let Some(back) = self.chunks.back_mut() else {
+                break;
+            };
+            if to_drop >= back.len() {
+                to_drop -= back.len();
+                self.chunks.pop_back();
+            } else {
+                back.truncate(back.len() - to_drop);
+                to_drop = 0;
+            }
+        }
+        self.remaining = len;
+    }
+}
+
+impl Buf for ChunkedBuf {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.chunks.front().map(Bytes::as_ref).unwrap_or(&[])
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        assert!(
+            cnt <= self.remaining,
+            "cannot advance ChunkedBuf by {cnt} bytes: only {} remain",
+            self.remaining
+        );
+        self.remaining -= cnt;
+        while cnt > 0 {
+            let front = self
+                .chunks
+                .front_mut()
+                .expect("remaining bytes imply a chunk");
+            if cnt < front.len() {
+                front.advance(cnt);
+                return;
+            }
+            cnt -= front.len();
+            self.chunks.pop_front();
+        }
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        assert!(
+            len <= self.remaining,
+            "cannot copy {len} bytes from ChunkedBuf: only {} remain",
+            self.remaining
+        );
+        let within_front = self.chunks.front().is_some_and(|front| len <= front.len());
+        if within_front {
+            let front = self
+                .chunks
+                .front_mut()
+                .expect("checked that a front chunk exists");
+            let bytes = front.split_to(len);
+            self.remaining -= len;
+            if front.is_empty() {
+                self.chunks.pop_front();
+            }
+            return bytes;
+        }
+        // Straddles a chunk boundary: a copy is unavoidable.
+        let mut out = Vec::with_capacity(len);
+        let mut left = len;
+        while left > 0 {
+            let chunk = self.chunk();
+            let take = min(left, chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            self.advance(take);
+            left -= take;
+        }
+        Bytes::from(out)
+    }
+}
+
 /// Read a protobuf message at file position 'pos'.
 ///
 /// We write protobuf by first writing the length of the message as a u32,
@@ -64,21 +178,23 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 
     if msg_len + 4 > buf.len() {
         let remaining_range = range.end..min(4 + pos + msg_len, file_size);
-        // Assemble into one pre-allocated buffer; fetching the remainder as
-        // concurrent chunks lifts the single-connection throughput cap on
-        // large messages (e.g. manifests of datasets with many fragments).
-        let mut full = BytesMut::with_capacity(buf.len() + remaining_range.len());
-        full.extend_from_slice(&buf);
+        // Fetching the remainder as concurrent chunks lifts the
+        // single-connection throughput cap on large messages (e.g. manifests of
+        // datasets with many fragments); decoding straight from the chunks
+        // avoids re-copying the whole message into one buffer.
+        let mut full = ChunkedBuf::default();
+        full.push(buf.slice(4..));
         let mut chunks = read_range_in_chunks(reader, remaining_range, METADATA_READ_CHUNK_SIZE);
         while let Some(chunk) = chunks.try_next().await? {
-            full.extend_from_slice(&chunk);
+            full.push(chunk);
         }
-        if full.len() < msg_len + 4 {
+        if full.remaining() < msg_len {
             return Err(Error::io("file size is too small".to_string()));
         }
-        Ok(M::decode(&full[4..4 + msg_len])?)
+        full.truncate(msg_len);
+        Ok(M::decode(full)?)
     } else {
-        Ok(M::decode(&buf[4..4 + msg_len])?)
+        Ok(M::decode(buf.slice(4..4 + msg_len))?)
     }
 }
 
@@ -236,9 +352,14 @@ impl CachedFileSize {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Bytes, BytesMut};
+    use std::cmp::min;
+
+    use bytes::{Buf, Bytes, BytesMut};
     use futures::TryStreamExt;
     use object_store::path::Path;
+    use prost::Message;
+
+    use super::{ChunkedBuf, read_message};
 
     use crate::{
         Error, Result,
@@ -392,5 +513,89 @@ mod tests {
 
         assert_eq!(copied, 3);
         assert_eq!(store.read_one_all(&dst).await.unwrap().as_ref(), b"cde");
+    }
+
+    #[test]
+    fn chunked_buf_advances_and_copies_across_chunks() {
+        let mut buf = ChunkedBuf::default();
+        buf.push(Bytes::from_static(b"abc"));
+        buf.push(Bytes::new());
+        buf.push(Bytes::from_static(b"defgh"));
+        buf.push(Bytes::from_static(b"ij"));
+        assert_eq!(buf.remaining(), 10);
+        assert_eq!(buf.chunk(), b"abc");
+
+        // Within one chunk: zero-copy slice of that chunk.
+        let first_chunk_ptr = buf.chunk().as_ptr();
+        let head = buf.copy_to_bytes(2);
+        assert_eq!(head.as_ref(), b"ab");
+        assert_eq!(head.as_ptr(), first_chunk_ptr);
+
+        // Straddling a boundary: copied, contents preserved, cursor advanced.
+        let cross = buf.copy_to_bytes(4);
+        assert_eq!(cross.as_ref(), b"cdef");
+        assert_eq!(buf.remaining(), 4);
+        assert_eq!(buf.chunk(), b"gh");
+
+        buf.advance(3);
+        assert_eq!(buf.chunk(), b"j");
+        assert_eq!(buf.copy_to_bytes(1).as_ref(), b"j");
+        assert_eq!(buf.remaining(), 0);
+        assert_eq!(buf.chunk(), b"");
+    }
+
+    #[test]
+    fn chunked_buf_truncate_drops_trailing_bytes() {
+        let mut buf = ChunkedBuf::default();
+        buf.push(Bytes::from_static(b"0123"));
+        buf.push(Bytes::from_static(b"4567"));
+        buf.push(Bytes::from_static(b"89"));
+        buf.truncate(20);
+        assert_eq!(buf.remaining(), 10);
+        buf.truncate(5);
+        assert_eq!(buf.remaining(), 5);
+        assert_eq!(buf.copy_to_bytes(5).as_ref(), b"01234");
+        assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn chunked_buf_decodes_message_split_across_chunks() {
+        // `Bytes` implements `prost::Message` (one bytes field), which is
+        // exactly the shape whose decoding should be zero-copy within a chunk.
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let msg = Bytes::from(payload);
+        let encoded = Bytes::from(msg.encode_to_vec());
+        for chunk_size in [1usize, 7, 64, 4096, usize::MAX] {
+            let mut buf = ChunkedBuf::default();
+            for start in (0..encoded.len()).step_by(chunk_size) {
+                buf.push(encoded.slice(start..min(start + chunk_size, encoded.len())));
+            }
+            // Trailing bytes (a footer) must be cut off before decoding.
+            buf.push(Bytes::from_static(b"footer"));
+            buf.truncate(encoded.len());
+            let decoded = Bytes::decode(buf).unwrap();
+            assert_eq!(decoded, msg, "chunk_size={chunk_size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_message_decodes_body_larger_than_one_block_from_chunks() {
+        // A message larger than the reader block size takes the chunked path.
+        let store = ObjectStore::memory();
+        let path = Path::from("/large_message");
+        let payload = Bytes::from(
+            (0..300_000u32)
+                .map(|i| (i % 253) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        let mut writer = store.create(&path).await.unwrap();
+        let pos = writer.write_protobuf(&payload).await.unwrap();
+        writer.write_magics(pos, 0, 1, b"LANC").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        assert!(payload.len() > reader.block_size());
+        let decoded: Bytes = read_message(reader.as_ref(), pos).await.unwrap();
+        assert_eq!(decoded, payload);
     }
 }

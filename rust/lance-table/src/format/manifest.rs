@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
@@ -17,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -384,6 +385,36 @@ impl Manifest {
                 "Field with id {} does not exist for replace_field_metadata",
                 field_id
             )))
+        }
+    }
+
+    /// Copy inline row ids out of the manifest buffer they were decoded from
+    /// when they are a small share of it.
+    ///
+    /// Inline row ids decoded from a `Bytes` buffer are slices of that buffer
+    /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
+    /// That is the right trade when the row ids are most of the manifest, as
+    /// they are for a compacted stable-row-id table, but a manifest whose row
+    /// ids are a few percent of its bytes would pin the rest for nothing.
+    /// `buffer_len` is the size of the decoded buffer.
+    pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
+        let inline_bytes: usize = self
+            .fragments
+            .iter()
+            .filter_map(|fragment| match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        // Keep the slices while the row ids are at least a quarter of the buffer.
+        if inline_bytes == 0 || inline_bytes.saturating_mul(4) >= buffer_len {
+            return;
+        }
+        for fragment in Arc::make_mut(&mut self.fragments) {
+            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
+                let copied = InlineRowIds::from(Bytes::copy_from_slice(data));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(copied));
+            }
         }
     }
 
@@ -1151,7 +1182,7 @@ mod tests {
 
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
 
@@ -1290,6 +1321,41 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    #[test]
+    fn test_detach_sparse_inline_row_ids_copies_only_small_shares() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]);
+        // Two 10 byte row id sequences sliced out of one buffer.
+        let buffer = Bytes::from(vec![7u8; 64]);
+        let fragments = [0..10, 20..30].into_iter().enumerate().map(|(id, range)| {
+            let mut fragment = Fragment::new(id as u64);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(InlineRowIds::from(buffer.slice(range))));
+            fragment
+        });
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments.collect()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let ptr = |manifest: &Manifest, i: usize| match &manifest.fragments[i].row_id_meta {
+            Some(RowIdMeta::Inline(data)) => data.bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let in_buffer = |p: *const u8| buffer.as_ptr_range().contains(&p);
+
+        // 20 of 80 bytes is a quarter: the slices stay.
+        manifest.detach_sparse_inline_row_ids(80);
+        assert!(in_buffer(ptr(&manifest, 0)) && in_buffer(ptr(&manifest, 1)));
+
+        // 20 of 81 bytes is below a quarter: copied out, contents intact.
+        manifest.detach_sparse_inline_row_ids(81);
+        assert!(!in_buffer(ptr(&manifest, 0)) && !in_buffer(ptr(&manifest, 1)));
+        let Some(RowIdMeta::Inline(copied)) = &manifest.fragments[1].row_id_meta else {
+            unreachable!()
+        };
+        assert_eq!(&**copied, &buffer[20..30]);
     }
 
     #[test]
