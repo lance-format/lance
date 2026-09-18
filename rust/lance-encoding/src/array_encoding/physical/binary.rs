@@ -42,6 +42,15 @@ fn oversized_binary_batch_error(num_rows: u64, num_bytes: u64) -> Error {
     ))
 }
 
+fn oversized_large_binary_batch_error(num_rows: u64, num_bytes: u64) -> Error {
+    Error::not_supported(format!(
+        "Could not create large_string/large_binary array in a single batch because {} rows \
+         would require {} bytes, which exceeds i64::MAX. Please reduce the batch_size or set \
+         LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
+        num_rows, num_bytes
+    ))
+}
+
 struct IndicesNormalizer {
     indices: Vec<u64>,
     validity: BooleanBufferBuilder,
@@ -326,9 +335,9 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         let target_vec = target_offsets.values();
         let start = target_vec[0];
         let end = *target_vec.last().unwrap();
+        let num_bytes = end - start;
         let offsets_buffer = match bytes_per_offset {
             4 => {
-                let num_bytes = end - start;
                 if num_bytes > i32::MAX as u64 {
                     return Err(oversized_binary_batch_error(num_rows, num_bytes));
                 }
@@ -336,14 +345,8 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                     .into_inner()
             }
             8 => {
-                let num_bytes = end - start;
                 if num_bytes > i64::MAX as u64 {
-                    return Err(Error::not_supported(format!(
-                        "Could not create large_string/large_binary array in a single batch \
-                         because {} rows would require {} bytes, which exceeds i64::MAX. Please \
-                         reduce the batch_size or set LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
-                        num_rows, num_bytes
-                    )));
+                    return Err(oversized_large_binary_batch_error(num_rows, num_bytes));
                 }
                 ScalarBuffer::from_iter(target_vec.iter().map(|&offset| (offset - start) as i64))
                     .into_inner()
