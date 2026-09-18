@@ -637,11 +637,7 @@ struct ListDecodeTask {
     offset_type: DataType,
 }
 
-fn oversized_batch_error(
-    items_field: &Field,
-    requested_rows: u64,
-    num_items: u64,
-) -> Error {
+fn oversized_batch_error(items_field: &Field, requested_rows: u64, num_items: u64) -> Error {
     if items_field.data_type() == &DataType::UInt8 {
         Error::not_supported(format!(
             "Could not create array with more than 2GiB of string/binary data in a single batch \
@@ -1317,7 +1313,11 @@ mod tests {
             128,
             i32::MAX as u64 + 1,
         );
-        assert!(error.to_string().contains("more than 2GiB of string/binary data"));
+        assert!(
+            error
+                .to_string()
+                .contains("more than 2GiB of string/binary data")
+        );
         assert!(error.to_string().contains("batch_size"));
         assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
         assert!(error.to_string().contains("large_string/large_binary"));
