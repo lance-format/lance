@@ -492,6 +492,10 @@ All we need to know is the meaning of each rep/def level and (when present) the 
 
 ### Blob Page Layout
 
+This section describes the earlier two-field blob layout. Blob v2 uses a
+five-field packed struct descriptor; see the [Blob v2 Specification](../table/blob.md)
+for its schema, null semantics, and payload storage rules.
+
 The blob page layout is a layout for large binary values where we would only have a few values per disk page.
 The actual data is stored out-of-line in external buffers. The disk page stores a "description" which is a
 struct array of two fields: `position` and `size`. The `position` is the absolute file offset of the blob and
