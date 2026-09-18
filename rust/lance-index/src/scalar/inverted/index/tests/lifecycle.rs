@@ -62,9 +62,16 @@ async fn build_multi_partition_index(
     (index, cache)
 }
 
-/// The prewarm cost estimate must come from cheap object metadata (the
-/// posting file length) without reading the posting data, and must be
-/// monotonic in the partition's content.
+/// The prewarm cost estimate must come from cheap object metadata -- the posting
+/// file's length -- and not from the row-count proxy `posting_data_size_bytes`
+/// falls back to when a reader cannot report its length. Asserting the exact
+/// length subsumes the monotonicity the proxy only approximates: a partition
+/// holding more postings writes a longer file.
+///
+/// `est > 0` cannot tell the two apart. The proxy is 16 bytes per row and rows
+/// equal tokens in the modern layout, so it is also non-zero, and a silent fall
+/// back to it would leave `posting_read_chunk_tokens` clamping every index to the
+/// same token ceiling instead of tracking the byte budget it exists to enforce.
 #[tokio::test]
 async fn test_posting_data_size_bytes_uses_file_length() {
     let tmpdir = TempObjDir::default();
@@ -74,13 +81,17 @@ async fn test_posting_data_size_bytes_uses_file_length() {
         Arc::new(LanceCache::no_cache()),
     ));
     let (index, _cache) = build_multi_partition_index(&store, 3).await;
+    let object_store = ObjectStore::local();
     for part in &index.partitions {
-        // File length is reported by object metadata at open time; it must be
-        // non-trivial for a partition that actually holds postings.
-        let est = part.inverted_list.posting_data_size_bytes();
-        assert!(
-            est > 0,
-            "expected a non-zero posting-data size estimate, got {est}"
+        let on_disk = object_store
+            .size(&tmpdir.clone().join(posting_file_path(part.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            part.inverted_list.posting_data_size_bytes(),
+            on_disk,
+            "partition {} must report its posting file's length",
+            part.id
         );
     }
 }
