@@ -33,7 +33,7 @@ use lance_index::{
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use std::{collections::HashMap, future::IntoFuture, sync::Arc};
-use tracing::instrument;
+use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
@@ -268,6 +268,31 @@ impl<'a> CreateIndexBuilder<'a> {
             column,
         )
         .await?;
+
+        if !train {
+            // A partition count is not among the settings a definition records,
+            // so a caller who asked for one gets a different shape when the
+            // index finally trains.
+            if let Some(requested) = self
+                .params
+                .as_any()
+                .downcast_ref::<VectorIndexParams>()
+                .and_then(|params| {
+                    params.stages.iter().find_map(|stage| match stage {
+                        StageParams::Ivf(ivf) => ivf.num_partitions,
+                        _ => None,
+                    })
+                })
+            {
+                warn!(
+                    column,
+                    requested_num_partitions = requested,
+                    "Recording the index without training it: the partition count \
+                     will be derived from the data it trains on. Use \
+                     target_partition_size to state a shape that survives the wait."
+                );
+            }
+        }
 
         // Load indices from the disk. Names are reserved against every index the
         // manifest carries: one this build cannot read still owns its name, and
