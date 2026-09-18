@@ -263,6 +263,21 @@ struct BinaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for BinaryPageDecoder {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        if num_rows == 0 {
+            return Ok(Some(0));
+        }
+        // `decoded_indices` holds one cumulative byte offset per row plus a final
+        // sentinel, so the value bytes for the requested rows are the difference
+        // between the bounding entries.  Only value bytes count: Arrow's i32
+        // limit constrains the final offset value, not the offset buffer size.
+        let value_bytes = self
+            .decoded_indices
+            .value((rows_to_skip + num_rows) as usize)
+            - self.decoded_indices.value(rows_to_skip as usize);
+        Ok(Some(value_bytes))
+    }
+
     // Continuing the example from BinaryPageScheduler
     // Suppose batch_size = 2. Then first, rows_to_skip=0, num_rows=2
     // Need to scan 2 rows
@@ -567,5 +582,164 @@ mod tests {
             LanceBuffer::reinterpret_vec(vec![7_u64, 3, 6, 13, 13, 13])
         );
         assert_eq!(null_adjustment, 7);
+    }
+
+    #[derive(Debug)]
+    struct NeverDecodedStub;
+
+    impl PrimitivePageDecoder for NeverDecodedStub {
+        fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+            unreachable!("byte accounting must not decode any values")
+        }
+    }
+
+    /// A real physical binary page over strings of the given byte lengths.
+    fn binary_page(value_lens: &[u64]) -> BinaryPageDecoder {
+        let mut indices = vec![0u64];
+        for len in value_lens {
+            indices.push(indices.last().unwrap() + len);
+        }
+        BinaryPageDecoder {
+            decoded_indices: UInt64Array::from(indices),
+            offsets_type: DataType::Int32,
+            validity: BooleanBuffer::new_set(value_lens.len()),
+            bytes_decoder: Box::new(NeverDecodedStub),
+        }
+    }
+
+    /// Variable-width value bytes of `n` rows starting at `skip` (what the
+    /// output array's i32 offsets index into).
+    fn expected_bytes(value_lens: &[u64], skip: usize, n: usize) -> u64 {
+        value_lens[skip..skip + n].iter().sum::<u64>()
+    }
+
+    #[test]
+    fn test_unknown_size_pages_split_at_page_boundaries() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use std::collections::VecDeque;
+
+        /// A variable-width page that cannot report sizes (default
+        /// `variable_width_bytes` returns `None`).
+        #[derive(Debug)]
+        struct UnknownSizeStub;
+
+        impl PrimitivePageDecoder for UnknownSizeStub {
+            fn decode(&self, _rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+                Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                    bits_per_offset: 32,
+                    data: LanceBuffer::empty(),
+                    offsets: LanceBuffer::reinterpret_vec(vec![0_i32; num_rows as usize + 1]),
+                    num_values: num_rows,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+        }
+
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(UnknownSizeStub),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Each page's size is unknown, so pages must not stack in one batch:
+        // the batch takes the first page alone and stops at its boundary.
+        let limit = root.max_rows_to_drain(6, I32_OFFSET_BYTE_BUDGET).unwrap();
+        assert_eq!(limit.rows, 3);
+    }
+
+    #[test]
+    fn test_physical_binary_page_reports_variable_width_bytes() {
+        let page = binary_page(&[4, 4, 5]);
+        assert_eq!(
+            page.variable_width_bytes(0, 3).unwrap(),
+            Some(expected_bytes(&[4, 4, 5], 0, 3))
+        );
+        assert_eq!(
+            page.variable_width_bytes(1, 2).unwrap(),
+            Some(expected_bytes(&[4, 4, 5], 1, 2))
+        );
+        assert_eq!(page.variable_width_bytes(0, 0).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_primitive_field_decoder_truncates_to_byte_budget() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::decoder::LogicalPageDecoder;
+
+        let lens = [4u64, 4, 5];
+        let decoder = PrimitiveFieldDecoder::new_from_data(
+            Arc::new(binary_page(&lens)),
+            DataType::Utf8,
+            3,
+            false,
+        );
+        let full = expected_bytes(&lens, 0, 3);
+
+        let limit = decoder.max_rows_to_drain(3, full).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (3, full));
+
+        // One byte short of the full request: only two rows fit.
+        let limit = decoder.max_rows_to_drain(3, full - 1).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (2, expected_bytes(&lens, 0, 2)));
+
+        // Nothing fits: zero rows, so the stream root can raise an error.
+        let limit = decoder.max_rows_to_drain(3, 0).unwrap();
+        assert_eq!(limit.rows, 0);
+    }
+
+    #[test]
+    fn test_physical_binary_pages_accumulate_budget_across_pages() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use std::collections::VecDeque;
+
+        let lens = [4u64, 4, 5];
+        let page_bytes = expected_bytes(&lens, 0, 3);
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(binary_page(&lens)),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Both pages fit: the batch spans the page boundary.
+        let limit = root.max_rows_to_drain(6, page_bytes * 2).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (6, page_bytes * 2));
+
+        // Page 1 plus the first two rows of page 2 fit.
+        let second_page_prefix = expected_bytes(&lens, 0, 2);
+        let limit = root
+            .max_rows_to_drain(6, page_bytes + second_page_prefix)
+            .unwrap();
+        assert_eq!(
+            (limit.rows, limit.bytes),
+            (5, page_bytes + second_page_prefix)
+        );
+
+        // Budget for page 1 only: the batch stops at the page boundary.
+        let limit = root.max_rows_to_drain(6, page_bytes).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (3, page_bytes));
     }
 }

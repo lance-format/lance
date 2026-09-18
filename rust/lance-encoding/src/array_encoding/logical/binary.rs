@@ -19,7 +19,7 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
-    decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
+    decoder::{DecoderReady, DrainLimit, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
@@ -127,6 +127,10 @@ impl LogicalPageDecoder for BinaryPageDecoder {
                 data_type: self.data_type.clone(),
             }),
         })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        self.inner.max_rows_to_drain(num_rows, byte_budget)
     }
 
     fn data_type(&self) -> &DataType {
