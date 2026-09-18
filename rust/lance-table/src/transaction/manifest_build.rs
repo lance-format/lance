@@ -930,6 +930,8 @@ impl Transaction {
                         }
                     }
                 }
+                let remaining_field_ids = schema.field_ids().into_iter().collect::<HashSet<_>>();
+                Self::retain_relevant_overlays(&mut merged_fragments, &remaining_field_ids);
                 final_fragments.extend(merged_fragments);
 
                 // A Merge can rewrite a column's data file in place; the field stays
@@ -961,6 +963,7 @@ impl Transaction {
                             .any(|field_id| remaining_field_ids.contains(field_id))
                     });
                 }
+                Self::retain_relevant_overlays(&mut final_fragments, &remaining_field_ids);
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -1594,6 +1597,20 @@ impl Transaction {
             });
         }
     }
+
+    /// Remove overlays that no longer supply any field in the schema.
+    fn retain_relevant_overlays(fragments: &mut [Fragment], remaining_field_ids: &HashSet<i32>) {
+        for fragment in fragments {
+            fragment.overlays.retain(|overlay| {
+                overlay
+                    .data_file
+                    .fields
+                    .iter()
+                    .any(|field_id| remaining_field_ids.contains(field_id))
+            });
+        }
+    }
+
     /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
     /// removed and the fragments they became are *not* added.
     fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {
@@ -1625,6 +1642,7 @@ mod tests {
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1636,6 +1654,67 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[rstest]
+    #[case::project(false)]
+    #[case::merge(true)]
+    fn test_schema_change_prunes_irrelevant_overlays(#[case] is_merge: bool) {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, false),
+        ]);
+        let schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let mut projected_schema = schema.clone();
+        projected_schema.fields.retain(|field| field.name != "c");
+
+        let overlay = |path: &str, fields: Vec<i32>| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields(path, fields, None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 1,
+        };
+        let mut fragment0 = Fragment::new(0);
+        fragment0.overlays = vec![
+            overlay("dropped-0.lance", vec![2]),
+            overlay("kept-mixed.lance", vec![0, 2]),
+        ];
+        let mut fragment1 = Fragment::new(1);
+        fragment1.overlays = vec![
+            overlay("dropped-1.lance", vec![2]),
+            overlay("kept-live.lance", vec![1]),
+        ];
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment0, fragment1]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let operation = if is_merge {
+            Operation::Merge {
+                fragments: manifest.fragments.as_ref().clone(),
+                schema: projected_schema,
+                preserves_nullability: true,
+            }
+        } else {
+            Operation::Project {
+                schema: projected_schema,
+                preserves_nullability: true,
+            }
+        };
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let overlay_paths = result
+            .fragments
+            .iter()
+            .flat_map(|fragment| &fragment.overlays)
+            .map(|overlay| overlay.data_file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(overlay_paths, ["kept-mixed.lance", "kept-live.lance"]);
     }
 
     #[test]
