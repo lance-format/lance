@@ -1042,6 +1042,15 @@ async fn build_vector_index_impl(
         .await?;
     let stages = &params.stages;
 
+    // RaBitQ encodes against L2 or dot residuals, and its transform rejects
+    // anything else, but only after the IVF model has been trained on a sample.
+    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+        return Err(Error::index(format!(
+            "Build Vector Index: {} does not support the {} metric",
+            index_type, params.metric_type
+        )));
+    }
+
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -2212,7 +2221,43 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
+
+    /// IVF_RQ encodes residuals under L2 or dot; the RQ transform rejects other
+    /// metrics, but only once the IVF model has been trained, so the build spends
+    /// the training pass before failing. Hamming is also contradictory for RQ,
+    /// which requires float vectors while Hamming is a binary-vector metric.
+    #[tokio::test]
+    async fn test_build_rejects_hamming_for_rq() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use lance_index::vector::bq::RQBuildParams;
+
+        let dim = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(dim)),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Hamming,
+            IvfBuildParams::new(2),
+            RQBuildParams::default(),
+        );
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IVF_RQ does not support the hamming metric"),
+            "expected the up-front metric rejection, got: {err}"
+        );
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
