@@ -53,7 +53,7 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 
 [workspace.dependencies]
 arc-swap = "1.7"
