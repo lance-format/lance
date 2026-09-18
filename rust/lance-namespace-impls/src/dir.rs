@@ -5117,7 +5117,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<InsertIntoTableResponse> {
         self.record_op("insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let (reader, _num_rows) =
+        let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "insert_into_table")?;
 
         let mode = match request.mode.as_deref() {
@@ -5135,16 +5135,18 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        if !self.table_uri_has_actual_manifests(&table_uri).await? {
+        let dataset = if !self.table_uri_has_actual_manifests(&table_uri).await? {
             self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
-                .await?;
+                .await?
         } else {
             self.write_reader_to_table(&table_uri, reader, mode, None)
-                .await?;
-        }
+                .await?
+        };
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
+            num_inserted_rows: Some(num_rows as i64),
+            version: Some(dataset.version().version as i64),
             ..Default::default()
         })
     }
@@ -11023,10 +11025,12 @@ mod tests {
         let ipc_data = create_test_ipc_data(&schema);
         let mut insert_req = InsertIntoTableRequest::new();
         insert_req.id = Some(vec!["test_table".to_string()]);
-        namespace
+        let response = namespace
             .insert_into_table(insert_req, bytes::Bytes::from(ipc_data))
             .await
             .unwrap();
+        assert_eq!(response.num_inserted_rows, Some(0));
+        assert_eq!(response.version, Some(1));
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -11115,13 +11119,15 @@ mod tests {
 
         let mut insert_req = InsertIntoTableRequest::new();
         insert_req.id = Some(vec!["test_table".to_string()]);
-        namespace
+        let response = namespace
             .insert_into_table(
                 insert_req,
                 bytes::Bytes::from(create_non_empty_test_ipc_data()),
             )
             .await
             .unwrap();
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.version, Some(1));
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -13753,6 +13759,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(response.transaction_id.is_none());
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify total rows
             let count_req = CountTableRowsRequest {
@@ -13797,10 +13805,12 @@ mod tests {
                 ..Default::default()
             };
 
-            namespace
+            let response = namespace
                 .insert_into_table(request, Bytes::from(buffer))
                 .await
                 .unwrap();
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify overwrite: only 2 rows remain
             let count_req = CountTableRowsRequest {
@@ -13888,6 +13898,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(response.transaction_id.is_none());
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify rows were inserted
             let count_req = CountTableRowsRequest {
