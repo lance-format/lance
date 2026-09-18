@@ -162,20 +162,29 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowAddrMaskKey {
+pub struct RowAddrMaskKey<'a> {
     pub version: u64,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so the manifest e-tag distinguishes mask entries from
+    /// different dataset generations. Callers without one must not share a
+    /// cached mask.
+    pub e_tag: Option<&'a str>,
     /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
 }
 
-impl CacheKey for RowAddrMaskKey {
+impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
     fn key(&self) -> Cow<'_, str> {
-        match self.restrict_hash {
-            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
-            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+        match (self.e_tag, self.restrict_hash) {
+            (None, None) => Cow::Owned(format!("row_addr_mask/{}", self.version)),
+            (None, Some(hash)) => Cow::Owned(format!("row_addr_mask/{}/{hash:x}", self.version)),
+            (Some(e_tag), None) => Cow::Owned(format!("row_addr_mask/{}/{e_tag}", self.version)),
+            (Some(e_tag), Some(hash)) => {
+                Cow::Owned(format!("row_addr_mask/{}/{e_tag}/{hash:x}", self.version))
+            }
         }
     }
     fn type_name() -> &'static str {
@@ -183,11 +192,17 @@ impl CacheKey for RowAddrMaskKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
         if let Some(restrict_hash) = self.restrict_hash {
             builder.write_some();
             builder.write_u64(restrict_hash);
