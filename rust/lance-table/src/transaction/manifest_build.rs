@@ -24,6 +24,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -423,16 +424,24 @@ impl Transaction {
             ));
         }
 
-        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
-            let names: Vec<&str> = current_indices
-                .iter()
-                .map(|idx| idx.name.as_str())
-                .collect();
+        // The fragment-reuse index is internal bookkeeping registered by
+        // compaction with deferred index remap, not something a user can
+        // meaningfully drop and recreate, so it must not gate the migration.
+        // It is dropped from the migrated manifest below, which is what makes
+        // ignoring it here safe. Every other index, including the MemWAL
+        // index, still blocks: only the fragment-reuse index is known to be
+        // discardable.
+        let blocking_indices: Vec<&str> = current_indices
+            .iter()
+            .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+            .map(|idx| idx.name.as_str())
+            .collect();
+        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
                  recreate them afterwards: {}",
-                names.join(", ")
+                blocking_indices.join(", ")
             )));
         }
         let mut reference_paths = match current_manifest {
@@ -493,6 +502,18 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+
+        // A fragment-reuse index maps old row *addresses* to new ones, and the
+        // read path attaches it to every index it opens without checking
+        // whether the dataset uses stable row ids. Carrying it past the
+        // migration would therefore rewrite freshly issued row ids as if they
+        // were addresses, and rows whose new id happens to fall in the old
+        // address range would disappear from indexed queries. Nothing needs it
+        // afterwards either, since compaction rejects deferred index remap on
+        // a stable-row-id dataset.
+        if config.migration_next_row_id.is_some() {
+            final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
+        }
 
         // Snapshot taken before the operation rewrites the list, so coverage can
         // be compared against what each logical index looked like going in. Only
@@ -573,7 +594,10 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        *f = (*updated).clone();
+                        // The post-image was built at the transaction's read
+                        // version. Only its deletion file is new; retain all
+                        // other state from the current fragment when rebasing.
+                        f.deletion_file = updated.deletion_file.clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -1588,7 +1612,9 @@ mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
-    use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+    use crate::format::{
+        DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+    };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
         default_build_config, last_updated_at_versions, make_stable_row_id_manifest,
@@ -1730,14 +1756,32 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_build_manifest_replaces_and_removes_fragments() {
-        let manifest = sample_manifest_with_fragments(0..5);
+    fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
+        let mut manifest = sample_manifest_with_fragments(0..5);
+        manifest.version = 2;
+        let current_fragment = &mut Arc::make_mut(&mut manifest.fragments)[2];
+        current_fragment.physical_rows = Some(42);
+        current_fragment.overlays = vec![overlay_with_field(0, 2)];
+        current_fragment.last_updated_at_version_meta = Some(
+            RowDatasetVersionMeta::from_sequence(
+                &RowDatasetVersionSequence::from_uniform_row_count(42, 2),
+            )
+            .unwrap(),
+        );
 
         let mut updated2 = Fragment::new(2);
         updated2.physical_rows = Some(42);
+        let deletion_file = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        updated2.deletion_file = Some(deletion_file.clone());
 
         let transaction = Transaction::new(
-            manifest.version,
+            1,
             Operation::Delete {
                 updated_fragments: vec![updated2],
                 deleted_fragment_ids: vec![1, 3],
@@ -1758,6 +1802,11 @@ mod tests {
             .map(|f| f.physical_rows)
             .collect();
         assert_eq!(rows, vec![None, Some(42), None]);
+        let overlays = &new_manifest.fragments[1].overlays;
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].committed_version, 2);
+        assert_eq!(new_manifest.fragments[1].deletion_file, Some(deletion_file));
+        assert_eq!(last_updated_at_versions(&new_manifest, 2), vec![2; 42]);
     }
 
     #[test]

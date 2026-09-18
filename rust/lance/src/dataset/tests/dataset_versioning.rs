@@ -1300,6 +1300,21 @@ async fn test_branch() {
     assert_eq!(tag_open.version().version, 3);
     assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
 
+    // Opening a branch URI with a tag pointing to a non-latest version on that same branch must check out the tag's version.
+    main_dataset
+        .tags()
+        .create("tag_branch1_v1", ("branch1", 1))
+        .await
+        .unwrap();
+    let branch_tag_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_tag("tag_branch1_v1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_tag_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_tag_open.version().version, 1);
+    assert_eq!(branch_tag_open.count_rows(None).await.unwrap(), 50);
+
     // Malformed branch names are rejected at the boundary
     for bad_name in ["", "branch1/"] {
         let err = main_dataset
@@ -1389,6 +1404,7 @@ async fn test_branch() {
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.tags().delete("tag1").await.unwrap();
+    dataset.tags().delete("tag_branch1_v1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 

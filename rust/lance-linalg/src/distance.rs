@@ -12,9 +12,12 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
-use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray};
+use arrow_array::types::{Float16Type, Float32Type, Float64Type, Int8Type, UInt8Type};
+use arrow_array::{
+    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray, PrimitiveArray,
+};
 use arrow_schema::{ArrowError, DataType};
+use lance_core::utils::cpu::SimdSupport;
 
 pub mod cosine;
 pub mod cosine_u8;
@@ -26,7 +29,29 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
+/// Widens an `Int8` query vector to `f32`, rejecting nulls.
+///
+/// The three `_arrow_batch` entry points that accept `Int8` take the query as a
+/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null
+/// element has no distance to compute, so it is rejected rather than widened.
+fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
+    if query.null_count() > 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Int8 query vector `from` must not contain nulls, found {} in {} values",
+            query.null_count(),
+            query.len()
+        )));
+    }
+    Ok(Float32Array::from(
+        query.values().iter().map(|&v| v as f32).collect::<Vec<_>>(),
+    ))
+}
+
+// `#[track_caller]` on both helpers is load-bearing: without it a length-contract
+// panic reports this file rather than the distance function the caller reached.
+// See #8863.
 #[inline]
+#[track_caller]
 fn assert_equal_lengths(left_len: usize, right_len: usize) {
     assert_eq!(
         left_len, right_len,
@@ -35,6 +60,7 @@ fn assert_equal_lengths(left_len: usize, right_len: usize) {
 }
 
 #[inline]
+#[track_caller]
 fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
     assert!(
         dimension > 0,
@@ -49,6 +75,94 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
         0,
         "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
     );
+}
+
+/// Runtime backend shared by the f16 and bf16 C kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfBackend {
+    Avx512,
+    Avx2,
+    Neon,
+    Lsx,
+    Lasx,
+    Scalar,
+}
+
+/// Half-precision element type whose fallback kernel is being selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfType {
+    F16,
+    Bf16,
+}
+
+/// CPU features required by the x86 fallback objects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct X86HalfFeatures {
+    has_avx2: bool,
+    has_f16c: bool,
+    has_fma: bool,
+}
+
+/// Whether this target links the optional half-precision C objects.
+const HALF_KERNELS_COMPILED: bool = cfg!(all(
+    feature = "fp16kernels",
+    not(target_os = "windows"),
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "loongarch64"
+    )
+));
+
+/// Selects a half-precision backend without reading host or build state so the
+/// exclusive SIMD tier ladder can be tested on any machine.
+fn half_backend(
+    support: SimdSupport,
+    half_type: HalfType,
+    has_kernels: bool,
+    has_avx512_kernel: bool,
+    x86_features: X86HalfFeatures,
+) -> HalfBackend {
+    if !has_kernels {
+        return HalfBackend::Scalar;
+    }
+
+    match support {
+        SimdSupport::Avx512FP16 if has_avx512_kernel => HalfBackend::Avx512,
+        // SIMD_SUPPORT reports one exclusive tier. An AVX-512 host that cannot
+        // use the optional AVX-512 C object must therefore be named here to
+        // reach the always-built x86 fallback object.
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2
+            if x86_features.has_fma
+                && match half_type {
+                    HalfType::F16 => x86_features.has_f16c,
+                    HalfType::Bf16 => x86_features.has_avx2,
+                } =>
+        {
+            HalfBackend::Avx2
+        }
+        SimdSupport::Neon => HalfBackend::Neon,
+        SimdSupport::Lsx => HalfBackend::Lsx,
+        SimdSupport::Lasx => HalfBackend::Lasx,
+        _ => HalfBackend::Scalar,
+    }
+}
+
+/// Detects every feature emitted by the x86 fallback objects.
+#[inline]
+fn x86_half_features() -> X86HalfFeatures {
+    #[cfg(target_arch = "x86_64")]
+    {
+        X86HalfFeatures {
+            has_avx2: std::is_x86_feature_detected!("avx2"),
+            has_f16c: std::is_x86_feature_detected!("f16c"),
+            has_fma: std::is_x86_feature_detected!("fma"),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        X86HalfFeatures::default()
+    }
 }
 
 /// Largest number of maximal u8 product terms whose sum fits in a u32.
@@ -508,6 +622,143 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
 
+    const NO_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: false,
+        has_f16c: false,
+        has_fma: false,
+    };
+    const F16_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: false,
+        has_f16c: true,
+        has_fma: true,
+    };
+    const BF16_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: false,
+        has_fma: true,
+    };
+    const ALL_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: true,
+        has_fma: true,
+    };
+    const X86_HALF_FEATURES_WITHOUT_FMA: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: true,
+        has_fma: false,
+    };
+
+    #[rstest::rstest]
+    #[case::kernels_disabled(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        false,
+        false,
+        ALL_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::avx512_kernel_ready(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        true,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Avx512
+    )]
+    #[case::f16_fallback_from_avx512fp16(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        F16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::bf16_fallback_from_avx512fp16(
+        SimdSupport::Avx512FP16,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::fallback_from_avx512(
+        SimdSupport::Avx512,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::f16_missing_f16c(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::bf16_missing_avx2(
+        SimdSupport::Avx512FP16,
+        HalfType::Bf16,
+        true,
+        false,
+        F16_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::fallback_missing_fma(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        X86_HALF_FEATURES_WITHOUT_FMA,
+        HalfBackend::Scalar
+    )]
+    #[case::avx2_tier(
+        SimdSupport::Avx2,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::neon(
+        SimdSupport::Neon,
+        HalfType::F16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Neon
+    )]
+    #[case::lsx(
+        SimdSupport::Lsx,
+        HalfType::Bf16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Lsx
+    )]
+    #[case::lasx(
+        SimdSupport::Lasx,
+        HalfType::Bf16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Lasx
+    )]
+    fn half_backend_follows_exclusive_tier_and_feature_requirements(
+        #[case] support: SimdSupport,
+        #[case] half_type: HalfType,
+        #[case] has_kernels: bool,
+        #[case] has_avx512_kernel: bool,
+        #[case] features: X86HalfFeatures,
+        #[case] expected: HalfBackend,
+    ) {
+        assert_eq!(
+            half_backend(support, half_type, has_kernels, has_avx512_kernel, features),
+            expected
+        );
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_x86_runtime_feature_report() {
@@ -619,6 +870,83 @@ mod tests {
             matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
             "Float32 query with hamming must be rejected for the metric, got: {err}"
         );
+    }
+
+    /// The `_arrow_batch` entry points that accept `Int8` widen the query element
+    /// by element.
+    /// A null there used to reach an `unwrap`, so a query column with a null in
+    /// its values panicked instead of returning an error, on the metrics that
+    /// accept `Int8`.
+    #[test]
+    fn test_arrow_batch_rejects_null_int8_query() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m)
+                    if m.contains("Int8 query vector `from`") && m.contains("found 1 in 2 values")),
+                "{dt} accepted a null Int8 query element, got: {err}"
+            );
+        }
+
+        // The same query without nulls goes through, so the guard is not
+        // rejecting every `Int8` query.
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![1_i8, 2]));
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            assert_eq!(
+                dt.arrow_batch_func()(query.as_ref(), &targets)
+                    .unwrap()
+                    .len(),
+                2,
+                "{dt} rejected a well-formed Int8 query"
+            );
+        }
+
+        // A sliced query reads through `values()`, which has to follow the slice:
+        // the window here holds no nulls while the full buffer does. The L2
+        // distances are asserted literally rather than against a second call,
+        // since computing the expected values by the same route would hide a bug
+        // that transformed both alike. Query [3, 4] against [[1, 2], [3, 4]]
+        // gives (3-1)^2 + (4-2)^2 = 8 and 0.
+        let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
+        let query: Arc<dyn Array> = Arc::new(sliced);
+        let got = DistanceType::L2.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+        assert_eq!(
+            got.values(),
+            &[8.0_f32, 0.0],
+            "L2 did not follow the query slice"
+        );
+        for dt in [DistanceType::Cosine, DistanceType::Dot] {
+            let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+            let want =
+                dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
+                    .unwrap();
+            assert_eq!(got, want, "{dt} did not follow the query slice");
+        }
+    }
+
+    /// An input that is both a length mismatch and a null query must reach the
+    /// null error on all three metrics. `dot` used to carry a second
+    /// `debug_assert_eq!` on the dimension in its public entry point, ahead of
+    /// the `Int8` arm's null guard.
+    #[test]
+    fn test_arrow_batch_null_and_length_mismatch_agree() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1_i8, 2, 3, 4]), 2)
+                .unwrap();
+        let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None, Some(2)]));
+
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            assert!(
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+                "{dt} did not report the null query, got: {err}"
+            );
+        }
     }
 
     /// `Int8` is a valid vector element type elsewhere in the crate but has no

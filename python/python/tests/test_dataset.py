@@ -2553,7 +2553,7 @@ def test_merge_data_legacy(tmp_path: Path):
 
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
-    with pytest.raises(OSError, match=r"Join produced null values for type: Int64"):
+    with pytest.raises(OSError, match=r"Column 'c' has null values of type: Int64"):
         dataset.merge(new_tab, "a")
 
 

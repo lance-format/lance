@@ -46,6 +46,8 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
+    from pyarrow._compute import Expression
+
     from .dataset import (
         ColumnOrdering,
         DatasetBasePath,
@@ -516,9 +518,7 @@ class LanceFragment(pa.dataset.Fragment):
     def fragment_id(self):
         return self._fragment.id()
 
-    def count_rows(
-        self, filter: Optional[Union[pa.compute.Expression, str]] = None
-    ) -> int:
+    def count_rows(self, filter: Optional[Union[Expression, str]] = None) -> int:
         if isinstance(filter, pa.compute.Expression):
             return self.scanner(
                 with_row_id=True, columns=[], filter=filter
@@ -568,7 +568,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -687,7 +687,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -726,7 +726,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -762,7 +762,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         batch_size: Optional[int] = None,

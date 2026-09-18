@@ -829,6 +829,7 @@ fn is_upcast_downcast_impl(
 
 pub fn validate_nulls(
     version: ConcreteFileVersion,
+    column_name: &str,
     datatype: &DataType,
     has_nulls: bool,
 ) -> Result<()> {
@@ -847,8 +848,8 @@ pub fn validate_nulls(
     };
     if has_nulls && !supported {
         return Err(Error::invalid_input(format!(
-            "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
-            datatype, version
+            "Column '{}' has null values of type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
+            column_name, datatype, version
         )));
     }
     Ok(())

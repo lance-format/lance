@@ -1329,12 +1329,15 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
-            let mut opened_files = vec![];
-            for data_file in &self.metadata.files {
-                let reader = match metadata_mode {
+            // Each open is at least one object-store round trip for the file's
+            // metadata; a fragment with several data files (one per
+            // `add_columns` / merge) would otherwise pay them back to back.
+            // `try_join_all` keeps the readers in data-file order.
+            let opens = self.metadata.files.iter().map(|data_file| async move {
+                match metadata_mode {
                     MetadataMode::LazyAllowed => {
                         self.open_reader(data_file, Some(projection), read_config)
-                            .await?
+                            .await
                     }
                     MetadataMode::Full => {
                         self.open_reader_with_full_metadata(
@@ -1342,13 +1345,12 @@ impl FileFragment {
                             Some(projection),
                             read_config,
                         )
-                        .await?
+                        .await
                     }
-                };
-                if let Some(reader) = reader {
-                    opened_files.push(reader);
                 }
-            }
+            });
+            let mut opened_files: Vec<Box<dyn GenericFileReader>> =
+                try_join_all(opens).await?.into_iter().flatten().collect();
 
             // This should return immediately on modern datasets.  Need to use physical_rows because
             // deletions will be applied later
@@ -2140,7 +2142,7 @@ impl FileFragment {
         for field in write_schema.fields() {
             if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
                 return Err(Error::invalid_input(format!(
-                    "Column {} is a reversed metadata column and cannot be updated",
+                    "Column {} is a reserved metadata column and cannot be updated",
                     field.name()
                 )));
             }

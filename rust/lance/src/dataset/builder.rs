@@ -840,7 +840,10 @@ impl DatasetBuilder {
                 version_number = Some(tag_content.version);
             }
 
-            if branch.as_deref() != dataset.manifest.branch.as_deref() {
+            let branch_differs = branch.as_deref() != dataset.manifest.branch.as_deref();
+            let version_differs =
+                version_number.is_some() && version_number != Some(dataset.manifest.version);
+            if branch_differs || version_differs {
                 return dataset
                     .checkout_version((branch.as_deref(), version_number))
                     .await;
