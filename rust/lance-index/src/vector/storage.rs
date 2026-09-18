@@ -594,26 +594,39 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
             .map_err(|e| Error::index(format!("Failed to decode IVF metadata: {}", e)))?;
-        let ivf_bytes = reader.read_global_buffer(ivf_pos).await?;
-        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
-
-        let mut metadata: Vec<String> = serde_json::from_str(
+        // Parsed before the reads below because it holds the position of the
+        // quantizer buffer, which is what lets that read start alongside the
+        // IVF one.
+        let mut metadata_strs: Vec<String> = serde_json::from_str(
             schema
                 .metadata
                 .get(STORAGE_METADATA_KEY)
                 .ok_or(Error::index(format!("{} not found", STORAGE_METADATA_KEY)))?
                 .as_str(),
         )?;
-        debug_assert_eq!(metadata.len(), 1);
+        debug_assert_eq!(metadata_strs.len(), 1);
         // for now the metadata is the same for all partitions, so we just store one
-        let metadata = metadata
+        let metadata_str = metadata_strs
             .pop()
             .ok_or(Error::index("metadata is empty".to_string()))?;
-        let mut metadata: Q::Metadata = serde_json::from_str(&metadata)?;
+        let mut metadata: Q::Metadata = serde_json::from_str(&metadata_str)?;
+        let quantizer_buffer_pos = metadata.buffer_index();
+
+        // Both positions come from the schema metadata, so the reads do not
+        // depend on each other: issue them together instead of waiting for the
+        // IVF protobuf before asking for the quantizer buffer.
+        let (ivf_bytes, quantizer_bytes) =
+            futures::try_join!(reader.read_global_buffer(ivf_pos), async {
+                match quantizer_buffer_pos {
+                    Some(pos) => reader.read_global_buffer(pos).await.map(Some),
+                    None => Ok(None),
+                }
+            })?;
+        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
+
         // we store large metadata (e.g. PQ codebook) in global buffer,
         // and the schema metadata just contains a pointer to the buffer
-        if let Some(pos) = metadata.buffer_index() {
-            let bytes = reader.read_global_buffer(pos).await?;
+        if let Some(bytes) = quantizer_bytes {
             metadata.parse_buffer(bytes)?;
         }
 
