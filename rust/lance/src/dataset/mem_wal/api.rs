@@ -575,9 +575,17 @@ pub trait DatasetMemWalExt {
     /// persisted.
     ///
     /// Takes effect for MemTables opened after the commit. A generation already
-    /// sealed keeps whatever it was written with, and the readers that need an
-    /// index a generation lacks build a transient one for the query, so the two
-    /// sets coexist without a drain.
+    /// sealed keeps whatever it was written with, and a reader meeting one that
+    /// lacks the index it wants still answers from it: a full-text search builds
+    /// a transient index for the query, a vector search falls back to exact
+    /// brute force, and a predicate scans. So the two sets coexist without a
+    /// drain, at the cost of the slower path over the generations written
+    /// before the change.
+    ///
+    /// The catch-up progress an index must earn before its SSTables can be
+    /// trimmed is derived per commit from the indexes the table actually has,
+    /// so a newly maintained index starts with none and holds the trim until it
+    /// proves coverage.
     async fn update_mem_wal_maintained_indexes(&mut self, _indexes: Vec<String>) -> Result<()> {
         Err(Error::not_supported(
             "update_mem_wal_maintained_indexes on this dataset type",
@@ -1387,6 +1395,80 @@ mod tests {
             vec!["id_idx".to_string()],
             "a rejected set must leave the committed one alone"
         );
+    }
+
+    /// The set shrinks as well as grows, and the progress the index carries --
+    /// what has been compacted, and what each index has caught up to -- is not
+    /// what this call is about, so it survives untouched.
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_narrows_without_losing_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        for (columns, name) in [(&["id"][..], "id_idx"), (&["v"][..], "v_idx")] {
+            dataset
+                .create_index(
+                    columns,
+                    IndexType::BTree,
+                    Some(name.to_string()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["id_idx", "v_idx"])
+            .execute()
+            .await
+            .unwrap();
+        let before = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+
+        dataset
+            .update_mem_wal_maintained_indexes(vec!["id_idx".to_string()])
+            .await
+            .expect("dropping one from the set is allowed");
+
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized");
+        assert_eq!(after.maintained_indexes, vec!["id_idx".to_string()]);
+        assert_eq!(
+            after.compacted_sstables, before.compacted_sstables,
+            "what has been compacted is not the maintained set"
+        );
+        assert_eq!(
+            after.writer_config_defaults, before.writer_config_defaults,
+            "the writer defaults are not the maintained set"
+        );
+        assert_eq!(
+            after.num_shards, before.num_shards,
+            "the shard count is not the maintained set"
+        );
+
+        // Emptying it is a legitimate set, not a request to uninstall.
+        dataset
+            .update_mem_wal_maintained_indexes(Vec::new())
+            .await
+            .expect("an empty set is allowed");
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized after emptying the set");
+        assert!(after.maintained_indexes.is_empty());
     }
 
     /// Updating before initializing is a caller error, not a silent install.
