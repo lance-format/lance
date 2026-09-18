@@ -20,7 +20,7 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -126,6 +126,9 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
+    /// Runtime-only IVF_RQ aux columns except codes. Dropped on disk-cache
+    /// deserialize; in-process reconstruct keeps the open-time buffers.
+    pub(crate) preloaded_aux_side: Option<Arc<RecordBatch>>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -208,6 +211,8 @@ pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 /// - `io_prepare`: prepare concurrency follows I/O parallelism, not just CPU.
 /// - `parallel_files`: load `index.idx` and `auxiliary.idx` concurrently.
 /// - `overlap_prefilter`: start partition I/O without waiting for the prefilter.
+/// - `preload_aux`: at index open, load every IVF_RQ aux column except codes.
+///   Not part of `all`; enable it explicitly for A/B.
 const IVF_QUERY_OPTS_ENV: &str = "LANCE_IVF_QUERY_OPTS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +221,7 @@ struct IvfQueryOpts {
     io_prepare: bool,
     parallel_files: bool,
     overlap_prefilter: bool,
+    preload_aux: bool,
 }
 
 impl IvfQueryOpts {
@@ -224,12 +230,14 @@ impl IvfQueryOpts {
         io_prepare: true,
         parallel_files: true,
         overlap_prefilter: true,
+        preload_aux: false,
     };
     const NONE: Self = Self {
         first_wave: false,
         io_prepare: false,
         parallel_files: false,
         overlap_prefilter: false,
+        preload_aux: false,
     };
 
     fn from_env() -> Self {
@@ -254,11 +262,13 @@ impl IvfQueryOpts {
                 "io_prepare" => opts.io_prepare = true,
                 "parallel_files" => opts.parallel_files = true,
                 "overlap_prefilter" => opts.overlap_prefilter = true,
+                "preload_aux" => opts.preload_aux = true,
                 "" => {}
                 other => {
                     warn!(
                         "ignoring unknown {IVF_QUERY_OPTS_ENV} item {other:?}; \
-                         expected first_wave, io_prepare, parallel_files, overlap_prefilter, all, or none"
+                         expected first_wave, io_prepare, parallel_files, overlap_prefilter, \
+                         preload_aux, all, or none"
                     );
                 }
             }
@@ -722,6 +732,17 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
+            + self
+                .preloaded_aux_side
+                .as_ref()
+                .map(|batch| {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| column.get_array_memory_size())
+                        .sum::<usize>()
+                })
+                .unwrap_or_default()
     }
 }
 
@@ -829,6 +850,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
+                preloaded_aux_side: None,
             })))
         }
 
@@ -1687,6 +1709,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
         let storage =
             IvfQuantizationStorage::try_new_with_remapper(storage_reader, frag_reuse_index).await?;
+        if IvfQueryOpts::from_env().preload_aux {
+            storage.preload_non_code_columns().await?;
+        }
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -1786,6 +1811,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[cfg(test)]
     pub(crate) fn prepared_partitions(&self) -> &PreparedPartitionTracker {
         &self.prepared_partitions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &IvfQuantizationStorage<Q> {
+        &self.storage
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -2105,6 +2135,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
+            preloaded_aux_side: self.storage.preloaded_non_code_columns(),
         }))
     }
 }
@@ -3053,6 +3084,9 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.distance_type,
         frag_reuse_index,
     );
+    if let Some(side) = &state.preloaded_aux_side {
+        storage.set_preloaded_non_code_columns(side.clone());
+    }
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
@@ -3098,12 +3132,17 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
+        builder::RabitQuantizer,
         ex_dot::{blocked_ex_code_bytes, padded_query_len},
-        storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
+        storage::{
+            RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQuantizationMetadata,
+            RabitQueryEstimator,
+        },
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::ivf::storage::IvfModel;
     use lance_index::vector::storage::VectorStore;
+    use lance_index::vector::storage::is_rq_code_column;
     use lance_index::vector::v3::subindex::IvfSubIndex;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
@@ -3154,7 +3193,7 @@ mod tests {
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_io::{
         object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
-        scheduler::{ScanScheduler, SchedulerConfig},
+        scheduler::{IoStats, ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
     };
     use lance_linalg::distance::{DistanceType, multivec_distance};
@@ -3207,6 +3246,20 @@ mod tests {
             super::IvfQueryOpts {
                 overlap_prefilter: true,
                 ..super::IvfQueryOpts::NONE
+            }
+        );
+        assert_eq!(
+            super::IvfQueryOpts::parse("preload_aux"),
+            super::IvfQueryOpts {
+                preload_aux: true,
+                ..super::IvfQueryOpts::NONE
+            }
+        );
+        assert_eq!(
+            super::IvfQueryOpts::parse("all"),
+            super::IvfQueryOpts {
+                preload_aux: false,
+                ..super::IvfQueryOpts::ALL
             }
         );
     }
@@ -6456,6 +6509,77 @@ mod tests {
             "Expected merge optimize to merge indices into one"
         );
         assert_rq_rotation_type(&dataset, rotation_type).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_rq_preload_aux_reads_only_codes_at_query() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(4);
+        let rq_params = RQBuildParams::with_rotation_type(1, RQRotationType::Fast);
+        let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = index
+            .as_any()
+            .downcast_ref::<super::IVFIndex<FlatIndex, RabitQuantizer>>()
+            .expect("IVF_RQ index");
+
+        let part_id = (0..ivf.storage().num_partitions())
+            .find(|&part_id| ivf.storage().partition_size(part_id) > 0)
+            .expect("non-empty partition");
+
+        let full_stats = IoStats::new();
+        ivf.load_partition_storage(part_id, Some(full_stats.clone()))
+            .await
+            .unwrap();
+        let full = full_stats.snapshot();
+
+        ivf.storage().preload_non_code_columns().await.unwrap();
+        let side = ivf
+            .storage()
+            .preloaded_non_code_columns()
+            .expect("side columns should be resident after preload");
+        assert!(side.num_rows() > 0);
+        for field in side.schema().fields() {
+            assert!(
+                !is_rq_code_column(field.name()),
+                "preloaded column {} should not be a code column",
+                field.name()
+            );
+        }
+        assert!(side.column_by_name(ROW_ID).is_some());
+        assert!(side.column_by_name(RABIT_CODE_COLUMN).is_none());
+
+        let codes_stats = IoStats::new();
+        ivf.load_partition_storage(part_id, Some(codes_stats.clone()))
+            .await
+            .unwrap();
+        let codes = codes_stats.snapshot();
+        assert!(
+            codes.iops < full.iops,
+            "preloaded query IOPS {} should be below full-schema IOPS {}",
+            codes.iops,
+            full.iops
+        );
+        assert!(
+            codes.bytes_read < full.bytes_read,
+            "preloaded query bytes {} should be below full-schema bytes {}",
+            codes.bytes_read,
+            full.bytes_read
+        );
+
+        test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
     }
 
     #[rstest]
