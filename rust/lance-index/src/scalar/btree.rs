@@ -1980,7 +1980,7 @@ fn filter_row_ids(
 
 /// True if `filter` would keep no rows at all (its keep-set is empty), letting
 /// the merge skip reading the segment entirely.
-fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
+pub(super) fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
         Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),

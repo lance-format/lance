@@ -484,7 +484,10 @@ async fn merge_scalar_indices<'a>(
 
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
-    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::NGram);
+    let has_segment_merge_primitive = matches!(
+        index_type,
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
+    );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
@@ -562,6 +565,19 @@ async fn merge_scalar_indices<'a>(
                     let (_, old_data_filters) =
                         build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
                     crate::index::scalar::btree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                    )
+                    .await?
+                }
+                IndexType::Bitmap => {
+                    let (_, old_data_filters) =
+                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
@@ -4789,5 +4805,438 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(total, 150, "no rows may be lost across compaction + merge");
+    }
+
+    /// Build one Bitmap segment per fragment of `dataset` under `index_name`.
+    async fn commit_bitmap_segment_per_fragment(dataset: &mut Dataset, index_name: &str) {
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let frag_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<Vec<_>>();
+        let mut staged = Vec::with_capacity(frag_ids.len());
+        for frag_id in frag_ids {
+            staged.push(
+                CreateIndexBuilder::new(dataset, &["cat"], IndexType::Bitmap, &params)
+                    .name(index_name.into())
+                    .fragments(vec![frag_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(index_name, "cat", staged)
+            .await
+            .unwrap();
+    }
+
+    fn id_cat_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]))
+    }
+
+    /// `id` ascending, `cat` cycling through A/B/C.
+    fn id_cat_batch(schema: &Arc<Schema>, range: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    range.map(|i| ["A", "B", "C"][(i % 3) as usize]),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn count_cat(dataset: &Dataset, cat: &str) -> usize {
+        count_rows_where(dataset, &format!("cat = '{cat}'")).await
+    }
+
+    async fn count_rows_where(dataset: &Dataset, predicate: &str) -> usize {
+        dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap() as usize
+    }
+
+    /// `id` ascending, `cat` cycling through A/B/C/NULL.
+    fn id_cat_nullable_batch(schema: &Arc<Schema>, range: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter(
+                    range.map(|i| ["A", "B", "C"].get((i % 4) as usize).copied()),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The K-way merge over a nullable column: nulls must survive consolidation of
+    /// several segments plus an unindexed tail, and `IS NULL` is served from
+    /// `null_map`, which is filled separately from the value row sets.
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_merge_keeps_nulls() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, true),
+        ]));
+
+        // 36 rows over three 12-row fragments; every fourth row is null.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_nullable_batch(&schema, 0..12)),
+                Ok(id_cat_nullable_batch(&schema, 12..24)),
+                Ok(id_cat_nullable_batch(&schema, 24..36)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 12,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    vec![Ok(id_cat_nullable_batch(&schema, 36..48))],
+                    schema.clone(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the merge must consolidate every bitmap segment"
+        );
+
+        // 48 rows cycling A/B/C/NULL: 12 of each.
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                12,
+                "wrong row count for cat = {cat} after merging a nullable column"
+            );
+        }
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NULL").await,
+            12,
+            "nulls lost across the bitmap merge"
+        );
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NOT NULL").await,
+            36,
+            "IS NOT NULL disagrees with the value row sets"
+        );
+        assert_eq!(dataset.scan().count_rows().await.unwrap(), 48);
+    }
+
+    /// A 200-way merge over three Bitmap segments plus an unindexed fragment must
+    /// consolidate into one segment (via the N:1 segment-merge primitive) and keep
+    /// every posting.
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_merge_consolidates() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_batch(&schema, 0..50)),
+                Ok(id_cat_batch(&schema, 50..100)),
+                Ok(id_cat_batch(&schema, 100..150)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            3
+        );
+
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(id_cat_batch(&schema, 150..200))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "a 200-way merge must consolidate every bitmap segment, got {segments:?}"
+        );
+        let expected_coverage = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&expected_coverage),
+            "merged bitmap segment must cover every dataset fragment"
+        );
+
+        for (cat, expected) in [("A", 67), ("B", 67), ("C", 66)] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "wrong row count for cat = {cat} after multi-segment bitmap merge"
+            );
+        }
+    }
+
+    /// A wide consolidation: 26 Bitmap delta segments merged into one by a single
+    /// `optimize_indices` call, with no unindexed data on top.
+    #[tokio::test]
+    async fn test_optimize_bitmap_wide_consolidation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let num_segments = 26;
+        let rows_per_fragment = 12;
+        let total_rows = num_segments * rows_per_fragment;
+        let batches = (0..num_segments)
+            .map(|i| {
+                Ok(id_cat_batch(
+                    &schema,
+                    i * rows_per_fragment..(i + 1) * rows_per_fragment,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), num_segments as usize);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            num_segments as usize
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "a {num_segments}-way merge must consolidate every bitmap segment, got {segments:?}"
+        );
+        let expected_coverage = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&expected_coverage)
+        );
+
+        let per_cat = (total_rows / 3) as usize;
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                per_cat,
+                "wrong row count for cat = {cat} after wide bitmap consolidation"
+            );
+        }
+    }
+
+    /// Deferred-remap compaction leaves the bitmap segments pointing at retired
+    /// fragment ids; a K-way segment merge must remap them through the
+    /// FragReuseIndex instead of dropping or misattributing the rows.
+    #[tokio::test]
+    async fn test_optimize_bitmap_merge_remaps_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_batch(&schema, 0..50)),
+                Ok(id_cat_batch(&schema, 50..100)),
+                Ok(id_cat_batch(&schema, 100..150)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(id_cat_batch(&schema, 150..200))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        for (cat, expected) in [("A", 67), ("B", 67), ("C", 66)] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "cat = {cat} lost or gained rows across deferred compaction + bitmap merge"
+            );
+        }
+        assert_eq!(
+            dataset.scan().count_rows().await.unwrap(),
+            200,
+            "no rows may be lost across compaction + bitmap merge"
+        );
+    }
+
+    /// Stable-row-id update against an older Bitmap segment's fragment: the K-way
+    /// merge must drop that segment's stale postings, not just the tail segment's.
+    #[tokio::test]
+    async fn test_optimize_bitmap_drops_stale_rows_across_segments_after_update() {
+        use crate::dataset::UpdateBuilder;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_batch(&schema, 0..50)),
+                Ok(id_cat_batch(&schema, 50..100)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+
+        // Rows 0..25 live in the *older* segment's fragment; rewrite their cat.
+        let res = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("cat", "'Z'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = res.new_dataset.as_ref().clone();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // Two segments went in, so this exercised the K-way path rather than the
+        // single-segment `update` this change does not touch.
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the optimize must have consolidated both segments"
+        );
+        // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
+        assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
+        for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "bitmap merge returned stale rows for cat = {cat}"
+            );
+        }
     }
 }
