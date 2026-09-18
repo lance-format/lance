@@ -347,6 +347,22 @@ impl JsonQueryParser {
             target_expr
         }
     }
+
+    fn path_matches_typed_accessor(path: &str) -> bool {
+        // A bare number is an object field in JSONPath but a root-array index in
+        // the typed accessors, so its meaning also depends on the input value.
+        if path.parse::<usize>().is_ok() {
+            return false;
+        }
+        let Ok(json_path) = jsonb::jsonpath::parse_json_path(path.as_bytes()) else {
+            return false;
+        };
+
+        matches!(
+            json_path.paths.as_slice(),
+            [jsonb::jsonpath::Path::DotField(field)] if field.as_ref() == path
+        )
+    }
 }
 
 impl ScalarQueryParser for JsonQueryParser {
@@ -417,6 +433,14 @@ impl ScalarQueryParser for JsonQueryParser {
                     _ => return None,
                 };
                 if udf.args.len() != 2 {
+                    return None;
+                }
+                // Index training evaluates `self.path` as JSONPath, while typed accessors
+                // perform one literal object-key lookup (or a root-array index lookup).
+                // These operations are equivalent only when the path parses as one bare
+                // object key with no normalization. In particular, `$.user.age` and
+                // `user.age` must fall back to a scan instead of querying nested index keys.
+                if !Self::path_matches_typed_accessor(&self.path) {
                     return None;
                 }
                 // We already know index 0 is a column reference to the column so we just need to
@@ -1062,6 +1086,17 @@ mod tests {
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
+
+    #[rstest]
+    #[case::bare_key("name", true)]
+    #[case::unicode_key("名字", true)]
+    #[case::root_prefixed("$.name", false)]
+    #[case::nested("name.first", false)]
+    #[case::jsonpath_array_index("$[0]", false)]
+    #[case::accessor_array_index("0", false)]
+    fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection

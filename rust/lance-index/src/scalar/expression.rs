@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_get_string(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, 'name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -3049,7 +3049,7 @@ mod tests {
                 ColInfo::new(
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
-                        "$.name".to_string(),
+                        "name".to_string(),
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -3064,23 +3064,27 @@ mod tests {
         // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_get_string(json, '$.name') = 'foo'",
+            "json_get_string(json, 'name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.name".to_string(),
+                "name".to_string(),
             ),
         );
         // `json_extract` evaluates to serialized JSON text, which does not match the
         // decoded keys in the index, so it must not route.
         // https://github.com/lance-format/lance/issues/8806
-        check_no_index(&index_info, "json_extract(json, '$.name') = 'foo'");
-        check_no_index(&index_info, "json_extract(json, '$.name') = '\"foo\"'");
-        check_no_index(&index_info, "json_extract(json, '$.name') < 'foo'");
+        check_no_index(&index_info, "json_extract(json, 'name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, 'name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, 'name') < 'foo'");
+        // Root-prefixed and nested JSONPath expressions do not have the same
+        // semantics as the typed accessors' literal key argument.
+        check_no_index(&index_info, "json_get_string(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'name.first') = 'foo'");
         // A typed accessor on a path the index was not built for still declines.
-        check_no_index(&index_info, "json_get_string(json, '$.other') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -4235,9 +4239,9 @@ mod tests {
     #[test]
     fn test_multi_json_indices_route_by_path() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // path "a" and one for path "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
-            "$.a".to_string(),
+            "a".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4245,7 +4249,7 @@ mod tests {
             )),
         )));
         multi.add(Box::new(JsonQueryParser::new(
-            "$.b".to_string(),
+            "b".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
                 "Json".to_string(),
@@ -4267,12 +4271,12 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.b".to_string(),
+                "b".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_get_string(json, '$.b') = 'foo'",
+            "json_get_string(json, 'b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4286,18 +4290,18 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.a".to_string(),
+                "a".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_get_string(json, '$.a') = 'foo'",
+            "json_get_string(json, 'a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_get_string(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'c') = 'foo'");
     }
 
     #[test]
