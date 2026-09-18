@@ -52,7 +52,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::Span;
+use tracing::{Span, instrument};
 
 use crate::udf::register_functions;
 use crate::{
@@ -692,6 +692,7 @@ fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
+#[instrument(level = "debug", skip_all)]
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -749,6 +750,7 @@ pub async fn analyze_plan(
 /// the context carrying those extensions; otherwise the nodes error during
 /// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
 /// of surfacing the error.
+#[instrument(level = "debug", name = "analyze_plan", skip_all)]
 pub async fn analyze_plan_with_context(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -1244,6 +1246,16 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 mod tests {
     use super::*;
 
+    use datafusion::physical_plan::empty::EmptyExec;
+    use tracing::{
+        Level,
+        span::{Attributes, Id},
+    };
+    use tracing_mock::{expect, subscriber};
+    use tracing_subscriber::{
+        Layer, layer::Context as LayerContext, layer::SubscriberExt, registry::LookupSpan,
+    };
+
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1387,42 +1399,62 @@ mod tests {
     #[derive(Debug)]
     struct RequiredExtension;
 
-    /// Execution node that only succeeds when [`RequiredExtension`] is present
-    /// on the task context's session config. This mirrors distributed routing
-    /// nodes that read a session-config identity extension during `execute`.
-    #[derive(Debug)]
-    struct NeedsExtensionExec {
+    type ExecuteFn = Box<
+        dyn Fn(Arc<TaskContext>) -> datafusion_common::Result<SendableRecordBatchStream>
+            + Send
+            + Sync,
+    >;
+
+    /// Single-partition execution node over an empty schema whose `execute` body
+    /// the test supplies. `name` is what the node reports as itself, including
+    /// in an analyze report.
+    struct TestExec {
+        name: &'static str,
         properties: Arc<PlanProperties>,
-        /// Set once the node reaches execution with the extension present.
-        /// Observed by the test so that dropping context forwarding (which
-        /// makes `execute` error before this point) is detectable.
-        executed: Arc<std::sync::atomic::AtomicBool>,
+        on_execute: ExecuteFn,
     }
 
-    impl NeedsExtensionExec {
-        fn new(executed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+    impl TestExec {
+        fn new(
+            name: &'static str,
+            on_execute: impl Fn(
+                Arc<TaskContext>,
+            ) -> datafusion_common::Result<SendableRecordBatchStream>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
             let schema = Arc::new(ArrowSchema::empty());
             Self {
+                name,
                 properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(schema),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
                 )),
-                executed,
+                on_execute: Box::new(on_execute),
             }
         }
     }
 
-    impl DisplayAs for NeedsExtensionExec {
-        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-            write!(f, "NeedsExtensionExec")
+    impl std::fmt::Debug for TestExec {
+        fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+            f.debug_struct("TestExec")
+                .field("name", &self.name)
+                .finish()
         }
     }
 
-    impl ExecutionPlan for NeedsExtensionExec {
+    impl DisplayAs for TestExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+            write!(f, "{}", self.name)
+        }
+    }
+
+    impl ExecutionPlan for TestExec {
         fn name(&self) -> &str {
-            "NeedsExtensionExec"
+            self.name
         }
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
@@ -1441,23 +1473,15 @@ mod tests {
             _partition: usize,
             context: Arc<TaskContext>,
         ) -> datafusion_common::Result<SendableRecordBatchStream> {
-            if context
-                .session_config()
-                .get_extension::<RequiredExtension>()
-                .is_none()
-            {
-                return Err(DataFusionError::Execution(
-                    "missing required session-config extension".to_string(),
-                ));
-            }
-            self.executed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let schema = self.schema();
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                stream::empty(),
-            )))
+            (self.on_execute)(context)
         }
+    }
+
+    fn empty_stream() -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(ArrowSchema::empty()),
+            stream::empty(),
+        ))
     }
 
     // Regression: analyze must run under a caller-provided TaskContext so nodes
@@ -1468,8 +1492,27 @@ mod tests {
     async fn test_analyze_plan_uses_provided_task_context() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        // The node mirrors distributed routing nodes that read a session-config
+        // identity extension during `execute`. It sets `executed` only once it
+        // reaches execution with the extension present, so dropping context
+        // forwarding (which makes `execute` error first) is detectable.
         let executed = Arc::new(AtomicBool::new(false));
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(TestExec::new("NeedsExtensionExec", {
+            let executed = executed.clone();
+            move |context| {
+                if context
+                    .session_config()
+                    .get_extension::<RequiredExtension>()
+                    .is_none()
+                {
+                    return Err(DataFusionError::Execution(
+                        "missing required session-config extension".to_string(),
+                    ));
+                }
+                executed.store(true, Ordering::SeqCst);
+                Ok(empty_stream())
+            }
+        }));
 
         // Default context lacks the extension: the node errors during execute
         // (never reaching the `executed` flag), but AnalyzeExec absorbs that
@@ -1516,5 +1559,115 @@ mod tests {
             executed.load(Ordering::SeqCst),
             "supplied context must be forwarded so the node executes"
         );
+    }
+
+    /// Records `(name, level, parent name)` for every span opened while it is
+    /// installed. Tests read the recording back after the subscriber is
+    /// uninstalled, which keeps the assertions independent of the order spans
+    /// are opened in and reports a mismatch as an ordinary assertion failure
+    /// rather than a panic inside a tracing callback.
+    #[derive(Clone, Default)]
+    struct SpanRecorder(Arc<Mutex<Vec<RecordedSpan>>>);
+
+    /// A span as the recorder saw it: its name and level, and the name of the
+    /// span it was opened under.
+    type RecordedSpan = (&'static str, Level, Option<&'static str>);
+
+    impl SpanRecorder {
+        fn recorded(&self) -> Vec<RecordedSpan> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<S> Layer<S> for SpanRecorder
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
+            let parent = ctx
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.name());
+            let meta = attrs.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((meta.name(), *meta.level(), parent));
+        }
+    }
+
+    #[test]
+    fn test_execute_plan_opens_execute_plan_span() {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(ArrowSchema::empty())));
+
+        let (subscriber, handle) = subscriber::mock()
+            .with_filter(|meta| meta.name() == "execute_plan")
+            .new_span(expect::span().named("execute_plan").at_level(Level::DEBUG))
+            .run_with_handle();
+
+        tracing::subscriber::with_default(subscriber, || {
+            execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+        });
+
+        handle.assert_finished();
+    }
+
+    // Unlike `execute_plan`, which returns before the stream is polled, analyze
+    // drives the plan to completion inside the call and re-parents the plan
+    // under its own span via `TracedExec`, so the spans a plan opens while it
+    // runs must sit underneath `analyze_plan` rather than beside it.
+    #[test]
+    fn test_analyze_plan_span_parents_plan_execution() {
+        // `TracedExec` re-parents in two places: around `execute`, and around
+        // every poll of the stream that `execute` returns. Real operators open
+        // their IO spans on the polling path, so cover both.
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(TestExec::new("SpanningExec", |_context| {
+            let _span = tracing::info_span!("plan_execute").entered();
+            let batches = stream::once(async {
+                let _span = tracing::info_span!("plan_poll").entered();
+                Ok(RecordBatch::new_empty(Arc::new(ArrowSchema::empty())))
+            });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(ArrowSchema::empty()),
+                batches,
+            )))
+        }));
+
+        let recorder = SpanRecorder::default();
+        // A subscriber is installed on one thread only, so the tasks analyze
+        // spawns for the plan must poll on the thread that installs it.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(recorder.clone()),
+            || {
+                runtime
+                    .block_on(analyze_plan(plan, LanceExecutionOptions::default()))
+                    .unwrap();
+            },
+        );
+
+        let spans = recorder.recorded();
+        assert!(
+            spans
+                .iter()
+                .any(|(name, level, _)| *name == "analyze_plan" && *level == Level::DEBUG),
+            "analyze must open a debug-level `analyze_plan` span, recorded: {spans:?}"
+        );
+        for opened_by_plan in ["plan_execute", "plan_poll"] {
+            let (.., parent) = spans
+                .iter()
+                .find(|(name, ..)| *name == opened_by_plan)
+                .unwrap_or_else(|| {
+                    panic!("the plan must open `{opened_by_plan}`, recorded: {spans:?}")
+                });
+            assert_eq!(
+                *parent,
+                Some("analyze_plan"),
+                "`{opened_by_plan}` must be parented to the analyze span, recorded: {spans:?}"
+            );
+        }
     }
 }

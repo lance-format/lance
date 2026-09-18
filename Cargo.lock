@@ -4623,6 +4623,8 @@ dependencies = [
  "rstest",
  "tokio",
  "tracing",
+ "tracing-mock",
+ "tracing-subscriber",
 ]
 
 [[package]]

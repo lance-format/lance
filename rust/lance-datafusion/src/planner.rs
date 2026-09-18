@@ -49,6 +49,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_core::datatypes::Schema;
 use lance_core::error::LanceOptionExt;
+use tracing::instrument;
 
 use chrono::Utc;
 use lance_core::{Error, Result};
@@ -1010,6 +1011,7 @@ impl Planner {
     }
 
     /// Optimize the filter expression and coerce data types.
+    #[instrument(level = "trace", name = "filter_optimize", skip_all)]
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
@@ -1331,6 +1333,33 @@ mod tests {
             );
             Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(0.0))))
         }
+    }
+
+    #[test]
+    fn test_optimize_expr_opens_filter_optimize_span() {
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )])));
+        let expr = col("i").gt(lit(3_i32));
+
+        // Filtering the mock down to the span under test keeps unrelated
+        // DataFusion spans out of its ordered expectation queue.
+        let (subscriber, handle) = tracing_mock::subscriber::mock()
+            .with_filter(|meta| meta.name() == "filter_optimize")
+            .new_span(
+                tracing_mock::expect::span()
+                    .named("filter_optimize")
+                    .at_level(tracing::Level::TRACE),
+            )
+            .run_with_handle();
+
+        tracing::subscriber::with_default(subscriber, || {
+            planner.optimize_expr(expr).unwrap();
+        });
+
+        handle.assert_finished();
     }
 
     #[test]
