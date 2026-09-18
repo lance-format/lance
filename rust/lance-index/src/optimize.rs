@@ -10,7 +10,7 @@ use crate::progress::{IndexBuildProgress, noop_progress};
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OptimizeOptions {
-    /// Number of delta indices to merge for one column. Default: 1.
+    /// Number of delta indices to merge for one column. Default: None.
     ///
     /// If `num_indices_to_merge` is None, lance will create a new delta index if no partition is split, otherwise it will merge all delta indices.
     /// If `num_indices_to_merge` is Some(N), the delta updates and latest N indices
