@@ -48,6 +48,7 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
@@ -608,6 +609,76 @@ impl GenericFileReader for NullReader {
     }
 }
 
+/// A per-scan cache of `ScanScheduler`s for non-default bases.
+///
+/// Files that live on an additional base (e.g. shallow clones) each need a
+/// scheduler for their base's object store. Without this cache every opened
+/// base file builds its own scheduler, so the scheduler back-pressure budget
+/// scales with the number of files opened and can exhaust memory. Sharing one
+/// scheduler per base for the lifetime of a scan bounds that budget by the
+/// number of bases instead.
+///
+/// The cache lives on [`FragReadConfig`], so it shares the scan's lifetime and
+/// its `io_buffer_size` — matching the primary scheduler threaded in through
+/// [`FragReadConfig::scan_scheduler`] rather than a longer, dataset-wide scope.
+#[derive(Clone)]
+pub struct BaseSchedulers {
+    /// `None` sizes each scheduler for the max bandwidth of its base's store.
+    io_buffer_size: Option<u64>,
+    schedulers: Arc<std::sync::Mutex<HashMap<u32, Arc<ScanScheduler>>>>,
+}
+
+impl std::fmt::Debug for BaseSchedulers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseSchedulers")
+            .field("io_buffer_size", &self.io_buffer_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BaseSchedulers {
+    /// Create an empty cache whose schedulers will use `io_buffer_size`, the
+    /// same budget as the scan's primary scheduler.
+    pub fn new(io_buffer_size: u64) -> Self {
+        Self {
+            io_buffer_size: Some(io_buffer_size),
+            schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create an empty cache whose schedulers are sized for the max bandwidth
+    /// of their base's object store, for scans whose primary scheduler uses
+    /// [`SchedulerConfig::max_bandwidth`].
+    pub fn max_bandwidth() -> Self {
+        Self {
+            io_buffer_size: None,
+            schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Return the scheduler for `base_id`, building it once from `object_store`
+    /// and reusing it for every later file read from the same base.
+    fn get_or_create(&self, base_id: u32, object_store: Arc<ObjectStore>) -> Arc<ScanScheduler> {
+        let mut schedulers = self.schedulers.lock().unwrap();
+        schedulers
+            .entry(base_id)
+            .or_insert_with(|| {
+                let config = match self.io_buffer_size {
+                    Some(io_buffer_size) => SchedulerConfig::new(io_buffer_size),
+                    None => SchedulerConfig::max_bandwidth(&object_store),
+                };
+                ScanScheduler::new(object_store, config)
+            })
+            .clone()
+    }
+
+    /// Number of distinct bases a scheduler has been built for.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.schedulers.lock().unwrap().len()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FragReadConfig {
     // Add the row id column
@@ -633,6 +704,11 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// Per-scan cache of schedulers for non-default bases.
+    ///
+    /// The scan sets this so every base file it opens shares one scheduler per
+    /// base. When absent, a base file falls back to building its own scheduler.
+    pub base_schedulers: Option<BaseSchedulers>,
 }
 
 impl FragReadConfig {
@@ -675,6 +751,11 @@ impl FragReadConfig {
 
     pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
         self.file_reader_options = Some(value);
+        self
+    }
+
+    pub fn with_base_schedulers(mut self, value: BaseSchedulers) -> Self {
+        self.base_schedulers = Some(value);
         self
     }
 }
@@ -1191,13 +1272,19 @@ impl FileFragment {
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
         let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
-            // TODO: reuse the same scan scheduler for non-default bases
             let object_store = self.dataset.object_store(Some(base_id)).await?;
-            let config = SchedulerConfig::max_bandwidth(&object_store);
-            (
-                ScanScheduler::new(object_store, config),
-                read_config.reader_priority.unwrap_or(0),
-            )
+            // Reuse one scheduler per base for the scan's lifetime so the
+            // scheduler budget scales with the number of bases, not files. When
+            // there is no scan cache (a one-off read), fall back to a dedicated
+            // scheduler for this file.
+            let scheduler = match read_config.base_schedulers.as_ref() {
+                Some(cache) => cache.get_or_create(base_id, object_store),
+                None => ScanScheduler::new(
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
+                ),
+            };
+            (scheduler, read_config.reader_priority.unwrap_or(0))
         } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
             (
                 scan_scheduler.clone(),
@@ -7291,5 +7378,35 @@ mod tests {
         // Verify the operation produced valid results
         assert!(!fields_modified.is_empty());
         assert!(!updated_fragment.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_base_schedulers_shares_one_per_base() {
+        let cache = BaseSchedulers::new(4 * 1024 * 1024);
+        let store = Arc::new(ObjectStore::local());
+
+        // Repeated resolutions of the same base reuse one scheduler, so opening
+        // many files from a base does not multiply scheduler budgets.
+        let first = cache.get_or_create(1, store.clone());
+        let second = cache.get_or_create(1, store.clone());
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same base must reuse one scheduler"
+        );
+
+        // A different base gets its own scheduler.
+        let other = cache.get_or_create(2, store.clone());
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different bases must not share a scheduler"
+        );
+
+        // Clones of the cache (as threaded per fragment) share the same map.
+        let cloned = cache.clone();
+        let via_clone = cloned.get_or_create(1, store);
+        assert!(
+            Arc::ptr_eq(&first, &via_clone),
+            "cache clones must share the per-scan scheduler map"
+        );
     }
 }
