@@ -1849,6 +1849,24 @@ def test_knn_with_deletions(tmp_path):
     assert expected == [r.as_py() for r in results]
 
 
+def test_create_index_warns_that_filter_nan_needs_an_accelerator(tmp_path):
+    # filter_nan only reaches the torch helpers, so on a CPU build it decides
+    # nothing: non-finite vectors are filtered either way.
+    tbl = create_table(nvec=256, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    with pytest.warns(UserWarning, match="filter_nan"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=2,
+            num_sub_vectors=2,
+            filter_nan=False,
+        )
+
+    assert len(dataset.describe_indices()) == 1
+
+
 def test_index_cache_size(tmp_path):
     rng = np.random.default_rng(seed=42)
 

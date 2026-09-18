@@ -3997,6 +3997,18 @@ class LanceDataset(pa.dataset.Dataset):
                     f"got {field.type.value_type}"
                 )
 
+        if filter_nan is False and accelerator is None:
+            # filter_nan only reaches the torch helpers in lance.vector, which
+            # run under `accelerator`; CPU training filters non-finite vectors
+            # unconditionally.
+            warnings.warn(
+                "filter_nan=False only has an effect on accelerator builds. "
+                "A CPU build always filters non-finite vectors, so this "
+                "parameter is ignored.",
+                UserWarning,
+                stacklevel=3,
+            )
+
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
@@ -4404,9 +4416,11 @@ class LanceDataset(pa.dataset.Dataset):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         filter_nan: bool
-            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
-            values are present (and otherwise will not). Disables the null filter used
-            for nullable columns. Obtains a small speed boost.
+            Defaults to True. Only honored on accelerator builds, where False is
+            UNSAFE: it disables the null filter for nullable columns, which
+            crashes if any null or nan value is present, in exchange for a small
+            speed boost. A CPU build always filters non-finite vectors, so the
+            parameter is ignored there.
         train : bool, default True
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
