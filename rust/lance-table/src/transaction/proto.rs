@@ -22,6 +22,7 @@ use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -462,6 +463,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         .map(|f| IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                         })
                         .collect(),
                 )
@@ -739,6 +741,9 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
                         .map(|f| pb::IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: f
+                                .file_metadata_size_bytes
+                                .map_or(0, NonZero::get),
                         })
                         .collect()
                 })

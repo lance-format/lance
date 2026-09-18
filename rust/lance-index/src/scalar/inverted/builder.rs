@@ -2951,6 +2951,7 @@ mod tests {
             Ok(IndexFile {
                 path: self.path.clone(),
                 size_bytes: 0,
+                file_metadata_size_bytes: None,
             })
         }
 
@@ -2961,6 +2962,7 @@ mod tests {
             Ok(IndexFile {
                 path: self.path.clone(),
                 size_bytes: 0,
+                file_metadata_size_bytes: None,
             })
         }
     }
