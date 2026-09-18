@@ -356,11 +356,17 @@ pub struct DrainLimit {
 /// buffer's offsets exceed `i32::MAX`, so batches are split before that point.
 pub(crate) const I32_OFFSET_BYTE_BUDGET: u64 = i32::MAX as u64;
 
-fn single_row_over_budget_error() -> Error {
-    Error::not_supported(
-        "A single row exceeds Arrow's i32 offset capacity and cannot be decoded into one Arrow array"
-            .to_string(),
-    )
+/// Clamp a batch's row count to the byte-budgeted limit.
+///
+/// A batch always advances by at least one row: a first row whose (possibly
+/// over-estimated) size exceeds the whole budget is emitted alone.  A genuinely
+/// oversized row then surfaces the same arrow-level offset error it always did,
+/// while an over-estimated one decodes fine.
+fn clamp_rows_to_i32_budget(limit: DrainLimit, to_take: u64) -> u64 {
+    if to_take == 0 {
+        return 0;
+    }
+    limit.rows.clamp(1, to_take)
 }
 
 /// Returns whether concatenating arrays of this type can overflow an i32 offset buffer.
@@ -1672,11 +1678,9 @@ impl BatchDecodeStream {
                 to_take,
                 I32_OFFSET_BYTE_BUDGET,
             )?;
-            if limit.rows == 0 && to_take > 0 {
-                return Err(single_row_over_budget_error());
-            }
-            self.rows_remaining += to_take - limit.rows;
-            to_take = limit.rows;
+            let clamped = clamp_rows_to_i32_budget(limit, to_take);
+            self.rows_remaining += to_take - clamped;
+            to_take = clamped;
         }
 
         let next_task = self.root_decoder.drain(to_take)?;
@@ -1910,11 +1914,9 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         let limit = self
             .root_decoder
             .max_rows_to_drain(to_take, I32_OFFSET_BYTE_BUDGET)?;
-        if limit.rows == 0 && to_take > 0 {
-            return Err(single_row_over_budget_error());
-        }
-        self.rows_remaining += to_take - limit.rows;
-        to_take = limit.rows;
+        let clamped = clamp_rows_to_i32_budget(limit, to_take);
+        self.rows_remaining += to_take - clamped;
+        to_take = clamped;
 
         let next_task = self.root_decoder.drain_batch(to_take)?;
 
@@ -1930,9 +1932,12 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_batch_task()
-            .transpose()
-            .map(|r| r.map_err(ArrowError::from))
+        let next = self.next_batch_task().transpose();
+        if let Some(Err(_)) = &next {
+            // Fuse after an error instead of re-attempting every remaining batch
+            self.rows_remaining = 0;
+        }
+        next.map(|r| r.map_err(ArrowError::from))
     }
 }
 
@@ -3407,6 +3412,22 @@ mod tests {
         )
         .await;
         assert_eq!(batch_sizes, vec![2, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_array_stream_emits_over_budget_rows_alone() {
+        // Rows whose (possibly over-estimated) size exceeds the whole budget are
+        // emitted as single-row batches rather than failing the scan.
+        const FAKE_ROW_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+        let batch_sizes = array_stream_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["a"], FAKE_ROW_BYTES),
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["b"], FAKE_ROW_BYTES),
+            ],
+            4,
+        )
+        .await;
+        assert_eq!(batch_sizes, vec![1, 1]);
     }
 
     #[test]

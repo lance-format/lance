@@ -168,18 +168,35 @@ struct DictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DictionaryPageDecoder {
-    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
         // Decoding materializes each row's dictionary value into a plain string
-        // array, so the longest dictionary value bounds the per-row size.  The
-        // dictionary is tiny (u8 indices), so scanning it here is cheap.
+        // array.  The u8 indices are cheap to decode, so compute the exact value
+        // bytes by summing each requested row's dictionary entry length (index 0
+        // is the in-band null and contributes nothing).
         let Some(strings) = self.decoded_dict.as_any().downcast_ref::<StringArray>() else {
             return Ok(None);
         };
-        let max_value_len = (0..strings.len())
-            .map(|i| strings.value_length(i) as u64)
-            .max()
-            .unwrap_or(0);
-        Ok(Some(num_rows * max_value_len))
+        let indices = self.indices_decoder.decode(rows_to_skip, num_rows)?;
+        let indices = match &indices {
+            DataBlock::FixedWidth(fixed) => fixed,
+            DataBlock::Nullable(nullable) => {
+                let Some(fixed) = nullable.data.as_fixed_width_ref() else {
+                    return Ok(None);
+                };
+                fixed
+            }
+            _ => return Ok(None),
+        };
+        if indices.bits_per_value != 8 {
+            return Ok(None);
+        }
+        let mut bytes = 0u64;
+        for &code in indices.data.as_ref() {
+            if code != 0 {
+                bytes += strings.value_length((code - 1) as usize) as u64;
+            }
+        }
+        Ok(Some(bytes))
     }
 
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {

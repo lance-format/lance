@@ -1382,7 +1382,8 @@ mod tests {
 
     #[test]
     fn test_list_page_reports_zero_rows_for_single_row_over_i32_offset_limit() {
-        // The stream root turns a zero-row limit into a "not supported" error.
+        // The stream root emits a zero-row limit as a single-row batch, letting a
+        // genuinely oversized row fail at the arrow layer as it always did.
         let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
         let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
         assert_eq!(limit.rows, 0);
