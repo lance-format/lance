@@ -627,3 +627,78 @@ def test_project_nullability_assertion_round_trips(tmp_path: Path):
     )
     with pytest.raises(Exception, match="preempted"):
         lance.LanceDataset.commit(tmp_path, relax, read_version=written_at)
+
+
+def test_rewrite_columns(tmp_path: Path):
+    table = pa.table({"a": range(8), "b": [str(i) for i in range(8)], "c": range(8)})
+    dataset = lance.write_dataset(
+        table, tmp_path, max_rows_per_file=4, data_storage_version="2.0"
+    )
+    dataset.delete("a = 3")
+    dataset.create_scalar_index("a", "BTREE")
+    expected = dataset.to_table()
+    version = dataset.version
+
+    dataset.rewrite_columns(["c"], data_storage_version="2.2")
+
+    assert dataset.version == version + 1
+    for fragment in dataset.get_fragments():
+        files = fragment.data_files()
+        assert [f.fields for f in files] == [[0, 1, -2], [2]]
+        assert (files[0].file_major_version, files[0].file_minor_version) == (2, 0)
+        assert (files[1].file_major_version, files[1].file_minor_version) == (2, 2)
+    assert dataset.to_table() == expected
+    assert dataset.data_storage_version == "2.0"
+    # The values did not change, so the index still covers every fragment.
+    (index,) = dataset.describe_indices()
+    (segment,) = index.segments
+    assert set(segment.fragment_ids) == {0, 1}
+    assert dataset.to_table(filter="a = 5").num_rows == 1
+
+    # Already in the requested layout: no new version.
+    dataset.rewrite_columns(["c"], data_storage_version="2.2")
+    assert dataset.version == version + 1
+
+    with pytest.raises(ValueError, match="not a top-level column"):
+        dataset.rewrite_columns(["missing"])
+
+    # A compaction that knows the group keeps `c` apart while moving the rest.
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100,
+        column_groups=[["c"]],
+        data_storage_version="2.2",
+    )
+    (fragment,) = dataset.get_fragments()
+    files = fragment.data_files()
+    assert [f.fields for f in files] == [[0, 1], [2]]
+    assert all((f.file_major_version, f.file_minor_version) == (2, 2) for f in files)
+    assert dataset.to_table() == expected
+
+
+def test_rewrite_columns_per_fragment_commit(tmp_path: Path):
+    table = pa.table({"a": range(6), "b": [str(i) for i in range(6)]})
+    dataset = lance.write_dataset(
+        table, tmp_path, max_rows_per_file=3, data_storage_version="2.0"
+    )
+    expected = dataset.to_table()
+
+    # The distributed shape: rewrite each fragment on its own, commit once.
+    updated = [
+        fragment.rewrite_columns(["b"], data_storage_version="2.1")
+        for fragment in dataset.get_fragments()
+    ]
+    assert all(metadata is not None for metadata in updated)
+    operation = lance.LanceOperation.Update(
+        updated_fragments=updated, update_mode="rewrite_columns"
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset, operation, read_version=dataset.version
+    )
+
+    for fragment in dataset.get_fragments():
+        files = fragment.data_files()
+        assert [f.fields for f in files] == [[0, -2], [1]]
+        assert (files[1].file_major_version, files[1].file_minor_version) == (2, 1)
+        # Nothing left to do for this fragment.
+        assert fragment.rewrite_columns(["b"], data_storage_version="2.1") is None
+    assert dataset.to_table() == expected

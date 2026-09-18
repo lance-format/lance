@@ -106,7 +106,7 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
+pub(super) async fn create_seed_writers(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     params: &WriteParams,
@@ -146,21 +146,13 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
-    let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
         dataset,
         normalized_schema,
         &params,
         schema_compare_options(version),
     )?;
-    match version {
-        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
-            write::validate_legacy_blob_write_schema(&schema, &version_name)?;
-        }
-        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::validate_blob_v2_write_schema(&schema)?;
-        }
-    }
+    validate_write_schema(version, &schema)?;
     let seed_writers = create_seed_writers(version, dataset, &params).await?;
     let fragments = write_fragments_direct(
         version,
@@ -176,6 +168,18 @@ pub async fn write_fragments(
     )
     .await?;
     Ok((fragments, schema))
+}
+
+/// Reject a schema whose blob columns the file `version` cannot store.
+pub(super) fn validate_write_schema(version: ConcreteFileVersion, schema: &Schema) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
+            write::validate_legacy_blob_write_schema(schema, &format!("{version:?}"))
+        }
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            write::validate_blob_v2_write_schema(schema)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

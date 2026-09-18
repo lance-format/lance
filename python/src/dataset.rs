@@ -3272,6 +3272,28 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (columns, data_storage_version = None))]
+    fn rewrite_columns(
+        &mut self,
+        columns: Vec<String>,
+        data_storage_version: Option<&str>,
+    ) -> PyResult<()> {
+        let version = data_storage_version
+            .map(str::parse)
+            .transpose()
+            .infer_error()?;
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = rt()
+            .spawn(None, async move {
+                let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+                new_self.rewrite_columns(&columns, version).await?;
+                Ok(new_self)
+            })?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[pyo3(signature = (reader, batch_size = None))]
     fn add_columns_from_reader(
         &mut self,

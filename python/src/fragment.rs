@@ -380,6 +380,26 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    #[pyo3(signature = (columns, data_storage_version = None))]
+    fn rewrite_columns(
+        &self,
+        columns: Vec<String>,
+        data_storage_version: Option<&str>,
+    ) -> PyResult<Option<PyLance<Fragment>>> {
+        let version = data_storage_version
+            .map(str::parse)
+            .transpose()
+            .infer_error()?;
+        let fragment = self.fragment.clone();
+        let updated = rt()
+            .spawn(None, async move {
+                let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+                fragment.rewrite_columns(&columns, version).await
+            })?
+            .infer_error()?;
+        Ok(updated.map(PyLance))
+    }
+
     fn merge(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,

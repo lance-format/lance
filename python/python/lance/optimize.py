@@ -131,3 +131,13 @@ class CompactionOptions(TypedDict, total=False):
     input versions and no overlays; TryBinaryCopy reencodes ineligible inputs,
     while ForceBinaryCopy reports an error.
     """
+    column_groups: Optional[list[list[str]]]
+    """
+    Top-level columns to keep in their own data files. Each inner list becomes
+    one data file per compacted fragment holding exactly those columns; every
+    column not listed goes to one shared file. This is the layout
+    ``LanceDataset.rewrite_columns`` produces, so a compaction configured with
+    the same groups preserves it. Binary copy is disabled when set, and
+    ``max_bytes_per_file`` is ignored so every group splits at the same rows.
+    (default: None, one file per fragment)
+    """

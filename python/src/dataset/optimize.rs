@@ -92,6 +92,11 @@ fn parse_compaction_options(
                     opts.data_storage_version = Some(version.parse().infer_error()?);
                 }
             }
+            "column_groups" => {
+                opts.column_groups = value
+                    .extract::<Option<Vec<Vec<String>>>>()?
+                    .unwrap_or_default();
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
@@ -129,8 +134,8 @@ pub struct PyCompactionMetrics {
     /// int : The number of files that have been removed, including deletion files.
     #[pyo3(get)]
     pub files_removed: usize,
-    /// int : The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// int : The number of files that have been added: one per new fragment, or
+    /// one per column group and fragment when ``column_groups`` is set.
     #[pyo3(get)]
     pub files_added: usize,
 }
