@@ -4434,10 +4434,21 @@ fn train_weighted_hierarchical_f32_kmeans(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized || cluster.indices.len() <= 1 {
-            cluster.finalized = true;
+        if cluster.finalized {
+            // Ordering pops non-finalized clusters first, so a finalized
+            // cluster at the top means nothing splittable is left.
             heap.push(cluster);
             break;
+        }
+        if cluster.indices.len() <= 1 {
+            // Priority is loss, not size, and `assign_weighted_f32_points`
+            // folds each supplied base loss into the cluster loss that orders
+            // the heap, so one huge base loss puts a singleton on top. Finalize
+            // it so it sinks and keep splitting the rest; giving up here
+            // rejected counts that were attainable.
+            cluster.finalized = true;
+            heap.push(cluster);
+            continue;
         }
 
         let remaining_k = target_k - heap.len();
@@ -4497,23 +4508,31 @@ fn train_weighted_hierarchical_f32_kmeans(
 
     let mut clusters = heap.into_vec();
     clusters.sort_by_key(|cluster| cluster.id);
-    while clusters.len() < target_k {
-        let duplicate = clusters
-            .iter()
-            .max_by(|left, right| {
-                left.weight
-                    .partial_cmp(&right.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned()
-            .ok_or_else(|| Error::index("No weighted clusters were trained"))?;
-        clusters.push(WeightedCluster {
-            id: next_cluster_id,
-            ..duplicate
-        });
-        next_cluster_id += 1;
+    if clusters.len() < target_k {
+        // Duplicating the heaviest cluster to pad the count used to leave
+        // permanently empty partitions: a padded centroid is a bit-identical
+        // clone, and assignment keeps the incumbent on a tie, so no vector is
+        // ever assigned to a duplicate. Reject instead, like the flat
+        // hierarchical trainer. The shortfall has two causes worth
+        // distinguishing in a bug report but not in the advice: the coreset
+        // rows are too alike to split further, or splitting stopped early.
+        return Err(Error::invalid_input(format!(
+            "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
+             non-empty clusters from {} weighted coreset rows, and the rest could not be \
+             split further. Reduce num_partitions to <= {} or provide more diverse data.",
+            clusters.len(),
+            data.len(),
+            clusters.len()
+        )));
     }
-    clusters.truncate(target_k);
+    // The split loop stops at `target_k`, and every `cluster_k` it takes is
+    // bounded by what is left, so the count lands exactly on `target_k`.
+    debug_assert_eq!(
+        clusters.len(),
+        target_k,
+        "weighted kmeans formed {} clusters for target_k {target_k}",
+        clusters.len()
+    );
 
     let mut values = Vec::with_capacity(target_k * dimension);
     for cluster in clusters {
@@ -6411,6 +6430,95 @@ mod tests {
             !is_callback_active.load(Ordering::SeqCst),
             "progress callback remained active after streaming IVF returned"
         );
+    }
+
+    /// Duplicating the heaviest cluster to pad the partition count used to
+    /// yield permanently empty partitions (a padded centroid is a clone, and
+    /// assignment keeps the incumbent on a tie); reject like the flat
+    /// hierarchical trainer.
+    ///
+    /// Two shapes reach the shortfall. Fewer rows than partitions is the
+    /// obvious one; the one the only production caller can actually produce is
+    /// a coreset with enough rows whose clusters cannot be split further,
+    /// because the coreset always carries at least `num_partitions` rows.
+    #[rstest::rstest]
+    #[case::fewer_rows_than_partitions(6, 16)]
+    #[case::enough_rows_all_identical(32, 16)]
+    #[test]
+    fn test_weighted_hierarchical_rejects_padding_with_duplicates(
+        #[case] num_points: usize,
+        #[case] target_k: usize,
+    ) {
+        let dimension = 8;
+        // Every row identical in the second case, a ramp in the first: either
+        // way the trainer cannot reach `target_k` non-empty clusters.
+        let values: Vec<f32> = if num_points < target_k {
+            (0..num_points * dimension)
+                .map(|i| i as f32 * 0.01)
+                .collect()
+        } else {
+            vec![0.5; num_points * dimension]
+        };
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
+                .unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k,
+            metric_type: MetricType::L2,
+            max_iters: 2,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let err = train_weighted_hierarchical_f32_kmeans(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.1; num_points],
+            &params,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Cannot create {target_k} IVF partitions")),
+            "got: {msg}"
+        );
+        // The row count belongs in the message: it is the coreset size, not
+        // the dataset's, so a reader can tell the two shortfalls apart.
+        assert!(
+            msg.contains(&format!("{num_points} weighted coreset rows")),
+            "got: {msg}"
+        );
+    }
+
+    /// A high-loss singleton must not stop training while other clusters still
+    /// have distinct rows to split. `assign_weighted_f32_points` folds each
+    /// supplied `base_losses[row]` into the cluster loss that orders the heap,
+    /// so one huge base loss puts a single-member cluster at the top; breaking
+    /// there rejected a 257-partition request that 258 distinct rows can serve,
+    /// advising a maximum of 16.
+    #[test]
+    fn test_weighted_hierarchical_exhausts_splittable_clusters() {
+        let dimension = 1;
+        let num_points = 258;
+        let target_k = 257;
+        let mut values = Vec::with_capacity(num_points);
+        values.push(1.0e9);
+        values.extend((1..num_points).map(|i| i as f32 * 100.0));
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: dimension as usize,
+            target_k,
+            metric_type: MetricType::L2,
+            max_iters: 20,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let mut losses = vec![0.0; num_points];
+        losses[0] = 1.0e20;
+
+        let centroids =
+            train_weighted_hierarchical_f32_kmeans(&data, &vec![1.0; num_points], &losses, &params)
+                .unwrap();
+        assert_eq!(centroids.len(), target_k);
     }
 
     /// Regression test for a hang in the streaming *coreset* trainer
