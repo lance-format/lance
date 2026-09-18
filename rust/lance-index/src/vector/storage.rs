@@ -3,12 +3,9 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
-use crate::vector::bq::storage::{
-    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN,
-};
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -16,8 +13,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
-use lance_file::reader::{FileReader, ReaderProjection};
-use lance_file::versions::reader_projection_from_column_names;
+use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
@@ -27,8 +23,8 @@ use std::{
     borrow::Cow,
     collections::BinaryHeap,
     mem::size_of,
-    ops::{Deref, DerefMut, Range},
-    sync::{Arc, OnceLock},
+    ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -58,99 +54,6 @@ where
     // this future and therefore cannot be inserted into the cache. A later
     // cache lookup remains responsible for retrying the load.
     spawn_cpu(materialize).await
-}
-
-/// Quantization code columns that stay on disk until a partition is queried.
-///
-/// IVF_RQ side columns (`_rowid`, residual factors) are much smaller than these
-/// and can be loaded when the index is opened.
-pub fn is_rq_code_column(name: &str) -> bool {
-    matches!(
-        name,
-        RABIT_CODE_COLUMN | RABIT_EX_CODE_COLUMN | RABIT_BLOCKED_EX_CODE_COLUMN
-    )
-}
-
-fn schema_names_matching(
-    schema: &lance_core::datatypes::Schema,
-    pred: impl Fn(&str) -> bool,
-) -> Vec<&str> {
-    schema
-        .fields
-        .iter()
-        .map(|field| field.name.as_str())
-        .filter(|name| pred(name))
-        .collect()
-}
-
-fn record_batch_heap_size(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|column| column.get_array_memory_size())
-        .sum()
-}
-
-fn merge_code_and_side_columns(
-    codes: &RecordBatch,
-    side: &RecordBatch,
-    full_schema: SchemaRef,
-) -> Result<RecordBatch> {
-    if codes.num_rows() != side.num_rows() {
-        return Err(Error::index(format!(
-            "preloaded aux side columns have {} rows but codes have {} rows",
-            side.num_rows(),
-            codes.num_rows()
-        )));
-    }
-    let columns = full_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            if let Some(column) = codes.column_by_name(field.name()) {
-                Ok(column.clone())
-            } else if let Some(column) = side.column_by_name(field.name()) {
-                Ok(column.clone())
-            } else {
-                Err(Error::index(format!(
-                    "missing column {} when merging preloaded IVF aux side columns",
-                    field.name()
-                )))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(full_schema, columns)?)
-}
-
-async fn read_projected_range(
-    reader: &FileReader,
-    range: Range<usize>,
-    projection: ReaderProjection,
-    io_stats: Option<&IoStats>,
-) -> Result<RecordBatch> {
-    let arrow_schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
-    if range.is_empty() {
-        return Ok(RecordBatch::new_empty(arrow_schema));
-    }
-    let reader = match io_stats {
-        Some(io_stats) => Cow::Owned(reader.with_io_stats(io_stats.recorder())),
-        None => Cow::Borrowed(reader),
-    };
-    let batches = reader
-        .read_stream_projected(
-            ReadBatchParams::Range(range),
-            u32::MAX,
-            8,
-            projection,
-            FilterExpression::no_filter(),
-        )
-        .await?
-        .try_collect::<Vec<_>>()
-        .await?;
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(arrow_schema));
-    }
-    Ok(concat_batches(&arrow_schema, batches.iter())?)
 }
 
 fn compact_prewarm_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
@@ -649,21 +552,11 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
     ivf: IvfModel,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    /// Aux columns except quantization codes, loaded at index open.
-    /// Query-time partition loads then read only the code columns.
-    preloaded_side: OnceLock<Arc<RecordBatch>>,
-    codes_projection: OnceLock<ReaderProjection>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context)
-            + self.ivf.deep_size_of_children(context)
-            + self
-                .preloaded_side
-                .get()
-                .map(|batch| record_batch_heap_size(batch))
-                .unwrap_or_default()
+        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
 
@@ -730,8 +623,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
-            preloaded_side: OnceLock::new(),
-            codes_projection: OnceLock::new(),
         })
     }
 
@@ -763,8 +654,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
-            preloaded_side: OnceLock::new(),
-            codes_projection: OnceLock::new(),
         }
     }
 
@@ -806,74 +695,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    /// Load every auxiliary column except IVF_RQ code columns into memory.
-    ///
-    /// No-op when the file has no RaBitQ code columns. Query-time
-    /// [`Self::load_partition`] then reads only the remaining code columns.
-    pub async fn preload_non_code_columns(&self) -> Result<()> {
-        if self.preloaded_side.get().is_some() {
-            return Ok(());
-        }
-        let schema = self.reader.schema();
-        let code_names = schema_names_matching(schema, is_rq_code_column);
-        if code_names.is_empty() {
-            return Ok(());
-        }
-        let side_names = schema_names_matching(schema, |name| !is_rq_code_column(name));
-        if side_names.is_empty() {
-            return Ok(());
-        }
-
-        let side_projection = reader_projection_from_column_names(
-            self.reader.metadata().version(),
-            schema,
-            &side_names,
-        )?;
-        let codes_projection = reader_projection_from_column_names(
-            self.reader.metadata().version(),
-            schema,
-            &code_names,
-        )?;
-        let num_rows = usize::try_from(self.reader.num_rows()).map_err(|_| {
-            Error::index(format!(
-                "aux file row count {} does not fit in usize",
-                self.reader.num_rows()
-            ))
-        })?;
-        let batch = read_projected_range(&self.reader, 0..num_rows, side_projection, None).await?;
-        let _ = self.preloaded_side.set(Arc::new(batch));
-        let _ = self.codes_projection.set(codes_projection);
-        Ok(())
-    }
-
-    pub fn set_preloaded_non_code_columns(&self, batch: Arc<RecordBatch>) {
-        let _ = self.preloaded_side.set(batch);
-    }
-
-    pub fn preloaded_non_code_columns(&self) -> Option<Arc<RecordBatch>> {
-        self.preloaded_side.get().cloned()
-    }
-
-    fn codes_projection(&self) -> Result<Option<ReaderProjection>> {
-        if self.preloaded_side.get().is_none() {
-            return Ok(None);
-        }
-        if let Some(projection) = self.codes_projection.get() {
-            return Ok(Some(projection.clone()));
-        }
-        let code_names = schema_names_matching(self.reader.schema(), is_rq_code_column);
-        if code_names.is_empty() {
-            return Ok(None);
-        }
-        let projection = reader_projection_from_column_names(
-            self.reader.metadata().version(),
-            self.reader.schema(),
-            &code_names,
-        )?;
-        let _ = self.codes_projection.set(projection.clone());
-        Ok(Some(projection))
-    }
-
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///
@@ -881,9 +702,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// scheduler also records into the sink (a cheap clone that shares all
     /// cached metadata, so no file is re-opened).  When `None`, the normal
     /// uninstrumented reader is used.
-    ///
-    /// If [`Self::preload_non_code_columns`] has run, only code columns are
-    /// read from disk and merged with the resident side columns.
     pub async fn load_partition(
         &self,
         part_id: usize,
@@ -894,26 +712,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = self.reader.schema();
             let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
             RecordBatch::new_empty(Arc::new(arrow_schema))
-        } else if let (Some(side), Some(codes_projection)) =
-            (self.preloaded_side.get(), self.codes_projection()?)
-        {
-            if range.end > side.num_rows() {
-                return Err(Error::index(format!(
-                    "partition {part_id} row range {}..{} exceeds preloaded aux side columns ({} rows)",
-                    range.start,
-                    range.end,
-                    side.num_rows()
-                )));
-            }
-            let codes = read_projected_range(
-                &self.reader,
-                range.clone(),
-                codes_projection,
-                io_stats.as_ref(),
-            )
-            .await?;
-            let side = side.slice(range.start, range.end - range.start);
-            merge_code_and_side_columns(&codes, &side, self.schema())?
         } else {
             let reader = match &io_stats {
                 Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
@@ -973,8 +771,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches, is_rq_code_column,
-        merge_code_and_side_columns, spawn_prewarm_materialization,
+        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches,
+        spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use lance_core::deepsize::DeepSizeOf;
@@ -1125,73 +923,5 @@ mod tests {
             assert_eq!(scratch.u32.len(), 3);
             assert_eq!(scratch.u32.capacity(), 3);
         });
-    }
-
-    #[test]
-    fn test_is_rq_code_column() {
-        assert!(is_rq_code_column("_rabit_codes"));
-        assert!(is_rq_code_column("__ex_codes"));
-        assert!(is_rq_code_column("__blocked_ex_codes"));
-        assert!(!is_rq_code_column("_rowid"));
-        assert!(!is_rq_code_column("__add_factors"));
-        assert!(!is_rq_code_column("__pq_code"));
-    }
-
-    #[test]
-    fn test_merge_code_and_side_columns() {
-        let codes = RecordBatch::try_from_iter([(
-            "_rabit_codes",
-            Arc::new(UInt64Array::from_iter_values(10..13)) as ArrayRef,
-        )])
-        .unwrap();
-        let side = RecordBatch::try_from_iter([
-            (
-                "_rowid",
-                Arc::new(UInt64Array::from_iter_values(0..3)) as ArrayRef,
-            ),
-            (
-                "__add_factors",
-                Arc::new(UInt64Array::from_iter_values(100..103)) as ArrayRef,
-            ),
-        ])
-        .unwrap();
-        let full_schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("_rowid", arrow_schema::DataType::UInt64, true),
-            arrow_schema::Field::new("_rabit_codes", arrow_schema::DataType::UInt64, true),
-            arrow_schema::Field::new("__add_factors", arrow_schema::DataType::UInt64, true),
-        ]);
-        let merged = merge_code_and_side_columns(&codes, &side, Arc::new(full_schema)).unwrap();
-        assert_eq!(merged.num_columns(), 3);
-        assert_eq!(merged.num_rows(), 3);
-        assert_eq!(
-            merged
-                .column_by_name("_rowid")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .values(),
-            &[0, 1, 2]
-        );
-        assert_eq!(
-            merged
-                .column_by_name("_rabit_codes")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .values(),
-            &[10, 11, 12]
-        );
-        assert_eq!(
-            merged
-                .column_by_name("__add_factors")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .values(),
-            &[100, 101, 102]
-        );
     }
 }
