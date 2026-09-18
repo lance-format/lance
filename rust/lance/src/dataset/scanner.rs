@@ -7280,7 +7280,7 @@ pub mod test_dataset {
     use uuid::Uuid;
 
     use crate::dataset::WriteParams;
-    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::{StageParams, VectorIndexParams};
 
     // Creates a dataset with 5 batches where each batch has 80 rows
     //
@@ -7379,7 +7379,13 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
+            let mut params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
+            // Two partitions over 400 vectors only holds at a sample rate this
+            // fixture can cover: the trained count is capped at the vectors
+            // available per centroid.
+            if let Some(StageParams::Ivf(ivf)) = params.stages.first_mut() {
+                ivf.sample_rate = 200;
+            }
             self.dataset
                 .create_index(
                     &["vec"],
