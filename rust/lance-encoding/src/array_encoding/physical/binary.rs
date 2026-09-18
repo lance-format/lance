@@ -332,32 +332,21 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
                 if num_bytes > i32::MAX as u64 {
                     return Err(oversized_binary_batch_error(num_rows, num_bytes));
                 }
-                let offsets = target_vec
-                    .iter()
-                    .map(|&offset| {
-                        i32::try_from(offset - start)
-                            .map_err(|_| oversized_binary_batch_error(num_rows, num_bytes))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                ScalarBuffer::from(offsets).into_inner()
+                ScalarBuffer::from_iter(target_vec.iter().map(|&offset| (offset - start) as i32))
+                    .into_inner()
             }
             8 => {
                 let num_bytes = end - start;
-                let offsets = target_vec
-                    .iter()
-                    .map(|&offset| {
-                        i64::try_from(offset - start).map_err(|_| {
-                            Error::not_supported(format!(
-                                "Could not create large_string/large_binary array in a single \
-                                 batch because {} rows would require {} bytes, which exceeds \
-                                 i64::MAX. Please reduce the batch_size or set \
-                                 LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
-                                num_rows, num_bytes
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                ScalarBuffer::from(offsets).into_inner()
+                if num_bytes > i64::MAX as u64 {
+                    return Err(Error::not_supported(format!(
+                        "Could not create large_string/large_binary array in a single batch \
+                         because {} rows would require {} bytes, which exceeds i64::MAX. Please \
+                         reduce the batch_size or set LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
+                        num_rows, num_bytes
+                    )));
+                }
+                ScalarBuffer::from_iter(target_vec.iter().map(|&offset| (offset - start) as i64))
+                    .into_inner()
             }
             _ => panic!("Unsupported offsets type"),
         };
