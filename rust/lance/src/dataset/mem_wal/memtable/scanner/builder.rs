@@ -347,10 +347,11 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
                 }
                 return Ok(());
             }
-            IndexFtsQuery::MultiMatch(_) => {
-                return Err(Error::not_supported(
-                    "MemTable full-text search does not support multi-match queries".to_string(),
-                ));
+            IndexFtsQuery::MultiMatch(m) => {
+                for leaf in &m.match_queries {
+                    visit(&IndexFtsQuery::Match(leaf.clone()), current)?;
+                }
+                return Ok(());
             }
         };
         match (*current, requested) {
@@ -428,11 +429,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
             }
             builder.build()
         }
-        IndexFtsQuery::MultiMatch(_) => {
-            return Err(Error::not_supported(
-                "MemTable full-text search does not support multi-match queries".to_string(),
-            ));
-        }
+        IndexFtsQuery::MultiMatch(m) => FtsQueryExpr::MultiMatch {
+            children: m
+                .match_queries
+                .iter()
+                .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
+                .collect::<Result<_>>()?,
+        },
     })
 }
 
@@ -2096,8 +2099,8 @@ mod tests {
             "nesting flattened: {must:?}"
         );
 
-        // Multi-match spans columns -> still refused; the memtable holds one
-        // inverted index per column.
+        // Multi-match maps to a best-child node whose leaves keep their own
+        // columns, so a tree spanning fields still routes leaf by leaf.
         let multi = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
             MultiMatchQuery::try_new(
                 "x".to_string(),
@@ -2105,10 +2108,18 @@ mod tests {
             )
             .unwrap(),
         ));
-        assert!(
-            local_fts_query(multi, None).is_err(),
-            "multi-match must be rejected"
+        let local = local_fts_query(multi, None).unwrap();
+        let FtsQueryExpr::MultiMatch { children } = &local.expr else {
+            panic!("expected a MultiMatch expr, got {:?}", local.expr);
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.column())
+                .collect::<Vec<_>>(),
+            [Some("text"), Some("other")]
         );
+        assert_eq!(local.columns(), ["text", "other"]);
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());
