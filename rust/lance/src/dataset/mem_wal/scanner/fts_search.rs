@@ -1979,10 +1979,6 @@ mod tests {
         );
     }
 
-    /// The SSTable arm must apply the filter as a true FTS prefilter, and that
-    /// prefiltered candidate set must compose with cross-generation block-list
-    /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
-    /// superseded by gen 2; with over-fetch, gen 1 should still contribute id=4.
     /// A cross-column predicate meets on rows, so every leaf has to reach its
     /// own index. When a sealed generation stores one of those columns under an
     /// older name, each leaf would need a different name -- and `with_column`
@@ -2100,6 +2096,10 @@ mod tests {
             .expect("an unmoved cross-column predicate still plans over the generation");
     }
 
+    /// The SSTable arm must apply the filter as a true FTS prefilter, and that
+    /// prefiltered candidate set must compose with cross-generation block-list
+    /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
+    /// superseded by gen 2; with over-fetch, gen 1 should still contribute id=4.
     #[tokio::test]
     async fn prefilter_on_sstable_composes_with_block_list() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
