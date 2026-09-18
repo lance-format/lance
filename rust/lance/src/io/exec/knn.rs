@@ -47,12 +47,14 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
+use lance_index::IndexType;
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
+use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::{
-    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
-    flat::compute_distance,
+    ApproxMode, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query,
+    VectorIndex, flat::compute_distance,
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -1241,6 +1243,7 @@ pub fn new_knn_exec(
     prefilter_source: PreFilterSource,
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
+    quantized_refine_factor: Option<u32>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1260,6 +1263,9 @@ pub fn new_knn_exec(
     }
     if external_mask.is_some() {
         sub_index = sub_index.with_external_mask(external_mask);
+    }
+    if let Some(factor) = quantized_refine_factor {
+        sub_index = sub_index.with_quantized_refine_factor(factor)?;
     }
 
     Ok(Arc::new(sub_index))
@@ -1532,6 +1538,9 @@ pub struct ANNIvfSubIndexExec {
     properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
+
+    /// Coarse-candidate overfetch factor for RQ Fast-to-Accurate refinement.
+    quantized_refine_factor: Option<u32>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -1564,6 +1573,7 @@ impl ANNIvfSubIndexExec {
             external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            quantized_refine_factor: None,
         })
     }
 
@@ -1579,6 +1589,17 @@ impl ANNIvfSubIndexExec {
     pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
         self.external_mask = mask;
         self
+    }
+
+    /// Refine RQ candidates from one-bit Fast scores to multi-bit Accurate scores.
+    pub fn with_quantized_refine_factor(mut self, factor: u32) -> Result<Self> {
+        if factor == 0 {
+            return Err(Error::invalid_input(
+                "quantized refine factor must be greater than zero",
+            ));
+        }
+        self.quantized_refine_factor = Some(factor);
+        Ok(self)
     }
 
     /// Returns a reference to the vector query.
@@ -1617,8 +1638,12 @@ impl DisplayAs for ANNIvfSubIndexExec {
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
-                )
+                    metric_str,
+                )?;
+                if let Some(factor) = self.quantized_refine_factor {
+                    write!(f, ", quantized_refine_factor={factor}")?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -1627,8 +1652,12 @@ impl DisplayAs for ANNIvfSubIndexExec {
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
-                )
+                    metric_str,
+                )?;
+                if let Some(factor) = self.quantized_refine_factor {
+                    write!(f, "\nquantized_refine_factor={factor}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -1828,6 +1857,84 @@ fn restrict_to_segment(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
+struct RestrictedPreFilter {
+    inner: Arc<dyn PreFilter>,
+    restriction: Arc<RowAddrMask>,
+}
+
+#[async_trait::async_trait]
+impl PreFilter for RestrictedPreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        self.inner.wait_for_ready().await
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        Arc::new(self.inner.mask().as_ref().clone() & self.restriction.as_ref().clone())
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.mask().selected_indices(row_ids)
+    }
+}
+
+fn quantized_top_k(batch: &RecordBatch, query: &Query) -> Result<RecordBatch> {
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::internal("quantized refinement result has no row-id column"))?
+        .as_primitive::<UInt64Type>();
+    let distances = batch
+        .column_by_name(DIST_COL)
+        .ok_or_else(|| Error::internal("quantized refinement result has no distance column"))?
+        .as_primitive::<Float32Type>();
+    if row_ids.len() != distances.len() {
+        return Err(Error::internal(format!(
+            "quantized refinement returned {} row ids and {} distances",
+            row_ids.len(),
+            distances.len()
+        )));
+    }
+
+    let lower_bound = query.lower_bound.unwrap_or(f32::MIN);
+    let upper_bound = query.upper_bound.unwrap_or(f32::MAX);
+    let mut top_results = BinaryHeap::with_capacity(query.k);
+    for row_idx in 0..row_ids.len() {
+        if row_ids.is_null(row_idx) || distances.is_null(row_idx) {
+            continue;
+        }
+        let distance = distances.value(row_idx);
+        if distance.is_nan() || distance < lower_bound || distance >= upper_bound {
+            continue;
+        }
+        let node = (OrderedFloat(distance), row_ids.value(row_idx));
+        if top_results.len() < query.k {
+            top_results.push(node);
+        } else if top_results.peek().is_some_and(|farthest| farthest > &node) {
+            top_results.pop();
+            top_results.push(node);
+        }
+    }
+
+    let mut ordered = top_results.into_vec();
+    ordered.sort_unstable();
+    let mut row_ids = Vec::with_capacity(ordered.len());
+    let mut distances = Vec::with_capacity(ordered.len());
+    for (distance, row_id) in ordered {
+        row_ids.push(row_id);
+        distances.push(distance.0);
+    }
+    Ok(RecordBatch::try_new(
+        KNN_INDEX_SCHEMA.clone(),
+        vec![
+            Arc::new(Float32Array::from(distances)),
+            Arc::new(UInt64Array::from(row_ids)),
+        ],
+    )?)
+}
+
 fn effective_query_parallelism(
     query: &Query,
     index: &dyn VectorIndex,
@@ -1865,12 +1972,73 @@ impl ANNIvfSubIndexExec {
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> DataFusionResult<RecordBatch> {
-        let batch = index
-            .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
-            .await?;
-        let batch = restrict_to_segment(batch, seg_mask.as_deref())?;
+        let batch = if let Some(factor) = quantized_refine_factor {
+            if index.index_type() != IndexType::IvfRq {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "quantized refinement requires an IVF_RQ flat index, got {}",
+                    index.index_type()
+                )));
+            }
+            let candidate_limit = query.k.checked_mul(factor as usize).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "quantized refinement candidate count overflows: k={} factor={factor}",
+                    query.k
+                ))
+            })?;
+            let mut coarse_query = query.clone();
+            coarse_query.approx_mode = ApproxMode::Fast;
+            coarse_query.refine_factor = None;
+            coarse_query.lower_bound = None;
+            coarse_query.upper_bound = None;
+            let candidate_prefilter: Arc<dyn PreFilter> = match &seg_mask {
+                Some(restriction) => Arc::new(RestrictedPreFilter {
+                    inner: pre_filter,
+                    restriction: restriction.clone(),
+                }),
+                None => pre_filter,
+            };
+            let candidates = index
+                .search_in_partition_with_candidates(
+                    part_id,
+                    &coarse_query,
+                    candidate_prefilter,
+                    &metrics.index_metrics,
+                    candidate_limit,
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "failed to discover quantized refinement candidates: {e}"
+                    ))
+                })?;
+            let offsets = candidates
+                .candidates
+                .iter()
+                .map(|candidate| candidate.offset_in_partition)
+                .collect::<Vec<_>>();
+            let scored = index
+                .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "failed to score quantized refinement candidates: {e}"
+                    ))
+                })?;
+            let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
+            quantized_top_k(&scored, &query).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "failed to select quantized refinement results: {e}"
+                ))
+            })?
+        } else {
+            let batch = index
+                .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
+                .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {e}")))
+                .await?;
+            restrict_to_segment(batch, seg_mask.as_deref())?
+        };
         metrics.baseline_metrics.record_output(batch.num_rows());
         Ok(batch)
     }
@@ -1910,6 +2078,7 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1950,6 +2119,9 @@ impl ANNIvfSubIndexExec {
             if let Some(max_results) = max_results
                 && found_so_far < max_results
                 && max_results <= query.k
+                // Quantized refinement must score every returned row and apply its
+                // distance bounds, so it cannot emit unscored rows from this shortcut.
+                && quantized_refine_factor.is_none()
             {
                 // In this case there are fewer than k results matching the prefilter so
                 // just return the prefilter ids and don't bother searching any further
@@ -2003,7 +2175,7 @@ impl ANNIvfSubIndexExec {
 
             let query_parallelism =
                 effective_query_parallelism(&query, index.as_ref(), target_partitions);
-            if query_parallelism <= 1 {
+            if query_parallelism <= 1 && quantized_refine_factor.is_none() {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
                     let index_metrics: Arc<dyn MetricsCollector> =
@@ -2052,6 +2224,7 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     let seg_mask = seg_mask.clone();
+                    let quantized_refine_factor = quantized_refine_factor;
                     async move {
                         metrics.partitions_searched.add(1);
                         let batch = Self::search_partition(
@@ -2061,6 +2234,7 @@ impl ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             seg_mask,
+                            quantized_refine_factor,
                         )
                         .await?;
                         state.record_late_batch(batch.num_rows());
@@ -2088,12 +2262,13 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
         let query_parallelism =
             effective_query_parallelism(&query, index.as_ref(), target_partitions);
-        if query_parallelism <= 1 {
+        if query_parallelism <= 1 && quantized_refine_factor.is_none() {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
                 let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -2140,6 +2315,7 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 let seg_mask = seg_mask.clone();
+                let quantized_refine_factor = quantized_refine_factor;
                 async move {
                     let batch = Self::search_partition(
                         index,
@@ -2148,6 +2324,7 @@ impl ANNIvfSubIndexExec {
                         pre_filter,
                         metrics,
                         seg_mask,
+                        quantized_refine_factor,
                     )
                     .await?;
                     state.record_batch(&batch);
@@ -2214,6 +2391,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
+                quantized_refine_factor: self.quantized_refine_factor,
             }
         } else {
             return Err(DataFusionError::Internal(
@@ -2232,6 +2410,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let schema = self.schema();
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
+        let quantized_refine_factor = self.quantized_refine_factor;
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
@@ -2324,6 +2503,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let indices_by_uuid = indices_by_uuid.clone();
                     let state = state.clone();
                     let segment_bitmaps = segment_bitmaps.clone();
+                    let quantized_refine_factor = quantized_refine_factor;
                     let mut query = query.clone();
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
@@ -2377,6 +2557,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             state.clone(),
                             target_partitions,
                             seg_mask.clone(),
+                            quantized_refine_factor,
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -2389,6 +2570,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             state,
                             target_partitions,
                             seg_mask,
+                            quantized_refine_factor,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -3883,6 +4065,7 @@ mod tests {
             state,
             usize::MAX,
             None,
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -3933,6 +4116,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -3997,6 +4181,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4087,6 +4272,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask.clone()),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4120,6 +4306,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4182,6 +4369,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask.clone()),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4199,6 +4387,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4232,6 +4421,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             None,
+            None,
         )
         .try_collect::<Vec<_>>();
 
@@ -4250,6 +4440,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>();
