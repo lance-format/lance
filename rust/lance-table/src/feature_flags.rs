@@ -60,8 +60,12 @@ pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// (see `supported_flags_when`), so a build that knows the flag but not the
 /// handling behind it cannot open such a table.
 pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
+/// Tagged FRI requires a reader that interprets its mappings and a writer that
+/// preserves them during maintenance. Legacy-only FRI does not set this bit.
+/// Bit 9 is taken by the stable-row-id FRI compatibility flag.
+pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 10;
+pub const FLAG_UNKNOWN: u64 = 1 << 11;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -72,11 +76,7 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 // boundary is bit 8, so anything at or above it is refused there.
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
-
-/// Tagged FRI requires a reader that interprets its mappings and a writer that
-/// preserves them during maintenance. Legacy-only FRI does not set this bit.
-/// Bit 9 is taken by the stable-row-id FRI compatibility flag.
-pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -209,6 +209,9 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
+    // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
+    // until its reader/writer handling lands.
+    mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
     supported
 }
 
