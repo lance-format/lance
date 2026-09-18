@@ -138,10 +138,10 @@ mod tests {
     use super::SessionBuilder;
     use std::sync::Arc;
 
+    use arrow_array::record_batch;
     use arrow_array::{Int64Array, RecordBatch};
     use datafusion::catalog::SchemaProvider;
     use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
-    use datafusion::common::record_batch;
     use datafusion::datasource::MemTable;
     use datafusion::error::Result;
 
