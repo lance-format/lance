@@ -266,6 +266,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
             paginated_lister,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         })
     }
 }
