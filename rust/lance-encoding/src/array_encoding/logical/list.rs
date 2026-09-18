@@ -859,22 +859,6 @@ impl LogicalPageDecoder for ListPageDecoder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use arrow_schema::{DataType, Field};
-
-    use super::oversized_batch_error;
-
-    #[test]
-    fn oversized_binary_batch_error_is_actionable() {
-        let error = oversized_batch_error(&Field::new("item", DataType::UInt8, false), 128, i32::MAX as u64 + 1);
-        assert!(error.to_string().contains("more than 2GiB of string/binary data"));
-        assert!(error.to_string().contains("batch_size"));
-        assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
-        assert!(error.to_string().contains("large_string/large_binary"));
-    }
-}
-
 struct IndirectlyLoaded {
     offsets: Arc<[u64]>,
     validity: BooleanBuffer,
@@ -1317,5 +1301,25 @@ impl FieldEncoder for ListFieldEncoder {
             Ok(columns)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::{DataType, Field};
+
+    use super::oversized_batch_error;
+
+    #[test]
+    fn oversized_binary_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::UInt8, false),
+            128,
+            i32::MAX as u64 + 1,
+        );
+        assert!(error.to_string().contains("more than 2GiB of string/binary data"));
+        assert!(error.to_string().contains("batch_size"));
+        assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
+        assert!(error.to_string().contains("large_string/large_binary"));
     }
 }
