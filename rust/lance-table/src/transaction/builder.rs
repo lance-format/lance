@@ -5,6 +5,7 @@
 
 use crate::transaction::Operation;
 use lance_core::deepsize::DeepSizeOf;
+use lance_select::RowAddrTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -22,6 +23,22 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Conditions that must hold for this transaction to commit. A commit is
+    /// rejected instead of rebased when a concurrent transaction violates one.
+    pub preconditions: Vec<Precondition>,
+}
+
+/// A declaration that specific cells of the dataset must be unchanged when
+/// this transaction commits.
+///
+/// `rows` holds the protected row addresses; `field_ids` the protected
+/// columns. If a concurrent transaction modified any protected cell, this
+/// transaction's commit is rejected rather than rebased, since a staged value
+/// computed from the old state would be stale.
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct Precondition {
+    pub field_ids: Vec<i32>,
+    pub rows: RowAddrTreeMap,
 }
 
 /// Add TransactionBuilder for flexibly setting option without using `mut`
@@ -32,6 +49,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    preconditions: Vec<Precondition>,
 }
 
 impl TransactionBuilder {
@@ -42,7 +60,13 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            preconditions: Vec::new(),
         }
+    }
+
+    pub fn precondition(mut self, precondition: Precondition) -> Self {
+        self.preconditions.push(precondition);
+        self
     }
 
     pub fn uuid(mut self, uuid: String) -> Self {
@@ -73,6 +97,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            preconditions: self.preconditions,
         }
     }
 }

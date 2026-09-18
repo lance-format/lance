@@ -39,7 +39,7 @@ mod validate;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use builder::{Transaction, TransactionBuilder};
+pub use builder::{Precondition, Transaction, TransactionBuilder};
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,
     UpdatedFragmentOffsets,
