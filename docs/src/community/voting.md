@@ -90,9 +90,14 @@ such PRs are labeled `format-change` automatically. The
 blocks merging a `format-change` PR until all of the following hold:
 
 - **Three binding +1 votes.** Three PMC members have approved the PR, excluding
-  the proposer. Cast +1 by approving the PR. Only approvals on the latest commit
-  count — pushing new commits invalidates earlier approvals, since the proposal
-  has changed.
+  the proposer. Cast +1 by approving the PR. An approval counts no matter what commit
+  it was cast on, so a rebase or a typo fix does not send everyone back to
+  re-vote.
+- **One +1 on the latest commit.** At least one of those approvals — from a PMC
+  member who is not the proposer — must be on the latest commit. That member is
+  vouching that nothing substantive has changed since the earlier approvals; if
+  something has, they should ask the other voters for fresh votes rather than
+  approving. This approval counts toward the three; it is not a fourth vote.
 - **No veto.** No PMC member has an outstanding "Request changes" review. A `-1`
   binding vote (cast by requesting changes) is a veto and blocks the merge until
   withdrawn.

@@ -1795,8 +1795,7 @@ impl BlobFile {
     /// Read the entire blob file from the current cursor position
     /// to the end of the file
     ///
-    /// After this call the cursor will be pointing to the end of
-    /// the file.
+    /// Advances the cursor by the number of bytes returned.
     pub async fn read(&self) -> Result<bytes::Bytes> {
         let mut state = self.state.lock().await;
         match state.deref_mut() {
@@ -1807,7 +1806,6 @@ impl BlobFile {
                 cursor, prefetch, ..
             } => {
                 if *cursor >= self.size {
-                    *cursor = self.size;
                     *prefetch = None;
                     return Ok(Bytes::new());
                 }
@@ -9781,6 +9779,19 @@ mod tests {
         let jumped = blob.read_up_to(4).await.unwrap();
         assert_eq!(jumped.as_ref(), &payload[20..24]);
         assert_eq!(blob.range_submission_count(), after_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn read_past_eof_leaves_the_cursor() {
+        let payload = b"abcdef";
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        let past_eof = blob.size() + 1;
+
+        blob.seek(past_eof).await.unwrap();
+        assert!(blob.read().await.unwrap().is_empty());
+        assert_eq!(blob.tell().await.unwrap(), past_eof);
     }
 
     #[tokio::test]
