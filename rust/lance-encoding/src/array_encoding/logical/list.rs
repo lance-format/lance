@@ -637,6 +637,51 @@ struct ListDecodeTask {
     offset_type: DataType,
 }
 
+fn oversized_batch_error(
+    items_field: &Field,
+    requested_range: Range<u64>,
+    decodable_prefix_end: u64,
+    num_items: u64,
+) -> Error {
+    let prefix_detail = if decodable_prefix_end > requested_range.start {
+        format!(
+            "rows {}..{} fit, but requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            decodable_prefix_end,
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    } else {
+        format!(
+            "requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    };
+    if items_field.data_type() == &DataType::UInt8 {
+        Error::not_supported(format!(
+            "Could not create array with more than 2GiB of string/binary data in a single batch \
+             ({prefix_detail}). Please reduce the batch_size, set LANCE_DEFAULT_BATCH_SIZE to a \
+             smaller value, or convert the column to large_string/large_binary."
+        ))
+    } else {
+        Error::not_supported(format!(
+            "Could not create a list array with more than i32::MAX items in a single batch \
+             ({prefix_detail}). Please reduce the batch_size."
+        ))
+    }
+}
+
 impl DecodeArrayTask for ListDecodeTask {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let items = self
@@ -782,11 +827,14 @@ impl LogicalPageDecoder for ListPageDecoder {
             }
         }
         if actual_num_rows < num_rows {
-            // TODO: We should be able to automatically
-            // shrink the read batch size if we detect the batches are going to be huge (maybe
-            // even achieve this with a read_batch_bytes parameter, though some estimation may
-            // still be required)
-            return Err(Error::not_supported_source(format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into()));
+            let requested_range = self.rows_drained..self.rows_drained + num_rows;
+            let num_items = self.offsets[requested_range.end as usize] - item_start;
+            return Err(oversized_batch_error(
+                self.items_field.as_ref(),
+                requested_range,
+                self.rows_drained + actual_num_rows,
+                num_items,
+            ));
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]
@@ -1279,5 +1327,76 @@ impl FieldEncoder for ListFieldEncoder {
             Ok(columns)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_buffer::BooleanBuffer;
+    use arrow_schema::{DataType, Field};
+
+    use super::{ListPageDecoder, oversized_batch_error};
+    use crate::decoder::LogicalPageDecoder;
+
+    #[test]
+    fn oversized_binary_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::UInt8, false),
+            32..160,
+            96,
+            i32::MAX as u64 + 1,
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("more than 2GiB of string/binary data")
+        );
+        assert!(error.to_string().contains("rows 32..96 fit"));
+        assert!(error.to_string().contains("requesting rows 32..160"));
+        assert!(error.to_string().contains("batch_size"));
+        assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
+        assert!(error.to_string().contains("large_string/large_binary"));
+    }
+
+    #[test]
+    fn oversized_list_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::Int32, false),
+            8..32,
+            16,
+            i32::MAX as u64 + 1,
+        );
+        let message = error.to_string();
+        assert!(message.contains("list array"));
+        assert!(message.contains("more than i32::MAX items"));
+        assert!(message.contains("rows 8..16 fit"));
+        assert!(message.contains("requesting rows 8..32"));
+    }
+
+    #[test]
+    fn list_decoder_overflow_reports_row_span() {
+        let mut decoder = ListPageDecoder {
+            unloaded: None,
+            offsets: Arc::<[u64]>::from(vec![0_u64, 1, 2, 3, 3 + i32::MAX as u64 + 1]),
+            validity: BooleanBuffer::from_iter([true, true, true, true]),
+            item_decoder: None,
+            num_rows: 4,
+            rows_drained: 2,
+            rows_loaded: 4,
+            items_field: Arc::new(Field::new("item", DataType::UInt8, false)),
+            offset_type: DataType::Int32,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+        };
+
+        let Err(error) = decoder.drain(2) else {
+            panic!("expected overflow error");
+        };
+        let message = error.to_string();
+        assert!(message.contains("rows 2..3 fit"));
+        assert!(message.contains("requesting rows 2..4"));
+        assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
+        assert!(message.contains("batch_size"));
     }
 }
