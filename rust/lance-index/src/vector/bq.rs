@@ -11,6 +11,7 @@ use crate::pb::vector_index_details::RabitQuantization;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, ArrayRef, UInt8Array, cast::AsArray};
 use lance_core::{Error, Result};
+use lance_linalg::distance::DistanceType;
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +136,24 @@ pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
 
 pub fn validate_supported_rq_num_bits(num_bits: u8) -> Result<()> {
     validate_rq_num_bits(num_bits)
+}
+
+/// Validates that a distance type can be used to build an IVF_RQ index.
+///
+/// ```
+/// use lance_index::vector::bq::validate_rq_distance_type;
+/// use lance_linalg::distance::DistanceType;
+///
+/// validate_rq_distance_type(DistanceType::L2).unwrap();
+/// assert!(validate_rq_distance_type(DistanceType::Hamming).is_err());
+/// ```
+pub fn validate_rq_distance_type(distance_type: DistanceType) -> Result<()> {
+    match distance_type {
+        DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot => Ok(()),
+        DistanceType::Hamming => Err(Error::invalid_input(format!(
+            "IVF_RQ does not support distance_type={distance_type}; expected l2, cosine, or dot"
+        ))),
+    }
 }
 
 pub fn rabit_ex_bits(num_bits: u8) -> Result<u8> {
