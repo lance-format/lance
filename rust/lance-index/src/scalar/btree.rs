@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
 use std::{
     any::Any,
     cmp::Ordering,
@@ -1588,7 +1589,11 @@ pub struct BTreeIndex {
     /// - The local page_idx is calculated: `142 - 100 = 42`.
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
 impl DeepSizeOf for BTreeIndex {
@@ -1619,6 +1624,7 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
+            batch_remapper: None,
         }
     }
 
@@ -1714,11 +1720,21 @@ impl BTreeIndex {
         let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
+        // Tagged async remap must run in this async context; the legacy
+        // synchronous remap is handled by `decode_page` (also used off the CPU
+        // pool in `prewarm`).
+        if let Some(remapper) = self.batch_remapper.as_ref() {
+            let serialized_page =
+                remap_record_batch_async(remapper.as_ref(), serialized_page, 1).await?;
+            return FlatIndex::try_new(serialized_page);
+        }
         Self::decode_page(serialized_page, self.frag_reuse_index.as_deref())
     }
 
     /// Turn a serialized page into a searchable [`FlatIndex`], applying the
-    /// fragment-reuse row id remap first when there is one.
+    /// legacy synchronous fragment-reuse row id remap first when there is one.
+    /// The tagged asynchronous remapper is applied by the caller before this,
+    /// since it cannot run on the synchronous CPU pool.
     fn decode_page(
         mut serialized_page: RecordBatch,
         frag_reuse_index: Option<&dyn RowIdRemapper>,
@@ -1830,6 +1846,20 @@ impl BTreeIndex {
             ranges_to_files,
             frag_reuse_index,
         ))
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
+        index.batch_remapper = remapping;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
+        Ok(Arc::new(index))
     }
 
     async fn load(
@@ -1995,9 +2025,14 @@ impl BTreeIndex {
                 continue;
             }
             let stream = segment.data_stream().await?;
-            let stream = match segment.frag_reuse_index.clone() {
-                Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
-                None => stream,
+            let stream = if let Some(frag_reuse_index) = segment.frag_reuse_index.clone() {
+                // Legacy synchronous remapping path.
+                remap_row_ids(stream, frag_reuse_index)
+            } else if let Some(remapper) = segment.batch_remapper.clone() {
+                // Tagged asynchronous path.
+                remap_row_ids_batch(stream, remapper)
+            } else {
+                stream
             };
             let stream = match old_data_filter.clone() {
                 Some(filter) => filter_row_ids(stream, filter),
@@ -2080,6 +2115,18 @@ fn remap_row_ids(
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
 
+fn remap_row_ids_batch(
+    stream: SendableRecordBatchStream,
+    remapper: Arc<dyn BatchRowIdRemapper>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let remapped = stream.and_then(move |batch| {
+        let remapper = remapper.clone();
+        async move { Ok(remap_record_batch_async(remapper.as_ref(), batch, 1).await?) }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
+}
+
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
     match bound {
         Bound::Unbounded => Bound::Unbounded,
@@ -2127,9 +2174,16 @@ impl Index for BTreeIndex {
             .await?
             .map(|page| {
                 let frag_reuse_index = self.frag_reuse_index.clone();
+                let batch_remapper = self.batch_remapper.clone();
                 async move {
-                    let (page_idx, serialized_page) = page?;
+                    let (page_idx, mut serialized_page) = page?;
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_idx);
+                    // Tagged async remap runs here in the async context; the
+                    // legacy synchronous remap stays on the CPU pool below.
+                    if let Some(remapper) = batch_remapper.as_ref() {
+                        serialized_page =
+                            remap_record_batch_async(remapper.as_ref(), serialized_page, 1).await?;
+                    }
                     let page = spawn_cpu(move || {
                         Self::decode_page(serialized_page, frag_reuse_index.as_deref())
                     })
@@ -3416,6 +3470,20 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(BTreeIndex::load_with_remapping(index_store, remapping, cache).await?)
     }
 
     async fn get_from_cache(

@@ -313,6 +313,75 @@ impl InvertedIndex {
         }))
     }
 
+    /// Additive sibling of [`Self::load_legacy_index`] for mappings that
+    /// require asynchronous batch row-ID translation.
+    async fn load_legacy_index_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        log::warn!("loading legacy FTS index");
+        let tokens_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let token_reader = store.open_index_file(TOKENS_FILE).await?;
+                let tokenizer = token_reader
+                    .schema()
+                    .metadata
+                    .get("tokenizer")
+                    .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
+                    .transpose()?
+                    .unwrap_or_default();
+                let tokens = TokenSet::load(token_reader, TokenSetFormat::Arrow).await?;
+                Result::Ok((tokenizer, tokens))
+            }
+        });
+        let invert_list_fut = tokio::spawn({
+            let store = store.clone();
+            let index_cache_clone = index_cache.clone();
+            async move {
+                let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
+                let invert_list =
+                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
+                Result::Ok(Arc::new(invert_list))
+            }
+        });
+        let docs_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let docs_reader = store.open_index_file(DOCS_FILE).await?;
+                let docs = DocSet::load_with_remapping(docs_reader, true, remapping).await?;
+                Result::Ok(docs)
+            }
+        });
+
+        let (tokenizer_config, tokens) = tokens_fut.await??;
+        let inverted_list = invert_list_fut.await??;
+        let docs = docs_fut.await??;
+
+        let tokenizer = tokenizer_config.build()?;
+
+        Ok(Arc::new(Self {
+            params: tokenizer_config,
+            store: store.clone(),
+            tokenizer,
+            token_set_format: TokenSetFormat::Arrow,
+            format_version: InvertedListFormatVersion::V1,
+            partitions: vec![Arc::new(InvertedPartition {
+                id: 0,
+                store,
+                tokens: tokens.into(),
+                inverted_list,
+                docs: PartitionDocumentStore::Legacy(Arc::new(docs)),
+                token_set_format: TokenSetFormat::Arrow,
+            })],
+            corpus_stats: Arc::new(OnceCell::new()),
+            prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
+            document_projections_resident: Arc::new(AtomicBool::new(false)),
+            deleted_fragments: RoaringBitmap::new(),
+        }))
+    }
+
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].docs.legacy().is_some()
     }
@@ -470,6 +539,118 @@ impl InvertedIndex {
             Err(_) => {
                 // old index format
                 Self::load_legacy_index(store, frag_reuse_index, index_cache).await
+            }
+        }
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        // for new index format, there is a metadata file and multiple partitions,
+        // each partition is a separate index containing tokens, inverted list and docs.
+        // for old index format, there is no metadata file, and it's just like a single partition
+
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
+                let mut params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let partitions = reader
+                    .schema()
+                    .metadata
+                    .get("partitions")
+                    .ok_or(Error::index("partitions not found in metadata".to_owned()))?;
+                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+                let token_set_format = reader
+                    .schema()
+                    .metadata
+                    .get(TOKEN_SET_FORMAT_KEY)
+                    .map(|name| TokenSetFormat::from_str(name))
+                    .transpose()?
+                    .unwrap_or(TokenSetFormat::Arrow);
+                let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
+
+                // Load deleted_fragments if present (optional for backward compatibility)
+                let deleted_fragments = if reader.num_rows() > 0 {
+                    let metadata_batch = reader.read_range(0..1, None).await?;
+                    if let Some(col) = metadata_batch.column_by_name(DELETED_FRAGMENTS_COL) {
+                        let arr = col.as_binary_opt::<i32>().expect_ok()?;
+                        RoaringBitmap::deserialize_from(arr.value(0))?
+                    } else {
+                        RoaringBitmap::new()
+                    }
+                } else {
+                    RoaringBitmap::new()
+                };
+
+                let format = token_set_format;
+                let partitions = partitions.into_iter().enumerate().map(|(priority, id)| {
+                    let store = store.with_io_priority(priority as u64);
+                    let remapping_clone = remapping.clone();
+                    let index_cache_for_part =
+                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    let token_set_format = format;
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load_with_remapping(
+                                store,
+                                id,
+                                remapping_clone,
+                                &index_cache_for_part,
+                                token_set_format,
+                            )
+                            .await?,
+                        ))
+                    }
+                });
+                let partitions = stream::iter(partitions)
+                    .buffer_unordered(store.io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let coordinate_rank = partitions
+                    .first()
+                    .map(|partition| partition.docs.coordinate_rank())
+                    .unwrap_or(0);
+                if partitions
+                    .iter()
+                    .any(|partition| partition.docs.coordinate_rank() != coordinate_rank)
+                {
+                    return Err(Error::index(
+                        "FTS partitions have inconsistent document coordinate ranks".to_string(),
+                    ));
+                }
+                params.document_granularity = if coordinate_rank == 0 {
+                    DocumentGranularity::Row
+                } else {
+                    DocumentGranularity::ListElement
+                };
+
+                let tokenizer = params.build()?;
+                Ok(Arc::new(Self {
+                    params,
+                    store,
+                    tokenizer,
+                    token_set_format,
+                    format_version,
+                    partitions,
+                    corpus_stats: Arc::new(OnceCell::new()),
+                    prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
+                    document_projections_resident: Arc::new(AtomicBool::new(false)),
+                    deleted_fragments,
+                }))
+            }
+            Err(_) => {
+                // old index format
+                Self::load_legacy_index_with_remapping(store, remapping, index_cache).await
             }
         }
     }

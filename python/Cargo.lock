@@ -4401,6 +4401,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
