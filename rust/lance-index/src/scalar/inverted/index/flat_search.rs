@@ -69,6 +69,9 @@ pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
+            if doc_array.is_null(i) {
+                continue;
+            }
             let doc = doc_array.value(i);
             if document_matches_flat_query(doc, &mut tokenizer, &query_tokens, phrase_slop)? {
                 results.push(row_id_array.value(i));
@@ -115,9 +118,14 @@ pub(super) fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
                     .join(" ");
                 document_matches_flat_query(&document, &mut tokenizer, &query_tokens, phrase_slop)?
             } else {
-                iter_str_array(elements.as_ref())
-                    .flatten()
-                    .any(|element| has_query_token(element, &mut tokenizer, &query_tokens))
+                let mut matches = false;
+                for element in iter_str_array(elements.as_ref()).flatten() {
+                    if document_matches_flat_query(element, &mut tokenizer, &query_tokens, None)? {
+                        matches = true;
+                        break;
+                    }
+                }
+                matches
             };
             if matches {
                 results.push(row_id_array.value(i));
@@ -135,7 +143,12 @@ pub(super) fn document_matches_flat_query(
     phrase_slop: Option<u32>,
 ) -> Result<bool> {
     let Some(slop) = phrase_slop else {
-        return Ok(has_query_token(document, tokenizer, query_tokens));
+        let operator = effective_json_query_operator(
+            tokenizer.json_tokenizer_mode(),
+            query_tokens,
+            Operator::Or,
+        );
+        return document_matches_query(document, tokenizer, query_tokens, operator);
     };
 
     for tokens in tokenizer.token_streams_for_doc(document)? {
@@ -574,15 +587,14 @@ pub(super) fn initialize_scorer(
 }
 
 fn collapse_flattened_rows(batch: RecordBatch) -> Result<RecordBatch> {
-    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-    let scores = batch[SCORE_COL]
-        .as_primitive::<Float32Type>()
-        .values()
-        .to_vec();
-    let (row_ids, scores): (Vec<_>, Vec<_>) =
-        collapse_scored_rows(row_ids.into_iter().zip(scores), usize::MAX)
-            .into_iter()
-            .unzip();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    let (row_ids, scores): (Vec<_>, Vec<_>) = collapse_scored_rows(
+        row_ids.iter().copied().zip(scores.iter().copied()),
+        usize::MAX,
+    )
+    .into_iter()
+    .unzip();
     Ok(RecordBatch::try_new(
         FTS_SCHEMA.clone(),
         vec![

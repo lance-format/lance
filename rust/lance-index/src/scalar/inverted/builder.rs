@@ -206,12 +206,6 @@ impl InvertedIndexBuilder {
         }
     }
 
-    fn infer_lance_tokenizer(&mut self, doc_type: DocType) {
-        if self.params.lance_tokenizer.is_none() {
-            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
-        }
-    }
-
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
         self.format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
             posting_tail_codec,
@@ -255,7 +249,9 @@ impl InvertedIndexBuilder {
         // infer lance_tokenizer based on document type
         let field = schema.column_with_name(doc_col).expect_ok()?.1;
         let doc_type = DocType::try_from(field)?;
-        self.infer_lance_tokenizer(doc_type);
+        self.params
+            .lance_tokenizer
+            .get_or_insert_with(|| doc_type.as_ref().to_string());
         if self.params.lance_tokenizer.as_deref() == Some("json")
             && self.params.json_tokenizer_mode.is_none()
         {
@@ -291,7 +287,9 @@ impl InvertedIndexBuilder {
 
         let field = schema.column_with_name(doc_col).expect_ok()?.1;
         let doc_type = DocType::try_from(field)?;
-        self.infer_lance_tokenizer(doc_type);
+        self.params
+            .lance_tokenizer
+            .get_or_insert_with(|| doc_type.as_ref().to_string());
 
         let mut files = self
             .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
@@ -1594,10 +1592,9 @@ impl IndexWorker {
             }
         };
         self.total_doc_length += doc.len();
-        let with_position = self.has_position();
         let sub_docs = self.tokenizer.token_streams_for_doc(doc.as_ref())?;
         for tokens in sub_docs {
-            self.process_tokenized_doc(row_id, tokens, with_position, doc_index)
+            self.process_tokenized_doc(row_id, tokens, doc_index)
                 .await?;
         }
 
@@ -1608,9 +1605,9 @@ impl IndexWorker {
         &mut self,
         row_id: u64,
         tokens: Vec<lance_tokenizer::Token>,
-        with_position: bool,
         doc_index: &[u32],
     ) -> Result<()> {
+        let with_position = self.has_position();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;

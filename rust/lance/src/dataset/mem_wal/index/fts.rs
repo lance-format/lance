@@ -2579,7 +2579,15 @@ impl FtsMemIndex {
                 })
                 .or_insert(entry);
         }
-        rows.into_values().collect()
+        let mut rows = rows.into_values().collect::<Vec<_>>();
+        rows.sort_unstable_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.row_position.cmp(&right.row_position))
+                .then_with(|| left.doc_index.cmp(&right.doc_index))
+        });
+        rows
     }
 
     // ------------------------------------------------------------------

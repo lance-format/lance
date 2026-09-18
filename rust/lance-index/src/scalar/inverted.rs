@@ -62,7 +62,7 @@ pub(crate) fn collapse_scored_rows(
             .total_cmp(left_score)
             .then_with(|| left_id.cmp(right_id))
     });
-    rows.truncate(rows.len().min(limit));
+    rows.truncate(limit);
     rows
 }
 
