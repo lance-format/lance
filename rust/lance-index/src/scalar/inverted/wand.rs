@@ -2321,6 +2321,7 @@ struct AndWindowStats {
     score_first_rejections: usize,
     pairwise_intersections: usize,
     windows_sliced: usize,
+    windows_frequency_pruned: usize,
 }
 
 impl Eq for TailPosting {}
@@ -4317,6 +4318,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // The frequency-bucket prune decisions only depend on the floor and
         // the followers' block maxes, which rarely change between windows.
         let mut freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+        // Keyed separately from the score limit: the per-candidate prune can
+        // refresh the limit in the middle of a window without touching the
+        // table, so an unchanged limit key does not mean the table is current.
+        let mut freq_cannot_beat_key: Option<(u32, u64)> = None;
         // Per clause: the block that was sliced last and the end of that
         // slice. Windows are contiguous, so the next slice of the same block
         // starts where the previous one ended instead of at a binary search.
@@ -4503,6 +4508,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             score_sum_upper_bound_factor(num_lists),
                         );
                         first_score_limit_key = Some(key);
+                    }
+                    if freq_cannot_beat_key != Some(key) {
                         let freq_bound_lut = freq_bound_lut
                             .as_ref()
                             .expect("positive threshold should initialize the frequency bound LUT");
@@ -4512,11 +4519,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             None => [false; FREQ_LUT_BUCKETS],
                         };
+                        freq_cannot_beat_key = Some(key);
                     }
-                } else if first_score_limit_key.is_some() {
+                } else if freq_cannot_beat_key.is_some() {
                     freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
-                    first_score_limit = None;
-                    first_score_limit_key = None;
+                    freq_cannot_beat_key = None;
+                }
+                #[cfg(test)]
+                if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                    self.and_window_stats.windows_frequency_pruned += 1;
                 }
                 #[cfg(target_arch = "x86_64")]
                 let use_avx2 = *HAS_AVX2;
@@ -10809,5 +10820,86 @@ mod tests {
             "impact bounds must activate on the first window after the heap fills"
         );
         assert!(scored.load(Ordering::Relaxed) > 0);
+    }
+
+    /// The floor turns positive in the middle of the first window, where only
+    /// the per-candidate prune refreshes the score limit. The second window
+    /// has the same floor and the same follower block max, so the frequency
+    /// prune table must still be built for it instead of staying disabled.
+    #[test]
+    fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
+        let num_docs = (MAX_POSTING_BLOCK_SIZE * 2) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let run = |mode| {
+            // One block spanning both windows; only document 0 can win.
+            let sparse_docs = (0..num_docs).step_by(2).collect::<Vec<_>>();
+            let sparse_freqs = sparse_docs
+                .iter()
+                .map(|&doc| if doc == 0 { 10 } else { 1 })
+                .collect::<Vec<_>>();
+            // Two blocks with the same block max, so the follower bound is
+            // identical in both windows. Document 257 keeps the second window
+            // competitive by block max without matching the sparse clause.
+            let dense_docs = (0..num_docs).collect::<Vec<_>>();
+            let dense_freqs = dense_docs
+                .iter()
+                .map(|&doc| if doc == 0 || doc == 257 { 10 } else { 1 })
+                .collect::<Vec<_>>();
+            let postings = [(sparse_docs, sparse_freqs), (dense_docs, dense_freqs)]
+                .into_iter()
+                .enumerate()
+                .map(|(term, (doc_ids, freqs))| {
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            freqs,
+                            vec![1; len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(1)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            (
+                hits,
+                wand.threshold,
+                wand.and_window_stats.windows_sliced,
+                wand.and_window_stats.windows_frequency_pruned,
+            )
+        };
+        let (classic, classic_floor, _, _) = run(BulkAndMode::Off);
+        let (bulk, bulk_floor, windows_sliced, windows_frequency_pruned) = run(BulkAndMode::On);
+        assert_eq!(bulk, classic);
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(bulk[0].0, 0);
+        assert_eq!(bulk_floor, 20.0);
+        assert_eq!(bulk_floor, classic_floor);
+        assert_eq!(
+            windows_sliced, 2,
+            "the dense clause's block boundary splits two windows"
+        );
+        assert_eq!(
+            windows_frequency_pruned, 1,
+            "the second window must apply the frequency prune table"
+        );
     }
 }
