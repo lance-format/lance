@@ -180,6 +180,21 @@ impl Transaction {
         groups: &[RewriteGroup],
     ) {
         for group in groups {
+            // Order-preserving partial compaction represents untouched trailing
+            // fragments as exact metadata copies with a new ID. Their overlays
+            // are still live and must not invalidate index coverage.
+            if let ([old_fragment], [new_fragment]) = (
+                group.old_fragments.as_slice(),
+                group.new_fragments.as_slice(),
+            ) {
+                let mut relabeled_fragment = new_fragment.clone();
+                relabeled_fragment.id = old_fragment.id;
+                relabeled_fragment.deletion_file = old_fragment.deletion_file.clone();
+                if relabeled_fragment == *old_fragment {
+                    continue;
+                }
+            }
+
             // field id -> newest overlay committed_version supplying that field
             let mut overlaid_field_versions: HashMap<i32, u64> = HashMap::new();
             for old_frag in &group.old_fragments {
