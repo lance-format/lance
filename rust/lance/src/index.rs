@@ -6114,6 +6114,56 @@ mod tests {
             .collect()
     }
 
+    /// A table indexed while empty trains on the first append-mode optimize
+    /// that has data behind it.
+    ///
+    /// Writing rows never touches the index, so the optimize is where the
+    /// definition becomes a real index — and append is the mode scheduled
+    /// maintenance uses, so it has to be the mode that gets there.
+    #[tokio::test]
+    async fn test_append_mode_trains_a_definition_once_data_arrives() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 0).await;
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let mut dataset = append_vectors(test_dir.path(), 3000).await;
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3000);
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "writing rows leaves the index a definition"
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices.len(),
+            1,
+            "training supersedes the definition rather than adding a delta to it"
+        );
+        assert!(
+            !indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "3,000 vectors clear the floor, so the append trains the column"
+        );
+        // Sized from the 3,000 vectors present, not the 2 the request named.
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
     /// The cap reduces a requested count only while the data cannot support it.
     #[tokio::test]
     async fn test_create_index_partition_cap_follows_the_data() {
