@@ -776,7 +776,16 @@ pub(super) async fn alter_columns(
 ) -> Result<()> {
     let unsupported = if alterations.iter().any(|a| a.data_type.is_some()) {
         Some(Unsupported::Retype)
-    } else if alterations.iter().any(|a| a.nullable == Some(false)) {
+    } else if alterations.iter().any(|a| {
+        // Only a column that can currently hold a null is being tightened.
+        // Restating `nullable: false` on one that already forbids them asks
+        // for nothing, and is answered the same way on any table.
+        a.nullable == Some(false)
+            && dataset
+                .schema()
+                .field(&a.path)
+                .is_none_or(|field| field.nullable)
+    }) {
         Some(Unsupported::Tightening)
     } else {
         None
@@ -1201,6 +1210,73 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+
+    /// What the MemWAL guard refuses, and what it lets through.
+    ///
+    /// A retype and a genuine tightening are refused. Restating `nullable:
+    /// false` on a column that already forbids nulls asks for nothing, so it
+    /// is answered the same way a table without a MemWAL answers it.
+    #[tokio::test]
+    async fn alter_columns_on_a_mem_wal_table_refuses_only_what_it_must() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![Some(10i64)])),
+            ],
+        )
+        .unwrap();
+        let uri = format!("memory://mem_wal_alter_guard_{}", uuid::Uuid::new_v4());
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int32)])
+            .await
+            .expect_err("a retype must be refused");
+        assert!(
+            err.to_string().contains("cannot change a column's type"),
+            "unexpected error: {err}"
+        );
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).set_nullable(false)])
+            .await
+            .expect_err("tightening a nullable column must be refused");
+        assert!(
+            err.to_string()
+                .contains("cannot make a column non-nullable"),
+            "unexpected error: {err}"
+        );
+
+        // `id` already forbids nulls, so this asks for nothing.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+            .await
+            .expect("restating a column's existing nullability must be allowed");
+
+        // A rename is untouched by the guard.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
+            .await
+            .expect("a rename must be allowed");
+        assert!(dataset.schema().field("amount").is_some());
+    }
 
     #[test]
     fn test_merge_introduces_required_field() {
