@@ -49,9 +49,10 @@
 //!
 //! ## Chunk Handling
 //!
-//! - Maximum chunk size depends on data type:
-//!   - f32: 1024 values (4KB per chunk)
-//!   - f64: 512 values (4KB per chunk)
+//! - Maximum chunk size is the smaller of the byte budget and
+//!   `LANCE_MINIBLOCK_MAX_VALUES` rounded down to a power of two:
+//!   - f32: 1024 values (4KB per chunk) at the default configuration
+//!   - f64: 512 values (4KB per chunk) at the default configuration
 //! - All chunks share a single global buffer
 //! - Non-last chunks always contain power-of-2 values
 
@@ -62,7 +63,8 @@ use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
@@ -94,15 +96,33 @@ impl ByteStreamSplitEncoder {
     }
 
     fn max_chunk_size(&self) -> usize {
+        Self::chunk_size_for(self.bits_per_value, *MAX_MINIBLOCK_VALUES)
+    }
+
+    /// Largest chunk this encoder may emit, given the configured value cap.
+    ///
+    /// Split out from [`Self::max_chunk_size`] so the rounding is testable without
+    /// touching the process-wide `LANCE_MINIBLOCK_MAX_VALUES` lazy static.
+    fn chunk_size_for(bits_per_value: usize, configured_max_values: u64) -> usize {
         // For ByteStreamSplit, total bytes = bytes_per_value * chunk_size
         // MAX_MINIBLOCK_BYTES = 8186
         // For f32 (4 bytes): 8186 / 4 = 2046, so max chunk = 1024 (power of 2)
         // For f64 (8 bytes): 8186 / 8 = 1023, so max chunk = 512 (power of 2)
-        match self.bits_per_value {
+        let by_bytes = match bits_per_value {
             32 => 1024,
             64 => 512,
             _ => unreachable!("ByteStreamSplit only supports 32 or 64 bit values"),
-        }
+        };
+        // `LANCE_MINIBLOCK_MAX_VALUES` is documented as an upper bound on the values in
+        // any mini-block chunk, so honor it here too. It has to be rounded down to a
+        // power of two: `compress` records a non-final chunk's length as
+        // `chunk_size.ilog2()`, and a chunk size that is not a power of two would
+        // declare fewer values than were written. Two is the floor, because a non-final
+        // chunk carrying `log_num_values == 0` is rejected on read.
+        let configured = usize::try_from(configured_max_values)
+            .unwrap_or(usize::MAX)
+            .max(2);
+        by_bytes.min(1usize << configured.ilog2())
     }
 }
 
@@ -448,5 +468,71 @@ mod tests {
 
         assert_eq!(decompressed_fixed.num_values, 0);
         assert_eq!(decompressed_fixed.data.len(), 0);
+    }
+
+    /// The round trips above fit in one chunk, so nothing checked a non-final chunk's
+    /// `log_num_values` against the length actually written. That is the invariant
+    /// `chunk_size_for` rounds to a power of two to preserve.
+    #[rstest::rstest]
+    #[case::f32(32)]
+    #[case::f64(64)]
+    fn test_non_final_chunks_declare_their_length(#[case] bits_per_value: usize) {
+        let bytes_per_value = bits_per_value / 8;
+        let max_chunk =
+            ByteStreamSplitEncoder::chunk_size_for(bits_per_value, *MAX_MINIBLOCK_VALUES);
+        let num_values = max_chunk * 2 + 5;
+
+        let data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![7u8; num_values * bytes_per_value]),
+            bits_per_value: bits_per_value as u64,
+            num_values: num_values as u64,
+            block_info: BlockInfo::new(),
+        });
+        let (compressed, _encoding) = ByteStreamSplitEncoder::new(bits_per_value)
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
+            .unwrap();
+
+        assert_eq!(compressed.num_values, num_values as u64);
+        assert_eq!(compressed.chunks.len(), 3);
+        let (last, non_final) = compressed.chunks.split_last().unwrap();
+        for chunk in non_final {
+            assert_eq!(
+                1usize << chunk.log_num_values,
+                max_chunk,
+                "a non-final chunk must declare the {max_chunk} values it holds"
+            );
+            assert_eq!(chunk.buffer_sizes[0] as usize, max_chunk * bytes_per_value);
+        }
+        // Zero is the sentinel for the trailing chunk, whose length the reader derives.
+        assert_eq!(last.log_num_values, 0);
+        assert_eq!(last.buffer_sizes[0] as usize, 5 * bytes_per_value);
+    }
+
+    /// `compress` stores a non-final chunk's length as `chunk_size.ilog2()`, so the
+    /// configured cap has to reach this encoder as a power of two no smaller than two.
+    #[rstest::rstest]
+    // The default cap is above the byte budget, so the byte budget still decides.
+    #[case::default_cap(4096, 1024, 512)]
+    // The maximum cap likewise leaves the byte budget binding.
+    #[case::max_cap(32768, 1024, 512)]
+    // A cap below the byte budget takes over.
+    #[case::below_byte_budget(256, 256, 256)]
+    // A cap that is not a power of two rounds down rather than truncating ilog2.
+    #[case::rounds_down(300, 256, 256)]
+    // The env parser clamps to a minimum of one; two is the smallest usable chunk.
+    #[case::floor_of_two(1, 2, 2)]
+    fn test_chunk_size_honors_configured_value_cap(
+        #[case] configured: u64,
+        #[case] expected_f32: usize,
+        #[case] expected_f64: usize,
+    ) {
+        assert_eq!(
+            ByteStreamSplitEncoder::chunk_size_for(32, configured),
+            expected_f32
+        );
+        assert_eq!(
+            ByteStreamSplitEncoder::chunk_size_for(64, configured),
+            expected_f64
+        );
     }
 }
