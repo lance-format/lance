@@ -713,10 +713,7 @@ async fn rebuild_vector_segment(
 /// the same outcome: nothing can be served from it, and a rebuild is what makes
 /// it useful again.
 fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
-    let no_files_recorded = metadata
-        .files
-        .as_ref()
-        .is_none_or(|files| files.is_empty());
+    let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
         .fragment_bitmap
         .as_ref()
