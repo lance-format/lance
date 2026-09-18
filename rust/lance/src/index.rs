@@ -6510,8 +6510,8 @@ mod tests {
             "100 vectors cannot train a 256-code quantizer, so nothing is covered yet"
         );
 
-        // 3100 vectors would clear 8 * 256, but the request was not recorded:
-        // training derives the count from the data instead, 3100 / 8192 -> 1.
+        // 3100 vectors would clear 8 * 256, but no count was recorded, so
+        // training derives one from the data: 3100 / 8192 -> 1.
         let mut dataset = append_vectors(test_dir.path(), 3000).await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
@@ -6523,8 +6523,7 @@ mod tests {
 
     /// Appending to an index that is still a definition, on a table that still
     /// cannot train, is a no-op rather than an error, and stays one when
-    /// repeated: a caller that optimizes on a schedule relies on the commit
-    /// each call makes.
+    /// repeated.
     #[tokio::test]
     async fn test_append_to_a_definition_that_still_cannot_train() {
         let test_dir = tempfile::tempdir().unwrap();

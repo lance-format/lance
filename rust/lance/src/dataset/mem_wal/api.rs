@@ -825,9 +825,9 @@ async fn load_vector_index_config(
     // Inherit the base table's distance type so the in-memory index and the
     // base index produce comparable distances. The index's recorded details
     // state it, and for an index that covers nothing they are the only source:
-    // it carries its settings with no file to open. Opening the index covers
-    // an entry whose details do not decode. Surface the failure instead of
-    // silently defaulting to L2 — flushed `IVF_HNSW_SQ` files bake this metric
+    // it carries its settings with no file to open. Opening the index is the
+    // fallback for an entry whose details do not decode. Surface the failure
+    // rather than silently defaulting to L2 — flushed `IVF_HNSW_SQ` files bake this metric
     // into their on-disk metadata, so a wrong default would be durable
     // corruption.
     let recorded = index_meta
@@ -1064,7 +1064,7 @@ mod tests {
     /// An index that covers nothing is maintainable: its recorded details
     /// state the distance type, so there is no file to open.
     ///
-    /// A table registers WAL before it holds enough vectors to train, and
+    /// A table can register WAL before it holds enough vectors to train, and
     /// validation refusing the definition would leave the index outside the
     /// maintained set for the life of the table — the set is a snapshot, so
     /// training it later does not add it back.
