@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+/*
+ * Shared transaction building blocks, referenced by both the legacy
+ * operations in transaction.proto and the action-based transactions in
+ * actions.proto.
+ *
+ * These types are transaction *machinery* (metadata merges, conflict-detection
+ * filters), not persisted table state, so they live here rather than in
+ * table.proto. Kept in a dedicated file so both transaction models can import
+ * them without a circular dependency (transaction.proto imports actions.proto,
+ * so actions.proto must not import transaction.proto).
+ */
+
+/*
+ * An entry for a map update.
+ *
+ * If `value` is not set, the key is removed from the map.
+ */
+message UpdateMapEntry {
+  // The key of the map entry to update.
+  string key = 1;
+  // The value to set for the key. Absent removes the key.
+  optional string value = 2;
+}
+
+/*
+ * A set of updates to apply to a string map (table config, table metadata,
+ * schema metadata, or per-field metadata).
+ */
+message UpdateMap {
+  repeated UpdateMapEntry update_entries = 1;
+  /*
+   * If true, the map is replaced entirely with these entries. If false, the
+   * entries are merged into the existing map.
+   */
+  bool replace = 2;
+}
+
+/*
+ * Exact set of key hashes for conflict detection.
+ *
+ * Used when the number of inserted rows is small.
+ */
+message ExactKeySetFilter {
+  // 64-bit hashes of the inserted row keys.
+  repeated uint64 key_hashes = 1;
+}
+
+/*
+ * Bloom filter for key existence tests.
+ *
+ * Used when the number of inserted rows is large.
+ */
+message BloomFilter {
+  // Bitset backing the bloom filter (SBBF format).
+  bytes bitmap = 1;
+  // Number of bits in the bitmap.
+  uint32 num_bits = 2;
+  /*
+   * Number of items the filter was sized for. Used for intersection validation:
+   * filters with different sizes cannot be compared. Default: 8192.
+   */
+  uint64 number_of_items = 3;
+  /*
+   * False positive probability the filter was sized for. Used for intersection
+   * validation: filters with different parameters cannot be compared.
+   * Default: 0.00057.
+   */
+  double probability = 4;
+}
+
+/*
+ * A filter for checking key existence in the set of rows inserted by a
+ * merge-insert operation.
+ *
+ * Only created when the merge-insert's ON columns match the schema's unenforced
+ * primary key; its presence indicates strict primary-key conflict detection.
+ * Conflict detection intersects two filters, so the underlying representation
+ * is either an exact set (small row counts) or a Bloom filter (large counts).
+ */
+message KeyExistenceFilter {
+  // Field ids of the columns participating in the key (the unenforced primary key).
+  repeated int32 field_ids = 1;
+  // The underlying data structure storing the key hashes.
+  oneof data {
+    // Exact set of key hashes (small number of rows).
+    ExactKeySetFilter exact = 2;
+    // Bloom filter (large number of rows).
+    BloomFilter bloom = 3;
+  }
+}
