@@ -3039,8 +3039,8 @@ mod tests {
                 lance_datagen::array::fill_utf8("document".to_string()),
             )
             .into_reader_rows(
-                lance_datagen::RowCount::from(2),
-                lance_datagen::BatchCount::from(2),
+                lance_datagen::RowCount::from(1),
+                lance_datagen::BatchCount::from(4),
             );
         let mut fields = reader.schema().fields().to_vec();
         fields.push(Arc::new(ArrowField::new(
@@ -3064,14 +3064,14 @@ mod tests {
             reader,
             "memory://",
             Some(WriteParams {
-                max_rows_per_file: 2,
+                max_rows_per_file: 1,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.get_fragments().len(), 4);
 
         let params = ScalarIndexParams::for_builtin(index_type.try_into().unwrap());
         let fragment_groups = if index_type == IndexType::Fm {
@@ -3102,7 +3102,7 @@ mod tests {
         }
 
         // Compaction needs an indexed group to write fragment-reuse metadata.
-        // One committed segment keeps both fragments in the same compaction bin.
+        // One committed segment keeps all fragments in the compaction bins.
         dataset
             .create_index(
                 &[column],
@@ -3119,7 +3119,7 @@ mod tests {
                 crate::dataset::optimize::compact_files(
                     &mut dataset,
                     crate::dataset::optimize::CompactionOptions {
-                        target_rows_per_fragment: 4,
+                        target_rows_per_fragment: 2,
                         defer_index_remap: true,
                         ..Default::default()
                     },
@@ -3127,15 +3127,38 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(dataset.get_fragments().len(), 1);
-                assert!(dataset.get_fragments()[0].id() > 1);
+                assert_eq!(dataset.get_fragments().len(), 2);
+                assert!(
+                    dataset
+                        .get_fragments()
+                        .iter()
+                        .all(|fragment| fragment.id() > 3)
+                );
                 assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+
+                if index_type == IndexType::BTree {
+                    let error = dataset
+                        .merge_existing_index_segments(vec![segments[0].clone()])
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(error, Error::InvalidInput { .. }));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("source segment group partially covers"),
+                        "unexpected partial rewrite-group error: {error}"
+                    );
+                }
             }
 
             let merged = dataset
                 .merge_existing_index_segments(segments.clone())
                 .await
                 .unwrap();
+            assert_eq!(
+                merged.fragment_bitmap.as_ref(),
+                Some(dataset.fragment_bitmap.as_ref())
+            );
             // Query the output directly so a scan cannot use the committed
             // scaffolding index or fall back to reading unindexed fragments.
             let index = crate::index::scalar::open_scalar_index(
@@ -3178,6 +3201,39 @@ mod tests {
                     .contains(RowAddress::from(u64::from(*row_addr)).fragment_id())),
                 "{index_type:?} merge returned retired row addresses (compacted: {compact})"
             );
+
+            if compact && index_type == IndexType::BTree {
+                crate::dataset::optimize::remapping::remap_column_index(
+                    &mut dataset,
+                    &[column],
+                    Some("committed".to_string()),
+                )
+                .await
+                .unwrap();
+                crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                    .await
+                    .unwrap();
+                assert!(
+                    dataset
+                        .frag_reuse_index()
+                        .await
+                        .unwrap()
+                        .expect("trimmed fragment-reuse index should retain a manifest entry")
+                        .is_empty()
+                );
+
+                let error = dataset
+                    .merge_existing_index_segments(segments.clone())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("no applicable fragment-reuse mapping is available"),
+                    "unexpected missing fragment-reuse error: {error}"
+                );
+            }
         }
     }
 

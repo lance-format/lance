@@ -149,13 +149,6 @@ async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexMetadata],
 ) -> Result<bool> {
-    let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
-        return Ok(false);
-    };
-    if !append::fragment_reuse_affects_segments(&frag_reuse_index, segments.iter()) {
-        return Ok(false);
-    }
-
     let mut merged_coverage = segments
         .iter()
         .map(|segment| {
@@ -169,6 +162,59 @@ async fn remap_merged_segment_coverage(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+    let retired_coverage = &merged_coverage - dataset.fragment_bitmap.as_ref();
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let Some(frag_reuse_index) = frag_reuse_index.filter(|frag_reuse_index| {
+        append::fragment_reuse_affects_segments(frag_reuse_index, segments.iter())
+    }) else {
+        if !retired_coverage.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "merge_existing_index_segments: source segments cover retired fragments {:?}, \
+                 but no applicable fragment-reuse mapping is available; rebuild the segments \
+                 against dataset version {}",
+                retired_coverage, dataset.manifest.version
+            )));
+        }
+        return Ok(false);
+    };
+
+    // Validate the union before remapping. The generic bitmap remapper heals a
+    // straddling rewrite group by dropping its partial old coverage, which is
+    // appropriate for committed indices that can scan the gap. A caller-supplied
+    // merge has no such fallback and must not publish that loss as current.
+    let mut coverage_at_version = merged_coverage.clone();
+    for version in &frag_reuse_index.details.versions {
+        for group in &version.groups {
+            let old_fragment_ids = group
+                .old_frags
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<Vec<_>>();
+            let covered_old_fragment_ids = old_fragment_ids
+                .iter()
+                .copied()
+                .filter(|fragment_id| coverage_at_version.contains(*fragment_id))
+                .collect::<Vec<_>>();
+            if covered_old_fragment_ids.is_empty() {
+                continue;
+            }
+            if covered_old_fragment_ids.len() != old_fragment_ids.len() {
+                return Err(Error::invalid_input(format!(
+                    "merge_existing_index_segments: source segment group partially covers \
+                     fragment-reuse rewrite group at dataset version {}: covered old fragment \
+                     ids {:?}, rewrite group old fragment ids {:?}; rebuild the segments against \
+                     the current dataset",
+                    version.dataset_version, covered_old_fragment_ids, old_fragment_ids
+                )));
+            }
+
+            for fragment_id in old_fragment_ids {
+                coverage_at_version.remove(fragment_id);
+            }
+            coverage_at_version.extend(group.new_frags.iter().map(|fragment| fragment.id as u32));
+        }
+    }
+
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
     merged_coverage &= dataset.fragment_bitmap.as_ref();
 
