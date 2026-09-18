@@ -859,6 +859,33 @@ enum OffsetPreloadSource {
     Sidecar,
 }
 
+/// Ranges of `partition_id`'s rows in the shuffle data file, one per flush
+/// group that holds any.
+///
+/// A partition is usually absent from most groups, and a zero-length range
+/// still costs the reader a range entry, so the empty ones are dropped.
+fn preloaded_partition_ranges(
+    offsets: &[u64],
+    num_batches: usize,
+    num_partitions: usize,
+    partition_id: usize,
+) -> Vec<Range<u64>> {
+    let mut ranges = Vec::with_capacity(num_batches);
+    for batch_idx in 0..num_batches {
+        let end_index = batch_idx * num_partitions + partition_id;
+        let start = if end_index == 0 {
+            0
+        } else {
+            offsets[end_index - 1]
+        };
+        let end = offsets[end_index];
+        if start < end {
+            ranges.push(start..end);
+        }
+    }
+    ranges
+}
+
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -1036,19 +1063,12 @@ impl TwoFileShuffleReader {
         }
 
         match &self.offsets {
-            ShuffleOffsets::Preloaded(offsets) => {
-                let mut ranges = Vec::with_capacity(self.num_batches);
-                for batch_idx in 0..self.num_batches {
-                    let end_index = batch_idx * self.num_partitions + partition_id;
-                    let start = if end_index == 0 {
-                        0
-                    } else {
-                        offsets[end_index - 1]
-                    };
-                    ranges.push(start..offsets[end_index]);
-                }
-                Ok(ranges)
-            }
+            ShuffleOffsets::Preloaded(offsets) => Ok(preloaded_partition_ranges(
+                offsets,
+                self.num_batches,
+                self.num_partitions,
+                partition_id,
+            )),
             ShuffleOffsets::OnDemand(offsets_reader) => {
                 self.read_partition_ranges(offsets_reader, partition_id)
                     .await
@@ -1141,7 +1161,11 @@ impl TwoFileShuffleReader {
                     format!("missing end offset for partition {}", partition_id),
                 )
             })?;
-            ranges.push(start..end);
+            // Same as the preloaded path: skip the groups this partition has no
+            // rows in rather than passing empty ranges to the reader.
+            if start < end {
+                ranges.push(start..end);
+            }
         }
         Ok(ranges)
     }
@@ -2849,6 +2873,33 @@ mod tests {
         assert_eq!(p0.num_rows(), 126);
         let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
         assert_eq!(p1.num_rows(), 130);
+    }
+
+    /// A partition that only appears in some flush groups used to get one
+    /// zero-length range per group it is absent from, and those reach the file
+    /// reader as real range entries.
+    #[test]
+    fn test_preloaded_partition_ranges_skip_empty_groups() {
+        // Three partitions, four flush groups. Offsets are cumulative row
+        // counts per (group, partition): partition 1 holds rows in group 1 only.
+        let offsets = vec![
+            1u64, 1, 2, // group 0: p0 one row, p1 none, p2 one row
+            2, 4, 4, // group 1: p0 none, p1 two rows, p2 none
+            5, 5, 5, // group 2: p0 one row, nothing else
+            5, 5, 6, // group 3: p2 one row
+        ];
+
+        let p1 = preloaded_partition_ranges(&offsets, 4, 3, 1);
+        assert_eq!(p1, vec![2..4], "partition 1 spans group 1 only");
+
+        let p0 = preloaded_partition_ranges(&offsets, 4, 3, 0);
+        assert_eq!(p0, vec![0..1, 4..5], "partition 0 spans groups 0 and 2");
+        assert!(
+            p0.iter()
+                .chain(p1.iter())
+                .all(|range| range.start < range.end),
+            "no zero-length range should survive: {p0:?} {p1:?}"
+        );
     }
 
     /// Nullable `__ivf_part_id` must not be treated as partition 0 via `values()`.
