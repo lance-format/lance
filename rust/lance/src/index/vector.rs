@@ -1042,6 +1042,21 @@ async fn build_vector_index_impl(
         .await?;
     let stages = &params.stages;
 
+    // RQ and SQ quantize floats only. Their own `build` rejects anything else,
+    // but not before the builder has sampled and loaded training data, so the
+    // dtype is checked here the way the flat and PQ arms already check it.
+    if matches!(index_type, IndexType::IvfSq | IndexType::IvfRq)
+        && !matches!(
+            element_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        )
+    {
+        return Err(Error::index(format!(
+            "Build Vector Index: invalid data type: {:?}",
+            element_type
+        )));
+    }
+
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -2208,11 +2223,73 @@ mod tests {
     use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
+
+    /// SQ and RQ only quantize floats. Their `build` rejects other element
+    /// types, but the builder samples and loads training data first, so the
+    /// dtype is checked up front like the flat and PQ arms do. The error has to
+    /// be the early one, not the quantizer's.
+    #[rstest::rstest]
+    #[case::sq_l2(IndexType::IvfSq, MetricType::L2)]
+    #[case::rq_l2(IndexType::IvfRq, MetricType::L2)]
+    // Hamming is the case worth catching early: kmeans accepts UInt8 there, so
+    // without the check the whole IVF model is trained before the quantizer
+    // rejects the dtype.
+    #[case::sq_hamming(IndexType::IvfSq, MetricType::Hamming)]
+    #[tokio::test]
+    async fn test_build_rejects_non_float_vectors_before_training(
+        #[case] index_type: IndexType,
+        #[case] metric_type: MetricType,
+    ) {
+        let dim = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vector",
+            ArrowDataType::FixedSizeList(
+                Arc::new(Field::new("item", ArrowDataType::UInt8, true)),
+                dim,
+            ),
+            false,
+        )]));
+        let values = arrow_array::UInt8Array::from(vec![1u8; 256 * dim as usize]);
+        let vectors = arrow_array::FixedSizeListArray::try_new_from_values(values, dim).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let params = match index_type {
+            IndexType::IvfSq => VectorIndexParams::with_ivf_sq_params(
+                metric_type,
+                IvfBuildParams::new(2),
+                Default::default(),
+            ),
+            IndexType::IvfRq => VectorIndexParams::with_ivf_rq_params(
+                metric_type,
+                IvfBuildParams::new(2),
+                Default::default(),
+            ),
+            other => panic!("unexpected index type {other:?}"),
+        };
+
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Build Vector Index: invalid data type: UInt8"),
+            "expected the up-front dtype rejection, got: {err}"
+        );
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
