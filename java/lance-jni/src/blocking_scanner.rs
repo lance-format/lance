@@ -385,6 +385,16 @@ pub(crate) fn build_scanner_with_options<'a>(
             .nearest(&column, &key, k)
             .map_err(|err| Error::input_error(err.to_string()))?;
 
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        scanner.distance_range(lower_bound, upper_bound);
+
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
 
