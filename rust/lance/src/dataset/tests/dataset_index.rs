@@ -585,6 +585,75 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
     }
 }
 
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+async fn test_numeric_coercion_uses_scalar_index(#[case] index_type: IndexType) {
+    let batch = arrow_array::record_batch!(
+        ("i", Int64, [None, Some(1), Some(2), Some(3)]),
+        ("x", Float32, [None, Some(0.5), Some(1.0), Some(1.5)]),
+        ("id", UInt64, [0, 1, 2, 3])
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    for column in ["i", "x"] {
+        dataset
+            .create_index(
+                &[column],
+                index_type,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    for (predicate, requires_index, expected) in [
+        ("i > 1.5", true, vec![2, 3]),
+        ("i = 2.0", true, vec![2]),
+        ("i BETWEEN 1 AND 2.5", true, vec![1, 2]),
+        ("i IN (1.5, 2)", true, vec![2]),
+        ("x > CAST(0.5 AS double)", true, vec![2, 3]),
+        ("CAST(x AS double) > CAST(0.5 AS double)", true, vec![2, 3]),
+        ("x BETWEEN 0.0 AND CAST(0.5 AS double)", true, vec![1]),
+        // Lossy explicit casts keep their rounding and skip the index.
+        ("CAST(i AS float) > 1.5", false, vec![2, 3]),
+        ("NOT (i = 1.5)", false, vec![1, 2, 3]),
+    ] {
+        for use_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_index)
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            if use_index && requires_index {
+                let plan = scan.explain_plan(false).await.unwrap();
+                assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+            }
+            let result = scan.try_into_batch().await.unwrap();
+            let mut ids = result["id"].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{index_type:?}, {predicate}, index={use_index}"
+            );
+        }
+    }
+}
+
 async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
     let test_uri = TempStrDir::default();
 
