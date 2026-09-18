@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Auto-dream — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/context/design/auto-dream/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../">Overview</a>
+    <a href="../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../pytorch/">PyTorch</a>
+    <a href="../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../duckdb/">Overview</a>
+    <a href="../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../huggingface/">Home</a>
+    <a href="../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../spark/">Welcome</a>
+    <a href="../../../spark/install/">Install</a>
+    <a href="../../../spark/config/">Config</a>
+    <a href="../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../ray/">Welcome</a>
+    <a href="../../../ray/read/">Read</a>
+    <a href="../../../ray/write/">Write</a>
+    <a href="../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../ray/compaction/">Compaction</a>
+    <a href="../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../trino/">Welcome</a>
+    <a href="../../../trino/install/">Install</a>
+    <a href="../../../trino/config/">Config</a>
+    <a href="../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../guide/quickstart/">Quickstart</a>
+    <a href="../../guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../guide/storage/">Storage backends</a>
+    <a href="../../guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../partitioned-namespace/">Partitioned namespace</a>
+    <a class="active" href="./">Auto-dream</a>
+    <a href="../using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Lance Context</span>
+        <span>/</span><span>Design</span>
+        <span>/</span><b>Auto-dream</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="design-offline-memory-consolidation-auto-dream">Design: Offline Memory Consolidation ("auto-dream")<a class="headerlink" href="#design-offline-memory-consolidation-auto-dream" title="Permanent link">&para;</a></h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Status</strong></td>
+<td>Draft — for discussion</td>
+</tr>
+<tr>
+<td><strong>Issue</strong></td>
+<td><a href="https://github.com/lance-format/lance-context/issues/99">#99 — RFC: Offline memory consolidation ("auto-dream")</a></td>
+</tr>
+<tr>
+<td><strong>Relates to</strong></td>
+<td><a href="https://github.com/lance-format/lance-context/issues/96">#96 — Curate records into trainable datasets</a> · <a href="https://github.com/lance-format/lance-context/issues/37">#37 — Architecture discussion</a> · [#16 — Compaction]</td>
+</tr>
+<tr>
+<td><strong>References</strong></td>
+<td>Generative Agents (reflection) · 2025 "sleep-time compute" line</td>
+</tr>
+<tr>
+<td><strong>Scope</strong></td>
+<td>Storage-native machinery + a user-supplied abstraction hook. No bundled models, no agent framework, no hard deletion.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="1-summary">1. Summary<a class="headerlink" href="#1-summary" title="Permanent link">&para;</a></h2>
+<p>Long-running agents accumulate large volumes of low-level episodic memory. As the store
+fills with redundant / near-duplicate entries, recall quality and cost degrade.
+<strong>Consolidation</strong> ("auto-dream") summarizes many raw turns into a few higher-signal
+memories, links each derived memory back to its sources, and <strong>retires</strong> (does not delete)
+the now-redundant raw records — keeping online memory compact, auditable, and reversible.</p>
+<p>This is deliberately <em>storage-native machinery only</em>: candidate selection, clustering,
+write-back, lifecycle, and versioning live in <code>lance-context</code>; the <strong>abstraction step is a
+user-supplied hook</strong>. We bundle no LLMs.</p>
+<p>The central design decision this doc records: <strong>auto-dream and #96 (curate/export) are the
+same loop and should share one engine</strong> — <code>select → transform → sink</code> — differing only in
+<em>sink</em> (export writes JSONL; consolidation writes derived records back and supersedes
+sources) and <em>trigger</em> (on-demand vs. idle/background).</p>
+<h2 id="2-background">2. Background<a class="headerlink" href="#2-background" title="Permanent link">&para;</a></h2>
+<h3 id="21-where-we-are-today">2.1 Where we are today<a class="headerlink" href="#21-where-we-are-today" title="Permanent link">&para;</a></h3>
+<p><code>lance-context</code> already holds the raw memory and every primitive consolidation needs:</p>
+<ul>
+<li><strong>embeddings</strong> + cosine distance — already used in <code>export.rs</code> for near-duplicate
+  <strong>dedup</strong> and <strong>decontamination</strong>; the same machinery clusters related memories.</li>
+<li><strong>relationships</strong> (<code>relationships</code> column + <code>related()</code> traversal) — link a derived
+  memory to the source records it summarizes.</li>
+<li><strong>lifecycle</strong> (<code>upsert</code>/supersede, <code>update</code>/retire, <code>delete</code>/tombstone) — replace
+  consolidated-away records non-destructively.</li>
+<li><strong>versioning</strong> (<code>version()</code> / <code>checkout()</code>) — every pass is a new, inspectable,
+  rollback-able version.</li>
+<li><strong>background compaction scheduler</strong> (<code>should_compact</code>, <code>start_background_compaction</code>) —
+  an existing pattern for bounded, opt-in background work.</li>
+</ul>
+<p>What does <strong>not</strong> exist yet is the <em>write-back</em>: there is no API that, given a cluster,
+inserts a derived record, links it to its sources, and retires those sources atomically.</p>
+<h3 id="22-what-99-asks">2.2 What #99 asks<a class="headerlink" href="#22-what-99-asks" title="Permanent link">&para;</a></h3>
+<p>An opt-in process that: (1) selects redundant/related sets, (2) calls a user hook to
+abstract each set into a consolidated record, (3) writes the result back and retires the
+originals, (4) optionally runs on a schedule, (5) stays reversible and reproducible.</p>
+<h3 id="23-why-storage-native-fits">2.3 Why storage-native fits<a class="headerlink" href="#23-why-storage-native-fits" title="Permanent link">&para;</a></h3>
+<p>The same bet as #96: consolidation maps directly onto existing storage features, so it
+belongs next to the data rather than re-deriving it in the agent layer from flat exports.
+"Curate in place + version" beats "export, transform externally, re-import".</p>
+<h2 id="3-goals-non-goals">3. Goals / Non-goals<a class="headerlink" href="#3-goals-non-goals" title="Permanent link">&para;</a></h2>
+<p><strong>Goals</strong>
+- A shared <code>select → transform → sink</code> engine; consolidation is a second sink on the #96
+  substrate.
+- An opt-in, synchronous <code>consolidate(options, hook)</code> first; scheduler later.
+- Non-destructive, reversible, reproducible: retire (never tombstone) sources; record
+  params + source ids; pin/inspect by version.</p>
+<p><strong>Non-goals</strong>
+- No bundled models / prompting — abstraction is a hook.
+- No hard deletion for consolidation (lifecycle only).
+- Not physical compaction (#16): that optimizes files; this is <em>semantic</em> consolidation.
+- No background scheduler <strong>on by default</strong> until demand is validated (§10).</p>
+<h2 id="4-the-consolidation-loop-in-brief">4. The consolidation loop, in brief<a class="headerlink" href="#4-the-consolidation-loop-in-brief" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>        ┌─────────── shared engine (with #96) ───────────┐
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>raw ──► select (filters + lifecycle + cluster) ──► transform (user hook) ──► sink
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>        └────────────────────────────────────────────────┘                   │
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>                                                          export (#96): JSONL + manifest
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                                                          consolidate (#99): insert derived
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>                                                            + relationship-link + supersede
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>                                                            + version bump
+</span></code></pre></div>
+<h2 id="5-design">5. Design<a class="headerlink" href="#5-design" title="Permanent link">&para;</a></h2>
+<h3 id="51-principle-derive-and-supersede-one-engine-two-sinks">5.1 Principle: derive-and-supersede; one engine, two sinks<a class="headerlink" href="#51-principle-derive-and-supersede-one-engine-two-sinks" title="Permanent link">&para;</a></h3>
+<p><code>export.rs</code> (from #96) already implements the <strong>read side</strong>:</p>
+<ul>
+<li><strong>candidate selection</strong> — <code>list_filtered_with_options</code> (lifecycle-correct: drops
+  tombstoned/expired/retired/superseded/contradicted) + metadata/quality filters;</li>
+<li><strong>clustering / redundancy</strong> — cosine <code>dedup</code> / <code>decontaminate</code> over embeddings;</li>
+<li><strong>grouping/aggregation</strong> — by <code>session_id</code> / <code>run_id</code> / <code>tenant</code> / external-id prefix,
+  deterministically ordered;</li>
+<li><strong>provenance + manifest</strong> — source ids, version, params.</li>
+</ul>
+<p>Consolidation reuses all of that and replaces only the <strong>sink</strong>. Proposed refactor:
+extract selection + clustering + grouping from <code>export.rs</code> into a shared <code>curate</code> module,
+then implement both sinks on top of it. The transform hook differs only in signature.</p>
+<h3 id="52-candidate-selection-clustering">5.2 Candidate selection &amp; clustering<a class="headerlink" href="#52-candidate-selection-clustering" title="Permanent link">&para;</a></h3>
+<p>Two selection modes, both already expressible:</p>
+<ol>
+<li><strong>Structural</strong> — group by <code>session_id</code> / <code>run_id</code> / time window (existing <code>group_records</code>).</li>
+<li><strong>Semantic</strong> — cluster by embedding similarity. v1 = greedy near-duplicate collapse
+   using the existing cosine helper, with an exposed similarity floor and <code>max_cluster_size</code>.</li>
+</ol>
+<p>A cluster proceeds to abstraction only if it is <strong>above a similarity floor</strong> <em>and</em> <strong>at or
+above a minimum size</strong> (don't summarize singletons).</p>
+<h3 id="53-abstraction-hook-user-supplied">5.3 Abstraction hook (user-supplied)<a class="headerlink" href="#53-abstraction-hook-user-supplied" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>type ConsolidateHook = (cluster: &amp;[ContextRecord]) -&gt; Option&lt;DerivedRecord&gt;;
+</span></code></pre></div>
+<p>Given a cluster, the caller's hook returns a consolidated record (summary/abstraction), or
+<code>None</code> to skip. <code>lance-context</code> invokes the hook and persists the result; it bundles no
+models. (FFI note: in Python this is a callback; the engine batches clusters and calls the
+hook per cluster between async write phases.)</p>
+<h3 id="54-write-back-insert-derived-link-supersede-version">5.4 Write-back: insert derived + link + supersede + version<a class="headerlink" href="#54-write-back-insert-derived-link-supersede-version" title="Permanent link">&para;</a></h3>
+<p>For each accepted cluster with derived record <code>D</code> over sources <code>S_1..S_n</code>:</p>
+<ol>
+<li><strong>Insert</strong> <code>D</code> with <code>source="consolidated"</code>.</li>
+<li><strong>Link</strong> <code>D</code> to every <code>S_i</code> via <code>relationships</code> (<code>relation = "consolidates"</code>), so trace-back
+   is a <code>related()</code> traversal.</li>
+<li><strong>Retire</strong> each <code>S_i</code> non-destructively — set <code>superseded_by_id = D.id</code> (and/or
+   <code>retired_at</code> + <code>retired_reason = "consolidated:&lt;D.id&gt;"</code>). <code>is_hidden_by_lifecycle()</code>
+   already hides records with <code>superseded_by_id</code>/<code>retired_at</code> from default reads.</li>
+<li><strong>One version bump</strong> for the whole pass.</li>
+</ol>
+<blockquote>
+<p><strong>API gap to fill:</strong> today supersession is 1→1 (<code>upsert</code>) and <code>RecordPatch</code> does not expose
+<code>superseded_by_id</code>. Consolidation is N→1, so we need a small atomic primitive —
+"mark records <code>S_1..S_n</code> superseded-by <code>D</code> and insert <code>D</code>" — rather than reusing <code>upsert</code>
+per record. This is the main new storage operation auto-dream introduces.</p>
+</blockquote>
+<h3 id="55-search-interaction-traceability">5.5 Search interaction &amp; traceability<a class="headerlink" href="#55-search-interaction-traceability" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Default reads / <code>search</code></strong>: consolidated (L0) records are visible; retired originals
+  drop out of default recall (via <code>is_hidden_by_lifecycle</code>).</li>
+<li><strong>Traceability</strong>: originals remain in the store and are reachable with
+  <code>LifecycleQueryOptions { include_retired: true }</code> + the <code>consolidates</code> relationships —
+  exactly the L0→L1→L2 evidence trace-back described in #37.</li>
+<li>So raw memory stays queryable for evidence; it just stops competing in normal recall.</li>
+</ul>
+<h3 id="56-scheduling-deferred">5.6 Scheduling (deferred)<a class="headerlink" href="#56-scheduling-deferred" title="Permanent link">&para;</a></h3>
+<p>A background/idle pass would reuse the <code>should_compact</code> / <code>start_background_compaction</code>
+pattern: bounded, cancellable, threshold/cadence-triggered. <strong>Deferred</strong> until the
+synchronous API proves out and demand is validated (§10).</p>
+<h3 id="57-api-sketch">5.7 API sketch<a class="headerlink" href="#57-api-sketch" title="Permanent link">&para;</a></h3>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ConsolidateOptions</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">filters</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">RecordFilters</span><span class="o">&gt;</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">lifecycle</span><span class="p">:</span><span class="w"> </span><span class="nc">LifecycleQueryOptions</span><span class="p">,</span><span class="w">      </span><span class="c1">// default visible-only</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">cluster_by</span><span class="p">:</span><span class="w"> </span><span class="nc">ClusterBy</span><span class="p">,</span><span class="w">                 </span><span class="c1">// Structural(GroupBy) | Semantic { threshold, max_size }</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">min_cluster_size</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span><span class="w">               </span><span class="c1">// skip singletons</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">scope_boundary</span><span class="p">:</span><span class="w"> </span><span class="nc">ScopeBoundary</span><span class="p">,</span><span class="w">         </span><span class="c1">// never cross session/tenant by default</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">dry_run</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span><span class="w">                         </span><span class="c1">// report clusters without writing</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="p">}</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ConsolidationManifest</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">version</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">clusters</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">derived</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">retired_sources</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">params</span><span class="p">:</span><span class="w"> </span><span class="nc">ConsolidateParamsSummary</span><span class="p">,</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">derived_ids</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="p">}</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="k">impl</span><span class="w"> </span><span class="n">ContextStore</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">consolidate</span><span class="p">(</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="w">        </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="w">        </span><span class="n">options</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">ConsolidateOptions</span><span class="p">,</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="w">        </span><span class="n">hook</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">ConsolidateHook</span><span class="p">,</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">LanceResult</span><span class="o">&lt;</span><span class="n">ConsolidationManifest</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><code>dry_run</code> returns the proposed clusters + counts without writing — a cheap way to tune
+thresholds before committing a pass.</p>
+<h2 id="6-shared-engine-with-96-recommendation-yes">6. Shared engine with #96 — recommendation: <strong>yes</strong><a class="headerlink" href="#6-shared-engine-with-96-recommendation-yes" title="Permanent link">&para;</a></h2>
+<p>Build <strong>one</strong> selection/clustering substrate, <strong>two</strong> sinks. Concretely:</p>
+<ul>
+<li>Move <code>list_filtered_with_options</code>-based selection, the cosine cluster/dedup helpers, and
+  <code>group_records</code> from <code>export.rs</code> into a shared <code>curate</code>/<code>cluster</code> module (pure refactor,
+  no behavior change; #96 keeps passing).</li>
+<li><code>export_training</code> becomes "select → format → JSONL sink"; <code>consolidate</code> becomes
+  "select → hook → write-back sink".</li>
+</ul>
+<p>This avoids two parallel near-duplicate implementations and means improvements to
+clustering benefit both training-data curation and online consolidation.</p>
+<h2 id="7-guardrails-against-over-abstraction">7. Guardrails against over-abstraction<a class="headerlink" href="#7-guardrails-against-over-abstraction" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Reversible</strong>: sources are retired, never deleted; a pass is a single version you can
+  <code>checkout</code>/roll back.</li>
+<li><strong>Minimums</strong>: similarity floor + <code>min_cluster_size</code> prevent trivial/lossy merges.</li>
+<li><strong>Scope boundaries</strong>: never abstract across <code>session_id</code>/<code>tenant</code> by default.</li>
+<li><strong>Auditable</strong>: <code>ConsolidationManifest</code> records params + source/derived ids; the
+  <code>consolidates</code> relationships preserve the full lineage.</li>
+<li><strong><code>dry_run</code></strong> before committing.</li>
+</ul>
+<h2 id="8-interaction-with-existing-features">8. Interaction with existing features<a class="headerlink" href="#8-interaction-with-existing-features" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Lifecycle</strong>: reuses supersede/retire visibility; adds the N→1 supersede primitive (§5.4).</li>
+<li><strong>Relationships</strong>: the lineage carrier; <code>migrate_relationships</code> already backfills the column.</li>
+<li><strong>Versioning</strong>: each pass = one version; reproducible and inspectable.</li>
+<li><strong>Compaction (#16)</strong>: orthogonal — semantic consolidation reduces row count; physical
+  compaction reclaims files. They compose.</li>
+<li><strong>Curation/export (#96)</strong>: shared engine (§6).</li>
+<li><strong>Namespaces (#94)</strong>: consolidation runs per partition; cross-partition is out of scope.</li>
+</ul>
+<h2 id="9-alternatives-considered">9. Alternatives considered<a class="headerlink" href="#9-alternatives-considered" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Do it in the agent layer</strong> — viable, but loses in-store versioning, lifecycle audit,
+  and reuse of the #96 substrate; re-derives from flat data. Keep as the fallback for users
+  who don't want in-store consolidation.</li>
+<li><strong>Hard-delete consolidated rows</strong> — rejected: not reversible/auditable (matches #96 audit
+  guidance: don't conflate curation/consolidation with record removal).</li>
+<li><strong>Two parallel engines (#96 + #99)</strong> — rejected in favor of the shared engine (§6).</li>
+</ul>
+<h2 id="10-open-questions">10. Open questions<a class="headerlink" href="#10-open-questions" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Demand</strong> — what concrete agent workflow needs <em>in-store</em> (vs. agent-layer)
+  consolidation? Same validation bar as #96. Gate the scheduler on a real use case; ship the
+  synchronous API first.</li>
+<li><strong>N→1 supersede primitive</strong> — exact shape/atomicity (§5.4): extend <code>RecordPatch</code> vs. a
+  dedicated <code>consolidate</code> write op.</li>
+<li><strong>Clustering quality</strong> — is greedy cosine enough for v1, or do we need a real clustering
+  pass (e.g. connected-components over a similarity graph)?</li>
+<li><strong>Hook batching / failure semantics</strong> — partial-failure behavior if the hook errors on
+  one cluster mid-pass (all-or-nothing per pass vs. best-effort with a report).</li>
+</ul>
+<h2 id="11-phased-rollout">11. Phased rollout<a class="headerlink" href="#11-phased-rollout" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>This doc</strong> — record scope, the shared-engine decision, guardrails (RFC acceptance).</li>
+<li><strong>Refactor</strong> — extract shared selection/cluster/group module from <code>export.rs</code> (no
+   behavior change).</li>
+<li><strong>N→1 supersede primitive</strong> — the one new storage op (§5.4), with tests.</li>
+<li><strong><code>consolidate(options, hook)</code></strong> — synchronous, opt-in, with <code>dry_run</code>; core + Python.</li>
+<li><strong>Scheduler</strong> — idle/cadence background pass, gated on validated demand (§10).</li>
+</ol>
+<h2 id="12-acceptance-criteria-mapping-99-rfc-stage">12. Acceptance criteria mapping (#99, RFC stage)<a class="headerlink" href="#12-acceptance-criteria-mapping-99-rfc-stage" title="Permanent link">&para;</a></h2>
+<ul>
+<li>[x] Scope / non-goals agreed (machinery + hook, no bundled models) — §3.</li>
+<li>[x] Shared-engine decision with #96 — <strong>yes</strong>, §6.</li>
+<li>[x] Short design doc under <code>docs/design/</code> — this file.</li>
+<li>[ ] Maintainer sign-off → then implementation tracked in follow-ups (§11).</li>
+</ul>
+<h2 id="13-references">13. References<a class="headerlink" href="#13-references" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Issue #99 (this RFC), #96 (curate/export), #37 (architecture), #16 (compaction).</li>
+<li><code>docs/design/partitioned-namespace.md</code> — companion design doc (same storage-native bet).</li>
+<li>Generative Agents (reflection); 2025 "sleep-time compute" line.</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../partitioned-namespace/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Partitioned namespace</div>
+        </a>
+        <a class="next" href="../using-datagen-store/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Using the datagen store</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#1-summary">1. Summary</a>
+      <a class="ld-toc__h2" href="#2-background">2. Background</a>
+      <a class="ld-toc__h3" href="#21-where-we-are-today">2.1 Where we are today</a>
+      <a class="ld-toc__h3" href="#22-what-99-asks">2.2 What #99 asks</a>
+      <a class="ld-toc__h3" href="#23-why-storage-native-fits">2.3 Why storage-native fits</a>
+      <a class="ld-toc__h2" href="#3-goals-non-goals">3. Goals / Non-goals</a>
+      <a class="ld-toc__h2" href="#4-the-consolidation-loop-in-brief">4. The consolidation loop, in brief</a>
+      <a class="ld-toc__h2" href="#5-design">5. Design</a>
+      <a class="ld-toc__h3" href="#51-principle-derive-and-supersede-one-engine-two-sinks">5.1 Principle: derive-and-supersede; one engine, two sinks</a>
+      <a class="ld-toc__h3" href="#52-candidate-selection-clustering">5.2 Candidate selection &amp; clustering</a>
+      <a class="ld-toc__h3" href="#53-abstraction-hook-user-supplied">5.3 Abstraction hook (user-supplied)</a>
+      <a class="ld-toc__h3" href="#54-write-back-insert-derived-link-supersede-version">5.4 Write-back: insert derived + link + supersede + version</a>
+      <a class="ld-toc__h3" href="#55-search-interaction-traceability">5.5 Search interaction &amp; traceability</a>
+      <a class="ld-toc__h3" href="#56-scheduling-deferred">5.6 Scheduling (deferred)</a>
+      <a class="ld-toc__h3" href="#57-api-sketch">5.7 API sketch</a>
+      <a class="ld-toc__h2" href="#6-shared-engine-with-96-recommendation-yes">6. Shared engine with #96 — recommendation: yes</a>
+      <a class="ld-toc__h2" href="#7-guardrails-against-over-abstraction">7. Guardrails against over-abstraction</a>
+      <a class="ld-toc__h2" href="#8-interaction-with-existing-features">8. Interaction with existing features</a>
+      <a class="ld-toc__h2" href="#9-alternatives-considered">9. Alternatives considered</a>
+      <a class="ld-toc__h2" href="#10-open-questions">10. Open questions</a>
+      <a class="ld-toc__h2" href="#11-phased-rollout">11. Phased rollout</a>
+      <a class="ld-toc__h2" href="#12-acceptance-criteria-mapping-99-rfc-stage">12. Acceptance criteria mapping (#99, RFC stage)</a>
+      <a class="ld-toc__h2" href="#13-references">13. References</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

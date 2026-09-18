@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>MemTable & WAL — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/mem_wal/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a href="../schema/">Schema</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../transaction/">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a href="../row_id_lineage/">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a class="active" href="./">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>MemTable & WAL</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="memtable-wal-specification-experimental">MemTable &amp; WAL Specification (Experimental)<a class="headerlink" href="#memtable-wal-specification-experimental" title="Permanent link">&para;</a></h1>
+<p>Lance MemTable &amp; WAL (MemWAL) specification describes a Log-Structured-Merge (LSM) tree architecture for Lance tables, enabling high-performance streaming write workloads while maintaining indexed read performance for key workloads including
+scan, point lookup, vector search and full-text search.</p>
+<h2 id="overall-architecture">Overall Architecture<a class="headerlink" href="#overall-architecture" title="Permanent link">&para;</a></h2>
+<p><img alt="MemWAL Overview" src="../../../images/mem_wal_overview.png" /></p>
+<p>A Lance table is called the <strong>base table</strong> in this document.
+The base table may have an <a href="../#unenforced-primary-key">unenforced primary key</a> in its schema.
+Primary keys are required for primary-key lookups and last-write-wins upsert semantics.
+Append-only MemWAL tables may omit a primary key.</p>
+<p>MemWAL adds a set of shards on top of the base table.
+Writers append to shards.
+Each shard keeps recent data in an in-memory MemTable, persists writes to a per-shard WAL, flushes MemTables as small Lance datasets, and later compacts those SSTables into the base table.</p>
+<p>The base table manifest contains one MemWAL system index entry named <code>__lance_mem_wal</code>.
+This index stores MemWAL configuration and global progress metadata inline in <code>IndexMetadata.index_details</code>.
+Each shard's own manifest remains authoritative for shard-local mutable state.</p>
+<h3 id="memwal-shard">MemWAL Shard<a class="headerlink" href="#memwal-shard" title="Permanent link">&para;</a></h3>
+<p>A <strong>MemWAL shard</strong> is the unit of horizontal write scaling.
+Each shard has exactly one active writer epoch at a time.
+Writers claim a shard, append WAL entries, update the in-memory MemTable, and publish SSTable generations by updating the shard manifest.</p>
+<p>For primary-key tables, all rows for the same primary key must map to the same shard.
+If one primary key can appear in multiple shards, asynchronous compaction order between shards can make an older row overwrite a newer row.
+Append-only tables without a primary key do not rely on last-write-wins conflict resolution and may use any deterministic shard assignment suitable for the workload.</p>
+<h3 id="memwal-index">MemWAL Index<a class="headerlink" href="#memwal-index" title="Permanent link">&para;</a></h3>
+<p>The MemWAL index is a system index entry on the base table.
+It has <code>name = "__lance_mem_wal"</code>, no indexed fields, and no index files.
+<code>IndexMetadata.files</code> is <code>None</code>.
+All MemWAL index data is stored in the <code>MemWalIndexDetails</code> protobuf message in <code>IndexMetadata.index_details</code>.</p>
+<p>The index stores:</p>
+<ul>
+<li><strong>Configuration</strong>: <code>sharding_specs</code>, <code>maintained_indexes</code>, and <code>writer_config_defaults</code>.</li>
+<li><strong>Compaction progress</strong>: <code>compacted_sstables</code>, the last SSTable compacted into the base table for each shard.</li>
+<li><strong>Index catchup progress</strong>: <code>index_catchup</code>, the compacted SSTable generation covered by each base-table index.</li>
+<li><strong>Shard snapshots</strong>: optional point-in-time snapshot fields for read optimization.</li>
+</ul>
+<p>Shard snapshots are not authoritative.
+Readers that need the latest shard set list <code>_mem_wal/</code> and read each shard's latest manifest.</p>
+<h2 id="shard-architecture">Shard Architecture<a class="headerlink" href="#shard-architecture" title="Permanent link">&para;</a></h2>
+<p><img alt="Shard Architecture" src="../../../images/mem_wal_shard.png" /></p>
+<p>Within a shard, writes first enter an in-memory <strong>MemTable</strong> and are durably appended to the shard <strong>write-ahead log (WAL)</strong>.
+The MemTable is periodically <strong>flushed</strong> to storage as a Lance dataset.
+SSTables are asynchronously <strong>compacted</strong> into the base table.</p>
+<h3 id="memtable">MemTable<a class="headerlink" href="#memtable" title="Permanent link">&para;</a></h3>
+<p>A MemTable holds rows inserted into a shard before those rows are flushed to storage.
+It serves two purposes:</p>
+<ol>
+<li>It buffers data and per-MemTable indexes before an SSTable is written.</li>
+<li>It lets readers access data that has not been flushed yet when strong consistency is required.</li>
+</ol>
+<p>The storage format does not prescribe the in-memory MemTable layout.
+Conceptually, a MemTable is an append log of Arrow record batches.
+Later appends have larger in-memory row positions.
+For primary-key tables, in-memory reads use the largest visible row position as the newest row for a key.</p>
+<h3 id="sstable-generation">SSTable Generation<a class="headerlink" href="#sstable-generation" title="Permanent link">&para;</a></h3>
+<p>Within each shard, SSTables have monotonically increasing generation numbers starting from 1.
+When a MemTable is flushed, the resulting SSTable is assigned the shard manifest's <code>current_generation</code>, and <code>current_generation</code> advances to the next SSTable generation.
+A MemTable does not have a generation.</p>
+<p>SSTable generation numbers order persisted data freshness within one shard:</p>
+<ul>
+<li>Base table data is modeled as generation 0.</li>
+<li>Higher SSTable generations are newer.</li>
+<li>The active MemTable is newer than every published SSTable.</li>
+<li>Within the active MemTable, higher row positions are newer.</li>
+<li>Within an SSTable, flush-time deletion vectors hide older duplicate primary-key rows, so readers see at most the newest row for each primary key.</li>
+</ul>
+<h2 id="wal">WAL<a class="headerlink" href="#wal" title="Permanent link">&para;</a></h2>
+<p>The WAL is the durable append log for a shard.
+Every durable WAL append creates one <strong>WAL entry</strong>.</p>
+<h3 id="wal-entry-positions">WAL Entry Positions<a class="headerlink" href="#wal-entry-positions" title="Permanent link">&para;</a></h3>
+<p>WAL entry positions are 1-based.
+The first data entry is position 1.
+Position 0 is reserved as the sentinel value meaning no WAL entry has been covered.</p>
+<p>Writers append WAL entries in increasing position order.
+If entry <code>N</code> is not fully written, entry <code>N + 1</code> must not exist.
+Recovery replays from <code>replay_after_wal_entry_position + 1</code>.</p>
+<h3 id="wal-entry-format">WAL Entry Format<a class="headerlink" href="#wal-entry-format" title="Permanent link">&para;</a></h3>
+<p>Each WAL entry is an Apache Arrow IPC stream file.
+The Arrow schema metadata includes:</p>
+<ul>
+<li><code>writer_epoch</code>: decimal string containing the writer epoch that created the entry.</li>
+<li><code>fence_sentinel</code>: optional marker for a data-less fence sentinel entry.</li>
+</ul>
+<p>A normal WAL entry contains one or more record batches.
+A fence sentinel entry contains no batches and is skipped during replay.
+Sentinels are used so an older writer collides on the next WAL position and discovers that it has been fenced.</p>
+<h3 id="wal-storage-layout">WAL Storage Layout<a class="headerlink" href="#wal-storage-layout" title="Permanent link">&para;</a></h3>
+<p>WAL entries live under <code>_mem_wal/{shard_id}/wal/</code>.
+Filenames use bit-reversed 64-bit binary names with the <code>.arrow</code> suffix:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>_mem_wal/{shard_id}/wal/{bit_reversed_position}.arrow
+</span></code></pre></div>
+<p>The bit-reversal spreads sequential positions across object-store keyspace.
+For example, position 5 is encoded as:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>1010000000000000000000000000000000000000000000000000000000000000.arrow
+</span></code></pre></div>
+<h2 id="sstable">SSTable<a class="headerlink" href="#sstable" title="Permanent link">&para;</a></h2>
+<p>An SSTable is the immutable result of flushing a MemTable.
+It is stored as a Lance dataset under its shard directory.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Unlike a classic LSM sorted string table, a MemWAL SSTable is not sorted by key; random access is instead served by its BTree primary-key sidecar. It is called an SSTable because it is an immutable, persisted, indexed run.</p>
+</div>
+<h3 id="sstable-storage-layout">SSTable Storage Layout<a class="headerlink" href="#sstable-storage-layout" title="Permanent link">&para;</a></h3>
+<p>An SSTable with generation <code>i</code> is written to:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>_mem_wal/{shard_id}/{random8}_gen_{i}/
+</span></code></pre></div>
+<p><code>{random8}</code> is an 8-character random hex value generated for each flush attempt.
+If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
+The shard manifest records the successful directory name in the SSTable's <code>path</code>.</p>
+<h3 id="sstable-accounting">SSTable Accounting<a class="headerlink" href="#sstable-accounting" title="Permanent link">&para;</a></h3>
+<p>Alongside <code>generation</code> and <code>path</code>, a shard manifest entry may record what the
+SSTable holds, as the writer's MemTable accounted for it at flush:</p>
+<ul>
+<li><code>in_memory_bytes</code>: payload size of the rows, summed over the MemTable's
+  buffers as the window each one holds.</li>
+<li><code>physical_rows</code>: rows held, counting the older duplicates of a primary key
+  that the generation's deletion vector masks. A scan applying the deletion
+  vector yields fewer.</li>
+<li><code>primary_key_bytes</code>: total payload size of the primary-key columns over every
+  row in <code>physical_rows</code>. Not a per-row size, which varies for a
+  variable-length key.</li>
+</ul>
+<p>All three are estimates of payload, not bounds on what reading the SSTable
+costs: they exclude the per-array structure a reader materializes, and
+<code>primary_key_bytes</code> is not the size of any encoded form of the key. A consumer
+budgeting memory from them adds its own headroom.</p>
+<p>All three are optional. An entry written before they existed records none of
+them, and a reader must not treat an absent value as zero; <code>primary_key_bytes</code>
+is also absent on a table with no primary key.</p>
+<p>The SSTable directory is a standard Lance dataset written with the base table's data storage version.
+Each SSTable is written as one fragment.
+Additional MemWAL sidecars may be present:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>{random8}_gen_{i}/
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>├── _versions/
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>│   └── {version}.manifest
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>├── _deletions/                         # Present when within-SSTable dedup deletes rows
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>├── _indices/                           # Present when maintained user indexes are built
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>│   └── {index_uuid}/
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>├── _pk_index/                          # Primary-key sidecar BTree, not a manifest index
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>└── bloom_filter.bin                    # Primary-key bloom filter
+</span></code></pre></div>
+<p>The exact Lance dataset internals follow the <a href="../layout/">Lance table storage layout</a>.</p>
+<h3 id="sstable-row-order">SSTable Row Order<a class="headerlink" href="#sstable-row-order" title="Permanent link">&para;</a></h3>
+<p>SSTable rows are written in forward insert order.
+Physical row offsets increase with write time.
+For a duplicate primary key within one SSTable, the newest row has the largest physical offset.</p>
+<p>Primary-key SSTables use a deletion vector to expose last-write-wins semantics.
+During flush, the writer scans rows in forward order, keeps the last occurrence of each primary key, and marks all earlier duplicate offsets deleted.
+The deletion vector is attached to fragment 0 in the SSTable's Lance manifest.</p>
+<p>Append-only SSTables without a primary key do not perform primary-key deduplication and retain every row.</p>
+<h3 id="tombstone-rows">Tombstone Rows<a class="headerlink" href="#tombstone-rows" title="Permanent link">&para;</a></h3>
+<p>Delete operations are represented as rows with the internal <code>_tombstone</code> column.
+Tombstone rows follow the same forward row ordering and deletion-vector rules as ordinary rows.
+If the newest row for a primary key is a tombstone, the deletion vector keeps that tombstone row and hides older rows for the key.
+Read planning then filters <code>_tombstone = false</code>, so the key is absent from query results.</p>
+<h3 id="sstable-primary-key-sidecars">SSTable Primary-Key Sidecars<a class="headerlink" href="#sstable-primary-key-sidecars" title="Permanent link">&para;</a></h3>
+<p>Primary-key MemTables maintain an implicit BTree for primary-key deduplication, independent of <code>maintained_indexes</code>.
+When a primary-key MemTable is flushed, the SSTable writes two primary-key sidecars:</p>
+<ul>
+<li><code>bloom_filter.bin</code> stores the SSTable's primary-key bloom filter and lets point lookups skip SSTables that cannot contain the queried key.</li>
+<li><code>_pk_index/</code> stores a standalone BTree over primary-key values to forward row ids.</li>
+</ul>
+<p>The <code>_pk_index/</code> sidecar is not a maintained user index, is not registered in the SSTable's Lance manifest, and has no manifest UUID.
+Its identity is its immutable SSTable path.
+Readers open it directly from <code>{sstable_path}/_pk_index</code>.</p>
+<p>The <code>_pk_index/</code> directory is a Lance scalar BTree index store:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>_pk_index/
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>├── page_data.lance
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>└── page_lookup.lance
+</span></code></pre></div>
+<p>Readers load this directory as a BTree index using <code>BTreeIndexDetails</code> with default parameters.
+The primary-key index type is the Arrow type of the primary-key column for a single-column primary key, or <code>Binary</code> for a composite primary key.</p>
+<p>The <code>page_lookup.lance</code> file has the following schema:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>min</code></td>
+<td>{PrimaryKeyIndexType}</td>
+<td>true</td>
+<td>Minimum primary-key index value in the page</td>
+</tr>
+<tr>
+<td><code>max</code></td>
+<td>{PrimaryKeyIndexType}</td>
+<td>true</td>
+<td>Maximum primary-key index value in the page</td>
+</tr>
+<tr>
+<td><code>null_count</code></td>
+<td>UInt32</td>
+<td>false</td>
+<td>Number of null values in the page</td>
+</tr>
+<tr>
+<td><code>page_idx</code></td>
+<td>UInt32</td>
+<td>false</td>
+<td>Page number pointing into <code>page_data.lance</code></td>
+</tr>
+</tbody>
+</table>
+<p>The <code>page_data.lance</code> file has the following schema:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>values</code></td>
+<td>{PrimaryKeyIndexType}</td>
+<td>true</td>
+<td>Sorted primary-key index values</td>
+</tr>
+<tr>
+<td><code>ids</code></td>
+<td>UInt64</td>
+<td>false</td>
+<td>Forward row ids corresponding to each primary-key index value</td>
+</tr>
+</tbody>
+</table>
+<p>For a single-column primary key, the indexed value stores the primary-key scalar directly.
+For a composite primary key, the indexed value stores an order-preserving binary tuple encoding of all primary-key columns in primary-key column order.
+Each tuple column is encoded as:</p>
+<ul>
+<li><code>0x00</code> for null.</li>
+<li><code>0x01</code> followed by the non-null value encoding otherwise.</li>
+</ul>
+<p>Supported non-null value encodings are:</p>
+<ul>
+<li>Signed integers and date values: sign-flipped 8-byte big-endian integer bytes.</li>
+<li>Unsigned integers: 8-byte big-endian unsigned integer bytes.</li>
+<li>Boolean: one byte, <code>0x00</code> for false and <code>0x01</code> for true.</li>
+<li>UTF-8 and binary values: raw bytes, with each <code>0x00</code> byte escaped as <code>0x00 0xff</code>, followed by a <code>0x00 0x00</code> terminator.</li>
+</ul>
+<p>This encoding is injective and preserves primary-key tuple ordering under lexicographic byte comparison.
+Composite primary-key columns must use one of the supported encodings above.</p>
+<p>The sidecar row ids are in the same forward row-position space as the data files, deletion vector, and maintained user indexes.
+The sidecar is used for cross-generation membership and block-list checks.
+It is not used to choose the newest row inside the same SSTable; the deletion vector has already hidden older same-generation duplicates.</p>
+<h3 id="maintained-user-indexes">Maintained User Indexes<a class="headerlink" href="#maintained-user-indexes" title="Permanent link">&para;</a></h3>
+<p>When the MemWAL index lists <code>maintained_indexes</code>, flush may build matching indexes inside the SSTable.
+These index files live in the SSTable's <code>_indices/{index_uuid}/</code> directory and are recorded in the SSTable's Lance manifest.
+The implicit primary-key BTree sidecar is not included in <code>maintained_indexes</code> and does not live under <code>_indices/</code>.</p>
+<p>These indexes use the same row-position space as the forward-written data files.
+If the SSTable has a primary key, its deletion vector masks stale duplicate rows for indexed reads as well.</p>
+<h3 id="sstable-compaction">SSTable Compaction<a class="headerlink" href="#sstable-compaction" title="Permanent link">&para;</a></h3>
+<p>SSTables are compacted into the base table in ascending generation order within each shard.
+Lower generation numbers are older and must be compacted before higher generation numbers.
+SSTable compaction uses merge-insert semantics so newer rows overwrite older rows for the same primary key.</p>
+<h2 id="shard-manifest">Shard Manifest<a class="headerlink" href="#shard-manifest" title="Permanent link">&para;</a></h2>
+<p>Each shard has a versioned manifest.
+The latest shard manifest is the source of truth for shard-local state.</p>
+<h3 id="shard-manifest-contents">Shard Manifest Contents<a class="headerlink" href="#shard-manifest-contents" title="Permanent link">&para;</a></h3>
+<p>The manifest contains:</p>
+<ul>
+<li><strong>Identity</strong>: <code>shard_id</code>, <code>shard_spec_id</code>, and <code>shard_field_entries</code>.</li>
+<li><strong>Fencing state</strong>: <code>writer_epoch</code>.</li>
+<li><strong>WAL pointers</strong>: <code>replay_after_wal_entry_position</code> and <code>wal_entry_position_last_seen</code>.</li>
+<li><strong>SSTable generation state</strong>: <code>current_generation</code> and <code>sstables</code>.</li>
+<li><strong>Lifecycle state</strong>: <code>status</code>, either <code>ACTIVE</code> or <code>SEALED</code>.</li>
+</ul>
+<p><code>shard_field_entries</code> stores computed shard field values as raw Arrow scalar bytes keyed by <code>ShardingField.field_id</code>.
+The matching <code>ShardingField.result_type</code> determines how to decode each value.
+For example, <code>int32</code> values are four little-endian bytes and <code>utf8</code> values are raw UTF-8 bytes.</p>
+<p><code>replay_after_wal_entry_position</code> is the most recent 1-based WAL position covered by an SSTable.
+The default value 0 means no WAL entry has been covered and recovery starts at position 1.</p>
+<p><code>wal_entry_position_last_seen</code> is a best-effort hint for the most recent WAL position observed at manifest update time.
+It is not authoritative because it is not updated on every WAL write.
+Recovery must still probe or list WAL files to find the actual tail.</p>
+<p><code>current_generation</code> is the generation number to assign to the next SSTable created by flushing the MemTable.
+Each entry in <code>sstables</code> records a published SSTable's <code>generation</code> and <code>path</code>.</p>
+<p><code>status = SEALED</code> marks a reversible in-flight drop-table operation.
+Sealed shards refuse new writer claims.</p>
+<p>The manifest is serialized as the <code>ShardManifest</code> protobuf message.</p>
+<details>
+<summary>ShardManifest protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">ShardManifest</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="c1">// Shard identifier (UUID v4).</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="n">UUID</span><span class="w"> </span><span class="na">shard_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">  </span><span class="cm">/* Manifest version number.</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="cm">   * Matches the version encoded in the filename.</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="cm">   */</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">  </span><span class="cm">/* Shard spec ID this shard was created with.</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="cm">   * Set at shard creation and immutable thereafter.</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="cm">   * A value of 0 indicates a manually-created shard not governed by any spec.</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="cm">   */</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">shard_spec_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="w">  </span><span class="cm">/* Computed shard field values as raw Arrow scalar bytes, keyed by shard</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="cm">   * field id. The byte encoding follows Arrow's little-endian convention:</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="cm">   * int32 is 4 LE bytes, utf8 is raw UTF-8 bytes, etc. The receiver looks</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="cm">   * up the result_type from the ShardingSpec to interpret each value.</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="cm">   */</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">ShardFieldEntry</span><span class="w"> </span><span class="na">shard_field_entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">14</span><span class="p">;</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="w">  </span><span class="cm">/* Writer fencing token - monotonically increasing.</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="cm">   * A writer must increment this when claiming the shard.</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="cm">   */</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">writer_epoch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="w">  </span><span class="cm">/* The most recent WAL entry position that has been flushed to a MemTable.</span>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="cm">   * During recovery, replay starts from replay_after_wal_entry_position + 1.</span>
+</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="cm">   * WAL positions are 1-based, so the default value 0 unambiguously means</span>
+</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="cm">   * "no flush has ever stamped this shard" and recovery replays from 1.</span>
+</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a><span class="cm">   */</span>
+</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">replay_after_wal_entry_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a>
+</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a><span class="w">  </span><span class="cm">/* The most recent WAL entry position observed at the time the manifest was</span>
+</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a><span class="cm">   * updated. WAL positions are 1-based; default 0 means no entry has been</span>
+</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a><span class="cm">   * written yet. This is a hint, not authoritative - recovery must list</span>
+</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a><span class="cm">   * files to find actual state.</span>
+</span><span id="__span-5-39"><a id="__codelineno-5-39" name="__codelineno-5-39" href="#__codelineno-5-39"></a><span class="cm">   */</span>
+</span><span id="__span-5-40"><a id="__codelineno-5-40" name="__codelineno-5-40" href="#__codelineno-5-40"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">wal_entry_position_last_seen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-5-41"><a id="__codelineno-5-41" name="__codelineno-5-41" href="#__codelineno-5-41"></a>
+</span><span id="__span-5-42"><a id="__codelineno-5-42" name="__codelineno-5-42" href="#__codelineno-5-42"></a><span class="w">  </span><span class="c1">// Generation to assign to the next SSTable (incremented after each MemTable flush).</span>
+</span><span id="__span-5-43"><a id="__codelineno-5-43" name="__codelineno-5-43" href="#__codelineno-5-43"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">current_generation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-5-44"><a id="__codelineno-5-44" name="__codelineno-5-44" href="#__codelineno-5-44"></a>
+</span><span id="__span-5-45"><a id="__codelineno-5-45" name="__codelineno-5-45" href="#__codelineno-5-45"></a><span class="w">  </span><span class="cm">/* Field 7 removed: compaction progress lives in</span>
+</span><span id="__span-5-46"><a id="__codelineno-5-46" name="__codelineno-5-46" href="#__codelineno-5-46"></a><span class="cm">   * MemWalIndexDetails.compacted_sstables.</span>
+</span><span id="__span-5-47"><a id="__codelineno-5-47" name="__codelineno-5-47" href="#__codelineno-5-47"></a><span class="cm">   */</span>
+</span><span id="__span-5-48"><a id="__codelineno-5-48" name="__codelineno-5-48" href="#__codelineno-5-48"></a>
+</span><span id="__span-5-49"><a id="__codelineno-5-49" name="__codelineno-5-49" href="#__codelineno-5-49"></a><span class="w">  </span><span class="c1">// List of SSTables created by flushing MemTables and their directory paths.</span>
+</span><span id="__span-5-50"><a id="__codelineno-5-50" name="__codelineno-5-50" href="#__codelineno-5-50"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">SsTable</span><span class="w"> </span><span class="na">sstables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-5-51"><a id="__codelineno-5-51" name="__codelineno-5-51" href="#__codelineno-5-51"></a>
+</span><span id="__span-5-52"><a id="__codelineno-5-52" name="__codelineno-5-52" href="#__codelineno-5-52"></a><span class="w">  </span><span class="cm">/* Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop</span>
+</span><span id="__span-5-53"><a id="__codelineno-5-53" name="__codelineno-5-53" href="#__codelineno-5-53"></a><span class="cm">   * (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.</span>
+</span><span id="__span-5-54"><a id="__codelineno-5-54" name="__codelineno-5-54" href="#__codelineno-5-54"></a><span class="cm">   */</span>
+</span><span id="__span-5-55"><a id="__codelineno-5-55" name="__codelineno-5-55" href="#__codelineno-5-55"></a><span class="w">  </span><span class="n">ShardStatus</span><span class="w"> </span><span class="na">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">15</span><span class="p">;</span>
+</span><span id="__span-5-56"><a id="__codelineno-5-56" name="__codelineno-5-56" href="#__codelineno-5-56"></a>
+</span><span id="__span-5-57"><a id="__codelineno-5-57" name="__codelineno-5-57" href="#__codelineno-5-57"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="shard-manifest-versioning">Shard Manifest Versioning<a class="headerlink" href="#shard-manifest-versioning" title="Permanent link">&para;</a></h3>
+<p>Manifest versions start at 1.
+Each update writes a new immutable protobuf file:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>_mem_wal/{shard_id}/manifest/{bit_reversed_version}.binpb
+</span></code></pre></div>
+<p>Writers use put-if-not-exists or atomic rename, depending on storage support.
+If two processes race to write the same next version, one wins and the other reloads and retries.</p>
+<p>After a successful version write, the writer best-effort updates:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="p">{</span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="err">&lt;</span><span class="kc">ne</span><span class="err">w_versio</span><span class="kc">n</span><span class="err">&gt;</span><span class="p">}</span>
+</span></code></pre></div>
+<p>in:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>_mem_wal/{shard_id}/manifest/version_hint.json
+</span></code></pre></div>
+<p>Readers use <code>version_hint.json</code> as a starting point and then probe subsequent versions until a version is missing.
+The latest manifest is the last existing version.</p>
+<h2 id="memwal-index-details">MemWAL Index Details<a class="headerlink" href="#memwal-index-details" title="Permanent link">&para;</a></h2>
+<p>The MemWAL index is stored inline in the base table's <code>IndexMetadata</code>.
+It is a system index with no file directory.
+The <code>index_details</code> field contains a <code>MemWalIndexDetails</code> protobuf message.</p>
+<p>Important fields:</p>
+<ul>
+<li><code>sharding_specs</code>: sharding configuration used by writers and shard pruning.</li>
+<li><code>maintained_indexes</code>: names of base-table indexes to maintain in MemTables and SSTables.</li>
+<li><code>writer_config_defaults</code>: string map of default writer configuration values persisted for all writers.</li>
+<li><code>compacted_sstables</code>: per-shard compaction progress, updated atomically with base-table compaction commits.</li>
+<li><code>index_catchup</code>: per-index coverage progress after data has been compacted into the base table.</li>
+<li><code>snapshot_ts_millis</code>, <code>num_shards</code>, and <code>inline_snapshots</code>: optional shard snapshot fields for read optimization.</li>
+</ul>
+<p>A shard absent from <code>index_catchup</code> for an index means that index is <em>not</em> known
+to have caught up, so the shard's SSTables must be retained until some commit
+records that it has.</p>
+<p>Catch-up is derived at commit time, not reported by the writer. An index whose segments together span every fragment live at the transaction's read version holds every row compaction had copied into the base table by then, so the commit records it as caught up to that version's <code>compacted_sstables</code>. That is the only proof available — nothing maps a compaction generation to the fragments its rows landed in — so covering the table as the transaction read it is how an index shows it covered those rows. Fragments appended since that read are a later catch-up gap and are not required.</p>
+<p>Two rules bound what a commit may record. It never credits more than its own <code>compacted_sstables</code>, and it clamps to that value, so a position can only describe generations the base table has actually taken in. Otherwise it never lowers a position an index already held, provided that index is unchanged by this commit. "Unchanged" compares each segment's UUID together with its fragment bitmap, not the UUID alone, because an operation can prune the bitmap in place while keeping the UUID; the remaining metadata does not affect which rows the index answers for. An index this commit changes keeps no position it cannot re-earn.</p>
+<p>Because the position is derived rather than transmitted, it cannot go stale between inspection and commit, and it survives rebase — <code>read_version</code> is fixed for a transaction's life, so what a commit can prove does not move, though a rebased attempt may record a different result because the head it commits against has changed. Any commit can earn a position, so an ordinary index build that happens to cover the table records catch-up as a side effect. A dedicated repair is still needed where no such commit occurs, or where an index does not yet span the table.</p>
+<p>A read version with no fragments proves nothing, even though an index trivially covers an empty table. An empty fragment list is also what a manifest written before the <code>UpdateMemWalState</code> fragment fix looks like, where the SSTables are the last copy of those rows; crediting coverage there would retire them. The cost is that a table whose rows have all been deleted keeps its SSTables.</p>
+<p>Shard snapshots, when present, use the following Lance file schema:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Nullable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>shard_id</code></td>
+<td>Utf8</td>
+<td>false</td>
+<td>Shard UUID string</td>
+</tr>
+<tr>
+<td><code>shard_spec_id</code></td>
+<td>UInt32</td>
+<td>false</td>
+<td>Sharding spec that produced the shard</td>
+</tr>
+<tr>
+<td><code>shard_field_{field_id}</code></td>
+<td><code>ShardingField.result_type</code></td>
+<td>false</td>
+<td>Computed shard field value for the given sharding field</td>
+</tr>
+</tbody>
+</table>
+<p>The MemWAL index data is stored inline.
+Readers discover the latest shard set by listing <code>_mem_wal/</code> shard directories and reading shard manifests.</p>
+<details>
+<summary>MemWalIndexDetails protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">MemWalIndexDetails</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="c1">// Snapshot timestamp (Unix timestamp in milliseconds).</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">snapshot_ts_millis</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">  </span><span class="cm">/* Number of shards in the snapshot.</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="cm">   * Used to determine storage format without reading the snapshot data.</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="cm">   */</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_shards</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="w">  </span><span class="cm">/* Inline shard snapshots for small shard counts.</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="cm">   * When num_shards &lt;= threshold (implementation-defined, e.g., 100),</span>
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a><span class="cm">   * snapshots are stored inline as serialized bytes.</span>
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a><span class="cm">   * Format: Lance file bytes with the shard snapshot schema.</span>
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a><span class="cm">   */</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_snapshots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-9-16"><a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a>
+</span><span id="__span-9-17"><a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a><span class="w">  </span><span class="cm">/* Sharding specs defining how to derive shard identifiers.</span>
+</span><span id="__span-9-18"><a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="cm">   * This configuration determines how rows are partitioned into shards.</span>
+</span><span id="__span-9-19"><a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a><span class="cm">   */</span>
+</span><span id="__span-9-20"><a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">ShardingSpec</span><span class="w"> </span><span class="na">sharding_specs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-9-21"><a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a>
+</span><span id="__span-9-22"><a id="__codelineno-9-22" name="__codelineno-9-22" href="#__codelineno-9-22"></a><span class="w">  </span><span class="cm">/* Indexes from the base table to maintain in MemTables.</span>
+</span><span id="__span-9-23"><a id="__codelineno-9-23" name="__codelineno-9-23" href="#__codelineno-9-23"></a><span class="cm">   * These are index names referencing indexes defined on the base table.</span>
+</span><span id="__span-9-24"><a id="__codelineno-9-24" name="__codelineno-9-24" href="#__codelineno-9-24"></a><span class="cm">   * The primary key btree index is always maintained implicitly and</span>
+</span><span id="__span-9-25"><a id="__codelineno-9-25" name="__codelineno-9-25" href="#__codelineno-9-25"></a><span class="cm">   * should not be listed here.</span>
+</span><span id="__span-9-26"><a id="__codelineno-9-26" name="__codelineno-9-26" href="#__codelineno-9-26"></a><span class="cm">   *</span>
+</span><span id="__span-9-27"><a id="__codelineno-9-27" name="__codelineno-9-27" href="#__codelineno-9-27"></a><span class="cm">   * For vector indexes, MemTables inherit quantization parameters (PQ codebook,</span>
+</span><span id="__span-9-28"><a id="__codelineno-9-28" name="__codelineno-9-28" href="#__codelineno-9-28"></a><span class="cm">   * SQ params) from the base table index to ensure distance comparability.</span>
+</span><span id="__span-9-29"><a id="__codelineno-9-29" name="__codelineno-9-29" href="#__codelineno-9-29"></a><span class="cm">   */</span>
+</span><span id="__span-9-30"><a id="__codelineno-9-30" name="__codelineno-9-30" href="#__codelineno-9-30"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">maintained_indexes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-9-31"><a id="__codelineno-9-31" name="__codelineno-9-31" href="#__codelineno-9-31"></a>
+</span><span id="__span-9-32"><a id="__codelineno-9-32" name="__codelineno-9-32" href="#__codelineno-9-32"></a><span class="w">  </span><span class="cm">/* Latest SSTable compacted into the base table for each shard.</span>
+</span><span id="__span-9-33"><a id="__codelineno-9-33" name="__codelineno-9-33" href="#__codelineno-9-33"></a><span class="cm">   * This is updated atomically with merge-insert data commits, enabling</span>
+</span><span id="__span-9-34"><a id="__codelineno-9-34" name="__codelineno-9-34" href="#__codelineno-9-34"></a><span class="cm">   * conflict resolution when multiple compactors operate concurrently.</span>
+</span><span id="__span-9-35"><a id="__codelineno-9-35" name="__codelineno-9-35" href="#__codelineno-9-35"></a><span class="cm">   *</span>
+</span><span id="__span-9-36"><a id="__codelineno-9-36" name="__codelineno-9-36" href="#__codelineno-9-36"></a><span class="cm">   * Note: This is separate from shard snapshots because:</span>
+</span><span id="__span-9-37"><a id="__codelineno-9-37" name="__codelineno-9-37" href="#__codelineno-9-37"></a><span class="cm">   * 1. compacted_sstables is updated by compactors (atomic with data commit)</span>
+</span><span id="__span-9-38"><a id="__codelineno-9-38" name="__codelineno-9-38" href="#__codelineno-9-38"></a><span class="cm">   * 2. shard snapshots are updated by background index builder</span>
+</span><span id="__span-9-39"><a id="__codelineno-9-39" name="__codelineno-9-39" href="#__codelineno-9-39"></a><span class="cm">   */</span>
+</span><span id="__span-9-40"><a id="__codelineno-9-40" name="__codelineno-9-40" href="#__codelineno-9-40"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">CompactedSsTable</span><span class="w"> </span><span class="na">compacted_sstables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-9-41"><a id="__codelineno-9-41" name="__codelineno-9-41" href="#__codelineno-9-41"></a>
+</span><span id="__span-9-42"><a id="__codelineno-9-42" name="__codelineno-9-42" href="#__codelineno-9-42"></a><span class="w">  </span><span class="cm">/* Per-index catchup progress tracking.</span>
+</span><span id="__span-9-43"><a id="__codelineno-9-43" name="__codelineno-9-43" href="#__codelineno-9-43"></a><span class="cm">   * When data is compacted into the base table, base table indexes are rebuilt</span>
+</span><span id="__span-9-44"><a id="__codelineno-9-44" name="__codelineno-9-44" href="#__codelineno-9-44"></a><span class="cm">   * asynchronously. This field tracks which generation each index covers.</span>
+</span><span id="__span-9-45"><a id="__codelineno-9-45" name="__codelineno-9-45" href="#__codelineno-9-45"></a><span class="cm">   *</span>
+</span><span id="__span-9-46"><a id="__codelineno-9-46" name="__codelineno-9-46" href="#__codelineno-9-46"></a><span class="cm">   * For indexed queries, if an index's caught_up_generation &lt; compacted_generation,</span>
+</span><span id="__span-9-47"><a id="__codelineno-9-47" name="__codelineno-9-47" href="#__codelineno-9-47"></a><span class="cm">   * readers should use SSTable indexes for the gap instead of</span>
+</span><span id="__span-9-48"><a id="__codelineno-9-48" name="__codelineno-9-48" href="#__codelineno-9-48"></a><span class="cm">   * scanning unindexed data in the base table.</span>
+</span><span id="__span-9-49"><a id="__codelineno-9-49" name="__codelineno-9-49" href="#__codelineno-9-49"></a><span class="cm">   *</span>
+</span><span id="__span-9-50"><a id="__codelineno-9-50" name="__codelineno-9-50" href="#__codelineno-9-50"></a><span class="cm">   * An index absent from this list has recorded no catch-up, so the SSTables it</span>
+</span><span id="__span-9-51"><a id="__codelineno-9-51" name="__codelineno-9-51" href="#__codelineno-9-51"></a><span class="cm">   * would need stay live until a repair records it. Only the dedicated WAL</span>
+</span><span id="__span-9-52"><a id="__codelineno-9-52" name="__codelineno-9-52" href="#__codelineno-9-52"></a><span class="cm">   * index-repair path may add entries here;</span>
+</span><span id="__span-9-53"><a id="__codelineno-9-53" name="__codelineno-9-53" href="#__codelineno-9-53"></a><span class="cm">   * ordinary index operations have their entry removed automatically when they</span>
+</span><span id="__span-9-54"><a id="__codelineno-9-54" name="__codelineno-9-54" href="#__codelineno-9-54"></a><span class="cm">   * change an index, since they do not report what the new index covers.</span>
+</span><span id="__span-9-55"><a id="__codelineno-9-55" name="__codelineno-9-55" href="#__codelineno-9-55"></a><span class="cm">   */</span>
+</span><span id="__span-9-56"><a id="__codelineno-9-56" name="__codelineno-9-56" href="#__codelineno-9-56"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">IndexCatchupProgress</span><span class="w"> </span><span class="na">index_catchup</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-9-57"><a id="__codelineno-9-57" name="__codelineno-9-57" href="#__codelineno-9-57"></a>
+</span><span id="__span-9-58"><a id="__codelineno-9-58" name="__codelineno-9-58" href="#__codelineno-9-58"></a><span class="w">  </span><span class="cm">/* Default ShardWriter configuration values for this MemWAL index.</span>
+</span><span id="__span-9-59"><a id="__codelineno-9-59" name="__codelineno-9-59" href="#__codelineno-9-59"></a><span class="cm">   *</span>
+</span><span id="__span-9-60"><a id="__codelineno-9-60" name="__codelineno-9-60" href="#__codelineno-9-60"></a><span class="cm">   * A free-form string map persisted so that every writer — across</span>
+</span><span id="__span-9-61"><a id="__codelineno-9-61" name="__codelineno-9-61" href="#__codelineno-9-61"></a><span class="cm">   * processes and restarts — starts from the same default writer</span>
+</span><span id="__span-9-62"><a id="__codelineno-9-62" name="__codelineno-9-62" href="#__codelineno-9-62"></a><span class="cm">   * configuration. These are defaults only: an individual writer may</span>
+</span><span id="__span-9-63"><a id="__codelineno-9-63" name="__codelineno-9-63" href="#__codelineno-9-63"></a><span class="cm">   * still override any value at runtime in its own ShardWriterConfig</span>
+</span><span id="__span-9-64"><a id="__codelineno-9-64" name="__codelineno-9-64" href="#__codelineno-9-64"></a><span class="cm">   * (which is not persisted).</span>
+</span><span id="__span-9-65"><a id="__codelineno-9-65" name="__codelineno-9-65" href="#__codelineno-9-65"></a><span class="cm">   */</span>
+</span><span id="__span-9-66"><a id="__codelineno-9-66" name="__codelineno-9-66" href="#__codelineno-9-66"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">writer_config_defaults</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-9-67"><a id="__codelineno-9-67" name="__codelineno-9-67" href="#__codelineno-9-67"></a>
+</span><span id="__span-9-68"><a id="__codelineno-9-68" name="__codelineno-9-68" href="#__codelineno-9-68"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h2 id="sharding">Sharding<a class="headerlink" href="#sharding" title="Permanent link">&para;</a></h2>
+<p>A <strong>ShardingSpec</strong> defines how rows map to shards.
+Each spec has a positive <code>spec_id</code> and one or more <code>ShardingField</code> entries.
+Each shard manifest records the <code>shard_spec_id</code> and the computed shard field values for that shard.
+<code>spec_id = 0</code> means the shard was manually created and is not governed by a sharding spec.</p>
+<p>Each <code>ShardingField</code> contains:</p>
+<ul>
+<li><code>field_id</code>: stable identifier for the computed shard field.</li>
+<li><code>source_ids</code>: field IDs of source columns in the Lance schema.</li>
+<li><code>transform</code>: well-known transform name, when using built-in transform evaluation.</li>
+<li><code>expression</code>: reserved custom expression text, mutually exclusive with <code>transform</code>.</li>
+<li><code>result_type</code>: Arrow type name for the computed value.</li>
+<li><code>parameters</code>: transform-specific string parameters.</li>
+</ul>
+<p>The supported built-in transforms are:</p>
+<ul>
+<li><code>unsharded</code>: takes no source columns, always returns <code>int32</code> value 0, and creates one shard.</li>
+<li><code>bucket</code>: takes one source column and <code>num_buckets</code>, hashes the value, and returns an <code>int32</code> bucket id in <code>[0, num_buckets)</code>.</li>
+<li><code>identity</code>: takes one source column and returns the raw scalar value as the shard value.</li>
+</ul>
+<p><code>bucket</code> computes a deterministic 32-bit hash with seed 0 and then computes:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>(hash &amp; i32::MAX) % num_buckets
+</span></code></pre></div>
+<p><code>num_buckets</code> must be in <code>[1, 1024]</code>.
+Null bucket values hash to 0 and therefore map to bucket 0.
+See <a href="#appendix-3-bucket-hashing">Appendix 3: Bucket Hashing</a> for the exact hash algorithm and test vectors.</p>
+<p>The <code>bucket</code> transform supports scalar boolean, integer, floating-point, date32, time, timestamp, utf8, and large_utf8 source types.
+The <code>identity</code> transform supports scalar boolean, integer, utf8, and large_utf8 source types.</p>
+<p>The <code>year</code>, <code>month</code>, <code>day</code>, <code>hour</code>, <code>multi_bucket</code>, and <code>truncate</code> transform names are not supported MemWAL sharding transforms and must not be used in <code>ShardingSpec.transform</code>.</p>
+<h2 id="storage-layout">Storage Layout<a class="headerlink" href="#storage-layout" title="Permanent link">&para;</a></h2>
+<p>The MemWAL storage layout is:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>{table_path}/
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>├── _versions/
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>│   └── ...                              # Base table manifests, including __lance_mem_wal index metadata
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>├── _indices/
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>│   └── ...                              # Ordinary base table index files; MemWAL index has no files
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>└── _mem_wal/
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>    └── {shard_id}/
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>        ├── manifest/
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>        │   ├── {bit_reversed_version}.binpb
+</span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>        │   └── version_hint.json
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>        ├── wal/
+</span><span id="__span-11-12"><a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>        │   ├── {bit_reversed_position}.arrow
+</span><span id="__span-11-13"><a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a>        │   └── ...
+</span><span id="__span-11-14"><a id="__codelineno-11-14" name="__codelineno-11-14" href="#__codelineno-11-14"></a>        └── {random8}_gen_{generation}/
+</span><span id="__span-11-15"><a id="__codelineno-11-15" name="__codelineno-11-15" href="#__codelineno-11-15"></a>            ├── _versions/
+</span><span id="__span-11-16"><a id="__codelineno-11-16" name="__codelineno-11-16" href="#__codelineno-11-16"></a>            │   └── {version}.manifest
+</span><span id="__span-11-17"><a id="__codelineno-11-17" name="__codelineno-11-17" href="#__codelineno-11-17"></a>            ├── _deletions/
+</span><span id="__span-11-18"><a id="__codelineno-11-18" name="__codelineno-11-18" href="#__codelineno-11-18"></a>            ├── _indices/
+</span><span id="__span-11-19"><a id="__codelineno-11-19" name="__codelineno-11-19" href="#__codelineno-11-19"></a>            │   └── {index_uuid}/
+</span><span id="__span-11-20"><a id="__codelineno-11-20" name="__codelineno-11-20" href="#__codelineno-11-20"></a>            ├── _pk_index/
+</span><span id="__span-11-21"><a id="__codelineno-11-21" name="__codelineno-11-21" href="#__codelineno-11-21"></a>            └── bloom_filter.bin
+</span></code></pre></div>
+<p>Some SSTable subdirectories are conditional.
+For example, <code>_deletions/</code> is present only when the SSTable's Lance manifest references a deletion vector, <code>_indices/</code> is present only when maintained user indexes are built, and <code>_pk_index/</code> plus <code>bloom_filter.bin</code> are meaningful for primary-key tables.</p>
+<h2 id="implementation-expectation">Implementation Expectation<a class="headerlink" href="#implementation-expectation" title="Permanent link">&para;</a></h2>
+<p>This document specifies the storage layout and observable reader and writer invariants.
+Implementations may choose different in-memory structures, buffering policies, background scheduling, and query execution plans.</p>
+<p>An implementation is compatible when it:</p>
+<ol>
+<li>Writes WAL entries, shard manifests, SSTables, and MemWAL index metadata using the documented layout.</li>
+<li>Preserves WAL position, writer fencing, and manifest versioning invariants.</li>
+<li>Exposes last-write-wins semantics for primary-key tables.</li>
+<li>Preserves append-only semantics for tables without primary keys.</li>
+<li>Maintains generation ordering when compacting SSTables into the base table.</li>
+</ol>
+<h2 id="writer-expectations">Writer Expectations<a class="headerlink" href="#writer-expectations" title="Permanent link">&para;</a></h2>
+<p>A writer operates on one shard and is responsible for:</p>
+<ol>
+<li>Claiming the shard with epoch-based fencing.</li>
+<li>Appending WAL entries in sequential 1-based positions.</li>
+<li>Maintaining in-memory MemTable state.</li>
+<li>Flushing MemTables to SSTable Lance datasets.</li>
+<li>Updating the shard manifest after an SSTable is durably written.</li>
+</ol>
+<h3 id="writer-fencing">Writer Fencing<a class="headerlink" href="#writer-fencing" title="Permanent link">&para;</a></h3>
+<p>Writers use <code>writer_epoch</code> to enforce single-writer semantics per shard.</p>
+<p>To claim a shard:</p>
+<ol>
+<li>Load the latest shard manifest.</li>
+<li>Verify the shard is <code>ACTIVE</code>.</li>
+<li>Increment <code>writer_epoch</code>.</li>
+<li>Atomically write a new manifest version.</li>
+<li>If the manifest write loses a race, reload and retry.</li>
+</ol>
+<p>Before a manifest update, a writer verifies its local epoch is still current:</p>
+<ul>
+<li>If <code>local_writer_epoch == stored_writer_epoch</code>, the writer may proceed.</li>
+<li>If <code>local_writer_epoch &lt; stored_writer_epoch</code>, the writer has been fenced and must abort.</li>
+</ul>
+<p>WAL append conflicts also detect fencing.
+If an older writer collides with a newer writer's WAL entry at the same position, it reloads the manifest and observes the higher epoch.
+Fence sentinel entries make this collision path explicit without storing data batches.</p>
+<h2 id="background-job-expectations">Background Job Expectations<a class="headerlink" href="#background-job-expectations" title="Permanent link">&para;</a></h2>
+<p>Background jobs compact SSTables into the base table and remove obsolete shard data.</p>
+<h3 id="sstable-compactor">SSTable Compactor<a class="headerlink" href="#sstable-compactor" title="Permanent link">&para;</a></h3>
+<p>SSTables must be compacted into the base table in ascending generation order within each shard.
+The compaction uses Lance merge-insert semantics and updates <code>compacted_sstables[shard_id]</code> atomically with the base-table commit.</p>
+<p>On commit conflict, a compactor reloads the conflicting base-table version:</p>
+<ul>
+<li>If the committed <code>compacted_sstables[shard_id]</code> is already greater than or equal to the generation being compacted, the compactor skips that generation.</li>
+<li>Otherwise, the compactor retries from the latest base-table version.</li>
+</ul>
+<h3 id="garbage-collector">Garbage Collector<a class="headerlink" href="#garbage-collector" title="Permanent link">&para;</a></h3>
+<p>The garbage collector may remove obsolete SSTables after:</p>
+<ol>
+<li>The SSTable has been compacted into the base table.</li>
+<li>Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. An index absent from <code>index_catchup</code> has <em>not</em> caught up, so this condition is not met for it.</li>
+<li>No retained base-table version needs the SSTable for time travel or consistency.</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Deleting WAL files can weaken writer fencing.</p>
+<p>Fencing detects a stalled writer when its put-if-not-exists for the next WAL entry collides with a newer writer's entry at the same position.
+If garbage collection has removed that WAL file, the stalled writer may write into empty space with an old <code>writer_epoch</code>.
+Implementations that garbage collect WAL files must compensate by re-checking fence state after WAL writes, partitioning WAL positions by epoch, or otherwise preventing stale writers from landing at positions that have been garbage collected.</p>
+</div>
+<h2 id="reader-expectations">Reader Expectations<a class="headerlink" href="#reader-expectations" title="Permanent link">&para;</a></h2>
+<h3 id="lsm-tree-merging-read">LSM Tree Merging Read<a class="headerlink" href="#lsm-tree-merging-read" title="Permanent link">&para;</a></h3>
+<p>For primary-key tables, readers merge rows from the base table, SSTables, and optionally in-memory MemTables by primary key.
+The newest row wins.</p>
+<p>Freshness ordering within one shard is:</p>
+<ol>
+<li>The active MemTable wins over every SSTable and the base table.</li>
+<li>Among SSTables, higher generation wins.</li>
+<li>Any uncompacted SSTable wins over the base table.</li>
+<li>Within the active MemTable, higher row position wins.</li>
+<li>Within an SSTable, its deletion vector has already hidden older duplicate primary-key rows.</li>
+</ol>
+<p>For freshness comparisons, the base table uses the sentinel generation 0.
+SSTable generations are positive.
+This ordering applies only to sources selected for the same read plan.
+Readers must not include an SSTable that is already covered by the base table according to <code>compacted_sstables[shard_id]</code>, because otherwise the positive SSTable generation would incorrectly outrank base-table rows during deduplication.
+Rows from different shards do not need primary-key deduplication if the sharding spec guarantees that each primary key maps to exactly one shard.</p>
+<p>Append-only tables without a primary key do not perform primary-key deduplication.
+Rows from all selected sources are distinct appended rows.</p>
+<h3 id="tombstones">Tombstones<a class="headerlink" href="#tombstones" title="Permanent link">&para;</a></h3>
+<p>Readers must treat <code>_tombstone = true</code> rows as delete markers.
+In SSTables, deletion vectors first resolve same-generation duplicate primary keys.
+Then query planning filters tombstone rows from user-visible results.
+In active in-memory MemTables, the newest visible row position for a primary key wins; if that row is a tombstone, the key is absent.</p>
+<h3 id="reader-consistency">Reader Consistency<a class="headerlink" href="#reader-consistency" title="Permanent link">&para;</a></h3>
+<p>Reader consistency depends on:</p>
+<ol>
+<li>Whether the reader can access active in-memory MemTables.</li>
+<li>Whether shard metadata comes from latest shard manifests or from an older MemWAL index snapshot.</li>
+</ol>
+<p>Strong consistency requires active in-memory MemTable access for relevant shards and direct reads of latest shard manifests.
+Otherwise, reads are eventually consistent because unflushed data or newly-created shards may be absent from the read plan.</p>
+<p>Reading a stale MemWAL index snapshot does not corrupt last-write-wins ordering, but it can reduce freshness:</p>
+<ul>
+<li>If a compacted SSTable is still listed, readers must skip it when <code>generation &lt;= compacted_sstables[shard_id]</code>.
+    For primary-key tables, including it would let an older SSTable row outrank newer base-table contents because SSTable generations are positive and the base table is modeled as generation 0.
+    For append-only tables, including it would return the same append twice.</li>
+<li>If a garbage-collected SSTable is still listed, readers may skip it after failing to open it because its data must already be in the base table or be filtered out by <code>compacted_sstables</code>.</li>
+<li>If a new SSTable is not listed, the read is consistent with the older snapshot but may miss fresher data.</li>
+</ul>
+<p>Readers that require latest shard membership should list <code>_mem_wal/</code> and read shard manifests instead of relying only on snapshots.</p>
+<h3 id="query-planning">Query Planning<a class="headerlink" href="#query-planning" title="Permanent link">&para;</a></h3>
+<p>A query planner collects sources from:</p>
+<ol>
+<li>The base table.</li>
+<li>SSTables that are not yet safely replaceable by base-table indexed reads.</li>
+<li>Active in-memory MemTables, when available and required by the requested consistency level.</li>
+</ol>
+<p>Each source is tagged with its shard and freshness tier.
+SSTable sources are also tagged with their generation.
+For primary-key reads, the planner applies LSM deduplication across selected sources.
+For append-only reads, the planner concatenates selected sources without primary-key deduplication.</p>
+<p>Bloom filters and <code>_pk_index/</code> sidecars help prune SSTables during point lookups and cross-generation deduplication.</p>
+<h3 id="shard-pruning">Shard Pruning<a class="headerlink" href="#shard-pruning" title="Permanent link">&para;</a></h3>
+<p>When sharding specs are available, the planner evaluates query predicates against shard fields and skips shards whose computed shard values cannot match.</p>
+<p>For example, with <code>bucket(user_id, 10)</code> and predicate <code>user_id = 123</code>:</p>
+<ol>
+<li>Compute the bucket id for <code>123</code>.</li>
+<li>Scan only shards whose manifest has the same computed bucket value.</li>
+<li>Skip all other bucket shards.</li>
+</ol>
+<h3 id="indexed-read-plan">Indexed Read Plan<a class="headerlink" href="#indexed-read-plan" title="Permanent link">&para;</a></h3>
+<p>When data is compacted from an SSTable into the base table, base-table indexes may lag behind the data commit.
+<code>index_catchup</code> records which compacted generation each base-table index covers.</p>
+<p>If an indexed query needs index <code>I</code> and <code>I</code> has only caught up to generation <code>G</code> while <code>compacted_sstables[shard_id]</code> is higher, the planner should read the gap from SSTable indexes instead of scanning unindexed base-table rows.
+Once index <code>I</code> catches up, the planner can use the base-table index for those compacted rows.</p>
+<h2 id="appendices">Appendices<a class="headerlink" href="#appendices" title="Permanent link">&para;</a></h2>
+<h3 id="appendix-1-writer-fencing-example">Appendix 1: Writer Fencing Example<a class="headerlink" href="#appendix-1-writer-fencing-example" title="Permanent link">&para;</a></h3>
+<p>Initial shard manifest:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>version: 1
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>writer_epoch: 5
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>replay_after_wal_entry_position: 10
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>wal_entry_position_last_seen: 12
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>status: ACTIVE
+</span></code></pre></div>
+<p>Writer A loads version 1, claims epoch 6, and writes manifest version 2.
+It appends WAL entries 13, 14, and 15 with <code>writer_epoch = 6</code>.</p>
+<p>Writer B then loads version 2, claims epoch 7, and writes manifest version 3.
+It appends WAL entries 16 and 17 with <code>writer_epoch = 7</code>.</p>
+<p>When Writer A later tries to flush or update the shard manifest, it reloads the manifest and sees stored epoch 7 while its local epoch is 6.
+Writer A is fenced and must abort.</p>
+<p>Recovery starts from <code>replay_after_wal_entry_position + 1</code>, which is entry 11.
+Entries 13, 14, 15, 16, and 17 are valid replay inputs because they were written by epochs that were valid at write time and are not greater than the current shard epoch.</p>
+<h3 id="appendix-2-concurrent-compactor-example">Appendix 2: Concurrent Compactor Example<a class="headerlink" href="#appendix-2-concurrent-compactor-example" title="Permanent link">&para;</a></h3>
+<p>Initial state:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>MemWAL index:
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>  compacted_sstables: {shard: 5}
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>Shard manifest:
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>  current_generation: 8
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>  sstables:
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>    - generation: 6, path: "abc12345_gen_6"
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>    - generation: 7, path: "def67890_gen_7"
+</span></code></pre></div>
+<p>Two compactors both try to compact the SSTable at generation 6.
+Compactor A commits first and updates <code>compacted_sstables[shard]</code> to 6 in the same base-table commit as the data.
+Compactor B then hits a commit conflict, reloads the latest MemWAL index, sees <code>compacted_sstables[shard] &gt;= 6</code>, skips generation 6, and continues with generation 7.</p>
+<p>The MemWAL index is the authoritative compaction-progress record because it is committed atomically with the base-table data changes.</p>
+<h3 id="appendix-3-bucket-hashing">Appendix 3: Bucket Hashing<a class="headerlink" href="#appendix-3-bucket-hashing" title="Permanent link">&para;</a></h3>
+<p>The bucket transform hash uses 32-bit wrapping arithmetic with these mixing functions.
+Right shifts in <code>fmix</code> are logical shifts of the <code>u32</code> bit pattern.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>mix_k1(k) = rotl32(k * 0xcc9e2d51, 15) * 0x1b873593
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>mix_h1(h, k) = rotl32(h ^ k, 13) * 5 + 0xe6546b64
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>fmix(h, len) =
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>    h = h ^ len
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>    h = (h ^ (h &gt;&gt; 16)) * 0x85ebca6b
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>    h = (h ^ (h &gt;&gt; 13)) * 0xc2b2ae35
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a>    h ^ (h &gt;&gt; 16)
+</span></code></pre></div>
+<p>Signed and unsigned casts use two's-complement wrapping.
+Values are normalized and hashed as follows:</p>
+<ul>
+<li><code>bool</code>: <code>false</code> as <code>0</code>, <code>true</code> as <code>1</code>, then <code>hash_i32</code>.</li>
+<li><code>int8</code>, <code>int16</code>, <code>int32</code>, <code>uint8</code>, <code>uint16</code>, <code>uint32</code>, <code>date32</code>, <code>time32</code>: cast to <code>i32</code>, then <code>hash_i32</code>.</li>
+<li><code>int64</code>, <code>uint64</code>, <code>timestamp</code>, <code>time64</code>: cast to <code>i64</code>, then <code>hash_i64</code>.</li>
+<li><code>float32</code>: <code>-0.0</code> and <code>+0.0</code> normalize to bits <code>0</code>; all NaNs normalize to <code>0x7fc00000</code>; other values use IEEE 754 bits cast to <code>i32</code>, then <code>hash_i32</code>.</li>
+<li><code>float64</code>: <code>-0.0</code> and <code>+0.0</code> normalize to bits <code>0</code>; all NaNs normalize to <code>0x7ff8000000000000</code>; other values use IEEE 754 bits cast to <code>i64</code>, then <code>hash_i64</code>.</li>
+<li><code>utf8</code> and <code>large_utf8</code>: hash the UTF-8 bytes with <code>hash_bytes</code>.</li>
+</ul>
+<p>The helper hashes are:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>hash_i32(v) = fmix(mix_h1(0, mix_k1(v)), 4)
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>hash_i64(v) =
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>    low = low 32 bits of v as i32
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>    high = high 32 bits of v as i32
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>    fmix(mix_h1(mix_h1(0, mix_k1(low)), mix_k1(high)), 8)
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a>hash_bytes(bytes) =
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a>    h = 0
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>    for each complete 4-byte little-endian chunk:
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>        h = mix_h1(h, mix_k1(chunk_as_i32))
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a>    for each remaining byte:
+</span><span id="__span-15-13"><a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a>        h = mix_h1(h, mix_k1(sign_extend_i8(byte)))
+</span><span id="__span-15-14"><a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a>    fmix(h, byte_length)
+</span></code></pre></div>
+<p>Test vectors for <code>num_buckets = 8</code>:</p>
+<ul>
+<li><code>int32</code> or <code>date32</code>: <code>1 -&gt; 2</code>, <code>2 -&gt; 7</code>, <code>null -&gt; 0</code>, <code>3 -&gt; 1</code>.</li>
+<li><code>utf8</code>: <code>"a" -&gt; 1</code>, <code>"b" -&gt; 5</code>, <code>null -&gt; 0</code>.</li>
+<li><code>bool</code>: <code>true -&gt; 2</code>.</li>
+<li><code>float32</code>: <code>1.25 -&gt; 0</code>.</li>
+<li><code>float64</code>: <code>1.25 -&gt; 0</code>.</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../data_overlay_file/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Data Overlay Files</div>
+        </a>
+        <a class="next" href="../../index/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Overview</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overall-architecture">Overall Architecture</a>
+      <a class="ld-toc__h3" href="#memwal-shard">MemWAL Shard</a>
+      <a class="ld-toc__h3" href="#memwal-index">MemWAL Index</a>
+      <a class="ld-toc__h2" href="#shard-architecture">Shard Architecture</a>
+      <a class="ld-toc__h3" href="#memtable">MemTable</a>
+      <a class="ld-toc__h3" href="#sstable-generation">SSTable Generation</a>
+      <a class="ld-toc__h2" href="#wal">WAL</a>
+      <a class="ld-toc__h3" href="#wal-entry-positions">WAL Entry Positions</a>
+      <a class="ld-toc__h3" href="#wal-entry-format">WAL Entry Format</a>
+      <a class="ld-toc__h3" href="#wal-storage-layout">WAL Storage Layout</a>
+      <a class="ld-toc__h2" href="#sstable">SSTable</a>
+      <a class="ld-toc__h3" href="#sstable-storage-layout">SSTable Storage Layout</a>
+      <a class="ld-toc__h3" href="#sstable-accounting">SSTable Accounting</a>
+      <a class="ld-toc__h3" href="#sstable-row-order">SSTable Row Order</a>
+      <a class="ld-toc__h3" href="#tombstone-rows">Tombstone Rows</a>
+      <a class="ld-toc__h3" href="#sstable-primary-key-sidecars">SSTable Primary-Key Sidecars</a>
+      <a class="ld-toc__h3" href="#maintained-user-indexes">Maintained User Indexes</a>
+      <a class="ld-toc__h3" href="#sstable-compaction">SSTable Compaction</a>
+      <a class="ld-toc__h2" href="#shard-manifest">Shard Manifest</a>
+      <a class="ld-toc__h3" href="#shard-manifest-contents">Shard Manifest Contents</a>
+      <a class="ld-toc__h3" href="#shard-manifest-versioning">Shard Manifest Versioning</a>
+      <a class="ld-toc__h2" href="#memwal-index-details">MemWAL Index Details</a>
+      <a class="ld-toc__h2" href="#sharding">Sharding</a>
+      <a class="ld-toc__h2" href="#storage-layout">Storage Layout</a>
+      <a class="ld-toc__h2" href="#implementation-expectation">Implementation Expectation</a>
+      <a class="ld-toc__h2" href="#writer-expectations">Writer Expectations</a>
+      <a class="ld-toc__h3" href="#writer-fencing">Writer Fencing</a>
+      <a class="ld-toc__h2" href="#background-job-expectations">Background Job Expectations</a>
+      <a class="ld-toc__h3" href="#sstable-compactor">SSTable Compactor</a>
+      <a class="ld-toc__h3" href="#garbage-collector">Garbage Collector</a>
+      <a class="ld-toc__h2" href="#reader-expectations">Reader Expectations</a>
+      <a class="ld-toc__h3" href="#lsm-tree-merging-read">LSM Tree Merging Read</a>
+      <a class="ld-toc__h3" href="#tombstones">Tombstones</a>
+      <a class="ld-toc__h3" href="#reader-consistency">Reader Consistency</a>
+      <a class="ld-toc__h3" href="#query-planning">Query Planning</a>
+      <a class="ld-toc__h3" href="#shard-pruning">Shard Pruning</a>
+      <a class="ld-toc__h3" href="#indexed-read-plan">Indexed Read Plan</a>
+      <a class="ld-toc__h2" href="#appendices">Appendices</a>
+      <a class="ld-toc__h3" href="#appendix-1-writer-fencing-example">Appendix 1: Writer Fencing Example</a>
+      <a class="ld-toc__h3" href="#appendix-2-concurrent-compactor-example">Appendix 2: Concurrent Compactor Example</a>
+      <a class="ld-toc__h3" href="#appendix-3-bucket-hashing">Appendix 3: Bucket Hashing</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

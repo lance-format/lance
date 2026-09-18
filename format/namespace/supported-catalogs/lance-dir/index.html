@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Lance Directory Catalog — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/namespace/supported-catalogs/lance-dir/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../../index/scalar/btree/">BTree</a>
+    <a href="../../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../../index/scalar/label_list/">Label List</a>
+    <a href="../../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../../index/scalar/ngram/">N-gram</a>
+    <a href="../../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../">Overview</a>
+    <a href="../../object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../operations/">Overview</a>
+    <a href="../../operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../operations/models/">Operation Models</a>
+    <a href="../../operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../operations/models/Identity/">Identity</a>
+    <a href="../../operations/models/IndexContent/">IndexContent</a>
+    <a href="../../operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../operations/models/PartitionField/">PartitionField</a>
+    <a href="../../operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../operations/models/TableVersion/">TableVersion</a>
+    <a href="../../operations/models/TagContents/">TagContents</a>
+    <a href="../../operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../">Overview</a>
+    <a class="active" href="./">Lance Directory Catalog</a>
+    <a href="../lance-rest/">Lance REST Catalog</a>
+    <a href="../gravitino/">Apache Gravitino</a>
+    <a href="../hive2/">Apache Hive MetaStore V2</a>
+    <a href="../hive3/">Apache Hive MetaStore V3</a>
+    <a href="../iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../polaris/">Apache Polaris</a>
+    <a href="../glue/">AWS Glue</a>
+    <a href="../biglake/">Google BigLake</a>
+    <a href="../dataproc/">Google Dataproc</a>
+    <a href="../onelake/">Microsoft OneLake</a>
+    <a href="../unity/">Unity Catalog</a>
+    <a href="../template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Namespace Client Spec</span>
+        <span>/</span><span>Supported Catalogs</span>
+        <span>/</span><b>Lance Directory Catalog</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-directory-catalog">Lance Directory Catalog<a class="headerlink" href="#lance-directory-catalog" title="Permanent link">&para;</a></h1>
+<p>This document describes how the Lance Directory Catalog implements the Lance Namespace Client operations.</p>
+<h2 id="background">Background<a class="headerlink" href="#background" title="Permanent link">&para;</a></h2>
+<p>The Lance Directory Catalog is a storage-native catalog that stores tables in a directory structure on any local or remote storage system. For details on the catalog design including V1 (directory listing), V2 (manifest), and compatibility mode, see the <a href="../../../catalog/dir/">Lance Directory Catalog</a> specification.</p>
+<h2 id="implementation-configuration-properties">Implementation Configuration Properties<a class="headerlink" href="#implementation-configuration-properties" title="Permanent link">&para;</a></h2>
+<p>The Lance Directory Catalog implementation accepts the following configuration properties:</p>
+<p>The <strong>root</strong> property is required and specifies the root directory of the catalog where tables are stored. This can be a local path like <code>/my/dir</code> or a cloud storage URI like <code>s3://bucket/prefix</code>.</p>
+<p>The <strong>manifest_enabled</strong> property controls whether the manifest table is used for tracking tables and namespaces (V2). Defaults to <code>true</code>.</p>
+<p>The <strong>dir_listing_enabled</strong> property controls whether directory scanning is used for table discovery (V1). Defaults to <code>true</code>.</p>
+<p>By default, both properties are enabled, which means the implementation operates in <a href="../../../catalog/dir/#compatibility-mode">Compatibility Mode</a>.</p>
+<p>Properties with the <strong>storage.</strong> prefix are passed directly to the underlying Lance ObjectStore after removing the prefix. For example, <code>storage.region</code> becomes <code>region</code> when passed to the storage layer.</p>
+<h2 id="object-mapping">Object Mapping<a class="headerlink" href="#object-mapping" title="Permanent link">&para;</a></h2>
+<h3 id="namespace">Namespace<a class="headerlink" href="#namespace" title="Permanent link">&para;</a></h3>
+<p>The <strong>root namespace</strong> is the root directory specified by the <code>root</code> configuration property. This is the base path where all tables are stored.</p>
+<p>A <strong>child namespace</strong> is a logical container tracked in the manifest table. Child namespaces are only supported in V2; V1 treats the root directory as a flat namespace containing only tables. Child namespaces do not correspond to physical subdirectories.</p>
+<p>The <strong>namespace identifier</strong> is a list of strings representing the namespace path. For example, a namespace <code>["prod", "analytics"]</code> is serialized to <code>prod$analytics</code> when stored in the manifest table's <code>object_id</code> column.</p>
+<p><strong>Namespace properties</strong> are stored as JSON in the <code>metadata</code> column of the manifest table. This is only available in V2.</p>
+<h3 id="table">Table<a class="headerlink" href="#table" title="Permanent link">&para;</a></h3>
+<p>A <strong>table</strong> is a subdirectory containing Lance table data. The directory must contain valid Lance format files including the <code>_versions/</code> directory with version manifests.</p>
+<p>The <strong>table identifier</strong> is a list of strings representing the namespace path followed by the table name. For example, a table <code>["prod", "analytics", "users"]</code> represents a table named <code>users</code> in namespace <code>["prod", "analytics"]</code>. This is serialized to <code>prod$analytics$users</code> when stored in the manifest table's <code>object_id</code> column.</p>
+<p>The <strong>table location</strong> depends on the mode and namespace level:</p>
+<ul>
+<li>In V1 (root namespace only), tables are stored as <code>&lt;table_name&gt;.lance</code> directories</li>
+<li>In V2 with <code>dir_listing_enabled=true</code> and an empty namespace (root level), tables use the <code>&lt;table_name&gt;.lance</code> naming convention for backward compatibility</li>
+<li>In V2 for child namespaces, or when <code>dir_listing_enabled=false</code>, tables are stored as <code>&lt;hash&gt;_&lt;object_id&gt;</code> directories where hash provides entropy for object store throughput</li>
+</ul>
+<p><strong>Table properties</strong> are stored in Lance table metadata and can be accessed via the Lance SDK.</p>
+<h2 id="lance-table-identification">Lance Table Identification<a class="headerlink" href="#lance-table-identification" title="Permanent link">&para;</a></h2>
+<p>In a Directory Catalog, a Lance table is identified differently depending on the mode:</p>
+<p>In <strong>V1</strong>, a Lance table is any directory with the <code>.lance</code> suffix (e.g., <code>users.lance/</code>). The directory must contain valid Lance table data to be usable. Only single-level table identifiers (e.g., <code>["users"]</code>) are supported in this mode.</p>
+<p>In <strong>V2</strong>, a Lance table is identified by a row in the manifest table with <code>object_type="table"</code>. The row's <code>location</code> field points to the Lance table directory. Multi-level table identifiers (e.g., <code>["prod", "analytics", "users"]</code>) are supported.</p>
+<p>A valid Lance table directory must be non-empty.</p>
+<h2 id="basic-operations">Basic Operations<a class="headerlink" href="#basic-operations" title="Permanent link">&para;</a></h2>
+<h3 id="createnamespace">CreateNamespace<a class="headerlink" href="#createnamespace" title="Permanent link">&para;</a></h3>
+<p>This operation is only supported in V2. V1 does not support explicit namespace creation since it uses a flat directory structure.</p>
+<p>The implementation creates a new namespace using a merge-insert operation on the manifest table:</p>
+<ol>
+<li>Validate the parent namespace exists (if not creating at root level)</li>
+<li>Merge-insert a new row into the manifest table with:<ul>
+<li><code>object_id</code> set to the namespace identifier (e.g., <code>prod$analytics</code>)</li>
+<li><code>object_type</code> set to <code>"namespace"</code></li>
+<li><code>metadata</code> containing the namespace properties as JSON</li>
+<li><code>created_at</code> set to the current timestamp</li>
+</ul>
+</li>
+</ol>
+<p>Primary-key deduplication on <code>object_id</code> ensures no duplicate rows are inserted. If a namespace with the same identifier already exists, the operation fails.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If a namespace with the same identifier already exists, return error code <code>2</code> (NamespaceAlreadyExists).</p>
+<p>If the parent namespace does not exist (for nested namespaces), return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the identifier format is invalid, return error code <code>13</code> (InvalidInput).</p>
+<h3 id="listnamespaces">ListNamespaces<a class="headerlink" href="#listnamespaces" title="Permanent link">&para;</a></h3>
+<p>This operation lists child namespaces within a parent namespace.</p>
+<p>In <strong>V1</strong>, this operation returns an empty list since namespaces are not supported.</p>
+<p>In <strong>V2</strong>, the implementation queries the manifest table:</p>
+<ol>
+<li>Query for rows where <code>object_type = "namespace"</code></li>
+<li>Filter to rows where <code>object_id</code> starts with the parent namespace prefix</li>
+<li>Further filter to rows where <code>object_id</code> has exactly one more level than the parent</li>
+<li>Return the list of namespace names (the last component of each identifier)</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist (V2 only), return error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="describenamespace">DescribeNamespace<a class="headerlink" href="#describenamespace" title="Permanent link">&para;</a></h3>
+<p>This operation is only supported in V2 and returns namespace metadata.</p>
+<p>The implementation:</p>
+<ol>
+<li>Query the manifest table for the row with the matching <code>object_id</code></li>
+<li>Parse the <code>metadata</code> column as JSON</li>
+<li>Return the namespace name and properties</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="dropnamespace">DropNamespace<a class="headerlink" href="#dropnamespace" title="Permanent link">&para;</a></h3>
+<p>This operation is only supported in V2 and removes a namespace.</p>
+<p>The implementation:</p>
+<ol>
+<li>Check that the namespace exists in the manifest table</li>
+<li>Query for any child namespaces or tables with identifiers starting with this namespace's prefix</li>
+<li>If any children exist, the operation fails</li>
+<li>Delete the namespace row from the manifest table using the <code>object_id</code> primary key</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the namespace contains tables or child namespaces, return error code <code>3</code> (NamespaceNotEmpty).</p>
+<h3 id="declaretable">DeclareTable<a class="headerlink" href="#declaretable" title="Permanent link">&para;</a></h3>
+<p>This operation declares a new Lance table, reserving the table name and location without creating actual data files.</p>
+<p>The implementation:</p>
+<ol>
+<li>Validate the parent namespace exists (in V2)</li>
+<li>Determine the table location:<ul>
+<li>In V1: <code>&lt;root&gt;/&lt;table_name&gt;.lance</code></li>
+<li>In V2 with <code>dir_listing_enabled=true</code> at root level: <code>&lt;root&gt;/&lt;table_name&gt;.lance</code></li>
+<li>In V2 for child namespaces or with <code>dir_listing_enabled=false</code>: <code>&lt;root&gt;/&lt;hash&gt;_&lt;object_id&gt;/</code></li>
+</ul>
+</li>
+<li>Create a <code>.lance-reserved</code> file at the location to mark the table's existence</li>
+<li>In V2, merge-insert a row into the manifest table with:<ul>
+<li><code>object_id</code> set to the table identifier</li>
+<li><code>object_type</code> set to <code>"table"</code></li>
+<li><code>location</code> set to the table directory path</li>
+</ul>
+</li>
+</ol>
+<p>Primary-key deduplication on <code>object_id</code> ensures no duplicate rows are inserted. If a table with the same identifier already exists, the operation fails.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If a table with the same identifier already exists, return error code <code>5</code> (TableAlreadyExists).</p>
+<p>If there is a concurrent creation attempt, return error code <code>14</code> (ConcurrentModification).</p>
+<h3 id="listtables">ListTables<a class="headerlink" href="#listtables" title="Permanent link">&para;</a></h3>
+<p>This operation lists tables within a namespace.</p>
+<p>In <strong>V1</strong>:</p>
+<ol>
+<li>List all entries in the root directory</li>
+<li>Filter to directories matching the <code>*.lance</code> pattern</li>
+<li>Return the table names (directory names without the <code>.lance</code> suffix)</li>
+</ol>
+<p>In <strong>V2</strong>:</p>
+<ol>
+<li>Query the manifest table for rows where <code>object_type = "table"</code></li>
+<li>Filter to rows where <code>object_id</code> starts with the namespace prefix</li>
+<li>Further filter to rows where <code>object_id</code> has exactly one more level than the namespace</li>
+<li>Return the list of table names</li>
+</ol>
+<p>When <strong>both V1 and V2 are enabled</strong> (the default <a href="../../../catalog/dir/#compatibility-mode">Compatibility Mode</a>),
+the implementation performs both queries and merges results, with manifest entries taking precedence when duplicates exist.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the namespace does not exist (V2 only), return error code <code>1</code> (NamespaceNotFound).</p>
+<h3 id="describetable">DescribeTable<a class="headerlink" href="#describetable" title="Permanent link">&para;</a></h3>
+<p>This operation returns table metadata including schema, version, and properties.</p>
+<p>The implementation:</p>
+<ol>
+<li>Locate the table:<ul>
+<li>In V1, check for the <code>&lt;table_name&gt;.lance</code> directory</li>
+<li>In V2, query the manifest table for the table location</li>
+<li>When both V1 and V2 are enabled (the default <a href="../../../catalog/dir/#compatibility-mode">Compatibility Mode</a>),
+   first check the manifest table, then fall back to checking the <code>.lance</code> directory</li>
+</ul>
+</li>
+<li>Open the Lance table using the Lance SDK</li>
+<li>Read the table metadata and return:<ul>
+<li><code>name</code>: The table name</li>
+<li><code>schema</code>: The Arrow schema of the table</li>
+<li><code>version</code>: The current version number</li>
+<li><code>location</code>: The table directory path</li>
+</ul>
+</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If a specific version is requested and does not exist, return error code <code>11</code> (TableVersionNotFound).</p>
+<h3 id="deregistertable">DeregisterTable<a class="headerlink" href="#deregistertable" title="Permanent link">&para;</a></h3>
+<p>This operation deregisters a table from the catalog while preserving its data on storage. The table files remain at their storage location and can be re-registered later using RegisterTable.</p>
+<p>In <strong>V1</strong>:</p>
+<ol>
+<li>Locate the table by checking for the <code>&lt;table_name&gt;.lance</code> directory</li>
+<li>Verify the table exists and is not already deregistered</li>
+<li>Create a <code>.lance-deregistered</code> marker file inside the table directory</li>
+<li>Return the table location for reference</li>
+</ol>
+<p>The marker file approach ensures that:
+- Table data remains intact at its original location
+- The table is excluded from <code>ListTables</code> results
+- The table returns <code>TableNotFound</code> for <code>DescribeTable</code> and <code>TableExists</code> operations
+- The table can be re-registered by removing the marker file and calling <code>RegisterTable</code>
+- <code>DropTable</code> still works on deregistered tables (removes both data and marker file)</p>
+<p>In <strong>V2</strong>:</p>
+<ol>
+<li>Locate the table by querying the manifest table for the table location</li>
+<li>Remove the table row from the manifest table using the <code>object_id</code> primary key</li>
+<li>Keep the table files at the storage location</li>
+<li>Return the table location and properties for reference</li>
+</ol>
+<p>When <strong>both V1 and V2 are enabled</strong> (the default <a href="../../../catalog/dir/#compatibility-mode">Compatibility Mode</a>),
+first check the manifest table, then fall back to checking the <code>.lance</code> directory.
+If found in manifest, follow V2 behavior; otherwise follow V1 behavior.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist or is already deregistered, return error code <code>4</code> (TableNotFound).</p>
+<h2 id="additional-operations">Additional Operations<a class="headerlink" href="#additional-operations" title="Permanent link">&para;</a></h2>
+<h3 id="droptable">DropTable<a class="headerlink" href="#droptable" title="Permanent link">&para;</a></h3>
+<p>This operation removes a table and its data.</p>
+<p>In <strong>V1</strong>:</p>
+<ol>
+<li>Locate the table by checking for the <code>&lt;table_name&gt;.lance</code> directory</li>
+<li>Delete the table directory and all its contents from storage</li>
+<li>If deletion fails midway (directory is still non-empty), the drop has failed and should be retried</li>
+</ol>
+<p>In <strong>V2</strong>:</p>
+<ol>
+<li>Locate the table by querying the manifest table for the table location</li>
+<li>Remove the table row from the manifest table using the <code>object_id</code> primary key</li>
+<li>Delete the table directory and all its contents from storage
+   (failure here does not affect the success of the drop since the table is no longer reachable)</li>
+</ol>
+<p>When <strong>both V1 and V2 are enabled</strong> (the default <a href="../../../catalog/dir/#compatibility-mode">Compatibility Mode</a>),
+first check the manifest table, then fall back to checking the <code>.lance</code> directory.
+If found in manifest, follow V2 behavior; otherwise follow V1 behavior.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the parent namespace does not exist, return error code <code>1</code> (NamespaceNotFound).</p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If there is a file system permission error, return error code <code>15</code> (PermissionDenied).</p>
+<p>If there is an unexpected I/O error, return error code <code>18</code> (Internal).</p>
+<h3 id="createtableversion">CreateTableVersion<a class="headerlink" href="#createtableversion" title="Permanent link">&para;</a></h3>
+<p>This operation creates a new version entry for a table. It supports <code>put_if_not_exists</code> semantics.</p>
+<p>When <strong>table version management is not enabled</strong>:</p>
+<ol>
+<li>Resolve the table location</li>
+<li>Parse the staging manifest path from the request</li>
+<li>Determine the final manifest path based on the naming scheme (V1 or V2)</li>
+<li>Copy the staging manifest to the final path in the <code>_versions/</code> directory using <code>put_if_not_exists</code> semantics</li>
+<li>Delete the staging manifest file</li>
+<li>Return the created version info including the final manifest path</li>
+</ol>
+<p>When <strong>table version management is enabled</strong> (V2 with <code>table_version_management=true</code> in <code>__manifest</code> metadata), the directory catalog acts as an external manifest store. The commit process follows these steps:</p>
+<ol>
+<li><strong>Stage manifest in object storage</strong>: The caller writes the new manifest to a staging path (e.g., <code>{table_location}/_versions/{version}.manifest-{uuid}</code>). This staged manifest is not yet visible to readers.</li>
+<li><strong>Atomically commit to manifest table</strong>: Merge-insert a new row into the <code>__manifest</code> table with:<ul>
+<li><code>object_id</code> set to <code>&lt;table_id&gt;$&lt;version&gt;</code> (e.g., <code>users$1</code> or <code>ns1$users$1</code>)</li>
+<li><code>object_type</code> set to <code>"table_version"</code></li>
+<li><code>metadata</code> containing the JSON-encoded version metadata including the staging manifest path</li>
+</ul>
+</li>
+</ol>
+<p>Primary-key deduplication on <code>object_id</code> ensures no duplicate rows are inserted. The commit is effectively complete after this step. If this fails, another writer has already committed that version.
+3. <strong>Finalize in object storage</strong>: Copy the staged manifest to the standard location (<code>{table_location}/_versions/{version}.manifest</code>). This makes it discoverable by readers that do not use the manifest table.
+4. <strong>Update manifest table pointer</strong>: Update the <code>metadata</code> in the manifest table row to point to the finalized manifest path, synchronizing both systems.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If the version already exists, return error code <code>12</code> (TableVersionAlreadyExists).</p>
+<p>If there is a concurrent creation attempt, return error code <code>14</code> (ConcurrentModification).</p>
+<h3 id="batchcreatetableversions">BatchCreateTableVersions<a class="headerlink" href="#batchcreatetableversions" title="Permanent link">&para;</a></h3>
+<p>This operation atomically creates version entries for multiple tables.</p>
+<p>When <strong>table version management is not enabled</strong>, this operation iterates through each entry and calls <code>CreateTableVersion</code> for each one. Atomicity is not guaranteed.</p>
+<p>When <strong>table version management is enabled</strong>, the batch commit process follows these steps:</p>
+<ol>
+<li><strong>Stage manifests in object storage</strong>: For each entry, the caller writes the new manifest to a staging path (e.g., <code>{table_location}/_versions/{version}.manifest-{uuid}</code>).</li>
+<li><strong>Atomically commit to manifest table</strong>: Merge-insert all version rows into the <code>__manifest</code> table in a single atomic commit, each with:<ul>
+<li><code>object_id</code> set to <code>&lt;table_id&gt;$&lt;version&gt;</code></li>
+<li><code>object_type</code> set to <code>"table_version"</code></li>
+<li><code>metadata</code> containing the JSON-encoded version metadata including the staging manifest path</li>
+</ul>
+</li>
+</ol>
+<p>Primary-key deduplication on <code>object_id</code> ensures no duplicate rows are inserted. The commit is effectively complete after this step. If any version already exists, the entire batch fails.
+3. <strong>Finalize in object storage</strong>: For each entry, copy the staged manifest to the standard location.
+4. <strong>Update manifest table pointers</strong>: Update the <code>metadata</code> in each manifest table row to point to the finalized manifest paths.</p>
+<p><strong>Error Handling:</strong></p>
+<p>If any table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If any version already exists, return error code <code>12</code> (TableVersionAlreadyExists).</p>
+<p>If there is a concurrent modification, return error code <code>14</code> (ConcurrentModification).</p>
+<h3 id="listtableversions">ListTableVersions<a class="headerlink" href="#listtableversions" title="Permanent link">&para;</a></h3>
+<p>This operation lists version entries for a table.</p>
+<p>When <strong>table version management is not enabled</strong>:</p>
+<ol>
+<li>Resolve the table location</li>
+<li>List all files in the <code>_versions/</code> directory</li>
+<li>Parse version numbers from manifest filenames (handling both V1 and V2 naming schemes)</li>
+<li>Extract metadata from file attributes (size, e_tag, last_modified timestamp)</li>
+<li>Sort results by version number (descending if <code>descending=true</code>)</li>
+<li>Apply pagination using <code>page_token</code> and <code>limit</code></li>
+</ol>
+<p>When <strong>table version management is enabled</strong>:</p>
+<ol>
+<li>Query the manifest table for rows where:<ul>
+<li><code>object_type = "table_version"</code></li>
+<li><code>object_id</code> starts with <code>&lt;table_id&gt;$</code></li>
+</ul>
+</li>
+<li>Parse the version number from each <code>object_id</code></li>
+<li>Parse the <code>metadata</code> column as JSON to extract version details</li>
+<li>Sort results by version number (descending if <code>descending=true</code>)</li>
+<li>Apply pagination using <code>page_token</code> and <code>limit</code></li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<h3 id="describetableversion">DescribeTableVersion<a class="headerlink" href="#describetableversion" title="Permanent link">&para;</a></h3>
+<p>This operation retrieves details for a specific table version.</p>
+<p>When <strong>table version management is not enabled</strong>:</p>
+<ol>
+<li>Resolve the table location</li>
+<li>Open the Lance dataset at the specified version</li>
+<li>Read the manifest file to extract version metadata</li>
+<li>Return the version information including manifest_path, manifest_size, e_tag, timestamp_millis, and metadata</li>
+</ol>
+<p>When <strong>table version management is enabled</strong>, the read process validates and synchronizes the manifest:</p>
+<ol>
+<li><strong>Query manifest table</strong>: Retrieve the manifest path for the requested version from the row with <code>object_id = &lt;table_id&gt;$&lt;version&gt;</code>. If the path matches the expected path based on the naming scheme, synchronization is complete.</li>
+<li><strong>Synchronize to object storage</strong>: If the manifest path does not match the expected path based on the naming scheme (i.e., it is a staging path), copy the staged manifest to its final location (<code>{table_location}/_versions/{version}.manifest</code>). This is an idempotent operation.</li>
+<li><strong>Update manifest table</strong>: Update the <code>metadata</code> in the manifest table row to reflect the finalized path for future readers.</li>
+<li><strong>Return version information</strong>: Return the version information with the finalized manifest path, or error if synchronization fails.</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If the version does not exist, return error code <code>11</code> (TableVersionNotFound).</p>
+<h3 id="batchdeletetableversions">BatchDeleteTableVersions<a class="headerlink" href="#batchdeletetableversions" title="Permanent link">&para;</a></h3>
+<p>This operation deletes multiple version entries for a table.</p>
+<p>When <strong>table version management is not enabled</strong>:</p>
+<ol>
+<li>Resolve the table location</li>
+<li>Delete the manifest files in the <code>_versions/</code> directory for each specified version</li>
+<li>Return the count of deleted versions</li>
+</ol>
+<p>When <strong>table version management is enabled</strong>:</p>
+<ol>
+<li>Delete the manifest files in the <code>_versions/</code> directory for each specified version</li>
+<li>Delete rows from the manifest table using the <code>object_id</code> primary key for each specified version</li>
+<li>Return the count of deleted versions</li>
+</ol>
+<p><strong>Error Handling:</strong></p>
+<p>If the table does not exist, return error code <code>4</code> (TableNotFound).</p>
+<p>If any specified version does not exist, the operation may either skip it silently or return error code <code>11</code> (TableVersionNotFound), depending on the <code>ignore_missing</code> parameter.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Overview</div>
+        </a>
+        <a class="next" href="../lance-rest/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Lance REST Catalog</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#background">Background</a>
+      <a class="ld-toc__h2" href="#implementation-configuration-properties">Implementation Configuration Properties</a>
+      <a class="ld-toc__h2" href="#object-mapping">Object Mapping</a>
+      <a class="ld-toc__h3" href="#namespace">Namespace</a>
+      <a class="ld-toc__h3" href="#table">Table</a>
+      <a class="ld-toc__h2" href="#lance-table-identification">Lance Table Identification</a>
+      <a class="ld-toc__h2" href="#basic-operations">Basic Operations</a>
+      <a class="ld-toc__h3" href="#createnamespace">CreateNamespace</a>
+      <a class="ld-toc__h3" href="#listnamespaces">ListNamespaces</a>
+      <a class="ld-toc__h3" href="#describenamespace">DescribeNamespace</a>
+      <a class="ld-toc__h3" href="#dropnamespace">DropNamespace</a>
+      <a class="ld-toc__h3" href="#declaretable">DeclareTable</a>
+      <a class="ld-toc__h3" href="#listtables">ListTables</a>
+      <a class="ld-toc__h3" href="#describetable">DescribeTable</a>
+      <a class="ld-toc__h3" href="#deregistertable">DeregisterTable</a>
+      <a class="ld-toc__h2" href="#additional-operations">Additional Operations</a>
+      <a class="ld-toc__h3" href="#droptable">DropTable</a>
+      <a class="ld-toc__h3" href="#createtableversion">CreateTableVersion</a>
+      <a class="ld-toc__h3" href="#batchcreatetableversions">BatchCreateTableVersions</a>
+      <a class="ld-toc__h3" href="#listtableversions">ListTableVersions</a>
+      <a class="ld-toc__h3" href="#describetableversion">DescribeTableVersion</a>
+      <a class="ld-toc__h3" href="#batchdeletetableversions">BatchDeleteTableVersions</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Schema — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/schema/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a class="active" href="./">Schema</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../transaction/">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a href="../row_id_lineage/">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a href="../mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Schema</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="schema-format-specification">Schema Format Specification<a class="headerlink" href="#schema-format-specification" title="Permanent link">&para;</a></h1>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The schema describes the structure of a Lance table, including all fields, their data types, and metadata.
+Schemas use a logical type system where data types are represented as strings that map to Apache Arrow data types.
+Each field in the schema has a unique identifier (field ID) that enables robust schema evolution and version tracking.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Logical types are currently being simplified through discussion <a href="https://github.com/lance-format/lance/discussions/5864">#5864</a>.
+Proposed changes include consolidating encoding-specific variants (e.g., <code>large_string</code> and <code>string</code>, <code>large_binary</code> and <code>binary</code>)
+into single logical types with runtime optimization. Additionally, <a href="https://github.com/lance-format/lance/discussions/5817">#5817</a> proposes adding
+<code>string_view</code> and <code>binary_view</code> types. This document describes the current implementation.</p>
+</div>
+<h2 id="data-types">Data Types<a class="headerlink" href="#data-types" title="Permanent link">&para;</a></h2>
+<p>Lance supports a comprehensive set of data types that map to Apache Arrow types.
+Data types are represented as strings in the schema and can be grouped into several categories.</p>
+<h3 id="primitive-types">Primitive Types<a class="headerlink" href="#primitive-types" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>null</code></td>
+<td><code>Null</code></td>
+<td>Null type (no values)</td>
+</tr>
+<tr>
+<td><code>bool</code></td>
+<td><code>Boolean</code></td>
+<td>Boolean (true/false)</td>
+</tr>
+<tr>
+<td><code>int8</code></td>
+<td><code>Int8</code></td>
+<td>Signed 8-bit integer</td>
+</tr>
+<tr>
+<td><code>uint8</code></td>
+<td><code>UInt8</code></td>
+<td>Unsigned 8-bit integer</td>
+</tr>
+<tr>
+<td><code>int16</code></td>
+<td><code>Int16</code></td>
+<td>Signed 16-bit integer</td>
+</tr>
+<tr>
+<td><code>uint16</code></td>
+<td><code>UInt16</code></td>
+<td>Unsigned 16-bit integer</td>
+</tr>
+<tr>
+<td><code>int32</code></td>
+<td><code>Int32</code></td>
+<td>Signed 32-bit integer</td>
+</tr>
+<tr>
+<td><code>uint32</code></td>
+<td><code>UInt32</code></td>
+<td>Unsigned 32-bit integer</td>
+</tr>
+<tr>
+<td><code>int64</code></td>
+<td><code>Int64</code></td>
+<td>Signed 64-bit integer</td>
+</tr>
+<tr>
+<td><code>uint64</code></td>
+<td><code>UInt64</code></td>
+<td>Unsigned 64-bit integer</td>
+</tr>
+</tbody>
+</table>
+<h3 id="floating-point-types">Floating Point Types<a class="headerlink" href="#floating-point-types" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>halffloat</code></td>
+<td><code>Float16</code></td>
+<td>IEEE 754 half-precision floating point (16-bit)</td>
+</tr>
+<tr>
+<td><code>float</code></td>
+<td><code>Float32</code></td>
+<td>IEEE 754 single-precision floating point (32-bit)</td>
+</tr>
+<tr>
+<td><code>double</code></td>
+<td><code>Float64</code></td>
+<td>IEEE 754 double-precision floating point (64-bit)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="string-and-binary-types">String and Binary Types<a class="headerlink" href="#string-and-binary-types" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>string</code></td>
+<td><code>Utf8</code></td>
+<td>Variable-length UTF-8 encoded string</td>
+</tr>
+<tr>
+<td><code>binary</code></td>
+<td><code>Binary</code></td>
+<td>Variable-length binary data</td>
+</tr>
+<tr>
+<td><code>large_string</code></td>
+<td><code>LargeUtf8</code></td>
+<td>Variable-length UTF-8 string (supports large offsets)</td>
+</tr>
+<tr>
+<td><code>large_binary</code></td>
+<td><code>LargeBinary</code></td>
+<td>Variable-length binary data (supports large offsets)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="decimal-types">Decimal Types<a class="headerlink" href="#decimal-types" title="Permanent link">&para;</a></h3>
+<p>Decimal types support arbitrary-precision numeric values. The format is: <code>decimal:&lt;bit_width&gt;:&lt;precision&gt;:&lt;scale&gt;</code></p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Precision</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>decimal:128:P:S</code></td>
+<td><code>Decimal128</code></td>
+<td>Up to 38 digits</td>
+<td><code>decimal:128:10:2</code> (10 total digits, 2 after decimal)</td>
+</tr>
+<tr>
+<td><code>decimal:256:P:S</code></td>
+<td><code>Decimal256</code></td>
+<td>Up to 76 digits</td>
+<td><code>decimal:256:20:5</code></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Precision (P)</strong>: Total number of digits (1-38 for Decimal128, up to 76 for Decimal256)</li>
+<li><strong>Scale (S)</strong>: Number of digits after the decimal point (0 ≤ S ≤ P)</li>
+</ul>
+<h3 id="date-and-time-types">Date and Time Types<a class="headerlink" href="#date-and-time-types" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>date32:day</code></td>
+<td><code>Date32</code></td>
+<td>Date (days since epoch)</td>
+</tr>
+<tr>
+<td><code>date64:ms</code></td>
+<td><code>Date64</code></td>
+<td>Date (milliseconds since epoch)</td>
+</tr>
+<tr>
+<td><code>time32:s</code></td>
+<td><code>Time32</code></td>
+<td>Time (seconds since midnight)</td>
+</tr>
+<tr>
+<td><code>time32:ms</code></td>
+<td><code>Time32</code></td>
+<td>Time (milliseconds since midnight)</td>
+</tr>
+<tr>
+<td><code>time64:us</code></td>
+<td><code>Time64</code></td>
+<td>Time (microseconds since midnight)</td>
+</tr>
+<tr>
+<td><code>time64:ns</code></td>
+<td><code>Time64</code></td>
+<td>Time (nanoseconds since midnight)</td>
+</tr>
+<tr>
+<td><code>duration:s</code></td>
+<td><code>Duration</code></td>
+<td>Duration (seconds)</td>
+</tr>
+<tr>
+<td><code>duration:ms</code></td>
+<td><code>Duration</code></td>
+<td>Duration (milliseconds)</td>
+</tr>
+<tr>
+<td><code>duration:us</code></td>
+<td><code>Duration</code></td>
+<td>Duration (microseconds)</td>
+</tr>
+<tr>
+<td><code>duration:ns</code></td>
+<td><code>Duration</code></td>
+<td>Duration (nanoseconds)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="timestamp-types">Timestamp Types<a class="headerlink" href="#timestamp-types" title="Permanent link">&para;</a></h3>
+<p>Timestamp types represent a point in time and may include timezone information.
+Format: <code>timestamp:&lt;unit&gt;:&lt;timezone&gt;</code></p>
+<ul>
+<li><strong>Unit</strong>: <code>s</code> (seconds), <code>ms</code> (milliseconds), <code>us</code> (microseconds), <code>ns</code> (nanoseconds)</li>
+<li><strong>Timezone</strong>: IANA timezone string (e.g., <code>UTC</code>, <code>America/New_York</code>) or <code>-</code> for no timezone</li>
+</ul>
+<p>Examples:
+- <code>timestamp:us:UTC</code> - Microsecond precision timestamp in UTC
+- <code>timestamp:ms:America/New_York</code> - Millisecond precision timestamp in America/New_York timezone
+- <code>timestamp:ns:-</code> - Nanosecond precision timestamp with no timezone</p>
+<h3 id="complex-types">Complex Types<a class="headerlink" href="#complex-types" title="Permanent link">&para;</a></h3>
+<h4 id="struct-type">Struct Type<a class="headerlink" href="#struct-type" title="Permanent link">&para;</a></h4>
+<p>A struct is a container for named fields with heterogeneous types.</p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>struct</code></td>
+<td><code>Struct</code></td>
+<td>Composite type containing multiple named fields</td>
+</tr>
+</tbody>
+</table>
+<p>Struct fields are represented as child fields in the schema.</p>
+<p>Example schema with a struct:
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">Field</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="s">"address"</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="n">type</span><span class="o">:</span><span class="w"> </span><span class="s">"struct"</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">children</span><span class="o">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">        </span><span class="n">Field</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="s">"street"</span><span class="p">,</span><span class="w"> </span><span class="n">type</span><span class="o">:</span><span class="w"> </span><span class="s">"string"</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">        </span><span class="n">Field</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="s">"city"</span><span class="p">,</span><span class="w"> </span><span class="n">type</span><span class="o">:</span><span class="w"> </span><span class="s">"string"</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">        </span><span class="n">Field</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="s">"zip"</span><span class="p">,</span><span class="w"> </span><span class="n">type</span><span class="o">:</span><span class="w"> </span><span class="s">"int32"</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="p">]</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">}</span>
+</span></code></pre></div></p>
+<h4 id="list-types">List Types<a class="headerlink" href="#list-types" title="Permanent link">&para;</a></h4>
+<p>Lists represent variable-length arrays of a single type.</p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td><code>List</code></td>
+<td>Variable-length list of values</td>
+</tr>
+<tr>
+<td><code>list.struct</code></td>
+<td><code>List(Struct)</code></td>
+<td>Variable-length list of struct values</td>
+</tr>
+<tr>
+<td><code>large_list</code></td>
+<td><code>LargeList</code></td>
+<td>Variable-length list (supports large offsets)</td>
+</tr>
+<tr>
+<td><code>large_list.struct</code></td>
+<td><code>LargeList(Struct)</code></td>
+<td>Variable-length list of struct values (large offsets)</td>
+</tr>
+</tbody>
+</table>
+<p>The element type is specified as a child field.</p>
+<h4 id="fixed-size-list-types">Fixed-Size List Types<a class="headerlink" href="#fixed-size-list-types" title="Permanent link">&para;</a></h4>
+<p>Fixed-size lists have a predetermined size known at schema definition time.
+Format: <code>fixed_size_list:&lt;element_type&gt;:&lt;size&gt;</code></p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Description</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fixed_size_list:float:128</code></td>
+<td>Fixed-size list of 128 floats</td>
+<td>Vector embeddings (128-dimensional)</td>
+</tr>
+<tr>
+<td><code>fixed_size_list:int32:10</code></td>
+<td>Fixed-size list of 10 integers</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>Special extension types:
+- <code>fixed_size_list:lance.bfloat16:256</code> - Fixed-size list of bfloat16 values</p>
+<h4 id="fixed-size-binary-type">Fixed-Size Binary Type<a class="headerlink" href="#fixed-size-binary-type" title="Permanent link">&para;</a></h4>
+<p>Fixed-size binary data with a predetermined size in bytes.
+Format: <code>fixed_size_binary:&lt;size&gt;</code></p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Description</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fixed_size_binary:16</code></td>
+<td>Fixed-size binary of 16 bytes</td>
+<td>MD5 hash</td>
+</tr>
+<tr>
+<td><code>fixed_size_binary:32</code></td>
+<td>Fixed-size binary of 32 bytes</td>
+<td>SHA-256 hash</td>
+</tr>
+</tbody>
+</table>
+<h4 id="dictionary-type">Dictionary Type<a class="headerlink" href="#dictionary-type" title="Permanent link">&para;</a></h4>
+<p>Dictionary-encoded data with separate keys and values.
+Format: <code>dict:&lt;value_type&gt;:&lt;key_type&gt;:&lt;ordered&gt;</code></p>
+<ul>
+<li><strong>Value type</strong>: The type of dictionary values</li>
+<li><strong>Key type</strong>: The type used for dictionary indices (typically int8, int16, or int32)</li>
+<li><strong>Ordered</strong>: Boolean indicating if dictionary values are sorted (currently not fully supported)</li>
+</ul>
+<p>Example: <code>dict:string:int16:false</code> - Dictionary-encoded strings with int16 keys</p>
+<h4 id="map-type">Map Type<a class="headerlink" href="#map-type" title="Permanent link">&para;</a></h4>
+<p>Key-value pairs stored in a structured format.</p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Arrow Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>map</code></td>
+<td><code>Map</code></td>
+<td>Key-value pairs (currently supports unordered keys only)</td>
+</tr>
+</tbody>
+</table>
+<p>Maps have key and value types specified as child fields.</p>
+<h3 id="extension-types">Extension Types<a class="headerlink" href="#extension-types" title="Permanent link">&para;</a></h3>
+<p>Lance supports custom extension types that provide semantic meaning on top of Arrow types.</p>
+<h4 id="blob-type">Blob Type<a class="headerlink" href="#blob-type" title="Permanent link">&para;</a></h4>
+<p>Represents large binary data stored externally.</p>
+<table>
+<thead>
+<tr>
+<th>Logical Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blob</code></td>
+<td>Large binary data with external storage reference</td>
+</tr>
+<tr>
+<td><code>json</code></td>
+<td>JSON-encoded data stored as binary</td>
+</tr>
+</tbody>
+</table>
+<p>Blob types are stored as large binary data with metadata describing storage location.</p>
+<h4 id="bfloat16-type">BFloat16 Type<a class="headerlink" href="#bfloat16-type" title="Permanent link">&para;</a></h4>
+<p>Brain float (bfloat16) is a 16-bit floating point format optimized for ML.
+Used within fixed-size lists: <code>fixed_size_list:lance.bfloat16:SIZE</code></p>
+<h2 id="field-ids">Field IDs<a class="headerlink" href="#field-ids" title="Permanent link">&para;</a></h2>
+<p>Field IDs are unique integer identifiers assigned to each field in a schema.
+They are essential for robust schema evolution, as they allow fields to be renamed or reordered without breaking references.</p>
+<h3 id="field-id-assignment">Field ID Assignment<a class="headerlink" href="#field-id-assignment" title="Permanent link">&para;</a></h3>
+<p><strong>Initial assignment (depth-first order):</strong>
+When a table is created, field IDs are assigned to all fields in depth-first order, starting from 0.</p>
+<p>Nested fields are linked via the <code>parent_id</code> field in the protobuf message. For example, if field "c" (id: 2) is a struct containing fields "x", "y", "z", those child fields will have <code>parent_id: 2</code>. Top-level fields have <code>parent_id: -1</code>.</p>
+<p>Example with nested structure:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>Field order: a, b, c.x, c.y, c.z, d
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>Assigned IDs with parent relationships:
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>- a: 0 (parent_id: -1)
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>- b: 1 (parent_id: -1)
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>- c: 2 (parent_id: -1, struct type)
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>- c.x: 3 (parent_id: 2)
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>- c.y: 4 (parent_id: 2)
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>- c.z: 5 (parent_id: 2)
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>- d: 6 (parent_id: -1)
+</span></code></pre></div></p>
+<p>Note: A <code>parent_id</code> of -1 indicates a top-level field. For nested fields, <code>parent_id</code> references the ID of the parent field. Child fields reference their parent via <code>parent_id</code> rather than being stored as separate "children" arrays in the protobuf message (though the Rust in-memory representation maintains a children vector for convenience).</p>
+<p><strong>New field assignment (incremental):</strong>
+When fields are added later (e.g., through schema evolution), they receive the next available ID
+incrementally. This preserves the history of field additions.</p>
+<h3 id="field-id-properties">Field ID Properties<a class="headerlink" href="#field-id-properties" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Immutable</strong>: Once assigned, a field's ID never changes</li>
+<li><strong>Unique</strong>: Each field within a table has a unique ID</li>
+<li><strong>Stable</strong>: IDs are preserved across schema evolution operations</li>
+<li><strong>Sparse</strong>: Field IDs may not form a contiguous sequence after schema evolution</li>
+</ul>
+<h3 id="using-field-ids">Using Field IDs<a class="headerlink" href="#using-field-ids" title="Permanent link">&para;</a></h3>
+<p>When referencing fields internally within the format, use the field ids rather than field names or positions.</p>
+<h2 id="field-metadata">Field Metadata<a class="headerlink" href="#field-metadata" title="Permanent link">&para;</a></h2>
+<p>Fields can carry additional metadata as key-value pairs to configure encoding, primary key behavior, and other properties.</p>
+<h3 id="primary-key-metadata">Primary Key Metadata<a class="headerlink" href="#primary-key-metadata" title="Permanent link">&para;</a></h3>
+<p>Primary key configuration is handled by two protobuf fields in the Field message:
+- <strong>unenforced_primary_key</strong> (bool): Whether this field is part of the primary key
+- <strong>unenforced_primary_key_position</strong> (uint32): Position in primary key ordering (1-based for ordered, 0 for unordered)</p>
+<p>For detailed discussion on primary key configuration, see <a href="../#unenforced-primary-key">Unenforced Primary Key</a> in the table format overview.</p>
+<h3 id="clustering-key-metadata">Clustering Key Metadata<a class="headerlink" href="#clustering-key-metadata" title="Permanent link">&para;</a></h3>
+<p>Clustering key configuration uses a single protobuf field in the Field message:
+- <strong>unenforced_clustering_key_position</strong> (uint32): 1-based position in clustering key ordering. 0 means not a clustering key field.</p>
+<p>Clustering keys hint at the physical ordering of data within a table. Unlike primary keys,
+clustering key fields may be nullable. This metadata enables query engines to perform
+optimizations such as storage-partitioned joins.</p>
+<h3 id="encoding-metadata">Encoding Metadata<a class="headerlink" href="#encoding-metadata" title="Permanent link">&para;</a></h3>
+<p>Column encoding configurations are specified with the <code>lance-encoding:</code> prefix.
+See <a href="../../file/encoding/">File Format Encoding Specification</a> for complete details on available encodings.</p>
+<h3 id="arrow-extension-type-metadata">Arrow Extension Type Metadata<a class="headerlink" href="#arrow-extension-type-metadata" title="Permanent link">&para;</a></h3>
+<p>Custom Arrow extension types may have metadata under the <code>ARROW:extension:</code> namespace
+(e.g., <code>ARROW:extension:name</code>).</p>
+<h2 id="schema-protobuf-definition">Schema Protobuf Definition<a class="headerlink" href="#schema-protobuf-definition" title="Permanent link">&para;</a></h2>
+<p>The schema is serialized using protobuf messages. Key messages include:</p>
+<h3 id="field-message">Field Message<a class="headerlink" href="#field-message" title="Permanent link">&para;</a></h3>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Field</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">Type</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="na">PARENT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="na">REPEATED</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="na">LEAF</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="n">Type</span><span class="w"> </span><span class="na">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">  </span><span class="c1">// Fully qualified name.</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="cm">/* Field Id.</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="cm">   *</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="cm">   * See the comment in `DataFile.fields` for how field ids are assigned.</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="cm">   */</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">  </span><span class="c1">/// Parent Field ID. If not set, this is a top-level column.</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">parent_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">  </span><span class="cm">/* Logical types, support parameterized Arrow Type.</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="cm">   *</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="cm">   * PARENT types will always have logical type "struct".</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="cm">   *</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="cm">   * REPEATED types may have logical types:</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="cm">   * * "list"</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="cm">   * * "large_list"</span>
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="cm">   * * "list.struct"</span>
+</span><span id="__span-2-27"><a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a><span class="cm">   * * "large_list.struct"</span>
+</span><span id="__span-2-28"><a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a><span class="cm">   * The final two are used if the list values are structs, and therefore the</span>
+</span><span id="__span-2-29"><a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a><span class="cm">   * field is both implicitly REPEATED and PARENT.</span>
+</span><span id="__span-2-30"><a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a><span class="cm">   *</span>
+</span><span id="__span-2-31"><a id="__codelineno-2-31" name="__codelineno-2-31" href="#__codelineno-2-31"></a><span class="cm">   * LEAF types may have logical types:</span>
+</span><span id="__span-2-32"><a id="__codelineno-2-32" name="__codelineno-2-32" href="#__codelineno-2-32"></a><span class="cm">   * * "null"</span>
+</span><span id="__span-2-33"><a id="__codelineno-2-33" name="__codelineno-2-33" href="#__codelineno-2-33"></a><span class="cm">   * * "bool"</span>
+</span><span id="__span-2-34"><a id="__codelineno-2-34" name="__codelineno-2-34" href="#__codelineno-2-34"></a><span class="cm">   * * "int8" / "uint8"</span>
+</span><span id="__span-2-35"><a id="__codelineno-2-35" name="__codelineno-2-35" href="#__codelineno-2-35"></a><span class="cm">   * * "int16" / "uint16"</span>
+</span><span id="__span-2-36"><a id="__codelineno-2-36" name="__codelineno-2-36" href="#__codelineno-2-36"></a><span class="cm">   * * "int32" / "uint32"</span>
+</span><span id="__span-2-37"><a id="__codelineno-2-37" name="__codelineno-2-37" href="#__codelineno-2-37"></a><span class="cm">   * * "int64" / "uint64"</span>
+</span><span id="__span-2-38"><a id="__codelineno-2-38" name="__codelineno-2-38" href="#__codelineno-2-38"></a><span class="cm">   * * "halffloat" / "float" / "double"</span>
+</span><span id="__span-2-39"><a id="__codelineno-2-39" name="__codelineno-2-39" href="#__codelineno-2-39"></a><span class="cm">   * * "string" / "large_string"</span>
+</span><span id="__span-2-40"><a id="__codelineno-2-40" name="__codelineno-2-40" href="#__codelineno-2-40"></a><span class="cm">   * * "binary" / "large_binary"</span>
+</span><span id="__span-2-41"><a id="__codelineno-2-41" name="__codelineno-2-41" href="#__codelineno-2-41"></a><span class="cm">   * * "date32:day"</span>
+</span><span id="__span-2-42"><a id="__codelineno-2-42" name="__codelineno-2-42" href="#__codelineno-2-42"></a><span class="cm">   * * "date64:ms"</span>
+</span><span id="__span-2-43"><a id="__codelineno-2-43" name="__codelineno-2-43" href="#__codelineno-2-43"></a><span class="cm">   * * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"</span>
+</span><span id="__span-2-44"><a id="__codelineno-2-44" name="__codelineno-2-44" href="#__codelineno-2-44"></a><span class="cm">   * * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is</span>
+</span><span id="__span-2-45"><a id="__codelineno-2-45" name="__codelineno-2-45" href="#__codelineno-2-45"></a><span class="cm">   * "s", "ms", "us", "ns"</span>
+</span><span id="__span-2-46"><a id="__codelineno-2-46" name="__codelineno-2-46" href="#__codelineno-2-46"></a><span class="cm">   * * "dict:{value_type}:{index_type}:false"</span>
+</span><span id="__span-2-47"><a id="__codelineno-2-47" name="__codelineno-2-47" href="#__codelineno-2-47"></a><span class="cm">   */</span>
+</span><span id="__span-2-48"><a id="__codelineno-2-48" name="__codelineno-2-48" href="#__codelineno-2-48"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">logical_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-2-49"><a id="__codelineno-2-49" name="__codelineno-2-49" href="#__codelineno-2-49"></a><span class="w">  </span><span class="c1">// If this field is nullable.</span>
+</span><span id="__span-2-50"><a id="__codelineno-2-50" name="__codelineno-2-50" href="#__codelineno-2-50"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">nullable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-2-51"><a id="__codelineno-2-51" name="__codelineno-2-51" href="#__codelineno-2-51"></a>
+</span><span id="__span-2-52"><a id="__codelineno-2-52" name="__codelineno-2-52" href="#__codelineno-2-52"></a><span class="w">  </span><span class="c1">// optional field metadata (e.g. extension type name/parameters)</span>
+</span><span id="__span-2-53"><a id="__codelineno-2-53" name="__codelineno-2-53" href="#__codelineno-2-53"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span><span class="w">  </span>
+</span><span id="__span-2-54"><a id="__codelineno-2-54" name="__codelineno-2-54" href="#__codelineno-2-54"></a>
+</span><span id="__span-2-55"><a id="__codelineno-2-55" name="__codelineno-2-55" href="#__codelineno-2-55"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">unenforced_primary_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">12</span><span class="p">;</span>
+</span><span id="__span-2-56"><a id="__codelineno-2-56" name="__codelineno-2-56" href="#__codelineno-2-56"></a>
+</span><span id="__span-2-57"><a id="__codelineno-2-57" name="__codelineno-2-57" href="#__codelineno-2-57"></a><span class="w">  </span><span class="cm">/* Position of this field in the primary key (1-based).</span>
+</span><span id="__span-2-58"><a id="__codelineno-2-58" name="__codelineno-2-58" href="#__codelineno-2-58"></a><span class="cm">   * 0 means the field is part of the primary key but uses schema field id for ordering.</span>
+</span><span id="__span-2-59"><a id="__codelineno-2-59" name="__codelineno-2-59" href="#__codelineno-2-59"></a><span class="cm">   * When set to a positive value, primary key fields are ordered by this position.</span>
+</span><span id="__span-2-60"><a id="__codelineno-2-60" name="__codelineno-2-60" href="#__codelineno-2-60"></a><span class="cm">   */</span>
+</span><span id="__span-2-61"><a id="__codelineno-2-61" name="__codelineno-2-61" href="#__codelineno-2-61"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">unenforced_primary_key_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">13</span><span class="p">;</span>
+</span><span id="__span-2-62"><a id="__codelineno-2-62" name="__codelineno-2-62" href="#__codelineno-2-62"></a>
+</span><span id="__span-2-63"><a id="__codelineno-2-63" name="__codelineno-2-63" href="#__codelineno-2-63"></a><span class="w">  </span><span class="c1">// Reserved for future use. Use unenforced_clustering_key_position instead.</span>
+</span><span id="__span-2-64"><a id="__codelineno-2-64" name="__codelineno-2-64" href="#__codelineno-2-64"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">unenforced_clustering_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">14</span><span class="p">;</span>
+</span><span id="__span-2-65"><a id="__codelineno-2-65" name="__codelineno-2-65" href="#__codelineno-2-65"></a>
+</span><span id="__span-2-66"><a id="__codelineno-2-66" name="__codelineno-2-66" href="#__codelineno-2-66"></a><span class="w">  </span><span class="cm">/* Position of this field in the clustering key (1-based).</span>
+</span><span id="__span-2-67"><a id="__codelineno-2-67" name="__codelineno-2-67" href="#__codelineno-2-67"></a><span class="cm">   * 0 means the field is not part of the clustering key.</span>
+</span><span id="__span-2-68"><a id="__codelineno-2-68" name="__codelineno-2-68" href="#__codelineno-2-68"></a><span class="cm">   */</span>
+</span><span id="__span-2-69"><a id="__codelineno-2-69" name="__codelineno-2-69" href="#__codelineno-2-69"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">unenforced_clustering_key_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">15</span><span class="p">;</span>
+</span><span id="__span-2-70"><a id="__codelineno-2-70" name="__codelineno-2-70" href="#__codelineno-2-70"></a>
+</span><span id="__span-2-71"><a id="__codelineno-2-71" name="__codelineno-2-71" href="#__codelineno-2-71"></a><span class="w">  </span><span class="c1">// DEPRECATED ----------------------------------------------------------------</span>
+</span><span id="__span-2-72"><a id="__codelineno-2-72" name="__codelineno-2-72" href="#__codelineno-2-72"></a>
+</span><span id="__span-2-73"><a id="__codelineno-2-73" name="__codelineno-2-73" href="#__codelineno-2-73"></a><span class="w">  </span><span class="cm">/* Deprecated: Only used in V1 file format. V2 uses variable encodings defined</span>
+</span><span id="__span-2-74"><a id="__codelineno-2-74" name="__codelineno-2-74" href="#__codelineno-2-74"></a><span class="cm">   * per page.</span>
+</span><span id="__span-2-75"><a id="__codelineno-2-75" name="__codelineno-2-75" href="#__codelineno-2-75"></a><span class="cm">   *</span>
+</span><span id="__span-2-76"><a id="__codelineno-2-76" name="__codelineno-2-76" href="#__codelineno-2-76"></a><span class="cm">   * The global encoding to use for this field.</span>
+</span><span id="__span-2-77"><a id="__codelineno-2-77" name="__codelineno-2-77" href="#__codelineno-2-77"></a><span class="cm">   */</span>
+</span><span id="__span-2-78"><a id="__codelineno-2-78" name="__codelineno-2-78" href="#__codelineno-2-78"></a><span class="w">  </span><span class="n">Encoding</span><span class="w"> </span><span class="na">encoding</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-2-79"><a id="__codelineno-2-79" name="__codelineno-2-79" href="#__codelineno-2-79"></a>
+</span><span id="__span-2-80"><a id="__codelineno-2-80" name="__codelineno-2-80" href="#__codelineno-2-80"></a><span class="w">  </span><span class="cm">/* Deprecated: Only used in V1 file format. V2 dynamically chooses when to</span>
+</span><span id="__span-2-81"><a id="__codelineno-2-81" name="__codelineno-2-81" href="#__codelineno-2-81"></a><span class="cm">   * do dictionary encoding and keeps the dictionary in the data files.</span>
+</span><span id="__span-2-82"><a id="__codelineno-2-82" name="__codelineno-2-82" href="#__codelineno-2-82"></a><span class="cm">   *</span>
+</span><span id="__span-2-83"><a id="__codelineno-2-83" name="__codelineno-2-83" href="#__codelineno-2-83"></a><span class="cm">   * The file offset for storing the dictionary value.</span>
+</span><span id="__span-2-84"><a id="__codelineno-2-84" name="__codelineno-2-84" href="#__codelineno-2-84"></a><span class="cm">   * It is only valid if encoding is DICTIONARY.</span>
+</span><span id="__span-2-85"><a id="__codelineno-2-85" name="__codelineno-2-85" href="#__codelineno-2-85"></a><span class="cm">   *</span>
+</span><span id="__span-2-86"><a id="__codelineno-2-86" name="__codelineno-2-86" href="#__codelineno-2-86"></a><span class="cm">   * The logic type presents the value type of the column, i.e., string value.</span>
+</span><span id="__span-2-87"><a id="__codelineno-2-87" name="__codelineno-2-87" href="#__codelineno-2-87"></a><span class="cm">   */</span>
+</span><span id="__span-2-88"><a id="__codelineno-2-88" name="__codelineno-2-88" href="#__codelineno-2-88"></a><span class="w">  </span><span class="n">Dictionary</span><span class="w"> </span><span class="na">dictionary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-2-89"><a id="__codelineno-2-89" name="__codelineno-2-89" href="#__codelineno-2-89"></a>
+</span><span id="__span-2-90"><a id="__codelineno-2-90" name="__codelineno-2-90" href="#__codelineno-2-90"></a><span class="w">  </span><span class="cm">/* Deprecated: optional extension type name, use metadata field</span>
+</span><span id="__span-2-91"><a id="__codelineno-2-91" name="__codelineno-2-91" href="#__codelineno-2-91"></a><span class="cm">   * ARROW:extension:name</span>
+</span><span id="__span-2-92"><a id="__codelineno-2-92" name="__codelineno-2-92" href="#__codelineno-2-92"></a><span class="cm">   */</span>
+</span><span id="__span-2-93"><a id="__codelineno-2-93" name="__codelineno-2-93" href="#__codelineno-2-93"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">extension_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-2-94"><a id="__codelineno-2-94" name="__codelineno-2-94" href="#__codelineno-2-94"></a>
+</span><span id="__span-2-95"><a id="__codelineno-2-95" name="__codelineno-2-95" href="#__codelineno-2-95"></a><span class="w">  </span><span class="cm">/* Field number 11 was previously `string storage_class`.</span>
+</span><span id="__span-2-96"><a id="__codelineno-2-96" name="__codelineno-2-96" href="#__codelineno-2-96"></a><span class="cm">   * Keep it reserved so older manifests remain compatible while new writers</span>
+</span><span id="__span-2-97"><a id="__codelineno-2-97" name="__codelineno-2-97" href="#__codelineno-2-97"></a><span class="cm">   * avoid reusing the slot.</span>
+</span><span id="__span-2-98"><a id="__codelineno-2-98" name="__codelineno-2-98" href="#__codelineno-2-98"></a><span class="cm">   */</span>
+</span><span id="__span-2-99"><a id="__codelineno-2-99" name="__codelineno-2-99" href="#__codelineno-2-99"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-2-100"><a id="__codelineno-2-100" name="__codelineno-2-100" href="#__codelineno-2-100"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="s">"storage_class"</span><span class="p">;</span>
+</span><span id="__span-2-101"><a id="__codelineno-2-101" name="__codelineno-2-101" href="#__codelineno-2-101"></a>
+</span><span id="__span-2-102"><a id="__codelineno-2-102" name="__codelineno-2-102" href="#__codelineno-2-102"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The Field message contains:
+- <strong>id</strong>: Unique field identifier (int32)
+- <strong>name</strong>: Field name (string)
+- <strong>type</strong>: Field type enum (PARENT, REPEATED, or LEAF)
+- <strong>logical_type</strong>: Logical type string representation (string) - e.g., "int64", "struct", "list"
+- <strong>nullable</strong>: Whether the field can be null (bool)
+- <strong>parent_id</strong>: Parent field ID for nested fields; -1 for top-level fields (int32)
+- <strong>metadata</strong>: Key-value pairs for additional configuration (map<string, bytes>)
+- <strong>unenforced_primary_key</strong>: Whether this field is part of the primary key (bool)
+- <strong>unenforced_primary_key_position</strong>: Position in primary key ordering (uint32, 0 = unordered)</p>
+<h3 id="schema-message">Schema Message<a class="headerlink" href="#schema-message" title="Permanent link">&para;</a></h3>
+<p>The complete schema is represented as a collection of top-level fields plus metadata.</p>
+<h2 id="schema-evolution">Schema Evolution<a class="headerlink" href="#schema-evolution" title="Permanent link">&para;</a></h2>
+<p>Field IDs enable efficient schema evolution:</p>
+<ul>
+<li><strong>Add Column</strong>: Assign a new field ID and add to schema</li>
+<li><strong>Drop Column</strong>: Remove field from schema; its ID may be reused in some systems</li>
+<li><strong>Rename Column</strong>: Change field name; ID remains the same</li>
+<li><strong>Reorder Columns</strong>: Change field order in schema; IDs remain the same</li>
+<li><strong>Type Evolution</strong>: Data type can be changed. This might require rewriting the column in the data, depending on how the type was changed.</li>
+</ul>
+<p>The use of field IDs ensures that data files can be correctly interpreted even as the schema changes over time.</p>
+<h2 id="example-schemas">Example Schemas<a class="headerlink" href="#example-schemas" title="Permanent link">&para;</a></h2>
+<p>The examples below use a simplified representation of the field structure. In the actual protobuf format, <code>type</code> refers to the field type enum (PARENT/REPEATED/LEAF) and <code>logical_type</code> contains the data type string representation.</p>
+<h3 id="simple-table">Simple Table<a class="headerlink" href="#simple-table" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>Field {
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    id: 0
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    name: "id"
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    logical_type: "int64"
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    nullable: false
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    parent_id: -1
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>}
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>Field {
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>    id: 1
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>    name: "name"
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>    logical_type: "string"
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>    nullable: true
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>    parent_id: -1
+</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a>}
+</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>Field {
+</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>    id: 2
+</span><span id="__span-3-17"><a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>    name: "created_at"
+</span><span id="__span-3-18"><a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>    logical_type: "timestamp:us:UTC"
+</span><span id="__span-3-19"><a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>    nullable: true
+</span><span id="__span-3-20"><a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>    parent_id: -1
+</span><span id="__span-3-21"><a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a>}
+</span></code></pre></div>
+<h3 id="nested-structure">Nested Structure<a class="headerlink" href="#nested-structure" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Field {
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    id: 0
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    name: "id"
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    logical_type: "int64"
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    nullable: false
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>}
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>Field {
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    id: 1
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    name: "user"
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>    logical_type: "struct"
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>    nullable: true
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>}
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>Field {
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a>    id: 2
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a>    name: "name"
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>    logical_type: "string"
+</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a>    nullable: true
+</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a>    parent_id: 1  // Nested under "user" struct (id: 1)
+</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a>}
+</span><span id="__span-4-22"><a id="__codelineno-4-22" name="__codelineno-4-22" href="#__codelineno-4-22"></a>Field {
+</span><span id="__span-4-23"><a id="__codelineno-4-23" name="__codelineno-4-23" href="#__codelineno-4-23"></a>    id: 3
+</span><span id="__span-4-24"><a id="__codelineno-4-24" name="__codelineno-4-24" href="#__codelineno-4-24"></a>    name: "email"
+</span><span id="__span-4-25"><a id="__codelineno-4-25" name="__codelineno-4-25" href="#__codelineno-4-25"></a>    logical_type: "string"
+</span><span id="__span-4-26"><a id="__codelineno-4-26" name="__codelineno-4-26" href="#__codelineno-4-26"></a>    nullable: true
+</span><span id="__span-4-27"><a id="__codelineno-4-27" name="__codelineno-4-27" href="#__codelineno-4-27"></a>    parent_id: 1  // Nested under "user" struct (id: 1)
+</span><span id="__span-4-28"><a id="__codelineno-4-28" name="__codelineno-4-28" href="#__codelineno-4-28"></a>}
+</span><span id="__span-4-29"><a id="__codelineno-4-29" name="__codelineno-4-29" href="#__codelineno-4-29"></a>Field {
+</span><span id="__span-4-30"><a id="__codelineno-4-30" name="__codelineno-4-30" href="#__codelineno-4-30"></a>    id: 4
+</span><span id="__span-4-31"><a id="__codelineno-4-31" name="__codelineno-4-31" href="#__codelineno-4-31"></a>    name: "tags"
+</span><span id="__span-4-32"><a id="__codelineno-4-32" name="__codelineno-4-32" href="#__codelineno-4-32"></a>    logical_type: "list"
+</span><span id="__span-4-33"><a id="__codelineno-4-33" name="__codelineno-4-33" href="#__codelineno-4-33"></a>    nullable: true
+</span><span id="__span-4-34"><a id="__codelineno-4-34" name="__codelineno-4-34" href="#__codelineno-4-34"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-4-35"><a id="__codelineno-4-35" name="__codelineno-4-35" href="#__codelineno-4-35"></a>}
+</span><span id="__span-4-36"><a id="__codelineno-4-36" name="__codelineno-4-36" href="#__codelineno-4-36"></a>Field {
+</span><span id="__span-4-37"><a id="__codelineno-4-37" name="__codelineno-4-37" href="#__codelineno-4-37"></a>    id: 5
+</span><span id="__span-4-38"><a id="__codelineno-4-38" name="__codelineno-4-38" href="#__codelineno-4-38"></a>    name: "item"
+</span><span id="__span-4-39"><a id="__codelineno-4-39" name="__codelineno-4-39" href="#__codelineno-4-39"></a>    logical_type: "string"
+</span><span id="__span-4-40"><a id="__codelineno-4-40" name="__codelineno-4-40" href="#__codelineno-4-40"></a>    nullable: true
+</span><span id="__span-4-41"><a id="__codelineno-4-41" name="__codelineno-4-41" href="#__codelineno-4-41"></a>    parent_id: 4  // Nested under "tags" list (id: 4)
+</span><span id="__span-4-42"><a id="__codelineno-4-42" name="__codelineno-4-42" href="#__codelineno-4-42"></a>}
+</span></code></pre></div>
+<h3 id="with-vector-embeddings">With Vector Embeddings<a class="headerlink" href="#with-vector-embeddings" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>Field {
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    id: 0
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    name: "id"
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    logical_type: "int64"
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    nullable: false
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    unenforced_primary_key: true
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    unenforced_primary_key_position: 1  // Ordered position in primary key
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>}
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>Field {
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    id: 1
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    name: "text"
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    logical_type: "string"
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>    nullable: true
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>}
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>Field {
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>    id: 2
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a>    name: "embedding"
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a>    logical_type: "fixed_size_list:lance.bfloat16:384"
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a>    nullable: true
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>    parent_id: -1  // Top-level field
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>}
+</span></code></pre></div>
+<h2 id="type-conversion-reference">Type Conversion Reference<a class="headerlink" href="#type-conversion-reference" title="Permanent link">&para;</a></h2>
+<p>When converting between logical types and Arrow types, Lance uses the following mappings:</p>
+<table>
+<thead>
+<tr>
+<th>Arrow Type</th>
+<th>Logical Type Format</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Arrow::Null</code></td>
+<td><code>null</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Boolean</code></td>
+<td><code>bool</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Int8</code> to <code>Int64</code></td>
+<td><code>int8</code>, <code>int16</code>, <code>int32</code>, <code>int64</code></td>
+</tr>
+<tr>
+<td><code>Arrow::UInt8</code> to <code>UInt64</code></td>
+<td><code>uint8</code>, <code>uint16</code>, <code>uint32</code>, <code>uint64</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Float16</code></td>
+<td><code>halffloat</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Float32</code></td>
+<td><code>float</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Float64</code></td>
+<td><code>double</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Utf8</code></td>
+<td><code>string</code></td>
+</tr>
+<tr>
+<td><code>Arrow::LargeUtf8</code></td>
+<td><code>large_string</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Binary</code></td>
+<td><code>binary</code></td>
+</tr>
+<tr>
+<td><code>Arrow::LargeBinary</code></td>
+<td><code>large_binary</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Decimal128(p, s)</code></td>
+<td><code>decimal:128:p:s</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Decimal256(p, s)</code></td>
+<td><code>decimal:256:p:s</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Date32</code></td>
+<td><code>date32:day</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Date64</code></td>
+<td><code>date64:ms</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Time32(TimeUnit)</code></td>
+<td><code>time32:s</code>, <code>time32:ms</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Time64(TimeUnit)</code></td>
+<td><code>time64:us</code>, <code>time64:ns</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Timestamp(unit, tz)</code></td>
+<td><code>timestamp:unit:tz</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Duration(unit)</code></td>
+<td><code>duration:s</code>, <code>duration:ms</code>, <code>duration:us</code>, <code>duration:ns</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Struct</code></td>
+<td><code>struct</code></td>
+</tr>
+<tr>
+<td><code>Arrow::List(Element)</code></td>
+<td><code>list</code> or <code>list.struct</code> if element is Struct</td>
+</tr>
+<tr>
+<td><code>Arrow::LargeList(Element)</code></td>
+<td><code>large_list</code> or <code>large_list.struct</code></td>
+</tr>
+<tr>
+<td><code>Arrow::FixedSizeList(Element, Size)</code></td>
+<td><code>fixed_size_list:type:size</code></td>
+</tr>
+<tr>
+<td><code>Arrow::FixedSizeBinary(Size)</code></td>
+<td><code>fixed_size_binary:size</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Dictionary(KeyType, ValueType)</code></td>
+<td><code>dict:value_type:key_type:false</code></td>
+</tr>
+<tr>
+<td><code>Arrow::Map</code></td>
+<td><code>map</code></td>
+</tr>
+</tbody>
+</table>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Lance Table Format</div>
+        </a>
+        <a class="next" href="../versioning/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Versioning</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#data-types">Data Types</a>
+      <a class="ld-toc__h3" href="#primitive-types">Primitive Types</a>
+      <a class="ld-toc__h3" href="#floating-point-types">Floating Point Types</a>
+      <a class="ld-toc__h3" href="#string-and-binary-types">String and Binary Types</a>
+      <a class="ld-toc__h3" href="#decimal-types">Decimal Types</a>
+      <a class="ld-toc__h3" href="#date-and-time-types">Date and Time Types</a>
+      <a class="ld-toc__h3" href="#timestamp-types">Timestamp Types</a>
+      <a class="ld-toc__h3" href="#complex-types">Complex Types</a>
+      <a class="ld-toc__h3" href="#extension-types">Extension Types</a>
+      <a class="ld-toc__h2" href="#field-ids">Field IDs</a>
+      <a class="ld-toc__h3" href="#field-id-assignment">Field ID Assignment</a>
+      <a class="ld-toc__h3" href="#field-id-properties">Field ID Properties</a>
+      <a class="ld-toc__h3" href="#using-field-ids">Using Field IDs</a>
+      <a class="ld-toc__h2" href="#field-metadata">Field Metadata</a>
+      <a class="ld-toc__h3" href="#primary-key-metadata">Primary Key Metadata</a>
+      <a class="ld-toc__h3" href="#clustering-key-metadata">Clustering Key Metadata</a>
+      <a class="ld-toc__h3" href="#encoding-metadata">Encoding Metadata</a>
+      <a class="ld-toc__h3" href="#arrow-extension-type-metadata">Arrow Extension Type Metadata</a>
+      <a class="ld-toc__h2" href="#schema-protobuf-definition">Schema Protobuf Definition</a>
+      <a class="ld-toc__h3" href="#field-message">Field Message</a>
+      <a class="ld-toc__h3" href="#schema-message">Schema Message</a>
+      <a class="ld-toc__h2" href="#schema-evolution">Schema Evolution</a>
+      <a class="ld-toc__h2" href="#example-schemas">Example Schemas</a>
+      <a class="ld-toc__h3" href="#simple-table">Simple Table</a>
+      <a class="ld-toc__h3" href="#nested-structure">Nested Structure</a>
+      <a class="ld-toc__h3" href="#with-vector-embeddings">With Vector Embeddings</a>
+      <a class="ld-toc__h2" href="#type-conversion-reference">Type Conversion Reference</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

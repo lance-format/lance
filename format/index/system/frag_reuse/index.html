@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Fragment Reuse — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/index/system/frag_reuse/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../scalar/btree/">BTree</a>
+    <a href="../../scalar/bitmap/">Bitmap</a>
+    <a href="../../scalar/label_list/">Label List</a>
+    <a href="../../scalar/zonemap/">Zone Map</a>
+    <a href="../../scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../scalar/fts/">Full Text Search</a>
+    <a href="../../scalar/ngram/">N-gram</a>
+    <a href="../../scalar/fmindex/">FM-Index</a>
+    <a href="../../scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a class="active" href="./">Fragment Reuse</a>
+    <a href="../mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../../namespace/">Overview</a>
+    <a href="../../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../namespace/operations/">Overview</a>
+    <a href="../../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../../namespace/operations/models/">Operation Models</a>
+    <a href="../../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Index Formats</span>
+        <span>/</span><span>System Indices</span>
+        <span>/</span><b>Fragment Reuse</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="fragment-reuse-index">Fragment Reuse Index<a class="headerlink" href="#fragment-reuse-index" title="Permanent link">&para;</a></h1>
+<p>The Fragment Reuse Index (FRI) is an internal index that keeps existing indices
+usable while fragments are compacted or reclustered. It records how old physical
+row addresses map to new addresses, without changing surviving row values.</p>
+<h2 id="use-case-1-compact-fragments">Use Case 1: Compact Fragments<a class="headerlink" href="#use-case-1-compact-fragments" title="Permanent link">&para;</a></h2>
+<p>When data modifications happen against a Lance table, they can trigger compaction
+and index optimization at the same time to improve data layout and index coverage.
+By default, compaction remaps all indices to prevent read regression.
+This means both compaction and index optimization can modify the same index and
+cause one process to fail. Typically, compaction fails because it has to modify
+all indices and takes longer, resulting in table layout degrading over time.</p>
+<p>Fragment Reuse Index allows compaction to defer the index remap process.
+Suppose a compaction removes fragments A and B and produces C. At query runtime,
+the existing indices are reused by translating their addresses in A and B to
+addresses in C. Because indices are typically cached in memory after initial
+load, the translated index can be reused by subsequent queries.</p>
+<h2 id="use-case-2-recluster-fragments">Use Case 2: Recluster Fragments<a class="headerlink" href="#use-case-2-recluster-fragments" title="Permanent link">&para;</a></h2>
+<p>Fragments are often organized by data arrival order. Queries filtering by fields
+such as day or user UUID may therefore need to search many fragments or index
+segments. An external engine, such as Spark, can reorganize rows into destination
+fragments grouped by those fields.</p>
+<p>A <strong>stable partition</strong> assigns source rows to destination fragments while
+preserving their relative source order within each destination. This lets FRI
+reuse existing indices after reclustering. Sorting or arbitrarily shuffling rows
+within a destination requires a different mapping; it is not represented by the
+stable-partition format defined here.</p>
+<h2 id="index-details">Index Details<a class="headerlink" href="#index-details" title="Permanent link">&para;</a></h2>
+<p>FRI uses one system-index entry named <code>__lance_frag_reuse</code>. Its
+<code>IndexMetadata.index_details</code> contains <code>FragmentReuseIndexDetails</code>:</p>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">FragmentReuseIndexDetails</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">content</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="c1">// if &lt; 200KB, store the content inline, otherwise store the InlineContent bytes in external file</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="n">InlineContent</span><span class="w"> </span><span class="na">inline</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">InlineContent</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="c1">// Existing compaction records, with the original field number and contents.</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">Version</span><span class="w"> </span><span class="na">legacy_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="c1">// New mappings; requires index_version = 1.</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">Transition</span><span class="w"> </span><span class="na">transitions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">  </span><span class="c1">// One transition from source fragments to destination fragments.</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">Transition</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="c1">// Source fragments in scan order; counts include deleted rows.</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">FragmentDigest</span><span class="w"> </span><span class="na">sources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">    </span><span class="c1">// Destination fragments in label order; counts are recorded at creation.</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">FragmentDigest</span><span class="w"> </span><span class="na">destinations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">    </span><span class="cm">/* Exactly one mapping is required.</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="cm">     * New mapping types do not require an index_version increase if they preserve</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="cm">     * backward compatibility and older readers can handle them safely, including</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="cm">     * by falling back to a scan. Otherwise, index_version must increase.</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="cm">     * Other field numbers may be used for ordinary metadata.</span>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="cm">     */</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="w">    </span><span class="k">oneof</span><span class="w"> </span><span class="n">mapping</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="w">      </span><span class="cm">/* Concatenate surviving rows in source fragment order, preserving row order</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="cm">       * within each fragment, then split into destination fragments.</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="cm">       */</span>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="w">      </span><span class="n">OrderedCompaction</span><span class="w"> </span><span class="na">ordered_compaction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="w">      </span><span class="cm">/* Process source fragments sequentially, distributing their rows across</span>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="cm">       * destination fragments by label in source row order.</span>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="cm">       */</span>
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="w">      </span><span class="n">StablePartition</span><span class="w"> </span><span class="na">stable_partition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a>
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">OrderedCompaction</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a><span class="w">    </span><span class="c1">// RoaringTreemap of surviving source row addresses; missing rows are deleted.</span>
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">changed_row_addrs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-44"><a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a>
+</span><span id="__span-0-45"><a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">StablePartition</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-46"><a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a><span class="w">    </span><span class="c1">// UUID in _fri/&lt;map_id&gt;/stable_partition.lance; unchanged when the FRI UUID changes.</span>
+</span><span id="__span-0-47"><a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a><span class="w">    </span><span class="kt">string</span><span class="w"> </span><span class="na">map_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-48"><a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a><span class="w">    </span><span class="c1">// Size of stable_partition.lance in bytes.</span>
+</span><span id="__span-0-49"><a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">map_size_bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-50"><a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a><span class="w">    </span><span class="c1">// Unset: use the dataset base. Set: look up this ID in Manifest.base_paths.</span>
+</span><span id="__span-0-51"><a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a><span class="w">    </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">base_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-52"><a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-53"><a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a>
+</span><span id="__span-0-54"><a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">FragmentDigest</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-55"><a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-56"><a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a>
+</span><span id="__span-0-57"><a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">physical_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a>
+</span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_deleted_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a>
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a><span class="w">  </span><span class="c1">// A summarized version of the RewriteGroup information in a Rewrite transaction</span>
+</span><span id="__span-0-63"><a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">Group</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-64"><a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a><span class="w">    </span><span class="cm">/* A roaring treemap of the changed row addresses.</span>
+</span><span id="__span-0-65"><a id="__codelineno-0-65" name="__codelineno-0-65" href="#__codelineno-0-65"></a><span class="cm">     * When combined with the old fragment IDs and new fragment IDs,</span>
+</span><span id="__span-0-66"><a id="__codelineno-0-66" name="__codelineno-0-66" href="#__codelineno-0-66"></a><span class="cm">     * it can recover the full mapping of old row addresses to either new row addresses or deleted.</span>
+</span><span id="__span-0-67"><a id="__codelineno-0-67" name="__codelineno-0-67" href="#__codelineno-0-67"></a><span class="cm">     * this mapping can then be used to remap indexes or satisfy index queries for the new unindexed fragments.</span>
+</span><span id="__span-0-68"><a id="__codelineno-0-68" name="__codelineno-0-68" href="#__codelineno-0-68"></a><span class="cm">     */</span>
+</span><span id="__span-0-69"><a id="__codelineno-0-69" name="__codelineno-0-69" href="#__codelineno-0-69"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">changed_row_addrs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-70"><a id="__codelineno-0-70" name="__codelineno-0-70" href="#__codelineno-0-70"></a>
+</span><span id="__span-0-71"><a id="__codelineno-0-71" name="__codelineno-0-71" href="#__codelineno-0-71"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">FragmentDigest</span><span class="w"> </span><span class="na">old_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-72"><a id="__codelineno-0-72" name="__codelineno-0-72" href="#__codelineno-0-72"></a>
+</span><span id="__span-0-73"><a id="__codelineno-0-73" name="__codelineno-0-73" href="#__codelineno-0-73"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">FragmentDigest</span><span class="w"> </span><span class="na">new_fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-74"><a id="__codelineno-0-74" name="__codelineno-0-74" href="#__codelineno-0-74"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-75"><a id="__codelineno-0-75" name="__codelineno-0-75" href="#__codelineno-0-75"></a>
+</span><span id="__span-0-76"><a id="__codelineno-0-76" name="__codelineno-0-76" href="#__codelineno-0-76"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">Version</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-77"><a id="__codelineno-0-77" name="__codelineno-0-77" href="#__codelineno-0-77"></a><span class="w">    </span><span class="c1">// The dataset_version at the time the index adds this version entry</span>
+</span><span id="__span-0-78"><a id="__codelineno-0-78" name="__codelineno-0-78" href="#__codelineno-0-78"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">dataset_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-79"><a id="__codelineno-0-79" name="__codelineno-0-79" href="#__codelineno-0-79"></a>
+</span><span id="__span-0-80"><a id="__codelineno-0-80" name="__codelineno-0-80" href="#__codelineno-0-80"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">Group</span><span class="w"> </span><span class="na">groups</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-81"><a id="__codelineno-0-81" name="__codelineno-0-81" href="#__codelineno-0-81"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-82"><a id="__codelineno-0-82" name="__codelineno-0-82" href="#__codelineno-0-82"></a>
+</span><span id="__span-0-83"><a id="__codelineno-0-83" name="__codelineno-0-83" href="#__codelineno-0-83"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The outer <code>InlineContent</code> / <code>ExternalFile</code> choice applies to the entire history.
+Small histories are stored inline; larger histories store the serialized
+<code>InlineContent</code> in <code>_indices/&lt;FRI UUID&gt;/details.binpb</code>. Updating the history
+replaces the FRI metadata. Stable-partition row maps are separate immutable files
+and are not rewritten with that history.</p>
+<h3 id="fri-index-versions">FRI Index Versions<a class="headerlink" href="#fri-index-versions" title="Permanent link">&para;</a></h3>
+<p><code>IndexMetadata.index_version</code> identifies the format required to interpret FRI;
+it is not a dataset version or the sequence number of a rewrite.</p>
+<ul>
+<li><strong>Version 0</strong> retains the existing compaction format and read/write behavior.
+  <code>InlineContent.legacy_versions</code> keeps the original field number, 1, and wire
+  representation of <code>versions</code>.</li>
+<li><strong>Version 1</strong> adds <code>InlineContent.transitions</code> at field 2. It supports both
+  ordered compaction and stable partition. Each legacy group can be interpreted
+  as an ordered-compaction transition, forming one history with the new records.</li>
+</ul>
+<p>Adding a transition or a new mapping type does not itself require increasing
+<code>index_version</code>. Readers may skip unsupported mappings and fall back to scanning
+where a complete translation path is unavailable. Writers must reject operations
+that require interpreting or maintaining unsupported mappings; operations that
+carry the existing history unchanged need not interpret them. Changes to the
+shared metadata contract that require reader upgrades must increase <code>index_version</code>.</p>
+<h3 id="shared-transition-metadata">Shared Transition Metadata<a class="headerlink" href="#shared-transition-metadata" title="Permanent link">&para;</a></h3>
+<p>Each transition records ordered <code>sources</code> and <code>destinations</code>, plus exactly one
+mapping. A fragment digest contains its ID, physical row count, and deleted row
+count. Source counts describe the rewrite input; destination counts describe the
+newly written fragments, with zero deletions.</p>
+<p>Sources define scan order; destinations define output order for compaction and
+label order for stable partition. The surviving source row count must equal the
+total destination row count. Each fragment has at most one producer and one
+consumer in the retained history, and the graph must be acyclic. A fragment's
+physical row count stays constant across transitions; its deletion count may
+increase. Translation follows these dependencies, not the serialized list order.</p>
+<h2 id="mappings">Mappings<a class="headerlink" href="#mappings" title="Permanent link">&para;</a></h2>
+<h3 id="ordered-compaction">Ordered Compaction<a class="headerlink" href="#ordered-compaction" title="Permanent link">&para;</a></h3>
+<p>Ordered compaction concatenates surviving rows in source-fragment order, with
+ascending physical row offsets within each source, then splits that stream into
+the ordered destination fragments.</p>
+<p><code>changed_row_addrs</code> stores a serialized RoaringTreemap of surviving source
+addresses. A physical address uses the upper 32 bits for the fragment ID and the
+lower 32 bits for the row offset. A valid source row absent from the bitmap was
+deleted.</p>
+<p>To translate a surviving row, count the surviving rows in preceding source
+fragments and the surviving rows before its offset in its own fragment. Their
+sum is its zero-based position in the output stream. Find the destination whose
+cumulative physical-row range contains that position and subtract the start of
+that range to obtain the destination offset.</p>
+<p>The legacy <code>Group</code> and the new <code>OrderedCompaction</code> mapping use this same ordering
+and bitmap representation. No per-row destination labels are required.</p>
+<h3 id="stable-partition">Stable Partition<a class="headerlink" href="#stable-partition" title="Permanent link">&para;</a></h3>
+<p>A stable partition processes source fragments sequentially in their recorded
+order and assigns each surviving row a label: the zero-based position of its
+destination in <code>destinations</code>. Rows with the same label retain their relative
+source order. Deleted source rows carry a null label.</p>
+<p>The mapping payload is one immutable Lance file,
+<code>_fri/&lt;map_id&gt;/stable_partition.lance</code>. <code>map_id</code> is a UUID independent of the FRI
+index UUID, so the file survives FRI metadata rewrites. <code>map_size_bytes</code> records
+its exact size. An unset <code>base_id</code> selects the dataset base; otherwise it selects
+the corresponding <code>Manifest.base_paths</code> entry. Relocating a dataset requires
+copying these files or updating their references.</p>
+<h4 id="row-map-file-schema">Row Map File Schema<a class="headerlink" href="#row-map-file-schema" title="Permanent link">&para;</a></h4>
+<p>The row map is a Lance file with one nullable <code>uint16</code> label per physical source
+row. Rows follow source-fragment order, then physical row offset within each
+fragment, including deleted rows.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">row_map_schema</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span><span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"label"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint16</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">True</span><span class="p">)])</span>
+</span></code></pre></div>
+<p>A label tells us which destination receives the row: <code>0</code> means
+<code>destinations[0]</code>, <code>1</code> means <code>destinations[1]</code>, and <code>null</code> means the row was
+deleted at rewrite time. It stores the destination's position in the list, not
+its fragment ID or row offset. The number of destinations must be between 1
+and 65,536, and each non-null label must be smaller than that number.</p>
+<h4 id="counts-matrix">Counts Matrix<a class="headerlink" href="#counts-matrix" title="Permanent link">&para;</a></h4>
+<p>Labels tell us the destination fragment. To find the row offset inside that
+fragment, we count earlier source rows with the same label.</p>
+<p>To avoid reading all earlier labels, source rows are divided into blocks.
+For each block and destination, the counts matrix stores the cumulative number
+of rows sent to that destination through the end of the block. Null labels are
+not counted. <code>block_rows</code> must be positive; the current writer uses 65,536.
+Only the final block may be shorter.</p>
+<p>The matrix is stored in a Lance global buffer. The schema metadata key
+<code>lance:stable_partition:counts_buffer_index</code> contains its buffer index as a
+decimal string. Readers locate the buffer through the normal Lance file metadata.</p>
+<p>The buffer starts with a 28-byte header, in this order:</p>
+<ul>
+<li>Magic: four bytes, <code>LSPC</code>.</li>
+<li>Version: <code>u32</code>, value 1.</li>
+<li>Representation: <code>u32</code>, value 0 for the dense grid.</li>
+<li>Number of destinations: <code>u32</code>.</li>
+<li>Rows per block: <code>u32</code>.</li>
+<li>Total physical source rows: <code>u64</code>.</li>
+</ul>
+<p>All integers are unsigned and little-endian. The header is followed by
+<code>ceil(total_rows / block_rows) * num_destinations</code> cumulative <code>u32</code> counts,
+ordered by block, then destination. No extra bytes are allowed. Unsupported
+versions or representations must be rejected.</p>
+<p>Counts must never decrease, and a block cannot contribute more live rows than
+its length. Final destination counts must match the destination digests. The
+label-file row count and header total must match the sum of source physical row
+counts. An empty file has no grid rows and zero destination totals.</p>
+<h4 id="address-translation">Address Translation<a class="headerlink" href="#address-translation" title="Permanent link">&para;</a></h4>
+<p>For source fragment <code>s</code> and row offset <code>o</code>:</p>
+<ol>
+<li>Find its label-file position: the physical row counts of all preceding source
+   fragments, plus <code>o</code>.</li>
+<li>Read the block containing that position. A null label means the row was deleted;
+   otherwise label <code>d</code> selects <code>destinations[d]</code>.</li>
+<li>The destination row offset is the count for <code>d</code> before this block, plus the
+   number of occurrences of <code>d</code> strictly before this row within the block.
+   The count before the first block is zero.</li>
+</ol>
+<p>For batch translation, read each requested block once. Initialize destination
+counters from the preceding counts row, then scan the block in order. Each
+non-null label takes the current counter as its offset and increments it.
+Opening FRI history does not require reading labels; translation only needs the
+counts matrix and the requested label blocks.</p>
+<h2 id="expected-use-pattern">Expected Use Pattern<a class="headerlink" href="#expected-use-pattern" title="Permanent link">&para;</a></h2>
+<p>When indexing or index remapping cannot keep up with compaction or reclustering,
+FRI allows fragment rewrites to proceed while retaining existing indices.
+Each rewrite that defers index remapping records its mapping: a reuse version
+in FRI index version 0, or transitions in index version 1. A rewrite publishes
+its mapping atomically, replacing the FRI entry in the same commit. A
+transition must reference only fragments committed no later than itself.
+Fragments not covered by any index are served by scanning, so correctness
+never depends on a mapping being present.</p>
+<p>Once all dependent indices have caught up, the corresponding history can be
+trimmed. Cleanup must retain intermediate transitions still needed to translate
+old addresses. External mapping files can be deleted only when no retained
+dataset version references them.</p>
+<h2 id="stable-row-ids">Stable Row IDs<a class="headerlink" href="#stable-row-ids" title="Permanent link">&para;</a></h2>
+<p>Older readers and writers did not expect both stable row IDs and a Fragment Reuse Index but are
+not prevented from opening tables that have both. These older systems could silently corrupt such
+tables. A table version that has both sets <code>FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS</code> in the reader and
+writer <a href="../../../table/versioning/#current-feature-flags">feature flags</a> to guard against this.</p>
+<h2 id="impacts">Impacts<a class="headerlink" href="#impacts" title="Permanent link">&para;</a></h2>
+<h3 id="conflict-resolution">Conflict Resolution<a class="headerlink" href="#conflict-resolution" title="Permanent link">&para;</a></h3>
+<p>Deferring index remapping avoids replacing existing indices during a fragment
+rewrite, reducing conflicts with concurrent index building or optimization.
+FRI does not remove conflicts between overlapping rewrites. See
+<a href="../../../table/transaction/#conflict-resolution">conflict resolution</a>.</p>
+<h3 id="index-load-cost">Index Load Cost<a class="headerlink" href="#index-load-cost" title="Permanent link">&para;</a></h3>
+<p>Loading affected indices requires translating their stored row addresses.
+Ordered compaction uses its bitmap and fragment layouts; stable partition also
+reads the required row-map blocks. Translated indices can be cached and reused.
+Longer mapping chains add translation work; trimming unused history reduces it.</p>
+<h3 id="reader-and-writer-compatibility">Reader and Writer Compatibility<a class="headerlink" href="#reader-and-writer-compatibility" title="Permanent link">&para;</a></h3>
+<p>The first commit publishing FRI index version 1 sets
+<code>FLAG_FRAGMENT_REUSE_INDEX</code> (1024) in both manifest flag fields. Subsequent
+manifests retain both bits. FRI index version 0 does not require this flag.</p>
+<p>Tables using stable row IDs do not support tagged histories; writers must not
+publish <code>index_version &gt;= 1</code> on them.</p>
+<p>The reader flag prevents older clients from partially interpreting the new
+history. The writer flag prevents them from dropping mappings when rewriting
+FRI metadata. Clients that do not support the corresponding flag must reject
+the read or write and require an upgrade. See
+<a href="../../../table/versioning/">feature flags</a>.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../vector/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Vector Indices</div>
+        </a>
+        <a class="next" href="../mem_wal/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">MemWAL</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#use-case-1-compact-fragments">Use Case 1: Compact Fragments</a>
+      <a class="ld-toc__h2" href="#use-case-2-recluster-fragments">Use Case 2: Recluster Fragments</a>
+      <a class="ld-toc__h2" href="#index-details">Index Details</a>
+      <a class="ld-toc__h3" href="#fri-index-versions">FRI Index Versions</a>
+      <a class="ld-toc__h3" href="#shared-transition-metadata">Shared Transition Metadata</a>
+      <a class="ld-toc__h2" href="#mappings">Mappings</a>
+      <a class="ld-toc__h3" href="#ordered-compaction">Ordered Compaction</a>
+      <a class="ld-toc__h3" href="#stable-partition">Stable Partition</a>
+      <a class="ld-toc__h2" href="#expected-use-pattern">Expected Use Pattern</a>
+      <a class="ld-toc__h2" href="#stable-row-ids">Stable Row IDs</a>
+      <a class="ld-toc__h2" href="#impacts">Impacts</a>
+      <a class="ld-toc__h3" href="#conflict-resolution">Conflict Resolution</a>
+      <a class="ld-toc__h3" href="#index-load-cost">Index Load Cost</a>
+      <a class="ld-toc__h3" href="#reader-and-writer-compatibility">Reader and Writer Compatibility</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>
