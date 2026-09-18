@@ -269,18 +269,13 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         }
         // `decoded_indices` holds one cumulative byte offset per row plus a final
         // sentinel, so the value bytes for the requested rows are the difference
-        // between the bounding entries.  Add the offsets the decode emits
-        // ((num_rows + 1) entries) for a faithful decoded size.
+        // between the bounding entries.  Only value bytes count: Arrow's i32
+        // limit constrains the final offset value, not the offset buffer size.
         let value_bytes = self
             .decoded_indices
             .value((rows_to_skip + num_rows) as usize)
             - self.decoded_indices.value(rows_to_skip as usize);
-        let bytes_per_offset = match self.offsets_type {
-            DataType::Int32 => 4u64,
-            DataType::Int64 => 8u64,
-            _ => return Ok(None),
-        };
-        Ok(Some(value_bytes + (num_rows + 1) * bytes_per_offset))
+        Ok(Some(value_bytes))
     }
 
     // Continuing the example from BinaryPageScheduler
@@ -612,10 +607,56 @@ mod tests {
         }
     }
 
-    /// Decoded size of `n` rows starting at `skip`: value bytes plus the
-    /// (n + 1) i32 offsets the decode emits.
+    /// Variable-width value bytes of `n` rows starting at `skip` (what the
+    /// output array's i32 offsets index into).
     fn expected_bytes(value_lens: &[u64], skip: usize, n: usize) -> u64 {
-        value_lens[skip..skip + n].iter().sum::<u64>() + (n as u64 + 1) * 4
+        value_lens[skip..skip + n].iter().sum::<u64>()
+    }
+
+    #[test]
+    fn test_unknown_size_pages_split_at_page_boundaries() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use std::collections::VecDeque;
+
+        /// A variable-width page that cannot report sizes (default
+        /// `variable_width_bytes` returns `None`).
+        #[derive(Debug)]
+        struct UnknownSizeStub;
+
+        impl PrimitivePageDecoder for UnknownSizeStub {
+            fn decode(&self, _rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+                Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                    bits_per_offset: 32,
+                    data: LanceBuffer::empty(),
+                    offsets: LanceBuffer::reinterpret_vec(vec![0_i32; num_rows as usize + 1]),
+                    num_values: num_rows,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+        }
+
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(UnknownSizeStub),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Each page's size is unknown, so pages must not stack in one batch:
+        // the batch takes the first page alone and stops at its boundary.
+        let limit = root.max_rows_to_drain(6, I32_OFFSET_BYTE_BUDGET).unwrap();
+        assert_eq!(limit.rows, 3);
     }
 
     #[test]

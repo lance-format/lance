@@ -11,7 +11,8 @@ use log::trace;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
 use crate::decoder::{
-    DrainLimit, FieldScheduler, LogicalPageDecoder, SchedulingJob, has_i32_offsets,
+    DrainLimit, FieldScheduler, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder, SchedulingJob,
+    has_i32_offsets,
 };
 use crate::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
@@ -410,12 +411,15 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
                     .unwrap_or(0);
                 Ok(DrainLimit { rows: fits, bytes })
             }
-            // The encoding cannot report sizes: conservatively charge the whole
-            // budget so nothing stacks onto this page's rows within the batch.
-            None => Ok(DrainLimit {
+            // The encoding cannot report sizes.  Only accept this page's rows when
+            // the batch has accumulated no variable-width bytes yet (the budget is
+            // still whole), and charge the entire budget so nothing stacks after
+            // them; otherwise contribute nothing so the batch ends before them.
+            None if byte_budget >= I32_OFFSET_BYTE_BUDGET => Ok(DrainLimit {
                 rows: num_rows,
                 bytes: byte_budget,
             }),
+            None => Ok(DrainLimit { rows: 0, bytes: 0 }),
         }
     }
 

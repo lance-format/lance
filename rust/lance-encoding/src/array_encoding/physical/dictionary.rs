@@ -141,11 +141,11 @@ struct DirectDictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
-    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
         // The decoded batch shares this page's dictionary values; Arrow
-        // concatenation may merge dictionaries, so charge the whole dictionary
-        // plus a pessimistic index width per row.
-        Ok(Some(self.decoded_dict.data_size() + num_rows * 8))
+        // concatenation may merge each page's values into one array, so charge
+        // the whole dictionary once per page.
+        Ok(Some(self.decoded_dict.data_size()))
     }
 
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
@@ -179,7 +179,7 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             .map(|i| strings.value_length(i) as u64)
             .max()
             .unwrap_or(0);
-        Ok(Some(num_rows * (max_value_len + 4)))
+        Ok(Some(num_rows * max_value_len))
     }
 
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {

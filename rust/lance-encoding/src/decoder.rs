@@ -2707,11 +2707,12 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock>;
 
-    /// Returns the variable-width bytes that decoding `num_rows` rows starting at
-    /// `rows_to_skip` will produce, or `None` when the encoding cannot report
-    /// sizes without decoding.  An upper bound is acceptable; callers use this to
-    /// keep i32 offset buffers within capacity, so over-estimating only splits
-    /// batches earlier while under-estimating would let them overflow.
+    /// Returns the variable-width **value** bytes (the bytes an offsets buffer
+    /// indexes into) that decoding `num_rows` rows starting at `rows_to_skip`
+    /// will produce, or `None` when the encoding cannot report sizes without
+    /// decoding.  An upper bound is acceptable; callers use this to keep i32
+    /// offset values within capacity, so over-estimating only splits batches
+    /// earlier while under-estimating would let them overflow.
     fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
         Ok(None)
     }
