@@ -637,19 +637,20 @@ struct ListDecodeTask {
     offset_type: DataType,
 }
 
-fn oversized_batch_error(items_field: &Field, requested_rows: u64, num_items: u64) -> Error {
+fn oversized_batch_error(items_field: &Field, row_range: Range<u64>, num_items: u64) -> Error {
     if items_field.data_type() == &DataType::UInt8 {
         Error::not_supported(format!(
             "Could not create array with more than 2GiB of string/binary data in a single batch \
-             ({requested_rows} rows would require {num_items} bytes). Please reduce the \
+             (rows {}..{} would require {num_items} bytes). Please reduce the \
              batch_size, set LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert the column \
-             to large_string/large_binary."
+             to large_string/large_binary.",
+            row_range.start, row_range.end
         ))
     } else {
         Error::not_supported(format!(
             "Could not create a list array with more than i32::MAX items in a single batch \
-             ({requested_rows} rows would require {num_items} items). Please reduce the \
-             batch_size."
+             (rows {}..{} would require {num_items} items). Please reduce the batch_size.",
+            row_range.start, row_range.end
         ))
     }
 }
@@ -802,7 +803,7 @@ impl LogicalPageDecoder for ListPageDecoder {
             let num_items = self.offsets[(self.rows_drained + num_rows) as usize] - item_start;
             return Err(oversized_batch_error(
                 self.items_field.as_ref(),
-                num_rows,
+                self.rows_drained..self.rows_drained + num_rows,
                 num_items,
             ));
         }
@@ -1310,7 +1311,7 @@ mod tests {
     fn oversized_binary_batch_error_is_actionable() {
         let error = oversized_batch_error(
             &Field::new("item", DataType::UInt8, false),
-            128,
+            32..160,
             i32::MAX as u64 + 1,
         );
         assert!(
@@ -1318,6 +1319,7 @@ mod tests {
                 .to_string()
                 .contains("more than 2GiB of string/binary data")
         );
+        assert!(error.to_string().contains("rows 32..160"));
         assert!(error.to_string().contains("batch_size"));
         assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
         assert!(error.to_string().contains("large_string/large_binary"));
