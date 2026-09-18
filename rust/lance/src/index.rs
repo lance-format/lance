@@ -6114,37 +6114,27 @@ mod tests {
             .collect()
     }
 
-    /// Between the floor and a codebook per partition, train fewer partitions.
+    /// The cap reduces a requested count only while the data cannot support it.
     #[tokio::test]
-    async fn test_create_index_in_the_reduced_partition_band() {
-        let test_dir = tempfile::tempdir().unwrap();
-        // 8 partitions want 8 * 256 = 2048 vectors; 1000 falls inside the band.
-        let mut dataset = small_vector_dataset(test_dir.path(), 1000).await;
+    async fn test_create_index_partition_cap_follows_the_data() {
+        // 8 partitions want 8 * 256 = 2048 vectors: 1000 falls inside the band
+        // where the count is reduced, 3000 clears it.
+        for (rows, expected) in [(1000, 3), (3000, 8)] {
+            let test_dir = tempfile::tempdir().unwrap();
+            let mut dataset = small_vector_dataset(test_dir.path(), rows).await;
 
-        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
+            let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, false)
+                .await
+                .unwrap();
 
-        // 1000 / 256 = 3.
-        assert_eq!(trained_partitions(&dataset).await, vec![3]);
-    }
-
-    /// A codebook's worth of vectors per partition trains the count as asked.
-    #[tokio::test]
-    async fn test_create_index_above_the_reduced_partition_band() {
-        let test_dir = tempfile::tempdir().unwrap();
-        // 8 * 256 = 2048, cleared by 3000.
-        let mut dataset = small_vector_dataset(test_dir.path(), 3000).await;
-
-        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        assert_eq!(trained_partitions(&dataset).await, vec![8]);
+            assert_eq!(
+                trained_partitions(&dataset).await,
+                vec![expected],
+                "{rows} vectors"
+            );
+        }
     }
 
     /// The cap counts the vectors IVF fits a centroid on, not codebook entries.
@@ -6577,31 +6567,44 @@ mod tests {
         );
     }
 
-    /// A multivector row holds many vectors, and the floor counts vectors.
-    ///
-    /// 100 rows of 10 vectors give the quantizer 1,000 to train from, so this
-    /// must train rather than defer on the row count.
+    /// A multivector row holds a list, so the floor counts the vectors in the
+    /// lists rather than the rows that carry them.
     #[tokio::test]
     async fn test_multivector_floor_counts_vectors_not_rows() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let mut dataset = multivector_dataset(test_dir.path(), 100, 10).await;
+        let sparse = {
+            let mut lengths = vec![0_usize; 100];
+            lengths[0] = 10;
+            lengths
+        };
+        // Lists per row, whether that trains, and the count that decides it.
+        let cases: [(Vec<usize>, bool, &str); 4] = [
+            (vec![10; 100], true, "100 rows of 10 vectors give 1,000"),
+            (vec![2; 10], false, "10 rows of 2 vectors give 20"),
+            (sparse, false, "one row holding 10 vectors still gives 10"),
+            (vec![0; 100], false, "empty lists give none"),
+        ];
 
-        // Multivector columns are cosine-only.
-        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
+        for (lengths, trains, why) in cases {
+            let test_dir = tempfile::tempdir().unwrap();
+            let mut dataset = multivector_dataset_with(test_dir.path(), &lengths).await;
 
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert!(
-            !indices[0]
+            // Multivector columns are cosine-only.
+            let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, false)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{why}: a table below the floor takes the index rather than failing: {error}")
+                });
+
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1, "{why}");
+            let covers_nothing = indices[0]
                 .fragment_bitmap
                 .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty),
-            "1,000 vectors across 100 rows are enough to train"
-        );
+                .is_some_and(roaring::RoaringBitmap::is_empty);
+            assert_eq!(!covers_nothing, trains, "{why}");
+        }
     }
 
     /// A table of `rows`, each holding `vectors_per_row` vectors.
@@ -6654,53 +6657,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Uneven lists are counted, not extrapolated from one of them.
-    ///
-    /// One row of ten vectors and ninety-nine empty ones hold ten vectors, not
-    /// a thousand, so this is still short of a 256-code codebook.
-    #[tokio::test]
-    async fn test_multivector_floor_counts_sparse_lists() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let mut lengths = vec![0_usize; 100];
-        lengths[0] = 10;
-        let mut dataset = multivector_dataset_with(test_dir.path(), &lengths).await;
-
-        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .expect("ten vectors should defer, not fail");
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
-    }
-
-    /// A column of empty lists holds no vectors at all.
-    #[tokio::test]
-    async fn test_multivector_floor_counts_empty_lists_as_none() {
-        let test_dir = tempfile::tempdir().unwrap();
-        let mut dataset = multivector_dataset_with(test_dir.path(), &[0; 100]).await;
-
-        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .expect("no vectors should defer, not fail");
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
-    }
-
     /// The partition cap counts a multivector row's whole list too.
     ///
     /// 1,000 vectors support three partitions; counting the 100 rows instead
@@ -6718,28 +6674,6 @@ mod tests {
 
         // 1,000 / 256 = 3, capped from the 8 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![3]);
-    }
-
-    /// And a multivector table that really is too small defers, not errors.
-    #[tokio::test]
-    async fn test_multivector_below_the_floor_defers() {
-        let test_dir = tempfile::tempdir().unwrap();
-        // 10 rows of 2 vectors is 20 — far short of a 256-code codebook.
-        let mut dataset = multivector_dataset(test_dir.path(), 10, 2).await;
-
-        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .expect("a small multivector table should take the index, not fail");
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert!(
-            indices[0]
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        );
     }
 
     /// The partition cap counts vectors, so blanks cannot inflate it.
