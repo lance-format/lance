@@ -216,6 +216,18 @@ async fn cleanup_transaction_file(
     }
 }
 
+/// Best-effort removal of files a shallow clone staged in the target before
+/// its commit conclusively failed (the relocated FRI entry's spilled
+/// `details.binpb`). Never called when the commit outcome is unknown: the
+/// clone may have landed and still need them.
+async fn cleanup_spilled_clone_files(object_store: &ObjectStore, spilled_files: &[Path]) {
+    for path in spilled_files {
+        if let Err(e) = object_store.delete(path).await {
+            log::warn!("Failed to clean up staged clone file '{}': {}", path, e);
+        }
+    }
+}
+
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
 enum CommitOutcome {
@@ -422,7 +434,11 @@ async fn do_commit_new_dataset(
     // copy would tie the verdict to the payload size instead.
     let may_change_schema = operation_may_change_schema(&pb_transaction);
 
+    // Files a shallow clone writes into the target before the manifest
+    // commit; deleted again when the commit conclusively fails.
+    let mut spilled_clone_files: Vec<Path> = Vec::new();
     let clone_source = if let Operation::Clone {
+        is_shallow,
         ref_version,
         ref_path,
         ..
@@ -433,7 +449,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -445,19 +461,80 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
-        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
-            source_store,
-            &source_manifest_location,
-            &source_manifest,
-        )
-        .await?;
-        Some((source_store, source_manifest_location, source_manifest))
+
+        // Prepare the cloned index metadata now: an uncloneable tagged FRI
+        // history must be rejected before anything is written to the target.
+        let indices = if let Some(index_section_pos) = source_manifest.index_section {
+            let reader = source_store.open(&source_manifest_location.path).await?;
+            let section: pb::IndexSection =
+                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            section
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        let new_base_id = source_manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|id| *id + 1)
+            .unwrap_or(0);
+        let mut updated_indices = Vec::with_capacity(indices.len());
+        for mut index in indices {
+            if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
+                // Restamp the entry's row-map references through the clone's
+                // base mapping and move the entry itself into the clone. A
+                // shallow clone leaves the row-map files where they are; a
+                // deep clone copies them into its own `_fri/` (the copy loop
+                // in `deep_clone`), so every reference becomes local.
+                let base_remap = if *is_shallow {
+                    crate::index::frag_reuse::CloneBaseRemap::Shallow { new_base_id }
+                } else {
+                    crate::index::frag_reuse::CloneBaseRemap::Deep
+                };
+                let (relocated, spilled) =
+                    crate::index::frag_reuse::relocate_tagged_entry_for_clone(
+                        source_store,
+                        &source_base_path,
+                        &source_manifest,
+                        store_registry.clone(),
+                        &index,
+                        base_remap,
+                        object_store,
+                        base_path,
+                    )
+                    .await?;
+                index = relocated;
+                spilled_clone_files.extend(spilled);
+            } else if !*is_shallow {
+                // Deep clone: keep metadata but normalize base to local.
+                index.base_id = None;
+            } else if index.base_id.is_none() {
+                // Same rule as the data files in `Manifest::shallow_clone`:
+                // only the source's own entries get the new base; entries
+                // already stamped keep their ids, which carry over into
+                // the clone's `base_paths` verbatim (a chained clone must
+                // not restamp an origin-based index onto the middle hop).
+                index.base_id = Some(new_base_id);
+            }
+            updated_indices.push(index);
+        }
+        Some((source_manifest, new_base_id, updated_indices))
     } else {
         None
     };
 
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &pb_transaction).await?
+        match write_transaction_file(object_store, base_path, &pb_transaction).await {
+            Ok(transaction_file) => transaction_file,
+            Err(err) => {
+                cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+                return Err(err);
+            }
+        }
     } else {
         String::new()
     };
@@ -470,16 +547,10 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_store, source_manifest_location, source_manifest)),
+        Some((source_manifest, new_base_id, updated_indices)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
-            let new_base_id = source_manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| *id + 1)
-                .unwrap_or(0);
             let new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
@@ -487,37 +558,10 @@ async fn do_commit_new_dataset(
                 branch_name.clone(),
                 transaction_file.clone(),
             );
-
-            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        if index.base_id.is_none() {
-                            // Same rule as the data files in
-                            // `Manifest::shallow_clone`: only the source's own
-                            // entries get the new base; entries already stamped
-                            // keep their ids, which carry over into the clone's
-                            // `base_paths` verbatim. A chained clone (clone of
-                            // a clone) must not restamp an origin-based index
-                            // onto the middle hop, where its files do not
-                            // exist.
-                            index.base_id = Some(new_base_id);
-                        }
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                vec![]
-            };
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest.clone();
+            let mut new_manifest = source_manifest;
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
             new_manifest.tag = None;
@@ -535,22 +579,6 @@ async fn do_commit_new_dataset(
             }
             new_manifest.fragments = Arc::new(new_frags);
 
-            // Indices: keep metadata but normalize base to local
-            let mut updated_indices = Vec::new();
-            if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                updated_indices = section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = None;
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-            }
             (new_manifest, updated_indices)
         }
     } else {
@@ -628,6 +656,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
@@ -666,6 +695,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(err)
         }
     }
