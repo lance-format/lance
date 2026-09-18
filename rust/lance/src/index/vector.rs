@@ -512,12 +512,7 @@ impl IndexParams for VectorIndexParams {
 ///
 /// The metadata-only row total settles anything already short of the floor, so
 /// the validity count runs only where its answer can change the verdict.
-///
-pub(crate) async fn has_vectors_to_train(
-    dataset: &Dataset,
-    column: &str,
-    minimum: usize,
-) -> Result<bool> {
+pub async fn has_vectors_to_train(dataset: &Dataset, column: &str, minimum: usize) -> Result<bool> {
     let total = dataset.count_rows(None).await?;
     if total < minimum && !is_multivector(dataset, column)? {
         return Ok(false);
@@ -655,14 +650,20 @@ fn vectors_per_partition(stages: &[StageParams]) -> Option<usize> {
     )
 }
 
+/// Rows a PQ codebook needs before it can be trained.
+///
+/// One row per code, which is `2^num_bits` — 256 at the default 8 bits, and not
+/// 256 at any other setting. `None` when the width does not fit a `usize`.
+pub fn pq_quantizer_minimum_rows(num_bits: usize) -> Option<usize> {
+    1_usize.checked_shl(num_bits as u32)
+}
+
 /// Rows a vector index's quantizer needs before it can be trained.
 ///
-/// One row per code, which is `2^num_bits` for PQ — 256 at the default 8 bits,
-/// and not 256 at any other setting. `None` for an index type whose stages name
-/// no quantizer with a row floor.
+/// `None` for an index type whose stages name no quantizer with a row floor.
 pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<usize> {
     stages.iter().find_map(|stage| match stage {
-        StageParams::PQ(pq) => 1_usize.checked_shl(pq.num_bits as u32),
+        StageParams::PQ(pq) => pq_quantizer_minimum_rows(pq.num_bits),
         _ => None,
     })
 }
