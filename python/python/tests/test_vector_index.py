@@ -2205,6 +2205,8 @@ def test_describe_index_runtime_hints_stored(tmp_path):
         num_sub_vectors=4,
         max_iters=100,
         sample_rate=512,
+        shuffle_partition_batches=512,
+        shuffle_partition_concurrency=3,
     )
     details = dataset.describe_indices()[0].details
     hints = details.get("runtime_hints", {})
@@ -2212,6 +2214,10 @@ def test_describe_index_runtime_hints_stored(tmp_path):
     assert hints.get("lance.ivf.sample_rate") == "512"
     assert hints.get("lance.pq.max_iters") == "100"
     assert hints.get("lance.pq.sample_rate") == "512"
+    # Both shuffle knobs have to survive the binding, not just the one that
+    # was already parsed there.
+    assert hints.get("lance.ivf.shuffle_partition_batches") == "512"
+    assert hints.get("lance.ivf.shuffle_partition_concurrency") == "3"
 
 
 def test_optimize_indices(indexed_dataset):
