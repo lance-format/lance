@@ -356,8 +356,15 @@ impl Transformer for RQTransformer {
                 DistanceType::L2 => res_norm_square.clone(),
                 DistanceType::Dot => {
                     // for dot, the add factor is `1 - v*c + |c|^2 = dist_v_c + |c|^2`
-                    let part_ids = &batch[PART_ID_COLUMN];
-                    let part_ids = part_ids.as_primitive::<UInt32Type>();
+                    let part_ids = batch
+                        .column_by_name(PART_ID_COLUMN)
+                        .ok_or_else(|| {
+                            Error::index(format!(
+                                "RQ Transform: column {} not found in batch",
+                                PART_ID_COLUMN
+                            ))
+                        })?
+                        .as_primitive::<UInt32Type>();
                     let centroids_norm_square = self.centroids_norm_square.as_ref().ok_or(
                         Error::index("RQ Transform: centroids norm square not found".to_string()),
                     )?;
@@ -427,7 +434,15 @@ impl Transformer for RQTransformer {
                 ));
             }
 
-            let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
+            let part_ids = batch
+                .column_by_name(PART_ID_COLUMN)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "RQ Transform: column {} not found in batch",
+                        PART_ID_COLUMN
+                    ))
+                })?
+                .as_primitive::<UInt32Type>();
             let rotated_centroids = self.rotated_centroids.as_ref().ok_or_else(|| {
                 Error::internal("RabitQ raw-query transformer is missing rotated centroids")
             })?;
@@ -500,11 +515,49 @@ mod tests {
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
     use crate::vector::transform::Transformer;
     use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
+    use lance_core::Error;
 
     use super::{
         ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
         RQTransformer, compute_raw_query_factors, error_factor_value,
     };
+
+    /// `batch[PART_ID_COLUMN]` panics when the column is absent, and the
+    /// transformer is public, so a caller that forgets the partition column
+    /// gets a panic out of a library call instead of the same
+    /// column-not-found error the vector and centroid-distance columns give.
+    #[test]
+    fn test_rq_transformer_reports_missing_partition_column() {
+        let rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap();
+        let transformer = RQTransformer::new(rq, DistanceType::L2, centroids, "vector").unwrap();
+
+        let residual_vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0f32, -2.0, 3.0, -4.0, 1.5, -2.5, 3.5, -4.5]),
+            8,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residual_vectors) as ArrayRef),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(vec![73.0f32])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        let err = transformer.transform(&batch).unwrap_err();
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "expected an Index error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(PART_ID_COLUMN),
+            "the error should name the missing column, got: {err}"
+        );
+    }
 
     #[test]
     fn test_rq_transformer_writes_multi_bit_ex_factors() {
