@@ -4387,7 +4387,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
         index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
+            Deprecated and ignored. Index building does not use the index cache.
+            Set ``index_cache_size_bytes`` when opening the dataset, or configure
+            the cache on a ``Session``.
         shuffle_partition_batches : int, optional
             The number of batches, using the row group size of the dataset, to include
             in each shuffle partition. Default value is 10240.
@@ -4549,6 +4551,14 @@ class LanceDataset(pa.dataset.Dataset):
           <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
+        if index_cache_size is not None:
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated and ignored when "
+                "creating an index. Set 'index_cache_size_bytes' when opening the "
+                "dataset, or configure the cache on a Session.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
         self._create_index_impl(
@@ -4668,6 +4678,14 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
+        if index_cache_size is not None:
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated and ignored when "
+                "creating an index. Set 'index_cache_size_bytes' when opening the "
+                "dataset, or configure the cache on a Session.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         is_scalar_segment_request = self._is_segment_native_scalar_index_type(
             index_type
         )
