@@ -800,6 +800,16 @@ impl Planner {
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
+            SQLExpr::IsNotDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsNotDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
             SQLExpr::InList {
                 expr,
                 list,
@@ -1686,6 +1696,22 @@ mod tests {
                 true, false, false, true, false, false, true, false, false, true,
             ])
         );
+    }
+
+    #[rstest]
+    #[case::distinct("a IS DISTINCT FROM b", [false, true, true, false])]
+    #[case::not_distinct("a IS NOT DISTINCT FROM b", [true, false, false, true])]
+    fn test_sql_is_distinct_from(#[case] filter: &str, #[case] expected: [bool; 4]) {
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, [Some(1), None, Some(2), None]),
+            ("b", Int32, [Some(1), Some(2), None, None])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.optimize_expr(planner.parse_filter(filter).unwrap());
+        let physical = planner.create_physical_expr(&expr.unwrap()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected.to_vec()));
     }
 
     #[test]
