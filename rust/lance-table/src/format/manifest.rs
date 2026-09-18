@@ -19,7 +19,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
+use crate::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, STICKY_PAIRED_FLAGS,
+};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -283,13 +285,20 @@ impl Manifest {
             // wholesale -- `covering_fields` included -- a build that predates
             // covering could then open it and read carried columns as keyed ones.
             // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
+            // over-fencing a clone is harmless, under-fencing one is not. The
+            // same holds for the stable-row-id fragment reuse fence: the clone
+            // copies both the stable row ids and the fragment reuse index, so it
+            // needs the same protection from older readers and writers.
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA
+                    | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS
+                    | STICKY_PAIRED_FLAGS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA
+                    | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS
+                    | STICKY_PAIRED_FLAGS),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,

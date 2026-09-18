@@ -62,7 +62,7 @@ use lance_index::scalar::{
     inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata, MAX_JSON_INDEX_NESTING};
 use log::info;
 use prost::{Message, Name};
 use tracing::instrument;
@@ -307,19 +307,34 @@ impl IndexDetails {
 
     /// Returns whether this build has a reader for the complete declared type.
     pub(crate) fn has_reader(&self) -> bool {
-        let Some((_, details_type_name)) = self.0.type_url.rsplit_once('/') else {
-            return false;
-        };
-        if details_type_name.is_empty() || details_type_name.starts_with('.') {
-            return false;
+        let mut details = self.0.clone();
+        for _ in 0..=MAX_JSON_INDEX_NESTING {
+            let Some((_, details_type_name)) = details.type_url.rsplit_once('/') else {
+                return false;
+            };
+            if details_type_name.is_empty() || details_type_name.starts_with('.') {
+                return false;
+            }
+            if details_type_name
+                .eq_ignore_ascii_case(&lance_index::pb::JsonIndexDetails::full_name())
+            {
+                match lance_index::pb::JsonIndexDetails::decode(details.value.as_slice())
+                    .ok()
+                    .and_then(|json| json.target_details)
+                {
+                    Some(target) => details = Arc::new(target),
+                    None => return false,
+                }
+                continue;
+            }
+            return details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
+                // MemWAL flush briefly wrote this pre-`pb` package name. Keep that
+                // exact historical native identity readable without accepting any
+                // other message that merely shares the VectorIndexDetails suffix.
+                || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
+                || SCALAR_INDEX_PLUGIN_REGISTRY.supports_details(details.as_ref());
         }
-
-        details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
-            // MemWAL flush briefly wrote this pre-`pb` package name. Keep that
-            // exact historical native identity readable without accepting any
-            // other message that merely shares the VectorIndexDetails suffix.
-            || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
-            || SCALAR_INDEX_PLUGIN_REGISTRY.supports_details(self.0.as_ref())
+        false
     }
 
     /// Returns the index version
@@ -572,7 +587,7 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
+    let frag_reuse_index = dataset.frag_reuse_index_for(index, metrics).await?;
 
     let index_cache = dataset
         .index_cache
@@ -613,7 +628,12 @@ pub(crate) async fn cached_scalar_index_container(
     dataset: &Dataset,
     uuid: &Uuid,
 ) -> Option<Arc<dyn ScalarIndex>> {
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let index_meta = dataset.load_index(uuid).await.ok().flatten()?;
+    let frag_reuse_uuid = dataset
+        .frag_reuse_index_for(&index_meta, &NoOpMetricsCollector)
+        .await
+        .ok()?
+        .map(|index| index.uuid);
     let index_cache = dataset
         .index_cache
         .for_index(uuid, frag_reuse_uuid.as_ref());

@@ -55,8 +55,8 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
-use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
+use crate::index::{DatasetIndexInternalExt, stable_row_id_index_domain};
 use crate::index::{index_is_usable, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -1207,11 +1207,13 @@ pub(crate) async fn do_commit_detached_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_index_domain(
                 Some(dataset.manifest.as_ref()),
                 load_all_indices(dataset).await?.as_ref().clone(),
                 &transaction_file,
                 &write_config.to_build_config(),
+                None,
+                &stable_row_id_index_domain,
             )?,
         };
 
@@ -1559,12 +1561,13 @@ pub(crate) async fn commit_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest_with_read_version(
+            _ => transaction.build_manifest_with_index_domain(
                 Some(dataset.manifest.as_ref()),
                 load_all_indices(&dataset).await?.as_ref().clone(),
                 transaction_file,
                 &write_config.to_build_config(),
                 read_version_state,
+                &stable_row_id_index_domain,
             )?,
         };
 

@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
+use crate::index::{DatasetIndexInternalExt, effective_identifier_domain};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IdentifierDomain, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
@@ -43,8 +43,10 @@ impl Dataset {
     /// * Mapped destinations are not checked against the manifest and can be
     ///   stale, for example after every row of the destination fragment is deleted.
     /// * Not every compaction records an FRI: it requires `defer_index_remap`,
-    ///   fresh index-free tables do not receive one automatically, and datasets
-    ///   with stable row ids reject the option.
+    ///   and fresh index-free tables do not receive one automatically.
+    /// * With stable row ids the FRI still describes physical addresses. A table
+    ///   version with both sets reader and writer feature flags that older Lance
+    ///   versions, which could corrupt such a table, refuse.
     /// * Says nothing about deletion files, source-value changes, or whether an
     ///   address belongs to this table or branch.
     ///
@@ -84,6 +86,11 @@ impl Dataset {
 /// 2. it is at or past the reuse version's dataset version and no old fragment
 ///    in the version is still in its bitmap. A missing bitmap counts as caught
 ///    up, else the version could never be cleaned up.
+/// 3. it stores stable row ids, as indices on stable-row-id tables do today,
+///    which a rewrite does not move, and no old fragment in the version is still
+///    in its bitmap. Its data never needs the mapping; only coverage committed
+///    against fragments the version rewrote (an index created concurrently with
+///    the compaction) still does.
 ///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
@@ -124,12 +131,23 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
 
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
 
+    let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
+    let mut index_domains = Vec::with_capacity(indices.len());
+    for idx in indices.iter() {
+        index_domains.push((
+            idx,
+            effective_identifier_domain(idx, uses_stable_row_ids)? == IdentifierDomain::StableRowId,
+        ));
+    }
+
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
+        let check_results = index_domains
             .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
+            .map(|(idx, is_data_domain_stable)| {
+                is_index_remap_caught_up(version, idx, &chain_frag_bitmap, *is_data_domain_stable)
+            })
             .collect::<Vec<_>>();
 
         if check_results
@@ -195,6 +213,7 @@ fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
     index_meta: &IndexMetadata,
     chain_frag_bitmap: &RoaringBitmap,
+    is_data_domain_stable: bool,
 ) -> lance_core::Result<bool> {
     if is_system_index(index_meta) {
         return Ok(true);
@@ -211,7 +230,7 @@ fn is_index_remap_caught_up(
         return Ok(true);
     }
 
-    if index_meta.dataset_version < frag_reuse_version.dataset_version {
+    if !is_data_domain_stable && index_meta.dataset_version <= frag_reuse_version.dataset_version {
         return Ok(false);
     }
 
@@ -314,23 +333,26 @@ mod tests {
         // Non-covering, stale version: touches none of the rewritten frags, so
         // caught up despite version 5 < 10 (the case the old gate got wrong).
         assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), &chain, false)
+                .unwrap()
         );
 
         // Still holds an old fragment: not caught up.
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain, false)
+                .unwrap()
         );
 
         // Bitmap advanced onto the new fragment but data not yet remapped: not
         // caught up (why the chain must include new frags).
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain, false).unwrap()
         );
 
         // Once remapped (version advanced): caught up.
         assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain, false)
+                .unwrap()
         );
     }
 
@@ -345,7 +367,72 @@ mod tests {
 
         // Stale index (version 5) covering only v2's new fragment [7]: not
         // disjoint from the chain, so not caught up on v1.
-        assert_false!(is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain).unwrap());
+        assert_false!(
+            is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain, false).unwrap()
+        );
+    }
+
+    /// Stable-id entries never need the mapping, so the version gate does not
+    /// apply; only coverage that still names a rewritten fragment retains it.
+    #[test]
+    fn test_caught_up_stable_domain_needs_only_coverage() {
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+
+        // Coverage moved at commit, data untouched by design: caught up despite
+        // version 5 < 10.
+        assert_true!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain, true).unwrap()
+        );
+        // Committed concurrently against the rewritten fragments: retained until
+        // the coverage is repaired.
+        assert_false!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain, true)
+                .unwrap()
+        );
+    }
+
+    /// An index this build cannot classify may store addresses, so only coverage
+    /// disjoint from the chain counts as caught up.
+    #[test]
+    fn test_unknown_index_domain_retains_reuse_version() {
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let mut index = index_covering(10, &[1, 6]);
+        index.index_details = Some(std::sync::Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.FutureAddressIndexDetails".to_string(),
+            value: vec![],
+        }));
+        let is_data_domain_stable =
+            effective_identifier_domain(&index, true).unwrap() == IdentifierDomain::StableRowId;
+        assert_false!(is_data_domain_stable);
+        assert_false!(
+            is_index_remap_caught_up(&version, &index, &chain, is_data_domain_stable).unwrap()
+        );
+
+        index.fragment_bitmap = Some(RoaringBitmap::from_iter([1u32, 2]));
+        assert_true!(
+            is_index_remap_caught_up(&version, &index, &chain, is_data_domain_stable).unwrap()
+        );
+    }
+
+    /// A known type at a version this build cannot read may have changed domain.
+    #[test]
+    fn test_unsupported_index_version_retains_reuse_version() {
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let mut index = index_covering(10, &[1, 6]);
+        index.index_details = Some(std::sync::Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
+            value: vec![],
+        }));
+        index.index_version = 99;
+        let is_data_domain_stable =
+            effective_identifier_domain(&index, true).unwrap() == IdentifierDomain::StableRowId;
+        assert_false!(is_data_domain_stable);
+        assert_false!(
+            is_index_remap_caught_up(&version, &index, &chain, is_data_domain_stable).unwrap()
+        );
     }
 
     /// Whole-fragment removal (every row deleted, no replacement): an index
@@ -359,11 +446,13 @@ mod tests {
         let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
 
         // Index emptied by the deletion (empty bitmap): caught up.
-        assert_true!(is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain).unwrap());
+        assert_true!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain, false).unwrap()
+        );
 
         // Bitmap still lists the removed fragment (not yet updated): retained.
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain, false).unwrap()
         );
     }
 
@@ -423,6 +512,7 @@ mod tests {
                 &frag_reuse_details.versions[0],
                 scalar_index,
                 &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                false,
             )
             .unwrap()
         );
@@ -438,6 +528,7 @@ mod tests {
                 &frag_reuse_details.versions[0],
                 scalar_index,
                 &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                false,
             )
             .unwrap()
         );
@@ -537,6 +628,7 @@ mod tests {
                     &frag_reuse_details.versions[0],
                     index,
                     &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                    false,
                 )
                 .unwrap(),
                 "index {col}_idx was not caught up after remap"

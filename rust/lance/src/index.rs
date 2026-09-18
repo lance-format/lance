@@ -62,7 +62,9 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{
+    IdentifierDomain, IndexFile, IndexMetadata, list_index_files_with_sizes,
+};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -2061,7 +2063,9 @@ impl DatasetIndexExt for Dataset {
             let has_retired_coverage = segments
                 .iter()
                 .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
-            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+            let frag_reuse_index = self
+                .frag_reuse_index_for_row_id_entries(&NoOpMetricsCollector)
+                .await?;
             let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
                 segments.iter().any(|segment| {
                     append::fragment_reuse_affects_segment(
@@ -2725,6 +2729,27 @@ async fn gather_fragment_statistics(
     )))
 }
 
+/// [`IndexMetadata::identifier_domain`] that also treats an index version this build
+/// cannot read as unknown.
+pub(crate) fn effective_identifier_domain(
+    index: &IndexMetadata,
+    uses_stable_row_ids: bool,
+) -> Result<IdentifierDomain> {
+    if !uses_stable_row_ids {
+        return Ok(IdentifierDomain::RowAddress);
+    }
+    if unsupported_index_version(index).is_some() {
+        return Ok(IdentifierDomain::Unknown);
+    }
+    index.declared_identifier_domain()
+}
+
+/// [`effective_identifier_domain`] for the manifest build, which classifies for
+/// stable-row-id tables.
+pub(crate) fn stable_row_id_index_domain(index: &IndexMetadata) -> Result<IdentifierDomain> {
+    effective_identifier_domain(index, true)
+}
+
 /// `None` when this build supports the index's version, otherwise the highest
 /// version it does support.
 ///
@@ -2910,8 +2935,27 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         name: &str,
     ) -> Result<LogicalVectorIndex>;
 
-    /// Opens the fragment reuse index
+    /// Opens the fragment reuse index. Use it for fragment coverage; index data
+    /// goes through [`Self::frag_reuse_index_for`], which honors the index's
+    /// identifier domain.
     async fn open_frag_reuse_index(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
+
+    /// The fragment reuse index to remap `index`'s stored identifiers through: `None`
+    /// when there is none or `index` stores stable row ids, an error when its domain is
+    /// unknown to this build.
+    async fn frag_reuse_index_for(
+        &self,
+        index: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
+
+    /// [`Self::frag_reuse_index_for`] for an index being built or merged, whose
+    /// entries are the `_rowid` column and which has no metadata to classify yet:
+    /// stable row ids on this dataset, row addresses otherwise.
+    async fn frag_reuse_index_for_row_id_entries(
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
@@ -2953,7 +2997,14 @@ impl DatasetIndexInternalExt for Dataset {
         // Checking for cache existence is cheap so we just check the vector caches.
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        let frag_reuse_uuid = self
+            .frag_reuse_index_for(&index_meta, metrics)
+            .await?
+            .map(|index| index.uuid);
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -2980,10 +3031,6 @@ impl DatasetIndexInternalExt for Dataset {
         // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
         // file list (available since file sizes tracking was added). If the file list is not
         // available (older indices), we fall back to checking file existence via HEAD request.
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
         // Check if this is a vector index by looking at the files list
         let is_vector_index = if let Some(files) = &index_meta.files {
@@ -3032,11 +3079,12 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        let frag_reuse_index = self.frag_reuse_index_for(&index_meta, metrics).await?;
+        let frag_reuse_uuid = frag_reuse_index.as_ref().map(|index| index.uuid);
         let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
@@ -3044,7 +3092,6 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
                 .reconstruct(
@@ -3062,7 +3109,6 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(cached.0.clone());
         }
 
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()
@@ -3401,6 +3447,37 @@ impl DatasetIndexInternalExt for Dataset {
             Ok(Some(index))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn frag_reuse_index_for(
+        &self,
+        index: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
+        match effective_identifier_domain(index, self.manifest.uses_stable_row_ids())? {
+            IdentifierDomain::RowAddress => self.open_frag_reuse_index(metrics).await,
+            IdentifierDomain::StableRowId => Ok(None),
+            IdentifierDomain::Unknown => Err(Error::not_supported(format!(
+                "index {} ({}) stores identifiers of a type unknown to this build: {}",
+                index.name,
+                index.uuid,
+                index
+                    .index_details
+                    .as_ref()
+                    .map_or("no details", |details| details.type_url.as_str())
+            ))),
+        }
+    }
+
+    async fn frag_reuse_index_for_row_id_entries(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
+        if self.manifest.uses_stable_row_ids() {
+            Ok(None)
+        } else {
+            self.open_frag_reuse_index(metrics).await
         }
     }
 
@@ -12330,6 +12407,11 @@ mod tests {
     /// Both sides therefore have to count the same indices: planning from the
     /// filtered view while the commit carries the complete one makes compaction
     /// fail outright on a dataset holding an index from a newer build.
+    ///
+    /// The index survives, but this build cannot tell whether a version it cannot
+    /// read still stores stable row ids, so the rewrite withdraws its coverage of
+    /// the rewritten fragments instead of advancing it. Queries fall back to
+    /// scanning until a writer that can read the index rebuilds that coverage.
     #[tokio::test]
     async fn test_compaction_survives_an_unsupported_index() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -12352,6 +12434,7 @@ mod tests {
             .train(false)
             .await
             .unwrap();
+        let readable_version = manifest_index(&dataset, "id_idx").await.index_version;
         hide_index_from_this_build(&mut dataset, "id_idx").await;
 
         // A fragment the index does not cover, so a bin holding it together with
@@ -12367,6 +12450,8 @@ mod tests {
         .await
         .unwrap();
         let before = manifest_index(&dataset, "id_idx").await;
+        let filter = Some("id < 3".to_string());
+        assert_eq!(dataset.count_rows(filter.clone()).await.unwrap(), 6);
 
         let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
@@ -12380,15 +12465,44 @@ mod tests {
         let after = manifest_index(&dataset, "id_idx").await;
         assert_eq!(after.uuid, before.uuid);
         assert_eq!(after.index_version, before.index_version);
+        assert_eq!(after.fields, before.fields);
+        assert_eq!(after.index_details, before.index_details);
+        // Every fragment it covered was rewritten, and it claims none of the replacements.
+        assert!(after.fragment_bitmap.as_ref().unwrap().is_empty());
+        assert_eq!(dataset.count_rows(filter.clone()).await.unwrap(), 6);
+
+        // A writer that can read the index rebuilds its coverage.
+        let mut readable = after.clone();
+        readable.index_version = readable_version;
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![readable],
+                        removed_indices: vec![after],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .name("id_idx".to_string())
+            .replace(true)
+            .await
+            .unwrap();
+        let rebuilt = manifest_index(&dataset, "id_idx").await;
         let live = dataset
             .get_fragments()
             .iter()
             .map(|f| f.id() as u32)
             .collect::<RoaringBitmap>();
-        assert!(
-            !after.fragment_bitmap.unwrap().is_disjoint(&live),
-            "the surviving index covers only fragments the rewrite deleted"
-        );
+        assert_eq!(rebuilt.fragment_bitmap.unwrap(), live);
+        assert_eq!(dataset.count_rows(filter).await.unwrap(), 6);
     }
 
     /// Without stable row ids a rewrite moves every row address, so each index
@@ -12398,8 +12512,9 @@ mod tests {
     /// longer exist. Those fragments are held back from the plan instead; the
     /// rest of the table still compacts.
     ///
-    /// The stable-row-id case is the test above: there the fragment-reuse index
-    /// repairs the coverage afterwards, so nothing has to be held back.
+    /// The stable-row-id case is the test above: there nothing is held back, and the
+    /// index instead loses coverage of the rewritten fragments until a compatible
+    /// writer rebuilds it.
     #[rstest]
     #[case::newer_version(UnreadableIndexKind::NewerVersion)]
     #[case::unknown_type(UnreadableIndexKind::UnknownType)]

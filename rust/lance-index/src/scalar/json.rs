@@ -123,6 +123,10 @@ impl ScalarIndex for JsonIndex {
             .await
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.target_index.results_are_row_addresses()
+    }
+
     fn can_remap(&self) -> bool {
         self.target_index.can_remap()
     }
@@ -1008,14 +1012,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        // TODO: Allow return Result here
-        let registry = self.registry().unwrap();
+        let registry = self.registry().ok()?;
         let json_details =
-            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
-        let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
+        let target_details = json_details.target_details.as_ref()?;
+        let target_plugin = registry.get_plugin_by_details(target_details).ok()?;
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
+        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
         Some(Box::new(JsonQueryParser::new(
             json_details.path.clone(),
             target_parser,
@@ -1062,6 +1065,35 @@ mod tests {
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
+
+    #[test]
+    fn test_nested_json_query_parser() {
+        use prost::Message;
+        let json_type_url = "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string();
+        let btree = prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
+            value: vec![],
+        };
+        let inner = prost_types::Any {
+            type_url: json_type_url.clone(),
+            value: crate::pb::JsonIndexDetails {
+                path: "a".to_string(),
+                target_details: Some(btree),
+            }
+            .encode_to_vec(),
+        };
+        let outer = prost_types::Any {
+            type_url: json_type_url,
+            value: crate::pb::JsonIndexDetails {
+                path: "b".to_string(),
+                target_details: Some(inner),
+            }
+            .encode_to_vec(),
+        };
+        let registry = crate::registry::IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_details(&outer).unwrap();
+        assert!(plugin.new_query_parser("idx".to_string(), &outer).is_some());
+    }
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection

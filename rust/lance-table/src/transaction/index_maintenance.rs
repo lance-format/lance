@@ -10,7 +10,7 @@
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
 use crate::format::overlay::staleness::collect_overlay_stale_frags;
-use crate::format::{Fragment, IndexMetadata};
+use crate::format::{Fragment, IdentifierDomain, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::transaction::{RewriteGroup, RewrittenIndex, Transaction};
@@ -27,6 +27,7 @@ impl Transaction {
         fields_for_preserving_frag_bitmap: &[u32],
         original_overlaid_frags: &HashMap<u32, &Fragment>,
         schema: &Schema,
+        index_domain: &dyn Fn(&IndexMetadata) -> Result<IdentifierDomain>,
     ) -> Result<()> {
         if pure_update_frag_ids.is_empty() {
             return Ok(());
@@ -39,7 +40,7 @@ impl Transaction {
         for index in indices.iter_mut() {
             // Physical row addresses cannot follow moved rows into a new fragment.
             // Leave that fragment uncovered so the scanner reads it directly.
-            if index.results_are_row_addrs() {
+            if index_domain(index)? != IdentifierDomain::StableRowId {
                 continue;
             }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {

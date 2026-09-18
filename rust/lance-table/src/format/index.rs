@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::pb;
 use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
+use prost::Message;
 
 /// Metadata about a single file within an index segment.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -93,6 +94,77 @@ pub struct IndexMetadata {
     pub files: Option<Vec<IndexFile>>,
 }
 
+/// Full type name after the last `/`, case-insensitive, as the index registry matches.
+fn type_name_is(type_url: &str, full_name: &str) -> bool {
+    type_url
+        .rsplit_once('/')
+        .map_or(type_url, |(_, name)| name)
+        .eq_ignore_ascii_case(full_name)
+}
+
+/// Deepest chain of JSON index wrappers this build follows.
+pub const MAX_JSON_INDEX_NESTING: usize = 4;
+
+/// The identifiers an index stores, which decides whether a fragment reuse index may
+/// remap them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifierDomain {
+    RowAddress,
+    StableRowId,
+    /// A detail type this build does not recognize; treat conservatively.
+    Unknown,
+}
+
+const ROW_ADDR_DETAILS: &[&str] = &[
+    "lance.table.ZoneMapIndexDetails",
+    // Lance 0.36 released the zone map details in the index package.
+    "lance.index.pb.ZoneMapIndexDetails",
+    "lance.index.pb.BloomFilterIndexDetails",
+    "lance.index.pb.FMIndexDetails",
+];
+
+/// Index types whose entries are the `_rowid` column.
+const ROW_ID_DETAILS: &[&str] = &[
+    "lance.table.BTreeIndexDetails",
+    "lance.table.BitmapIndexDetails",
+    "lance.table.LabelListIndexDetails",
+    "lance.table.NGramIndexDetails",
+    "lance.table.InvertedIndexDetails",
+    // Lance 0.36 released these in the index package.
+    "lance.index.pb.BTreeIndexDetails",
+    "lance.index.pb.BitmapIndexDetails",
+    "lance.index.pb.LabelListIndexDetails",
+    "lance.index.pb.NGramIndexDetails",
+    "lance.index.pb.InvertedIndexDetails",
+    "lance.index.pb.RTreeIndexDetails",
+    "lance.index.pb.VectorIndexDetails",
+    "lance.index.VectorIndexDetails",
+];
+
+fn type_url_domain(type_url: &str) -> IdentifierDomain {
+    if ROW_ADDR_DETAILS
+        .iter()
+        .any(|full_name| type_name_is(type_url, full_name))
+    {
+        IdentifierDomain::RowAddress
+    } else if ROW_ID_DETAILS
+        .iter()
+        .any(|full_name| type_name_is(type_url, full_name))
+    {
+        IdentifierDomain::StableRowId
+    } else {
+        IdentifierDomain::Unknown
+    }
+}
+
+/// `JsonIndexDetails.target_details` (field 2 in `index.proto`), decoded here because
+/// `lance-index` depends on this crate.
+#[derive(Clone, PartialEq, prost::Message)]
+struct JsonIndexDetailsTarget {
+    #[prost(message, optional, tag = "2")]
+    target_details: Option<prost_types::Any>,
+}
+
 impl IndexMetadata {
     pub fn effective_fragment_bitmap(
         &self,
@@ -135,22 +207,60 @@ impl IndexMetadata {
     }
 
     /// True when the index reports matches as physical row addresses rather than row ids
-    /// (`ScalarIndex::results_are_row_addresses`).
-    ///
-    /// Such an index cannot follow its data through a rewrite: the addresses it stores
-    /// name fragments and offsets, and neither kind supports remap.
+    /// (`ScalarIndex::results_are_row_addresses`), judged from the outer details type only.
+    #[deprecated(
+        since = "13.0.0",
+        note = "ignores the target of a JSON index and cannot report an unknown type; use identifier_domain"
+    )]
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
-            let is_fm = details
-                .type_url
-                .rsplit_once('/')
-                .is_some_and(|(_, details_type_name)| {
-                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-                });
-            details.type_url.ends_with("ZoneMapIndexDetails")
-                || details.type_url.ends_with("BloomFilterIndexDetails")
-                || is_fm
+            type_url_domain(&details.type_url) == IdentifierDomain::RowAddress
         })
+    }
+
+    /// The domain the index type declares for a stable-row-id table. Metadata without
+    /// details is a legacy row-id index. A JSON index answers in its target's domain, so
+    /// JSON details that do not decode or name no target are an error rather than a guess.
+    pub fn declared_identifier_domain(&self) -> Result<IdentifierDomain> {
+        let Some(outer) = self.index_details.as_ref() else {
+            return Ok(IdentifierDomain::StableRowId);
+        };
+        let mut details = outer.as_ref().clone();
+        for _ in 0..=MAX_JSON_INDEX_NESTING {
+            if !type_name_is(&details.type_url, "lance.index.pb.JsonIndexDetails") {
+                return Ok(type_url_domain(&details.type_url));
+            }
+            let json_details =
+                JsonIndexDetailsTarget::decode(details.value.as_slice()).map_err(|err| {
+                    Error::corrupt_file_named(
+                        "index metadata",
+                        format!(
+                            "index {} ({}) has JsonIndexDetails that do not decode: {err}",
+                            self.name, self.uuid
+                        ),
+                    )
+                })?;
+            details = json_details.target_details.ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "index metadata",
+                    format!(
+                        "index {} ({}) has JsonIndexDetails without target_details",
+                        self.name, self.uuid
+                    ),
+                )
+            })?;
+        }
+        Ok(IdentifierDomain::Unknown)
+    }
+
+    /// The identifiers this index stores. Without stable row ids every index stores row
+    /// addresses; with them the type decides, and remapping stable row ids as if they
+    /// were addresses rewrites unrelated rows.
+    pub fn identifier_domain(&self, uses_stable_row_ids: bool) -> Result<IdentifierDomain> {
+        if !uses_stable_row_ids {
+            return Ok(IdentifierDomain::RowAddress);
+        }
+        self.declared_identifier_domain()
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
@@ -642,21 +752,166 @@ mod tests {
         }
     }
 
+    fn json_details_over(target_type_url: &str) -> Vec<u8> {
+        json_details_over_any(prost_types::Any {
+            type_url: target_type_url.to_string(),
+            value: Vec::new(),
+        })
+    }
+
+    fn json_details_over_any(target: prost_types::Any) -> Vec<u8> {
+        JsonIndexDetailsTarget {
+            target_details: Some(target),
+        }
+        .encode_to_vec()
+    }
+
+    fn nested_json(depth: usize, innermost_type_url: &str) -> prost_types::Any {
+        let mut details = prost_types::Any {
+            type_url: innermost_type_url.to_string(),
+            value: Vec::new(),
+        };
+        for _ in 0..depth {
+            details = prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+                value: json_details_over_any(details),
+            };
+        }
+        details
+    }
+
     #[rstest]
-    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
-    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
-    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
-    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
-    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
-    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", vec![], IdentifierDomain::RowAddress)]
+    #[case::zone_map_v036_package("type.googleapis.com/lance.index.pb.ZoneMapIndexDetails", vec![], IdentifierDomain::RowAddress)]
+    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", vec![], IdentifierDomain::RowAddress)]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", vec![], IdentifierDomain::RowAddress)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", vec![], IdentifierDomain::RowAddress)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", vec![], IdentifierDomain::StableRowId)]
+    #[case::btree_v036_package("type.googleapis.com/lance.index.pb.BTreeIndexDetails", vec![], IdentifierDomain::StableRowId)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", vec![], IdentifierDomain::StableRowId)]
+    #[case::vector("type.googleapis.com/lance.index.pb.VectorIndexDetails", vec![], IdentifierDomain::StableRowId)]
+    #[case::vector_legacy_package("type.googleapis.com/lance.index.VectorIndexDetails", vec![], IdentifierDomain::StableRowId)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", vec![], IdentifierDomain::Unknown)]
+    #[case::foreign_zone_map_terminal_name("type.googleapis.com/example.ZoneMapIndexDetails", vec![], IdentifierDomain::Unknown)]
+    #[case::future_type("type.googleapis.com/lance.table.FutureAddressIndexDetails", vec![], IdentifierDomain::Unknown)]
+    #[case::json_over_zone_map(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.table.ZoneMapIndexDetails"),
+        IdentifierDomain::RowAddress
+    )]
+    #[case::json_over_v036_zone_map(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.index.pb.ZoneMapIndexDetails"),
+        IdentifierDomain::RowAddress
+    )]
+    #[case::json_upper_case_over_zone_map(
+        "type.googleapis.com/LANCE.INDEX.PB.JSONINDEXDETAILS",
+        json_details_over("type.googleapis.com/LANCE.TABLE.ZONEMAPINDEXDETAILS"),
+        IdentifierDomain::RowAddress
+    )]
+    #[case::json_over_btree(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.table.BTreeIndexDetails"),
+        IdentifierDomain::StableRowId
+    )]
+    #[case::json_over_unknown_target(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.table.FutureAddressIndexDetails"),
+        IdentifierDomain::Unknown
+    )]
+    fn test_identifier_domain(
+        #[case] type_url: &str,
+        #[case] value: Vec<u8>,
+        #[case] expected: IdentifierDomain,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
-            value: Vec::new(),
+            value,
         }));
 
-        assert_eq!(metadata.results_are_row_addrs(), expected);
+        assert_eq!(metadata.declared_identifier_domain().unwrap(), expected);
+        assert_eq!(metadata.identifier_domain(true).unwrap(), expected);
+        assert_eq!(
+            metadata.identifier_domain(false).unwrap(),
+            IdentifierDomain::RowAddress
+        );
+    }
+
+    #[test]
+    fn test_identifier_domain_follows_nested_json_up_to_the_cap() {
+        let zone_map = "type.googleapis.com/lance.table.ZoneMapIndexDetails";
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(nested_json(MAX_JSON_INDEX_NESTING, zone_map)));
+        assert_eq!(
+            metadata.declared_identifier_domain().unwrap(),
+            IdentifierDomain::RowAddress
+        );
+        metadata.index_details = Some(Arc::new(nested_json(MAX_JSON_INDEX_NESTING + 1, zone_map)));
+        assert_eq!(
+            metadata.declared_identifier_domain().unwrap(),
+            IdentifierDomain::Unknown
+        );
+    }
+
+    #[test]
+    fn test_identifier_domain_without_details_is_legacy_row_id() {
+        let metadata = index_metadata_with(vec![0], vec![]);
+        assert_eq!(
+            metadata.identifier_domain(true).unwrap(),
+            IdentifierDomain::StableRowId
+        );
+        assert_eq!(
+            metadata.identifier_domain(false).unwrap(),
+            IdentifierDomain::RowAddress
+        );
+    }
+
+    /// The deprecated method keeps judging by the outer type only.
+    #[test]
+    #[allow(deprecated)]
+    fn test_results_are_row_addrs_ignores_json_target() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            value: json_details_over("type.googleapis.com/lance.table.ZoneMapIndexDetails"),
+        }));
+        assert!(!metadata.results_are_row_addrs());
+        assert_eq!(
+            metadata.declared_identifier_domain().unwrap(),
+            IdentifierDomain::RowAddress
+        );
+
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.ZoneMapIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+        assert!(metadata.results_are_row_addrs());
+    }
+
+    /// The domain decides whether stored identifiers get rewritten, so JSON details
+    /// that establish no target are refused instead of read as "stable row ids".
+    #[rstest]
+    #[case::undecodable(vec![0xff], "do not decode")]
+    #[case::no_target(vec![], "without target_details")]
+    fn test_results_are_row_addrs_rejects_incomplete_json_details(
+        #[case] value: Vec<u8>,
+        #[case] expected_message: &str,
+    ) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            value,
+        }));
+
+        let error = metadata.declared_identifier_domain().unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert!(metadata.identifier_domain(true).is_err());
+        assert_eq!(
+            metadata.identifier_domain(false).unwrap(),
+            IdentifierDomain::RowAddress
+        );
     }
 
     #[rstest]

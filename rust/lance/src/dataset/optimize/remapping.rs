@@ -6,15 +6,15 @@
 
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::{DatasetIndexExt, effective_identifier_domain};
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
-use lance_table::format::{Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{Fragment, IdentifierDomain, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -245,11 +245,27 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // remapping a *sibling* index).
     let baseline_version = curr_index_meta.dataset_version;
     let has_unknown_coverage = curr_index_meta.fragment_bitmap.is_none();
+    // Stable row ids survive a rewrite, so such an index never needs its data
+    // remapped; only coverage committed against rewritten fragments (an index
+    // created concurrently with the compaction) can be stale.
+    let is_data_domain_stable = match effective_identifier_domain(
+        &curr_index_meta,
+        dataset.manifest.uses_stable_row_ids(),
+    )? {
+        IdentifierDomain::StableRowId => true,
+        IdentifierDomain::RowAddress => false,
+        IdentifierDomain::Unknown => {
+            return Err(Error::not_supported(format!(
+                "cannot remap index {} ({}): its identifier domain is unknown to this build",
+                curr_index_meta.name, curr_index_meta.uuid
+            )));
+        }
+    };
     let (should_remap, mut bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
         Some(mut index_frag_bitmap) => {
             let mut should_remap = false;
             for version in frag_reuse_index.details.versions.iter() {
-                let data_predates_version = baseline_version < version.dataset_version;
+                let data_predates_version = baseline_version <= version.dataset_version;
                 for group in version.groups.iter() {
                     let mut old_frag_in_index = 0;
                     for old_frag in group.old_frags.iter() {
@@ -271,7 +287,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                         }
                         index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
                         should_remap = true;
-                    } else if data_predates_version
+                    } else if !is_data_domain_stable
+                        && data_predates_version
                         && group
                             .new_frags
                             .iter()
@@ -299,8 +316,11 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result =
-        index::remap_index(dataset, index_id, frag_reuse_index.row_addr_remap()).await?;
+    let remap_result = if is_data_domain_stable {
+        RemapResult::Keep(*index_id)
+    } else {
+        index::remap_index(dataset, index_id, frag_reuse_index.row_addr_remap()).await?
+    };
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
@@ -327,16 +347,18 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     };
 
     let new_index_meta = match remap_result {
-        // Nothing to commit: either the composed remap emptied the index (every
-        // row deleted), matching the prior per-version behavior, or
-        // `index::remap_index` withdrew a covered index it cannot carry payload
-        // through. Either way the existing entry is left untouched.
+        // Nothing to commit: `index::remap_index` withdrew a covered index it
+        // cannot carry payload through, so the existing entry is left untouched.
         //
-        // The withdrawal case is unreachable here today: the only caller is
-        // `remap_column_index`, which refuses a covered index first. Compaction
-        // reaches that withdrawal through `DatasetIndexRemapper`, which handles
-        // `RemapResult::Drop` in `dataset/index.rs` rather than through here.
+        // Unreachable here today: the only caller is `remap_column_index`, which
+        // refuses a covered index first. Compaction reaches that withdrawal
+        // through `DatasetIndexRemapper`, which handles `RemapResult::Drop` in
+        // `dataset/index.rs` rather than through here.
         RemapResult::Drop => return Ok(()),
+        // Same files, new coverage: the composed remap emptied the index (every
+        // row deleted) or the index stores stable row ids and only its coverage
+        // was stale. The files stay where they are, which on a shallow clone is
+        // the source dataset, so the base travels with them.
         RemapResult::Keep(new_id) => IndexMetadata {
             uuid: new_id,
             name: curr_index_meta.name.clone(),
@@ -347,7 +369,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
-            base_id: None,
+            base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
