@@ -287,7 +287,13 @@ impl Transformer for RQTransformer {
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
-            return Ok(batch.clone());
+            // The fresh-encode path below ends by dropping these two columns,
+            // so drop them here too: both exits have to emit the same schema.
+            // `drop_column` is a no-op when the column is absent.
+            let batch = batch
+                .drop_column(&self.vector_column)?
+                .drop_column(CENTROID_DIST_COLUMN)?;
+            return Ok(batch);
         }
 
         let residual_vectors = batch
@@ -491,7 +497,9 @@ mod tests {
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, UInt8Type};
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+    use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_arrow::RecordBatchExt;
     use lance_linalg::distance::DistanceType;
 
     use crate::vector::bq::RQRotationType;
@@ -505,6 +513,66 @@ mod tests {
         ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
         RQTransformer, compute_raw_query_factors, error_factor_value,
     };
+
+    /// The fresh-encode path ends by dropping the vector and centroid-distance
+    /// columns, so the early return for an already-encoded batch has to drop
+    /// them too. Otherwise the same transformer emits two different schemas
+    /// depending on whether the codes were already there.
+    #[test]
+    fn test_rq_transformer_early_return_matches_fresh_encode_schema() {
+        let rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap();
+        let transformer = RQTransformer::new(rq, DistanceType::L2, centroids, "vector").unwrap();
+
+        let residual_vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0f32, -2.0, 3.0, -4.0, 1.5, -2.5, 3.5, -4.5]),
+            8,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residual_vectors) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(vec![73.0f32])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        let fresh = transformer.transform(&batch).unwrap();
+        assert!(fresh.column_by_name("vector").is_none());
+        assert!(fresh.column_by_name(CENTROID_DIST_COLUMN).is_none());
+
+        // Feed the encoded batch back in, with the input columns still attached,
+        // which is what the early return has to normalize.
+        let encoded_with_inputs = fresh
+            .try_with_column(
+                arrow_schema::Field::new(
+                    "vector",
+                    batch.column_by_name("vector").unwrap().data_type().clone(),
+                    true,
+                ),
+                batch.column_by_name("vector").unwrap().clone(),
+            )
+            .unwrap()
+            .try_with_column(
+                arrow_schema::Field::new(CENTROID_DIST_COLUMN, DataType::Float32, true),
+                batch.column_by_name(CENTROID_DIST_COLUMN).unwrap().clone(),
+            )
+            .unwrap();
+
+        let early = transformer.transform(&encoded_with_inputs).unwrap();
+        assert_eq!(
+            early.schema().fields().iter().collect::<Vec<_>>(),
+            fresh.schema().fields().iter().collect::<Vec<_>>(),
+            "the early return should emit the fresh-encode schema"
+        );
+    }
 
     #[test]
     fn test_rq_transformer_writes_multi_bit_ex_factors() {
