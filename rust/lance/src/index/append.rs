@@ -702,16 +702,32 @@ async fn rebuild_vector_segment(
 /// Both fields have to say so themselves: an absent file list or bitmap records
 /// that the segment was never measured, not that it is empty, and such a
 /// segment may still have an index file on disk.
+/// Whether a segment has no index data behind it, so training is the work it
+/// is waiting for.
+///
+/// Both halves carry weight. Coverage alone is not enough: a segment
+/// initialized from another dataset's model holds centroids while covering no
+/// fragments, and retraining it from its parameters would discard them.
+///
+/// The file list is read as "no files recorded", absent included. The manifest
+/// stores it as a repeated field whose empty case means "sizes unknown", so a
+/// segment that recorded an empty list reads back as absent after any commit —
+/// treating absent as "has files" would stop recognising a definition the first
+/// time anything else commits to the table.
+///
+/// A segment whose rows were all deleted answers this the same way, and wants
+/// the same outcome: nothing can be served from it, and a rebuild is what makes
+/// it useful again.
 fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
-    let wrote_no_files = metadata
+    let no_files_recorded = metadata
         .files
         .as_ref()
-        .is_some_and(|files| files.is_empty());
+        .is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
         .fragment_bitmap
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty);
-    wrote_no_files && covers_nothing
+    no_files_recorded && covers_nothing
 }
 
 async fn scan_vector_fragments(
