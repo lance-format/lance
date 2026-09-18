@@ -1285,9 +1285,6 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
     if let Some(v) = read_optional_u64(env, config, "maxUnflushedMemtableBytes")? {
         writer_config = writer_config.with_max_unflushed_memtable_bytes(v as usize);
     }
-    if let Some(v) = read_optional_u64(env, config, "manifestScanBatchSize")? {
-        writer_config = writer_config.with_manifest_scan_batch_size(v as usize);
-    }
     if let Some(v) = read_optional_u64(env, config, "backpressureLogIntervalMs")? {
         writer_config = writer_config.with_backpressure_log_interval(Duration::from_millis(v));
     }
