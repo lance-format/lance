@@ -560,7 +560,7 @@ impl KNNVectorDistanceExec {
     /// candidate set has nothing else to move. `k` feeds only the execute-time cut,
     /// never the schema or plan properties, so the rest of the node carries over.
     ///
-    /// Returns an error for a zero `k` on a batch node, matching [`Self::try_new_batch`].
+    /// Returns an error for a zero `k` on a batch node, matching `try_new_batch`.
     pub fn with_k(&self, k: usize) -> Result<Self> {
         if self.is_batch && k == 0 {
             return Err(Error::invalid_input(
