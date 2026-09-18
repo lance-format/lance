@@ -6,6 +6,7 @@ mod data_file_part;
 mod dataset_aggregate;
 mod dataset_common;
 mod dataset_concurrency_store;
+mod dataset_fts_combined_fields;
 #[cfg(feature = "geo")]
 mod dataset_geo;
 mod dataset_index;
