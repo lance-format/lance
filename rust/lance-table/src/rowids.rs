@@ -897,7 +897,11 @@ pub fn rechunk_sequences(
         chunked_sequences.push(sequence);
     }
 
-    if segment_iter.peek().is_some() {
+    // The fill loop drains empty segments only while a chunk still needs rows,
+    // so once the last chunk is satisfied any trailing empty segment is still
+    // sitting in the iterator. Those carry no ids; a segment the last chunk
+    // only partially consumed is not empty, so it is still excess.
+    if segment_iter.any(|segment| !segment.is_empty()) {
         return Err(too_many_segments_error(
             chunked_sequences.len(),
             total_chunks,
@@ -1797,6 +1801,44 @@ mod test {
 
         let elements: Vec<u64> = result[0].iter().collect();
         assert_eq!(elements, vec![0, 1]);
+
+        // trailing empty segments: the final chunk is satisfied, so the fill
+        // loop exits without draining the iterator. They carry no ids and must
+        // not be reported as excess.
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (trailing empty)
+            RowIdSequence::from(20..20), // [] - 0 elements (trailing empty)
+        ];
+        let chunk_sizes = vec![2];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1]);
+
+        // a segment with ids behind the trailing empties is still excess, and
+        // so is a segment the last chunk only partially consumed.
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),
+            RowIdSequence::from(10..10),
+            RowIdSequence::from(20..21),
+            RowIdSequence::from(30..30),
+        ];
+        let err = rechunk_sequences(input_sequences, vec![2], false).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("too many segments"),
+            "leftover ids should still be reported as excess, got: {err}"
+        );
+
+        let err = rechunk_sequences(vec![RowIdSequence::from(0..3)], vec![2], false).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("too many segments"),
+            "a partially consumed segment still holds ids, got: {err}"
+        );
     }
 
     #[test]
