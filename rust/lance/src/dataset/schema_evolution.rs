@@ -13,6 +13,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
+use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
@@ -472,6 +473,50 @@ pub(super) async fn add_columns(
         .await
 }
 
+/// What `alter_columns` refuses on a table with a MemWAL, and why.
+///
+/// Each is an alteration whose meaning depends on rows the commit cannot see.
+enum Unsupported {
+    /// A cast takes a new field id, which rows still in the WAL cannot be
+    /// matched to.
+    Retype,
+    /// Tightening a column to non-null is validated against the committed
+    /// fragments, and a row still in the MemWAL is not among them. Flushing
+    /// first does not close the window: a flush covers the generations open
+    /// when it starts, and writes keep arriving into the next one, so a null
+    /// can be accepted after the check and before the commit. That row is then
+    /// in a table whose schema forbids it, and every later merge of it fails.
+    Tightening,
+}
+
+/// Refuse `unsupported` when the table has a MemWAL attached.
+///
+/// A table without one is unaffected: the presence of a MemWAL is the only
+/// thing this looks at.
+///
+/// Takes the decision already made rather than the alterations themselves: a
+/// reference to them held across the await would have to be `Sync`.
+async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
+    let Some(unsupported) = unsupported else {
+        return Ok(());
+    };
+    if dataset.mem_wal_index_details().await?.is_none() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(match unsupported {
+        Unsupported::Retype => {
+            "cannot change a column's type on a table with a MemWAL attached: a cast takes a \
+             new field id, which rows still in the WAL cannot be matched to. Drop the MemWAL, \
+             or add a column of the new type and backfill it."
+        }
+        Unsupported::Tightening => {
+            "cannot make a column non-nullable on a table with a MemWAL attached: the check \
+             runs against the base table, and a write admitted into the WAL while it runs is \
+             not there to be checked. Drop the MemWAL first."
+        }
+    }))
+}
+
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
     let Some(first_fragment) = fragments.first() else {
         return;
@@ -737,6 +782,24 @@ pub(super) async fn alter_columns(
     dataset: &mut Dataset,
     alterations: &[ColumnAlteration],
 ) -> Result<()> {
+    let unsupported = if alterations.iter().any(|a| a.data_type.is_some()) {
+        Some(Unsupported::Retype)
+    } else if alterations.iter().any(|a| {
+        // Only a column that can currently hold a null is being tightened.
+        // Restating `nullable: false` on one that already forbids them asks
+        // for nothing, and is answered the same way on any table.
+        a.nullable == Some(false)
+            && dataset
+                .schema()
+                .field(&a.path)
+                .is_none_or(|field| field.nullable)
+    }) {
+        Some(Unsupported::Tightening)
+    } else {
+        None
+    };
+    reject_on_mem_wal(dataset, unsupported).await?;
+
     // Validate referenced columns exist and enforce NOT NULL when tightening
     // a column from nullable to non-nullable.
     let mut new_schema = dataset.schema().clone();
@@ -1155,6 +1218,73 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+
+    /// What the MemWAL guard refuses, and what it lets through.
+    ///
+    /// A retype and a genuine tightening are refused. Restating `nullable:
+    /// false` on a column that already forbids nulls asks for nothing, so it
+    /// is answered the same way a table without a MemWAL answers it.
+    #[tokio::test]
+    async fn alter_columns_on_a_mem_wal_table_refuses_only_what_it_must() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![Some(10i64)])),
+            ],
+        )
+        .unwrap();
+        let uri = format!("memory://mem_wal_alter_guard_{}", uuid::Uuid::new_v4());
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int32)])
+            .await
+            .expect_err("a retype must be refused");
+        assert!(
+            err.to_string().contains("cannot change a column's type"),
+            "unexpected error: {err}"
+        );
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).set_nullable(false)])
+            .await
+            .expect_err("tightening a nullable column must be refused");
+        assert!(
+            err.to_string()
+                .contains("cannot make a column non-nullable"),
+            "unexpected error: {err}"
+        );
+
+        // `id` already forbids nulls, so this asks for nothing.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+            .await
+            .expect("restating a column's existing nullability must be allowed");
+
+        // A rename is untouched by the guard.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
+            .await
+            .expect("a rename must be allowed");
+        assert!(dataset.schema().field("amount").is_some());
+    }
 
     #[test]
     fn test_merge_introduces_required_field() {

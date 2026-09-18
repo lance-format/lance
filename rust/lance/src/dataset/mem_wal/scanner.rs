@@ -42,6 +42,7 @@ mod collector;
 mod data_source;
 pub mod exec;
 mod fts_search;
+mod generation;
 mod planner;
 mod point_lookup;
 mod projection;
