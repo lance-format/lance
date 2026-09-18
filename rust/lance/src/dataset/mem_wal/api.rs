@@ -43,6 +43,19 @@
 //! the table keeps serving without the fresh tier's copy of it. Naming one that
 //! does not exist is still rejected at initialization, which is the last moment
 //! it can be corrected.
+//!
+//! A schema change begun on a handle opened before a MemWAL was installed
+//! commits past the installation. The refusals below read the MemWAL state from
+//! the caller's handle, and the conflict resolver treats the two commits as
+//! compatible in either order, so the table ends up holding a change the
+//! refusals exist to prevent. Closing it means giving the resolver the same
+//! MemWAL exception a merge already carries.
+//!
+//! Adding a column is not refused the way altering one is, so a transform that
+//! derives a non-nullable column -- a SQL expression over a non-null literal, or
+//! a stream whose schema says so -- puts a column on the table that a generation
+//! written earlier has no values for. Projecting it over one of those rows fails
+//! when the batch is built, because the column admits no nulls to fill.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1135,7 +1135,7 @@ impl LsmFtsSearchPlanner {
                     // bindings, which rebinding would collapse onto one field.
                     _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => {
                         match columns {
-                            [column] => query.clone().with_column(column.to_string())?,
+                            [column] => query.clone().with_column(column.clone())?,
                             _ => query.clone(),
                         }
                     }
