@@ -1673,6 +1673,7 @@ pub(crate) async fn commit_transaction(
             _ => {
                 let frag_reuse = match tagged_rewrite.take() {
                     Some(assembly) => FragReuseUpdate::Rewrite(assembly),
+                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
                     None => FragReuseUpdate::None,
                 };
                 let prepared =

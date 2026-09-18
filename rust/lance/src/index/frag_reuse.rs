@@ -552,10 +552,9 @@ fn encode_length_delimited_field(tag: u32, bytes: &[u8]) -> Vec<u8> {
 /// `Any` is decoded directly, so the envelope is parsed exactly once, by the
 /// ledger. Works for v0 entries too: legacy versions decode as lifted
 /// transitions.
-// The production caller went away when the sp-x-sp manifest diff was
-// replaced by merge-through-reassembly; the commit-path tests still verify
-// committed entries with it.
-#[cfg_attr(not(test), allow(dead_code))]
+// The sp-x-sp manifest diff caller went away when it was replaced by
+// merge-through-reassembly; the maintenance stack (trim derivation, tagged
+// remap planning) and the commit-path tests call it now.
 pub(crate) async fn decode_frag_reuse_ledger(
     dataset: &Dataset,
     entry: &IndexMetadata,
@@ -568,6 +567,29 @@ pub(crate) async fn decode_frag_reuse_ledger(
         entry.index_version,
         details,
         |file| async move { read_fri_external_file(dataset, entry, &file).await },
+    )
+    .await
+}
+
+/// Decode already-loaded FRI content bytes into a transition ledger. Used by
+/// maintenance paths that hold the entry's verbatim content (the trim's
+/// splice inputs and outputs, cleanup's reference resolution) and by tests.
+pub(crate) async fn decode_frag_reuse_ledger_from_content(
+    index_version: i32,
+    content: &[u8],
+) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
+    let inline = prost_types::Any {
+        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+        value: encode_length_delimited_field(1, content),
+    };
+    lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
+        index_version,
+        &inline,
+        |_| async {
+            Err(Error::invalid_input(
+                "re-wrapped FRI content is inline; no external read is possible",
+            ))
+        },
     )
     .await
 }
@@ -1531,6 +1553,18 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         }
     }
 
+    let entry = build_tagged_frag_reuse_entry(dataset, content, fragment_bitmap).await?;
+    Ok((entry, base_entry_version))
+}
+
+/// Package assembled tagged FRI content bytes into a fresh manifest entry,
+/// spilling to an external details file above the inline threshold. The
+/// content must already be validated (a decodable ledger); this only encodes.
+pub(crate) async fn build_tagged_frag_reuse_entry(
+    dataset: &Dataset,
+    content: Vec<u8>,
+    fragment_bitmap: RoaringBitmap,
+) -> lance_core::Result<IndexMetadata> {
     let index_id = Uuid::new_v4();
     let details_value = if content.len() > 204800 {
         let file_path = dataset
@@ -1547,10 +1581,10 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         };
         encode_length_delimited_field(2, &external_file.encode_to_vec())
     } else {
-        assembled.value
+        encode_length_delimited_field(1, &content)
     };
 
-    let entry = IndexMetadata {
+    Ok(IndexMetadata {
         uuid: index_id,
         name: FRAG_REUSE_INDEX_NAME.to_string(),
         fields: vec![],
@@ -1567,8 +1601,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
-    };
-    Ok((entry, base_entry_version))
+    })
 }
 
 #[cfg(test)]
