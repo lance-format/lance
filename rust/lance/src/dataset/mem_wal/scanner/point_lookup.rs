@@ -34,11 +34,13 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::generation::GenerationRead;
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::reconcile::relabel_to;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -108,6 +110,10 @@ pub struct LsmPointLookupPlanner {
     /// Prefix of the in-memory memtables this planner reads. Applies to the fast
     /// BTree probe and the plan fallback alike, so both resolve a key the same.
     visibility: MemTableVisibility,
+    /// `base_schema` with each field's id, which is what resolves a sealed
+    /// generation's columns to the table's. Defaults to `base_schema`, which
+    /// carries them when the caller built it from a Lance schema.
+    identity_schema: SchemaRef,
 }
 
 impl LsmPointLookupPlanner {
@@ -127,7 +133,7 @@ impl LsmPointLookupPlanner {
         Self {
             collector,
             pk_columns,
-            base_schema,
+            base_schema: Arc::clone(&base_schema),
             bloom_filters: std::collections::HashMap::new(),
             session: None,
             store_params: None,
@@ -136,7 +142,14 @@ impl LsmPointLookupPlanner {
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
             visibility: MemTableVisibility::Published,
+            identity_schema: base_schema,
         }
+    }
+
+    /// Supply the table's field ids, when `base_schema` was built without them.
+    pub fn with_identity_schema(mut self, identity_schema: SchemaRef) -> Self {
+        self.identity_schema = identity_schema;
+        self
     }
 
     /// Read the in-memory memtables at `visibility`. See
@@ -262,9 +275,13 @@ impl LsmPointLookupPlanner {
         for source in sources {
             let generation = source.generation().as_u64();
 
-            let scan = self
-                .build_source_scan(&source, projection, &filter_expr)
-                .await?;
+            // Type-erased, not merely boxed: the `Send` proof recurses
+            // through a boxed future's concrete type but stops at a trait
+            // object. An arm resolves a generation's schema before it
+            // scans, which nests deeply enough to need that.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, &filter_expr));
+            let scan = arm.await?;
 
             // Data is stored in reverse order, so first match is newest
             let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(scan, 0, Some(1)));
@@ -683,13 +700,31 @@ impl LsmPointLookupPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                // Carry `_tombstone` through so the post-coalesce filter can drop
-                // a deleted key (gen written before deletes existed lack it →
-                // `project_to_carry` synthesizes `false`).
+                // A sealed generation holds the names the table had when it was
+                // sealed, so the projection, the key filter and the output all
+                // go through the same resolution the scanner uses.
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.filter_expr(filter.clone());
-                Box::pin(scanner.create_plan()).await?
+                let generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    cols,
+                );
+                // Every generation stores every primary key column — a key
+                // cannot be added or dropped — so the key filter always moves.
+                let stored_filter = generation.to_stored(filter).ok_or_else(|| {
+                    lance_core::Error::internal(format!(
+                        "point lookup: `{filter}` names a column generation {} does not store",
+                        source.generation()
+                    ))
+                })?;
+                scanner.project(&generation.stored_projection())?;
+                scanner.filter_expr(stored_filter);
+                let scan = Box::pin(scanner.create_plan()).await?;
+                // `_tombstone` is carried through so the post-coalesce filter
+                // can drop a deleted key; a generation written before deletes
+                // existed lacks it and `project_to_carry` synthesizes `false`.
+                generation.reconcile(scan)?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -1007,11 +1042,13 @@ fn gather_rows(
             // Single row: zero-copy `slice` (the common point-lookup case, and
             // measurably faster than `take` — copying regressed single-thread
             // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
-            match &indices {
-                None => Ok(col.slice(rows[0] as usize, 1)),
-                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)
-                    .map_err(lance_core::Error::from),
-            }
+            let picked = match &indices {
+                None => col.slice(rows[0] as usize, 1),
+                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)?,
+            };
+            // The memtable stores each field's id inside a nested column's own
+            // type; the caller asked for the table's plain one.
+            relabel_to(&picked, f.data_type())
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(target.clone(), cols)?)
