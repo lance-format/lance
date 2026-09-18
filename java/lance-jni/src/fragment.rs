@@ -1037,6 +1037,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            file_metadata_size_bytes: None,
             base_id,
         })
     }
