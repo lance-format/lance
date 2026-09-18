@@ -25,6 +25,40 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Per-fragment offsets as RoaringBitmap bytes, the `Update` encoding.
+fn offset_bitmaps_to_proto(offsets: Option<&UpdatedFragmentOffsets>) -> HashMap<u64, Vec<u8>> {
+    offsets
+        .map(|UpdatedFragmentOffsets(m)| {
+            m.iter()
+                .filter(|(_, b)| !b.is_empty())
+                .map(|(frag_id, b)| {
+                    let mut buf = Vec::new();
+                    b.serialize_into(&mut buf)
+                        .expect("RoaringBitmap serialization cannot fail");
+                    (*frag_id, buf)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn offset_bitmaps_from_proto(
+    bitmaps: HashMap<u64, Vec<u8>>,
+    what: &str,
+) -> Result<Option<UpdatedFragmentOffsets>> {
+    let m = bitmaps
+        .into_iter()
+        .filter(|(_, bytes)| !bytes.is_empty())
+        .map(|(id, bytes)| {
+            let bitmap = RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(|e| {
+                Error::invalid_input(format!("invalid {what} for fragment {id}: {e}"))
+            })?;
+            Ok((id, bitmap))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    Ok((!m.is_empty()).then_some(UpdatedFragmentOffsets(m)))
+}
+
 impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
     fn from(DataReplacementGroup(fragment_id, new_file): &DataReplacementGroup) -> Self {
         Self {
@@ -373,12 +407,19 @@ impl TryFrom<pb::Transaction> for Transaction {
                 }
             }
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement {
+                    replacements,
+                    replaced_offset_bitmaps,
+                },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                replaced_offsets: offset_bitmaps_from_proto(
+                    replaced_offset_bitmaps,
+                    "replaced_offset_bitmaps",
+                )?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState { compacted_sstables },
@@ -673,14 +714,16 @@ impl From<&Transaction> for pb::Transaction {
                 schema_metadata: Default::default(),
                 field_metadata: Default::default(),
             }),
-            Operation::DataReplacement { replacements } => {
-                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
-                    replacements: replacements
-                        .iter()
-                        .map(pb::transaction::DataReplacementGroup::from)
-                        .collect(),
-                })
-            }
+            Operation::DataReplacement {
+                replacements,
+                replaced_offsets,
+            } => pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                replacements: replacements
+                    .iter()
+                    .map(pb::transaction::DataReplacementGroup::from)
+                    .collect(),
+                replaced_offset_bitmaps: offset_bitmaps_to_proto(replaced_offsets.as_ref()),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -810,6 +853,50 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+
+    /// A DataReplacement's source fields and replaced offsets survive the
+    /// protobuf round-trip; absent on the wire, they read back as no
+    /// dependencies and no offsets, which is what every older writer produced.
+    #[test]
+    fn test_data_replacement_dependencies_roundtrip() {
+        let operation = Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                4,
+                DataFile::new_legacy_from_fields("replacement.lance", vec![7], None),
+            )],
+            replaced_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                4,
+                roaring::RoaringBitmap::from_iter([2u32, 5, 9]),
+            )]))),
+        };
+        let transaction = Transaction::new(1, operation.clone(), None);
+        let message = pb::Transaction::from(&transaction);
+        let read_back = Transaction::try_from(message).unwrap();
+        assert_eq!(read_back.operation, operation);
+
+        let legacy = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::DataReplacement(
+                pb::transaction::DataReplacement {
+                    replacements: vec![pb::transaction::DataReplacementGroup::from(
+                        &DataReplacementGroup(
+                            4,
+                            DataFile::new_legacy_from_fields("replacement.lance", vec![7], None),
+                        ),
+                    )],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        match Transaction::try_from(legacy).unwrap().operation {
+            Operation::DataReplacement {
+                replaced_offsets, ..
+            } => assert!(replaced_offsets.is_none()),
+            other => panic!("expected DataReplacement, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {
