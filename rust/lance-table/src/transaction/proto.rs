@@ -179,7 +179,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    frag_reuse_index: None,
+                    frag_reuse: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -555,7 +555,7 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                frag_reuse_index: _,
+                frag_reuse: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -810,6 +810,35 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+
+    #[test]
+    fn test_rewrite_frag_reuse_update_stays_in_memory() {
+        // The fragment reuse update never enters the transaction file:
+        // other writers' conflict decisions only need the fragment sets in
+        // `groups`.
+        let mut rewrite = crate::transaction::FragmentReuseRewrite::new(vec![
+            crate::format::pb::fragment_reuse_index_details::Transition::default(),
+        ]);
+        rewrite.base_entry_version = Some(3);
+        let transaction = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse: Some(crate::transaction::FragReuseUpdate::AppendTransitions(
+                    rewrite,
+                )),
+            },
+            None,
+        );
+        let decoded = Transaction::try_from(pb::Transaction::from(&transaction)).unwrap();
+        match decoded.operation {
+            Operation::Rewrite { frag_reuse, .. } => {
+                assert!(frag_reuse.is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {

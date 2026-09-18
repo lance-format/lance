@@ -45,7 +45,12 @@ pub(super) async fn load_indices(
         if !super::index_is_usable(index) {
             continue;
         }
-        if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME {
+        // System indices are table-level metadata, not per-fragment query
+        // segments: they carry no fragment coverage (MemWAL stores
+        // `fragment_bitmap: None`) and have no remap plugin, so the coverage
+        // filtering below would silently drop them. Pass them through
+        // untouched.
+        if lance_table::system_index::is_system_index(index) {
             result[position] = Some(index.clone());
         } else {
             groups
@@ -371,7 +376,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -398,11 +403,11 @@ mod tests {
     use prost::encoding::WireType;
     use tokio::io::AsyncWriteExt;
     use uuid::Uuid;
-    pub(super) async fn fixture() -> Dataset {
+    pub async fn fixture() -> Dataset {
         fixture_with_index(IndexType::BTree).await
     }
 
-    pub(super) async fn fixture_with_index(index_type: IndexType) -> Dataset {
+    pub async fn fixture_with_index(index_type: IndexType) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
@@ -460,8 +465,35 @@ mod tests {
         dataset
     }
 
-    pub(super) async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
-        let batch = dataset.scan().try_into_batch().await.unwrap();
+    pub async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        prepare_partition(dataset, &source_ids, 10).await
+    }
+
+    /// [`prepare`] over a subset of fragments: scans `source_ids` in order,
+    /// alternates their rows across two uncommitted destinations numbered
+    /// from `dest_base_id`, and writes the row map for that partition.
+    pub async fn prepare_partition(
+        dataset: &Dataset,
+        source_ids: &[u64],
+        dest_base_id: u64,
+    ) -> (Transition, Vec<Fragment>) {
+        let source_fragments: Vec<Fragment> = source_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .fragments()
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let batch = {
+            let mut scan = dataset.scan();
+            scan.with_fragments(source_fragments.clone());
+            scan.try_into_batch().await.unwrap()
+        };
         let values = batch["i"].as_primitive::<Int32Type>();
         let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
         let mut destinations = Vec::new();
@@ -496,11 +528,11 @@ mod tests {
             destinations.extend(fragments);
         }
         for (i, fragment) in destinations.iter_mut().enumerate() {
-            fragment.id = 10 + i as u64;
+            fragment.id = dest_base_id + i as u64;
         }
         let mut source_rows = Vec::new();
         let mut sources = Vec::new();
-        for fragment in dataset.fragments().iter() {
+        for fragment in source_fragments.iter() {
             let deleted: Option<RoaringBitmap> = dataset
                 .get_fragment(fragment.id as usize)
                 .unwrap()
@@ -552,7 +584,7 @@ mod tests {
         (transition, destinations)
     }
 
-    pub(super) fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
+    pub fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         prost::encoding::encode_key(tag, WireType::LengthDelimited, &mut output);
         prost::encoding::encode_varint(bytes.len() as u64, &mut output);
@@ -562,7 +594,7 @@ mod tests {
 
     // Assemble a reader snapshot directly. Publishing rewrites and their FRI
     // deltas atomically belongs to the writer PR, not this test helper.
-    pub(super) async fn install(
+    pub async fn install(
         dataset: &mut Dataset,
         content: Vec<u8>,
         destinations: Vec<Fragment>,
@@ -633,7 +665,7 @@ mod tests {
 
     // Maintenance and clone reopen the manifest instead of using the query cache.
     // Persist the assembled fixture without requiring the future rewrite writer.
-    pub(super) async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
+    pub async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
         let mut manifest = dataset.manifest.as_ref().clone();
         manifest.version += 1;
         manifest.update_max_fragment_id();
@@ -684,9 +716,11 @@ mod tests {
         assert!(error.to_string().contains("Please upgrade"));
     }
 
+    // Deferred compaction is no longer in this list: on a tagged table it
+    // appends an ordered-compaction transition to the tagged entry (see the
+    // chained end-to-end test in `crate::index::frag_reuse`).
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
-    #[case::deferred_compaction("deferred")]
     #[case::statistics("statistics")]
     #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
@@ -709,11 +743,10 @@ mod tests {
         persist_fixture(&mut dataset, indices).await;
         let version = dataset.manifest.version;
         let error = match operation {
-            "eager" | "deferred" => crate::dataset::optimize::compact_files(
+            "eager" => crate::dataset::optimize::compact_files(
                 &mut dataset,
                 crate::dataset::optimize::CompactionOptions {
                     target_rows_per_fragment: 100,
-                    defer_index_remap: operation == "deferred",
                     ..Default::default()
                 },
                 None,
@@ -985,8 +1018,16 @@ mod tests {
                     .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
                     .unwrap();
                 assert_eq!(fri.index_version, 0);
-                assert_eq!(dataset.manifest.reader_feature_flags & 512, 0);
-                assert_eq!(dataset.manifest.writer_feature_flags & 512, 0);
+                assert_eq!(
+                    dataset.manifest.reader_feature_flags
+                        & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                    0
+                );
+                assert_eq!(
+                    dataset.manifest.writer_feature_flags
+                        & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                    0
+                );
                 assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
                 assert!(
                     dataset
@@ -1239,8 +1280,16 @@ mod tests {
                         .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
                         .unwrap();
                     assert_eq!(fri.index_version, 0);
-                    assert_eq!(snapshot.manifest.reader_feature_flags & 512, 0);
-                    assert_eq!(snapshot.manifest.writer_feature_flags & 512, 0);
+                    assert_eq!(
+                        snapshot.manifest.reader_feature_flags
+                            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                        0
+                    );
+                    assert_eq!(
+                        snapshot.manifest.writer_feature_flags
+                            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX,
+                        0
+                    );
                     assert!(
                         snapshot
                             .open_frag_reuse_index(&metrics)
@@ -1670,7 +1719,7 @@ mod tests {
                     Operation::Rewrite {
                         groups: vec![],
                         rewritten_indices: vec![],
-                        frag_reuse_index: None,
+                        frag_reuse: None,
                     },
                     None,
                 ),

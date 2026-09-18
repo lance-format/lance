@@ -548,8 +548,10 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    // TODO: pass frag_reuse_index when available
-                    frag_reuse_index: None,
+                    // Never carried through the bindings: reuse updates are
+                    // in-process commit state (TODO: expose the v0
+                    // ReplaceEntry snapshot when needed).
+                    frag_reuse: None,
                 };
                 Ok(Self(op))
             }

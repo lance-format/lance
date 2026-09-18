@@ -98,17 +98,17 @@ impl PartialEq for Operation {
                 Self::Rewrite {
                     groups: a_groups,
                     rewritten_indices: a_indices,
-                    frag_reuse_index: a_frag_reuse_index,
+                    frag_reuse: a_frag_reuse,
                 },
                 Self::Rewrite {
                     groups: b_groups,
                     rewritten_indices: b_indices,
-                    frag_reuse_index: b_frag_reuse_index,
+                    frag_reuse: b_frag_reuse,
                 },
             ) => {
                 compare_vec(a_groups, b_groups)
                     && compare_vec(a_indices, b_indices)
-                    && a_frag_reuse_index == b_frag_reuse_index
+                    && a_frag_reuse == b_frag_reuse
             }
             (
                 Self::Merge {
@@ -1035,7 +1035,7 @@ mod tests {
         let rewrite = Operation::Rewrite {
             groups: vec![],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
+            frag_reuse: None,
         };
         assert_ne!(overlay(1), rewrite);
     }
