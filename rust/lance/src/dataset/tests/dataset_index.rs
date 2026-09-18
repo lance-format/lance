@@ -86,7 +86,7 @@ async fn test_create_index(
         false,
     )]));
 
-    let float_arr = generate_random_array(512 * dimension as usize);
+    let float_arr = generate_random_array(2560 * dimension as usize);
     let vectors = Arc::new(
         <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
             float_arr, dimension,
@@ -667,7 +667,7 @@ async fn test_create_int8_index(
         false,
     )]));
 
-    let int8_arr = generate_random_int8_array(512 * dimension as usize);
+    let int8_arr = generate_random_int8_array(2560 * dimension as usize);
     let vectors = Arc::new(
         <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
             int8_arr, dimension,
