@@ -294,6 +294,17 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             ),
         }
     }
+
+    fn decompressed_size(&self, data: &[u8], offsets_bytes: &[u8], bits_per_offset: u8) -> Option<u64> {
+        // Get the size after the inner decompressor runs (this is the FSST-compressed size).
+        // Fall back to the raw data length if the inner decompressor can't report a size.
+        let fsst_compressed_size = self
+            .inner_decompressor
+            .decompressed_size(data, offsets_bytes, bits_per_offset)
+            .unwrap_or(data.len() as u64);
+        // FSST expands by at most 8× per value.
+        Some(fsst_compressed_size.saturating_mul(8))
+    }
 }
 
 #[derive(Debug)]
@@ -315,6 +326,20 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[crate::buffer::LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        // Delegate to the inner decompressor (BinaryMiniBlockDecompressor) to get
+        // the FSST-compressed byte count, then apply the 8× pessimistic bound.
+        let compressed_bytes =
+            self.inner_decompressor
+                .decoded_bytes_from_chunk(chunk_buffers, offset_in_chunk, num_rows)?;
+        Some(compressed_bytes.saturating_mul(8))
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding

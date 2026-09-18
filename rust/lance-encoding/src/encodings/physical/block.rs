@@ -142,6 +142,14 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn config(&self) -> CompressionConfig;
+
+    /// Returns the decompressed size of a single compressed value by reading its
+    /// frame header, without decompressing.
+    ///
+    /// Returns `None` if the format does not embed the decompressed size.
+    fn decompressed_size_of_value(&self, _compressed: &[u8]) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(feature = "zstd")]
@@ -296,6 +304,14 @@ mod zstd {
                 level: Some(self.compression_level),
             }
         }
+
+        fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            // compress() always writes an 8-byte LE decompressed-length prefix first.
+            if compressed.len() < 8 {
+                return None;
+            }
+            Some(u64::from_le_bytes(compressed[..8].try_into().unwrap()))
+        }
     }
 }
 
@@ -364,6 +380,14 @@ mod lz4 {
                 level: None,
             }
         }
+
+        fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            // compress_to_buffer with prepend_size=true writes a 4-byte LE size header.
+            if compressed.len() < 4 {
+                return None;
+            }
+            Some(u32::from_le_bytes(compressed[..4].try_into().unwrap()) as u64)
+        }
     }
 }
 
@@ -386,6 +410,10 @@ impl BufferCompressor for NoopBufferCompressor {
             scheme: CompressionScheme::None,
             level: None,
         }
+    }
+
+    fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+        Some(compressed.len() as u64)
     }
 }
 
@@ -623,6 +651,49 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             block_info: BlockInfo::new(),
         }))
     }
+
+    fn decompressed_size(&self, data: &[u8], offsets_bytes: &[u8], bits_per_offset: u8) -> Option<u64> {
+        // Iterate the per-value offset pairs and sum frame-header sizes.
+        // Each value was independently compressed so each has its own frame header.
+        let bytes_per_offset = bits_per_offset as usize / 8;
+        let num_offsets = offsets_bytes.len() / bytes_per_offset;
+        if num_offsets < 2 {
+            return Some(0);
+        }
+
+        let mut total = 0u64;
+        for i in 0..num_offsets - 1 {
+            let start = usize::try_from(read_offset(offsets_bytes, i, bits_per_offset)?).ok()?;
+            let end = usize::try_from(read_offset(offsets_bytes, i + 1, bits_per_offset)?).ok()?;
+            // Rebase: offsets stored in self.offsets are absolute into self.data, but
+            // offsets_bytes here is the raw slice starting at offset_starts[row_start],
+            // so the first offset value is the base we subtract.
+            let base =
+                usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
+            let val_start = start.checked_sub(base)?;
+            let val_end = end.checked_sub(base)?;
+            if val_start == val_end {
+                // Null / zero-length value — contributes 0 decompressed bytes.
+                continue;
+            }
+            let value_bytes = data.get(val_start..val_end)?;
+            total += self.compressor.decompressed_size_of_value(value_bytes)?;
+        }
+        Some(total)
+    }
+}
+
+/// Read an offset value (u32 or u64) from a packed byte slice at position `idx`.
+fn read_offset(offsets_bytes: &[u8], idx: usize, bits_per_offset: u8) -> Option<u64> {
+    let bpo = bits_per_offset as usize / 8;
+    let start = idx.checked_mul(bpo)?;
+    let end = start.checked_add(bpo)?;
+    let bytes = offsets_bytes.get(start..end)?;
+    Some(match bits_per_offset {
+        32 => u32::from_le_bytes(bytes.try_into().ok()?) as u64,
+        64 => u64::from_le_bytes(bytes.try_into().ok()?),
+        _ => return None,
+    })
 }
 
 impl BlockCompressor for CompressedBufferEncoder {
