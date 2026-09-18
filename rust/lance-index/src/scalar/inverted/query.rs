@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::inverted::DocumentGranularity;
-use crate::scalar::inverted::document_tokenizer::DocType;
+use crate::scalar::inverted::document_tokenizer::{DocType, JsonTokenizerMode};
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -899,18 +900,82 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
     Tokens::with_positions(tokens, positions, token_type)
 }
 
+#[doc(hidden)]
+pub fn effective_json_query_operator(
+    mode: Option<JsonTokenizerMode>,
+    query_tokens: &Tokens,
+    operator: Operator,
+) -> Operator {
+    if mode == Some(JsonTokenizerMode::FlattenedSubDocs)
+        && query_tokens.into_iter().any(|token| {
+            token
+                .split_once(',')
+                .is_some_and(|(path, value)| path.ends_with("$idx") && value.starts_with("number,"))
+        })
+    {
+        Operator::And
+    } else {
+        operator
+    }
+}
+
+/// Match tokens within a single internal document, propagating tokenization errors.
+///
+/// For JSON arrays, all required query positions must match the same sub-document.
+/// Tokens sharing a query position are alternatives.
+///
+/// ```
+/// use lance_index::scalar::InvertedIndexParams;
+/// use lance_index::scalar::inverted::query::{
+///     collect_query_tokens, document_matches_query, Operator,
+/// };
+///
+/// let mut tokenizer = InvertedIndexParams::default().build()?;
+/// let tokens = collect_query_tokens("alpha beta", &mut tokenizer);
+/// assert!(document_matches_query("alpha beta", &mut tokenizer, &tokens, Operator::And)?);
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn document_matches_query(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    query_tokens: &Tokens,
+    operator: Operator,
+) -> Result<bool> {
+    let sub_docs = tokenizer.token_streams_for_doc(text)?;
+    Ok(sub_docs.into_iter().any(|tokens| match operator {
+        Operator::Or => tokens
+            .iter()
+            .any(|token| query_tokens.contains(&token.text)),
+        Operator::And => {
+            let mut remaining_positions = (0..query_tokens.len())
+                .map(|index| query_tokens.position(index))
+                .collect::<RoaringBitmap>();
+            if remaining_positions.is_empty() {
+                return false;
+            }
+            for token in tokens {
+                for index in 0..query_tokens.len() {
+                    if token.text == query_tokens.get_token(index) {
+                        remaining_positions.remove(query_tokens.position(index));
+                    }
+                }
+                if remaining_positions.is_empty() {
+                    return true;
+                }
+            }
+            false
+        }
+    }))
+}
+
+/// Return whether any query token matches, treating tokenization errors as no match.
+#[deprecated(note = "use document_matches_query to propagate tokenization errors")]
 pub fn has_query_token(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
     query_tokens: &Tokens,
 ) -> bool {
-    let mut stream = tokenizer.token_stream_for_doc(text);
-    while let Some(token) = stream.next() {
-        if query_tokens.contains(&token.text) {
-            return true;
-        }
-    }
-    false
+    document_matches_query(text, tokenizer, query_tokens, Operator::Or).unwrap_or(false)
 }
 
 fn fill_match_query_columns(
@@ -1008,6 +1073,24 @@ pub fn fill_fts_query_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::InvertedIndexParams;
+
+    #[test]
+    fn test_document_match_query_position_alternatives() {
+        let mut tokenizer = InvertedIndexParams::default().build().unwrap();
+        let tokens = Tokens::with_positions(
+            vec!["red".to_string(), "blue".to_string(), "shoe".to_string()],
+            vec![0, 0, 1],
+            DocType::Text,
+        );
+        assert!(
+            document_matches_query("blue shoe", &mut tokenizer, &tokens, Operator::And).unwrap()
+        );
+        assert!(
+            !document_matches_query("red blue", &mut tokenizer, &tokens, Operator::And).unwrap()
+        );
+        assert!(document_matches_query("red blue", &mut tokenizer, &tokens, Operator::Or).unwrap());
+    }
 
     #[test]
     fn test_fuzzy_expansion_mode_and_unicode_auto_boundaries() {
