@@ -1051,6 +1051,7 @@ mod tests {
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
     use uuid::Uuid;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
@@ -3044,6 +3045,397 @@ mod tests {
                 .all(|file| !file.path.starts_with("staging/")),
             "stale staging files must not be committed in IndexMetadata.files"
         );
+    }
+
+    /// A merge whose staged fragments are only *partly* retired still needs the
+    /// mapping: intersecting the retired half away would drop its rows while the
+    /// surviving half made the coverage look healthy.
+    #[tokio::test]
+    async fn test_merge_uncommitted_segments_partly_retired_by_compaction() {
+        // Two undersized fragments and one already at the compaction target, so
+        // compaction rewrites the pair and leaves the third alone.
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
+            );
+        let test_dir = tempfile::tempdir().unwrap();
+        let dataset_uri = test_dir.path().to_str().unwrap();
+        Dataset::write(
+            reader,
+            dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 4,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let staged_fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let staged = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+            .name("in_flight".to_string())
+            .fragments(staged_fragments.clone())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("committed".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        // Two rows per fragment against a four-row target pairs some fragments
+        // and leaves at least one alone.
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let staged_coverage = staged.fragment_bitmap.clone().unwrap();
+        let live = dataset.fragment_bitmap.as_ref();
+        assert!(
+            !staged_coverage.is_subset(live) && !staged_coverage.is_disjoint(live),
+            "precondition: the staged coverage must be partly retired, staged {staged_coverage:?} live {live:?}"
+        );
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("committed".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+
+        let merged = dataset
+            .merge_existing_index_segments(vec![staged])
+            .await
+            .unwrap();
+
+        let coverage = merged
+            .fragment_bitmap
+            .as_ref()
+            .expect("a merged segment records its coverage");
+        assert_eq!(
+            coverage,
+            &(&staged_coverage & dataset.fragment_bitmap.as_ref()),
+            "with no applicable mapping the claim is exactly the staged fragments still live"
+        );
+        assert!(
+            !coverage.is_empty(),
+            "the surviving fragment must still be covered"
+        );
+    }
+
+    /// Trimming the fragment reuse index drops the mapping a staged segment still
+    /// needs: the trim only asks committed indices whether they have caught up,
+    /// and a staged segment is committed to nothing.
+    ///
+    /// The merge must not claim the compacted fragment. Row addresses come from
+    /// the dataset's own mapping, which no longer has the link, so claiming it
+    /// would assert coverage the index cannot serve and suppress the scan those
+    /// rows need. Coverage shrinks instead, and what it claims it can serve.
+    #[tokio::test]
+    async fn test_merge_uncommitted_segments_after_the_reuse_mapping_was_trimmed() {
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        // Both fragments, so the staged coverage owns the whole rewrite group and
+        // only the trim can stop it from being remapped.
+        let staged_fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let staged = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+            .name("in_flight".to_string())
+            .fragments(staged_fragments)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("committed".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Catch the committed index up so the trim sees nothing still needing the
+        // mapping. Rebuilding it commits at the current version, which clears the
+        // stale-version gate a retrain alone leaves in place.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("committed".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .is_none_or(
+                    |index| !crate::index::append::fragment_reuse_affects_segments(
+                        &index,
+                        std::iter::once(&staged)
+                    )
+                ),
+            "precondition: the trim dropped the mapping the staged segment still needs"
+        );
+
+        let warnings = CapturedWarnings::default();
+        let merged = {
+            let subscriber = tracing_subscriber::registry().with(warnings.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dataset
+                .merge_existing_index_segments(vec![staged])
+                .await
+                .unwrap()
+        };
+
+        let coverage = merged
+            .fragment_bitmap
+            .as_ref()
+            .expect("a merged segment records its coverage");
+        assert!(
+            coverage.is_disjoint(dataset.fragment_bitmap.as_ref()),
+            "a merge with no applicable mapping must not claim live fragments, got {coverage:?}"
+        );
+        assert!(
+            warnings.contains("no applicable reuse mapping"),
+            "dropping those rows from the index must be reported, got {:?}",
+            warnings.messages()
+        );
+
+        // Whatever it does claim, it has to be able to serve.
+        let index =
+            crate::index::scalar::open_scalar_index(&dataset, "id", &merged, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let result = index
+            .search(
+                &SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+                    as &dyn AnyQuery,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let rows = match result {
+            SearchResult::Exact(rows) => rows,
+            other => panic!("unexpected search result: {other:?}"),
+        };
+        let row_addrs = rows.true_rows().row_addrs().unwrap().collect::<Vec<_>>();
+        assert!(
+            row_addrs
+                .iter()
+                .all(|row_addr| coverage
+                    .contains(RowAddress::from(u64::from(*row_addr)).fragment_id())),
+            "the merged index must only return rows on fragments it claims"
+        );
+    }
+
+    /// Segments that together cover only part of a rewrite group cannot claim the
+    /// fragment that group produced: it holds rows no segment indexed. The merge
+    /// covers nothing rather than over-claiming.
+    #[tokio::test]
+    async fn test_merge_uncommitted_segments_partly_covering_a_rewrite_group() {
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        // Only the first fragment is staged, so the pair compaction rewrites
+        // together is half indexed.
+        let first_fragment = dataset.get_fragments()[0].id() as u32;
+        let staged = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+            .name("in_flight".to_string())
+            .fragments(vec![first_fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        // Compaction needs an indexed group to write fragment-reuse metadata.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("committed".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let warnings = CapturedWarnings::default();
+        let merged = {
+            let subscriber = tracing_subscriber::registry().with(warnings.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dataset
+                .merge_existing_index_segments(vec![staged])
+                .await
+                .unwrap()
+        };
+
+        let coverage = merged
+            .fragment_bitmap
+            .as_ref()
+            .expect("a merged segment records its coverage");
+        assert!(
+            coverage.is_empty(),
+            "a half-covered rewrite group must not be claimed, got {coverage:?}"
+        );
+        assert!(
+            warnings.contains("Merged index covers no rows"),
+            "losing the group to a straddle must be reported, got {:?}",
+            warnings.messages()
+        );
+    }
+
+    /// Collects warning messages emitted while it is the default subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedWarnings {
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn contains(&self, needle: &str) -> bool {
+            self.messages()
+                .iter()
+                .any(|message| message.contains(needle))
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CapturedWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut message = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "message" {
+                        message = format!("{value:?}");
+                    }
+                },
+            );
+            self.0.lock().unwrap().push(message);
+        }
     }
 
     #[rstest]

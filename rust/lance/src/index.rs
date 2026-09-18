@@ -145,18 +145,17 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 /// as only partially covering the rewrite group and drop the new fragment. The
 /// merge owns the whole caller-defined group, so remap its union and use that
 /// representable group coverage while materializing every source.
+///
+/// Returns whether coverage was remapped. Coverage only ever moves together with
+/// the row addresses the dataset's own mapping supplies, so where no mapping
+/// applies the coverage shrinks instead — reported, because those rows leave the
+/// merged index and fall back to a flat scan.
 async fn remap_merged_segment_coverage(
     dataset: &Dataset,
+    index_name: &str,
     segments: &mut [IndexMetadata],
 ) -> Result<bool> {
-    let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
-        return Ok(false);
-    };
-    if !append::fragment_reuse_affects_segments(&frag_reuse_index, segments.iter()) {
-        return Ok(false);
-    }
-
-    let mut merged_coverage = segments
+    let staged_coverage = segments
         .iter()
         .map(|segment| {
             segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
@@ -169,8 +168,69 @@ async fn remap_merged_segment_coverage(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let has_fragment_reuse_index = frag_reuse_index.is_some();
+    // Partly retired counts as stale: the retired half is about to be
+    // intersected away, which drops its rows from the merged index.
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let Some(frag_reuse_index) = frag_reuse_index
+        .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
+    else {
+        // Nothing to remap through, so the retired fragments are intersected away
+        // and the merged index will not cover their rows. It cannot claim them
+        // either: moving coverage without the row addresses, which
+        // `open_scalar_index` derives from the dataset's own mapping, would leave
+        // an index asserting coverage it cannot serve and suppress the scan
+        // fallback those rows need. So report and let the coverage shrink.
+        if coverage_is_stale {
+            tracing::warn!(
+                index_name,
+                staged_fragments = staged_coverage.len(),
+                has_fragment_reuse_index,
+                "Merging index segments over retired fragments with no applicable reuse \
+                 mapping: the merged index will not cover their rows, which fall back to \
+                 a flat scan. Rebuild the index to cover them."
+            );
+        }
+        return Ok(false);
+    };
+
+    let mut merged_coverage = staged_coverage.clone();
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
+
+    // An applicable mapping can still be short of what these segments need.
+    // Fragments compacted more than once need every link in the chain, and a trim
+    // that dropped an earlier link leaves the remap on an intermediate fragment
+    // the dataset no longer has. The intersect below would remove it silently.
+    let unmapped = &merged_coverage - dataset.fragment_bitmap.as_ref();
+    if !unmapped.is_empty() {
+        tracing::warn!(
+            index_name,
+            unmapped_fragments = unmapped.len(),
+            "Merged index will not cover rows whose fragments the reuse history only \
+             partly maps: a link in their rewrite chain is missing. Rebuild the index \
+             to cover those rows."
+        );
+    }
+
     merged_coverage &= dataset.fragment_bitmap.as_ref();
+
+    if merged_coverage.is_empty() {
+        // The union straddles: these segments together still cover only part of a
+        // rewrite group, so the group's new fragments hold rows no segment indexed
+        // and claiming them would be a lie. Covering nothing is the conservative
+        // answer. `remap_fragment_bitmap` already reports the group it healed, but
+        // it cannot say what that costs the caller, and here it costs the whole
+        // merged index.
+        tracing::warn!(
+            index_name,
+            staged_fragments = staged_coverage.len(),
+            "Merged index covers no rows: its segments together cover only part of a \
+             rewrite group, so the fragments that group produced hold rows no segment \
+             indexed. The remapper reports the group; this is the effect on the merge."
+        );
+    }
 
     for segment in segments {
         segment.fragment_bitmap = Some(merged_coverage.clone());
@@ -2031,7 +2091,8 @@ impl DatasetIndexExt for Dataset {
         // through the FRI row-address remapper, so they must filter and report
         // coverage in that same current fragment space.
         let has_remapped_source_coverage = if !all_vector && !all_rtree {
-            remap_merged_segment_coverage(self, &mut source_segments).await?
+            let index_name = source_segments[0].name.clone();
+            remap_merged_segment_coverage(self, &index_name, &mut source_segments).await?
         } else {
             false
         };
