@@ -637,20 +637,47 @@ struct ListDecodeTask {
     offset_type: DataType,
 }
 
-fn oversized_batch_error(items_field: &Field, row_range: Range<u64>, num_items: u64) -> Error {
+fn oversized_batch_error(
+    items_field: &Field,
+    requested_range: Range<u64>,
+    decodable_prefix_end: u64,
+    num_items: u64,
+) -> Error {
+    let prefix_detail = if decodable_prefix_end > requested_range.start {
+        format!(
+            "rows {}..{} fit, but requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            decodable_prefix_end,
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    } else {
+        format!(
+            "requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    };
     if items_field.data_type() == &DataType::UInt8 {
         Error::not_supported(format!(
             "Could not create array with more than 2GiB of string/binary data in a single batch \
-             (rows {}..{} would require {num_items} bytes). Please reduce the \
-             batch_size, set LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert the column \
-             to large_string/large_binary.",
-            row_range.start, row_range.end
+             ({prefix_detail}). Please reduce the batch_size, set LANCE_DEFAULT_BATCH_SIZE to a \
+             smaller value, or convert the column to large_string/large_binary."
         ))
     } else {
         Error::not_supported(format!(
             "Could not create a list array with more than i32::MAX items in a single batch \
-             (rows {}..{} would require {num_items} items). Please reduce the batch_size.",
-            row_range.start, row_range.end
+             ({prefix_detail}). Please reduce the batch_size."
         ))
     }
 }
@@ -800,17 +827,12 @@ impl LogicalPageDecoder for ListPageDecoder {
             }
         }
         if actual_num_rows < num_rows {
-            let failing_rows_start = if actual_num_rows == 0 {
-                self.rows_drained
-            } else {
-                self.rows_drained + actual_num_rows - 1
-            };
-            let failing_item_start = self.offsets[failing_rows_start as usize];
-            let num_items =
-                self.offsets[(self.rows_drained + num_rows) as usize] - failing_item_start;
+            let requested_range = self.rows_drained..self.rows_drained + num_rows;
+            let num_items = self.offsets[requested_range.end as usize] - item_start;
             return Err(oversized_batch_error(
                 self.items_field.as_ref(),
-                failing_rows_start..self.rows_drained + num_rows,
+                requested_range,
+                self.rows_drained + actual_num_rows,
                 num_items,
             ));
         }
@@ -1323,6 +1345,7 @@ mod tests {
         let error = oversized_batch_error(
             &Field::new("item", DataType::UInt8, false),
             32..160,
+            96,
             i32::MAX as u64 + 1,
         );
         assert!(
@@ -1330,7 +1353,8 @@ mod tests {
                 .to_string()
                 .contains("more than 2GiB of string/binary data")
         );
-        assert!(error.to_string().contains("rows 32..160"));
+        assert!(error.to_string().contains("rows 32..96 fit"));
+        assert!(error.to_string().contains("requesting rows 32..160"));
         assert!(error.to_string().contains("batch_size"));
         assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
         assert!(error.to_string().contains("large_string/large_binary"));
@@ -1355,7 +1379,8 @@ mod tests {
             panic!("expected overflow error");
         };
         let message = error.to_string();
-        assert!(message.contains("rows 2..4"));
+        assert!(message.contains("rows 2..3 fit"));
+        assert!(message.contains("requesting rows 2..4"));
         assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
         assert!(message.contains("batch_size"));
     }
