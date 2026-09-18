@@ -928,9 +928,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 .map(|row_id| partition_map.get(row_id).copied()),
                         );
                         let part_ids = UInt32Array::from(part_ids);
+                        // A batch that already carries the column would make
+                        // this a duplicate-name error, so report it instead of
+                        // panicking inside the spawned task.
                         batch = batch
                             .try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids.clone()))
-                            .expect("failed to add part id column");
+                            .map_err(|e| {
+                                Error::invalid_input(format!(
+                                    "could not attach the precomputed partition ids to a batch \
+                                     with schema {}: {e}",
+                                    batch.schema()
+                                ))
+                            })?;
 
                         if part_ids.null_count() > 0 {
                             log::info!(
@@ -958,7 +967,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
-            .map(|x| x.unwrap())
+            .map(|x| {
+                x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
+            })
             .peekable(),
         );
 
@@ -2197,7 +2208,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     tokio::spawn(async move { ivf_transformer.transform(&batch?) })
                 })
                 .buffered(get_num_compute_intensive_cpus())
-                .map(|x| x.unwrap())
+                .map(|x| {
+                    x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
+                })
                 .peekable(),
         );
 
@@ -3604,6 +3617,102 @@ mod tests {
             IvfBuildParams::try_with_centroids(centers.len(), Arc::new(centroids)).unwrap();
         ivf_params.target_partition_size = target_partition_size;
         VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params)
+    }
+
+    /// A batch that already carries `__ivf_part_id` used to panic inside the
+    /// spawned transform task (`try_with_column` rejects the duplicate name and
+    /// the call site expected it away), and the panic came back out of the
+    /// stream as a `JoinError` that was itself unwrapped. Both steps now report.
+    #[tokio::test]
+    async fn test_shuffle_data_reports_duplicate_partition_id_column() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().join("idx");
+
+        // A one-row partition map keyed by a row id the batch below carries.
+        let parts_uri = format!("{uri}_parts");
+        let parts_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("row_id", DataType::UInt64, false),
+            arrow_schema::Field::new("partition", DataType::UInt32, false),
+        ]));
+        let parts_batch = RecordBatch::try_new(
+            parts_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt32Array::from(vec![0u32])),
+            ],
+        )
+        .unwrap();
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(parts_batch)], parts_schema.clone());
+        crate::Dataset::write(reader, &parts_uri, None)
+            .await
+            .unwrap();
+
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 4]), 4)
+                .unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids.clone())).unwrap();
+        ivf_params.precomputed_partitions_file = Some(parts_uri);
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "vec".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            Some(ivf_params),
+            Some(()),
+            (),
+            None,
+        );
+        let Ok(mut builder) = builder else {
+            panic!("the builder should accept centroids with a partitions file");
+        };
+        builder
+            .with_ivf(IvfModel::new(centroids, None))
+            .with_quantizer(FlatQuantizer::new(4, DistanceType::L2));
+
+        // The batch arrives with the partition column already attached.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            PART_ID_FIELD.clone(),
+        ]));
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 4]), 4)
+                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(vectors),
+                Arc::new(UInt32Array::from(vec![0u32])),
+            ],
+        )
+        .unwrap();
+
+        let result = builder
+            .shuffle_data(Some(stream::iter(vec![Ok(batch)])))
+            .await;
+        let Err(err) = result else {
+            panic!("expected the duplicate partition column to be reported");
+        };
+        assert!(
+            err.to_string().contains("precomputed partition ids"),
+            "unexpected error: {err}"
+        );
     }
 
     fn cluster_schema() -> Arc<arrow_schema::Schema> {
