@@ -207,6 +207,10 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "stable_row_id_limit"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
