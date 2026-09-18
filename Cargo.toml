@@ -179,6 +179,15 @@ num-traits = "0.2"
 object_store = { version = "0.14.1" }
 opendal = { version = "0.59.2" }
 object_store_opendal = { version = "0.60.2" }
+# Pin 0.2.2 so Cargo unifies past OpenDAL 0.59.2's `^0.2.1` req. 0.2.2 keeps
+# `metadata_cache_enabled` off until GOOSEFS_METADATA_CACHE_ENABLED=true.
+goosefs-sdk = { version = "0.2.2", default-features = false }
+# Direct dependency so Cargo unifies cache features into the same
+# `opendal-service-goosefs` build as `opendal/services-goosefs`.
+opendal-service-goosefs = { version = "0.59.2", default-features = false, features = [
+    "metadata-cache",
+    "page-cache-io-uring",
+] }
 parquet = { version = "58.0.0", default-features = false, features = [
     "arrow",
     "async",

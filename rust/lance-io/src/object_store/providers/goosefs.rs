@@ -5,6 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use opendal::{Operator, services::GooseFs};
+// Direct deps so Cargo unifies `goosefs-sdk` 0.2.2 and
+// `metadata-cache` / `page-cache-io-uring` into the same
+// `opendal-service-goosefs` build as `opendal/services-goosefs`.
+use goosefs_sdk as _;
+use opendal_service_goosefs as _;
 use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
@@ -75,6 +80,20 @@ const STORAGE_OPTION_KEYS: &[&str] = &[
 /// that many datasets under the same master share a single cached `Operator`.
 /// A custom root also participates in the `ObjectStoreRegistry` cache prefix,
 /// so stores rooted at different subtrees do not collide.
+///
+/// Client caches are compiled into this provider via `opendal-service-goosefs`
+/// (`metadata-cache`, `page-cache-io-uring`) and `goosefs-sdk` 0.2.2.
+/// Compiling a cache does not replace runtime configuration:
+/// `Operator::build()` still loads `goosefs-site.properties` and `GOOSEFS_*`
+/// environment variables. Both caches stay off until explicitly enabled.
+///
+/// - Metadata cache: off by default (0.2.2 matches Java
+///   `goosefs.user.metadata.cache.enabled`). Set
+///   `GOOSEFS_METADATA_CACHE_ENABLED=true` to opt in.
+/// - Page cache: off by default. Set `GOOSEFS_USER_CLIENT_CACHE_ENABLED=true`
+///   and configure cache directories through `goosefs.user.client.cache.dirs`
+///   / `GOOSEFS_USER_CLIENT_CACHE_DIRS`. `page-cache-io-uring` uses io_uring
+///   on Linux and the portable `tokio::fs` store elsewhere.
 #[derive(Default, Debug)]
 pub struct GooseFsStoreProvider;
 
