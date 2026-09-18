@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
 import sys
+import tempfile
 from typing import Optional
 
 import pytest
@@ -86,6 +88,28 @@ def pytest_addoption(parser):
     )
 
 
+def _isolate_torch_inductor_cache(workerinput) -> None:
+    """Give each xdist worker its own torch.compile cache directory.
+
+    `lance.torch.distance` decorates six kernels with `@torch.compile`, so every
+    worker that reaches the torch accelerator compiles the same functions into
+    torch's single default cache directory. Inductor writes each generated module
+    by replacing it, which POSIX allows while another process holds it open and
+    Windows refuses, so the shared directory surfaces as an intermittent
+    `PermissionError` out of the codecache rather than a test failure.
+
+    Only under xdist: a single process cannot race itself, and leaving torch's
+    default alone there keeps the cache warm across runs. The per-worker
+    directories live under the same temp root for the same reason.
+    """
+    if workerinput is None:
+        return
+    root = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(
+        tempfile.gettempdir(), "lance_torchinductor"
+    )
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(root, workerinput["workerid"])
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
@@ -103,6 +127,7 @@ def pytest_configure(config):
     )
 
     workerinput = getattr(config, "workerinput", None)
+    _isolate_torch_inductor_cache(workerinput)
     if workerinput is not None:
         from compat.compat_decorator import use_version_snapshot
 
