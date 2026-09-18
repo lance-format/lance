@@ -88,7 +88,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
@@ -198,6 +198,101 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Query-time IVF load/score knobs that can be A/B'd independently.
+///
+/// `LANCE_IVF_QUERY_OPTS` is a comma-separated list, `all`, or `none`. Unset
+/// defaults to `all`. Known items:
+/// - `first_wave`: score after the first prepare wave instead of waiting for
+///   64 MiB / 128 partitions. Later chunks keep the memory/dispatch bound.
+/// - `io_prepare`: prepare concurrency follows I/O parallelism, not just CPU.
+/// - `parallel_files`: load `index.idx` and `auxiliary.idx` concurrently.
+/// - `overlap_prefilter`: start partition I/O without waiting for the prefilter.
+const IVF_QUERY_OPTS_ENV: &str = "LANCE_IVF_QUERY_OPTS";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IvfQueryOpts {
+    first_wave: bool,
+    io_prepare: bool,
+    parallel_files: bool,
+    overlap_prefilter: bool,
+}
+
+impl IvfQueryOpts {
+    const ALL: Self = Self {
+        first_wave: true,
+        io_prepare: true,
+        parallel_files: true,
+        overlap_prefilter: true,
+    };
+    const NONE: Self = Self {
+        first_wave: false,
+        io_prepare: false,
+        parallel_files: false,
+        overlap_prefilter: false,
+    };
+
+    fn from_env() -> Self {
+        match std::env::var(IVF_QUERY_OPTS_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => Self::ALL,
+        }
+    }
+
+    fn parse(raw: &str) -> Self {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+            return Self::ALL;
+        }
+        if raw.eq_ignore_ascii_case("none") {
+            return Self::NONE;
+        }
+        let mut opts = Self::NONE;
+        for part in raw.split(',') {
+            match part.trim() {
+                "first_wave" => opts.first_wave = true,
+                "io_prepare" => opts.io_prepare = true,
+                "parallel_files" => opts.parallel_files = true,
+                "overlap_prefilter" => opts.overlap_prefilter = true,
+                "" => {}
+                other => {
+                    warn!(
+                        "ignoring unknown {IVF_QUERY_OPTS_ENV} item {other:?}; \
+                         expected first_wave, io_prepare, parallel_files, overlap_prefilter, all, or none"
+                    );
+                }
+            }
+        }
+        opts
+    }
+}
+
+fn query_prepare_parallelism(io_parallelism: usize, opts: IvfQueryOpts) -> usize {
+    let cpu = get_num_compute_intensive_cpus().max(1);
+    if opts.io_prepare {
+        io_parallelism.max(1).max(cpu)
+    } else {
+        cpu
+    }
+}
+
+fn scoring_chunk_limits(
+    opts: IvfQueryOpts,
+    is_first: bool,
+    prepare_parallelism: usize,
+) -> (usize, usize) {
+    let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
+    if is_first && opts.first_wave {
+        (chunk_bytes, prepare_parallelism.max(1))
+    } else {
+        (chunk_bytes, GLOBAL_TOPK_CHUNK_MAX_PARTITIONS)
+    }
+}
+
+#[cfg(test)]
+fn global_topk_in_flight_bound(prepare_parallelism: usize) -> usize {
+    prepare_parallelism + 2 * GLOBAL_TOPK_CHUNK_MAX_PARTITIONS
+}
 
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
@@ -1320,19 +1415,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Pull prepared partitions off `prepared` until their pinned storage reaches
-    /// `chunk_bytes` or the chunk holds [`GLOBAL_TOPK_CHUNK_MAX_PARTITIONS`],
-    /// always taking at least one. `None` once the stream is exhausted; a failed
-    /// prepare ends the chunk (and the search) immediately.
+    /// `chunk_bytes` or the chunk holds `max_partitions`, always taking at least
+    /// one. `None` once the stream is exhausted; a failed prepare ends the chunk
+    /// (and the search) immediately.
     async fn next_scoring_chunk<St>(
         prepared: &mut St,
         chunk_bytes: usize,
+        max_partitions: usize,
     ) -> Option<Result<Vec<PreparedPartitionSearch<S, Q>>>>
     where
         St: Stream<Item = Result<PreparedPartitionSearch<S, Q>>> + Unpin,
     {
         let mut chunk = Vec::new();
         let mut bytes = 0;
-        while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
+        while bytes < chunk_bytes && chunk.len() < max_partitions {
             match prepared.next().await {
                 Some(Ok(prepared)) => {
                     bytes += prepared.part_entry.size_bytes();
@@ -1740,11 +1836,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
-    async fn load_partition_entry(
+    async fn load_partition_index(
         &self,
         partition_id: usize,
         io_stats: Option<IoStats>,
-    ) -> Result<PartitionEntry<S, Q>> {
+    ) -> Result<S> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
         // was read: the full file schema over a projected read would index past
@@ -1798,9 +1894,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             S::metadata_key().to_owned(),
             self.sub_index_metadata[partition_id].clone(),
         )?;
-        let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
-        Ok(PartitionEntry::new(idx, storage))
+        S::load(batch)
+    }
+
+    async fn load_partition_entry(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<PartitionEntry<S, Q>> {
+        // IVF-PQ/HNSW keep sub-index rows in `index.idx` and codes in
+        // `auxiliary.idx`. Overlapping those two files hides the sequential
+        // wait; IVF-RQ's index file is typically empty, so the join is a
+        // no-op there. Disable with `LANCE_IVF_QUERY_OPTS` to A/B.
+        if IvfQueryOpts::from_env().parallel_files {
+            let (idx, storage) = tokio::try_join!(
+                self.load_partition_index(partition_id, io_stats.clone()),
+                self.load_partition_storage(partition_id, io_stats),
+            )?;
+            Ok(PartitionEntry::new(idx, storage))
+        } else {
+            let idx = self
+                .load_partition_index(partition_id, io_stats.clone())
+                .await?;
+            let storage = self.load_partition_storage(partition_id, io_stats).await?;
+            Ok(PartitionEntry::new(idx, storage))
+        }
     }
 
     async fn materialize_prewarm_partition(
@@ -2303,15 +2421,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             )));
         }
 
-        let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+        let opts = IvfQueryOpts::from_env();
+        let prepare_parallelism = query_prepare_parallelism(self.io_parallelism, opts);
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
-            pre_filter.wait_for_ready().await?;
+            if !opts.overlap_prefilter {
+                pre_filter.wait_for_ready().await?;
+            }
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
+            let overlap_prefilter = opts.overlap_prefilter;
             // Stream prepared partitions through scoring in chunks rather than
             // collecting all of them first. A prepared partition pins its whole
             // quantized storage, so collecting `nprobes` of them before scoring
@@ -2332,20 +2454,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
                     async move {
-                        index
-                            .prepare_partition_without_prefilter_wait(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await
+                        if overlap_prefilter {
+                            index
+                                .prepare_partition(
+                                    part_id as usize,
+                                    &query,
+                                    pre_filter,
+                                    metrics.as_ref(),
+                                    raw_query_context,
+                                )
+                                .await
+                        } else {
+                            index
+                                .prepare_partition_without_prefilter_wait(
+                                    part_id as usize,
+                                    &query,
+                                    pre_filter,
+                                    metrics.as_ref(),
+                                    raw_query_context,
+                                )
+                                .await
+                        }
                     }
                 })
                 .buffered(prepare_parallelism)
                 .fuse();
-            let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
+            let (first_bytes, first_max) = scoring_chunk_limits(opts, true, prepare_parallelism);
+            let (rest_bytes, rest_max) = scoring_chunk_limits(opts, false, prepare_parallelism);
 
             let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
@@ -2356,7 +2491,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // the waiting (#7642). The heap is threaded through each dispatch so
             // scoring stays sequential, and a scored chunk is dropped before the
             // next one is scored.
-            let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
+            //
+            // The first chunk is capped at the prepare wave so scoring starts as
+            // soon as that wave is resident. Typical nprobes (20-80) of IVF_RQ
+            // partitions sit well under 64 MiB, so the old byte/128 cap waited
+            // for every probe before the first `spawn_cpu`. Later chunks keep
+            // the 64 MiB / 128 bound so a 4096-probe warm query does not pay a
+            // dispatch per wave.
+            let mut pending = Self::next_scoring_chunk(&mut prepared, first_bytes, first_max).await;
             while let Some(chunk) = pending {
                 let chunk = chunk?;
                 let search_metrics = metrics.clone();
@@ -2377,8 +2519,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     })?;
                     Ok(heap)
                 });
-                let (scored, next) =
-                    futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
+                let (scored, next) = futures::join!(
+                    score,
+                    Self::next_scoring_chunk(&mut prepared, rest_bytes, rest_max)
+                );
                 heap = scored?;
                 pending = next;
             }
@@ -2682,7 +2826,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // Streaming bounds resident partition storage to the load window plus one
         // chunk. `buffered` preserves the sorted load order above, so scoring order
         // (and thus the k-th-distance tie-break) stays deterministic.
-        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_parallelism =
+            query_prepare_parallelism(self.io_parallelism, IvfQueryOpts::from_env());
         let load_index = self.clone();
         let load_metrics = metrics.clone();
         let mut loaded_chunks = stream::iter(assignment_list)
@@ -3033,6 +3178,76 @@ mod tests {
     const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
+
+    #[test]
+    fn test_ivf_query_opts_parse() {
+        assert_eq!(super::IvfQueryOpts::parse("all"), super::IvfQueryOpts::ALL);
+        assert_eq!(super::IvfQueryOpts::parse(""), super::IvfQueryOpts::ALL);
+        assert_eq!(
+            super::IvfQueryOpts::parse("none"),
+            super::IvfQueryOpts::NONE
+        );
+        assert_eq!(
+            super::IvfQueryOpts::parse("first_wave"),
+            super::IvfQueryOpts {
+                first_wave: true,
+                ..super::IvfQueryOpts::NONE
+            }
+        );
+        assert_eq!(
+            super::IvfQueryOpts::parse("io_prepare,parallel_files"),
+            super::IvfQueryOpts {
+                io_prepare: true,
+                parallel_files: true,
+                ..super::IvfQueryOpts::NONE
+            }
+        );
+        assert_eq!(
+            super::IvfQueryOpts::parse("overlap_prefilter"),
+            super::IvfQueryOpts {
+                overlap_prefilter: true,
+                ..super::IvfQueryOpts::NONE
+            }
+        );
+    }
+
+    #[test]
+    fn test_scoring_chunk_limits_first_wave() {
+        let opts = super::IvfQueryOpts {
+            first_wave: true,
+            ..super::IvfQueryOpts::NONE
+        };
+        let prepare_parallelism = 8;
+        let (first_bytes, first_max) = super::scoring_chunk_limits(opts, true, prepare_parallelism);
+        let (rest_bytes, rest_max) = super::scoring_chunk_limits(opts, false, prepare_parallelism);
+        assert_eq!(first_bytes, *super::GLOBAL_TOPK_CHUNK_BYTES);
+        assert_eq!(first_max, prepare_parallelism);
+        assert_eq!(rest_bytes, *super::GLOBAL_TOPK_CHUNK_BYTES);
+        assert_eq!(rest_max, super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS);
+    }
+
+    #[test]
+    fn test_scoring_chunk_limits_matches_main_when_disabled() {
+        let opts = super::IvfQueryOpts::NONE;
+        let (first_bytes, first_max) = super::scoring_chunk_limits(opts, true, 8);
+        let (rest_bytes, rest_max) = super::scoring_chunk_limits(opts, false, 8);
+        assert_eq!(first_bytes, rest_bytes);
+        assert_eq!(first_max, rest_max);
+        assert_eq!(first_max, super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS);
+    }
+
+    #[test]
+    fn test_query_prepare_parallelism() {
+        let cpu = get_num_compute_intensive_cpus().max(1);
+        assert_eq!(
+            super::query_prepare_parallelism(64, super::IvfQueryOpts::NONE),
+            cpu
+        );
+        assert_eq!(
+            super::query_prepare_parallelism(64, super::IvfQueryOpts::ALL),
+            64.max(cpu)
+        );
+    }
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -6771,8 +6986,11 @@ mod tests {
         // far smaller than the chunk byte budget, so the partition cap is what
         // ends a chunk. Size the index so that the old collect-everything
         // behavior would clearly exceed the bound.
-        let in_flight_bound =
-            get_num_compute_intensive_cpus().max(1) + 2 * super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS;
+        let prepare_parallelism = super::query_prepare_parallelism(
+            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            super::IvfQueryOpts::from_env(),
+        );
+        let in_flight_bound = super::global_topk_in_flight_bound(prepare_parallelism);
         let num_partitions = 2 * in_flight_bound;
 
         let test_dir = TempStrDir::default();
