@@ -11,7 +11,7 @@ use arrow_array::{
 
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use log::trace;
 
 use crate::{
@@ -176,7 +176,11 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             }
             DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())?,
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>())?,
-            _ => panic!("Binary decoder does not support this data type"),
+            other => {
+                return Err(Error::internal(format!(
+                    "Binary decoder does not support data type {other}"
+                )));
+            }
         };
         // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
@@ -205,17 +209,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn logical_utf8_decode_preserves_non_overflow_arrow_error() {
+    fn make_single_byte_list(value: u8) -> ListArray {
         let offsets = OffsetBuffer::from_lengths([1_usize]);
-        let values: ArrayRef = Arc::new(UInt8Array::from(vec![0xFF_u8]));
-        let list = ListArray::try_new(
+        let values: ArrayRef = Arc::new(UInt8Array::from(vec![value]));
+        ListArray::try_new(
             Arc::new(Field::new("item", DataType::UInt8, false)),
             offsets,
             values,
             None,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn logical_utf8_decode_preserves_non_overflow_arrow_error() {
+        let list = make_single_byte_list(0xFF_u8);
         let decoder = BinaryArrayDecoder {
             inner: Box::new(StubDecodeTask {
                 array: Arc::new(list),
@@ -227,5 +235,24 @@ mod tests {
         let message = error.to_string();
         assert!(!message.contains("more than 2GiB of string/binary data"));
         assert!(message.to_lowercase().contains("utf"));
+    }
+
+    #[test]
+    fn logical_binary_decode_returns_internal_error_for_unsupported_type() {
+        let list = make_single_byte_list(b'x');
+        let decoder = BinaryArrayDecoder {
+            inner: Box::new(StubDecodeTask {
+                array: Arc::new(list),
+            }),
+            data_type: DataType::Int32,
+        };
+
+        let error = Box::new(decoder).decode().unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Binary decoder does not support data type Int32")
+        );
     }
 }
