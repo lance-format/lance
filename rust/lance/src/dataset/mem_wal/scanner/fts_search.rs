@@ -343,12 +343,16 @@ fn transient_fts_index_store(
     // defaults here would have the active rows disagree with base and SSTable
     // rows about what matches — silently, by returning fewer rows. Defaults are
     // right only when no persisted index covers the column, where there is no
-    // contract to match.
+    // contract to match — except for positions. The base answers a phrase over
+    // an unindexed column from a flat scan, where positions are implicit, and a
+    // transient index built without them returns no phrase hit for rows the
+    // base finds. The index lives for one query over the visible prefix, so the
+    // extra storage is bounded by that prefix.
     for (column, field_id) in field_ids {
         let params = index_params
             .get(column)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| InvertedIndexParams::default().with_position(true))
             .document_granularity(document_granularity);
         store.add_fts_with_params(
             format!("__transient_fts_{column}"),
@@ -2933,6 +2937,100 @@ mod tests {
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    }
+
+    /// A column with no FTS index is served by a transient index over the
+    /// visible prefix. The base answers a phrase there from a flat scan, so the
+    /// transient index has to carry positions or every phrase hit in fresh rows
+    /// is silently lost while a plain match on the same rows succeeds.
+    #[tokio::test]
+    async fn phrase_over_an_unindexed_column_reaches_the_active_memtable() {
+        use lance_index::scalar::inverted::query::PhraseQuery;
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        // Deliberately no FTS index on `text`.
+        let active_batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["alpha prose here", "prose alpha reversed", "nothing"],
+        );
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let ctx = datafusion::prelude::SessionContext::new();
+        let ids_for = |query: FullTextSearchQuery| {
+            let planner = &planner;
+            let ctx = &ctx;
+            async move {
+                let plan = planner
+                    .plan_search(query, Some(10), Some(&["id".to_string()]))
+                    .await
+                    .expect("plans");
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, ctx.task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut ids: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+
+        let matched = ids_for(FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+        )))
+        .await;
+        assert_eq!(
+            matched,
+            vec![1, 2],
+            "precondition: the transient index serves a match"
+        );
+
+        let phrase = ids_for(FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
+            PhraseQuery::new("alpha prose".to_string()).with_column(Some("text".to_string())),
+        )))
+        .await;
+        assert_eq!(
+            phrase,
+            vec![1],
+            "the phrase matches row 1 only; row 2 carries the terms reversed"
+        );
     }
 
     /// A multi-match reaches the active memtable across every queried column,
