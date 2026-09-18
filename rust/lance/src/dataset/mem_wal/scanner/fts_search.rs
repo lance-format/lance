@@ -1125,19 +1125,23 @@ impl LsmFtsSearchPlanner {
                 // the scanner exactly as the other arms get it -- including a
                 // cross-column predicate, whose leaves carry their own bindings
                 // and must not be collapsed onto one column.
+                // Bound here, limited below: this arm's limit rule is not the
+                // one `bind` applies, so only the column binding is taken from
+                // the shape of the set.
                 let bound_query = match stored_columns.as_slice() {
+                    // Every queried column is stored under the name the table
+                    // still uses, so the tree reaches the scanner as the other
+                    // arms get it -- a cross-column predicate keeps its own leaf
+                    // bindings, which rebinding would collapse onto one field.
                     _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => {
-                        bind(query)?
+                        match columns {
+                            [column] => query.clone().with_column(column.to_string())?,
+                            _ => query.clone(),
+                        }
                     }
                     // One column, moved: bind the whole tree to the name this
                     // generation stores it under.
-                    [(_, stored)] => {
-                        let bound = query.clone().with_column(stored.clone())?;
-                        match limit.filter(|_| above.is_none()) {
-                            Some(limit) => bound.limit(Some(limit as i64)),
-                            None => bound.limit(None),
-                        }
-                    }
+                    [(_, stored)] => query.clone().with_column(stored.clone())?,
                     // Several columns, at least one of them renamed. Each leaf
                     // would need its own name and `with_column` rebinds the
                     // whole tree, collapsing a cross-column predicate onto one
@@ -1156,6 +1160,15 @@ impl LsmFtsSearchPlanner {
                             renamed.join(", ")
                         )));
                     }
+                };
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has taken its top-k
+                // by score. Cutting first would drop rows that pass the
+                // predicate behind rows that do not, so a generation with a
+                // deferred predicate does not cut.
+                let bound_query = match limit.filter(|_| above.is_none()) {
+                    Some(limit) => bound_query.limit(Some(limit as i64)),
+                    None => bound_query.limit(None),
                 };
                 scanner.full_text_search(bound_query)?;
                 // Boxed for the reason the scan planner's arm gives: a
