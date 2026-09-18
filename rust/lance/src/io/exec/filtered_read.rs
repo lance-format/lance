@@ -3309,7 +3309,11 @@ impl ExecutionPlan for FilteredReadExec {
             // divided by the number of partitions.
             let total_rows =
                 if let Some(scan_range_before_filter) = &self.options.scan_range_before_filter {
-                    total_rows.min(scan_range_before_filter.end - scan_range_before_filter.start)
+                    // The range slices the scanned fragments end to end, so the scan emits
+                    // the part of it overlapping rows that exist. A range reaching past the
+                    // last of those rows yields the rows up to it, not its full width.
+                    let end = scan_range_before_filter.end.min(total_rows);
+                    end.saturating_sub(scan_range_before_filter.start)
                 } else {
                     total_rows
                 };
@@ -4338,6 +4342,48 @@ mod tests {
             .with_scan_range_before_filter(300..400)
             .unwrap();
         fixture.test_plan(options, &u32s(vec![])).await;
+    }
+
+    /// The reported row count steers DataFusion's `COUNT(*)` folding and its limit
+    /// pushdown, so it has to match what the scan emits. `scan_range_before_filter`
+    /// slices the scanned fragments end to end, so a range reaching past the last of
+    /// those rows yields the rows up to it, not the range's full width.
+    #[rstest]
+    #[case::no_range(None, None, 250)]
+    #[case::within_the_dataset(None, Some(25..125), 100)]
+    #[case::past_the_last_row(None, Some(200..300), 50)]
+    #[case::starting_past_the_last_row(None, Some(300..400), 0)]
+    #[case::past_the_last_row_of_a_fragment_subset(Some(vec![2]), Some(25..125), 25)]
+    #[test_log::test(tokio::test)]
+    async fn test_range_statistics_match_the_scan(
+        #[case] fragment_ids: Option<Vec<u32>>,
+        #[case] range: Option<Range<u64>>,
+        #[case] expected_rows: usize,
+    ) {
+        let fixture = TestFixture::new().await;
+
+        let mut options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        if let Some(fragment_ids) = fragment_ids {
+            options = options.with_fragments(fixture.frags(&fragment_ids));
+        }
+        if let Some(range) = range {
+            options = options.with_scan_range_before_filter(range).unwrap();
+        }
+
+        let plan = fixture.make_plan(options).await;
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
+
+        // The estimate is only worth anything if it matches what the scan emits.
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let scanned: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(scanned, expected_rows);
     }
 
     #[test_log::test(tokio::test)]
