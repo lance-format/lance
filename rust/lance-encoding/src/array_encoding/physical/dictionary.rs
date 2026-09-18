@@ -141,6 +141,13 @@ struct DirectDictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        // The decoded batch shares this page's dictionary values; Arrow
+        // concatenation may merge dictionaries, so charge the whole dictionary
+        // plus a pessimistic index width per row.
+        Ok(Some(self.decoded_dict.data_size() + num_rows * 8))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let indices = self
             .indices_decoder
@@ -161,6 +168,20 @@ struct DictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DictionaryPageDecoder {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        // Decoding materializes each row's dictionary value into a plain string
+        // array, so the longest dictionary value bounds the per-row size.  The
+        // dictionary is tiny (u8 indices), so scanning it here is cheap.
+        let Some(strings) = self.decoded_dict.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        let max_value_len = (0..strings.len())
+            .map(|i| strings.value_length(i) as u64)
+            .max()
+            .unwrap_or(0);
+        Ok(Some(num_rows * (max_value_len + 4)))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         // Decode the indices
         let indices_data = self.indices_decoder.decode(rows_to_skip, num_rows)?;

@@ -10,7 +10,9 @@ use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
-use crate::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
+use crate::decoder::{
+    DrainLimit, FieldScheduler, LogicalPageDecoder, SchedulingJob, has_i32_offsets,
+};
 use crate::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
 use crate::{array_encoding::physical::decoder_from_array_encoding, data::DataBlock};
@@ -366,6 +368,55 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
             task,
             num_rows: rows_to_take,
         })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        if num_rows == 0 || !has_i32_offsets(&self.data_type) {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+            });
+        }
+        let Some(physical_decoder) = self.physical_decoder.as_ref() else {
+            return Err(lance_core::Error::internal(format!(
+                "max_rows_to_drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
+                self.data_type, self.column_index
+            )));
+        };
+        match physical_decoder.variable_width_bytes(self.rows_drained, num_rows)? {
+            Some(bytes) if bytes <= byte_budget => Ok(DrainLimit {
+                rows: num_rows,
+                bytes,
+            }),
+            Some(_) => {
+                // Largest prefix of the request that still fits the budget.
+                // `variable_width_bytes` is monotonically non-decreasing in the row
+                // count; zero rows always fit.
+                let mut fits = 0u64;
+                let mut too_big = num_rows;
+                while fits + 1 < too_big {
+                    let mid = fits + (too_big - fits) / 2;
+                    let mid_bytes = physical_decoder
+                        .variable_width_bytes(self.rows_drained, mid)?
+                        .unwrap_or(0);
+                    if mid_bytes <= byte_budget {
+                        fits = mid;
+                    } else {
+                        too_big = mid;
+                    }
+                }
+                let bytes = physical_decoder
+                    .variable_width_bytes(self.rows_drained, fits)?
+                    .unwrap_or(0);
+                Ok(DrainLimit { rows: fits, bytes })
+            }
+            // The encoding cannot report sizes: conservatively charge the whole
+            // budget so nothing stacks onto this page's rows within the batch.
+            None => Ok(DrainLimit {
+                rows: num_rows,
+                bytes: byte_budget,
+            }),
+        }
     }
 
     fn rows_loaded(&self) -> u64 {
