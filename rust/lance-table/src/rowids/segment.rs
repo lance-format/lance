@@ -312,6 +312,21 @@ impl U64Segment {
             return Self::Range(0..0);
         }
 
+        // A contiguous subslice of a Range is the Range itself, so computing it
+        // directly avoids decoding the values and re-encoding them through
+        // from_slice's stats pass: O(1) per slice instead of O(len).
+        // Out-of-bounds slices keep the generic path, which silently truncates
+        // rather than panicking.
+        if let Self::Range(range) = self
+            && let Some(end) = offset
+                .checked_add(len)
+                .and_then(|end| u64::try_from(end).ok())
+            && end <= range.end - range.start
+        {
+            let start = range.start + offset as u64;
+            return Self::Range(start..start + len as u64);
+        }
+
         let values: Vec<u64> = self.iter().skip(offset).take(len).collect();
 
         // `from_slice` will compute stats and select the best representation.
@@ -857,6 +872,55 @@ impl SegmentCursorState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_range_slice_matches_generic_path() {
+        // The fast path must agree with decode-and-re-encode for every
+        // in-bounds slice: same representation (a contiguous run re-encodes
+        // to a Range) and same values.
+        let segment = U64Segment::Range(5..15);
+        for (offset, len) in [(0, 10), (3, 4), (9, 1), (10, 0)] {
+            let fast = segment.slice(offset, len);
+            let slow = {
+                let values: Vec<u64> = segment.iter().skip(offset).take(len).collect();
+                U64Segment::from_slice(&values)
+            };
+            assert_eq!(fast, slow, "slice({offset}, {len}) diverged");
+            assert_eq!(
+                fast.iter().collect::<Vec<_>>(),
+                (5 + offset as u64..5 + offset as u64 + len as u64).collect::<Vec<_>>()
+            );
+        }
+
+        // Out-of-bounds falls back to the truncating generic path.
+        assert_eq!(segment.slice(8, 5), U64Segment::Range(13..15));
+
+        // The fast path has to stay Range-only: a gapped segment's span is
+        // wider than its length, so slicing it as if it were contiguous would
+        // hand back the holes as row ids. Both gapped encodings are covered;
+        // the variant assertions also say when the cost model has moved.
+        let mut wide: Vec<u64> = (0..100).collect();
+        wide.retain(|v| ![50u64, 51].contains(v));
+        let with_holes = U64Segment::from_slice(&wide);
+        assert!(
+            matches!(with_holes, U64Segment::RangeWithHoles { .. }),
+            "expected RangeWithHoles, got {with_holes:?}"
+        );
+        assert_eq!(
+            with_holes.slice(48, 4).iter().collect::<Vec<_>>(),
+            vec![48, 49, 52, 53]
+        );
+
+        let with_bitmap = U64Segment::from_slice(&[5, 6, 9, 10, 11, 12, 13, 14]);
+        assert!(
+            matches!(with_bitmap, U64Segment::RangeWithBitmap { .. }),
+            "expected RangeWithBitmap, got {with_bitmap:?}"
+        );
+        assert_eq!(
+            with_bitmap.slice(1, 3).iter().collect::<Vec<_>>(),
+            vec![6, 9, 10]
+        );
+    }
 
     #[test]
     fn test_range_with_bitmap_data_remains_publicly_mutable() {
