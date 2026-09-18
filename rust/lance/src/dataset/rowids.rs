@@ -875,7 +875,8 @@ mod test {
 
     #[tokio::test]
     async fn test_row_ids_update() {
-        // Updated fragments get fresh row ids.
+        // With stable row ids an update remaps the row's id onto the rewritten
+        // row's address; it does not mint a new id.
         let num_rows = 5u64;
         let batch = sequence_batch(0..num_rows as i32);
 

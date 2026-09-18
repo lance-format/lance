@@ -612,9 +612,13 @@ pub struct WriteParams {
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
-    /// These row ids are stable after compaction operations, but not after updates.
-    /// This makes compaction more efficient, since with stable row ids no
-    /// secondary indices need to be updated to point to new row ids.
+    /// A row then keeps the same id for its lifetime: compaction, update and
+    /// merge insert relocate or rewrite the row without changing its id.
+    ///
+    /// This only applies to new datasets. A write to an existing dataset does
+    /// not change that dataset's setting, so this value can neither enable nor
+    /// disable the feature after creation; to enable it later, use the
+    /// [`super::Dataset::migrate_to_stable_row_ids`] method. Default is false.
     pub enable_stable_row_ids: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.

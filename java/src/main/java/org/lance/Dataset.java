@@ -1749,10 +1749,12 @@ public class Dataset implements Closeable {
   /**
    * Check whether the dataset uses stable row IDs.
    *
-   * <p>Stable row IDs remain constant when rows are moved during compaction. This reads the
-   * manifest feature flag directly rather than the user-facing config map.
+   * <p>Stable row IDs remain constant when a row is relocated or rewritten, whether by compaction,
+   * an update, or a merge insert. This reads the manifest feature flag directly rather than the
+   * user-facing config map.
    *
-   * @return true if the dataset was created with stable row IDs enabled
+   * @return true if the dataset uses stable row IDs, whether enabled at creation or by a later
+   *     migration
    */
   public boolean hasStableRowIds() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

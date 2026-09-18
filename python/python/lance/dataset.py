@@ -4946,10 +4946,11 @@ class LanceDataset(pa.dataset.Dataset):
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
         enable_stable_row_ids: bool, optional
-            If True, enables stable row IDs when creating a new dataset.  Stable
-            row IDs assign each row a monotonically increasing id that persists
-            across compaction and other maintenance operations.  This option is
-            ignored for existing datasets.
+            If True, enables stable row IDs when creating a new dataset.  Each new
+            row is assigned the next id in increasing order and keeps that id for
+            its lifetime: compaction, update and merge insert relocate or rewrite
+            the row without changing its id.  This option is ignored for existing
+            datasets.
         namespace_client : LanceNamespace, optional
             A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
@@ -8065,9 +8066,10 @@ def write_dataset(
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        A row then keeps the same id for its lifetime: compaction, update and merge
+        insert relocate or rewrite the row without changing its id. This only
+        applies to new datasets; a write to an existing dataset keeps that
+        dataset's own setting.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically

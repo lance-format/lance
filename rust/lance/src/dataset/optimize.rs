@@ -2233,9 +2233,9 @@ async fn index_fragment_coverage(
 /// They are held out of the plan instead, and the rest of the table still
 /// compacts.
 ///
-/// Only the eager remap path needs this. Stable row ids keep the addresses
-/// across a rewrite, and `defer_index_remap` hands the repair to a build that
-/// can read the index, through the fragment-reuse index it writes.
+/// Only the eager remap path needs this. Under stable row ids a rewrite leaves
+/// the index's row ids untouched, and `defer_index_remap` hands the repair to a
+/// build that can read the index, through the fragment-reuse index it writes.
 async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
