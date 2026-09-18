@@ -642,11 +642,13 @@ impl DatasetConsistencyWrapper {
 
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
+    ///
+    /// Acquires the write lock before reloading so that tokio's write-fairness
+    /// prevents reader starvation of the writer.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
-        self.reload().await?;
-        let guard = DatasetWriteGuard {
-            guard: self.0.write().await,
-        };
+        let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await?;
+        let guard = DatasetWriteGuard { guard: write_guard };
         ensure_readable(guard.metadata())?;
         ensure_writable(guard.metadata())?;
         Ok(guard)
@@ -663,7 +665,10 @@ impl DatasetConsistencyWrapper {
         }
     }
 
-    /// Reload the dataset to the latest version.
+    /// Reload the dataset to the latest version (for the read path).
+    ///
+    /// Takes a read lock first to check if a reload is needed, then upgrades
+    /// to a write lock only if necessary.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
@@ -699,16 +704,29 @@ impl DatasetConsistencyWrapper {
 
         // Need to reload, acquire write lock
         let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await
+    }
 
-        // Double-check after acquiring write lock (someone else might have reloaded)
-        let has_successor_version = write_guard.has_successor_version().await.map_err(|e| {
+    /// Reload the dataset while already holding the write lock.
+    async fn reload_under_write_lock(
+        dataset: &mut tokio::sync::RwLockWriteGuard<'_, Dataset>,
+    ) -> Result<()> {
+        let dataset_uri = dataset.uri().to_string();
+        let current_version = dataset.version().version;
+        log::debug!(
+            "Reload (under write lock) for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
+
+        let has_successor_version = dataset.has_successor_version().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to check dataset staleness: {:?}", e),
             })
         })?;
 
         if has_successor_version {
-            write_guard.checkout_latest().await.map_err(|e| {
+            dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
@@ -3868,6 +3886,9 @@ mod tests {
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     async fn create_manifest_namespace(
         root: &str,
@@ -4464,6 +4485,57 @@ mod tests {
             original_version
         );
         assert_eq!(manifest_data_paths(&manifest_ns).await, data_paths_before);
+    }
+
+    /// A reader that arrives after a waiting `get_mut()` must be served after
+    /// it. tokio's `RwLock` guarantees that only once the writer is queued on
+    /// the write lock: if `get_mut()` first queued as a reader to reload, the
+    /// later reader would be admitted alongside it, and a reader that holds
+    /// its permit until the writer is done would then block the write lock
+    /// forever.
+    #[tokio::test]
+    async fn test_get_mut_is_served_before_later_readers() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        let wrapper = manifest_ns.manifest_dataset.clone();
+
+        // Hold the lock exclusively so both tasks below park on their first
+        // lock request, in spawn order. The current-thread test runtime polls
+        // each spawned task before this task resumes from `yield_now`.
+        let blocker = wrapper.0.write().await;
+        let writer = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                wrapper.get_mut().await.unwrap();
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // The late reader takes a single read permit and keeps it until told
+        // to let go. A raw lock rather than `get()` so that it never releases
+        // and re-acquires the permit around a reload probe, which would leave
+        // a window for the writer's request to slip in ahead of it.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let late_reader = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                let guard = wrapper.0.read().await;
+                release_rx.await.unwrap();
+                drop(guard);
+            })
+        };
+        tokio::task::yield_now().await;
+
+        drop(blocker);
+        timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("get_mut() waited on a reader that arrived after it")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), late_reader)
+            .await
+            .expect("the late reader did not finish after the writer released the lock")
+            .unwrap();
     }
 
     #[tokio::test]
