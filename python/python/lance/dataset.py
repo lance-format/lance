@@ -3138,6 +3138,11 @@ class LanceDataset(pa.dataset.Dataset):
     def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
+
+        Each entry is a :class:`Version` with ``version``, ``timestamp``,
+        ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
+        bytes of that version's manifest file, or ``None`` if the commit
+        handler could not report it.
         """
         versions = self._ds.versions()
         for v in versions:
@@ -6070,6 +6075,11 @@ class Version(TypedDict):
     version: int
     timestamp: int | datetime
     metadata: Dict[str, str]
+    #: Size of this version's manifest file, in bytes, or ``None`` when the
+    #: commit handler could not report the size. The manifest grows with the
+    #: number of columns and fragments, so this is useful for observing
+    #: metadata amplification in wide tables.
+    manifest_size: int | None
 
 
 class VersionRef(TypedDict):
