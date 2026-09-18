@@ -470,8 +470,8 @@ impl<'a> TransactionRebase<'a> {
                 ..
             } = &other_transaction.operation
             {
-                // The presence of inserted_rows_filter means this is a primary key operation
-                // and strict conflict detection should be applied.
+                // Merge inserts persist the keys of rows they inserted so stale
+                // transactions cannot insert the same join keys concurrently.
                 match (self_inserted_rows_filter, other_inserted_rows_filter) {
                     (Some(self_keys), Some(other_keys)) => {
                         if self_keys.field_ids != other_keys.field_ids {
@@ -498,8 +498,8 @@ impl<'a> TransactionRebase<'a> {
                         }
                     }
                     (Some(_), None) => {
-                        // Current transaction has primary key conflict detection but
-                        // the already committed transaction doesn't have a filter.
+                        // The current transaction inserted tracked keys but the
+                        // already committed transaction doesn't have a filter.
                         // We can't determine what rows were inserted by the other
                         // transaction, so we must fail to be safe.
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
@@ -589,9 +589,9 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::Append { .. } => {
-                    // If current transaction has primary key conflict detection,
-                    // we can't safely commit against an Append because we don't
-                    // know if the appended rows conflict with inserted rows.
+                    // If the current transaction inserted tracked keys, we can't
+                    // safely commit against an Append because we don't know if the
+                    // appended rows conflict with them.
                     if self_inserted_rows_filter.is_some() {
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
