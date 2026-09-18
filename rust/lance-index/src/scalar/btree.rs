@@ -1196,6 +1196,82 @@ impl BTreeLookup {
     }
 }
 
+/// One batched read of the pages a query is missing from cache.
+///
+/// Loading pages one at a time costs a request per page, which dominates any
+/// query whose predicate spans many pages: a range covering most of a column
+/// touches one page per `batch_size` values.  Handing the whole missing set to
+/// [`IndexReader::read_record_batches`] at once lets the reader merge
+/// neighbouring pages into shared requests.
+///
+/// The read is lazy and runs at most once per query, triggered by whichever
+/// page reaches its loader first.  A query whose pages are all cached, or whose
+/// pages another query is already loading, therefore does no I/O of its own.
+struct BatchedPageRead {
+    index_reader: LazyIndexReader,
+    batch_size: u64,
+    /// Ascending and deduplicated, so the ranges handed to the reader are
+    /// disjoint and in order - what lets it merge neighbours.
+    page_numbers: Vec<u32>,
+    batches: tokio::sync::OnceCell<HashMap<u32, RecordBatch>>,
+}
+
+impl BatchedPageRead {
+    fn new(index_reader: LazyIndexReader, batch_size: u64, page_numbers: Vec<u32>) -> Self {
+        Self {
+            index_reader,
+            batch_size,
+            page_numbers,
+            batches: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Reader to fall back to for a page this batch does not cover.
+    fn index_reader(&self) -> LazyIndexReader {
+        self.index_reader.clone()
+    }
+
+    /// The serialized page, reading the whole batch first if it has not run yet.
+    ///
+    /// Returns `None` for a page the batch does not cover, leaving the caller to
+    /// read it on its own.
+    async fn take(&self, page_number: u32) -> Result<Option<RecordBatch>> {
+        // Sorted, so this stays cheap even for a query spanning thousands of pages.
+        if self.page_numbers.binary_search(&page_number).is_err() {
+            return Ok(None);
+        }
+        let batches = self
+            .batches
+            .get_or_try_init(|| async {
+                let reader = self.index_reader.get().await?;
+                let batch_numbers = self
+                    .page_numbers
+                    .iter()
+                    .map(|page_number| *page_number as u64)
+                    .collect::<Vec<_>>();
+                let batches = reader
+                    .read_record_batches(&batch_numbers, self.batch_size)
+                    .await?;
+                if batches.len() != self.page_numbers.len() {
+                    return Err(Error::internal(format!(
+                        "index reader returned {} batches for {} requested pages",
+                        batches.len(),
+                        self.page_numbers.len()
+                    )));
+                }
+                Result::Ok(
+                    self.page_numbers
+                        .iter()
+                        .copied()
+                        .zip(batches)
+                        .collect::<HashMap<_, _>>(),
+                )
+            })
+            .await?;
+        Ok(batches.get(&page_number).cloned())
+    }
+}
+
 // We only need to open a file reader for pages if we need to load a page.  If all
 // pages are cached we don't open it.  If we do open it we should only open it once.
 #[derive(Clone)]
@@ -1291,6 +1367,51 @@ impl IndexReader for LazyRangedIndexReader {
         reader
             .read_record_batch(local_page_idx as u64, batch_size)
             .await
+    }
+
+    /// Group the requested pages by the file that holds them, so each file
+    /// coalesces its own pages into one read rather than one read per page.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        // Keep each page's position in the request so the grouped reads can be
+        // scattered back into the order the caller asked for.
+        let mut by_file: HashMap<String, (Vec<u64>, Vec<usize>)> = HashMap::new();
+        for (position, page) in batch_numbers.iter().enumerate() {
+            let page_idx = *page as u32;
+            let (file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
+                Error::internal(format!(
+                    "Unexpected page index, index {} is out of range.",
+                    page_idx
+                ))
+            })?;
+            let entry = by_file.entry(file_name.clone()).or_default();
+            entry.0.push((page_idx - *offset) as u64);
+            entry.1.push(position);
+        }
+
+        let groups = by_file
+            .into_iter()
+            .map(|(file_name, (local_pages, positions))| async move {
+                let reader = self.get_reader(&file_name).await?;
+                let batches = reader.read_record_batches(&local_pages, batch_size).await?;
+                Result::Ok(positions.into_iter().zip(batches))
+            });
+        let groups = futures::future::try_join_all(groups).await?;
+
+        let mut results: Vec<Option<RecordBatch>> = vec![None; batch_numbers.len()];
+        for (position, batch) in groups.into_iter().flatten() {
+            results[position] = Some(batch);
+        }
+        results
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .ok_or_else(|| Error::internal("Missing page in ranged index read".to_string()))
+            })
+            .collect()
     }
 
     async fn read_range(
@@ -1651,10 +1772,38 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<FlatIndex>> {
+        self.lookup_page_with(page_number, index_reader, None, metrics)
+            .await
+    }
+
+    /// [`Self::lookup_page`], optionally taking the page's data from a batched
+    /// read shared with the rest of the query.
+    ///
+    /// The batched read stays *behind* the page cache's loader so that
+    /// concurrent queries still coalesce against each other: a page another
+    /// query is already loading is awaited rather than read a second time.
+    async fn lookup_page_with(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        batched: Option<&BatchedPageRead>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<FlatIndex>> {
         let result = self
             .index_cache
             .get_or_insert_with_key_hit(BTreePageKey { page_number }, move || async move {
-                self.read_page(page_number, index_reader, metrics).await
+                let serialized_page = match batched {
+                    Some(batched) => batched.take(page_number).await?,
+                    None => None,
+                };
+                match serialized_page {
+                    Some(serialized_page) => {
+                        self.build_page(page_number, serialized_page, metrics).await
+                    }
+                    // Not in the batch: the page became uncached after the
+                    // batch was chosen, so fall back to reading it on its own.
+                    None => self.read_page(page_number, index_reader, metrics).await,
+                }
             })
             .await;
         match &result {
@@ -1664,6 +1813,33 @@ impl BTreeIndex {
         result.map(|(page, _)| page)
     }
 
+    /// The pages a query needs that are not in the cache right now.
+    ///
+    /// Probing the cache for the whole page set before loading any of it is what
+    /// lets the misses be read together.  The answer is a snapshot and may be
+    /// stale by the time a page is loaded, which is why the loader falls back to
+    /// a single-page read for anything the batch turns out not to cover.
+    async fn uncached_pages(&self, pages: &[Matches]) -> Vec<u32> {
+        // Sorted and deduplicated so the reader sees ascending, disjoint ranges,
+        // which is what lets it merge neighbours into shared requests.
+        let mut wanted = pages.iter().map(Matches::page_id).collect::<Vec<_>>();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut missing = Vec::new();
+        for page_number in wanted {
+            if self
+                .index_cache
+                .get_with_key(&BTreePageKey { page_number })
+                .await
+                .is_none()
+            {
+                missing.push(page_number);
+            }
+        }
+        missing
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn read_page(
         &self,
@@ -1671,12 +1847,22 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<FlatIndex> {
-        metrics.record_part_load();
-        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
-        let mut serialized_page = index_reader
+        let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
+        self.build_page(page_number, serialized_page, metrics).await
+    }
+
+    /// Turn a page's serialized batch into a searchable page.
+    async fn build_page(
+        &self,
+        page_number: u32,
+        mut serialized_page: RecordBatch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<FlatIndex> {
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
             serialized_page =
                 frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
@@ -1704,13 +1890,18 @@ impl BTreeIndex {
         &self,
         query: &SargableQuery,
         matches: Matches,
-        index_reader: LazyIndexReader,
+        batched: &BatchedPageRead,
         prebuilt: Option<&Arc<dyn PhysicalExpr>>,
         track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         let subindex = self
-            .lookup_page(matches.page_id(), index_reader, metrics)
+            .lookup_page_with(
+                matches.page_id(),
+                batched.index_reader(),
+                Some(batched),
+                metrics,
+            )
             .await?;
 
         match matches {
@@ -2229,13 +2420,20 @@ impl ScalarIndex for BTreeIndex {
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        // Decide the whole page set before loading any of it, so the pages that
+        // are not cached can be fetched together rather than one request each.
+        let batched = BatchedPageRead::new(
+            lazy_index_reader,
+            self.batch_size,
+            self.uncached_pages(&pages).await,
+        );
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
                 self.search_page(
                     query,
                     page_index,
-                    lazy_index_reader.clone(),
+                    &batched,
                     prebuilt.as_ref(),
                     options.track_nulls(),
                     metrics,
@@ -3804,6 +4002,114 @@ mod tests {
         assert_eq!(warm.index_cache_hits(), 1);
         assert_eq!(warm.index_cache_misses(), 0);
         assert_eq!(warm.parts_loaded.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_range_query_coalesces_page_reads() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 10k values at 64 per page is ~157 pages, enough that reading one page
+        // per request would be plainly visible in the IOPS count.
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Ignore the I/O that loading the index itself did.
+        object_store.io_stats_incremental();
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
+            std::ops::Bound::Excluded(ScalarValue::Float32(Some(9000.0))),
+        );
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+        let SearchResult::Exact(selection) = result else {
+            panic!("expected an exact search result");
+        };
+        assert_eq!(selection.selected_rows().len(), Some(9000));
+
+        let parts_loaded = metrics.parts_loaded.load(Ordering::Relaxed) as u64;
+        assert!(
+            parts_loaded > 100,
+            "expected the range to span many pages, loaded {parts_loaded}"
+        );
+        // The pages are consecutive, so they should coalesce into a handful of
+        // requests rather than one per page.
+        let read_iops = object_store.io_stats_snapshot().read_iops;
+        assert!(
+            read_iops < parts_loaded / 4,
+            "expected {parts_loaded} pages to coalesce, but took {read_iops} reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batched_page_read_matches_individual_reads() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 1000 rows at 64 per page leaves a short final page, so the batched
+        // read has to clamp the last range the same way a single read does.
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(1));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let reader = test_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        let num_pages = reader.num_batches(64).await as u64;
+        assert!(num_pages > 2, "expected several pages, got {num_pages}");
+
+        // Out of order and with a gap, to check the batched read puts the
+        // batches back in the order they were asked for.
+        let requested = [num_pages - 1, 0, 2];
+        let batched = reader.read_record_batches(&requested, 64).await.unwrap();
+        assert_eq!(batched.len(), requested.len());
+        for (page_number, batched_page) in requested.iter().zip(batched) {
+            let individual = reader.read_record_batch(*page_number, 64).await.unwrap();
+            assert_eq!(
+                batched_page, individual,
+                "page {page_number} differed between a batched and an individual read"
+            );
+        }
     }
 
     #[tokio::test]

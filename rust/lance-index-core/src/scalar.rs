@@ -172,6 +172,23 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Read several record batches, returning one batch per entry of
+    /// `batch_numbers`, in the order requested.
+    ///
+    /// The default implementation issues one read per batch in parallel, which
+    /// costs a request per batch.  Readers whose batches sit on predictable row
+    /// ranges override this to fold them into a single [`Self::read_ranges`]
+    /// call, so that neighbouring batches share a request.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        let futures = batch_numbers
+            .iter()
+            .map(|n| self.read_record_batch(*n, batch_size));
+        futures::future::try_join_all(futures).await
+    }
     /// Reads a global buffer by index.
     async fn read_global_buffer(&self, _index: u32) -> Result<Bytes> {
         Err(Error::not_supported(

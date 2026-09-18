@@ -209,13 +209,58 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+impl CurrentIndexReader {
+    /// Row range covered by batch `offset`, clamped to the end of the file.
+    fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
+        let num_rows = self.0.num_rows();
+        let start = (offset * batch_size).min(num_rows);
+        let end = (start + batch_size).min(num_rows);
+        (start as usize, end as usize)
+    }
+}
+
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
-        let start = offset * batch_size;
-        let end = start + batch_size;
-        let end = end.min(self.0.num_rows());
-        self.read_range(start as usize..end as usize, None).await
+        let (start, end) = self.batch_bounds(offset, batch_size);
+        self.read_range(start..end, None).await
+    }
+
+    /// Fold every requested batch into one [`Self::read_ranges`] call.
+    ///
+    /// Batch N occupies rows `[N * batch_size, (N + 1) * batch_size)`, so a set
+    /// of batch numbers maps directly onto a set of row ranges, and `read_ranges`
+    /// already merges adjacent and nearby ranges into shared requests.  A range
+    /// query that touches thousands of consecutive batches therefore becomes a
+    /// handful of large reads rather than one request per batch.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        if batch_numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranges = batch_numbers
+            .iter()
+            .map(|n| {
+                let (start, end) = self.batch_bounds(*n, batch_size);
+                start..end
+            })
+            .collect::<Vec<_>>();
+        let merged = self.read_ranges(&ranges, None).await?;
+        // `read_ranges` returns the rows in the order the ranges were given, so
+        // the batches come back out as consecutive slices of the merged batch.
+        let mut offset = 0;
+        Ok(ranges
+            .iter()
+            .map(|range| {
+                let len = range.end - range.start;
+                let batch = merged.slice(offset, len);
+                offset += len;
+                batch
+            })
+            .collect())
     }
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
