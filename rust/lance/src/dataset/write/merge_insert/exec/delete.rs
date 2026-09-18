@@ -131,6 +131,9 @@ impl DeleteOnlyMergeInsertExec {
             })?;
 
         let mut delete_row_addrs = RoaringTreemap::new();
+        // Target addresses claimed by `MatchedNoOp` rows purely for dedupe
+        // accounting; they are removed from the delete set before returning.
+        let mut claimed_no_op_addrs = RoaringTreemap::new();
 
         while let Some(batch_result) = input_stream.next().await {
             let batch = batch_result?;
@@ -165,15 +168,27 @@ impl DeleteOnlyMergeInsertExec {
                     ))
                 })?;
 
-                if action == Action::Delete && !row_addr_array.is_null(row_idx) {
+                if matches!(action, Action::Delete | Action::MatchedNoOp)
+                    && !row_addr_array.is_null(row_idx)
+                {
                     let row_addr = row_addr_array.value(row_idx);
                     // The treemap dedupes addresses, so a repeat insert signals
                     // a duplicate source row matching the same target; apply the
                     // same dedupe policy as updates. (Delete-only never carries
                     // `delete_not_matched_by_source`, so every delete here is a
                     // source match.)
+                    //
+                    // `MatchedNoOp` rows claim their target address without
+                    // being deleted, so a conditional clause that excludes one
+                    // of two source rows matching the same target still trips
+                    // the dedupe policy. `claimed_no_op_addrs` remembers those
+                    // claims so they can be removed from the delete set below.
                     if delete_row_addrs.insert(row_addr) {
-                        metrics.num_deleted_rows.add(1);
+                        if action == Action::Delete {
+                            metrics.num_deleted_rows.add(1);
+                        } else {
+                            claimed_no_op_addrs.insert(row_addr);
+                        }
                     } else {
                         match source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
@@ -190,7 +205,7 @@ impl DeleteOnlyMergeInsertExec {
             }
         }
 
-        Ok(delete_row_addrs)
+        Ok(delete_row_addrs - claimed_no_op_addrs)
     }
 }
 
@@ -204,10 +219,20 @@ impl DisplayAs for DeleteOnlyMergeInsertExec {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
+                let when_matched = match &self.params.when_matched {
+                    crate::dataset::WhenMatched::Delete => "Delete".to_string(),
+                    crate::dataset::WhenMatched::DeleteIf(condition) => {
+                        format!("DeleteIf({})", condition)
+                    }
+                    crate::dataset::WhenMatched::DeleteIfExpr(expr) => {
+                        format!("DeleteIfExpr({})", expr.human_display())
+                    }
+                    other => format!("{:?}", other),
+                };
                 write!(
                     f,
-                    "DeleteOnlyMergeInsert: on=[{}], when_matched=Delete, when_not_matched=DoNothing",
-                    on_keys
+                    "DeleteOnlyMergeInsert: on=[{}], when_matched={}, when_not_matched=DoNothing",
+                    on_keys, when_matched
                 )
             }
             datafusion::physical_plan::DisplayFormatType::TreeRender => {
