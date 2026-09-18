@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
+use crate::{Error, Result};
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
+};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -14,63 +16,113 @@ use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
-use lance_core::ROW_ID;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-fn extract_row_ids(
-    row_ids: &mut CapturedRowIds,
-    batch: RecordBatch,
-    row_id_idx: usize,
-    non_row_id_projection: &[usize],
-) -> DFResult<RecordBatch> {
-    let row_ids_arr = batch.column(row_id_idx);
-    let row_ids_itr = row_ids_arr
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap_or_else(|| {
-            panic!(
-                "Row ids had an unexpected type: {}",
-                row_ids_arr.data_type()
-            )
-        })
-        .values();
-    row_ids.capture(row_ids_itr)?;
-    Ok(batch.project(non_row_id_projection)?)
+/// Which column a capture stream consumes, and how its values accumulate.
+#[derive(Debug, Clone, Copy)]
+pub enum RowCapture {
+    /// Capture `_rowid`. `stable` follows the dataset's row id feature: with
+    /// stable row ids the values accumulate as a `RowIdSequence`, otherwise as
+    /// addresses.
+    RowId { stable: bool },
+    /// Capture `_rowaddr`, always accumulated as addresses. Deletion flows need
+    /// only the addresses of the removed rows for their deletion vectors, so
+    /// capturing those directly keeps them out of the row id domain: the capture
+    /// needs no row id index to translate ids back to addresses.
+    RowAddr,
 }
 
-/// Given a stream that includes a row id column, return a stream that will
-/// capture the row id. At completion of the stream, the captured row ids can
-/// be received from the returned receiver.
-pub fn make_rowid_capture_stream(
+impl RowCapture {
+    fn column(&self) -> &'static str {
+        match self {
+            Self::RowId { .. } => ROW_ID,
+            Self::RowAddr => ROW_ADDR,
+        }
+    }
+
+    fn accumulator(&self) -> CapturedRowIds {
+        match self {
+            Self::RowId { stable } => CapturedRowIds::new(*stable),
+            Self::RowAddr => CapturedRowIds::AddressSet(RoaringTreemap::new()),
+        }
+    }
+}
+
+fn capture_and_project(
+    captured: &mut CapturedRowIds,
+    batch: RecordBatch,
+    column: &str,
+    value_idx: usize,
+    output_projection: &[usize],
+) -> DFResult<RecordBatch> {
+    let values_arr = batch.column(value_idx);
+    let values = values_arr
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "{column} had an unexpected type: {}",
+                values_arr.data_type()
+            ))
+        })?;
+    if values.null_count() > 0 {
+        // Both capture columns are nullable, and `values()` reads the buffer
+        // without consulting validity, so a null would be captured as some
+        // unrelated address. Deletion vectors are built straight from these,
+        // so refuse the batch instead of deleting whatever that address is.
+        return Err(datafusion::error::DataFusionError::Execution(format!(
+            "{column} had {} null values in a capture stream",
+            values.null_count()
+        )));
+    }
+    captured.capture(values.values())?;
+    Ok(batch.project(output_projection)?)
+}
+
+/// Given a stream carrying the column named by `capture`, return a stream that
+/// captures that column's values and drops it from the output. At completion of
+/// the stream the captured values can be received from the returned receiver.
+///
+/// A `RowId` capture without stable row ids accumulates with
+/// `RoaringTreemap::append`, which rejects values that do not arrive ascending;
+/// see `CapturedRowIds::AddressStyle` for why compaction wants that. A `RowAddr`
+/// capture only needs the set, so any order will do, and a stable-row-id capture
+/// keeps arrival order, which the new fragments' row id sequences are built from.
+pub fn make_row_capture_stream(
     mut target: SendableRecordBatchStream,
-    stable_row_ids: bool,
+    capture: RowCapture,
 ) -> Result<(SendableRecordBatchStream, Receiver<CapturedRowIds>)> {
-    let mut row_ids = CapturedRowIds::new(stable_row_ids);
+    let mut captured = capture.accumulator();
+    let column = capture.column();
 
     let (tx, rx) = std::sync::mpsc::channel();
 
     let schema = target.schema();
-    let (row_id_idx, _) = schema
-        .column_with_name(ROW_ID)
-        .expect("Received a batch without row ids");
-    let non_row_ids_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx)
+    let (value_idx, _) = schema.column_with_name(column).ok_or_else(|| {
+        Error::internal(format!(
+            "A capture stream needs a `{column}` column, but none of the stream's {} columns is it",
+            schema.fields().len()
+        ))
+    })?;
+    let output_cols = (0..schema.fields.len())
+        .filter(|col| *col != value_idx)
         .collect::<Vec<_>>();
-    let output_schema = Arc::new(schema.project(&non_row_ids_cols)?);
+    let output_schema = Arc::new(schema.project(&output_cols)?);
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
-            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, &non_row_ids_cols);
+            let res = capture_and_project(&mut captured, batch, column, value_idx, &output_cols);
             std::task::Poll::Ready(Some(res))
         }
         std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
         std::task::Poll::Ready(None) => {
-            let row_ids_out = std::mem::take(&mut row_ids);
-            tx.send(row_ids_out).unwrap();
+            let captured_out = std::mem::replace(&mut captured, capture.accumulator());
+            tx.send(captured_out).unwrap();
             std::task::Poll::Ready(None)
         }
         std::task::Poll::Pending => std::task::Poll::Pending,
@@ -83,7 +135,17 @@ pub fn make_rowid_capture_stream(
 
 #[derive(Debug)]
 pub enum CapturedRowIds {
+    /// Addresses that arrive ascending, enforced with `append`. Compaction is
+    /// the caller that needs the check: it writes its rows in capture order and
+    /// then recovers that order by iterating the treemap, which is ascending —
+    /// so for the pairing to hold, arrival order has to be ascending too.
+    /// Update and merge insert accumulate here as well, and only have to stay
+    /// within the check rather than depending on it.
     AddressStyle(RoaringTreemap),
+    /// Addresses collected as a set, with no ordering requirement. Deletion
+    /// flows want only the set of removed rows, and a plan that reads rows the
+    /// index's way rather than the fragments' hands them over unordered.
+    AddressSet(RoaringTreemap),
     SequenceStyle(RowIdSequence),
 }
 
@@ -99,9 +161,15 @@ impl CapturedRowIds {
     pub fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
         match self {
             Self::AddressStyle(ids) => {
-                // Assume they are sorted
+                // Not just the cheap path: compaction writes rows in capture
+                // order and recovers the pairing by iterating the treemap
+                // ascending, so accepting a reordered batch here would remap
+                // index entries onto the wrong rows. Let `append` catch it.
                 ids.append(row_ids.iter().cloned())
                     .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            }
+            Self::AddressSet(ids) => {
+                ids.extend(row_ids.iter().cloned());
             }
             Self::SequenceStyle(sequence) => {
                 sequence.extend(row_ids.into());
@@ -119,7 +187,7 @@ impl CapturedRowIds {
 
     pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
-            Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
+            Self::AddressStyle(addrs) | Self::AddressSet(addrs) => Ok(Cow::Borrowed(addrs)),
             Self::SequenceStyle(sequence) => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
@@ -136,12 +204,6 @@ impl CapturedRowIds {
                 Ok(Cow::Owned(treemap))
             }
         }
-    }
-}
-
-impl Default for CapturedRowIds {
-    fn default() -> Self {
-        Self::AddressStyle(RoaringTreemap::new())
     }
 }
 
@@ -337,5 +399,73 @@ impl SchemaAdapter {
             converted_schema,
             converted_stream,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_accumulators_differ_on_order() {
+        // Each capture picks its accumulator, and that pairing is the contract
+        // the two tests below rest on.
+        assert!(matches!(
+            RowCapture::RowAddr.accumulator(),
+            CapturedRowIds::AddressSet(_)
+        ));
+        assert!(matches!(
+            RowCapture::RowId { stable: false }.accumulator(),
+            CapturedRowIds::AddressStyle(_)
+        ));
+        // A stable-row-id capture has to reach the sequence: every consumer of
+        // one reads it through `row_id_sequence()`, which returns `None` for the
+        // address variants, so getting this wrong is a silent skip rather than
+        // an error.
+        assert!(matches!(
+            RowCapture::RowId { stable: true }.accumulator(),
+            CapturedRowIds::SequenceStyle(_)
+        ));
+
+        // The delete flow's accumulator takes addresses in any order...
+        let mut set = CapturedRowIds::AddressSet(RoaringTreemap::new());
+        set.capture(&[5, 3]).unwrap();
+        assert_eq!(
+            set.row_addrs(None).unwrap().iter().collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+
+        // ...while compaction's insists on ascending input, because it pairs
+        // the captured addresses positionally with the rows it wrote.
+        let mut ordered = CapturedRowIds::AddressStyle(RoaringTreemap::new());
+        assert!(ordered.capture(&[5, 3]).is_err());
+    }
+
+    #[test]
+    fn capture_refuses_null_addresses() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new("x", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![Some(0), None])),
+                Arc::new(UInt64Array::from(vec![Some(1), Some(2)])),
+            ],
+        )
+        .unwrap();
+
+        // The null here sits over a 0 in the values buffer, so an unguarded
+        // capture would delete fragment 0 row 0.
+        let mut captured = CapturedRowIds::AddressSet(RoaringTreemap::new());
+        let err = capture_and_project(&mut captured, batch, ROW_ADDR, 0, &[1]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(ROW_ADDR) && msg.contains("null"),
+            "error should name the column and the nulls, got: {err}"
+        );
+        // The check runs before the capture, so nothing reached the accumulator.
+        assert!(captured.row_addrs(None).unwrap().is_empty());
     }
 }
