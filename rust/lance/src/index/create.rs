@@ -3283,6 +3283,76 @@ mod tests {
                         .contains("no applicable fragment-reuse mapping is available"),
                     "unexpected missing fragment-reuse error: {error}"
                 );
+
+                let compacted_fragment_ids = dataset.fragment_bitmap.as_ref().clone();
+                let append_batch = dataset.scan().try_into_batch().await.unwrap().slice(0, 2);
+                let append_schema = append_batch.schema();
+                let reader = RecordBatchIterator::new(vec![Ok(append_batch)], append_schema);
+                dataset
+                    .append(
+                        reader,
+                        Some(WriteParams {
+                            max_rows_per_file: 1,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let appended_fragment_ids =
+                    dataset.fragment_bitmap.as_ref() - &compacted_fragment_ids;
+                assert_eq!(appended_fragment_ids.len(), 2);
+                let mut partially_trimmed_segments = segments.clone();
+                for fragment_id in appended_fragment_ids {
+                    partially_trimmed_segments.push(
+                        CreateIndexBuilder::new(&mut dataset, &[column], IndexType::BTree, &params)
+                            .name("in_flight".to_string())
+                            .fragments(vec![fragment_id])
+                            .execute_uncommitted()
+                            .await
+                            .unwrap(),
+                    );
+                }
+                dataset
+                    .create_index(
+                        &[column],
+                        IndexType::BTree,
+                        Some("committed".to_string()),
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 2,
+                        defer_index_remap: true,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    !dataset
+                        .frag_reuse_index()
+                        .await
+                        .unwrap()
+                        .expect("newer fragment-reuse mapping should be retained")
+                        .is_empty()
+                );
+
+                let error = dataset
+                    .merge_existing_index_segments(partially_trimmed_segments)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("retained fragment-reuse history does not account for retired"),
+                    "unexpected partially trimmed fragment-reuse error: {error}"
+                );
             }
         }
     }

@@ -215,6 +215,16 @@ async fn remap_merged_segment_coverage(
         }
     }
 
+    let unmapped_retired_coverage = &coverage_at_version - dataset.fragment_bitmap.as_ref();
+    if !unmapped_retired_coverage.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "merge_existing_index_segments: retained fragment-reuse history does not account \
+             for retired source fragment ids {:?}; rebuild the segments against the current \
+             dataset",
+            unmapped_retired_coverage
+        )));
+    }
+
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
     merged_coverage &= dataset.fragment_bitmap.as_ref();
 
