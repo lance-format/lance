@@ -72,16 +72,25 @@ impl AddFragment {
         self.data_change
     }
 
-    /// Nothing for a local token: the fragment does not exist in the read
+    /// No coordinate for a local token: the fragment does not exist in the read
     /// version, so no concurrent writer can be naming it.
     ///
-    /// A committed id does write one coordinate. A reservation is meant to be
-    /// one writer's alone, but nothing in the format enforces that, so two
-    /// operations handed the same range would otherwise each add a fragment at
-    /// the same id and the second commit would silently win.
+    /// A committed id does write one. A reservation is meant to be one writer's
+    /// alone, but nothing in the format enforces that, so two operations handed
+    /// the same range would otherwise each add a fragment at the same id and
+    /// the second commit would silently win.
+    ///
+    /// Either form records that rows arrive, which is the one thing about an
+    /// added fragment a concurrent
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys) has to know. A fragment
+    /// that is not a data change holds rows that were already in the dataset --
+    /// a compaction rewrite -- and brings in no new key.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         if let Some(id) = self.id.committed() {
             footprint.add(Coordinate::FragmentExistence(id));
+        }
+        if self.data_change {
+            footprint.insert_rows();
         }
     }
 }
