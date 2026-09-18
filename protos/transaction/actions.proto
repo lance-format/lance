@@ -430,6 +430,16 @@ message AddIndexSegment {
   string name = 2;
   // Indexed field ids (Committed, or Local for same-op minted fields).
   repeated Ref fields = 3;
+  /*
+   * The trailing entries of `fields` whose values the segment carries but is
+   * not keyed on, repeated here rather than given as a count so a reader does
+   * not have to trust the two lists to line up. Empty for a segment that
+   * carries no extra column.
+   *
+   * Never all of `fields`: the first entry is always a column the segment is
+   * keyed on. Apply checks both rules before the segment reaches a manifest.
+   */
+  repeated Ref covering_fields = 12;
   google.protobuf.Any index_details = 4;
   optional int32 index_version = 5;
   /*
