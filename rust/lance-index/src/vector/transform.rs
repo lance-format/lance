@@ -194,7 +194,15 @@ impl Transformer for Flatten {
         match arr.data_type() {
             DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "Flatten: multivector column {} requires a {} column in the batch",
+                            self.column, ROW_ID
+                        ))
+                    })?
+                    .as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
@@ -235,6 +243,41 @@ mod tests {
     use half::f16;
     use lance_arrow::*;
     use lance_linalg::distance::L2;
+
+    /// The multivector branch needs the row-id column to repeat each row id per
+    /// inner vector, and `batch[ROW_ID]` panics when it is absent. `Flatten` is
+    /// public, so the column set is the caller's to get wrong, and the
+    /// fixed-size-list branch right above returns the batch untouched without
+    /// needing it.
+    #[test]
+    fn test_flatten_reports_missing_row_id_for_multivector() {
+        let inner = Arc::new(Field::new(
+            "item",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        ));
+        let values = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values([1.0, 2.0, 3.0, 4.0]),
+            2,
+        )
+        .unwrap();
+        let offsets = arrow::buffer::OffsetBuffer::new(vec![0, 2].into());
+        let multivectors =
+            arrow_array::ListArray::try_new(inner.clone(), offsets, Arc::new(values), None)
+                .unwrap();
+        let schema = Schema::new(vec![Field::new("v", DataType::List(inner), true)]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(multivectors)]).unwrap();
+
+        let err = Flatten::new("v").transform(&batch).unwrap_err();
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "expected an Index error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(ROW_ID),
+            "the error should name the missing column, got: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {
