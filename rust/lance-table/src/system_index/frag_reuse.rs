@@ -647,13 +647,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_compact_fri_rejects_invalid_changed_row_bitmap() {
+    #[rstest]
+    #[case::garbage(vec![1, 2, 3])]
+    // A plausible length prefix followed by a truncated body, so the failure happens inside
+    // treemap parsing rather than on the first read.
+    #[case::truncated_body([4u64.to_le_bytes().as_slice(), &[0xff; 6]].concat())]
+    fn test_compact_fri_rejects_invalid_changed_row_bitmap(#[case] changed_row_addrs: Vec<u8>) {
         let details = FragReuseIndexDetails {
             versions: vec![FragReuseVersion {
                 dataset_version: 1,
                 groups: vec![FragReuseGroup {
-                    changed_row_addrs: vec![1, 2, 3],
+                    changed_row_addrs,
                     old_frags: vec![digest(1, 1)],
                     new_frags: vec![digest(2, 1)],
                 }],
@@ -831,6 +835,242 @@ mod tests {
                 physical_rows: 1,
                 num_deleted_rows: 0,
             }]
+        );
+    }
+
+    /// One rewrite group. `rewritten` is `(old_frag, offset)` in any order: the treemap sorts
+    /// and run-optimizes it, which is what compaction writes.
+    fn group(
+        rewritten: impl IntoIterator<Item = (u32, u32)>,
+        old_frags: Vec<FragDigest>,
+        new_frags: Vec<FragDigest>,
+    ) -> FragReuseGroup {
+        let mut addrs = RoaringTreemap::from_iter(
+            rewritten
+                .into_iter()
+                .map(|(frag, offset)| addr(frag, offset)),
+        );
+        addrs.optimize();
+        let mut changed_row_addrs = Vec::with_capacity(addrs.serialized_size());
+        addrs.serialize_into(&mut changed_row_addrs).unwrap();
+        FragReuseGroup {
+            changed_row_addrs,
+            old_frags,
+            new_frags,
+        }
+    }
+
+    /// One version per inner vec, numbered from 1 in order.
+    fn details(versions: Vec<Vec<FragReuseGroup>>) -> FragReuseIndexDetails {
+        FragReuseIndexDetails {
+            versions: versions
+                .into_iter()
+                .enumerate()
+                .map(|(i, groups)| FragReuseVersion {
+                    dataset_version: i as u64 + 1,
+                    groups,
+                })
+                .collect(),
+        }
+    }
+
+    fn open(details: FragReuseIndexDetails) -> CompactFragReuseIndex {
+        CompactFragReuseIndex::try_new(Uuid::new_v4(), details).expect("index should open")
+    }
+
+    #[test]
+    fn test_compact_fri_maps_moved_deleted_and_untouched() {
+        let index = open(details(vec![vec![group(
+            [(0, 0), (0, 2)],
+            vec![digest(0, 3)],
+            vec![digest(10, 2)],
+        )]]));
+
+        // Moved, in read order.
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(0, 2)), Some(addr(10, 1)));
+        // Offset 1 was deleted before compaction: gone, not unchanged.
+        assert_eq!(index.remap_row_id(addr(0, 1)), None);
+        // A fragment no group covers is left alone.
+        assert_eq!(index.remap_row_id(addr(9, 0)), Some(addr(9, 0)));
+        // The output address is not remapped again.
+        assert_eq!(index.remap_row_id(addr(10, 0)), Some(addr(10, 0)));
+        // Past the fragment's recorded row count there was no row to rewrite or delete, so
+        // the address is not the remap's to answer and passes through unchanged.
+        assert_eq!(index.remap_row_id(addr(0, 3)), Some(addr(0, 3)));
+        assert_eq!(index.remap_row_id(addr(0, 99)), Some(addr(0, 99)));
+    }
+
+    #[test]
+    fn test_compact_fri_pairs_rows_in_read_order_not_address_order() {
+        // `old_frags` records the order compaction read the fragments, and rows are paired
+        // positionally in that order rather than by address. The two coincide in practice,
+        // since the manifest keeps its fragment list id-sorted, so this input is not
+        // reachable from any current writer. It is pinned because it records which pairing
+        // is the correct one, and would catch a regression if that invariant stopped holding.
+        let index = open(details(vec![vec![group(
+            [(4, 0), (4, 1), (3, 0), (3, 1)],
+            vec![digest(4, 2), digest(3, 2)],
+            vec![digest(10, 4)],
+        )]]));
+
+        assert_eq!(index.remap_row_id(addr(4, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(4, 1)), Some(addr(10, 1)));
+        assert_eq!(index.remap_row_id(addr(3, 0)), Some(addr(10, 2)));
+        assert_eq!(index.remap_row_id(addr(3, 1)), Some(addr(10, 3)));
+    }
+
+    #[test]
+    fn test_compact_fri_handles_large_run_optimized_bitmaps() {
+        // Real payloads span fragments of up to `max_rows_per_file` and are run-optimized
+        // before serializing, so the offsets land in run and bitmap containers rather than
+        // the small array containers every other test here uses. This is what exercises the
+        // rank lookup on those container types.
+        const ROWS: u32 = 200_000;
+        let holes = [7u32, 65_535, 65_536, 131_072];
+        let kept: Vec<u32> = (0..ROWS).filter(|o| !holes.contains(o)).collect();
+        let index = open(details(vec![vec![group(
+            kept.iter().map(|&o| (0u32, o)),
+            vec![digest(0, ROWS as usize)],
+            vec![digest(10, kept.len())],
+        )]]));
+
+        // Every kept offset shifts down by the number of holes below it.
+        for probe in [0u32, 6, 8, 65_534, 65_537, 131_073, ROWS - 1] {
+            let rank = probe - holes.iter().filter(|&&h| h < probe).count() as u32;
+            assert_eq!(
+                index.remap_row_id(addr(0, probe)),
+                Some(addr(10, rank)),
+                "offset {probe}"
+            );
+        }
+        for hole in holes {
+            assert_eq!(index.remap_row_id(addr(0, hole)), None, "hole {hole}");
+        }
+    }
+
+    #[test]
+    fn test_compact_fri_resolves_across_many_new_fragments() {
+        // A task whose output exceeds `max_rows_per_file` rolls into several fragments. With
+        // only one or two ranges the search for the destination fragment never lands
+        // strictly inside the list, so a mid-list off-by-one would go unnoticed.
+        let new: Vec<FragDigest> = (10..15).map(|id| digest(id, 3)).collect();
+        let index = open(details(vec![vec![group(
+            (0..15u32).map(|o| (0u32, o)),
+            vec![digest(0, 15)],
+            new,
+        )]]));
+
+        for offset in 0..15u32 {
+            let expected = addr(10 + offset / 3, offset % 3);
+            assert_eq!(
+                index.remap_row_id(addr(0, offset)),
+                Some(expected),
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_fri_skips_emptied_fragment_without_shifting_later_ones() {
+        // The emptied fragment sits between two live ones. If its rows were charged to the
+        // running position, frag 1's rows would land two slots late.
+        let index = open(details(vec![vec![group(
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+            vec![digest(0, 2), digest(7, 2), digest(1, 2)],
+            vec![digest(10, 4)],
+        )]]));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(0, 1)), Some(addr(10, 1)));
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(10, 2)));
+        assert_eq!(index.remap_row_id(addr(1, 1)), Some(addr(10, 3)));
+        // The emptied fragment is covered, so its addresses are deleted rather than kept.
+        assert_eq!(index.remap_row_id(addr(7, 0)), None);
+        assert_eq!(index.remap_row_id(addr(7, 1)), None);
+        // A fragment outside the group is still untouched.
+        assert_eq!(index.remap_row_id(addr(8, 0)), Some(addr(8, 0)));
+    }
+
+    #[test]
+    fn test_compact_fri_composes_a_deep_chain() {
+        // Version i rewrites fragment i into fragment i+1, so a row entering at (0,0) must
+        // arrive at (32,0) having passed through every link.
+        const VERSIONS: u32 = 32;
+        let chain = (0..VERSIONS)
+            .map(|i| {
+                vec![group(
+                    [(i, 0)],
+                    vec![digest(i as u64, 1)],
+                    vec![digest(i as u64 + 1, 1)],
+                )]
+            })
+            .collect();
+        let index = open(details(chain));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(VERSIONS, 0)));
+        // Entering midway walks only the remaining links.
+        assert_eq!(
+            index.remap_row_id(addr(VERSIONS / 2, 0)),
+            Some(addr(VERSIONS, 0))
+        );
+    }
+
+    #[test]
+    fn test_compact_fri_deletion_mid_chain_is_terminal() {
+        // v1 moves (0,0) -> (10,0); v2 covers frag 10 and keeps nothing, so the row dies.
+        // v3 also covers frag 10 and would move it on, so a walk that failed to stop would
+        // resurrect the row at (30,0) rather than merely passing a stale address along.
+        let index = open(details(vec![
+            vec![group([(0, 0)], vec![digest(0, 1)], vec![digest(10, 1)])],
+            vec![group([], vec![digest(10, 1)], vec![])],
+            vec![group([(10, 0)], vec![digest(10, 1)], vec![digest(30, 1)])],
+        ]));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), None);
+        // Entering at the intermediate address still dies in v2, before v3 is consulted.
+        assert_eq!(index.remap_row_id(addr(10, 0)), None);
+    }
+
+    #[test]
+    fn test_compact_fri_keeps_groups_in_one_version_independent() {
+        // One compaction commits several rewrite groups. They share a version, so they
+        // collapse into a single remap step, and each group's positions restart.
+        let index = open(details(vec![vec![
+            group([(0, 0), (0, 1)], vec![digest(0, 2)], vec![digest(10, 2)]),
+            group([(1, 0), (1, 1)], vec![digest(1, 2)], vec![digest(11, 2)]),
+        ]]));
+
+        assert_eq!(index.remap_row_id(addr(0, 1)), Some(addr(10, 1)));
+        // Group 2's first row starts at its own new fragment, not offset 2 of frag 10.
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(11, 0)));
+        assert_eq!(index.remap_row_id(addr(1, 1)), Some(addr(11, 1)));
+    }
+
+    #[rstest]
+    #[case::no_versions(vec![])]
+    #[case::version_without_groups(vec![vec![]])]
+    fn test_compact_fri_with_nothing_to_remap(#[case] versions: Vec<Vec<FragReuseGroup>>) {
+        let index = open(details(versions));
+        assert!(index.is_empty());
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(0, 0)));
+    }
+
+    #[rstest]
+    // Rewritten rows and new-fragment rows must match exactly, or positions are unsound.
+    #[case::too_few_new_rows(vec![(0, 0), (0, 1)], vec![digest(0, 2)], vec![digest(10, 1)])]
+    #[case::too_many_new_rows(vec![(0, 0)], vec![digest(0, 1)], vec![digest(10, 2)])]
+    fn test_compact_fri_rejects_row_count_mismatch(
+        #[case] rewritten: Vec<(u32, u32)>,
+        #[case] old_frags: Vec<FragDigest>,
+        #[case] new_frags: Vec<FragDigest>,
+    ) {
+        let details = details(vec![vec![group(rewritten, old_frags, new_frags)]]);
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details)
+            .expect_err("inconsistent details should be rejected");
+        assert!(
+            error.to_string().contains("old rows"),
+            "expected the row-count validation, got: {error}"
         );
     }
 }
