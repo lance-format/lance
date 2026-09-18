@@ -57,7 +57,7 @@ use datafusion_physical_expr::{
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
-    stream::{self},
+    stream::{self, BoxStream},
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
@@ -1842,16 +1842,31 @@ impl BTreeIndex {
         Schema::new(vec![value_field, row_id_field])
     }
 
+    /// Clone this index with its store rescoped to hold at most `bytes` of outstanding
+    /// prefetched data, for callers that drain several segments at once.
+    ///
+    /// See [`IndexStore::with_io_buffer_size`]; stores that cannot rescope return
+    /// themselves and this is then a no-op.
+    fn with_io_buffer_size(&self, bytes: u64) -> Self {
+        let mut scoped = self.clone();
+        scoped.store = self.store.with_io_buffer_size(bytes);
+        scoped
+    }
+
     /// Create a stream of all the data in the index, in the same format used to train the index
+    ///
+    /// This is a whole-file plan where the reader supports one (see
+    /// [`IndexReader::whole_file_stream`]), so its peak resident encoded bytes are bounded
+    /// by the store's scheduler budget rather than by readahead. Callers that run several
+    /// of these concurrently should rescope with [`Self::with_io_buffer_size`] first.
     async fn data_stream(&self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
-        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
-        let batches = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(self.store.io_parallelism())
+        let batches = stream_index_file(reader, self.batch_size, self.store.io_parallelism())
+            .await?
+            .map_err(DataFusionError::from)
             .map_ok(move |batch| {
                 RecordBatch::try_new(
                     new_schema.clone(),
@@ -1909,11 +1924,27 @@ impl BTreeIndex {
             )));
         }
 
+        // Every `data_stream()` below is a whole-file plan that begins prefetching as soon
+        // as it is awaited, i.e. before the merge operator below even exists, and each
+        // source segment carries its own store and therefore its own scheduler budget
+        // (`open_scalar_index` builds one store per segment). Left alone the merge would
+        // hold N times a single scan's worth of encoded bytes, none of it visible to the
+        // DataFusion memory pool. Rescope each source so the aggregate stays near one
+        // scan's budget. `new_data` is a dataset scan against a different store and keeps
+        // its own budget.
+        let num_sources = old_data_filters
+            .iter()
+            .filter(|filter| !filter_keeps_nothing(filter))
+            .count()
+            .max(1) as u64;
+        let io_buffer_size = merge_io_buffer_size(first.store.io_parallelism(), num_sources);
+
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
             if filter_keeps_nothing(old_data_filter) {
                 continue;
             }
+            let segment = segment.with_io_buffer_size(io_buffer_size);
             let stream = segment.data_stream().await?;
             let stream = match segment.frag_reuse_index.clone() {
                 Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
@@ -1976,6 +2007,22 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// Prefetch allowance per I/O thread, mirroring `SchedulerConfig::max_bandwidth`, which
+/// sizes an index store's budget assuming a 32 MiB maximum page.
+const MERGE_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
+
+/// Divide one scan's worth of prefetch budget across `num_sources` segment streams that
+/// will be drained concurrently.
+///
+/// The floor keeps a whole page in flight per source, so the aggregate bound is
+/// `max(one scan's budget, num_sources * 32 MiB)` rather than a constant. Past
+/// `io_parallelism` sources the floor wins and the total starts growing again; that is the
+/// point at which a caller wanting a real constant would have to merge in passes.
+fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
+    let total = MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
+    (total / num_sources.max(1)).max(MERGE_BYTES_PER_IO_THREAD)
 }
 
 /// True if `filter` would keep no rows at all (its keep-set is empty), letting
@@ -2110,9 +2157,12 @@ impl Index for BTreeIndex {
 
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let sub_index_reader = lazy_reader.get().await?;
-        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-            .await
-            .buffered(self.store.io_parallelism());
+        let mut reader_stream = stream_index_file(
+            sub_index_reader,
+            self.batch_size,
+            self.store.io_parallelism(),
+        )
+        .await?;
         while let Some(serialized) = reader_stream.try_next().await? {
             let page = FlatIndex::try_new(serialized)?;
             frag_ids |= page.calculate_included_frags()?;
@@ -2308,20 +2358,23 @@ impl ScalarIndex for BTreeIndex {
             let train_schema_clone = train_schema.clone();
             let train_schema = train_schema.clone();
 
-            let remapped_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-                .await
-                .buffered(self.store.io_parallelism())
-                .map_err(DataFusionError::from)
-                .and_then(move |batch| {
-                    // Remap the batch and then convert from the serialized schema to the training input schema
-                    let remapped =
-                        FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
-                    let with_train_schema = remapped.and_then(|batch| {
-                        RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
-                            .map_err(DataFusionError::from)
-                    });
-                    std::future::ready(with_train_schema)
+            let remapped_stream = stream_index_file(
+                sub_index_reader,
+                self.batch_size,
+                self.store.io_parallelism(),
+            )
+            .await?
+            .map_err(DataFusionError::from)
+            .and_then(move |batch| {
+                // Remap the batch and then convert from the serialized schema to the training input schema
+                let remapped =
+                    FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
+                let with_train_schema = remapped.and_then(|batch| {
+                    RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
+                        .map_err(DataFusionError::from)
                 });
+                std::future::ready(with_train_schema)
+            });
 
             let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
                 train_schema_clone,
@@ -2816,6 +2869,12 @@ async fn merge_range_partitioned_lookups(
 
     for (idx, (part_id, part_lookup_file)) in sorted_part_lookup_files.into_iter().enumerate() {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
+        // Deliberately NOT `stream_index_file`: this loop and `merge_pages` below build one
+        // stream per partition against a *shared* `store`, and every stream is constructed
+        // before the consumer polls any of them. A whole-file plan per partition would let
+        // partitions the consumer is not draining occupy the scheduler's byte budget — which
+        // is credited back only when a batch is polled — and stall the partition that is being
+        // drained. These two paths stay demand-paced at `buffered(1)`.
         let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
         let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
         while let Some(batch) = stream.next().await {
@@ -2978,8 +3037,8 @@ async fn merge_pages(
 
         let reader = store.open_index_file(&page_file_name).await?;
 
+        // Shared `store` across k partitions — see the note in `merge_range_partitioned_lookups`.
         let reader_stream = IndexReaderStream::new(reader, batch_size).await;
-
         let stream = reader_stream
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(batch_readhead.unwrap_or(1))
@@ -3159,6 +3218,33 @@ pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
 
 pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
+}
+
+/// Stream an index file end to end as `batch_size`-row batches.
+///
+/// Prefers the reader's single-decode-plan path ([`IndexReader::whole_file_stream`]).
+/// Falls back to independent per-batch reads for readers that don't offer one, which is
+/// what every caller used to do unconditionally — correct, but it builds a decode plan per
+/// batch and each one issues its own uncoalesced metadata and data reads.
+async fn stream_index_file(
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    batch_readahead: usize,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    // Clamp rather than cast: `batch_size` comes from the index file's own metadata
+    // (`BATCH_SIZE_META_KEY`), so a `u64` that is a multiple of 2^32 would truncate to a
+    // `rows_per_batch` of 0 and yield an empty stream — silently retraining an empty index.
+    let batch_size_u32 = u32::try_from(batch_size).unwrap_or(u32::MAX).max(1);
+    if let Some(stream) = reader
+        .whole_file_stream(batch_size_u32, batch_readahead.max(1) as u32)
+        .await?
+    {
+        return Ok(stream.boxed());
+    }
+    Ok(IndexReaderStream::new(reader, batch_size)
+        .await
+        .buffered(batch_readahead.max(1))
+        .boxed())
 }
 
 /// A stream that reads the original training data back out of the index
@@ -3411,8 +3497,13 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use std::pin::Pin;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
+
+    use async_trait::async_trait;
+
+    use super::super::IndexReader;
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
@@ -3422,6 +3513,7 @@ mod tests {
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
+    use futures::FutureExt;
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
@@ -3585,6 +3677,751 @@ mod tests {
             .unwrap();
 
         assert_eq!(original_data, remapped_data);
+    }
+
+    /// Scanning an index end to end must build ONE decode plan, not one per batch.
+    ///
+    /// Reading a file as N independent `read_record_batch` calls builds N decode plans,
+    /// and each one issues its own small reads: the page metadata it touches and then the
+    /// page data. Neither coalesces with the neighbouring batch's, so the scan costs two
+    /// round trips per batch. A single plan over the whole file schedules every page up
+    /// front and the scheduler merges those reads into a handful of large requests.
+    #[tokio::test]
+    async fn test_data_stream_builds_one_decode_plan() {
+        const BATCH_SIZE: u64 = 64;
+        // Above `DEFAULT_INLINE_SCHEDULING_THRESHOLD` (16 Ki rows) so this exercises the
+        // *spawned* scheduling path that production uses, not the inline one.
+        const ROWS: u64 = 40_000;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(400));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, BATCH_SIZE as usize);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), BATCH_SIZE, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let num_pages = ROWS.div_ceil(BATCH_SIZE);
+
+        // Reset the counters so we measure only the scan.
+        let _ = object_store.io_stats_incremental();
+
+        let mut stream = index.data_stream().await.unwrap();
+        let mut rows_seen = 0u64;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows_seen += batch.num_rows() as u64;
+        }
+        assert_eq!(rows_seen, ROWS);
+
+        let iops = object_store.io_stats_incremental().read_iops;
+        // Measured on this fixture: 9 IOPs with a single plan, 1251 (two per batch plus
+        // one) with one plan per batch. The bound is deliberately far below the per-batch
+        // figure so the test fails loudly if the fast path stops being taken, but well
+        // above 9 so it does not tighten into a flake if readahead or footer handling
+        // changes.
+        assert!(
+            iops < 64,
+            "scanning a {num_pages}-batch index took {iops} read IOPs; a decode plan \
+             rebuilt per batch costs about two per batch"
+        );
+    }
+
+    /// A whole-file plan's prefetch is bounded by its store's scheduler budget, and
+    /// `merge_segments` drains one store per source at the same time. Splitting the budget
+    /// is what keeps the merge's aggregate near a single scan's, and the floor is what
+    /// makes that "near" rather than "equal" past `io_parallelism` sources.
+    #[test]
+    fn test_merge_io_buffer_size_splits_one_scans_budget() {
+        const MIB: u64 = 1024 * 1024;
+        // Cloud default: 64 threads, so one scan gets 2 GiB.
+        assert_eq!(super::merge_io_buffer_size(64, 1), 2048 * MIB);
+        assert_eq!(super::merge_io_buffer_size(64, 4), 512 * MIB);
+        // Aggregate is conserved while the floor is not binding.
+        for sources in [1u64, 2, 8, 64] {
+            assert_eq!(
+                super::merge_io_buffer_size(64, sources) * sources,
+                2048 * MIB
+            );
+        }
+        // Past that the floor wins and the aggregate grows again, as documented.
+        assert_eq!(super::merge_io_buffer_size(64, 128), 32 * MIB);
+        // Local default of 8 threads, and degenerate inputs stay at the floor.
+        assert_eq!(super::merge_io_buffer_size(8, 1), 256 * MIB);
+        assert_eq!(super::merge_io_buffer_size(0, 0), 32 * MIB);
+    }
+
+    /// A sorted `(value, _rowid)` stream of `rows` rows, the shape `train_btree_index`
+    /// and `merge_segments` both consume.
+    ///
+    /// Both columns are random so the page file is incompressible and its size is
+    /// predictable (about 12 bytes per row), which lets a test size it against a budget.
+    fn sorted_training_stream(rows: u64, batch_size: u64) -> SendableRecordBatchStream {
+        let data = gen_batch()
+            .col("value", array::rand::<Int32Type>())
+            .col("_rowid", array::rand::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from((rows / 100) as u32));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, batch_size as usize);
+        let stream = stream.map_err(DataFusionError::from);
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
+    }
+
+    /// Build a btree index of `rows` rows in a fresh store and return the store.
+    async fn build_index_for_scan(
+        index_dir: Path,
+        object_store: Arc<ObjectStore>,
+        rows: u64,
+        batch_size: u64,
+    ) -> Arc<LanceIndexStore> {
+        let store = Arc::new(LanceIndexStore::new(
+            object_store,
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream = sorted_training_stream(rows, batch_size);
+        train_btree_index(stream, store.as_ref(), batch_size, None, None)
+            .await
+            .unwrap();
+        store
+    }
+
+    /// On-disk size of the index file `name`, so a test can check its fixture is large
+    /// enough to exercise the budget it runs against.
+    async fn index_file_size(store: &LanceIndexStore, name: &str) -> u64 {
+        store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path == name)
+            .unwrap_or_else(|| panic!("index file {name} not found"))
+            .size_bytes
+    }
+
+    /// A whole-file scan must respect the store's byte budget.
+    ///
+    /// A whole-file decode plan schedules every page eagerly, so its outstanding bytes are
+    /// bounded only by the scheduler budget. The fixture is several times larger than each
+    /// budget plus the slack below, and the guard asserts that, so an unenforced budget
+    /// fails the bound instead of passing it vacuously.
+    ///
+    /// The bound is deliberately budget + `max_iop_size`: the budget is soft by design, since
+    /// `can_deliver` admits a request over budget when its priority is at or below everything
+    /// in flight, which is what guarantees forward progress, or when it is a later chunk of a
+    /// request already in flight. The slack is the largest single admission the scheduler
+    /// can make; several small over-budget admissions stay well inside it.
+    #[tokio::test]
+    async fn test_whole_file_scan_respects_the_byte_budget() {
+        const BATCH_SIZE: u64 = 64;
+        // About 23 MiB on disk; see `build_index_for_scan`.
+        const ROWS: u64 = 2_000_000;
+        const MIB: u64 = 1024 * 1024;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let max_iop_size = object_store.max_iop_size();
+        let store =
+            build_index_for_scan(tmpdir.clone(), object_store.clone(), ROWS, BATCH_SIZE).await;
+        let file_size = index_file_size(store.as_ref(), BTREE_PAGES_NAME).await;
+
+        for budget in [MIB, 4 * MIB] {
+            // Fixture guard: the plan schedules the whole file, so the bound below can only
+            // hold because the budget throttled it.
+            assert!(
+                file_size > budget + max_iop_size,
+                "fixture is {file_size} bytes, too small to exercise a {budget} byte budget"
+            );
+
+            let scoped = store.with_io_buffer_size(budget);
+            let scoped_lance = scoped
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .expect("with_io_buffer_size returns a LanceIndexStore");
+            let index = BTreeIndex::load(scoped.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            let mut stream = index.data_stream().await.unwrap();
+            let mut rows_seen = 0u64;
+            let first = stream.try_next().await.unwrap().expect("empty scan");
+            rows_seen += first.num_rows() as u64;
+
+            // Pause the consumer and let the scheduler admit as much as the budget allows.
+            // Nothing is being credited back, so bytes in flight climb until the budget
+            // blocks admission and then stop; wait for that plateau instead of relying on
+            // I/O outpacing decode on this machine.
+            let plateau = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut last = scoped_lance
+                    .scheduler()
+                    .backpressure_stats()
+                    .bytes_in_flight;
+                let mut unchanged = 0;
+                while unchanged < 10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let now = scoped_lance
+                        .scheduler()
+                        .backpressure_stats()
+                        .bytes_in_flight;
+                    unchanged = if now == last { unchanged + 1 } else { 0 };
+                    last = now;
+                }
+                last
+            })
+            .await
+            .expect("bytes in flight never settled while the consumer was paused");
+            assert!(
+                plateau >= budget / 2,
+                "with the consumer paused, a {file_size} byte scan settled at only {plateau} \
+                 bytes in flight against a {budget} byte budget; backpressure never engaged"
+            );
+
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                rows_seen += batch.num_rows() as u64;
+            }
+            assert_eq!(rows_seen, ROWS);
+
+            let bp = scoped_lance.scheduler().backpressure_stats();
+            assert_eq!(bp.io_buffer_size, budget, "store was not rescoped");
+            assert!(
+                bp.max_bytes_in_flight <= budget + max_iop_size,
+                "whole-file scan held {} bytes in flight against a {budget} byte budget \
+                 ({} priority-bypass admissions); the budget is soft but not this soft",
+                bp.max_bytes_in_flight,
+                bp.priority_bypass_admissions
+            );
+        }
+    }
+
+    /// Abandoning a scan part-way must return the whole budget.
+    ///
+    /// A whole-file plan has far more outstanding when it is dropped than a per-batch read
+    /// did, so any leak in the credit path is proportionally worse here. The file is
+    /// several times the budget, so the abandoned scan is holding a full budget at the
+    /// moment it is dropped. Drop at three depths, require the bytes in flight to return to
+    /// zero, and require that a later scan on the same store still completes.
+    #[tokio::test]
+    async fn test_dropping_a_scan_part_way_returns_the_budget() {
+        const BATCH_SIZE: u64 = 64;
+        // About 4.6 MiB on disk; see `build_index_for_scan`.
+        const ROWS: u64 = 400_000;
+        const BUDGET: u64 = 1024 * 1024;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = build_index_for_scan(tmpdir.clone(), object_store, ROWS, BATCH_SIZE).await;
+        let file_size = index_file_size(store.as_ref(), BTREE_PAGES_NAME).await;
+        assert!(
+            file_size > 2 * BUDGET,
+            "fixture is {file_size} bytes, too small to hold a full {BUDGET} byte budget \
+             when the scan is dropped"
+        );
+
+        for stop_after in [1usize, 32, 256] {
+            let scoped = store.with_io_buffer_size(BUDGET);
+            let scoped_lance = scoped
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .expect("with_io_buffer_size returns a LanceIndexStore");
+            let index = BTreeIndex::load(scoped.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            {
+                let mut stream = index.data_stream().await.unwrap();
+                let mut batches = 0usize;
+                while (stream.try_next().await.unwrap()).is_some() {
+                    batches += 1;
+                    if batches >= stop_after {
+                        break;
+                    }
+                }
+                assert_eq!(batches, stop_after, "fixture too small to stop this late");
+            }
+
+            // Requests already admitted are credited back when their responses are dropped,
+            // which happens asynchronously once nothing is waiting for them.
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if scoped_lance
+                        .scheduler()
+                        .backpressure_stats()
+                        .bytes_in_flight
+                        == 0
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "dropping the scan at batch {stop_after} left {} bytes in flight",
+                scoped_lance
+                    .scheduler()
+                    .backpressure_stats()
+                    .bytes_in_flight
+            );
+
+            // The abandoned scan must not have stranded any of the budget: a full scan on
+            // the same store has to complete.
+            let mut stream = index.data_stream().await.unwrap();
+            let mut rows_seen = 0u64;
+            while let Some(batch) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), stream.try_next())
+                    .await
+                    .expect("scan after an abandoned scan stalled; budget was leaked")
+                    .unwrap()
+            {
+                rows_seen += batch.num_rows() as u64;
+            }
+            assert_eq!(
+                rows_seen, ROWS,
+                "scan after dropping at batch {stop_after} did not complete"
+            );
+        }
+    }
+
+    /// A reader that refuses to serve a whole-file scan.
+    struct NoWholeFileReader(Arc<dyn IndexReader>);
+
+    impl std::fmt::Debug for NoWholeFileReader {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("NoWholeFileReader")
+        }
+    }
+
+    #[async_trait]
+    impl IndexReader for NoWholeFileReader {
+        async fn read_record_batch(
+            &self,
+            n: u64,
+            batch_size: u64,
+        ) -> lance_core::Result<RecordBatch> {
+            self.0.read_record_batch(n, batch_size).await
+        }
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> lance_core::Result<RecordBatch> {
+            self.0.read_range(range, projection).await
+        }
+        async fn whole_file_stream(
+            &self,
+            _batch_size: u32,
+            _batch_readahead: u32,
+        ) -> lance_core::Result<Option<Pin<Box<dyn lance_io::stream::RecordBatchStream>>>> {
+            panic!("the search path must not take the whole-file scan path");
+        }
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.0.num_batches(batch_size).await
+        }
+        fn num_rows(&self) -> usize {
+            self.0.num_rows()
+        }
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.0.schema()
+        }
+    }
+
+    /// Wraps a store so every reader it hands out panics on a whole-file scan.
+    #[derive(Debug)]
+    struct NoWholeFileStore(Arc<dyn IndexStore>);
+
+    impl DeepSizeOf for NoWholeFileStore {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for NoWholeFileStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self(self.0.clone()))
+        }
+        fn io_parallelism(&self) -> usize {
+            self.0.io_parallelism()
+        }
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self(self.0.with_io_priority(io_priority)))
+        }
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self(self.0.with_io_buffer_size(bytes)))
+        }
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> lance_core::Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.0.new_index_file(name, schema).await
+        }
+        async fn open_index_file(&self, name: &str) -> lance_core::Result<Arc<dyn IndexReader>> {
+            let inner = self.0.open_index_file(name).await?;
+            Ok(Arc::new(NoWholeFileReader(inner)))
+        }
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.0.copy_index_file(name, dest_store).await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.0.rename_index_file(name, new_name).await
+        }
+        async fn delete_index_file(&self, name: &str) -> lance_core::Result<()> {
+            self.0.delete_index_file(name).await
+        }
+        async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<crate::scalar::IndexFile>> {
+            self.0.list_files_with_sizes().await
+        }
+    }
+
+    /// The query path must not reach the whole-file scan.
+    ///
+    /// `whole_file_stream` is wired into three maintenance call sites; searches do point
+    /// lookups through `read_range`. Assert that structurally by handing the index a reader
+    /// that panics if anyone asks it for a whole-file stream, so a future change that routes
+    /// a search through one fails here instead of in production.
+    #[tokio::test]
+    async fn test_search_path_never_takes_the_whole_file_scan() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = build_index_for_scan(tmpdir.clone(), object_store, ROWS, BATCH_SIZE).await;
+
+        let guarded: Arc<dyn IndexStore> = Arc::new(NoWholeFileStore(store));
+        let index = BTreeIndex::load(guarded, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Positive control: a maintenance scan through the same store must hit the guard.
+        // Without this, the searches below could pass simply because the guard is never
+        // consulted, and the test would prove nothing.
+        let reached = std::panic::AssertUnwindSafe(async {
+            let mut scan = index.data_stream().await.unwrap();
+            while (scan.try_next().await.unwrap()).is_some() {}
+        })
+        .catch_unwind()
+        .await
+        .is_err();
+        assert!(
+            reached,
+            "the guard was never consulted; this test is vacuous"
+        );
+
+        // Equality, range and IS NULL: the three shapes a btree serves.
+        for query in [
+            SargableQuery::Equals(ScalarValue::Int32(Some(17))),
+            SargableQuery::Range(
+                std::ops::Bound::Included(ScalarValue::Int32(Some(10))),
+                std::ops::Bound::Excluded(ScalarValue::Int32(Some(4000))),
+            ),
+            SargableQuery::IsNull(),
+        ] {
+            index
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .expect("search failed");
+        }
+    }
+
+    /// Records every store `with_io_buffer_size` hands out, so a test can reach the
+    /// schedulers `merge_segments` actually drained. All other calls pass through.
+    #[derive(Debug)]
+    struct RescopeRecordingStore {
+        inner: Arc<dyn IndexStore>,
+        rescoped: Arc<std::sync::Mutex<Vec<Arc<dyn IndexStore>>>>,
+    }
+
+    impl DeepSizeOf for RescopeRecordingStore {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for RescopeRecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+                rescoped: self.rescoped.clone(),
+            })
+        }
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+                rescoped: self.rescoped.clone(),
+            })
+        }
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            let scoped = self.inner.with_io_buffer_size(bytes);
+            self.rescoped.lock().unwrap().push(scoped.clone());
+            scoped
+        }
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> lance_core::Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+        async fn open_index_file(&self, name: &str) -> lance_core::Result<Arc<dyn IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.inner.copy_index_file(name, dest_store).await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+        async fn delete_index_file(&self, name: &str) -> lance_core::Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+        async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    /// `merge_segments` must bound its aggregate prefetch across N sources.
+    ///
+    /// Every source's whole-file plan starts prefetching the moment it is built, each
+    /// against its own store, so an N-way merge holds N budgets of encoded bytes unless
+    /// something splits them. `test_whole_file_scan_respects_the_byte_budget` shows one
+    /// scan respects one store's budget; this shows the merge hands every source a 1/N
+    /// share, drains all N through those rescoped stores and nothing else, and still
+    /// merges correctly. Together the two bound the aggregate at
+    /// `max(one scan's budget, N * 32 MiB)` plus one split request per source.
+    ///
+    /// The per-source budgets here (32 MiB and up) are far larger than the 40k-row
+    /// fixture, so this checks the split and the plumbing, not throttling under it.
+    #[tokio::test]
+    async fn test_merge_segments_bounds_aggregate_prefetch() {
+        const BATCH_SIZE: u64 = 64;
+        const ROWS: u64 = 40_000;
+        const NEW_ROWS: u64 = 1_000;
+        const MIB: u64 = 1024 * 1024;
+        const MAX_IOP_SIZE: u64 = 16 * MIB;
+
+        for num_segments in [2usize, 4, 8] {
+            let object_store = Arc::new(ObjectStore::local());
+            let io_parallelism = object_store.io_parallelism();
+            let expected_budget = super::merge_io_buffer_size(io_parallelism, num_segments as u64);
+
+            let mut tmpdirs = Vec::new();
+            let mut originals = Vec::new();
+            let mut recorders = Vec::new();
+            let mut segments = Vec::new();
+            for _ in 0..num_segments {
+                let tmpdir = TempObjDir::default();
+                let store =
+                    build_index_for_scan(tmpdir.clone(), object_store.clone(), ROWS, BATCH_SIZE)
+                        .await;
+                let recorder = Arc::new(RescopeRecordingStore {
+                    inner: store.clone(),
+                    rescoped: Arc::new(std::sync::Mutex::new(Vec::new())),
+                });
+                let index = BTreeIndex::load(
+                    recorder.clone() as Arc<dyn IndexStore>,
+                    None,
+                    &LanceCache::no_cache(),
+                )
+                .await
+                .unwrap();
+                segments.push(index);
+                originals.push(store);
+                recorders.push(recorder);
+                tmpdirs.push(tmpdir);
+            }
+
+            // Everything the merge reads must go through the rescoped stores, so the
+            // original schedulers have to end the merge exactly where they start it.
+            let before: Vec<_> = originals
+                .iter()
+                .map(|store| store.scheduler().backpressure_stats().max_bytes_in_flight)
+                .collect();
+
+            let dest_dir = TempObjDir::default();
+            let dest_store = Arc::new(LanceIndexStore::new(
+                object_store.clone(),
+                dest_dir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            let filters: Vec<Option<OldIndexDataFilter>> = vec![None; num_segments];
+            BTreeIndex::merge_segments(
+                &segments,
+                sorted_training_stream(NEW_ROWS, BATCH_SIZE),
+                dest_store.as_ref(),
+                &filters,
+            )
+            .await
+            .unwrap();
+
+            // Each source was rescoped exactly once, to a 1/N share of one scan's budget.
+            let mut aggregate_peak = 0u64;
+            for (i, recorder) in recorders.iter().enumerate() {
+                let handed_out = recorder.rescoped.lock().unwrap();
+                assert_eq!(
+                    handed_out.len(),
+                    1,
+                    "segment {i} was rescoped {} times, expected exactly once",
+                    handed_out.len()
+                );
+                let scoped = handed_out[0]
+                    .as_any()
+                    .downcast_ref::<LanceIndexStore>()
+                    .expect("rescoping a LanceIndexStore yields a LanceIndexStore");
+                let bp = scoped.scheduler().backpressure_stats();
+                assert_eq!(
+                    bp.io_buffer_size, expected_budget,
+                    "segment {i} of {num_segments} got budget {}, expected {}",
+                    bp.io_buffer_size, expected_budget
+                );
+                // Without this the bounds below pass vacuously if a stream never ran.
+                assert!(
+                    bp.max_bytes_in_flight > 0,
+                    "segment {i} recorded no bytes in flight; the bound proves nothing"
+                );
+                assert!(
+                    bp.max_bytes_in_flight <= expected_budget + MAX_IOP_SIZE,
+                    "segment {i} held {} bytes against a {} byte budget \
+                     ({} priority-bypass admissions)",
+                    bp.max_bytes_in_flight,
+                    expected_budget,
+                    bp.priority_bypass_admissions
+                );
+                aggregate_peak += bp.max_bytes_in_flight;
+            }
+
+            // The documented aggregate bound. Summing per-store peaks overstates the true
+            // simultaneous peak (they need not coincide), so this can only fail on the
+            // conservative side.
+            let one_scan = super::MERGE_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64;
+            let bound = one_scan.max(num_segments as u64 * super::MERGE_BYTES_PER_IO_THREAD)
+                + num_segments as u64 * MAX_IOP_SIZE;
+            assert!(
+                aggregate_peak <= bound,
+                "merge of {num_segments} segments held {aggregate_peak} bytes aggregate, \
+                 documented bound is {bound}"
+            );
+
+            for (i, (store, before)) in originals.iter().zip(&before).enumerate() {
+                let after = store.scheduler().backpressure_stats().max_bytes_in_flight;
+                assert_eq!(
+                    after, *before,
+                    "segment {i}'s original scheduler saw merge traffic; the budget \
+                     split does not cover whatever read this"
+                );
+            }
+
+            // And the merge has to have actually merged.
+            let merged = BTreeIndex::load(
+                dest_store.clone() as Arc<dyn IndexStore>,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+            let mut stream = merged.data_stream().await.unwrap();
+            let mut rows = 0u64;
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                rows += batch.num_rows() as u64;
+            }
+            assert_eq!(rows, num_segments as u64 * ROWS + NEW_ROWS);
+        }
+    }
+
+    /// `batch_size` is read from the index file's own metadata, so a value that is a
+    /// multiple of 2^32 used to truncate to a `rows_per_batch` of 0 — an empty stream that
+    /// silently retrained an empty index and reported success. It must clamp instead.
+    #[tokio::test]
+    async fn test_stream_index_file_clamps_oversized_batch_size() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let reader = test_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+
+        // 2^32 truncates to 0 in a bare `as u32`.
+        let mut stream = super::stream_index_file(reader, 1u64 << 32, 8)
+            .await
+            .unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows += batch.num_rows();
+        }
+        assert_eq!(
+            rows, 1000,
+            "oversized batch_size must not yield an empty stream"
+        );
     }
 
     #[tokio::test]
