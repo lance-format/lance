@@ -78,6 +78,9 @@ const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 
+/// Reserved for fragment trees. Readers and writers reject it until implemented.
+pub const FLAG_FRAGMENT_TREE: u64 = 1 << 11;
+
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
 /// Environment variable that opts a release build into reading and writing data
@@ -310,6 +313,17 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn test_fragment_tree_flag_is_reserved_not_supported() {
+        assert_eq!(FLAG_FRAGMENT_TREE, 2048);
+        assert_eq!(
+            FLAG_FRAGMENT_TREE & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS | FLAG_FRAGMENT_REUSE_INDEX),
+            0
+        );
+        assert!(!can_read_dataset(FLAG_FRAGMENT_TREE));
+        assert!(!can_write_dataset(FLAG_FRAGMENT_TREE));
+    }
 
     /// Reserved ahead of its implementation: refused for reading and writing
     /// until the handling lands, so a build from the gap cannot open the table.
