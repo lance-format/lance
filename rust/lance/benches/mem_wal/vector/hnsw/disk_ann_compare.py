@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import time
-
 import numpy as np
 
 K = 10
@@ -49,8 +48,8 @@ def normalize(x):
 
 # ---------------- prepare ----------------
 def load_corpus(cache_dir, needed):
-    import pyarrow.parquet as pq
     import requests
+    import pyarrow.parquet as pq
 
     os.makedirs(cache_dir, exist_ok=True)
     shards = sorted(
@@ -151,8 +150,7 @@ def sweep(name, make_q, params, queries, gt):
             {"param": p, "recall": rec, "p50_us": p50, "p99_us": p99, "qps": qps}
         )
         print(
-            f"  {name} param={p} recall={rec:.4f} "
-            f"p50={p50:.0f}us p99={p99:.0f}us qps={qps:.0f}",
+            f"  {name} param={p} recall={rec:.4f} p50={p50:.0f}us p99={p99:.0f}us qps={qps:.0f}",
             flush=True,
         )
     return rows
@@ -160,10 +158,9 @@ def sweep(name, make_q, params, queries, gt):
 
 # ---------------- systems ----------------
 def run_lance(base, rows, corpus, queries, gt):
-    import shutil
-
     import lance
     import pyarrow as pa
+    import shutil
 
     uri = os.path.join(base, f"lance_{rows}")
     shutil.rmtree(uri, ignore_errors=True)
@@ -223,14 +220,14 @@ def run_lance_sstable(base, rows, corpus, queries, gt, lance_path, id_offset, co
                 .column("id")
                 .to_numpy()
             )
-            return ids - id_offset  # map SSTable id -> corpus index
+            return ids - id_offset  # map flushed-gen id -> corpus index
 
         return q
 
     return {
         "lance_path": lance_path,
         "id_offset": id_offset,
-        "sweep": sweep("lance_sstable", make_q, None, queries, gt),
+        "sweep": sweep("lance_flushed", make_q, None, queries, gt),
     }
 
 
@@ -324,8 +321,8 @@ def cmd_run(args):
     queries = np.load(os.path.join(d, "queries.npy"))
     gt = np.load(os.path.join(d, "gt.npy"))
     print(f"=== {args.system} rows={args.rows} corpus={len(corpus)} ===", flush=True)
-    if args.system == "lance_sstable":
-        res = run_lance_sstable(
+    if args.system == "lance_flushed":
+        res = run_lance_flushed(
             args.base,
             args.rows,
             corpus,
