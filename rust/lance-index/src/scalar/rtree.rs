@@ -73,6 +73,59 @@ fn validate_stored_page_size(page_size: u32, num_items: usize) -> Result<()> {
     Ok(())
 }
 
+/// Read `page_size` the way [`RTreeMetadata::from`] does, so validation and
+/// construction agree on the value being checked.
+fn parse_stored_page_size(metadata: &HashMap<String, String>) -> u32 {
+    metadata
+        .get("page_size")
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_RTREE_PAGE_SIZE)
+}
+
+/// Read `num_items` the way [`RTreeMetadata::from`] does.
+fn parse_stored_num_items(metadata: &HashMap<String, String>) -> usize {
+    metadata
+        .get("num_items")
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Reject a stored `num_pages` that disagrees with the page count implied by
+/// `num_items` and `page_size`.
+///
+/// This runs on the raw metadata because [`RTreeMetadata::new`] already
+/// `debug_assert!`s the same equality: constructing first would panic in debug
+/// builds instead of returning this error. An absent key is accepted and
+/// derived, matching the traversal algorithm in the format spec, which computes
+/// every page offset from `num_items` and `page_size`.
+///
+/// The equality only holds for `page_size >= 2`; below that `page_offsets` is
+/// empty and the tree is a single implicit page.
+fn validate_stored_num_pages(metadata: &HashMap<String, String>) -> Result<()> {
+    let Some(raw) = metadata.get("num_pages") else {
+        return Ok(());
+    };
+    let page_size = parse_stored_page_size(metadata);
+    if page_size < 2 {
+        return Ok(());
+    }
+    let num_items = parse_stored_num_items(metadata);
+    let expected = RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64;
+    let stored: u64 = raw.parse().map_err(|_| {
+        Error::invalid_input(format!(
+            "stored RTree num_pages {raw:?} is not a page count; expected {expected} \
+             for {num_items} items at page_size {page_size}"
+        ))
+    })?;
+    if stored != expected {
+        return Err(Error::invalid_input(format!(
+            "stored RTree num_pages {stored} disagrees with the {expected} pages implied by \
+             {num_items} items at page_size {page_size}"
+        )));
+    }
+    Ok(())
+}
+
 static BBOX_FIELD: LazyLock<Arc<ArrowField>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
     Arc::new(bbox_type.to_field("bbox", false))
@@ -205,18 +258,16 @@ impl RTreeMetadata {
 
 impl From<&HashMap<String, String>> for RTreeMetadata {
     fn from(metadata: &HashMap<String, String>) -> Self {
-        let page_size = metadata
-            .get("page_size")
-            .map(|bs| bs.parse().unwrap_or(DEFAULT_RTREE_PAGE_SIZE))
-            .unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
+        let page_size = parse_stored_page_size(metadata);
+        let num_items = parse_stored_num_items(metadata);
+        // The page count is fully determined by `num_items` and `page_size`, so
+        // derive it rather than defaulting an absent or unreadable key to zero:
+        // zero contradicts the invariant `new` asserts, and a search walking
+        // down from `num_pages - 1` would silently visit nothing.
         let num_pages = metadata
             .get("num_pages")
-            .map(|bs| bs.parse().unwrap_or(0))
-            .unwrap_or(0);
-        let num_items = metadata
-            .get("num_items")
-            .map(|bs| bs.parse().unwrap_or(0))
-            .unwrap_or(0);
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or_else(|| Self::calculate_page_offsets(num_items, page_size).len() as u64);
         let bbox = metadata
             .get("bbox")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
@@ -318,7 +369,9 @@ impl RTreeIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
-        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
+        let stored = &pages_reader.schema().metadata;
+        validate_stored_num_pages(stored)?;
+        let metadata = RTreeMetadata::from(stored);
         validate_stored_page_size(metadata.page_size, metadata.num_items)?;
         let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
 
@@ -1803,5 +1856,125 @@ mod tests {
                 .await
                 .is_some()
         )
+    }
+
+    /// Write a `page_data.lance` whose schema metadata is `metadata`, so `load`
+    /// sees exactly those keys. `load` validates before touching page contents,
+    /// so a single row is enough to reach it.
+    async fn store_with_page_metadata(
+        metadata: HashMap<String, String>,
+    ) -> (Arc<LanceIndexStore>, TempObjDir) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let bbox_type = RectType::new(Dimension::XY, Default::default());
+        let mut rect_builder = RectBuilder::new(bbox_type);
+        rect_builder.push_rect(Some(&Rect::new(
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 1.0, y: 1.0 },
+        )));
+        let batch = RecordBatch::try_new(
+            RTREE_PAGE_SCHEMA.clone(),
+            vec![
+                rect_builder.finish().into_array_ref(),
+                Arc::new(UInt64Array::from(vec![0u64])),
+            ],
+        )
+        .unwrap();
+
+        let mut writer = store
+            .new_index_file(RTREE_PAGES_NAME, RTREE_PAGE_SCHEMA.clone())
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // `load` opens the nulls file once validation passes.
+        RTreeIndexPlugin::write_nulls(store.as_ref(), RowAddrTreeMap::new())
+            .await
+            .unwrap();
+
+        (store, tmpdir)
+    }
+
+    fn page_metadata(
+        num_items: usize,
+        page_size: u32,
+        num_pages: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut metadata = HashMap::from([
+            ("page_size".to_owned(), page_size.to_string()),
+            ("num_items".to_owned(), num_items.to_string()),
+            (
+                "bbox".to_owned(),
+                serde_json::json!(BoundingBox::new()).to_string(),
+            ),
+        ]);
+        if let Some(num_pages) = num_pages {
+            metadata.insert("num_pages".to_owned(), num_pages.to_owned());
+        }
+        metadata
+    }
+
+    /// A `num_pages` that disagrees with `num_items` and `page_size` used to load
+    /// fine and then answer the wrong rows: the walk starts at `num_pages - 1`, so
+    /// zero underflows to `u64::MAX` and every page range comes back empty, while a
+    /// low value truncates the walk. Both now fail at load.
+    #[tokio::test]
+    async fn test_load_rejects_corrupt_num_pages() {
+        // 200 items at page_size 16 is a 14-page tree.
+        let expected = RTreeMetadata::calculate_page_offsets(200, 16).len();
+        assert_eq!(expected, 14);
+
+        for bad in ["", "abc", "-1", "0", "99999999999999999999999", "13"] {
+            let (store, _tmpdir) =
+                store_with_page_metadata(page_metadata(200, 16, Some(bad))).await;
+            let err = RTreeIndex::load(store, None, &LanceCache::no_cache())
+                .await
+                .expect_err(&format!("num_pages {bad:?} should be rejected"));
+            assert!(
+                err.to_string().contains("num_pages"),
+                "num_pages {bad:?}: unexpected message {err}"
+            );
+        }
+    }
+
+    /// The page count is fully derivable from `num_items` and `page_size`, which is
+    /// how the format spec describes traversal, so an absent key must load rather
+    /// than be read as zero.
+    #[tokio::test]
+    async fn test_load_derives_an_absent_num_pages() {
+        for (num_items, page_size) in [(200usize, 16u32), (1, 16), (0, 16)] {
+            let (store, _tmpdir) =
+                store_with_page_metadata(page_metadata(num_items, page_size, None)).await;
+            let index = RTreeIndex::load(store, None, &LanceCache::no_cache())
+                .await
+                .unwrap_or_else(|e| panic!("{num_items} items at {page_size}: {e}"));
+            assert_eq!(
+                index.metadata.num_pages,
+                index.metadata.page_offsets.len() as u64,
+                "{num_items} items at {page_size}"
+            );
+        }
+    }
+
+    /// An agreeing `num_pages` still loads, and below page_size 2 `page_offsets` is
+    /// empty so the equality is not asserted at all.
+    #[tokio::test]
+    async fn test_load_accepts_consistent_and_degenerate_num_pages() {
+        let (store, _tmpdir) = store_with_page_metadata(page_metadata(200, 16, Some("14"))).await;
+        let index = RTreeIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.metadata.num_pages, 14);
+
+        for page_size in [0u32, 1] {
+            let metadata = page_metadata(1, page_size, Some("7"));
+            assert!(validate_stored_num_pages(&metadata).is_ok(), "{page_size}");
+        }
     }
 }
