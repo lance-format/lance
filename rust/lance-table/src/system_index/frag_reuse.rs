@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod ledger;
+
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow_array::cast::AsArray;
