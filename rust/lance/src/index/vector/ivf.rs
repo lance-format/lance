@@ -1739,7 +1739,11 @@ pub async fn build_ivf_model(
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
-    let num_partitions = params.num_partitions.unwrap();
+    // `num_partitions` is optional, and `build_ivf_model` is public, so a
+    // caller can arrive with neither it nor `target_partition_size` set. Fall
+    // back to 32 the way the two sibling trainers in this file already do
+    // rather than unwrapping `None`.
+    let num_partitions = params.num_partitions.unwrap_or(32);
     let centroids = params.centroids.clone();
     if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");

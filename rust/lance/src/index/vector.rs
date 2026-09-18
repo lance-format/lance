@@ -2826,6 +2826,39 @@ mod tests {
         assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
     }
 
+    /// `build_ivf_model` is public and `IvfBuildParams::num_partitions` is an
+    /// `Option`, so a caller that sets neither it nor `target_partition_size`
+    /// used to unwrap `None` and panic. The two sibling trainers in this file
+    /// already fall back to 32 for the same reason, so this one does too.
+    #[tokio::test]
+    async fn test_build_ivf_model_defaults_num_partitions() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = lance_index::vector::ivf::builder::IvfBuildParams::default();
+        assert!(params.num_partitions.is_none());
+        assert!(params.target_partition_size.is_none());
+
+        let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dim,
+            MetricType::L2,
+            &params,
+            None,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ivf_model.num_partitions(), 32);
+    }
+
     #[tokio::test]
     async fn test_build_distributed_invalid_fragment_ids() {
         let test_dir = TempStrDir::default();
