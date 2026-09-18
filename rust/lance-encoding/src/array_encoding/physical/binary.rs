@@ -32,6 +32,16 @@ use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::{Error, Result};
 
+fn oversized_binary_batch_error(num_rows: u64, num_bytes: u64) -> Error {
+    Error::not_supported(format!(
+        "Could not create array with more than 2GiB of string/binary data in a single batch \
+         ({} rows would require {} bytes). Please reduce the batch_size, set \
+         LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert the column to \
+         large_string/large_binary.",
+        num_rows, num_bytes
+    ))
+}
+
 struct IndicesNormalizer {
     indices: Vec<u64>,
     validity: BooleanBufferBuilder,
@@ -320,29 +330,35 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             4 => {
                 let num_bytes = end - start;
                 if num_bytes > i32::MAX as u64 {
-                    return Err(Error::not_supported(format!(
-                        "Could not create array with more than 2GiB of string/binary data in a \
-                         single batch ({} rows would require {} bytes). Please reduce the \
-                         batch_size, set LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert \
-                         the column to large_string/large_binary.",
-                        num_rows, num_bytes
-                    )));
+                    return Err(oversized_binary_batch_error(num_rows, num_bytes));
                 }
-                ScalarBuffer::from(
-                    target_vec
-                        .iter()
-                        .map(|&offset| i32::try_from(offset - start).expect("checked above"))
-                        .collect::<Vec<_>>(),
-                )
-                .into_inner()
-            }
-            8 => ScalarBuffer::from(
-                target_vec
+                let offsets = target_vec
                     .iter()
-                    .map(|&offset| i64::try_from(offset - start).expect("u64 offsets fit in i64"))
-                    .collect::<Vec<_>>(),
-            )
-            .into_inner(),
+                    .map(|&offset| {
+                        i32::try_from(offset - start)
+                            .map_err(|_| oversized_binary_batch_error(num_rows, num_bytes))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                ScalarBuffer::from(offsets).into_inner()
+            }
+            8 => {
+                let num_bytes = end - start;
+                let offsets = target_vec
+                    .iter()
+                    .map(|&offset| {
+                        i64::try_from(offset - start).map_err(|_| {
+                            Error::not_supported(format!(
+                                "Could not create large_string/large_binary array in a single \
+                                 batch because {} rows would require {} bytes, which exceeds \
+                                 i64::MAX. Please reduce the batch_size or set \
+                                 LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
+                                num_rows, num_bytes
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                ScalarBuffer::from(offsets).into_inner()
+            }
             _ => panic!("Unsupported offsets type"),
         };
 

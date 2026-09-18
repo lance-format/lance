@@ -11,7 +11,7 @@ use arrow_array::{
 
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use log::trace;
 
 use crate::{
@@ -160,15 +160,7 @@ impl BinaryArrayDecoder {
             .inner()
             .clone();
         let offsets = array.offsets().clone();
-        let array = GenericByteArray::<T>::try_new(offsets, values, array.nulls().cloned())
-            .map_err(|err| {
-                Error::not_supported(format!(
-                    "Could not create array with more than 2GiB of string/binary data in a \
-                     single batch. Please reduce the batch_size, set LANCE_DEFAULT_BATCH_SIZE \
-                     to a smaller value, or convert the column to large_string/large_binary. \
-                     Arrow error: {err}"
-                ))
-            })?;
+        let array = GenericByteArray::<T>::try_new(offsets, values, array.nulls().cloned())?;
         Ok(Arc::new(array))
     }
 }
@@ -189,5 +181,51 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((result, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ListArray, UInt8Array};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+
+    use super::*;
+    use crate::decoder::DecodeArrayTask;
+
+    struct StubDecodeTask {
+        array: ArrayRef,
+    }
+
+    impl DecodeArrayTask for StubDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Ok((self.array, 0))
+        }
+    }
+
+    #[test]
+    fn logical_utf8_decode_preserves_non_overflow_arrow_error() {
+        let offsets = OffsetBuffer::from_lengths([1_usize]);
+        let values: ArrayRef = Arc::new(UInt8Array::from(vec![0xFF_u8]));
+        let list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::UInt8, false)),
+            offsets,
+            values,
+            None,
+        )
+        .unwrap();
+        let decoder = BinaryArrayDecoder {
+            inner: Box::new(StubDecodeTask {
+                array: Arc::new(list),
+            }),
+            data_type: DataType::Utf8,
+        };
+
+        let error = Box::new(decoder).decode().unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains("more than 2GiB of string/binary data"));
+        assert!(message.to_lowercase().contains("utf"));
     }
 }
