@@ -162,20 +162,32 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowAddrMaskKey {
+pub struct RowAddrMaskKey<'a> {
     pub version: u64,
     /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise serve the
+    /// previous incarnation's mask for a version the new incarnation also
+    /// holds. The e-tag disambiguates generations the same way
+    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
+    /// cached mask at all (see `do_create_deletion_mask_row_id`).
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for RowAddrMaskKey {
+impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
+    // Only the legacy display form. Identity comes from `write_key` below.
     fn key(&self) -> Cow<'_, str> {
-        match self.restrict_hash {
-            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
-            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+        match (self.restrict_hash, self.e_tag) {
+            (None, None) => Cow::Owned(format!("row_addr_mask/{}/", self.version)),
+            (Some(h), None) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+            (None, Some(e)) => Cow::Owned(format!("row_addr_mask/{}/{}", self.version, e)),
+            (Some(h), Some(e)) => {
+                Cow::Owned(format!("row_addr_mask/{}/{:x}/{}", self.version, h, e))
+            }
         }
     }
     fn type_name() -> &'static str {
@@ -183,7 +195,7 @@ impl CacheKey for RowAddrMaskKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -191,6 +203,12 @@ impl CacheKey for RowAddrMaskKey {
         if let Some(restrict_hash) = self.restrict_hash {
             builder.write_some();
             builder.write_u64(restrict_hash);
+        } else {
+            builder.write_none();
+        }
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
         } else {
             builder.write_none();
         }
@@ -434,6 +452,47 @@ mod tests {
                 .get_with_key(&RowIdIndexKey {
                     version: 5,
                     e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let mask = || {
+            Arc::new(RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::new(),
+            ))
+        };
+        let key = RowAddrMaskKey {
+            version: 5,
+            restrict_hash: None,
+            e_tag: Some("first-etag"),
+        };
+        cache.insert_with_key(&key, mask()).await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        // Same version and restriction, different dataset generation.
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 5,
+                    restrict_hash: None,
+                    e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+        // A different fragment restriction must not alias the unrestricted
+        // entry either, even within one generation.
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 5,
+                    restrict_hash: Some(0xa),
+                    e_tag: Some("first-etag"),
                 })
                 .await
                 .is_none()
