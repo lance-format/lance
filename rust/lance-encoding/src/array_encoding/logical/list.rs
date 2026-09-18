@@ -1303,9 +1303,13 @@ impl FieldEncoder for ListFieldEncoder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_buffer::BooleanBuffer;
     use arrow_schema::{DataType, Field};
 
-    use super::oversized_batch_error;
+    use super::{ListPageDecoder, oversized_batch_error};
+    use crate::decoder::LogicalPageDecoder;
 
     #[test]
     fn oversized_binary_batch_error_is_actionable() {
@@ -1323,5 +1327,29 @@ mod tests {
         assert!(error.to_string().contains("batch_size"));
         assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
         assert!(error.to_string().contains("large_string/large_binary"));
+    }
+
+    #[test]
+    fn list_decoder_overflow_reports_row_span() {
+        let mut decoder = ListPageDecoder {
+            unloaded: None,
+            offsets: Arc::<[u64]>::from(vec![0_u64, 1, 2, 3, 3 + i32::MAX as u64 + 1]),
+            validity: BooleanBuffer::from_iter([true, true, true, true]),
+            item_decoder: None,
+            num_rows: 4,
+            rows_drained: 2,
+            rows_loaded: 4,
+            items_field: Arc::new(Field::new("item", DataType::UInt8, false)),
+            offset_type: DataType::Int32,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+        };
+
+        let Err(error) = decoder.drain(2) else {
+            panic!("expected overflow error");
+        };
+        let message = error.to_string();
+        assert!(message.contains("rows 2..4"));
+        assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
+        assert!(message.contains("batch_size"));
     }
 }

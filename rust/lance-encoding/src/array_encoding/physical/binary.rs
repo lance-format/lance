@@ -590,6 +590,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BytesDecoder {
+        bytes: Vec<u8>,
+    }
+
+    impl PrimitivePageDecoder for BytesDecoder {
+        fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+            let start = rows_to_skip as usize;
+            let end = start + num_rows as usize;
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 8,
+                data: LanceBuffer::from(self.bytes[start..end].to_vec()),
+                num_values: num_rows,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
     #[test]
     fn test_encode_indices_adjusts_nulls() {
         // Null entries in string arrays should be adjusted
@@ -663,5 +681,27 @@ mod tests {
         assert!(message.contains("exceeds i64::MAX"));
         assert!(message.contains("batch_size"));
         assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
+    }
+
+    #[test]
+    fn test_large_binary_decode_success_path() {
+        let decoded_indices = UInt64Array::from(vec![100_u64, 102, 105]);
+        let mut bytes = vec![0_u8; 100];
+        bytes.extend_from_slice(b"abcde");
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true, true]),
+            offsets_type: DataType::Int64,
+            bytes_decoder: Box::new(BytesDecoder { bytes }),
+        };
+
+        let data = decoder.decode(0, 2).unwrap();
+        let variable = data.as_variable_width().unwrap();
+        assert_eq!(variable.bits_per_offset, 64);
+        assert_eq!(variable.data.as_ref(), b"abcde");
+        assert_eq!(
+            variable.offsets.borrow_to_typed_slice::<i64>().as_ref(),
+            &[0_i64, 2, 5]
+        );
     }
 }
