@@ -69,6 +69,7 @@ pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
+use crate::scheduler::{SCHEDULER_ERROR_MODE_STORAGE_OPTION, SchedulerErrorMode};
 use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -217,6 +218,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// Scheduler error handling validated at the store construction boundary.
+    scheduler_error_mode: SchedulerErrorMode,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
@@ -396,6 +399,10 @@ impl ObjectStoreParams {
             .and_then(|a| a.initial_storage_options())
     }
 
+    pub(crate) fn scheduler_error_mode(&self) -> Result<SchedulerErrorMode> {
+        parse_scheduler_error_mode(self.storage_options())
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -416,6 +423,22 @@ impl ObjectStoreParams {
             })
         }
     }
+}
+
+fn parse_scheduler_error_mode(
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<SchedulerErrorMode> {
+    let value = storage_options.and_then(|options| {
+        options
+            .get(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+            .or_else(|| {
+                options.iter().find_map(|(key, value)| {
+                    key.eq_ignore_ascii_case(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+                        .then_some(value)
+                })
+            })
+    });
+    value.map_or(Ok(SchedulerErrorMode::BestEffort), |value| value.parse())
 }
 
 fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
@@ -675,6 +698,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                scheduler_error_mode: params.scheduler_error_mode()?,
                 io_tracker,
                 store_prefix,
                 // Type-erased on the way in, so there is no telling if it can paginate.
@@ -800,6 +824,10 @@ impl ObjectStore {
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
             .max(1)
+    }
+
+    pub(crate) fn scheduler_error_mode(&self) -> SchedulerErrorMode {
+        self.scheduler_error_mode
     }
 
     /// Get the IO tracker for this object store
@@ -1762,9 +1790,15 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
     std::sync::LazyLock::new(ObjectStoreRegistry::default);
 
 impl ObjectStore {
+    /// Wrap an object store implementation with Lance I/O behavior.
+    ///
+    /// `storage_options` may contain `scheduler_error_mode`. Valid values are
+    /// `best_effort` and `fail_fast`. Because this legacy constructor is
+    /// infallible, an invalid value is logged and falls back to `best_effort`.
+    /// Use [`Self::try_new`] when invalid storage options must be rejected.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut store: Arc<DynObjectStore>,
+        store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -1774,21 +1808,126 @@ impl ObjectStore {
         download_retry_count: usize,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Self {
-        let scheme = location.scheme();
-        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-        let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
-            Some(provider) => provider
-                .calculate_object_store_prefix(&location, storage_options)
-                .unwrap(),
+        let scheduler_error_mode = match parse_scheduler_error_mode(storage_options) {
+            Ok(mode) => mode,
+            Err(error) => {
+                log::warn!(
+                    "{error}; ObjectStore::new is falling back to best_effort. Use ObjectStore::try_new to reject invalid storage options"
+                );
+                SchedulerErrorMode::BestEffort
+            }
+        };
+        let store_prefix = Self::direct_store_prefix(&location, storage_options).unwrap();
+        Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        )
+    }
+
+    /// Wrap an object store implementation and validate Lance storage options.
+    ///
+    /// This is the fallible counterpart to [`Self::new`]. Custom object-store
+    /// providers may use it to reject an invalid `scheduler_error_mode` before
+    /// returning a store. A store returned through [`ObjectStoreRegistry`] is
+    /// validated by the registry independently of which constructor its provider
+    /// uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use lance_io::object_store::ObjectStore;
+    /// use object_store::memory::InMemory;
+    /// use url::Url;
+    ///
+    /// # fn build_store() -> lance_core::Result<()> {
+    /// let storage_options = HashMap::from([(
+    ///     "scheduler_error_mode".to_string(),
+    ///     "fail_fast".to_string(),
+    /// )]);
+    /// let _store = ObjectStore::try_new(
+    ///     Arc::new(InMemory::new()),
+    ///     Url::parse("memory:///").expect("valid memory URL"),
+    ///     None,
+    ///     None,
+    ///     false,
+    ///     true,
+    ///     64,
+    ///     3,
+    ///     Some(&storage_options),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Self> {
+        let scheduler_error_mode = parse_scheduler_error_mode(storage_options)?;
+        let store_prefix = Self::direct_store_prefix(&location, storage_options)?;
+        Ok(Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        ))
+    }
+
+    fn direct_store_prefix(
+        location: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(location.scheme()) {
+            Some(provider) => provider.calculate_object_store_prefix(location, storage_options),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
                 log::warn!(
                     "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
                     store_prefix
                 );
-                store_prefix
+                Ok(store_prefix)
             }
-        };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_scheduler_error_mode(
+        mut store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        scheduler_error_mode: SchedulerErrorMode,
+        store_prefix: String,
+    ) -> Self {
+        let scheme = location.scheme();
+        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
         let mut io_tracker = IOTracker::default();
         meter_store(&mut store, &mut io_tracker, &store_prefix);
 
@@ -1810,6 +1949,7 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            scheduler_error_mode,
             io_tracker,
             store_prefix,
             // Type-erased on the way in, so there is no telling if it can paginate.
@@ -1907,6 +2047,82 @@ mod tests {
             store.read_one_all(&path).await.unwrap(),
             b"first".as_slice()
         );
+    }
+
+    #[rstest]
+    #[case::default(None, SchedulerErrorMode::BestEffort)]
+    #[case::best_effort(Some("best_effort"), SchedulerErrorMode::BestEffort)]
+    #[case::fail_fast(Some("fail_fast"), SchedulerErrorMode::FailFast)]
+    #[case::case_insensitive(Some("FAIL_FAST"), SchedulerErrorMode::FailFast)]
+    fn test_scheduler_error_mode_storage_option(
+        #[case] value: Option<&str>,
+        #[case] expected: SchedulerErrorMode,
+    ) {
+        let storage_options_accessor = value.map(|value| {
+            Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+                [(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    value.to_string(),
+                )],
+            )))
+        });
+        let params = ObjectStoreParams {
+            storage_options_accessor,
+            ..Default::default()
+        };
+
+        assert_eq!(params.scheduler_error_mode().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_scheduler_error_mode_storage_option() {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    "invalid".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let error = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_scheduler_error_mode() {
+        let storage_options = HashMap::from([(
+            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+            "invalid".to_string(),
+        )]);
+
+        let error = ObjectStore::try_new(
+            Arc::new(InMemory::new()),
+            Url::parse("memory:///").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            Some(&storage_options),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
     }
 
     #[tokio::test]
