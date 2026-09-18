@@ -18,6 +18,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 /// Hugging Face object store provider backed by OpenDAL.
 #[derive(Default, Debug)]
 pub struct HuggingfaceStoreProvider;
@@ -142,10 +144,20 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
         config_map.insert("enable_resolve_cache".to_string(), enabled.clone());
     }
 
+    if let Some((_, max_retries)) = options
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
+    {
+        config_map.insert("client_max_retries".to_string(), max_retries.clone());
+    }
+
     Ok(config_map)
 }
 
 fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+    let storage_options = StorageOptions(config_map);
+    let max_retries = storage_options.client_max_retries();
+    let config_map = &storage_options.0;
     let repo_type = config_map
         .get("repo_type")
         .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
@@ -178,6 +190,7 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     let operator = Operator::new(builder).map_err(|e| {
         Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
     })?;
+    let operator = finish_opendal_operator(operator, max_retries);
 
     Ok(OpendalStore::new(operator))
 }
@@ -190,7 +203,8 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         } = parse_hf_url(&base_path)?;
 
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
 
         let mut base_options = build_hf_base_options(&repo_type, &repo_id, &storage_options);
@@ -412,6 +426,21 @@ mod tests {
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("enable_resolve_cache"));
         assert!(err.to_string().contains("Expected true or false"));
+    }
+
+    #[test]
+    fn storage_option_preserves_client_max_retries() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([(
+                "CLIENT_MAX_RETRIES".to_string(),
+                "5".to_string(),
+            )])),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("client_max_retries").unwrap(), "5");
     }
 
     #[test]
