@@ -800,10 +800,13 @@ impl LogicalPageDecoder for ListPageDecoder {
             }
         }
         if actual_num_rows < num_rows {
-            let num_items = self.offsets[(self.rows_drained + num_rows) as usize] - item_start;
+            let failing_rows_start = self.rows_drained + actual_num_rows;
+            let failing_item_start = self.offsets[failing_rows_start as usize];
+            let num_items =
+                self.offsets[(self.rows_drained + num_rows) as usize] - failing_item_start;
             return Err(oversized_batch_error(
                 self.items_field.as_ref(),
-                self.rows_drained..self.rows_drained + num_rows,
+                failing_rows_start..self.rows_drained + num_rows,
                 num_items,
             ));
         }
@@ -1348,8 +1351,8 @@ mod tests {
             panic!("expected overflow error");
         };
         let message = error.to_string();
-        assert!(message.contains("rows 2..4"));
-        assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
+        assert!(message.contains("rows 3..4"));
+        assert!(message.contains(&(i32::MAX as u64 + 1).to_string()));
         assert!(message.contains("batch_size"));
     }
 }
