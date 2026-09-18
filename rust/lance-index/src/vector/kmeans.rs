@@ -418,9 +418,18 @@ fn dot_membership_amx_f16(
 ) -> Option<Vec<Option<(u32, f32)>>> {
     let k = centroids.len() / dimension;
     // Under one full 32-wide k-pass the GEMM degenerates to the kernel's scalar
-    // cleanup, and under one full 32-centroid block most of its work would be
-    // the zero padding. Neither is worth leaving the per-vector path for.
-    if dimension < 32 || k < 32 {
+    // cleanup, so `dimension` still has to clear 32.
+    //
+    // `k` only has to clear 16, not the kernel's 32-centroid block width. The
+    // hierarchical k-means splitter caps every sub-clustering at
+    // `hierarchical_k` (16 by default), so a 32-centroid floor kept the GEMM out
+    // of every one of those sub-clusterings -- inside `train_ivf` it only ever
+    // ran for the closing assignment against the full centroid set, and during
+    // shuffle. A 16-centroid block half-fills the kernel's 32-wide pass with the
+    // zero padding `PackedCentroidsF16` already appends, and that half-filled
+    // pass still beats scoring one vector at a time, so the sub-clusterings are
+    // worth admitting even though they waste half the columns.
+    if dimension < 32 || k < 16 {
         return None;
     }
     let packed = PackedCentroidsF16::new(centroids, k, dimension)?;
@@ -571,44 +580,45 @@ where
         loss: f64,
     ) -> KMeans {
         let mut centroids = vec![T::Native::zero(); k * dimension];
+        let threads = get_num_compute_intensive_cpus();
 
-        let mut num_cpus = get_num_compute_intensive_cpus();
-        if k < num_cpus || k < 16 {
-            num_cpus = 1;
-        }
-        let chunk_size = k / num_cpus;
-
-        centroids
-            .par_chunks_mut(dimension * chunk_size)
-            .enumerate()
-            .with_max_len(1)
-            .for_each(|(i, centroids)| {
-                let start = i * chunk_size;
-                let end = ((i + 1) * chunk_size).min(k);
-                data.chunks(dimension)
-                    .zip(membership.iter())
-                    .filter_map(|(vector, cluster_id)| {
-                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                    })
-                    .for_each(|(vector, cluster_id)| {
-                        if start <= cluster_id && cluster_id < end {
-                            let local_id = cluster_id - start;
-                            let centroid =
-                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
+        if let Some(sums) = Self::sum_clusters_over_data(data, dimension, k, membership, threads) {
+            centroids
+                .par_chunks_mut(dimension)
+                .zip(sums.par_chunks(dimension))
+                .zip(cluster_sizes.par_iter())
+                .for_each(|((centroid, sums), &cnt)| {
+                    // An empty cluster keeps the all-zero centroid the
+                    // partitioned path would leave it, for `split_clusters`
+                    // below to replace.
+                    if cnt == 0 {
+                        return;
+                    }
+                    let norm = 1.0 / cnt as f32;
+                    centroid.iter_mut().zip(sums).for_each(|(c, s)| {
+                        *c = T::Native::from_f32(s * norm).unwrap_or_else(T::Native::zero);
                     });
-            });
+                });
+        } else {
+            Self::sum_clusters_over_centroids(
+                data,
+                dimension,
+                k,
+                membership,
+                &mut centroids,
+                threads,
+            );
 
-        centroids
-            .par_chunks_mut(dimension)
-            .zip(cluster_sizes.par_iter())
-            .for_each(|(centroid, &cnt)| {
-                if cnt > 0 {
-                    let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
-                    centroid.iter_mut().for_each(|v| *v *= norm);
-                }
-            });
+            centroids
+                .par_chunks_mut(dimension)
+                .zip(cluster_sizes.par_iter())
+                .for_each(|(centroid, &cnt)| {
+                    if cnt > 0 {
+                        let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
+                        centroid.iter_mut().for_each(|v| *v *= norm);
+                    }
+                });
+        }
 
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
@@ -638,6 +648,291 @@ where
             distance_type,
             loss,
         }
+    }
+}
+
+/// How much memory the data-parallel centroid update may hold in per-block
+/// accumulators at once.
+///
+/// The strategy trades memory for work: each block sums into a private
+/// `k * dimension` buffer, and all of them are live at once while they are
+/// folded together, so the footprint is `blocks * k * dimension * 4` bytes.
+/// A budget rather than a per-block cap because what has to stay bounded is the
+/// footprint of a training round, and the block count is the only free variable
+/// in that product.
+const CENTROID_SUM_BUDGET_BYTES: usize = 512 << 20;
+
+/// Fewest rows worth giving a block an accumulator of its own.
+///
+/// Below this the zeroing and the reduction cost more than the summing they
+/// parallelize, and the reduction is `k * dimension` per block however few rows
+/// the block covers.
+const MIN_ROWS_PER_SUM_BLOCK: usize = 1024;
+
+/// Accumulator floats the data-partitioned sum may fold for every membership
+/// entry the in-place update would otherwise visit, when that update is itself
+/// parallel.
+///
+/// With `k` centroids spread over `owners` threads the in-place path reads every
+/// vector exactly once, and the work it repeats is the walk over the membership
+/// array that each owner makes to find its own rows: `n` entries per owner, on
+/// all owners at once, so `n` visits of wall time. The data-partitioned path
+/// skips that walk but zeroes and then folds `blocks * k * dimension` floats of
+/// accumulator, the fold serially, so per row it trades
+/// `blocks * k * dimension / n` folded floats for one membership visit.
+///
+/// Measured on a 64-thread host with both strategies called directly on f32:
+/// at 2 folded floats per row (a PQ sub-vector, `dimension` 8, `k` 256) the
+/// data path is 1.9-3.6x faster, at 4 (`dimension` 16) 1.9x, at 8 1.24x, and
+/// at 16 (`dimension` 64 or 128, `k` 256) it is slower at 0.78-0.87x; the
+/// shapes of `benches/kmeans_recompute.rs` with `k * dimension` in the hundreds
+/// of thousands or more are 0.13-0.45x. The crossover is near 11; 4 sits on the
+/// winning side of it with room to spare.
+const FOLD_FLOATS_PER_MEMBERSHIP_VISIT: usize = 4;
+
+/// Accumulator floats the data-partitioned sum may fold for every scalar
+/// half-precision add the in-place update would make per owner.
+///
+/// An f16 column has a second cost on the in-place path that the f32 column
+/// does not: `*c += *v` on `f16` is a scalar convert-add-convert on every
+/// element an owner accumulates, `n * dimension / owners` of them in wall time,
+/// where the data-partitioned path reads the same elements once into an f32
+/// accumulator at a fraction of the cost. That saving is proportional to
+/// `dimension / owners`, so the allowance for f16 grows with it rather than
+/// being a second constant: the same 64 folded floats per row that are 2-3.3x
+/// faster at `dimension` 1024 (`k` 64) are break-even at `dimension` 512
+/// (`k` 128), and at `dimension` 128 (`k` 256) 32 per row is already 0.96x.
+/// Measured against the crossover on the same host -- break-even at 32, 64,
+/// 128 and 256 per row for `dimension` 128, 512, 1024 and 2048 respectively,
+/// all with 64 threads -- the per-element saving is worth about 8 folded
+/// floats; 6 sits on the winning side.
+const FOLD_FLOATS_PER_HALF_ADD: usize = 6;
+
+impl<T: ArrowNumericType> KMeansAlgoFloat<T>
+where
+    T::Native: Float + AddAssign,
+{
+    /// Sums each cluster's member vectors by splitting the *data*, giving every
+    /// block a private f32 accumulator and reducing them at the end.
+    ///
+    /// `None` when this strategy does not apply, and the caller must use
+    /// [`sum_clusters_over_centroids`](Self::sum_clusters_over_centroids)
+    /// instead.
+    ///
+    /// Walking the membership once is what this is for. Partitioning the
+    /// *centroids* instead — the only way to write centroids in place without
+    /// conflicting — makes each of the `p` blocks walk the whole membership
+    /// array to find the rows falling in its own centroid range, so that path
+    /// costs `p * n` membership visits against `n` here. Worse, it cannot use
+    /// more blocks than there are centroids, and hierarchical k-means
+    /// sub-clusters at `hierarchical_k` (16 by default) while a build host has
+    /// far more cores than that, so the centroid-partitioned update ran
+    /// single-threaded for the whole of `train_ivf` — it was the dominant cost
+    /// of training, several times the distance computation the AMX GEMM
+    /// accelerates.
+    ///
+    /// Where the centroid-partitioned path *is* parallel — `k` at least the
+    /// thread count — the membership walk (and, for f16, its scalar adds) is
+    /// all this path saves, and it pays for the saving with
+    /// `blocks * k * dimension` floats of accumulator to zero and fold; see
+    /// [`FOLD_FLOATS_PER_MEMBERSHIP_VISIT`] and [`FOLD_FLOATS_PER_HALF_ADD`]
+    /// for where that trade stops paying and this path hands the shape back.
+    ///
+    /// Every block accumulates in f32 whatever `T::Native` is, and that is why
+    /// an f16 column takes this path even when there is only one block to give
+    /// it. The private accumulators are fresh memory either way, so widening them
+    /// to f32 costs one extra copy of `k * dimension` per block and nothing in
+    /// the read of the data. What it buys is a guard against f16's 11 significant
+    /// bits: a running f16 total past 2048 can no longer represent an increment
+    /// of 1, so a cluster of a few thousand rows sums to a fraction of its true
+    /// total and the mean comes out wrong rather than slow. `train_kmeans` caps
+    /// its input at `k * 512` rows precisely so the in-place f16 update never
+    /// reaches that regime, and this path keeps the same property without
+    /// leaning on the cap. The centroid is a mean, so an f32 total divided by
+    /// the count lands back in f16 range whatever the cluster size.
+    ///
+    /// `available_threads` is a parameter rather than a read of
+    /// [`get_num_compute_intensive_cpus`] so the block arithmetic — and with it
+    /// which strategy a shape lands on — is reproducible in a test on any host.
+    /// It is the right bound on the block count and not just a convenient one:
+    /// past one block per thread there is no parallelism left to buy, only more
+    /// partial sums to fold, and that fold is `k * dimension` per block.
+    ///
+    /// The sums are therefore a function of the core count, and two hosts with
+    /// different core counts will differ in the last bits of a centroid. Within
+    /// a host the result is reproducible — the partial sums are folded in block
+    /// order, not in completion order — which is what debugging a training run
+    /// needs. Reproducibility *across* hosts is not something this path could
+    /// offer anyway: `train_kmeans` seeds its initial centroids from
+    /// `SmallRng::from_os_rng`.
+    fn sum_clusters_over_data(
+        data: &[T::Native],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+        available_threads: usize,
+    ) -> Option<Vec<f32>> {
+        // An f64 column has more mantissa than the accumulator would keep, so it
+        // stays on the path that accumulates in its own element type.
+        if T::DATA_TYPE == DataType::Float64 {
+            return None;
+        }
+        let width = k.checked_mul(dimension)?;
+        let per_block_bytes = width.checked_mul(size_of::<f32>())?.max(1);
+        // Checked before the block count and not folded into it: the count is
+        // clamped up to 1, so a budget that cannot pay for even a single
+        // accumulator would otherwise still allocate one.
+        if per_block_bytes > CENTROID_SUM_BUDGET_BYTES {
+            return None;
+        }
+        let n = data.len() / dimension;
+        debug_assert_eq!(membership.len(), n);
+        // `par_chunks` rejects a zero chunk size, which is what an empty input
+        // would compute below. No rows means every sum is zero.
+        if n == 0 {
+            return Some(vec![0f32; width]);
+        }
+
+        let blocks = available_threads
+            .min(CENTROID_SUM_BUDGET_BYTES / per_block_bytes)
+            .min(n.div_ceil(MIN_ROWS_PER_SUM_BLOCK))
+            .max(1);
+        // A single block buys no parallelism, so for a type whose own arithmetic
+        // is exact enough the in-place path is the cheaper way to the same
+        // answer. f16 is the exception above: it takes the wider accumulator on
+        // any core count.
+        if blocks < 2 && T::DATA_TYPE != DataType::Float16 {
+            return None;
+        }
+        // Against an in-place update that is itself parallel, this path only
+        // pays off while the accumulators it folds stay small next to the work
+        // it saves that update: the membership walk, and for f16 the scalar
+        // adds. A single f16 block is exempt for the same reason as above: it is
+        // here for the accumulator, and it has no partial sums to fold. An
+        // overflow in the arithmetic hands the shape back too, which is the
+        // safe way round.
+        let owners = Self::centroid_owner_blocks(k, available_threads);
+        if blocks >= 2 && owners > 1 {
+            let mut allowance = n.checked_mul(FOLD_FLOATS_PER_MEMBERSHIP_VISIT)?;
+            if T::DATA_TYPE == DataType::Float16 {
+                let half_adds_per_owner = n.checked_mul(dimension)? / owners;
+                allowance = allowance
+                    .checked_add(half_adds_per_owner.checked_mul(FOLD_FLOATS_PER_HALF_ADD)?)?;
+            }
+            if blocks.checked_mul(width)? > allowance {
+                return None;
+            }
+        }
+        let rows_per_block = n.div_ceil(blocks);
+
+        let partials: Vec<Vec<f32>> = data
+            .par_chunks(rows_per_block * dimension)
+            .zip(membership.par_chunks(rows_per_block))
+            .map(|(rows, ids)| {
+                let mut sums = vec![0f32; width];
+                rows.chunks_exact(dimension)
+                    .zip(ids)
+                    .filter_map(|(vector, id)| id.map(|id| (vector, id as usize)))
+                    // A membership out of range would index past the end of the
+                    // accumulator. The centroid-partitioned path drops those
+                    // rows silently by construction, so this one does too.
+                    .filter(|&(_, cluster_id)| cluster_id < k)
+                    .for_each(|(vector, cluster_id)| {
+                        let sums = &mut sums[cluster_id * dimension..(cluster_id + 1) * dimension];
+                        // Fully qualified: importing `ToPrimitive` here would
+                        // shadow `half::f16`'s inherent `to_f32` -- which
+                        // returns `f32`, not `Option<f32>` -- for every caller
+                        // in this module.
+                        sums.iter_mut().zip(vector).for_each(|(s, v)| {
+                            *s += num_traits::ToPrimitive::to_f32(v).unwrap_or_default()
+                        });
+                    });
+                sums
+            })
+            .collect();
+
+        // Folded in block order rather than reduced pairwise. `reduce` would
+        // join the partial sums in whatever order the work stealing produced,
+        // so a centroid's last bits would vary between two runs on the same
+        // host.
+        //
+        // Sequentially, and not striped across threads by output position:
+        // striping measured 75% slower than this at the shape that matters,
+        // and this is within 3% of the unordered `reduce` it replaces. The fold
+        // is `blocks * k * dimension` additions over memory that is read
+        // straight through, while a stripe narrow enough to give every thread
+        // one reaches into all `blocks` allocations for a few hundred bytes
+        // each. Hierarchical k-means sub-clusters at `hierarchical_k`, so the
+        // accumulator here is 16 centroids wide -- kilobytes, not megabytes,
+        // and already cheap to walk once per block.
+        let mut partials = partials.into_iter();
+        let mut sums = partials.next().unwrap_or_else(|| vec![0f32; width]);
+        for partial in partials {
+            sums.iter_mut().zip(&partial).for_each(|(s, p)| *s += *p);
+        }
+        Some(sums)
+    }
+
+    /// How many blocks [`sum_clusters_over_centroids`](Self::sum_clusters_over_centroids)
+    /// splits the centroids into: one per thread, or a single one when there is
+    /// not a centroid per thread to give, or fewer than 16 in all.
+    ///
+    /// Every block needs at least one centroid of its own, and below 16 the
+    /// membership walk this repeats per block costs more than the parallelism
+    /// returns. Shared with the data-partitioned path so that its routing rule
+    /// can tell a parallel in-place update from a serial one by the same test
+    /// the update itself makes.
+    fn centroid_owner_blocks(k: usize, available_threads: usize) -> usize {
+        let num_cpus = available_threads.max(1);
+        if k < num_cpus || k < 16 { 1 } else { num_cpus }
+    }
+
+    /// Sums each cluster's member vectors by splitting the *centroids*, each
+    /// block scanning the whole dataset for the rows assigned to the centroids
+    /// it owns.
+    ///
+    /// The fallback for the cases
+    /// [`sum_clusters_over_data`](Self::sum_clusters_over_data) declines: an f64
+    /// column, a `k * dimension` too large to hold an accumulator for, a non-f16
+    /// column with only one block's worth of rows, and — when this path runs
+    /// parallel — a shape whose accumulators would cost more to fold than the
+    /// membership walks they save. All four are cases where accumulating in
+    /// place is the cheaper trade.
+    ///
+    /// `available_threads` is a parameter for the same reason it is one there:
+    /// so a test can pin the partitioning without depending on the host.
+    fn sum_clusters_over_centroids(
+        data: &[T::Native],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+        centroids: &mut [T::Native],
+        available_threads: usize,
+    ) {
+        let num_cpus = Self::centroid_owner_blocks(k, available_threads);
+        let chunk_size = k / num_cpus;
+
+        centroids
+            .par_chunks_mut(dimension * chunk_size)
+            .enumerate()
+            .with_max_len(1)
+            .for_each(|(i, centroids)| {
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size).min(k);
+                data.chunks(dimension)
+                    .zip(membership.iter())
+                    .filter_map(|(vector, cluster_id)| {
+                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                    })
+                    .for_each(|(vector, cluster_id)| {
+                        if start <= cluster_id && cluster_id < end {
+                            let local_id = cluster_id - start;
+                            let centroid =
+                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
+                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        }
+                    });
+            });
     }
 }
 
@@ -2303,16 +2598,17 @@ mod tests {
     }
 
     /// The two paths across the shapes that exercise each boundary: `k` on and
-    /// off the kernel's 32-centroid block (so with and without zero padding),
-    /// `dim` with and without the kernel's scalar tail, and row counts on and
-    /// off the 32-row tile pass (so with and without trailing fallback rows).
+    /// off the kernel's 32-centroid block (so with and without zero padding,
+    /// including the half-filled 16 the hierarchical splitter trains at), `dim`
+    /// with and without the kernel's scalar tail, and row counts on and off the
+    /// 32-row tile pass (so with and without trailing fallback rows).
     #[test]
     fn test_dot_amx_matches_per_vector_path() {
         if !amx_fp16_supported() {
             return;
         }
         let mut rng = SmallRng::seed_from_u64(0xD07);
-        for k in [32usize, 64, 100] {
+        for k in [16usize, 32, 64, 100] {
             for dimension in [32usize, 64, 768] {
                 for n in [64usize, 100, 1000] {
                     let centroids = random_f16(k * dimension, &mut rng);
@@ -2337,33 +2633,58 @@ mod tests {
     /// Here every real dot product is negative, so every real distance exceeds
     /// 1.0 and a reduction over the padded row width would hand *every* vector
     /// a cluster id past the end of the centroid set.
+    ///
+    /// `k = 16` is the worst case the training path actually runs at: half the
+    /// block is padding, so half of every scored row is a column that must
+    /// never win.
     #[test]
     fn test_dot_amx_padding_columns_never_win() {
         if !amx_fp16_supported() {
             return;
         }
-        const K: usize = 100;
         const DIM: usize = 64;
         const N: usize = 128;
 
         let mut rng = SmallRng::seed_from_u64(0xBAD5);
-        let negate = |v: &f16| f16::from_f32(-v.to_f32().abs() - 0.1);
-        let centroids = random_f16(K * DIM, &mut rng)
-            .iter()
-            .map(negate)
-            .collect::<Vec<_>>();
-        let data = random_f16(N * DIM, &mut rng)
-            .iter()
-            .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
-            .collect::<Vec<_>>();
+        for k in [100usize, 16] {
+            let negate = |v: &f16| f16::from_f32(-v.to_f32().abs() - 0.1);
+            let centroids = random_f16(k * DIM, &mut rng)
+                .iter()
+                .map(negate)
+                .collect::<Vec<_>>();
+            let data = random_f16(N * DIM, &mut rng)
+                .iter()
+                .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
+                .collect::<Vec<_>>();
 
-        for vector in data.chunks(DIM) {
+            for vector in data.chunks(DIM) {
+                assert!(
+                    dot_distance_batch(vector, &centroids, DIM).all(|dist| dist > 1.0),
+                    "premise broken: a real centroid is nearer than the zero padding"
+                );
+            }
+            assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, &format!("padding k={k}"));
+        }
+    }
+
+    /// Shapes the kernel is not worth entering for must decline before touching
+    /// it, so this needs no AMX host to run.
+    ///
+    /// The `k` bound is 16 -- half the kernel's 32-centroid block -- and
+    /// `prefers_flat_amx_assignment` in `utils.rs` mirrors it; the two have to
+    /// move together or a build could take the exact-assignment route with no
+    /// GEMM under it.
+    #[test]
+    fn test_dot_amx_declines_shapes_below_half_a_block() {
+        let mut rng = SmallRng::seed_from_u64(0x5A11);
+        for (k, dimension) in [(15usize, 64usize), (64, 31), (15, 31)] {
+            let centroids = random_f16(k * dimension, &mut rng);
+            let data = random_f16(64 * dimension, &mut rng);
             assert!(
-                dot_distance_batch(vector, &centroids, DIM).all(|dist| dist > 1.0),
-                "premise broken: a real centroid is nearer than the zero padding"
+                dot_membership_amx_f16(&centroids, &data, dimension, 0.0, None).is_none(),
+                "k={k} dim={dimension}"
             );
         }
-        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "padding");
     }
 
     /// The bias path. `argmin_value_float_with_bias` minimizes `distance +
@@ -2766,5 +3087,382 @@ mod tests {
             first.centroids.as_primitive::<Float32Type>().values(),
             second.centroids.as_primitive::<Float32Type>().values()
         );
+    }
+
+    /// The two centroid-summing strategies must total the same clusters.
+    ///
+    /// They disagree structurally -- one splits the data and reduces private
+    /// accumulators, the other splits the centroids and accumulates in place --
+    /// so only one of them runs for any given call and nothing else compares
+    /// them. Exact equality is not required: summing in a different order moves
+    /// the last bits, and the data-parallel path deliberately accumulates in f32
+    /// rather than in the element type.
+    ///
+    /// Unassigned rows are in the fixture because both paths have to skip them,
+    /// by different code: a `filter_map` on one side, a range test on the other.
+    ///
+    /// The thread count is passed rather than probed so this pins the same
+    /// partitioning on every host. Probing would make the assertion vacuous on a
+    /// small CI container -- an f32 column with one block's worth of threads
+    /// takes the in-place path, and the call under test would return `None`.
+    #[test]
+    fn test_centroid_sums_agree_across_strategies() {
+        const N: usize = 8192;
+        const DIM: usize = 16;
+        const K: usize = 8;
+        const THREADS: usize = 4;
+
+        let mut st = 0x9E37u64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let data: Vec<f32> = (0..N * DIM).map(|_| next()).collect();
+        let membership: Vec<Option<u32>> = (0..N)
+            .map(|i| (i % 17 != 0).then_some((i % K) as u32))
+            .collect();
+
+        let over_data = KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+            &data,
+            DIM,
+            K,
+            &membership,
+            THREADS,
+        )
+        .expect("an f32 column with several blocks of rows is this path's own case");
+        let mut over_centroids = vec![0f32; K * DIM];
+        KMeansAlgoFloat::<Float32Type>::sum_clusters_over_centroids(
+            &data,
+            DIM,
+            K,
+            &membership,
+            &mut over_centroids,
+            THREADS,
+        );
+
+        for (i, (over_data, over_centroids)) in over_data.iter().zip(&over_centroids).enumerate() {
+            let tolerance = 1e-3 * over_data.abs().max(1.0);
+            assert!(
+                (over_data - over_centroids).abs() <= tolerance,
+                "sums disagree at {i}: {over_data} (over data) vs {over_centroids} (over centroids)"
+            );
+        }
+    }
+
+    /// A cluster whose running total outgrows f16 must still produce the mean of
+    /// its members -- on any number of cores.
+    ///
+    /// f16 carries 11 significant bits, so a total past 2048 can no longer
+    /// represent an increment of 1: summing 4096 ones in f16 stops dead at 2048
+    /// and the mean comes out at half its true value. The in-place path this
+    /// compares against relies on `train_kmeans` capping its input at `k * 512`
+    /// rows to stay clear of that (see `test_float16_underflow_fix`); the
+    /// data-partitioned path accumulates in f32 and must not need the cap. The
+    /// single-block case is asserted explicitly below because it is what a CI
+    /// container gets, and the guard has to hold there too.
+    #[test]
+    fn test_centroid_sum_survives_a_cluster_f16_cannot_total() {
+        const N: usize = 4096;
+        const DIM: usize = 4;
+        const K: usize = 1;
+
+        let data = vec![f16::ONE; N * DIM];
+        let membership: Vec<Option<u32>> = vec![Some(0); N];
+        let mut cluster_sizes = vec![N];
+
+        let kmeans = <KMeansAlgoFloat<Float16Type> as KMeansAlgo<f16>>::to_kmeans(
+            &data,
+            DIM,
+            K,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        let centroids = kmeans.centroids.as_primitive::<Float16Type>().values();
+        assert_eq!(
+            centroids,
+            [f16::ONE; DIM].as_slice(),
+            "the mean of {N} copies of 1.0 is 1.0"
+        );
+
+        // The single-core case, which is the one a small CI host runs and the
+        // one an earlier revision of this code got wrong by handing f16 back to
+        // the in-place path whenever there was no parallelism to be had.
+        let single_block =
+            KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(&data, DIM, K, &membership, 1)
+                .expect("an f16 column takes this path for its accumulator, not for its threads");
+        assert_eq!(
+            single_block,
+            vec![N as f32; DIM],
+            "one block must still total {N} rows of 1.0 exactly"
+        );
+
+        // The premise: f16 really cannot hold this total, so the assertions
+        // above are testing the accumulator and not something the element type
+        // would have got right anyway.
+        let mut in_element_type = vec![f16::ZERO; K * DIM];
+        KMeansAlgoFloat::<Float16Type>::sum_clusters_over_centroids(
+            &data,
+            DIM,
+            K,
+            &membership,
+            &mut in_element_type,
+            1,
+        );
+        assert!(
+            in_element_type[0].to_f32() < N as f32,
+            "an f16 accumulator was expected to lose increments past 2048, but it totalled {}",
+            in_element_type[0]
+        );
+    }
+
+    /// Which shapes the data-parallel path hands back to the in-place one, and
+    /// which it keeps.
+    ///
+    /// Every one of these is a quiet failure if the routing is wrong: an f64
+    /// column would be summed at two thirds of its mantissa, an oversized `k`
+    /// would allocate past the budget meant to bound it, and an f16 column sent
+    /// to the in-place path would lose increments (see the test above).
+    #[test]
+    fn test_centroid_sum_over_data_routes_shapes_it_cannot_serve() {
+        const DIM: usize = 8;
+        const K: usize = 4;
+        const N: usize = 8192;
+
+        let membership: Vec<Option<u32>> = vec![Some(0); N];
+
+        let f64_data = vec![1.0f64; N * DIM];
+        assert!(
+            KMeansAlgoFloat::<Float64Type>::sum_clusters_over_data(
+                &f64_data,
+                DIM,
+                K,
+                &membership,
+                8
+            )
+            .is_none(),
+            "an f64 column must keep the accumulator that holds its mantissa"
+        );
+
+        // One accumulator past the budget: `k * dimension * 4` here is 800 MB
+        // against a 512 MB allowance. Typed f16 deliberately -- for every other
+        // element type the `blocks < 2` rule below would decline this shape on
+        // its own (the budget division floors to zero and the count clamps up to
+        // one), so an f32 fixture here would still pass with the budget check
+        // deleted. f16 is exempt from that rule, which leaves the budget as the
+        // only thing standing between this call and an 800 MB allocation.
+        // Nothing of that size is allocated -- the check happens before the
+        // buffer does.
+        let tiny = vec![f16::ONE; N];
+        assert!(
+            KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(
+                &tiny,
+                1,
+                200_000_000,
+                &membership,
+                8
+            )
+            .is_none(),
+            "an accumulator larger than the whole budget must not be allocated"
+        );
+
+        let f32_rows = vec![1.0f32; MIN_ROWS_PER_SUM_BLOCK * DIM];
+        let f32_membership: Vec<Option<u32>> = vec![Some(0); MIN_ROWS_PER_SUM_BLOCK];
+        assert!(
+            KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+                &f32_rows,
+                DIM,
+                K,
+                &f32_membership,
+                8
+            )
+            .is_none(),
+            "one block's worth of f32 rows buys no parallelism and needs no wider accumulator"
+        );
+
+        // The same shape in f16 is kept, because there the accumulator is the
+        // point.
+        let f16_rows = vec![f16::ONE; MIN_ROWS_PER_SUM_BLOCK * DIM];
+        assert!(
+            KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(
+                &f16_rows,
+                DIM,
+                K,
+                &f32_membership,
+                8
+            )
+            .is_some(),
+            "an f16 column needs the wider accumulator whether or not it needs the threads"
+        );
+    }
+
+    /// Against an in-place update that is itself parallel, the data-parallel path
+    /// must keep only the shapes whose accumulators are small next to the work
+    /// it saves, and must keep every shape where the in-place update is serial.
+    ///
+    /// The failure this guards is a slowdown rather than a wrong answer: both
+    /// strategies sum to the same centroids, so nothing else would notice a
+    /// shape landing on the slower one. Each case fixes `blocks` by construction
+    /// -- `n / MIN_ROWS_PER_SUM_BLOCK` at or below the thread count -- so it is
+    /// the allowance arithmetic that is being tested, not the host.
+    #[test]
+    fn test_centroid_sum_over_data_yields_to_a_parallel_in_place_update() {
+        const THREADS: usize = 8;
+        let rows = |n: usize, dim: usize| vec![1.0f32; n * dim];
+        let rows_f16 = |n: usize, dim: usize| vec![f16::ONE; n * dim];
+        let membership = |n: usize, k: usize| -> Vec<Option<u32>> {
+            (0..n).map(|i| Some((i % k) as u32)).collect()
+        };
+
+        // k >= threads, so the in-place update runs 8 owners in parallel. 4
+        // blocks of 256 x 64 fold 65536 floats against 4096 rows: 16 per row,
+        // past the f32 allowance of 4. f16 also saves 64 / 8 scalar adds per
+        // row, worth 6 folded floats each, and keeps the shape.
+        let (n, dim, k) = (4096, 64, 256);
+        assert!(
+            KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+                &rows(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_none(),
+            "f32 must hand back a shape whose fold outweighs the membership walk it saves"
+        );
+        assert!(
+            KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(
+                &rows_f16(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_some(),
+            "f16 also saves the in-place path's scalar adds, so it keeps this shape"
+        );
+
+        // Same parallel in-place update, but a PQ sub-vector: 8 blocks of
+        // 256 x 8 fold 16384 floats against 8192 rows, 2 per row.
+        let (n, dim, k) = (8192, 8, 256);
+        assert!(
+            KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+                &rows(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_some(),
+            "small accumulators against a long membership are this path's win even at k >= threads"
+        );
+
+        // Past the f16 allowance too: 8 blocks of 4096 x 8 fold 32 floats per
+        // row, and at `dimension` 8 over 8 owners the scalar adds saved are
+        // worth only 6 more.
+        let (n, dim, k) = (8192, 8, 4096);
+        assert!(
+            KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(
+                &rows_f16(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_none(),
+            "f16 must hand back a shape whose fold outweighs both the walk and the adds it saves"
+        );
+
+        // k < threads: the in-place update is serial here, so the allowance
+        // must not apply -- 8 blocks of 4 x 1024 fold 32768 floats against 8192
+        // rows, which the rule above would refuse.
+        let (n, dim, k) = (8192, 1024, 4);
+        assert!(
+            KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+                &rows(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_some(),
+            "with fewer centroids than threads the in-place update is serial and this path always wins"
+        );
+
+        // k >= threads but k < 16: the in-place update is serial for the other
+        // reason, and the same must hold.
+        let (n, dim, k) = (8192, 1024, 12);
+        assert_eq!(
+            KMeansAlgoFloat::<Float32Type>::centroid_owner_blocks(k, THREADS),
+            1
+        );
+        assert!(
+            KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+                &rows(n, dim),
+                dim,
+                k,
+                &membership(n, k),
+                THREADS
+            )
+            .is_some(),
+            "below 16 centroids the in-place update is serial whatever the thread count"
+        );
+    }
+
+    /// A membership id past the last centroid must be dropped, not indexed with.
+    ///
+    /// The in-place path drops it as a side effect of testing the id against the
+    /// centroid range it owns; the data-parallel path indexes its accumulator
+    /// directly and would panic on the same input, so it filters explicitly.
+    #[test]
+    fn test_centroid_sums_ignore_out_of_range_membership() {
+        const N: usize = 4096;
+        const DIM: usize = 4;
+        const K: usize = 2;
+        const THREADS: usize = 4;
+
+        let data = vec![1.0f32; N * DIM];
+        let membership: Vec<Option<u32>> = (0..N)
+            .map(|i| Some(if i % 2 == 0 { 0 } else { K as u32 + 7 }))
+            .collect();
+
+        let over_data = KMeansAlgoFloat::<Float32Type>::sum_clusters_over_data(
+            &data,
+            DIM,
+            K,
+            &membership,
+            THREADS,
+        )
+        .expect("an f32 column with several blocks of rows is this path's own case");
+        let mut over_centroids = vec![0f32; K * DIM];
+        KMeansAlgoFloat::<Float32Type>::sum_clusters_over_centroids(
+            &data,
+            DIM,
+            K,
+            &membership,
+            &mut over_centroids,
+            THREADS,
+        );
+
+        assert_eq!(
+            over_data[0],
+            (N / 2) as f32,
+            "only the in-range half of the rows should have been summed"
+        );
+        assert_eq!(over_data, over_centroids);
+    }
+
+    /// An empty input must total to zeros rather than panicking.
+    ///
+    /// `par_chunks` rejects a zero chunk size, which is what the block
+    /// arithmetic computes for an input with no rows at all.
+    #[test]
+    fn test_centroid_sum_over_data_handles_empty_input() {
+        let sums = KMeansAlgoFloat::<Float16Type>::sum_clusters_over_data(&[], 8, 4, &[], 8)
+            .expect("an empty f16 column still takes the wider accumulator");
+        assert_eq!(sums, vec![0f32; 32]);
     }
 }
