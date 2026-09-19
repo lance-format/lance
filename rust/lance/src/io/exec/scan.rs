@@ -41,9 +41,13 @@ use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
     LEGACY_DEFAULT_FRAGMENT_READAHEAD,
 };
+use crate::dataset::versions;
 use crate::datatypes::Schema;
 
-use super::utils::{IoMetrics, buffered_fragment_opens};
+use super::utils::{
+    IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
+    rows_in_range,
+};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -627,6 +631,12 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
+    /// Measured once here: it depends only on the schema and the projection, and
+    /// `partition_statistics` is called repeatedly by the optimizer.
+    bytes_per_row: Option<f64>,
+    /// Whether the stream this node builds restricts itself to [`Self::range`],
+    /// which only the v2 readers do. Decided once here for the same reason.
+    applies_its_own_range: bool,
     properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
@@ -702,6 +712,10 @@ impl LanceScanExec {
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), projection.as_ref());
+        let applies_its_own_range = versions::scan_applies_its_own_range(
+            dataset.manifest().data_storage_format.lance_file_format(),
+        );
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -715,6 +729,8 @@ impl LanceScanExec {
             range,
             projection,
             output_schema,
+            bytes_per_row,
+            applies_its_own_range,
             properties,
             config,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -803,17 +819,38 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        // `with_make_deletions_null` keeps a row for every deleted row too -- its row
+        // id comes back null and callers use that as a selection vector -- so the node
+        // produces the fragment's physical rows rather than the live ones `num_rows`
+        // reports. `FilteredReadExec` draws the same distinction for its own
+        // `with_deleted_rows`.
+        let rows_produced = |fragment: &Fragment| {
+            if self.config.with_make_deletions_null {
+                fragment.physical_rows
+            } else {
+                fragment.num_rows()
+            }
+        };
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
                 .iter()
                 .fold(
                     (0, true),
-                    |(row_count, is_exact), fragment| match fragment.num_rows() {
+                    |(row_count, is_exact), fragment| match rows_produced(fragment) {
                         Some(num_rows) => (row_count + num_rows, is_exact),
                         None => (row_count, false),
                     },
                 );
+        // A v1 scan ignores the range it was handed and a `GlobalLimitExec` above
+        // applies the limit instead, so the unclamped count is the honest one
+        // there. Only a v2 scan produces at most the rows its range spans.
+        let row_count = if self.applies_its_own_range {
+            rows_in_range(row_count as u64, self.range.as_ref()) as usize
+        } else {
+            row_count
+        };
+
         let num_rows = match is_exact {
             true => Precision::Exact(row_count),
             false => Precision::Absent,
@@ -821,6 +858,7 @@ impl ExecutionPlan for LanceScanExec {
 
         Ok(Arc::new(Statistics {
             num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -844,6 +882,8 @@ mod tests {
     use datafusion::prelude::SessionConfig;
     use futures::TryStreamExt;
     use lance_datagen::gen_batch;
+    use lance_file::version::LanceFileVersion;
+    use rstest::rstest;
 
     use crate::utils::test::NoContextTestFixture;
 
@@ -865,6 +905,204 @@ mod tests {
         );
 
         scan.execute(0, Arc::new(TaskContext::default())).unwrap();
+    }
+
+    // 4 bytes for the nullable int32 and a validity bit, 16 for the 4-dim vector
+    // plus a bit for it and one per float: 20.75 bytes a row.
+    const ALL_ROWS_BYTES: usize = 8300;
+    const TEN_ROWS_BYTES: usize = 208;
+
+    /// A v2 scan applies its own range, so its statistics must describe that range.
+    /// Reporting the whole dataset instead can prevent collection of a small range
+    /// in a hash join. Both the full and the ranged size fit below the default
+    /// collect threshold, so the range is what the assertions turn on.
+    #[rstest]
+    #[case::v2_whole_dataset(LanceFileVersion::Stable, None, 400, ALL_ROWS_BYTES)]
+    #[case::v2_ranged(LanceFileVersion::Stable, Some(0..10), 10, TEN_ROWS_BYTES)]
+    // A v1 scan does not apply the range -- `LanceStream::try_new_v1` ignores the
+    // offsets it is handed and a `GlobalLimitExec` above does the limiting -- so its
+    // unclamped count is correct and must stay that way.
+    #[case::v1_range_is_not_applied(LanceFileVersion::Legacy, Some(0..10), 400, ALL_ROWS_BYTES)]
+    #[tokio::test]
+    async fn test_partition_statistics_follow_a_v2_scan_range(
+        #[case] version: LanceFileVersion,
+        #[case] range: Option<Range<u64>>,
+        #[case] expected_rows: usize,
+        #[case] expected_bytes: usize,
+    ) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::{Dimension, array};
+
+        use crate::dataset::WriteParams;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "v",
+                array::rand_vec::<arrow_array::types::Float32Type>(Dimension::from(4)),
+            )
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    data_storage_version: Some(version),
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            range,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+
+        let stats = exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(expected_bytes));
+    }
+
+    /// Keeping deleted rows means emitting them, so the statistics have to count
+    /// the fragment's physical rows. `num_rows` reports the live ones, which
+    /// understates both the count and the byte size scaled from it -- and an
+    /// `Exact` count that is wrong is what `AggregateStatistics` folds `COUNT(*)`
+    /// to.
+    #[rstest]
+    #[case::deletions_dropped(false, 60)]
+    #[case::deletions_kept_as_null(true, 100)]
+    #[tokio::test]
+    async fn test_partition_statistics_count_the_rows_a_scan_emits(
+        #[case] with_make_deletions_null: bool,
+        #[case] expected_rows: usize,
+    ) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        dataset.delete("x < 40").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig {
+                with_row_id: true,
+                with_make_deletions_null,
+                ..Default::default()
+            },
+        );
+
+        let stats = exec.partition_statistics(None).unwrap();
+        let stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let emitted: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+        assert_eq!(
+            emitted, expected_rows,
+            "fixture no longer emits what it claims"
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(emitted));
+        // 4 bytes of int32 and a validity bit, plus 8 of nullable row id and a bit
+        // of its own: 12.25 a row. The byte size is the half this branch added, so
+        // it has to follow the count rather than be derived from it here.
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Inexact((expected_rows as f64 * 12.25).ceil() as usize)
+        );
+    }
+
+    /// A legacy v1 blob payload reports no size either. It reaches the output as a
+    /// bare `LargeBinary` like a v2 payload, but carries `BLOB_META_KEY` rather
+    /// than the v2 extension name, so a v2-only check bills it as ordinary binary.
+    #[tokio::test]
+    async fn test_partition_statistics_suppress_a_legacy_blob_payload() {
+        use std::collections::HashMap;
+
+        use arrow_array::{LargeBinaryArray, RecordBatch, RecordBatchIterator, UInt64Array};
+        use arrow_schema::{DataType, Field as ArrowField};
+        use lance_arrow::BLOB_META_KEY;
+        use lance_core::datatypes::{BlobHandling, OnMissing};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::dataset::WriteParams;
+
+        let tmp = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            ArrowField::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        // Legacy blobs are rejected from 2.2 on, so this is the newest writer that
+        // can still produce one.
+        Dataset::write(
+            reader,
+            tmp.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(Dataset::open(tmp.as_str()).await.unwrap());
+
+        let projection = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("blobs", OnMissing::Error)
+            .unwrap();
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(projection.to_bare_schema()),
+            LanceScanConfig::default(),
+        );
+
+        assert_eq!(
+            exec.schema().field(0).data_type(),
+            &DataType::LargeBinary,
+            "the payload has to be materialized for this to be testing anything"
+        );
+        assert_eq!(
+            exec.partition_statistics(None).unwrap().total_byte_size,
+            Precision::Absent,
+            "a blob payload must not be billed at the LargeBinary estimate"
+        );
     }
 
     /// Verify that executing with target_partitions=1 produces the same row count as the

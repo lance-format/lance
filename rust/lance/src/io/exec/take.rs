@@ -40,7 +40,7 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -471,6 +471,9 @@ pub struct TakeExec {
     schema_to_take: Arc<Schema>,
     // The schema of the output
     output_schema: SchemaRef,
+    /// Measured once here, from the output schema: the take is where the plan gets
+    /// its width, and `partition_statistics` is called repeatedly.
+    bytes_per_row: Option<f64>,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -572,12 +575,25 @@ impl TakeExec {
                 .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
         );
 
+        let schema_to_take = projection.into_schema_ref();
+        // The output schema drops the blob v2 marker, so a projection over the
+        // dataset is what decides whether a width can be measured at all. It has to
+        // span the whole output: `calculate_output_schema` carries every input
+        // column through as well as the ones this node fetches, and a blob payload
+        // can arrive either way.
+        let width_projection = original_projection
+            .clone()
+            .union_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
+        let bytes_per_row =
+            estimated_bytes_per_row(output_arrow.as_ref(), &width_projection.to_bare_schema());
+
         Ok(Some(Self {
             dataset,
             output_projection: original_projection,
-            schema_to_take: projection.into_schema_ref(),
+            schema_to_take,
             input,
             output_schema: output_arrow,
+            bytes_per_row,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             batch_size_bytes,
@@ -739,8 +755,14 @@ impl ExecutionPlan for TakeExec {
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        // The take adds the columns the input did not carry, so this node is where a
+        // late-materialized plan gets its width. That is why the size comes from the
+        // output schema: without it a join above the take sees no size at all and
+        // falls back to the row count, which is the case the estimate exists for.
+        let num_rows = self.input.partition_statistics(partition)?.num_rows;
         Ok(Arc::new(Statistics {
-            num_rows: self.input.partition_statistics(partition)?.num_rows,
+            num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -835,6 +857,139 @@ mod tests {
             dataset: Arc::new(Dataset::open(test_uri).await.unwrap()),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    /// The take is where a late-materialized plan gets its width, so the reported
+    /// size has to come from the output schema and not the input's. Neutralising
+    /// that fails the inequality below, not just the literal.
+    #[tokio::test]
+    async fn test_take_statistics_measure_the_output_schema() {
+        use datafusion::common::stats::Precision;
+
+        let TestFixture { dataset, .. } = test_fixture().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            scan_schema,
+            config,
+        ));
+        let input_stats = input.partition_statistics(None).unwrap();
+        // 30 rows of a non-null int32 plus the nullable row id: 12.125 bytes a row.
+        assert_eq!(input_stats.num_rows, Precision::Exact(30));
+        assert_eq!(input_stats.total_byte_size, Precision::Inexact(364));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+        let stats = take_exec.partition_statistics(None).unwrap();
+
+        // The take passes the row count through and adds `s` to the width: 4 for
+        // the int32, 8.125 for the row id, and 64 of utf8 plus 4 of offsets.
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2404));
+        assert!(
+            stats.total_byte_size.get_value() > input_stats.total_byte_size.get_value(),
+            "the take must bill the columns it adds, not the key its input reads: {:?} vs {:?}",
+            stats.total_byte_size,
+            input_stats.total_byte_size
+        );
+    }
+
+    /// A blob payload suppresses the width wherever it enters the output, and the
+    /// take's own projection does not mention one it merely carries up from its
+    /// input. Measuring only the fetched columns bills megabyte rows at 72 bytes,
+    /// which is the one number this estimate must never publish.
+    #[tokio::test]
+    async fn test_take_statistics_suppress_a_carried_blob_payload() {
+        use arrow_array::UInt64Array;
+        use datafusion::common::stats::Precision;
+        use lance_core::datatypes::BlobHandling;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::blob::{BlobArrayBuilder, blob_field};
+
+        let tmp_dir = TempStrDir::default();
+        let mut blobs = BlobArrayBuilder::new(3);
+        for payload in [b"foo".as_slice(), b"bar".as_slice(), b"baz".as_slice()] {
+            blobs.push_bytes(payload).unwrap();
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blob", true),
+            Field::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                blobs.finish().unwrap(),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &tmp_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // The scan reads the payload itself, so it knows it is a blob and reports
+        // nothing. The take below has to reach the same answer without being told.
+        let scan_projection = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("blob", OnMissing::Error)
+            .unwrap();
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(scan_projection.to_bare_schema()),
+            LanceScanConfig {
+                with_row_id: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            input.partition_statistics(None).unwrap().total_byte_size,
+            Precision::Absent,
+            "the scan itself must not bill a blob payload"
+        );
+
+        // `idx` is the only column the take fetches, and it is an ordinary uint64.
+        let take_projection = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("idx", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, take_projection)
+            .unwrap()
+            .unwrap();
+        let stats = take_exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Absent,
+            "the take carries the payload into its output, so it must suppress too"
+        );
     }
 
     #[tokio::test]

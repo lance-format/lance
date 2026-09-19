@@ -12,14 +12,16 @@ use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
@@ -36,12 +38,15 @@ use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
+use lance_encoding::decoder::estimate_bytes_per_row;
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
 use tracing::Instrument;
 
 use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
+use crate::dataset::blob::schema_has_binary_blob_payload;
+use crate::datatypes::Schema as LanceSchema;
 use crate::index::prefilter::DatasetPreFilter;
 
 /// Open fragments on cancellation-safe tasks while preserving the stream's
@@ -935,14 +940,186 @@ impl MetricsCollector for IndexMetrics {
     }
 }
 
+/// The average list length [`estimate_bytes_per_row`] assumes when it sizes a
+/// list's values. Mirrored here so a list's child buffers are counted as many
+/// times as its values are; `list_length_assumption_matches_the_decoder` fails
+/// if the decoder ever picks a different number.
+const ASSUMED_LIST_LENGTH: f64 = 5.0;
+
+/// The narrowest row this estimate will report, in bytes.
+///
+/// DataFusion's default collect thresholds are 1 MiB and 128 Ki rows
+/// (`hash_join_single_partition_threshold` and its `_rows` twin), and 1 MiB over
+/// 128 Ki rows is exactly 8 bytes. Publishing any byte size retires the row
+/// guard, because `supports_collect_by_thresholds` consults the row count only
+/// when the byte size is absent. With those defaults, flooring the width here
+/// keeps this estimate from admitting a row count the row guard would reject.
+/// Without the floor, a nullable boolean column is estimated at a quarter byte
+/// per row, allowing four million rows to fit below the default byte threshold.
+///
+/// That agreement holds only at the default ratio, and a session that moves
+/// either threshold does not get it: `partition_statistics` takes no
+/// `ConfigOptions`, so this constant cannot follow a threshold it cannot read.
+/// At a byte threshold of 1000 and a row threshold of 100, a floored 101 rows
+/// report 808 bytes and qualify to be collected although the row cap would have
+/// turned them away -- see
+/// `a_custom_threshold_ratio_outruns_the_floor`. That is DataFusion's documented
+/// order rather than a hole this floor can close: the row threshold is what it
+/// consults when no byte size exists, and every source that reports one -- Lance
+/// and `DataSourceExec` alike -- retires it. The floor is only here to stop a
+/// sub-byte width from passing off an enormous input as a small one; the byte
+/// threshold still bounds the memory actually collected, and a floored width
+/// over-reports a narrow row rather than under-reporting it.
+const MIN_BYTES_PER_ROW: f64 = 8.0;
+
+/// Arrow bytes per row of one field: its values, the buffers around them, and
+/// the same for every nested child.
+///
+/// What DataFusion wants here is the size of the Arrow data a node produces,
+/// which is what it derives for itself elsewhere -- `DataSourceExec` reports
+/// `get_array_memory_size` -- and it compares the two sides of a join against
+/// each other. A decoded-payload figure on one side and an allocation figure on
+/// the other makes the Lance side look smaller than an equivalent Arrow input,
+/// so the buffers are counted alongside the values rather than left out.
+///
+/// Leaf values come from [`estimate_bytes_per_row`], the decoder's own estimate.
+/// The composite types are walked here rather than there because how Arrow lays
+/// a column out is not always how the decoder sizes it: a dictionary costs its
+/// keys a row, not its decoded values. A type with no arm of its own reports
+/// whatever the decoder says: exact for the fixed-width types, and 64 bytes for
+/// anything the decoder does not recognise either.
+///
+/// Allocation padding and per-array object sizes are omitted because the schema
+/// does not describe buffer capacities or batch counts. Arrow's buffer allocator
+/// rounds capacities to multiples of 64 bytes, but buffers imported from `Vec`
+/// retain that allocation. `get_array_memory_size` also includes the array object
+/// itself. These omitted costs can affect small-input comparisons in
+/// `should_swap_join_order`, which compares sizes without a minimum threshold.
+fn arrow_bytes_per_row(field: &arrow_schema::Field) -> f64 {
+    // A `NullArray` is a row count and nothing else: no values buffer and no
+    // validity bitmap whatever the field's nullability says, so it returns ahead
+    // of the validity term below.
+    if matches!(field.data_type(), DataType::Null) {
+        return 0.0;
+    }
+    // Estimate one validity bit per nullable value, including nested children.
+    // Arrays with no nulls can omit the bitmap, so this can overestimate validity
+    // storage; it does not include bitmap padding or spare capacity.
+    let validity = if field.is_nullable() { 1.0 / 8.0 } else { 0.0 };
+    // Variable-width types carry `n + 1` offsets; the one extra is a per-batch
+    // constant this ignores for the same reason it ignores padding.
+    let data = match field.data_type() {
+        DataType::Utf8 | DataType::Binary => 4.0 + estimate_bytes_per_row(field.data_type()),
+        DataType::LargeUtf8 | DataType::LargeBinary => {
+            8.0 + estimate_bytes_per_row(field.data_type())
+        }
+        // A view is a 16-byte struct a row that holds the value inline when it is
+        // 12 bytes or shorter and points into a data buffer when it is longer. The
+        // decoder's estimate describes the long case, so this counts both terms;
+        // a column of short strings really costs the 16 on its own.
+        DataType::Utf8View | DataType::BinaryView => {
+            16.0 + estimate_bytes_per_row(field.data_type())
+        }
+        DataType::List(child) => 4.0 + ASSUMED_LIST_LENGTH * arrow_bytes_per_row(child),
+        DataType::Map(entries, _) => 4.0 + ASSUMED_LIST_LENGTH * arrow_bytes_per_row(entries),
+        DataType::LargeList(child) => 8.0 + ASSUMED_LIST_LENGTH * arrow_bytes_per_row(child),
+        DataType::FixedSizeList(child, dim) => *dim as f64 * arrow_bytes_per_row(child),
+        DataType::Struct(fields) => fields.iter().map(|field| arrow_bytes_per_row(field)).sum(),
+        // Arrow holds a dictionary encoded: one key a row, plus a values buffer
+        // the whole batch shares. Only the keys scale with the row count, and the
+        // schema does not say how many distinct values there are, so the shared
+        // buffer is left out the way the per-batch offset is. Billing the decoded
+        // values a row instead would report a low-cardinality column at tens of
+        // times the memory it occupies.
+        DataType::Dictionary(key_type, _) => estimate_bytes_per_row(key_type),
+        other => estimate_bytes_per_row(other),
+    };
+    validity + data
+}
+
+/// Estimated Arrow bytes per row of `schema`, or `None` when no width is reported.
+///
+/// Computed once when a node is built, because it depends only on the schema and
+/// the projection, and `partition_statistics` is called repeatedly by the
+/// optimizer.
+///
+/// The width is [`arrow_bytes_per_row`] summed over the fields and floored at
+/// [`MIN_BYTES_PER_ROW`]: the values the decoder estimates plus the Arrow buffers
+/// around them. What DataFusion wants here is the size of the Arrow data the node
+/// produces, which is what it derives for itself elsewhere -- `DataSourceExec`
+/// sums `get_array_memory_size` -- so decoded payload alone would be the wrong
+/// quantity rather than a rough one.
+///
+/// `None` has two causes and one meaning: report no size at all.
+///
+/// A blob payload is the first, of either generation. Such a leaf reaches an
+/// output schema as a plain `LargeBinary`: for v2 because
+/// `public_blob_v2_binary_output_schema` strips the marker that identifies it,
+/// for a legacy v1 blob because `Field::binary_blob_mut` never wrote one there.
+/// The ordinary binary estimate uses 64 bytes of value and 8 of offsets, while
+/// blob payloads can be megabytes. Inspect `projection`, which still carries the
+/// marker, to suppress that estimate; otherwise derive the width from `schema`. The second cause is a schema with nothing to measure -- no fields,
+/// or none that occupy a buffer -- which is `None` rather than zero. DataFusion
+/// reads the byte size first and consults the row count only when the byte size
+/// is absent, so a wrong size -- or a zero -- retires the row guard that no size
+/// at all would have left in place.
+pub(crate) fn estimated_bytes_per_row(
+    schema: &arrow_schema::Schema,
+    projection: &LanceSchema,
+) -> Option<f64> {
+    if schema_has_binary_blob_payload(projection) {
+        return None;
+    }
+    let bytes_per_row: f64 = schema
+        .fields()
+        .iter()
+        .map(|field| arrow_bytes_per_row(field))
+        .sum();
+    if bytes_per_row <= 0.0 {
+        return None;
+    }
+    Some(bytes_per_row.max(MIN_BYTES_PER_ROW))
+}
+
+/// A row count scaled by a width from [`estimated_bytes_per_row`], always inexact.
+///
+/// `Absent` in, `Absent` out: a size derived from a row count we do not have would
+/// be an invention rather than an estimate, and so would one derived from a width
+/// that does not describe the rows.
+pub(crate) fn estimated_total_byte_size(
+    num_rows: Precision<usize>,
+    bytes_per_row: Option<f64>,
+) -> Precision<usize> {
+    let (Some(rows), Some(bytes_per_row)) = (num_rows.get_value(), bytes_per_row) else {
+        return Precision::Absent;
+    };
+    // A float-to-int cast saturates at `usize::MAX` rather than wrapping, so a
+    // huge row count degrades to an enormous estimate instead of a tiny one.
+    Precision::Inexact((*rows as f64 * bytes_per_row).ceil() as usize)
+}
+
+/// The rows of `total` that a scan range leaves: those past its start, capped at
+/// its length. Saturating, so a range that starts past the end leaves nothing
+/// rather than wrapping.
+pub(crate) fn rows_in_range(total: u64, range: Option<&Range<u64>>) -> u64 {
+    match range {
+        Some(range) => total
+            .saturating_sub(range.start)
+            .min(range.end.saturating_sub(range.start)),
+        None => total,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use std::sync::Arc;
 
     use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
-    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use arrow_schema::{DataType, Field, Fields, Schema, SortOptions};
     use datafusion::common::NullEquality;
+    use datafusion::common::stats::Precision;
+    use datafusion::config::ConfigOptions;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::{
         logical_expr::JoinType,
@@ -952,9 +1129,13 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt, stream};
+    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
     use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_encoding::decoder::estimate_bytes_per_row;
+
+    use crate::datatypes::Schema as LanceSchema;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
     use roaring::RoaringBitmap;
@@ -1450,5 +1631,321 @@ mod tests {
                 "partition {partition}: MarkerError not found in source chain: {err}"
             );
         }
+    }
+
+    /// 4 bytes for the fixed-width column, the decoder's 64-byte estimate for the
+    /// variable-width one, and 4 more for that one's offsets: 72 per row. Neither
+    /// column is nullable, so neither pays for a validity bitmap.
+    fn uint32_and_utf8() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", DataType::Utf8, false),
+        ])
+    }
+
+    #[rstest]
+    // The estimate is inexact whatever the row count's precision.
+    #[case::exact_row_count(Precision::Exact(10), Some(72.0), Precision::Inexact(720))]
+    #[case::inexact_row_count(Precision::Inexact(10), Some(72.0), Precision::Inexact(720))]
+    // No row count means no size: scaling a number we do not have would be an
+    // invention rather than an estimate.
+    #[case::no_row_count(Precision::Absent, Some(72.0), Precision::Absent)]
+    // No width means no size either, however many rows there are.
+    #[case::no_width(Precision::Exact(1_000_000_000), None, Precision::Absent)]
+    fn estimated_byte_size_needs_both_a_row_count_and_a_width(
+        #[case] num_rows: Precision<usize>,
+        #[case] bytes_per_row: Option<f64>,
+        #[case] expected: Precision<usize>,
+    ) {
+        assert_eq!(
+            super::estimated_total_byte_size(num_rows, bytes_per_row),
+            expected
+        );
+    }
+
+    /// The width a node measures once at construction and then reuses.
+    #[test]
+    fn a_width_is_measured_from_the_schema_once() {
+        let schema = uint32_and_utf8();
+        let projection = LanceSchema::try_from(&schema).unwrap();
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &projection),
+            Some(72.0)
+        );
+
+        // A schema with nothing to measure has no width rather than a zero one.
+        let empty = Schema::empty();
+        let empty_projection = LanceSchema::try_from(&empty).unwrap();
+        assert_eq!(
+            super::estimated_bytes_per_row(&empty, &empty_projection),
+            None
+        );
+    }
+
+    /// The width model: the decoder's estimate of the values, plus the buffers
+    /// Arrow allocates around them.
+    #[rstest]
+    #[case::fixed_width(Field::new("a", DataType::Int64, false), 8.0)]
+    // A nullable field pays one validity bit a row.
+    #[case::fixed_width_nullable(Field::new("a", DataType::Int64, true), 8.125)]
+    // Boolean values are a bit a row as well, so validity doubles the column.
+    #[case::boolean_nullable(Field::new("a", DataType::Boolean, true), 0.25)]
+    // 64 estimated bytes of characters plus a 4-byte offset a row, 8 for a Large.
+    #[case::utf8(Field::new("a", DataType::Utf8, false), 68.0)]
+    #[case::large_utf8(Field::new("a", DataType::LargeUtf8, false), 72.0)]
+    // Children pay their own validity once per value, not once per row: a 4-dim
+    // vector of nullable floats carries four bits a row.
+    #[case::fixed_size_list(
+        Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ),
+        16.5
+    )]
+    // Five assumed items a row at 8 bytes and a validity bit each, plus the list's
+    // own offset and validity bit.
+    #[case::list(
+        Field::new(
+            "a",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+        44.75
+    )]
+    #[case::nested_struct(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Utf8, false),
+            ])),
+            false,
+        ),
+        76.125
+    )]
+    // A dictionary costs one key a row; its values buffer is shared by the batch
+    // and does not scale with the row count.
+    #[case::dictionary(
+        Field::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        1.0
+    )]
+    // Nested is where billing the decoded values would still have shown through:
+    // the struct's own walk has to reach the dictionary arm.
+    #[case::dictionary_in_a_struct(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "word",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            )])),
+            false,
+        ),
+        4.125
+    )]
+    // A view is 16 bytes a row beside the same 64-byte value estimate a string
+    // gets, in place of the 4-byte offset.
+    #[case::utf8_view(Field::new("a", DataType::Utf8View, false), 80.0)]
+    // A `NullArray` has neither a values buffer nor a validity bitmap, so a
+    // nullable one is still free.
+    #[case::null(Field::new("a", DataType::Null, true), 0.0)]
+    fn width_counts_values_and_the_buffers_around_them(
+        #[case] field: Field,
+        #[case] expected: f64,
+    ) {
+        assert_eq!(super::arrow_bytes_per_row(&field), expected);
+    }
+
+    /// With DataFusion's default thresholds, the floored estimate rejects
+    /// collection at the same row count as the row guard.
+    #[test]
+    fn a_narrow_row_is_floored_to_the_row_guard() {
+        // Read DataFusion's guards rather than copy them. The floor is derived from
+        // both, so an upgrade that moves either default has to fail here instead of
+        // leaving behind a floor that no longer reproduces the row cap.
+        let optimizer = ConfigOptions::default().optimizer;
+        let collect_bytes = optimizer.hash_join_single_partition_threshold;
+        let collect_rows = optimizer.hash_join_single_partition_threshold_rows;
+        assert_eq!(
+            super::MIN_BYTES_PER_ROW,
+            collect_bytes as f64 / collect_rows as f64,
+            "the floor is the byte guard spread across the row guard"
+        );
+
+        // A quarter byte a row: a bit of value and a bit of validity. Unfloored,
+        // four million rows of this would still pass for less than 1 MiB.
+        let narrow = Schema::new(vec![Field::new("flag", DataType::Boolean, true)]);
+
+        let projection = LanceSchema::try_from(&narrow).unwrap();
+        let width = super::estimated_bytes_per_row(&narrow, &projection);
+        assert_eq!(width, Some(super::MIN_BYTES_PER_ROW), "the floor applies");
+
+        let under = super::estimated_total_byte_size(Precision::Exact(collect_rows - 1), width);
+        assert!(
+            under
+                .get_value()
+                .is_some_and(|bytes| *bytes < collect_bytes),
+            "a row short of the row guard has to stay under the byte guard: {under:?}"
+        );
+
+        let over = super::estimated_total_byte_size(Precision::Exact(collect_rows), width);
+        assert!(
+            over.get_value()
+                .is_some_and(|bytes| *bytes >= collect_bytes),
+            "the row count the row guard rejects has to fail the byte guard too: {over:?}"
+        );
+    }
+
+    /// A blob payload has no width a schema can describe, and a wrong width is
+    /// worse than none: publishing any size retires DataFusion's row guard.
+    ///
+    /// Both generations reach a plan as a bare `LargeBinary` leaf, and neither is
+    /// any more sizeable than the other. A v2 payload keeps the extension marker
+    /// until `public_blob_v2_binary_output_schema` strips it on the way out; a
+    /// legacy v1 payload is marked only by `BLOB_META_KEY`, because
+    /// `Field::binary_blob_mut` writes the extension name for v2 alone.
+    #[rstest]
+    #[case::blob_v2(ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME)]
+    #[case::blob_v1_legacy(BLOB_META_KEY, "true")]
+    fn a_blob_payload_reports_no_size(#[case] marker_key: &str, #[case] marker_value: &str) {
+        let blob_arrow = Schema::new(vec![Field::new("payload", DataType::LargeBinary, true)]);
+        let plain = LanceSchema::try_from(&blob_arrow).unwrap();
+        let mut blob = plain.clone();
+        blob.fields[0]
+            .metadata
+            .insert(marker_key.to_string(), marker_value.to_string());
+
+        // Unmarked it is ordinary binary: 64 of value, 8 of offsets and a validity
+        // bit. That is the number the guard exists to suppress, for rows that in
+        // practice run to megabytes.
+        assert_eq!(
+            super::estimated_bytes_per_row(&blob_arrow, &plain),
+            Some(72.125)
+        );
+        assert_eq!(super::estimated_bytes_per_row(&blob_arrow, &blob), None);
+    }
+
+    /// The floor reproduces the row guard at DataFusion's default ratio and only
+    /// there. This pins what a session that moves a threshold actually gets, so
+    /// that the agreement above is not mistaken for a guarantee the estimate can
+    /// make: `partition_statistics` never sees `ConfigOptions`, so no constant
+    /// here can track a threshold the caller reconfigured.
+    #[test]
+    fn a_custom_threshold_ratio_outruns_the_floor() {
+        // A ratio of 10 bytes a row against a floor of 8.
+        let collect_bytes = 1000_usize;
+        let collect_rows = 100_usize;
+        let rows = collect_rows + 1;
+
+        let narrow = Schema::new(vec![Field::new("flag", DataType::Boolean, true)]);
+        let projection = LanceSchema::try_from(&narrow).unwrap();
+        let width = super::estimated_bytes_per_row(&narrow, &projection);
+        let size = super::estimated_total_byte_size(Precision::Exact(rows), width);
+
+        // Both comparisons are `supports_collect_by_thresholds`', which reads the
+        // byte size first and reaches the row count only when there is none.
+        assert_eq!(size, Precision::Inexact(808));
+        assert!(
+            size.get_value().is_some_and(|bytes| *bytes < collect_bytes),
+            "the byte guard admits it: {size:?}"
+        );
+        assert!(
+            rows >= collect_rows,
+            "while the row guard, had it been consulted, would not have"
+        );
+    }
+
+    /// Arrow holds a dictionary encoded, so a row costs a key and nothing else:
+    /// the values buffer is shared by the whole batch. The decoder's estimate
+    /// describes the column *decoded*, and publishing that as the width would
+    /// report a low-cardinality column at tens of times the memory it occupies,
+    /// which disqualifies it from every collect threshold it should pass.
+    #[test]
+    fn a_dictionary_is_billed_for_its_keys_alone() {
+        let dict = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("word", dict.clone(), false),
+        ]);
+        let projection = LanceSchema::try_from(&schema).unwrap();
+
+        // Eight bytes of int64 and one of int8 key. Billing the decoded string
+        // beside the key would report 73, and the int64 is here so the total clears
+        // the floor and the dictionary's own contribution is visible.
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &projection),
+            Some(9.0)
+        );
+
+        // On its own a narrow dictionary is under the floor, which is what a
+        // column this cheap should report rather than the decoded 65.
+        let alone = Schema::new(vec![Field::new("word", dict, false)]);
+        let alone_projection = LanceSchema::try_from(&alone).unwrap();
+        assert_eq!(
+            super::estimated_bytes_per_row(&alone, &alone_projection),
+            Some(super::MIN_BYTES_PER_ROW)
+        );
+    }
+
+    /// A scan range is a window, not a count: the rows before its start are gone
+    /// and the rows past its end were never read.
+    #[test]
+    fn a_scan_range_is_a_window_over_the_rows() {
+        use super::rows_in_range;
+
+        assert_eq!(rows_in_range(250, None), 250);
+        // Wholly inside: the range's own length.
+        assert_eq!(rows_in_range(250, Some(&(25..125))), 100);
+        // Runs off the end: only what is actually there.
+        assert_eq!(rows_in_range(250, Some(&(200..400))), 50);
+        // Starts past the end: nothing, and no wrap.
+        assert_eq!(rows_in_range(250, Some(&(300..400))), 0);
+        // An inverted range is empty rather than enormous. Built field by field
+        // because clippy rejects the literal form.
+        let inverted = std::ops::Range {
+            start: 100u64,
+            end: 50,
+        };
+        assert_eq!(rows_in_range(250, Some(&inverted)), 0);
+    }
+
+    fn int64_item() -> Arc<Field> {
+        Arc::new(Field::new("item", DataType::Int64, false))
+    }
+
+    fn map_entries() -> Arc<Field> {
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Int64, false),
+                Field::new("values", DataType::Int64, true),
+            ])),
+            false,
+        ))
+    }
+
+    /// `ASSUMED_LIST_LENGTH` duplicates a constant that lives in the decoder, so
+    /// derive the decoder's from its own output and fail if the two drift apart.
+    ///
+    /// One case per type that uses the constant. `List` and `LargeList` share an
+    /// arm in the decoder today, but `Map` has its own and could move alone.
+    #[rstest]
+    #[case::list(DataType::List(int64_item()), DataType::Int64)]
+    #[case::large_list(DataType::LargeList(int64_item()), DataType::Int64)]
+    #[case::map(
+        DataType::Map(map_entries(), false),
+        map_entries().data_type().clone()
+    )]
+    fn list_length_assumption_matches_the_decoder(
+        #[case] nested: DataType,
+        #[case] child: DataType,
+    ) {
+        let decoder_assumption = estimate_bytes_per_row(&nested) / estimate_bytes_per_row(&child);
+        assert_eq!(decoder_assumption, super::ASSUMED_LIST_LENGTH);
     }
 }
