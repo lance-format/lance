@@ -42,8 +42,10 @@ python bench.py run \
 python plot.py --results-dir results --out results/ivf_rq_latency.png
 ```
 
-`run_versions.py` installs isolated interpreters for the last two stable
-pylance wheels plus a local checkout of this repo, then runs the full matrix.
+`run_versions.py` installs isolated interpreters for pylance 9.0.1, 10.0.0,
+11.0.0, 12.0.0, plus a local checkout of this repo, then runs the full matrix.
+`--only v9.0.1,v10.0.0` measures just those labels and merges them into the
+existing result manifest.
 
 Each version builds its own `IVF_RQ1` and `IVF_RQ5` indexes in a private
 work corpus (fragment files are hardlinked from the snapshot; manifests are

@@ -24,6 +24,14 @@ def env_protoc() -> str:
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 
+# Latest stable wheel of each major, matching the published 11.0.0 / 12.0.0 cells.
+WHEEL_VERSIONS = (
+    ("v9.0.1", "9.0.1"),
+    ("v10.0.0", "10.0.0"),
+    ("v11.0.0", "11.0.0"),
+    ("v12.0.0", "12.0.0"),
+)
+
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
@@ -142,6 +150,35 @@ def bench_run_cmd(
     return cmd
 
 
+def parse_only(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    selected = {item.strip() for item in raw.split(",") if item.strip()}
+    if not selected:
+        raise ValueError("--only is empty")
+    return selected
+
+
+def include_job(label: str, selected: set[str] | None) -> bool:
+    if selected is None:
+        return True
+    if label in selected or label.lstrip("v") in selected:
+        return True
+    return "main" in selected and "main" in label
+
+
+def merge_manifest(path: Path, new_names: list[str]) -> list[str]:
+    existing: list[str] = []
+    if path.exists():
+        existing = list(json.loads(path.read_text()).get("results", []))
+    merged: list[str] = []
+    for name in existing + new_names:
+        if name not in merged:
+            merged.append(name)
+    path.write_text(json.dumps({"results": merged}, indent=2) + "\n")
+    return merged
+
+
 def latest_label() -> str:
     # Ignore bench-only commits so the chart names the engine revision.
     sha = subprocess.check_output(
@@ -166,7 +203,14 @@ def main() -> None:
         help="reuse each version's already-built IVF_RQ files",
     )
     parser.add_argument("--discard-first", type=int, default=1)
+    parser.add_argument(
+        "--only",
+        default=None,
+        help="comma-separated labels to run (e.g. v9.0.1,v10.0.0); "
+        "merges new JSON into the existing manifest",
+    )
     args = parser.parse_args()
+    selected = parse_only(args.only)
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -182,11 +226,11 @@ def main() -> None:
             ]
         )
 
-    jobs = [
-        ("v11.0.0", ensure_wheel_venv(args.work_dir, "11.0.0")),
-        ("v12.0.0", ensure_wheel_venv(args.work_dir, "12.0.0")),
-    ]
-    if not args.skip_main_build:
+    jobs = []
+    for label, version in WHEEL_VERSIONS:
+        if include_job(label, selected):
+            jobs.append((label, ensure_wheel_venv(args.work_dir, version)))
+    if not args.skip_main_build and include_job(latest_label(), selected):
         jobs.append((latest_label(), ensure_local_venv(args.work_dir)))
 
     # Each version writes its own IVF_RQ files. Sharing a writer across
@@ -213,8 +257,8 @@ def main() -> None:
             results.append(out.name)
 
     manifest = args.results_dir / "_manifest.json"
-    manifest.write_text(json.dumps({"results": results}, indent=2) + "\n")
-    print(f"wrote {manifest}")
+    merged = merge_manifest(manifest, results)
+    print(f"wrote {manifest} results={merged}")
     plot = HERE / "plot.py"
     if plot.exists() and results:
         run(

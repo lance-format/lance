@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 
-VERSION_ORDER = ("v11.0.0", "v12.0.0")
+VERSION_ORDER = ("v9.0.1", "v10.0.0", "v11.0.0", "v12.0.0")
 
 
 def _sort_key(label: str) -> tuple[int, str]:
@@ -62,7 +62,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(1, len(indexes), figsize=(12.5, 5.4), sharey=False)
+    fig, axes = plt.subplots(1, len(indexes), figsize=(14.5, 5.4), sharey=False)
     if len(indexes) == 1:
         axes = [axes]
 

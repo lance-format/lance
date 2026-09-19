@@ -16,7 +16,14 @@ from bench import (
     work_corpus_path,
 )
 from plot import axis_label, load_results, plot_results
-from run_versions import bench_run_cmd, latest_label
+from run_versions import (
+    WHEEL_VERSIONS,
+    bench_run_cmd,
+    include_job,
+    latest_label,
+    merge_manifest,
+    parse_only,
+)
 
 
 def _sample_result(label: str, num_bits: int, warm_mean: float, cold_mean: float) -> dict:
@@ -54,7 +61,9 @@ def _sample_result(label: str, num_bits: int, warm_mean: float, cold_mean: float
 def test_load_and_plot(tmp_path: Path) -> None:
     rows = [
         _sample_result("v11.0.0", 1, 4.0, 12.0),
+        _sample_result("v9.0.1", 1, 5.1, 16.0),
         _sample_result("v12.0.0", 1, 3.2, 10.5),
+        _sample_result("v10.0.0", 1, 4.4, 14.2),
         _sample_result("c8f182179 (main)", 1, 2.8, 9.4),
         _sample_result("v11.0.0", 5, 6.5, 18.0),
         _sample_result("v12.0.0", 5, 5.1, 15.2),
@@ -79,6 +88,8 @@ def test_load_and_plot(tmp_path: Path) -> None:
 
     loaded = load_results(tmp_path)
     assert [row["label"] for row in loaded if row["num_bits"] == 1] == [
+        "v9.0.1",
+        "v10.0.0",
         "v11.0.0",
         "v12.0.0",
         "c8f182179 (main)",
@@ -161,3 +172,29 @@ def test_latest_label_names_engine_revision_not_bench_commit() -> None:
 def test_axis_label_keeps_main_on_one_line() -> None:
     assert axis_label("c8f182179 (main)") == "main"
     assert axis_label("v12.0.0") == "v12.0.0"
+    assert axis_label("v9.0.1") == "v9.0.1"
+
+
+def test_wheel_matrix_includes_v9_and_v10() -> None:
+    assert [label for label, _ in WHEEL_VERSIONS] == [
+        "v9.0.1",
+        "v10.0.0",
+        "v11.0.0",
+        "v12.0.0",
+    ]
+
+
+def test_only_filter_accepts_label_or_bare_version() -> None:
+    selected = parse_only("v9.0.1,10.0.0")
+    assert include_job("v9.0.1", selected)
+    assert include_job("v10.0.0", selected)
+    assert not include_job("v11.0.0", selected)
+    assert include_job("v11.0.0", None)
+    assert include_job("c8f182179 (main)", parse_only("main"))
+
+
+def test_merge_manifest_keeps_existing_cells(tmp_path: Path) -> None:
+    path = tmp_path / "_manifest.json"
+    path.write_text(json.dumps({"results": ["v11.0.0-rq1.json"]}) + "\n")
+    merged = merge_manifest(path, ["v9.0.1-rq1.json", "v11.0.0-rq1.json"])
+    assert merged == ["v11.0.0-rq1.json", "v9.0.1-rq1.json"]
