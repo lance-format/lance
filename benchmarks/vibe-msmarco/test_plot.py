@@ -8,14 +8,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from bench import (
     advise_dontneed,
     clone_corpus,
+    nearest_rank,
     prime_os_page_cache,
     split_discard,
     work_corpus_path,
 )
-from plot import axis_label, load_results, plot_results
+from plot import axis_label, load_results, plot_results, series_ms
 from run_versions import (
     WHEEL_VERSIONS,
     bench_run_cmd,
@@ -38,6 +41,7 @@ def _sample_result(label: str, num_bits: int, warm_mean: float, cold_mean: float
                 "mean_ms": warm_mean,
                 "median_ms": warm_mean - 0.2,
                 "p95_ms": warm_mean + 0.4,
+                "p99_ms": warm_mean + 0.5,
                 "min_ms": warm_mean - 0.5,
                 "max_ms": warm_mean + 0.6,
                 "qps": 1000.0 / warm_mean,
@@ -50,6 +54,7 @@ def _sample_result(label: str, num_bits: int, warm_mean: float, cold_mean: float
                 "mean_ms": cold_mean,
                 "median_ms": cold_mean - 0.3,
                 "p95_ms": cold_mean + 0.8,
+                "p99_ms": cold_mean + 1.2,
                 "min_ms": cold_mean - 0.7,
                 "max_ms": cold_mean + 1.0,
                 "qps": 1000.0 / cold_mean,
@@ -191,6 +196,35 @@ def test_only_filter_accepts_label_or_bare_version() -> None:
     assert not include_job("v11.0.0", selected)
     assert include_job("v11.0.0", None)
     assert include_job("c8f182179 (main)", parse_only("main"))
+
+
+def test_nearest_rank_matches_recorded_p95_index() -> None:
+    ordered = [float(index) for index in range(100)]
+    assert nearest_rank(ordered, 0.95) == 94.0
+    assert nearest_rank(ordered, 0.99) == 98.0
+
+
+def test_nearest_rank_rejects_empty_and_invalid_quantile() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        nearest_rank([], 0.99)
+    with pytest.raises(ValueError, match="quantile"):
+        nearest_rank([1.0], 0.0)
+
+
+def test_series_ms_computes_p99_from_samples() -> None:
+    row = _sample_result("v12.0.0", 5, 5.0, 20.0)
+    del row["cold"]["summary"]["p99_ms"]
+    row["cold"]["latencies_ms"] = [10.0] * 98 + [20.0, 30.0]
+    assert series_ms(row, "cold", "p99_ms") == 20.0
+    assert series_ms(row, "warm", "p99_ms") == pytest.approx(5.5)
+
+
+def test_recorded_results_include_matching_p99() -> None:
+    results_dir = Path(__file__).resolve().parent / "results"
+    for row in load_results(results_dir):
+        for mode in ("cold", "warm"):
+            samples = sorted(row[mode]["latencies_ms"])
+            assert row[mode]["summary"]["p99_ms"] == nearest_rank(samples, 0.99)
 
 
 def test_merge_manifest_keeps_existing_cells(tmp_path: Path) -> None:

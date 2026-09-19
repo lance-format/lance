@@ -297,13 +297,27 @@ def split_discard(
     return latencies[:discard_first], latencies[discard_first:]
 
 
+def nearest_rank(ordered: list[float], quantile: float) -> float:
+    """Return the nearest-rank sample at ``quantile``.
+
+    The rank is ``max(int(n * quantile) - 1, 0)``. Recorded p95 values used
+    this index; p99 uses the same rule so both percentiles are comparable.
+    """
+    if not ordered:
+        raise ValueError("nearest_rank requires a non-empty sample")
+    if not 0.0 < quantile <= 1.0:
+        raise ValueError(f"quantile must be in (0, 1], got {quantile}")
+    return ordered[max(int(len(ordered) * quantile) - 1, 0)]
+
+
 def _summarize(latencies: list[float]) -> dict[str, float]:
     ordered = sorted(latencies)
     return {
         "count": len(ordered),
         "mean_ms": statistics.fmean(ordered) * 1000.0,
         "median_ms": statistics.median(ordered) * 1000.0,
-        "p95_ms": ordered[max(int(len(ordered) * 0.95) - 1, 0)] * 1000.0,
+        "p95_ms": nearest_rank(ordered, 0.95) * 1000.0,
+        "p99_ms": nearest_rank(ordered, 0.99) * 1000.0,
         "min_ms": ordered[0] * 1000.0,
         "max_ms": ordered[-1] * 1000.0,
         "qps": len(ordered) / sum(ordered),

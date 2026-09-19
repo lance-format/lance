@@ -13,8 +13,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+from bench import nearest_rank
+
 
 VERSION_ORDER = ("v9.0.1", "v10.0.0", "v11.0.0", "v12.0.0")
+COLORS = {"warm": "#2ca02c", "cold": "#ff7f0e"}
+MARKERS = {"warm": "o", "cold": "s"}
 
 
 def _sort_key(label: str) -> tuple[int, str]:
@@ -57,67 +61,106 @@ def load_results(results_dir: Path) -> list[dict]:
     return rows
 
 
+def series_ms(row: dict, mode: str, key: str) -> float:
+    """Read a latency stat, computing p99 from samples when the summary omits it."""
+    summary = row[mode]["summary"]
+    if key in summary:
+        return summary[key]
+    if key == "p99_ms":
+        samples = row[mode].get("latencies_ms")
+        if samples:
+            return nearest_rank(sorted(samples), 0.99)
+    raise KeyError(f"{mode} summary is missing {key}")
+
+
+def _style_axis(ax, labels: list[str], title: str) -> None:
+    xs = list(range(len(labels)))
+    for x in xs:
+        ax.axvline(x, color="#bbbbbb", linestyle=":", linewidth=0.8)
+    ax.set_xticks(xs, labels)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.set_title(title)
+    ax.set_xlabel("Lance / pylance version")
+    ax.set_ylabel("Query latency (ms)")
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(ymin, ymax * 1.08)
+
+
+def _plot_metric(
+    ax,
+    series: list[dict],
+    metrics: tuple[tuple[str, str, float, float, str], ...],
+    annotate: str,
+) -> None:
+    labels = [axis_label(row["label"]) for row in series]
+    xs = list(range(len(labels)))
+    for mode in ("cold", "warm"):
+        for key, linestyle, linewidth, alpha, suffix in metrics:
+            values = [series_ms(row, mode, key) for row in series]
+            ax.plot(
+                xs,
+                values,
+                color=COLORS[mode],
+                marker=MARKERS[mode],
+                linewidth=linewidth,
+                linestyle=linestyle,
+                alpha=alpha,
+                label=f"{mode} {suffix}",
+            )
+            if key == annotate:
+                for x, value in zip(xs, values):
+                    ax.annotate(
+                        f"{value:.1f}",
+                        (x, value),
+                        textcoords="offset points",
+                        xytext=(0, 7),
+                        ha="center",
+                        fontsize=8,
+                        color=COLORS[mode],
+                    )
+    _style_axis(ax, labels, ax.get_title())
+
+
 def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
     if not rows:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(1, len(indexes), figsize=(15.2, 5.5), sharey=False)
+    fig, axes = plt.subplots(2, len(indexes), figsize=(15.2, 9.2), sharey=False)
     if len(indexes) == 1:
-        axes = [axes]
+        mean_axes = [axes[0]]
+        p99_axes = [axes[1]]
+    else:
+        mean_axes = axes[0]
+        p99_axes = axes[1]
 
-    colors = {"warm": "#2ca02c", "cold": "#ff7f0e"}
-    markers = {"warm": "o", "cold": "s"}
+    mean_metrics = (
+        ("mean_ms", "-", 2.0, 1.0, "mean"),
+        ("median_ms", "--", 1.2, 0.85, "median"),
+    )
+    p99_metrics = (("p99_ms", "-", 2.0, 1.0, "p99"),)
 
-    for ax, index_name in zip(axes, indexes):
-        series = [row for row in rows if row["index"] == index_name]
-        labels = [axis_label(row["label"]) for row in series]
-        xs = list(range(len(labels)))
-        for mode in ("cold", "warm"):
-            means = [row[mode]["summary"]["mean_ms"] for row in series]
-            medians = [row[mode]["summary"]["median_ms"] for row in series]
-            ax.plot(
-                xs,
-                means,
-                color=colors[mode],
-                marker=markers[mode],
-                linewidth=2,
-                label=f"{mode} mean",
-            )
-            ax.plot(
-                xs,
-                medians,
-                color=colors[mode],
-                marker=markers[mode],
-                linewidth=1.2,
-                linestyle="--",
-                alpha=0.85,
-                label=f"{mode} median",
-            )
-            for x, mean in zip(xs, means):
-                ax.annotate(
-                    f"{mean:.1f}",
-                    (x, mean),
-                    textcoords="offset points",
-                    xytext=(0, 7),
-                    ha="center",
-                    fontsize=8,
-                    color=colors[mode],
-                )
-        for x in xs:
-            ax.axvline(x, color="#bbbbbb", linestyle=":", linewidth=0.8)
-        ax.set_xticks(xs, labels)
-        ax.tick_params(axis="x", labelsize=9)
+    for ax, index_name in zip(mean_axes, indexes):
         ax.set_title(index_name)
-        ax.set_xlabel("Lance / pylance version")
-        ax.set_ylabel("Query latency (ms)")
-        ax.grid(axis="y", linestyle=":", alpha=0.5)
-        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
-        ymin, ymax = ax.get_ylim()
-        ax.set_ylim(ymin, ymax * 1.08)
+        _plot_metric(
+            ax,
+            [row for row in rows if row["index"] == index_name],
+            mean_metrics,
+            "mean_ms",
+        )
+    for ax, index_name in zip(p99_axes, indexes):
+        ax.set_title(f"{index_name} p99")
+        _plot_metric(
+            ax,
+            [row for row in rows if row["index"] == index_name],
+            p99_metrics,
+            "p99_ms",
+        )
 
-    handles, legend_labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="upper right", frameon=False)
+    mean_axes[0].legend(loc="upper right", frameon=False)
+    p99_axes[0].legend(loc="upper right", frameon=False)
     fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13)
     fig.text(
         0.5,
@@ -128,7 +171,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         fontsize=8,
         color="#444444",
     )
-    fig.tight_layout(rect=(0, 0.07, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=160)
     print(f"wrote {out}")
@@ -144,7 +187,7 @@ def main() -> None:
             "vibe-msmarco-qwen-1024 · 8.84M × 1024-d · IVF 1024 partitions · "
             "k=10 nprobes=20 · select _rowid only · each version builds its own index · "
             "OS cache dropped then this index primed · first query discarded · "
-            "warm = prewarm_index"
+            "warm = prewarm_index · p99 = nearest-rank of the same 100 queries"
         ),
     )
     args = parser.parse_args()
