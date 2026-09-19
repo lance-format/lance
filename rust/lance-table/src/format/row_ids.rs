@@ -12,19 +12,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::pb;
 
-/// Field id of the hidden `_rowid` column that a spilled row id sequence lives in.
-///
-/// Field ids are `i32` and every negative value is reserved for system use:
-/// `-1` is the unassigned sentinel, `-2` is
-/// [`TOMBSTONE_FIELD_ID`](crate::format::overlay::TOMBSTONE_FIELD_ID), and
-/// `-3..=-5` are the three row lineage columns.
-pub const ROW_ID_FIELD_ID: i32 = -3;
-/// Field id of the hidden `_row_created_at_version` column that a spilled
-/// created-at version sequence lives in.
-pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = -4;
-/// Field id of the hidden `_row_last_updated_at_version` column that a spilled
-/// last-updated-at version sequence lives in.
-pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = -5;
+pub use lance_core::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+};
 
 /// A reference to a part of a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]

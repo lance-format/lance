@@ -147,12 +147,18 @@ pub async fn write_fragments(
     file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
-    let schema = write::prepare_write_schema(
+    // A writer that spills row lineage into the fragment's own data file
+    // carries the hidden columns in its stream. They are not dataset fields:
+    // set them aside before the schema is checked against the dataset's and
+    // put them back, under their reserved ids, on the schema that is written.
+    let (normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema);
+    let mut schema = write::prepare_write_schema(
         dataset,
         normalized_schema,
         &params,
         schema_compare_options(version),
     )?;
+    schema.fields.extend(lineage_fields);
     match version {
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::validate_legacy_blob_write_schema(&schema, &version_name)?;
@@ -176,6 +182,29 @@ pub async fn write_fragments(
     )
     .await?;
     Ok((fragments, schema))
+}
+
+/// Take the hidden row lineage columns out of a write schema, each keyed to
+/// the reserved field id its name maps to.
+fn split_row_lineage_fields(schema: Schema) -> (Schema, Vec<lance_core::datatypes::Field>) {
+    let (lineage, user): (Vec<_>, Vec<_>) = schema
+        .fields
+        .into_iter()
+        .partition(|field| lance_core::row_lineage_field_id(&field.name).is_some());
+    let lineage = lineage
+        .into_iter()
+        .map(|mut field| {
+            field.id = lance_core::row_lineage_field_id(&field.name).unwrap();
+            field
+        })
+        .collect();
+    (
+        Schema {
+            fields: user,
+            metadata: schema.metadata,
+        },
+        lineage,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
