@@ -17,8 +17,75 @@ from bench import nearest_rank
 
 
 VERSION_ORDER = ("v9.0.1", "v10.0.0", "v11.0.0", "v12.0.0")
-COLORS = {"warm": "#2ca02c", "cold": "#ff7f0e"}
-MARKERS = {"warm": "o", "cold": "s"}
+# One color + marker + dash per series so mean / median / p99 do not collapse.
+SERIES = (
+    {
+        "mode": "cold",
+        "key": "mean_ms",
+        "label": "cold mean",
+        "color": "#e67e22",
+        "marker": "o",
+        "linestyle": "-",
+        "linewidth": 2.4,
+        "markersize": 8,
+        "annotate": True,
+    },
+    {
+        "mode": "cold",
+        "key": "median_ms",
+        "label": "cold median",
+        "color": "#d4a017",
+        "marker": "D",
+        "linestyle": "--",
+        "linewidth": 1.6,
+        "markersize": 6,
+        "annotate": False,
+    },
+    {
+        "mode": "cold",
+        "key": "p99_ms",
+        "label": "cold p99",
+        "color": "#c0392b",
+        "marker": "^",
+        "linestyle": "-.",
+        "linewidth": 2.4,
+        "markersize": 8,
+        "annotate": True,
+    },
+    {
+        "mode": "warm",
+        "key": "mean_ms",
+        "label": "warm mean",
+        "color": "#1e8449",
+        "marker": "s",
+        "linestyle": "-",
+        "linewidth": 2.4,
+        "markersize": 7,
+        "annotate": True,
+    },
+    {
+        "mode": "warm",
+        "key": "median_ms",
+        "label": "warm median",
+        "color": "#16a085",
+        "marker": "P",
+        "linestyle": "--",
+        "linewidth": 1.6,
+        "markersize": 7,
+        "annotate": False,
+    },
+    {
+        "mode": "warm",
+        "key": "p99_ms",
+        "label": "warm p99",
+        "color": "#1f618d",
+        "marker": "v",
+        "linestyle": "-.",
+        "linewidth": 2.4,
+        "markersize": 8,
+        "annotate": True,
+    },
+)
 
 
 def _sort_key(label: str) -> tuple[int, str]:
@@ -74,10 +141,10 @@ def series_ms(row: dict, mode: str, key: str) -> float:
 
 
 ANNOTATE_OFFSET = {
-    ("cold", "mean_ms"): (0, 6),
-    ("warm", "mean_ms"): (0, 6),
-    ("cold", "p99_ms"): (-9, 10),
-    ("warm", "p99_ms"): (9, 10),
+    ("cold", "mean_ms"): (0, 7),
+    ("warm", "mean_ms"): (0, -13),
+    ("cold", "p99_ms"): (-8, 11),
+    ("warm", "p99_ms"): (8, 11),
 }
 
 
@@ -93,43 +160,37 @@ def _style_axis(ax, labels: list[str], title: str) -> None:
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
     ymin, ymax = ax.get_ylim()
-    ax.set_ylim(ymin, ymax * 1.16)
+    span = ymax - ymin
+    ax.set_ylim(ymin - span * 0.10, ymax + span * 0.14)
 
 
-def _plot_metric(
-    ax,
-    series: list[dict],
-    metrics: tuple[tuple[str, str, float, float, str], ...],
-    annotate: tuple[str, ...],
-) -> None:
-    labels = [axis_label(row["label"]) for row in series]
+def _plot_series(ax, rows: list[dict]) -> None:
+    labels = [axis_label(row["label"]) for row in rows]
     xs = list(range(len(labels)))
-    annotate_keys = set(annotate)
-    for mode in ("cold", "warm"):
-        for key, linestyle, linewidth, alpha, suffix in metrics:
-            values = [series_ms(row, mode, key) for row in series]
-            ax.plot(
-                xs,
-                values,
-                color=COLORS[mode],
-                marker=MARKERS[mode],
-                linewidth=linewidth,
-                linestyle=linestyle,
-                alpha=alpha,
-                label=f"{mode} {suffix}",
-            )
-            if key in annotate_keys:
-                offset = ANNOTATE_OFFSET.get((mode, key), (0, 7))
-                for x, value in zip(xs, values):
-                    ax.annotate(
-                        f"{value:.1f}",
-                        (x, value),
-                        textcoords="offset points",
-                        xytext=offset,
-                        ha="center",
-                        fontsize=8,
-                        color=COLORS[mode],
-                    )
+    for spec in SERIES:
+        values = [series_ms(row, spec["mode"], spec["key"]) for row in rows]
+        ax.plot(
+            xs,
+            values,
+            color=spec["color"],
+            marker=spec["marker"],
+            markersize=spec["markersize"],
+            linewidth=spec["linewidth"],
+            linestyle=spec["linestyle"],
+            label=spec["label"],
+        )
+        if spec["annotate"]:
+            offset = ANNOTATE_OFFSET.get((spec["mode"], spec["key"]), (0, 7))
+            for x, value in zip(xs, values):
+                ax.annotate(
+                    f"{value:.1f}",
+                    (x, value),
+                    textcoords="offset points",
+                    xytext=offset,
+                    ha="center",
+                    fontsize=8,
+                    color=spec["color"],
+                )
     _style_axis(ax, labels, ax.get_title())
 
 
@@ -142,19 +203,9 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
     if len(indexes) == 1:
         axes = [axes]
 
-    metrics = (
-        ("mean_ms", "-", 2.2, 1.0, "mean"),
-        ("median_ms", "--", 1.2, 0.85, "median"),
-        ("p99_ms", (0, (1.4, 1.2)), 2.0, 1.0, "p99"),
-    )
     for ax, index_name in zip(axes, indexes):
         ax.set_title(index_name)
-        _plot_metric(
-            ax,
-            [row for row in rows if row["index"] == index_name],
-            metrics,
-            ("mean_ms", "p99_ms"),
-        )
+        _plot_series(ax, [row for row in rows if row["index"] == index_name])
 
     handles, legend_labels = axes[0].get_legend_handles_labels()
     fig.legend(
