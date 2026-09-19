@@ -73,6 +73,14 @@ def series_ms(row: dict, mode: str, key: str) -> float:
     raise KeyError(f"{mode} summary is missing {key}")
 
 
+ANNOTATE_OFFSET = {
+    ("cold", "mean_ms"): (0, 6),
+    ("warm", "mean_ms"): (0, 6),
+    ("cold", "p99_ms"): (-9, 10),
+    ("warm", "p99_ms"): (9, 10),
+}
+
+
 def _style_axis(ax, labels: list[str], title: str) -> None:
     xs = list(range(len(labels)))
     for x in xs:
@@ -85,17 +93,18 @@ def _style_axis(ax, labels: list[str], title: str) -> None:
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
     ymin, ymax = ax.get_ylim()
-    ax.set_ylim(ymin, ymax * 1.08)
+    ax.set_ylim(ymin, ymax * 1.16)
 
 
 def _plot_metric(
     ax,
     series: list[dict],
     metrics: tuple[tuple[str, str, float, float, str], ...],
-    annotate: str,
+    annotate: tuple[str, ...],
 ) -> None:
     labels = [axis_label(row["label"]) for row in series]
     xs = list(range(len(labels)))
+    annotate_keys = set(annotate)
     for mode in ("cold", "warm"):
         for key, linestyle, linewidth, alpha, suffix in metrics:
             values = [series_ms(row, mode, key) for row in series]
@@ -109,13 +118,14 @@ def _plot_metric(
                 alpha=alpha,
                 label=f"{mode} {suffix}",
             )
-            if key == annotate:
+            if key in annotate_keys:
+                offset = ANNOTATE_OFFSET.get((mode, key), (0, 7))
                 for x, value in zip(xs, values):
                     ax.annotate(
                         f"{value:.1f}",
                         (x, value),
                         textcoords="offset points",
-                        xytext=(0, 7),
+                        xytext=offset,
                         ha="center",
                         fontsize=8,
                         color=COLORS[mode],
@@ -128,40 +138,34 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(2, len(indexes), figsize=(15.2, 9.2), sharey=False)
+    fig, axes = plt.subplots(1, len(indexes), figsize=(15.4, 6.2), sharey=False)
     if len(indexes) == 1:
-        mean_axes = [axes[0]]
-        p99_axes = [axes[1]]
-    else:
-        mean_axes = axes[0]
-        p99_axes = axes[1]
+        axes = [axes]
 
-    mean_metrics = (
-        ("mean_ms", "-", 2.0, 1.0, "mean"),
+    metrics = (
+        ("mean_ms", "-", 2.2, 1.0, "mean"),
         ("median_ms", "--", 1.2, 0.85, "median"),
+        ("p99_ms", (0, (1.4, 1.2)), 2.0, 1.0, "p99"),
     )
-    p99_metrics = (("p99_ms", "-", 2.0, 1.0, "p99"),)
-
-    for ax, index_name in zip(mean_axes, indexes):
+    for ax, index_name in zip(axes, indexes):
         ax.set_title(index_name)
         _plot_metric(
             ax,
             [row for row in rows if row["index"] == index_name],
-            mean_metrics,
-            "mean_ms",
-        )
-    for ax, index_name in zip(p99_axes, indexes):
-        ax.set_title(f"{index_name} p99")
-        _plot_metric(
-            ax,
-            [row for row in rows if row["index"] == index_name],
-            p99_metrics,
-            "p99_ms",
+            metrics,
+            ("mean_ms", "p99_ms"),
         )
 
-    mean_axes[0].legend(loc="upper right", frameon=False)
-    p99_axes[0].legend(loc="upper right", frameon=False)
-    fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13)
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.98),
+    )
+    fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13, y=1.02)
     fig.text(
         0.5,
         0.01,
@@ -171,9 +175,9 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         fontsize=8,
         color="#444444",
     )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
+    fig.tight_layout(rect=(0, 0.07, 1, 0.90))
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=160)
+    fig.savefig(out, dpi=160, bbox_inches="tight")
     print(f"wrote {out}")
 
 
