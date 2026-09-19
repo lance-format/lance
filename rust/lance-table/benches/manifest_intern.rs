@@ -63,6 +63,8 @@ fn make_uniform_pb_fragments(n: u64, num_fields: usize) -> Vec<pb::DataFragment>
             deletion_file: None,
             row_id_sequence: None,
             physical_rows: 1000,
+            clustering_generation: 0,
+            clustering_group_id: None,
             last_updated_at_version_sequence: Some(
                 pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                     version_bytes.clone(),
@@ -140,6 +142,8 @@ fn make_diverse_pb_fragments(
                 deletion_file: None,
                 row_id_sequence: None,
                 physical_rows: 1000,
+                clustering_generation: 0,
+                clustering_group_id: None,
                 last_updated_at_version_sequence: Some(
                     pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                         version_payloads[version_idx].clone(),

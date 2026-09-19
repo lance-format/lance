@@ -32,6 +32,24 @@ message UUID {
   bytes uuid = 1;
 }
 
+// The physical layout algorithm used by liquid clustering.
+enum ClusteringAlgorithm {
+  CLUSTERING_ALGORITHM_UNSPECIFIED = 0;
+  CLUSTERING_ALGORITHM_TYPED_QUANTILE_RANK_V1 = 1;
+}
+
+/* Table-level liquid-clustering state. The ordered clustering key is stored on
+ * schema fields through unenforced_clustering_key_position.
+ */
+message LiquidClusteringState {
+  // Whether liquid clustering is enabled for maintenance operations.
+  bool enabled = 1;
+  // Monotonically increasing physical-layout generation. Zero is invalid.
+  uint64 generation = 2;
+  // Algorithm that defines the physical layout for this generation.
+  ClusteringAlgorithm algorithm = 3;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -135,6 +153,9 @@ message Manifest {
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
    * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
+   * * 1 << 11: the dataset carries liquid-clustering configuration or fragment
+   *   layout stamps. Writers that do not understand this metadata must refuse
+   *   the dataset. Readers may ignore it.
    */
   uint64 reader_feature_flags = 9;
 
@@ -243,6 +264,11 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  /* Liquid-clustering state. The ordered clustering fields are defined by
+   * lance.file.Field.unenforced_clustering_key_position.
+   */
+  LiquidClusteringState liquid_clustering = 22;
 } // Manifest
 
 // external dataset base path
@@ -439,6 +465,16 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* The clustering layout generation this fragment was written under. A zero
+   * value means the fragment has no clustering generation.
+   */
+  uint64 clustering_generation = 12;
+
+  /* Identifies fragments produced by the same clustering rewrite group. When
+   * present, clustering_generation must be non-zero.
+   */
+  UUID clustering_group_id = 13;
 }
 
 message DataFile {

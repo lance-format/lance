@@ -1111,6 +1111,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            liquid_clustering: None,
         }
     }
 }
