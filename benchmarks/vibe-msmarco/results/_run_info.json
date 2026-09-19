@@ -3,12 +3,20 @@
   "dataset": "lance-format/vibe-msmarco-qwen-1024",
   "corpus_rows": 8840823,
   "query_count": 100,
+  "discard_first": 1,
   "k": 10,
   "nprobes": 20,
   "num_partitions": 1024,
   "metric": "cosine",
   "projection": "_rowid only",
   "index_writer": "each version builds its own IVF_RQ indexes",
+  "protocol": {
+    "drop_os_page_cache": true,
+    "prime_this_index_files": true,
+    "discard_first_query": true,
+    "cold": "fresh dataset handle, metadata opened untimed, partitions not prewarmed",
+    "warm": "prewarm_index on one handle"
+  },
   "versions": ["v11.0.0", "v12.0.0", "c8f182179 (main)"],
   "machine": {
     "vcpu": 4,

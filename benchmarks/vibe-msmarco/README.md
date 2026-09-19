@@ -58,18 +58,16 @@ OS page cache is dropped at the start of every cell.
 
 | Index | Version | Cold mean (ms) | Cold median (ms) | Warm mean (ms) | Warm QPS |
 | --- | --- | ---: | ---: | ---: | ---: |
-| IVF_RQ1 | v11.0.0 | 17.9 | 16.7 | 6.02 | 166 |
-| IVF_RQ1 | v12.0.0 | 14.4 | 14.1 | 4.91 | 204 |
-| IVF_RQ1 | c8f182179 (main) | 20.0 | 18.2 | 5.03 | 199 |
-| IVF_RQ5 | v11.0.0 | 24.4 | 23.3 | 12.8 | 78 |
-| IVF_RQ5 | v12.0.0 | 22.0 | 21.2 | 10.6 | 95 |
-| IVF_RQ5 | c8f182179 (main) | 25.1 | 24.4 | 10.4 | 97 |
+| IVF_RQ1 | v11.0.0 | 18.7 | 17.3 | 6.05 | 165 |
+| IVF_RQ1 | v12.0.0 | 13.9 | 13.8 | 4.68 | 214 |
+| IVF_RQ1 | c8f182179 (main) | 14.1 | 14.0 | 4.81 | 208 |
+| IVF_RQ5 | v11.0.0 | 29.2 | 28.7 | 15.2 | 66 |
+| IVF_RQ5 | v12.0.0 | 24.3 | 23.2 | 14.2 | 71 |
+| IVF_RQ5 | c8f182179 (main) | 26.8 | 24.5 | 13.4 | 75 |
 
-Warm search is close across the two stables and main (RQ1 ~5–6 ms, RQ5
-~10–13 ms). Cold search is also in the same band once each version reads
-an index it wrote. The earlier chart that reused a v11-written index made
-main look much slower on cold; that was a cross-version reader path, not
-main's own IVF_RQ performance.
+Under this protocol, main IVF_RQ1 matches v12 (cold ~14 ms, warm ~4.8 ms).
+v11 is slower on both bit widths. IVF_RQ5 cold is v12 24.3 / main 26.8 /
+v11 29.2; warm is close and main is slightly fastest.
 
 Index build wall time on this box: v11 RQ1/RQ5 420s/466s, v12 227s/457s,
 main 223s/461s.
