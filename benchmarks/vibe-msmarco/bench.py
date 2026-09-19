@@ -231,10 +231,19 @@ def advise_dontneed(path: Path) -> None:
 
 
 def index_storage_files(corpus_uri: str, index_name: str) -> list[Path]:
+    """Return on-disk files for one named index.
+
+    ``describe_indices`` omits the uuid on current bindings, so this uses
+    ``list_indices`` when it is available.
+    """
     lance = _import_lance()
     ds = lance.dataset(corpus_uri)
+    if hasattr(ds, "list_indices"):
+        entries = list(ds.list_indices())
+    else:
+        entries = _index_entries(ds)
     files: list[Path] = []
-    for entry in _index_entries(ds):
+    for entry in entries:
         if _index_name(entry) != index_name:
             continue
         uuid = entry["uuid"] if isinstance(entry, dict) else getattr(entry, "uuid", None)
@@ -244,6 +253,17 @@ def index_storage_files(corpus_uri: str, index_name: str) -> list[Path]:
         if root.is_dir():
             files.extend(path for path in root.rglob("*") if path.is_file())
     return files
+
+
+def prime_os_page_cache(paths: list[Path]) -> None:
+    """Read index files sequentially so later cold queries share the same OS cache."""
+    buf = bytearray(8 * 1024 * 1024)
+    for path in paths:
+        if not path.is_file():
+            continue
+        with open(path, "rb") as handle:
+            while handle.readinto(buf):
+                pass
 
 
 def drop_os_page_cache(paths: list[Path] | None = None) -> None:
@@ -428,16 +448,24 @@ def run_one(
         "discard_first": discard_first,
         "timed_queries": query_count,
         "cold": (
-            "drop caches, then fresh dataset per query; metadata opened "
-            "untimed; first query discarded so the timed set is lance-cold "
-            "with this index already in the OS page cache"
+            "drop caches, sequentially prime this index's files into the OS "
+            "page cache, then fresh dataset per query; metadata opened "
+            "untimed; first query discarded"
         ),
         "warm": "prewarm_index on one handle; first query discarded",
     }
     if drop_caches:
         files = index_storage_files(corpus_uri, index_name)
+        if not files:
+            raise RuntimeError(
+                f"no on-disk files for index {index_name!r} under {corpus_uri}"
+            )
         print(f"dropping OS page cache for {len(files)} index files", flush=True)
         drop_os_page_cache(files)
+        print(f"priming OS page cache from {len(files)} index files", flush=True)
+        started = time.perf_counter()
+        prime_os_page_cache(files)
+        print(f"prime finished in {time.perf_counter() - started:.1f}s", flush=True)
     print(
         f"timing {label} IVF_RQ{num_bits}  timed={query_count}  "
         f"discard_first={discard_first}  k={TOP_K} nprobes={NPROBES}",

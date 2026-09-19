@@ -8,7 +8,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bench import advise_dontneed, clone_corpus, split_discard, work_corpus_path
+from bench import (
+    advise_dontneed,
+    clone_corpus,
+    prime_os_page_cache,
+    split_discard,
+    work_corpus_path,
+)
 from plot import load_results, plot_results
 from run_versions import bench_run_cmd, latest_label
 
@@ -139,6 +145,13 @@ def test_advise_dontneed_on_regular_file(tmp_path: Path) -> None:
     path.write_bytes(b"x" * 4096)
     advise_dontneed(path)
     assert path.read_bytes()[:4] == b"xxxx"
+
+
+def test_prime_os_page_cache_reads_whole_file(tmp_path: Path) -> None:
+    path = tmp_path / "idx.bin"
+    path.write_bytes(b"q" * (1024 * 64))
+    prime_os_page_cache([path])
+    assert path.stat().st_size == 1024 * 64
 
 
 def test_latest_label_names_engine_revision_not_bench_commit() -> None:

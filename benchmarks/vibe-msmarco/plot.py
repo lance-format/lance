@@ -125,7 +125,7 @@ def main() -> None:
         default=(
             "vibe-msmarco-qwen-1024 · 8.84M × 1024-d · IVF 1024 partitions · "
             "k=10 nprobes=20 · select _rowid only · each version builds its own index · "
-            "OS page cache dropped per cell · first query discarded · "
+            "OS cache dropped then this index primed · first query discarded · "
             "warm = prewarm_index"
         ),
     )

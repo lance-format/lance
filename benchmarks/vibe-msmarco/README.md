@@ -9,10 +9,9 @@ The chart covers **IVF_RQ1** and **IVF_RQ5** in two cache states:
 - **cold** — fresh dataset per query; metadata opened untimed; partitions not
   prewarmed
 
-Each (version, index) cell starts with `sync` + OS page-cache drop so a
-previous RQ5 file does not leave another cell half-resident. The first query
-of each mode is discarded (file open / JIT). Timed cold queries are therefore
-lance-cold with **this** index already in the page cache.
+Each (version, index) cell starts with `sync` + OS page-cache drop, then a
+sequential read of **that** index's files so every cell is lance-cold against
+the same OS-warm baseline. The first query of each mode is discarded.
 
 Queries project only `_rowid` so the timed path does not read payload columns.
 
