@@ -1,0 +1,4 @@
+huggingface_hub
+matplotlib
+numpy
+pyarrow
