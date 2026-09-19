@@ -57,6 +57,14 @@ def ensure_local_venv(root: Path) -> Path:
     marker = venv / ".built-from-source"
     if python.exists() and marker.exists():
         return python
+    if python.exists():
+        try:
+            subprocess.check_call([str(python), "-c", "import lance"])
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            marker.write_text("ok\n")
+            return python
     run(["uv", "venv", str(venv)])
     run(
         [
