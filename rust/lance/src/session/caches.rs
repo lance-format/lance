@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
+    format::{DataFile, DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -259,6 +259,9 @@ pub struct RowIdSequenceKey<'a> {
     /// which those bytes memoize on first use — an array-encoded sequence is
     /// 8 bytes per row, too much to rehash on every lookup.
     pub row_id_meta: &'a RowIdMeta,
+    /// The data file the sequence is spilled to, when `row_id_meta` says it
+    /// is one; identifies the contents the way an inline digest does.
+    pub lineage_file: Option<&'a DataFile>,
 }
 
 impl CacheKey for RowIdSequenceKey<'_> {
@@ -287,6 +290,19 @@ impl CacheKey for RowIdSequenceKey<'_> {
                 builder.write_str(&file.path);
                 builder.write_u64(file.offset);
                 builder.write_u64(file.size);
+            }
+            // The sequence lives in one of the fragment's data files, which is
+            // named freshly per rewrite; the file identifies the contents the
+            // way the inline digest does.
+            RowIdMeta::Column => {
+                builder.write_variant(2);
+                match self.lineage_file {
+                    Some(file) => {
+                        builder.write_str(&file.path);
+                        builder.write_u64(file.base_id.map_or(u64::MAX, u64::from));
+                    }
+                    None => builder.write_str(""),
+                }
             }
         }
     }
@@ -353,6 +369,7 @@ mod tests {
         let key = RowIdSequenceKey {
             fragment_id: 0,
             row_id_meta: &first_generation,
+            lineage_file: None,
         };
         cache
             .insert_with_key(&key, Arc::new(RowIdSequence::from(0..100)))
@@ -365,6 +382,7 @@ mod tests {
                 .get_with_key(&RowIdSequenceKey {
                     fragment_id: 0,
                     row_id_meta: &second_generation,
+                    lineage_file: None,
                 })
                 .await
                 .is_none()
@@ -389,6 +407,7 @@ mod tests {
                 &RowIdSequenceKey {
                     fragment_id: 0,
                     row_id_meta: &first_slice,
+                    lineage_file: None,
                 },
                 Arc::new(RowIdSequence::from(0..100)),
             )
@@ -400,6 +419,7 @@ mod tests {
                 .get_with_key(&RowIdSequenceKey {
                     fragment_id: 0,
                     row_id_meta: &second_slice,
+                    lineage_file: None,
                 })
                 .await
                 .is_none()
@@ -411,6 +431,7 @@ mod tests {
                 .get_with_key(&RowIdSequenceKey {
                     fragment_id: 0,
                     row_id_meta: &inline,
+                    lineage_file: None,
                 })
                 .await
                 .is_none()
