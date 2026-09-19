@@ -222,7 +222,7 @@ pub async fn copy_blob_columns(
     let target = Arc::new(target);
     let target_base = target.managed_default_base()?;
     let mut copies = HashMap::new();
-    for (id, uri) in managed_references(&source).await? {
+    for (id, uri) in managed_references(&source, source.scan()).await? {
         let source_base = source.manifest.base_paths.get(&id).ok_or_else(|| {
             Error::invalid_input(format!("Managed clone references unknown base ID {id}"))
         })?;
