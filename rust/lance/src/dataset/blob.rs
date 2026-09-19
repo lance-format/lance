@@ -21,7 +21,6 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
 };
 use bytes::Bytes;
-use dashmap::DashMap;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
@@ -33,11 +32,9 @@ use lance_arrow::{
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use object_store::path::Path;
-use prost::Message;
 use tokio::sync::{Mutex, Notify, OnceCell, oneshot};
 use url::Url;
 
-use super::scanner::Scanner;
 use super::take::{MissingRowPolicy, TakeBuilder};
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
@@ -4689,32 +4686,8 @@ fn visit_managed_row(
     Ok(())
 }
 
-// Manifests are already inspected concurrently; keep per-manifest prefetch bounded.
-const MANAGED_REFERENCE_READAHEAD: usize = 4;
-
-type ManagedReferences = HashSet<(u32, String)>;
-type ManagedReferenceCell = Arc<OnceCell<Arc<ManagedReferences>>>;
-
-/// A fragment's descriptor view, independent of the manifest version and config.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ManagedReferenceScan {
-    store_prefix: String,
-    data_dir: Path,
-    bases: Vec<(u32, String, bool)>,
-    fragment: Vec<u8>,
-    fields: Vec<ArrowField>,
-    field_ids: Vec<i32>,
-}
-
-/// Scoped to one cleanup so concurrent manifests share descriptor I/O without
-/// sharing their retained/expired classification or caching failed reads.
-#[derive(Debug, Default)]
-pub(super) struct ManagedReferenceCache {
-    scans: DashMap<ManagedReferenceScan, ManagedReferenceCell>,
-}
-
 /// Discover referenced objects from stored descriptors without reading payloads.
-async fn managed_references(dataset: &Dataset, mut scan: Scanner) -> Result<ManagedReferences> {
+async fn managed_references(dataset: &Dataset) -> Result<HashSet<(u32, String)>> {
     let fields = dataset
         .schema()
         .fields
@@ -4728,6 +4701,7 @@ async fn managed_references(dataset: &Dataset, mut scan: Scanner) -> Result<Mana
         .iter()
         .map(|field| field.name.as_str())
         .collect::<Vec<_>>();
+    let mut scan = dataset.scan();
     scan.project(&names)?;
     let mut stream = scan.try_into_stream().await?;
     let mut references = HashSet::new();
@@ -4747,88 +4721,31 @@ async fn managed_references(dataset: &Dataset, mut scan: Scanner) -> Result<Mana
     Ok(references)
 }
 
-impl ManagedReferenceCache {
-    /// Resolve cached descriptors in this snapshot's base namespace and limit
-    /// results to the cleanup owner's deletion jurisdiction.
-    pub(super) async fn paths(&self, dataset: &Dataset, owner: &Dataset) -> Result<HashSet<Path>> {
-        let names = dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| field_contains_blob(field))
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            return Ok(HashSet::new());
+/// Resolve only objects within the cleanup owner's deletion jurisdiction.
+pub(super) async fn managed_paths(dataset: &Dataset, owner: &Dataset) -> Result<HashSet<Path>> {
+    let references = managed_references(dataset).await?;
+    let mut paths = HashSet::new();
+    let mut bases = HashMap::new();
+    for (id, uri) in references {
+        if let std::collections::hash_map::Entry::Vacant(entry) = bases.entry(id) {
+            let base = dataset.manifest.base_paths.get(&id).ok_or_else(|| {
+                Error::invalid_input(format!("Managed reference scan found unknown base_id {id}"))
+            })?;
+            let store = dataset.object_store(Some(id)).await?;
+            let root = base.extract_path(dataset.session.store_registry())?;
+            entry.insert((store.store_prefix == owner.object_store.store_prefix, root));
         }
-        let projection = dataset.schema().project(&names)?;
-        let fields = projection
-            .fields
-            .iter()
-            .map(ArrowField::from)
-            .collect::<Vec<_>>();
-        let field_ids = projection.field_ids();
-        let mut bases = dataset
-            .manifest
-            .base_paths
-            .iter()
-            .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
-            .collect::<Vec<_>>();
-        bases.sort_unstable();
-        let mut scans = stream::iter(dataset.get_fragments())
-            .map(|fragment| {
-                // Fragment metadata includes deletion files and overlays: identical
-                // data paths alone do not imply identical visible descriptor rows.
-                let key = ManagedReferenceScan {
-                    store_prefix: dataset.object_store.store_prefix.clone(),
-                    data_dir: dataset.data_dir(),
-                    bases: bases.clone(),
-                    fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
-                        .encode_to_vec(),
-                    fields: fields.clone(),
-                    field_ids: field_ids.clone(),
-                };
-                let cell = self.scans.entry(key).or_default().clone();
-                async move {
-                    cell.get_or_try_init(|| async {
-                        managed_references(dataset, fragment.scan())
-                            .await
-                            .map(Arc::new)
-                    })
-                    .await
-                    .cloned()
-                }
-            })
-            .buffer_unordered(MANAGED_REFERENCE_READAHEAD);
-        let mut references = HashSet::new();
-        while let Some(fragment_references) = scans.try_next().await? {
-            references.extend(fragment_references.iter().cloned());
-        }
-        let mut paths = HashSet::new();
-        let mut bases = HashMap::new();
-        for (id, uri) in references {
-            if let std::collections::hash_map::Entry::Vacant(entry) = bases.entry(id) {
-                let base = dataset.manifest.base_paths.get(&id).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Managed reference scan found unknown base_id {id}"
-                    ))
-                })?;
-                let store = dataset.object_store(Some(id)).await?;
-                let root = base.extract_path(dataset.session.store_registry())?;
-                entry.insert((store.store_prefix == owner.object_store.store_prefix, root));
-            }
-            let (same_store, root) = bases
-                .get(&id)
-                .ok_or_else(|| Error::internal("Missing resolved Managed base"))?;
-            if *same_store {
-                let path = join_base_and_relative_path(root, &uri)?;
-                if path.prefix_match(&owner.base).is_some() {
-                    paths.insert(path);
-                }
+        let (same_store, root) = bases
+            .get(&id)
+            .ok_or_else(|| Error::internal("Missing resolved Managed base"))?;
+        if *same_store {
+            let path = join_base_and_relative_path(root, &uri)?;
+            if path.prefix_match(&owner.base).is_some() {
+                paths.insert(path);
             }
         }
-        Ok(paths)
     }
+    Ok(paths)
 }
 
 /// Rewrite descriptors in the same snapshot base namespace, copying only Inline
@@ -5062,10 +4979,7 @@ mod tests {
         let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
         assert_ne!(dataset.manifest.reader_feature_flags & flag, 0);
         assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
-        for (_, uri) in super::managed_references(&dataset, dataset.scan())
-            .await
-            .unwrap()
-        {
+        for (_, uri) in super::managed_references(&dataset).await.unwrap() {
             assert!(uri.starts_with("_blobs/"), "{uri}");
             assert_eq!(uri.split('/').count(), 2);
             Uuid::parse_str(uri.trim_start_matches("_blobs/").trim_end_matches(".blob")).unwrap();

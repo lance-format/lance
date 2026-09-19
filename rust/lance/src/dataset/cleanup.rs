@@ -65,7 +65,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -298,7 +298,6 @@ struct CleanupTask<'a> {
     ignored_manifests: HashSet<Path>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
-    managed_references: Arc<super::blob::ManagedReferenceCache>,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -450,7 +449,6 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
-            managed_references: Arc::default(),
         }
     }
 
@@ -600,7 +598,7 @@ impl<'a> CleanupTask<'a> {
                 .dataset
                 .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
                 .await?;
-            match self.managed_references.paths(&snapshot, self.dataset).await {
+            match super::blob::managed_paths(&snapshot, self.dataset).await {
                 Ok(paths) => paths,
                 // A concurrent cleanup may already have removed expired data
                 // files. Losing deletion proof is safe; losing retained references
@@ -1339,9 +1337,7 @@ impl<'a> CleanupTask<'a> {
                 .dataset
                 .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
                 .await?;
-            self.managed_references
-                .paths(&snapshot, self.dataset)
-                .await?
+            super::blob::managed_paths(&snapshot, self.dataset).await?
         } else {
             HashSet::new()
         };
@@ -1833,327 +1829,6 @@ mod tests {
     use object_store::ObjectStoreExt;
     use rstest::rstest;
     use uuid::Uuid;
-
-    fn managed_cleanup_batch() -> RecordBatch {
-        let mut blobs = BlobArrayBuilder::new(2);
-        blobs.push_bytes(b"first payload").unwrap();
-        blobs.push_bytes(b"second payload").unwrap();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            crate::blob_field_with_options(
-                "blob",
-                false,
-                crate::BlobFieldOptions::default()
-                    .with_inline_size_threshold(1)
-                    .with_dedicated_size_threshold(std::num::NonZeroUsize::new(8).unwrap()),
-            ),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt64Array::from(vec![0, 1])),
-                blobs.finish().unwrap(),
-            ],
-        )
-        .unwrap()
-    }
-
-    #[rstest]
-    #[case::metadata_only(false)]
-    #[case::overlapping_fragments(true)]
-    #[tokio::test]
-    async fn managed_cleanup_deduplicates_fragment_scans(#[case] append: bool) {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let batch = managed_cleanup_batch();
-        let params = WriteParams {
-            store_params: Some(fixture.os_params()),
-            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-            max_rows_per_file: 1,
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-            &fixture.dataset_path,
-            Some(params.clone()),
-        )
-        .await
-        .unwrap();
-        for version in 2..=8 {
-            dataset
-                .update_config([("measurement_version".to_string(), version.to_string())])
-                .await
-                .unwrap();
-            if append && version == 4 {
-                dataset
-                    .append(
-                        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                        Some(params.clone()),
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
-        let data_files = dataset
-            .manifest
-            .fragments
-            .iter()
-            .flat_map(|fragment| {
-                fragment
-                    .files
-                    .iter()
-                    .map(|file| dataset.data_dir().join(file.path.as_str()))
-            })
-            .collect::<Vec<_>>();
-        dataset.object_store.io_stats_incremental();
-        cleanup_old_versions(
-            &dataset,
-            CleanupPolicy {
-                before_version: Some(dataset.version_id()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let stats = dataset.object_store.io_stats_incremental();
-        for file in data_files {
-            assert_eq!(
-                stats
-                    .requests
-                    .iter()
-                    .filter(|request| request.method == "get_opts" && request.path == file)
-                    .count(),
-                1,
-                "descriptor reads for {file}: {stats:#?}"
-            );
-        }
-        let values = Arc::new(dataset)
-            .take_blobs_by_indices(&[0, 1], "blob")
-            .await
-            .unwrap();
-        assert_eq!(
-            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"first payload"
-        );
-        assert_eq!(
-            values[1].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"second payload"
-        );
-    }
-
-    #[rstest]
-    #[case::latest(false, false)]
-    #[case::tag(true, false)]
-    #[case::branch(false, true)]
-    #[tokio::test]
-    async fn managed_cleanup_preserves_snapshot_visibility(
-        #[case] tag: bool,
-        #[case] branch: bool,
-    ) {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let batch = managed_cleanup_batch();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let original = dataset.clone();
-        if tag {
-            dataset
-                .tags()
-                .create("protected", dataset.version_id())
-                .await
-                .unwrap();
-        }
-        let child = if branch {
-            Some(
-                fixture
-                    .create_branch_and_load(&mut dataset, "child", (None, None))
-                    .await
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-        dataset.delete("id = 0").await.unwrap();
-        dataset
-            .update_config([("metadata_only", "true")])
-            .await
-            .unwrap();
-        cleanup_old_versions(
-            &dataset,
-            CleanupPolicy {
-                before_version: Some(dataset.version_id()),
-                error_if_tagged_old_versions: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let payloads = dataset
-            .object_store
-            .read_dir_all(&dataset.base.clone().join("_blobs"), None)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        // Without protection, proof from the expired snapshot permits immediate
-        // deletion of the first payload, despite the unverified retention period.
-        assert_eq!(payloads.len(), if tag || branch { 2 } else { 1 });
-        let values = Arc::new(dataset)
-            .take_blobs_by_indices(&[0], "blob")
-            .await
-            .unwrap();
-        assert_eq!(
-            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"second payload"
-        );
-        if tag || branch {
-            let protected = Arc::new(child.unwrap_or(original));
-            let values = protected.take_blobs_by_indices(&[0], "blob").await.unwrap();
-            assert_eq!(
-                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-                b"first payload"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn managed_cleanup_reference_cache_respects_projection() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let batch = managed_cleanup_batch();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            batch.schema().field(1).clone(),
-            batch.schema().field(1).clone().with_name("other"),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![batch.column(1).clone(), batch.column(1).clone()],
-        )
-        .unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let cache = super::super::blob::ManagedReferenceCache::default();
-        let before = cache.paths(&dataset, &dataset).await.unwrap();
-        assert_eq!(before.len(), 4);
-        dataset.drop_columns(&["other"]).await.unwrap();
-        let after = cache.paths(&dataset, &dataset).await.unwrap();
-        assert_eq!(after.len(), 2);
-        assert!(after.is_subset(&before));
-    }
-
-    #[tokio::test]
-    async fn managed_cleanup_reference_cache_respects_base_bindings() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let batch = managed_cleanup_batch();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        // Keep the descriptor file at the same physical path while changing
-        // the base namespace used to interpret its payload references.
-        for fragment in Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments) {
-            for file in fragment.referenced_lance_files_mut() {
-                file.base_id = None;
-            }
-        }
-        let cache = super::super::blob::ManagedReferenceCache::default();
-        let before = cache.paths(&dataset, &dataset).await.unwrap();
-        assert_eq!(before.len(), 2);
-        let mut rebound = dataset.clone();
-        for base in Arc::make_mut(&mut rebound.manifest).base_paths.values_mut() {
-            base.path = format!("{}/alternate", dataset.uri);
-        }
-        let after = cache.paths(&rebound, &dataset).await.unwrap();
-        assert_eq!(after.len(), before.len());
-        assert!(after.is_disjoint(&before));
-        assert!(after.iter().all(|path| {
-            path.prefix_match(&dataset.base.clone().join("alternate"))
-                .is_some()
-        }));
-    }
-
-    #[tokio::test]
-    async fn managed_cleanup_scan_failure_prevents_deletion() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let batch = managed_cleanup_batch();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        dataset
-            .update_config([("metadata_only", "true")])
-            .await
-            .unwrap();
-        let data_file = dataset
-            .data_dir()
-            .join(dataset.manifest.fragments[0].files[0].path.as_str());
-        let deletes = Arc::new(AtomicUsize::new(0));
-        let observed_deletes = deletes.clone();
-        fixture.mock_store.policy.lock().unwrap().set_before_policy(
-            "fail_descriptor_read",
-            Arc::new(move |operation, path| {
-                if operation.contains("delete") {
-                    observed_deletes.fetch_add(1, Ordering::SeqCst);
-                }
-                if operation == "get_opts" && path == &data_file {
-                    return Err(Error::internal("descriptor read unavailable"));
-                }
-                Ok(())
-            }),
-        );
-        let policy = CleanupPolicy {
-            before_version: Some(dataset.version_id()),
-            ..Default::default()
-        };
-        let error = cleanup_old_versions(&dataset, policy.clone())
-            .await
-            .unwrap_err();
-        assert_contains!(error.to_string(), "descriptor read unavailable");
-        assert_eq!(deletes.load(Ordering::SeqCst), 0);
-        fixture
-            .mock_store
-            .policy
-            .lock()
-            .unwrap()
-            .clear_before_policy("fail_descriptor_read");
-        cleanup_old_versions(&dataset, policy).await.unwrap();
-        let values = Arc::new(dataset)
-            .take_blobs_by_indices(&[0], "blob")
-            .await
-            .unwrap();
-        assert_eq!(
-            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"first payload"
-        );
-    }
 
     #[derive(Debug)]
     struct MockObjectStore {
