@@ -17,7 +17,10 @@ use lance_table::{
         ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
         RowIdMeta,
     },
-    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    rowids::{
+        FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
+        version::{LoadedRowLineage, SpilledRowLineage},
+    },
 };
 use std::sync::Arc;
 
@@ -137,6 +140,61 @@ pub async fn load_row_version_sequence(
             .load_sequence()
             .map(|sequence| Some(Arc::new(sequence))),
     }
+}
+
+/// Read ahead every lineage sequence of `fragments` that lives outside the
+/// manifest, for a commit that will need to consult them.
+///
+/// Building a manifest is synchronous and cannot read a data file, so the
+/// commit path calls this first, over the whole manifest, and hands the result
+/// over in `ManifestBuildConfig::spilled_row_lineage`. Only spilled sequences
+/// are loaded; when none is, this returns an empty map without IO.
+pub async fn load_spilled_row_lineage<'a>(
+    dataset: &Dataset,
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+) -> Result<Arc<SpilledRowLineage>> {
+    // A `for` loop rather than `map`: a closure returning a future that borrows
+    // its argument trips the higher-ranked lifetime check on the outer future.
+    let mut loads = Vec::new();
+    for fragment in fragments {
+        if fragment.has_spilled_row_lineage() {
+            loads.push(load_fragment_spilled_lineage(dataset, fragment));
+        }
+    }
+    let loaded: SpilledRowLineage = futures::stream::iter(loads)
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    Ok(Arc::new(loaded))
+}
+
+/// The spilled sequences of one fragment, for [`load_spilled_row_lineage`].
+async fn load_fragment_spilled_lineage(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<(u64, LoadedRowLineage)> {
+    let row_ids = match &fragment.row_id_meta {
+        Some(RowIdMeta::Column) => Some(load_row_id_sequence(dataset, fragment).await?),
+        _ => None,
+    };
+    let mut versions = [None, None];
+    for (slot, kind) in versions
+        .iter_mut()
+        .zip([RowVersionKind::CreatedAt, RowVersionKind::LastUpdatedAt])
+    {
+        if let Some(RowDatasetVersionMeta::Column) = kind.meta(fragment) {
+            *slot = load_row_version_sequence(dataset, fragment, kind).await?;
+        }
+    }
+    let [created_at, last_updated_at] = versions;
+    Ok((
+        fragment.id,
+        LoadedRowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        },
+    ))
 }
 
 /// Load row id sequences from the given dataset and fragments.
