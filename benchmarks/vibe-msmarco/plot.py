@@ -23,11 +23,23 @@ def _sort_key(label: str) -> tuple[int, str]:
     return (len(VERSION_ORDER), label)
 
 
+def _result_paths(results_dir: Path) -> list[Path]:
+    manifest = results_dir / "_manifest.json"
+    if manifest.exists():
+        payload = json.loads(manifest.read_text())
+        paths = [Path(item) for item in payload.get("results", [])]
+        if paths:
+            return paths
+    return [
+        path
+        for path in sorted(results_dir.glob("*.json"))
+        if not path.name.startswith("_")
+    ]
+
+
 def load_results(results_dir: Path) -> list[dict]:
     rows = []
-    for path in sorted(results_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
+    for path in _result_paths(results_dir):
         payload = json.loads(path.read_text())
         if "index" in payload and "warm" in payload and "cold" in payload:
             rows.append(payload)
@@ -109,7 +121,8 @@ def main() -> None:
         "--subtitle",
         default=(
             "vibe-msmarco-qwen-1024 · 8.84M × 1024-d · IVF 1024 partitions · "
-            "k=10 nprobes=20 · select _rowid only · warm = prewarm_index"
+            "k=10 nprobes=20 · select _rowid only · each version builds its own index · "
+            "warm = prewarm_index"
         ),
     )
     args = parser.parse_args()

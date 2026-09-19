@@ -136,12 +136,32 @@ def download(data_dir: Path) -> tuple[Path, Path]:
     return corpus, queries
 
 
-def work_corpus_path(data_dir: Path) -> Path:
-    return data_dir / "work" / "base.lance"
+def work_slug(label: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in label)
+    return slug.strip("_") or "shared"
 
 
-def prepare_work_corpus(src: Path, dst: Path) -> Path:
-    """Copy the snapshot corpus once so indexing does not mutate the download."""
+def work_corpus_path(data_dir: Path, label: str) -> Path:
+    return data_dir / f"work-{work_slug(label)}" / "base.lance"
+
+
+def _clone_file(src_file: Path, dst_file: Path, *, hardlink: bool) -> None:
+    if hardlink:
+        try:
+            os.link(src_file, dst_file)
+            return
+        except OSError:
+            pass
+    shutil.copy2(src_file, dst_file)
+
+
+def clone_corpus(src: Path, dst: Path) -> Path:
+    """Clone the snapshot corpus so indexing does not mutate the download.
+
+    Fragment files under ``data/`` are hardlinked when possible. Manifests,
+    versions, and other metadata are copied so a later commit cannot change
+    the Hugging Face snapshot in place.
+    """
     if dst.exists():
         try:
             ds = _import_lance().dataset(str(dst))
@@ -149,10 +169,22 @@ def prepare_work_corpus(src: Path, dst: Path) -> Path:
                 return dst
         except Exception:
             shutil.rmtree(dst, ignore_errors=True)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    print(f"copying corpus {src} -> {dst}", flush=True)
-    shutil.copytree(src, dst)
+    print(f"cloning corpus {src} -> {dst}", flush=True)
+
+    def copy_file(src_file: str, dst_file: str) -> None:
+        rel = Path(src_file).relative_to(src)
+        _clone_file(
+            Path(src_file),
+            Path(dst_file),
+            hardlink=bool(rel.parts) and rel.parts[0] == "data",
+        )
+
+    shutil.copytree(src, dst, copy_function=copy_file)
     return dst
+
+
+def prepare_work_corpus(src: Path, dst: Path) -> Path:
+    return clone_corpus(src, dst)
 
 
 def build_index(corpus_uri: str, num_bits: int, index_name: str) -> dict[str, Any]:
@@ -290,7 +322,7 @@ def run_one(
     queries_uri = str(hf_root / "queries.lance")
     if not src.exists():
         download(data_dir)
-    corpus = prepare_work_corpus(src, work_corpus_path(data_dir))
+    corpus = prepare_work_corpus(src, work_corpus_path(data_dir, label))
     corpus_uri = str(corpus)
     index_name = f"ivf_rq{num_bits}"
 
@@ -316,6 +348,7 @@ def run_one(
     )
     cold = bench_cold(corpus_uri, index_name, queries)
     warm = bench_warm(corpus_uri, index_name, queries)
+    runtime = _pylance_info()
     return {
         "label": label,
         "index": f"IVF_RQ{num_bits}",
@@ -326,10 +359,12 @@ def run_one(
         "metric": METRIC,
         "query_count": len(queries),
         "dataset": HF_DATASET,
+        "corpus_uri": corpus_uri,
+        "index_writer": runtime["pylance_version"],
         "build": build,
         "cold": cold,
         "warm": warm,
-        "runtime": _pylance_info(),
+        "runtime": runtime,
     }
 
 

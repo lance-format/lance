@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from bench import clone_corpus, work_corpus_path
 from plot import load_results, plot_results
+from run_versions import bench_run_cmd, latest_label
 
 
 def _sample_result(label: str, num_bits: int, warm_mean: float, cold_mean: float) -> dict:
@@ -55,7 +57,19 @@ def test_load_and_plot(tmp_path: Path) -> None:
     for row in rows:
         name = f"{row['label'].replace(' ', '_')}-rq{row['num_bits']}.json"
         (tmp_path / name).write_text(json.dumps(row) + "\n")
-    (tmp_path / "_manifest.json").write_text("{}\n")
+    (tmp_path / "_manifest.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    str(tmp_path / f"{row['label'].replace(' ', '_')}-rq{row['num_bits']}.json")
+                    for row in rows
+                ]
+            }
+        )
+        + "\n"
+    )
+    leftover = _sample_result("v11.0.0-shared-index", 1, 99.0, 99.0)
+    (tmp_path / "leftover-shared-index.json").write_text(json.dumps(leftover) + "\n")
 
     loaded = load_results(tmp_path)
     assert [row["label"] for row in loaded if row["num_bits"] == 1] == [
@@ -63,8 +77,54 @@ def test_load_and_plot(tmp_path: Path) -> None:
         "v12.0.0",
         "c8f182179 (main)",
     ]
+    assert all(row["label"] != "v11.0.0-shared-index" for row in loaded)
 
     out = tmp_path / "chart.png"
     plot_results(loaded, out, "unit test")
     assert out.is_file()
     assert out.stat().st_size > 1000
+
+
+def test_each_version_gets_its_own_work_corpus(tmp_path: Path) -> None:
+    v11 = work_corpus_path(tmp_path, "v11.0.0")
+    v12 = work_corpus_path(tmp_path, "v12.0.0")
+    main = work_corpus_path(tmp_path, "c8f182179 (main)")
+    assert v11 != v12 != main
+    assert v11.parent.name == "work-v11.0.0"
+    assert v12.parent.name == "work-v12.0.0"
+    assert "c8f182179" in main.parent.name
+
+
+def test_clone_hardlinks_data_and_copies_metadata(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    (src / "data").mkdir(parents=True)
+    (src / "data" / "frag.lance").write_bytes(b"vector-bytes")
+    (src / "_latest").write_text("v1\n")
+    dst = tmp_path / "dst"
+    clone_corpus(src, dst)
+
+    src_data = src / "data" / "frag.lance"
+    dst_data = dst / "data" / "frag.lance"
+    assert dst_data.read_bytes() == b"vector-bytes"
+    assert src_data.stat().st_ino == dst_data.stat().st_ino
+    assert (src / "_latest").stat().st_ino != (dst / "_latest").stat().st_ino
+    (dst / "_latest").write_text("v2\n")
+    assert (src / "_latest").read_text() == "v1\n"
+
+
+def test_version_matrix_always_builds_index(tmp_path: Path) -> None:
+    cmd = bench_run_cmd(
+        python=tmp_path / "python",
+        data_dir=tmp_path / "data",
+        label="v12.0.0",
+        bits=5,
+        query_count=100,
+        out=tmp_path / "out.json",
+    )
+    assert "--skip-index" not in cmd
+    assert cmd[cmd.index("--label") + 1] == "v12.0.0"
+    assert cmd[cmd.index("--bits") + 1] == "5"
+
+
+def test_latest_label_names_engine_revision_not_bench_commit() -> None:
+    assert latest_label() == "c8f182179 (main)"

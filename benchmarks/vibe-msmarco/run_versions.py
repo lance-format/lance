@@ -98,9 +98,38 @@ def ensure_local_venv(root: Path) -> Path:
     return python
 
 
+def bench_run_cmd(
+    *,
+    python: Path,
+    data_dir: Path,
+    label: str,
+    bits: int,
+    query_count: int,
+    out: Path,
+) -> list[str]:
+    return [
+        str(python),
+        str(HERE / "bench.py"),
+        "run",
+        "--data-dir",
+        str(data_dir),
+        "--label",
+        label,
+        "--bits",
+        str(bits),
+        "--query-count",
+        str(query_count),
+        "--out",
+        str(out),
+    ]
+
+
 def latest_label() -> str:
+    # Ignore bench-only commits so the chart names the engine revision.
     sha = subprocess.check_output(
-        ["git", "rev-parse", "--short=9", "HEAD"], cwd=REPO, text=True
+        ["git", "log", "-1", "--format=%h", "--", ":!benchmarks"],
+        cwd=REPO,
+        text=True,
     ).strip()
     return f"{sha} (main)"
 
@@ -136,32 +165,24 @@ def main() -> None:
     if not args.skip_main_build:
         jobs.append((latest_label(), ensure_local_venv(args.work_dir)))
 
-    # Build each bit-width once with the oldest runtime so every version
-    # queries the same on-disk index. Current can read released IVF_RQ files;
-    # the reverse is not true for the latest writer.
+    # Each version writes its own IVF_RQ files. Sharing a writer across
+    # readers mixes one version's index layout with another version's search
+    # path, which is not that version's performance.
     results = []
-    for bits in (1, 5):
-        for i, (label, python) in enumerate(jobs):
+    for label, python in jobs:
+        for bits in (1, 5):
             slug = label.replace(" ", "_").replace("(", "").replace(")", "")
             out = args.results_dir / f"{slug}-rq{bits}.json"
-            cmd = [
-                str(python),
-                str(HERE / "bench.py"),
-                "run",
-                "--data-dir",
-                str(args.data_dir),
-                "--label",
-                label,
-                "--bits",
-                str(bits),
-                "--query-count",
-                str(args.query_count),
-                "--out",
-                str(out),
-            ]
-            if i > 0:
-                cmd.append("--skip-index")
-            run(cmd)
+            run(
+                bench_run_cmd(
+                    python=python,
+                    data_dir=args.data_dir,
+                    label=label,
+                    bits=bits,
+                    query_count=args.query_count,
+                    out=out,
+                )
+            )
             results.append(str(out))
 
     manifest = args.results_dir / "_manifest.json"
