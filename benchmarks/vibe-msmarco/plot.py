@@ -27,7 +27,10 @@ def _result_paths(results_dir: Path) -> list[Path]:
     manifest = results_dir / "_manifest.json"
     if manifest.exists():
         payload = json.loads(manifest.read_text())
-        paths = [Path(item) for item in payload.get("results", [])]
+        paths = [
+            path if path.is_absolute() else results_dir / path
+            for path in (Path(item) for item in payload.get("results", []))
+        ]
         if paths:
             return paths
     return [

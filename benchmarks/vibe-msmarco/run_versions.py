@@ -191,7 +191,7 @@ def main() -> None:
                     out=out,
                 )
             )
-            results.append(str(out))
+            results.append(out.name)
 
     manifest = args.results_dir / "_manifest.json"
     manifest.write_text(json.dumps({"results": results}, indent=2) + "\n")

@@ -9,7 +9,7 @@
   "metric": "cosine",
   "projection": "_rowid only",
   "index_writer": "each version builds its own IVF_RQ indexes",
-  "versions": ["v11.0.0", "v12.0.0", "latest commit"],
+  "versions": ["v11.0.0", "v12.0.0", "c8f182179 (main)"],
   "machine": {
     "vcpu": 4,
     "memory_gib": 15,
