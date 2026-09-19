@@ -2099,13 +2099,14 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
-        let removed_indices = existing_named_indices
-            .into_iter()
-            .map(|idx| -> Result<Option<IndexMetadata>> {
+        let mut removed_indices = Vec::new();
+        let mut retained_indices = Vec::new();
+        for idx in existing_named_indices {
+            let removed = (|| -> Result<bool> {
                 // A logical index cannot combine segment types. Full current-fragment
                 // coverage was verified above, so a type change replaces every segment.
                 if is_index_type_change {
-                    return Ok(Some(idx));
+                    return Ok(true);
                 }
 
                 let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
@@ -2116,18 +2117,18 @@ impl DatasetIndexExt for Dataset {
                             idx.uuid, index_name
                         )));
                     }
-                    return Ok(Some(idx));
+                    return Ok(true);
                 };
 
                 // A zero-fragment segment can be used to create an index while
                 // deferring the actual build. Such a segment is disjoint from every
                 // other segment but should still be removed.
                 if existing_fragments.is_empty() {
-                    return Ok(Some(idx));
+                    return Ok(true);
                 }
 
                 if existing_fragments.is_disjoint(&incoming_fragments) {
-                    return Ok(None);
+                    return Ok(false);
                 }
 
                 let uncovered = existing_fragments - &incoming_fragments;
@@ -2140,12 +2141,53 @@ impl DatasetIndexExt for Dataset {
                     )));
                 }
 
-                Ok(Some(idx))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+                Ok(true)
+            })()?;
+            if removed {
+                removed_indices.push(idx);
+            } else {
+                retained_indices.push(idx);
+            }
+        }
+
+        // Segments of a logical vector index are planned and ranked together,
+        // so coexisting segments — the incoming set plus every retained
+        // existing segment — must share one query contract (metric, dimension,
+        // sub-index type, quantizer kind). Reject incompatible combinations
+        // here; otherwise scan planning would derive the metric from the
+        // first segment and silently rank the rest under the wrong metric.
+        // Replacement is already selected, so a complete replacement may
+        // change these settings without conflicting with removed segments.
+        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+        let vector_segment_count = coexisting_indices
+            .clone()
+            .filter(|segment| segment_has_vector_details(segment))
+            .count();
+        if vector_segment_count > 1 {
+            if vector_segment_count != new_indices.len() + retained_indices.len() {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment set for index '{index_name}' mixes vector and non-vector segments"
+                )));
+            }
+            let mut vector_indices = Vec::with_capacity(vector_segment_count);
+            for segment in new_indices.iter().chain(retained_indices.iter()) {
+                let index = self
+                    .open_vector_index_from_metadata(column, segment, &NoOpMetricsCollector)
+                    .await
+                    .map_err(|error| {
+                        Error::invalid_input(format!(
+                            "CreateIndex: cannot open vector segment {} of index '{index_name}' for compatibility validation: {error}",
+                            segment.uuid
+                        ))
+                    })?;
+                vector_indices.push(index);
+            }
+            vector::ivf::validate_vector_query_compatibility(
+                &vector_indices,
+                &format!("CreateIndex: index '{index_name}'"),
+            )
+            .map_err(|error| Error::invalid_input(error.to_string()))?;
+        }
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -2711,102 +2753,21 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-#[async_trait]
-impl DatasetIndexInternalExt for Dataset {
-    async fn open_generic_index(
+impl Dataset {
+    /// Opens a vector index from its manifest metadata.
+    ///
+    /// Unlike [`DatasetIndexInternalExt::open_vector_index`], this does not
+    /// look the segment up in the manifest, so it can also open segments that
+    /// have been built but not committed yet.
+    pub(crate) async fn open_vector_index_from_metadata(
         &self,
         column: &str,
-        uuid: &Uuid,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn Index>> {
-        // Checking for cache existence is cheap so we just check the vector caches.
-        // Scalar indices cache themselves inside `open_scalar_index` (the cache
-        // key is a plugin detail), so there is no cheap scalar check here.
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-
-        // Check sized cache for IvfIndexState (v2+ indices).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if self.index_cache.get_with_key(&state_key).await.is_some() {
-            // Reconstruct via open_vector_index which will hit the same sized key.
-            let index = self.open_vector_index(column, uuid, metrics).await?;
-            return Ok(index.as_index());
-        }
-
-        // Fallback: in-memory cache for legacy indices.
-        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
-            return Ok(cached.0.clone().as_index());
-        }
-
-        let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
-            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
-        }
-
-        // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
-        // For example, we might want to get statistics for an index, regardless of type.
-        //
-        // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
-        // file list (available since file sizes tracking was added). If the file list is not
-        // available (older indices), we fall back to checking file existence via HEAD request.
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-
-        // Check if this is a vector index by looking at the files list
-        let is_vector_index = if let Some(files) = &index_meta.files {
-            // If we have file metadata, check if INDEX_FILE_NAME is in the list
-            files.iter().any(|f| f.path == INDEX_FILE_NAME)
-        } else {
-            // Fall back to file existence check for older indices without file metadata
-            let index_dir = self.indice_files_dir(&index_meta)?;
-            let index_file = index_dir
-                .clone()
-                .join(uuid.to_string())
-                .join(INDEX_FILE_NAME);
-            let object_store = self.object_store_for_index(&index_meta).await?;
-            object_store.exists(&index_file).await?
-        };
-
-        if is_vector_index {
-            let index = self.open_vector_index(column, uuid, metrics).await?;
-            Ok(index.as_index())
-        } else {
-            let index = self.open_scalar_index(column, uuid, metrics).await?;
-            Ok(index.as_index())
-        }
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn open_scalar_index(
-        &self,
-        column: &str,
-        uuid: &Uuid,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        // Caching (including the choice of in-memory vs. serializable state) is
-        // a plugin implementation detail handled inside `scalar::open_scalar_index`.
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-
-        scalar::open_scalar_index(self, column, &index_meta, metrics).await
-    }
-
-    async fn open_vector_index(
-        &self,
-        column: &str,
-        uuid: &Uuid,
+        index_meta: &IndexMetadata,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
+        let uuid = &index_meta.uuid;
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let object_store = self.object_store_for_index(&index_meta).await?;
+        let object_store = self.object_store_for_index(index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -2832,7 +2793,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_dir = self.indice_files_dir(index_meta)?;
         let index_file = index_dir
             .clone()
             .join(uuid.to_string())
@@ -2936,7 +2897,7 @@ impl DatasetIndexInternalExt for Dataset {
                     serde_json::from_str(index_metadata)?;
 
                 // Resolve the column name and field
-                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
+                let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
@@ -3108,7 +3069,105 @@ impl DatasetIndexInternalExt for Dataset {
         }
         Ok(index)
     }
+}
 
+#[async_trait]
+impl DatasetIndexInternalExt for Dataset {
+    async fn open_generic_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>> {
+        // Checking for cache existence is cheap so we just check the vector caches.
+        // Scalar indices cache themselves inside `open_scalar_index` (the cache
+        // key is a plugin detail), so there is no cheap scalar check here.
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+
+        // Check sized cache for IvfIndexState (v2+ indices).
+        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if self.index_cache.get_with_key(&state_key).await.is_some() {
+            // Reconstruct via open_vector_index which will hit the same sized key.
+            let index = self.open_vector_index(column, uuid, metrics).await?;
+            return Ok(index.as_index());
+        }
+
+        // Fallback: in-memory cache for legacy indices.
+        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
+            return Ok(cached.0.clone().as_index());
+        }
+
+        let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
+            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
+        }
+
+        // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
+        // For example, we might want to get statistics for an index, regardless of type.
+        //
+        // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
+        // file list (available since file sizes tracking was added). If the file list is not
+        // available (older indices), we fall back to checking file existence via HEAD request.
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+
+        // Check if this is a vector index by looking at the files list
+        let is_vector_index = if let Some(files) = &index_meta.files {
+            // If we have file metadata, check if INDEX_FILE_NAME is in the list
+            files.iter().any(|f| f.path == INDEX_FILE_NAME)
+        } else {
+            // Fall back to file existence check for older indices without file metadata
+            let index_dir = self.indice_files_dir(&index_meta)?;
+            let index_file = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_FILE_NAME);
+            let object_store = self.object_store_for_index(&index_meta).await?;
+            object_store.exists(&index_file).await?
+        };
+
+        if is_vector_index {
+            let index = self.open_vector_index(column, uuid, metrics).await?;
+            Ok(index.as_index())
+        } else {
+            let index = self.open_scalar_index(column, uuid, metrics).await?;
+            Ok(index.as_index())
+        }
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn open_scalar_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        // Caching (including the choice of in-memory vs. serializable state) is
+        // a plugin implementation detail handled inside `scalar::open_scalar_index`.
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+
+        scalar::open_scalar_index(self, column, &index_meta, metrics).await
+    }
+
+    async fn open_vector_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        self.open_vector_index_from_metadata(column, &index_meta, metrics)
+            .await
+    }
     async fn open_logical_vector_index(
         &self,
         column: &str,
@@ -8369,32 +8428,32 @@ mod tests {
         .await
         .unwrap();
 
-        let field_id = dataset.schema().field("vector").unwrap().id;
-        let seg0 = write_vector_segment_metadata(
-            &dataset,
-            "vector_idx",
-            field_id,
-            Uuid::new_v4(),
-            [0_u32],
-            b"seg0",
-        )
-        .await;
-        let seg1 = write_vector_segment_metadata(
-            &dataset,
-            "vector_idx",
-            field_id,
-            Uuid::new_v4(),
-            [1_u32],
-            b"seg1",
-        )
-        .await;
+        // Compatibility validation opens the coexisting segments, so this
+        // test builds real IVF segments instead of metadata-only fakes.
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            2,
+            lance_linalg::distance::DistanceType::L2,
+        );
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments().into_iter().take(2) {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name("worker_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let seg_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(segments.len(), 2);
 
         dataset
-            .commit_existing_index_segments(
-                "vector_idx",
-                "vector",
-                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
-            )
+            .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
             .unwrap();
 
@@ -8403,7 +8462,7 @@ mod tests {
         let committed_uuids = committed.iter().map(|idx| idx.uuid).collect::<HashSet<_>>();
         assert_eq!(
             committed_uuids,
-            HashSet::from([seg0.uuid, seg1.uuid]),
+            seg_uuids.into_iter().collect::<HashSet<_>>(),
             "all committed segment uuids should be preserved"
         );
         assert_eq!(
