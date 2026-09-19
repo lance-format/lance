@@ -221,7 +221,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::future::{BoxFuture, MaybeDone, maybe_done};
+use futures::future::{BoxFuture, MaybeDone, maybe_done, try_join_all};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
@@ -1954,9 +1954,16 @@ impl StructuralBatchDecodeStream {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
-                    for message in scan_line.decoders {
-                        let unloaded_page = message.into_structural();
-                        let loaded_page = unloaded_page.0.await?;
+                    // A later page can hold the I/O budget needed by an earlier page.
+                    // Poll them together, retaining their order for the field decoders.
+                    let pages = try_join_all(
+                        scan_line
+                            .decoders
+                            .into_iter()
+                            .map(|message| message.into_structural().0),
+                    )
+                    .await?;
+                    for loaded_page in pages {
                         self.root_decoder.accept_page(loaded_page)?;
                     }
                 }
@@ -3100,6 +3107,14 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use arrow_array::Int32Array;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use crate::data::FixedWidthDataBlock;
+    use crate::repdef::{DefinitionInterpretation, RepDefUnraveler};
 
     #[test]
     fn requested_row_indices_convert_to_checked_ranges() {
@@ -3377,6 +3392,88 @@ mod tests {
             batches.next().await.is_none(),
             "stream should stop after the page-load error"
         );
+    }
+
+    #[derive(Debug)]
+    struct SingleValuePage(i32);
+
+    impl StructuralPageDecoder for SingleValuePage {
+        fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            assert_eq!(num_rows, 1);
+            Ok(Box::new(Self(self.0)))
+        }
+
+        fn num_rows(&self) -> u64 {
+            1
+        }
+    }
+
+    impl DecodePageTask for SingleValuePage {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            Ok(DecodedPage {
+                data: DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: self.0.to_le_bytes().to_vec().into(),
+                    bits_per_value: 32,
+                    num_values: 1,
+                    block_info: Default::default(),
+                }),
+                repdef: RepDefUnraveler::new(
+                    None,
+                    None,
+                    Arc::new([DefinitionInterpretation::AllValidItem]),
+                    1,
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_structural_stream_loads_scan_line_concurrently_in_order() {
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Int32, false)]);
+        let root_decoder = StructuralStructDecoder::new(fields, false, true, false).unwrap();
+        let (released, waiting) = oneshot::channel();
+        let first = async move {
+            waiting.await.unwrap();
+            Ok(LoadedPageShard {
+                decoder: Box::new(SingleValuePage(11)),
+                path: VecDeque::from([0]),
+            })
+        }
+        .boxed();
+        let second = async move {
+            released.send(()).unwrap();
+            Ok(LoadedPageShard {
+                decoder: Box::new(SingleValuePage(22)),
+                path: VecDeque::from([0]),
+            })
+        }
+        .boxed();
+        let (tx, rx) = unbounded_channel();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 2,
+            decoders: vec![
+                MessageType::UnloadedPage(UnloadedPageShard(first)),
+                MessageType::UnloadedPage(UnloadedPageShard(second)),
+            ],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream =
+            StructuralBatchDecodeStream::new(rx, 2, 2, root_decoder, false, None).into_stream();
+        let batch = timeout(Duration::from_millis(500), async {
+            stream.next().await.unwrap().task.await.unwrap()
+        })
+        .await
+        .expect("loading the first page must also poll the page that releases its I/O budget");
+        assert_eq!(
+            batch["value"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![11, 22])
+        );
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

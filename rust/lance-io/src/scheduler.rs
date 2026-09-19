@@ -6,7 +6,7 @@ use futures::channel::oneshot;
 use futures::future::Either;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap, btree_map::Entry};
 use std::fmt::Debug;
 use std::future::Future;
 use std::num::NonZero;
@@ -45,53 +45,52 @@ pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
 }
 
-// We want to allow requests that have a lower priority than any
-// currently in-flight request.  This helps avoid potential deadlocks
-// related to backpressure.  Unfortunately, it is quite expensive to
-// keep track of which priorities are in-flight.
-//
-// TODO: At some point it would be nice if we can optimize this away but
-// in_flight should remain relatively small (generally less than 256 items)
-// and has not shown itself to be a bottleneck yet.
+#[derive(Default)]
 struct PrioritiesInFlight {
-    in_flight: Vec<u128>,
+    counts: BTreeMap<u128, usize>,
+    len: usize,
 }
 
 impl PrioritiesInFlight {
-    fn new(capacity: u32) -> Self {
-        Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
-        }
-    }
-
     fn min_in_flight(&self) -> u128 {
-        self.in_flight.first().copied().unwrap_or(u128::MAX)
+        self.counts
+            .first_key_value()
+            .map(|(&priority, _)| priority)
+            .unwrap_or(u128::MAX)
     }
 
-    fn contains(&self, prio: u128) -> bool {
-        self.in_flight.binary_search(&prio).is_ok()
+    fn contains(&self, priority: u128) -> bool {
+        self.counts.contains_key(&priority)
     }
 
-    fn push(&mut self, prio: u128) {
-        let pos = match self.in_flight.binary_search(&prio) {
-            Ok(pos) => pos,
-            Err(pos) => pos,
-        };
-        self.in_flight.insert(pos, prio);
+    fn push(&mut self, priority: u128) {
+        let count = self.counts.entry(priority).or_default();
+        *count = count
+            .checked_add(1)
+            .expect("priority count cannot exceed the number of live I/O requests");
+        self.len = self
+            .len
+            .checked_add(1)
+            .expect("priority count cannot exceed the number of live I/O requests");
     }
 
-    fn remove(&mut self, prio: u128) {
-        if let Ok(pos) = self.in_flight.binary_search(&prio) {
-            self.in_flight.remove(pos);
+    fn remove(&mut self, priority: u128) {
+        if let Entry::Occupied(mut entry) = self.counts.entry(priority) {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+            self.len -= 1;
         }
     }
 
     fn len(&self) -> usize {
-        self.in_flight.len()
+        self.len
     }
 
     fn is_empty(&self) -> bool {
-        self.in_flight.is_empty()
+        self.counts.is_empty()
     }
 }
 
@@ -129,7 +128,7 @@ impl IoQueueState {
             io_buffer_size,
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
-            priorities_in_flight: PrioritiesInFlight::new(io_capacity),
+            priorities_in_flight: PrioritiesInFlight::default(),
             done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
@@ -894,7 +893,6 @@ impl ScanScheduler {
             .unwrap_or_else(|| object_store.prefers_lite_scheduler());
         let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
-                io_capacity as u64,
                 config.io_buffer_size_bytes,
                 stats.clone(),
             ));
@@ -1395,6 +1393,60 @@ mod tests {
     };
 
     use super::*;
+
+    #[rstest]
+    #[case::ascending([0, 7, 1 << 64, u128::MAX])]
+    #[case::descending([u128::MAX, 1 << 64, 7, 0])]
+    #[case::mixed([7, u128::MAX, 0, 1 << 64])]
+    fn test_priorities_in_flight_counts_duplicates(#[case] priorities: [u128; 4]) {
+        let mut in_flight = PrioritiesInFlight::default();
+        assert!(in_flight.is_empty());
+        assert_eq!(in_flight.min_in_flight(), u128::MAX);
+        for priority in priorities {
+            in_flight.push(priority);
+            in_flight.push(priority);
+        }
+        assert_eq!(in_flight.len(), 8);
+        assert_eq!(in_flight.min_in_flight(), 0);
+        in_flight.remove(42);
+        assert_eq!(in_flight.len(), 8);
+        for priority in [0, 7, 1 << 64, u128::MAX] {
+            assert_eq!(in_flight.min_in_flight(), priority);
+            let len = in_flight.len();
+            in_flight.remove(priority);
+            assert!(in_flight.contains(priority));
+            assert_eq!(in_flight.min_in_flight(), priority);
+            assert_eq!(in_flight.len(), len - 1);
+            in_flight.remove(priority);
+            assert!(!in_flight.contains(priority));
+            assert_eq!(in_flight.len(), len - 2);
+        }
+        assert!(in_flight.is_empty());
+        assert_eq!(in_flight.min_in_flight(), u128::MAX);
+        in_flight.remove(u128::MAX);
+        assert_eq!(in_flight.len(), 0);
+    }
+
+    #[test]
+    fn test_priorities_in_flight_large_backlog() {
+        let mut in_flight = PrioritiesInFlight::default();
+        for priority in (0..4096).rev() {
+            in_flight.push(priority);
+            in_flight.push(priority);
+        }
+        for priority in 0..4096 {
+            in_flight.remove(priority);
+            assert!(in_flight.contains(priority));
+            assert_eq!(in_flight.min_in_flight(), 0);
+        }
+        assert_eq!(in_flight.len(), 4096);
+        for priority in (0..4096).rev() {
+            in_flight.remove(priority);
+            assert!(!in_flight.contains(priority));
+            assert_eq!(in_flight.len(), priority as usize);
+        }
+        assert!(in_flight.is_empty());
+    }
 
     fn make_task(priority: u128, bypass_backpressure: bool) -> IoTask {
         IoTask {
@@ -2199,8 +2251,13 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_same_priority_chunks_continue_after_higher_priority_request() {
+    async fn test_same_priority_chunks_continue_after_higher_priority_request(
+        #[case] use_lite_scheduler: bool,
+    ) {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(InMemory::new()),
             Url::parse("mem://").unwrap(),
@@ -2216,7 +2273,7 @@ mod tests {
             obj_store,
             SchedulerConfig {
                 io_buffer_size_bytes: 10,
-                use_lite_scheduler: Some(false),
+                use_lite_scheduler: Some(use_lite_scheduler),
             },
         );
         let semaphore = Arc::new(tokio::sync::Semaphore::new(0));

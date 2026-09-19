@@ -34,8 +34,8 @@ use bytes::Bytes;
 use lance_core::{Error, Result};
 
 use super::{
-    BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN, IoStats, SCHEDULER_STATE_EVENT_TARGET,
-    SchedulerStateEvent, emit_scheduler_state_event,
+    BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN, IoStats, PrioritiesInFlight,
+    SCHEDULER_STATE_EVENT_TARGET, SchedulerStateEvent, emit_scheduler_state_event,
 };
 
 type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
@@ -252,52 +252,6 @@ trait BackpressureThrottle: Send {
     fn state(&self) -> BackpressureState;
 }
 
-// We want to allow requests that have a lower priority than any
-// currently in-flight request.  This helps avoid potential deadlocks
-// related to backpressure.  Unfortunately, it is quite expensive to
-// keep track of which priorities are in-flight.
-//
-// TODO: At some point it would be nice if we can optimize this away but
-// in_flight should remain relatively small (generally less than 256 items)
-// and has not shown itself to be a bottleneck yet.
-struct PrioritiesInFlight {
-    in_flight: Vec<u128>,
-}
-
-impl PrioritiesInFlight {
-    fn new(capacity: u64) -> Self {
-        Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
-        }
-    }
-
-    fn min_in_flight(&self) -> u128 {
-        self.in_flight.first().copied().unwrap_or(u128::MAX)
-    }
-
-    fn contains(&self, prio: u128) -> bool {
-        self.in_flight.binary_search(&prio).is_ok()
-    }
-
-    fn push(&mut self, prio: u128) {
-        let pos = match self.in_flight.binary_search(&prio) {
-            Ok(pos) => pos,
-            Err(pos) => pos,
-        };
-        self.in_flight.insert(pos, prio);
-    }
-
-    fn remove(&mut self, prio: u128) {
-        if let Ok(pos) = self.in_flight.binary_search(&prio) {
-            self.in_flight.remove(pos);
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.in_flight.len()
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct BackpressureState {
     max_bytes: u64,
@@ -317,7 +271,7 @@ struct SimpleBackpressureThrottle {
 }
 
 impl SimpleBackpressureThrottle {
-    fn new(max_bytes: u64, max_concurrency: u64) -> Self {
+    fn new(max_bytes: u64) -> Self {
         if max_bytes > i64::MAX as u64 {
             // This is unlikely to ever be an issue
             panic!("Max bytes must be less than {}", i64::MAX);
@@ -327,7 +281,7 @@ impl SimpleBackpressureThrottle {
             start: Instant::now(),
             last_warn: AtomicU64::new(0),
             bytes_available: max_bytes as i64,
-            priorities_in_flight: PrioritiesInFlight::new(max_concurrency),
+            priorities_in_flight: PrioritiesInFlight::default(),
             no_backpressure: max_bytes == 0,
         }
     }
@@ -437,12 +391,9 @@ struct IoQueueState {
 }
 
 impl IoQueueState {
-    fn new(max_concurrency: u64, max_bytes: u64) -> Self {
+    fn new(max_bytes: u64) -> Self {
         Self {
-            backpressure_throttle: Box::new(SimpleBackpressureThrottle::new(
-                max_bytes,
-                max_concurrency,
-            )),
+            backpressure_throttle: Box::new(SimpleBackpressureThrottle::new(max_bytes)),
             pending_tasks: BinaryHeap::new(),
             tasks: HashMap::new(),
             next_task_id: 0,
@@ -531,9 +482,9 @@ pub(super) struct IoQueue {
 }
 
 impl IoQueue {
-    pub fn new(max_concurrency: u64, max_bytes: u64, stats: IoStats) -> Self {
+    pub fn new(max_bytes: u64, stats: IoStats) -> Self {
         Self {
-            state: Arc::new(Mutex::new(IoQueueState::new(max_concurrency, max_bytes))),
+            state: Arc::new(Mutex::new(IoQueueState::new(max_bytes))),
             stats,
         }
     }
@@ -724,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn test_priority_ordering() {
         // Backpressure budget of 10 bytes: only one 10-byte task runs at a time.
-        let queue = Arc::new(IoQueue::new(128, 10, IoStats::default()));
+        let queue = Arc::new(IoQueue::new(10, IoStats::default()));
 
         // Records the priority of each task when its run_fn is invoked (i.e. when
         // the task transitions to Running).
@@ -832,7 +783,7 @@ mod tests {
     async fn test_zero_buffer_bypasses_backpressure() {
         // Budget = 0 sets no_backpressure = true, so all tasks start immediately
         // regardless of how many bytes are "outstanding".
-        let queue = Arc::new(IoQueue::new(128, 0, IoStats::default()));
+        let queue = Arc::new(IoQueue::new(0, IoStats::default()));
         let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
 
         let make_run_fn =
@@ -874,7 +825,7 @@ mod tests {
     async fn test_bypass_flag_proceeds_past_exhausted_budget() {
         // Budget of 10 bytes. A blocker task fills it. A task with bypass=true starts
         // immediately despite the exhausted budget; a normal task stays queued.
-        let queue = Arc::new(IoQueue::new(128, 10, IoStats::default()));
+        let queue = Arc::new(IoQueue::new(10, IoStats::default()));
         let start_order: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
 
         let make_run_fn =
@@ -937,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_same_priority_reservation_continues_after_higher_priority() {
-        let mut throttle = SimpleBackpressureThrottle::new(10, 128);
+        let mut throttle = SimpleBackpressureThrottle::new(10);
 
         let low_priority_first = throttle.try_acquire(6, 10).unwrap();
         let high_priority = throttle.try_acquire(4, 0).unwrap();
@@ -949,7 +900,13 @@ mod tests {
         );
 
         throttle.release(low_priority_first);
+        assert_eq!(throttle.state().priorities_in_flight, 2);
+        let low_priority_last = throttle.try_acquire(2, 10).unwrap();
         throttle.release(high_priority);
         throttle.release(low_priority_next.unwrap());
+        assert_eq!(throttle.state().priorities_in_flight, 1);
+        throttle.release(low_priority_last);
+        assert_eq!(throttle.state().priorities_in_flight, 0);
+        assert_eq!(throttle.state().bytes_available, 10);
     }
 }
