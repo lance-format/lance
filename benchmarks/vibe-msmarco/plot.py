@@ -140,11 +140,13 @@ def series_ms(row: dict, mode: str, key: str) -> float:
     raise KeyError(f"{mode} summary is missing {key}")
 
 
+# Keep every label on the same side of its marker as the series it names.
+# Warm-mean used to sit below the line and land on the median.
 ANNOTATE_OFFSET = {
-    ("cold", "mean_ms"): (0, 7),
-    ("warm", "mean_ms"): (0, -13),
-    ("cold", "p99_ms"): (-8, 11),
-    ("warm", "p99_ms"): (8, 11),
+    ("cold", "mean_ms"): (0, 8),
+    ("warm", "mean_ms"): (0, 8),
+    ("cold", "p99_ms"): (-11, 12),
+    ("warm", "p99_ms"): (11, 12),
 }
 
 
@@ -161,7 +163,7 @@ def _style_axis(ax, labels: list[str], title: str) -> None:
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
     ymin, ymax = ax.get_ylim()
     span = ymax - ymin
-    ax.set_ylim(ymin - span * 0.10, ymax + span * 0.14)
+    ax.set_ylim(ymin - span * 0.06, ymax + span * 0.18)
 
 
 def _plot_series(ax, rows: list[dict]) -> None:

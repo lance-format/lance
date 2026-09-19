@@ -225,6 +225,8 @@ def test_recorded_results_include_matching_p99() -> None:
         for mode in ("cold", "warm"):
             samples = sorted(row[mode]["latencies_ms"])
             assert row[mode]["summary"]["p99_ms"] == nearest_rank(samples, 0.99)
+            for key in ("mean_ms", "median_ms", "p99_ms"):
+                assert series_ms(row, mode, key) == row[mode]["summary"][key]
 
 
 def test_merge_manifest_keeps_existing_cells(tmp_path: Path) -> None:
