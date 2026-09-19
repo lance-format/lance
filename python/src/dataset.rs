@@ -875,6 +875,7 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         transaction_files_removed: stats.transaction_files_removed,
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
+        failed_deletes: stats.failed_deletes,
     }
 }
 
