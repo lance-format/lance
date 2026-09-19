@@ -23,6 +23,13 @@ def _sort_key(label: str) -> tuple[int, str]:
     return (len(VERSION_ORDER), label)
 
 
+def axis_label(label: str) -> str:
+    """Keep the last tick readable; a SHA plus '(main)' wraps off the axis."""
+    if label.endswith(" (main)") or " (main)" in label:
+        return "main"
+    return label
+
+
 def _result_paths(results_dir: Path) -> list[Path]:
     manifest = results_dir / "_manifest.json"
     if manifest.exists():
@@ -55,7 +62,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(1, len(indexes), figsize=(12.5, 5.2), sharey=True)
+    fig, axes = plt.subplots(1, len(indexes), figsize=(12.5, 5.4), sharey=False)
     if len(indexes) == 1:
         axes = [axes]
 
@@ -64,9 +71,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
 
     for ax, index_name in zip(axes, indexes):
         series = [row for row in rows if row["index"] == index_name]
-        labels = [
-            row["label"].replace(" (main)", "\n(main)") for row in series
-        ]
+        labels = [axis_label(row["label"]) for row in series]
         xs = list(range(len(labels)))
         for mode in ("cold", "warm"):
             means = [row[mode]["summary"]["mean_ms"] for row in series]
@@ -89,17 +94,29 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
                 alpha=0.85,
                 label=f"{mode} median",
             )
+            for x, mean in zip(xs, means):
+                ax.annotate(
+                    f"{mean:.1f}",
+                    (x, mean),
+                    textcoords="offset points",
+                    xytext=(0, 7),
+                    ha="center",
+                    fontsize=8,
+                    color=colors[mode],
+                )
         for x in xs:
             ax.axvline(x, color="#bbbbbb", linestyle=":", linewidth=0.8)
         ax.set_xticks(xs, labels)
         ax.set_title(index_name)
         ax.set_xlabel("Lance / pylance version")
+        ax.set_ylabel("Query latency (ms)")
         ax.grid(axis="y", linestyle=":", alpha=0.5)
         ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(ymin, ymax * 1.08)
 
-    axes[0].set_ylabel("Query latency (ms)")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", frameon=False)
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper right", frameon=False)
     fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13)
     fig.text(
         0.5,

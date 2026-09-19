@@ -15,7 +15,7 @@ from bench import (
     split_discard,
     work_corpus_path,
 )
-from plot import load_results, plot_results
+from plot import axis_label, load_results, plot_results
 from run_versions import bench_run_cmd, latest_label
 
 
@@ -156,3 +156,8 @@ def test_prime_os_page_cache_reads_whole_file(tmp_path: Path) -> None:
 
 def test_latest_label_names_engine_revision_not_bench_commit() -> None:
     assert latest_label() == "c8f182179 (main)"
+
+
+def test_axis_label_keeps_main_on_one_line() -> None:
+    assert axis_label("c8f182179 (main)") == "main"
+    assert axis_label("v12.0.0") == "v12.0.0"
