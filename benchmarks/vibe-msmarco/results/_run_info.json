@@ -17,7 +17,7 @@
     "cold": "fresh dataset handle, metadata opened untimed, partitions not prewarmed",
     "warm": "prewarm_index on one handle"
   },
-  "versions": ["v11.0.0", "v12.0.0", "c8f182179 (main)"],
+  "versions": ["v9.0.1", "v10.0.0", "v11.0.0", "v12.0.0", "c8f182179 (main)"],
   "machine": {
     "vcpu": 4,
     "memory_gib": 15,

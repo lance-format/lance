@@ -56,22 +56,28 @@ version performance.
 
 Machine: 4 vCPU, 15 GiB RAM. 100 **timed** queries after discarding the first,
 `k=10`, `nprobes=20`, `_rowid` only. Each version writes its own indexes.
-OS page cache is dropped at the start of every cell.
+OS page cache is dropped at the start of every cell, then that index is primed.
 
 | Index | Version | Cold mean (ms) | Cold median (ms) | Warm mean (ms) | Warm QPS |
 | --- | --- | ---: | ---: | ---: | ---: |
+| IVF_RQ1 | v9.0.1 | 18.1 | 17.5 | 6.01 | 166 |
+| IVF_RQ1 | v10.0.0 | 17.7 | 17.2 | 6.10 | 164 |
 | IVF_RQ1 | v11.0.0 | 18.7 | 17.3 | 6.05 | 165 |
 | IVF_RQ1 | v12.0.0 | 13.9 | 13.8 | 4.68 | 214 |
 | IVF_RQ1 | c8f182179 (main) | 14.1 | 14.0 | 4.81 | 208 |
+| IVF_RQ5 | v9.0.1 | 25.7 | 24.6 | 15.9 | 63 |
+| IVF_RQ5 | v10.0.0 | 25.9 | 24.7 | 17.4 | 57 |
 | IVF_RQ5 | v11.0.0 | 29.2 | 28.7 | 15.2 | 66 |
 | IVF_RQ5 | v12.0.0 | 24.3 | 23.2 | 14.2 | 71 |
 | IVF_RQ5 | c8f182179 (main) | 26.8 | 24.5 | 13.4 | 75 |
 
-Under this protocol, main IVF_RQ1 matches v12 (cold ~14 ms, warm ~4.8 ms).
-v11 is slower on both bit widths. IVF_RQ5 cold is v12 24.3 / main 26.8 /
-v11 29.2; warm is close and main is slightly fastest.
+v9.0.1 and v10.0.0 track v11 on IVF_RQ1 (cold ~18 ms, warm ~6 ms). The RQ1
+drop is at v12 (cold ~14 ms, warm ~4.7 ms); main matches v12. On IVF_RQ5,
+v9/v10 cold (~26 ms) are faster than v11 (29.2) and close to main (26.8);
+v12 is the fastest cold (24.3). Warm RQ5 improves from v10 17.4 toward main
+13.4.
 
-Index build wall time on this box: v11 RQ1/RQ5 420s/466s, v12 227s/457s,
-main 223s/461s.
+Index build wall time on this box: v9 RQ1/RQ5 329s/459s, v10 213s/450s,
+v11 420s/466s, v12 227s/457s, main 223s/461s.
 
 ![IVF_RQ search latency](results/ivf_rq_latency.png)

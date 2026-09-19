@@ -62,7 +62,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(1, len(indexes), figsize=(14.5, 5.4), sharey=False)
+    fig, axes = plt.subplots(1, len(indexes), figsize=(15.2, 5.5), sharey=False)
     if len(indexes) == 1:
         axes = [axes]
 
@@ -107,6 +107,7 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         for x in xs:
             ax.axvline(x, color="#bbbbbb", linestyle=":", linewidth=0.8)
         ax.set_xticks(xs, labels)
+        ax.tick_params(axis="x", labelsize=9)
         ax.set_title(index_name)
         ax.set_xlabel("Lance / pylance version")
         ax.set_ylabel("Query latency (ms)")
