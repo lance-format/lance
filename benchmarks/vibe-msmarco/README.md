@@ -83,4 +83,11 @@ cold p99 ~16 ms versus 24–31 ms on v9–v11. On IVF_RQ5, cold p99 stays in the
 Index build wall time on this box: v9 RQ1/RQ5 329s/459s, v10 213s/450s,
 v11 420s/466s, v12 227s/457s, main 223s/461s.
 
+![IVF_RQ1 cold](results/ivf_rq1_cold.png)
+![IVF_RQ1 warm](results/ivf_rq1_warm.png)
+![IVF_RQ5 cold](results/ivf_rq5_cold.png)
+![IVF_RQ5 warm](results/ivf_rq5_warm.png)
+
+Overview:
+
 ![IVF_RQ search latency](results/ivf_rq_latency.png)

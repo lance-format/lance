@@ -18,7 +18,7 @@ from bench import (
     split_discard,
     work_corpus_path,
 )
-from plot import axis_label, load_results, plot_results, series_ms
+from plot import axis_label, load_results, panel_filename, plot_results, series_ms
 from run_versions import (
     WHEEL_VERSIONS,
     bench_run_cmd,
@@ -105,6 +105,15 @@ def test_load_and_plot(tmp_path: Path) -> None:
     plot_results(loaded, out, "unit test")
     assert out.is_file()
     assert out.stat().st_size > 1000
+    for index_name, mode in (
+        ("IVF_RQ1", "cold"),
+        ("IVF_RQ1", "warm"),
+        ("IVF_RQ5", "cold"),
+        ("IVF_RQ5", "warm"),
+    ):
+        panel = panel_filename(out, index_name, mode)
+        assert panel.is_file(), panel
+        assert panel.stat().st_size > 1000
 
 
 def test_each_version_gets_its_own_work_corpus(tmp_path: Path) -> None:
@@ -172,6 +181,12 @@ def test_prime_os_page_cache_reads_whole_file(tmp_path: Path) -> None:
 
 def test_latest_label_names_engine_revision_not_bench_commit() -> None:
     assert latest_label() == "c8f182179 (main)"
+
+
+def test_panel_filename_uses_index_and_mode(tmp_path: Path) -> None:
+    out = tmp_path / "ivf_rq_latency.png"
+    assert panel_filename(out, "IVF_RQ1", "cold").name == "ivf_rq1_cold.png"
+    assert panel_filename(out, "IVF_RQ5", "warm").name == "ivf_rq5_warm.png"
 
 
 def test_axis_label_keeps_main_on_one_line() -> None:

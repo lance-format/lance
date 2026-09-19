@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-"""Render a ClickBench-style IVF_RQ warm/cold latency chart."""
+"""Render IVF_RQ latency as four charts: {RQ1, RQ5} × {cold, warm}."""
 
 from __future__ import annotations
 
@@ -17,73 +17,41 @@ from bench import nearest_rank
 
 
 VERSION_ORDER = ("v9.0.1", "v10.0.0", "v11.0.0", "v12.0.0")
-# One color + marker + dash per series so mean / median / p99 do not collapse.
-SERIES = (
+MODES = ("cold", "warm")
+# Same three encodings in every panel; the panel title is the cache mode.
+METRICS = (
     {
-        "mode": "cold",
         "key": "mean_ms",
-        "label": "cold mean",
+        "label": "mean",
         "color": "#e67e22",
         "marker": "o",
         "linestyle": "-",
         "linewidth": 2.4,
         "markersize": 8,
         "annotate": True,
+        "offset": (0, 8),
     },
     {
-        "mode": "cold",
         "key": "median_ms",
-        "label": "cold median",
-        "color": "#d4a017",
+        "label": "median",
+        "color": "#7f8c8d",
         "marker": "D",
         "linestyle": "--",
-        "linewidth": 1.6,
-        "markersize": 6,
+        "linewidth": 1.8,
+        "markersize": 7,
         "annotate": False,
+        "offset": (0, -11),
     },
     {
-        "mode": "cold",
         "key": "p99_ms",
-        "label": "cold p99",
+        "label": "p99",
         "color": "#c0392b",
         "marker": "^",
         "linestyle": "-.",
         "linewidth": 2.4,
         "markersize": 8,
         "annotate": True,
-    },
-    {
-        "mode": "warm",
-        "key": "mean_ms",
-        "label": "warm mean",
-        "color": "#1e8449",
-        "marker": "s",
-        "linestyle": "-",
-        "linewidth": 2.4,
-        "markersize": 7,
-        "annotate": True,
-    },
-    {
-        "mode": "warm",
-        "key": "median_ms",
-        "label": "warm median",
-        "color": "#16a085",
-        "marker": "P",
-        "linestyle": "--",
-        "linewidth": 1.6,
-        "markersize": 7,
-        "annotate": False,
-    },
-    {
-        "mode": "warm",
-        "key": "p99_ms",
-        "label": "warm p99",
-        "color": "#1f618d",
-        "marker": "v",
-        "linestyle": "-.",
-        "linewidth": 2.4,
-        "markersize": 8,
-        "annotate": True,
+        "offset": (0, 11),
     },
 )
 
@@ -99,6 +67,11 @@ def axis_label(label: str) -> str:
     if label.endswith(" (main)") or " (main)" in label:
         return "main"
     return label
+
+
+def panel_filename(out: Path, index_name: str, mode: str) -> Path:
+    slug = index_name.lower().replace("ivf_rq", "rq")
+    return out.parent / f"ivf_{slug}_{mode}.png"
 
 
 def _result_paths(results_dir: Path) -> list[Path]:
@@ -140,16 +113,6 @@ def series_ms(row: dict, mode: str, key: str) -> float:
     raise KeyError(f"{mode} summary is missing {key}")
 
 
-# Keep every label on the same side of its marker as the series it names.
-# Warm-mean used to sit below the line and land on the median.
-ANNOTATE_OFFSET = {
-    ("cold", "mean_ms"): (0, 8),
-    ("warm", "mean_ms"): (0, 8),
-    ("cold", "p99_ms"): (-11, 12),
-    ("warm", "p99_ms"): (11, 12),
-}
-
-
 def _style_axis(ax, labels: list[str], title: str) -> None:
     xs = list(range(len(labels)))
     for x in xs:
@@ -162,15 +125,15 @@ def _style_axis(ax, labels: list[str], title: str) -> None:
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
     ymin, ymax = ax.get_ylim()
-    span = ymax - ymin
-    ax.set_ylim(ymin - span * 0.06, ymax + span * 0.18)
+    span = max(ymax - ymin, 1.0)
+    ax.set_ylim(ymin - span * 0.08, ymax + span * 0.16)
 
 
-def _plot_series(ax, rows: list[dict]) -> None:
+def _draw_panel(ax, rows: list[dict], mode: str, title: str) -> None:
     labels = [axis_label(row["label"]) for row in rows]
     xs = list(range(len(labels)))
-    for spec in SERIES:
-        values = [series_ms(row, spec["mode"], spec["key"]) for row in rows]
+    for spec in METRICS:
+        values = [series_ms(row, mode, spec["key"]) for row in rows]
         ax.plot(
             xs,
             values,
@@ -182,18 +145,30 @@ def _plot_series(ax, rows: list[dict]) -> None:
             label=spec["label"],
         )
         if spec["annotate"]:
-            offset = ANNOTATE_OFFSET.get((spec["mode"], spec["key"]), (0, 7))
             for x, value in zip(xs, values):
                 ax.annotate(
                     f"{value:.1f}",
                     (x, value),
                     textcoords="offset points",
-                    xytext=offset,
+                    xytext=spec["offset"],
                     ha="center",
                     fontsize=8,
                     color=spec["color"],
                 )
-    _style_axis(ax, labels, ax.get_title())
+    _style_axis(ax, labels, title)
+
+
+def _write_single_panel(
+    rows: list[dict], mode: str, title: str, path: Path
+) -> None:
+    fig, ax = plt.subplots(figsize=(8.4, 5.0))
+    _draw_panel(ax, rows, mode, title)
+    ax.legend(loc="best", frameon=False)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {path}")
 
 
 def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
@@ -201,24 +176,30 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         raise SystemExit("no result JSON files found")
 
     indexes = sorted({row["index"] for row in rows})
-    fig, axes = plt.subplots(1, len(indexes), figsize=(15.4, 6.2), sharey=False)
-    if len(indexes) == 1:
-        axes = [axes]
+    n_idx = len(indexes)
+    fig, axes = plt.subplots(n_idx, 2, figsize=(13.6, 4.8 * n_idx), sharey=False)
+    if n_idx == 1:
+        axis_rows = [axes]
+    else:
+        axis_rows = axes
 
-    for ax, index_name in zip(axes, indexes):
-        ax.set_title(index_name)
-        _plot_series(ax, [row for row in rows if row["index"] == index_name])
+    for i, index_name in enumerate(indexes):
+        series = [row for row in rows if row["index"] == index_name]
+        for j, mode in enumerate(MODES):
+            title = f"{index_name} {mode}"
+            _draw_panel(axis_rows[i][j], series, mode, title)
+            _write_single_panel(series, mode, title, panel_filename(out, index_name, mode))
 
-    handles, legend_labels = axes[0].get_legend_handles_labels()
+    handles, legend_labels = axis_rows[0][0].get_legend_handles_labels()
     fig.legend(
         handles,
         legend_labels,
         loc="upper center",
         ncol=3,
         frameon=False,
-        bbox_to_anchor=(0.5, 0.98),
+        bbox_to_anchor=(0.5, 0.99),
     )
-    fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13, y=1.02)
+    fig.suptitle("Lance IVF_RQ search latency over recent versions", fontsize=13, y=1.01)
     fig.text(
         0.5,
         0.01,
@@ -228,9 +209,10 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
         fontsize=8,
         color="#444444",
     )
-    fig.tight_layout(rect=(0, 0.07, 1, 0.90))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=160, bbox_inches="tight")
+    plt.close(fig)
     print(f"wrote {out}")
 
 
