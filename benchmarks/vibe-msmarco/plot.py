@@ -49,7 +49,9 @@ def plot_results(rows: list[dict], out: Path, subtitle: str) -> None:
 
     for ax, index_name in zip(axes, indexes):
         series = [row for row in rows if row["index"] == index_name]
-        labels = [row["label"] for row in series]
+        labels = [
+            row["label"].replace(" (main)", "\n(main)") for row in series
+        ]
         xs = list(range(len(labels)))
         for mode in ("cold", "warm"):
             means = [row[mode]["summary"]["mean_ms"] for row in series]

@@ -176,13 +176,11 @@ def build_index(corpus_uri: str, num_bits: int, index_name: str) -> dict[str, An
         ds = created
     elapsed = time.perf_counter() - started
     name = _find_index_name(ds, index_name)
-    stats = ds.stats.index_stats(name) if hasattr(ds.stats, "index_stats") else {}
     print(f"built {name} in {elapsed:.1f}s", flush=True)
     return {
         "index_name": name,
         "num_bits": num_bits,
         "build_seconds": elapsed,
-        "stats": stats,
     }
 
 

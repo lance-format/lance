@@ -8,9 +8,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def env_protoc() -> str:
+    found = shutil.which("protoc")
+    if found is None:
+        raise RuntimeError("protoc is required to build pylance from source")
+    return found
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -62,15 +71,29 @@ def ensure_local_venv(root: Path) -> Path:
             "huggingface_hub",
         ]
     )
-    run(
+    # Fat LTO on pylance OOMs a 16 GiB box. Keep opt-level=3 without LTO.
+    env = os.environ.copy()
+    env["CARGO_PROFILE_RELEASE_LTO"] = "false"
+    env["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] = "8"
+    env["PROTOC"] = env_protoc()
+    wheel_dir = root / "wheels"
+    wheel_dir.mkdir(exist_ok=True)
+    subprocess.check_call(
         [
             str(venv / "bin" / "maturin"),
-            "develop",
+            "build",
             "--release",
             "-m",
             str(REPO / "python" / "Cargo.toml"),
-        ]
+            "--out",
+            str(wheel_dir),
+        ],
+        env=env,
     )
+    wheels = sorted(wheel_dir.glob("pylance-*.whl"))
+    if not wheels:
+        raise RuntimeError(f"maturin built no pylance wheel in {wheel_dir}")
+    run(["uv", "pip", "install", "--python", str(python), "--force-reinstall", str(wheels[-1])])
     marker.write_text("ok\n")
     return python
 

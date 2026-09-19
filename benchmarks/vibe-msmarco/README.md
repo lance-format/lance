@@ -44,3 +44,23 @@ pylance wheels plus a local checkout of this repo, then runs the full matrix.
 Indexes are built once with the oldest runtime (`v11.0.0`) so every version
 queries the same on-disk IVF_RQ files. Current Lance can read those released
 indexes; older runtimes cannot read indexes written by the latest writer.
+
+## Measured results (2026-09-19)
+
+Machine: 4 vCPU, 15 GiB RAM. 100 queries, `k=10`, `nprobes=20`, `_rowid` only.
+Indexes written by pylance 11.0.0.
+
+| Index | Version | Cold mean (ms) | Cold median (ms) | Warm mean (ms) | Warm QPS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| IVF_RQ1 | v11.0.0 | 19.2 | 17.8 | 6.04 | 165 |
+| IVF_RQ1 | v12.0.0 | 18.4 | 17.0 | 5.60 | 179 |
+| IVF_RQ1 | c8f182179 (main) | 57.4 | 41.0 | 5.87 | 170 |
+| IVF_RQ5 | v11.0.0 | 62.2 | 57.3 | 6.22 | 161 |
+| IVF_RQ5 | v12.0.0 | 57.1 | 51.1 | 8.11 | 123 |
+| IVF_RQ5 | c8f182179 (main) | 80.8 | 60.1 | 5.81 | 172 |
+
+Warm latency is stable across the two stables and main (~5.6–6.2 ms, except
+v12 IVF_RQ5 at 8.1 ms). Cold latency on main is higher when reading the v11
+index files, especially IVF_RQ1 (18 ms → 57 ms).
+
+![IVF_RQ search latency](results/ivf_rq_latency.png)

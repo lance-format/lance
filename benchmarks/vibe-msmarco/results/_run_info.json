@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-19",
+  "dataset": "lance-format/vibe-msmarco-qwen-1024",
+  "corpus_rows": 8840823,
+  "query_count": 100,
+  "k": 10,
+  "nprobes": 20,
+  "num_partitions": 1024,
+  "metric": "cosine",
+  "projection": "_rowid only",
+  "index_writer": "pylance==11.0.0",
+  "versions": ["v11.0.0", "v12.0.0", "c8f182179 (main)"],
+  "machine": {
+    "vcpu": 4,
+    "memory_gib": 15,
+    "cpu": "Intel Xeon (KVM)"
+  }
+}
