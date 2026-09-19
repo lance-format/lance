@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::index::frag_reuse::{
+    TaggedTrimOutcome, derive_superseded_segments, derive_tagged_trim,
+    is_superseded_prune_transaction, is_tagged_trim_operation,
+};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_frag_reuse_rewrite_entry, load_frag_reuse_index_details,
@@ -704,6 +708,7 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
+            let self_is_tagged_trim = is_tagged_trim_operation(new_indices, removed_indices);
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
@@ -716,6 +721,22 @@ impl<'a> TransactionRebase<'a> {
                     new_indices: created_indices,
                     removed_indices: committed_removed_indices,
                 } => {
+                    if self_is_tagged_trim {
+                        // Two trims of the same entry cannot merge (mirrors the
+                        // v0 cleanup-vs-cleanup conflict); anything else only
+                        // changes the retention inputs, which the re-derivation
+                        // in `finish_create_index` recomputes from the current
+                        // manifest.
+                        return if created_indices
+                            .iter()
+                            .chain(committed_removed_indices.iter())
+                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                        {
+                            Err(self.retryable_conflict_err(other_transaction, other_version))
+                        } else {
+                            Ok(())
+                        };
+                    }
                     let self_has_frag_reuse = new_indices
                         .iter()
                         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
@@ -819,6 +840,15 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Rewrite {
                     groups, frag_reuse, ..
                 } => {
+                    // A tagged trim carries no state worth defending: the
+                    // rewrite's appended records live in the CURRENT manifest
+                    // entry (whether or not this process can see the in-memory
+                    // reuse update here), and `finish_create_index`
+                    // re-derives the whole trim against that entry, so the
+                    // concurrently appended transition is retained naturally.
+                    if self_is_tagged_trim {
+                        return Ok(());
+                    }
                     // if a reuse update is present, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
                     // The only case that needs rebasing is when the frag_reuse_index cleanup
@@ -2172,12 +2202,75 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+        // Computed before the operation is borrowed mutably below.
+        let self_is_superseded_prune = is_superseded_prune_transaction(&self.transaction);
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
             ..
         } = &mut self.transaction.operation
         {
+            // A tagged trim is re-derived against the CURRENT entry whenever
+            // this attempt builds on a version newer than the one it read,
+            // mirroring the stable-partition rewrite's assemble-at-attempt:
+            // a concurrent append's records are re-filtered in, a concurrent
+            // trim's result is re-trimmed instead of spliced over. When
+            // nothing is left to trim after the rebase (a concurrent commit,
+            // such as an index catching up mid-trim, already satisfied it),
+            // the attempt aborts with a marker conflict instead of writing an
+            // empty no-op version; `cleanup_frag_reuse_index` treats exactly
+            // that conflict as success.
+            if is_tagged_trim_operation(new_indices, removed_indices)
+                && dataset.manifest.version != self.transaction.read_version
+            {
+                match derive_tagged_trim(dataset).await? {
+                    TaggedTrimOutcome::NothingToTrim => {
+                        return Err(Error::retryable_commit_conflict_source(
+                            dataset.manifest.version,
+                            crate::dataset::index::frag_reuse::TAGGED_TRIM_REBASED_TO_NOOP.into(),
+                        ));
+                    }
+                    TaggedTrimOutcome::Replace {
+                        new_entry,
+                        current_entry,
+                    } => {
+                        *new_indices = vec![new_entry];
+                        *removed_indices = vec![current_entry];
+                    }
+                    TaggedTrimOutcome::Delete { current_entry } => {
+                        new_indices.clear();
+                        *removed_indices = vec![current_entry];
+                    }
+                }
+                return Ok(self.transaction);
+            }
+
+            // A superseded-segment prune's removal of a segment is justified
+            // by the coverage of kept same-name siblings, and a concurrent
+            // commit can withdraw exactly that justification without touching
+            // any segment in the removal set (e.g. a remap swap replacing a
+            // kept sibling with a narrower-coverage one), so no conflict
+            // predicate fires. Re-committing the original removal set after
+            // such a rebase would silently drop index coverage. Mirror the
+            // tagged trim: whenever this attempt builds on a version newer
+            // than the one it read, re-derive the removal set wholesale
+            // against the current manifest, and when nothing is superseded
+            // anymore abort with a marker conflict instead of writing an
+            // empty no-op version; `prune_superseded_segments` treats exactly
+            // that conflict as success.
+            if self_is_superseded_prune && dataset.manifest.version != self.transaction.read_version
+            {
+                let rederived = derive_superseded_segments(dataset).await?;
+                if rederived.is_empty() {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        crate::dataset::index::frag_reuse::SUPERSEDED_PRUNE_REBASED_TO_NOOP.into(),
+                    ));
+                }
+                *removed_indices = rederived;
+                return Ok(self.transaction);
+            }
+
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -6516,8 +6609,8 @@ mod tests {
 
         /// Matrix row 5: a user reindex (CreateIndex over the fragments the
         /// rewrite consumes) is compatible: the rewrite defers remapping, the
-        /// index keeps its retired coverage as provenance, and afterwards v0
-        /// cleanup refuses to touch the now-tagged history.
+        /// index keeps its retired coverage as provenance, and afterwards the
+        /// tagged trim retains the record that index still needs.
         #[tokio::test]
         async fn sp_lands_over_concurrent_user_index_and_blocks_v0_trim() {
             let mut dataset = ram_fixture(2, 4).await;
@@ -6563,12 +6656,16 @@ mod tests {
                     .unwrap(),
                 1
             );
-            // v0 cleanup must refuse to trim the tagged history out from
-            // under the not-yet-caught-up index.
-            let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut committed)
+            // The tagged trim must not release the history out from under
+            // the not-yet-caught-up index: everything is retained, so the
+            // cleanup is a no-op (no commit, entry untouched).
+            let version = committed.manifest.version;
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut committed)
                 .await
-                .unwrap_err();
-            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                .unwrap();
+            assert_eq!(committed.manifest.version, version);
+            let (entry_after, _) = fri_ledger(&committed).await;
+            assert_eq!(entry_after.uuid, entry.uuid);
         }
 
         /// Matrix row 6 (fresh session): two DISJOINT stable-partition
