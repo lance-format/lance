@@ -4,18 +4,23 @@
 
 """Download, index, and time IVF_RQ search on vibe-msmarco-qwen-1024.
 
-Queries project only ``_rowid``. Warm runs call ``prewarm_index`` first. Cold
-runs open the index metadata but do not prewarm partitions.
+Queries project only ``_rowid``. Each (version, index) cell drops the OS page
+cache first so later cells do not inherit another index's pages. The first
+query of each mode is discarded (process / file-open / JIT). Cold then times
+fresh dataset handles with metadata already opened; warm calls
+``prewarm_index`` and reuses one handle.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import platform
 import shutil
 import statistics
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +32,7 @@ NPROBES = 20
 TOP_K = 10
 METRIC = "cosine"
 DEFAULT_QUERY_COUNT = 100
+DEFAULT_DISCARD_FIRST = 1
 # Large enough to hold IVF_RQ5 codes (~6 GiB) plus IVF metadata.
 INDEX_CACHE_BYTES = 8 * 1024 * 1024 * 1024
 
@@ -216,6 +222,61 @@ def build_index(corpus_uri: str, num_bits: int, index_name: str) -> dict[str, An
     }
 
 
+def advise_dontneed(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def index_storage_files(corpus_uri: str, index_name: str) -> list[Path]:
+    lance = _import_lance()
+    ds = lance.dataset(corpus_uri)
+    files: list[Path] = []
+    for entry in _index_entries(ds):
+        if _index_name(entry) != index_name:
+            continue
+        uuid = entry["uuid"] if isinstance(entry, dict) else getattr(entry, "uuid", None)
+        if uuid is None:
+            continue
+        root = Path(corpus_uri) / "_indices" / str(uuid)
+        if root.is_dir():
+            files.extend(path for path in root.rglob("*") if path.is_file())
+    return files
+
+
+def drop_os_page_cache(paths: list[Path] | None = None) -> None:
+    """Evict process caches and the kernel page cache.
+
+    Requires passwordless ``sudo`` for ``/proc/sys/vm/drop_caches``. Also
+    ``posix_fadvise(DONTNEED)`` the given files so a specific index is dropped
+    even if another process refaults pages immediately.
+    """
+    gc.collect()
+    if paths:
+        for path in paths:
+            if path.is_file():
+                advise_dontneed(path)
+    subprocess.check_call(["sync"])
+    subprocess.check_call(
+        ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+    )
+
+
+def split_discard(
+    latencies: list[float], discard_first: int
+) -> tuple[list[float], list[float]]:
+    if discard_first < 0:
+        raise ValueError(f"discard_first must be >= 0, got {discard_first}")
+    if discard_first >= len(latencies):
+        raise ValueError(
+            f"discard_first={discard_first} leaves no timed queries "
+            f"(count={len(latencies)})"
+        )
+    return latencies[:discard_first], latencies[discard_first:]
+
+
 def _summarize(latencies: list[float]) -> dict[str, float]:
     ordered = sorted(latencies)
     return {
@@ -247,7 +308,28 @@ def _time_queries(search: Callable[[Any], Any], queries) -> list[float]:
     return latencies
 
 
-def bench_warm(corpus_uri: str, index_name: str, queries) -> dict[str, Any]:
+def _mode_payload(
+    mode: str,
+    latencies: list[float],
+    discard_first: int,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    discarded, kept = split_discard(latencies, discard_first)
+    payload = {
+        "mode": mode,
+        "discard_first": discard_first,
+        "discarded_ms": [latency * 1000.0 for latency in discarded],
+        "summary": _summarize(kept),
+        "latencies_ms": [latency * 1000.0 for latency in kept],
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def bench_warm(
+    corpus_uri: str, index_name: str, queries, discard_first: int
+) -> dict[str, Any]:
     lance = _import_lance()
     ds = _dataset(lance, corpus_uri)
     _open_index_metadata(ds, index_name)
@@ -261,15 +343,17 @@ def bench_warm(corpus_uri: str, index_name: str, queries) -> dict[str, Any]:
         return _search(ds, query)
 
     latencies = _time_queries(search, queries)
-    return {
-        "mode": "warm",
-        "prewarm_seconds": prewarm_seconds,
-        "summary": _summarize(latencies),
-        "latencies_ms": [latency * 1000.0 for latency in latencies],
-    }
+    return _mode_payload(
+        "warm",
+        latencies,
+        discard_first,
+        extra={"prewarm_seconds": prewarm_seconds},
+    )
 
 
-def bench_cold(corpus_uri: str, index_name: str, queries) -> dict[str, Any]:
+def bench_cold(
+    corpus_uri: str, index_name: str, queries, discard_first: int
+) -> dict[str, Any]:
     lance = _import_lance()
     latencies: list[float] = []
     for i, query in enumerate(queries):
@@ -290,11 +374,7 @@ def bench_cold(corpus_uri: str, index_name: str, queries) -> dict[str, Any]:
                 f"rows={table.num_rows}",
                 flush=True,
             )
-    return {
-        "mode": "cold",
-        "summary": _summarize(latencies),
-        "latencies_ms": [latency * 1000.0 for latency in latencies],
-    }
+    return _mode_payload("cold", latencies, discard_first)
 
 
 def _pylance_info() -> dict[str, Any]:
@@ -315,6 +395,8 @@ def run_one(
     num_bits: int,
     query_count: int,
     skip_index: bool,
+    drop_caches: bool,
+    discard_first: int,
 ) -> dict[str, Any]:
     lance = _import_lance()
     hf_root = data_dir / "hf"
@@ -340,14 +422,29 @@ def run_one(
     else:
         index_name = _find_index_name(ds, index_name)
 
-    queries = _query_vectors(lance, queries_uri, query_count)
+    queries = _query_vectors(lance, queries_uri, query_count + discard_first)
+    protocol = {
+        "drop_os_page_cache": drop_caches,
+        "discard_first": discard_first,
+        "timed_queries": query_count,
+        "cold": (
+            "drop caches, then fresh dataset per query; metadata opened "
+            "untimed; first query discarded so the timed set is lance-cold "
+            "with this index already in the OS page cache"
+        ),
+        "warm": "prewarm_index on one handle; first query discarded",
+    }
+    if drop_caches:
+        files = index_storage_files(corpus_uri, index_name)
+        print(f"dropping OS page cache for {len(files)} index files", flush=True)
+        drop_os_page_cache(files)
     print(
-        f"timing {label} IVF_RQ{num_bits}  queries={len(queries)}  "
-        f"k={TOP_K} nprobes={NPROBES}",
+        f"timing {label} IVF_RQ{num_bits}  timed={query_count}  "
+        f"discard_first={discard_first}  k={TOP_K} nprobes={NPROBES}",
         flush=True,
     )
-    cold = bench_cold(corpus_uri, index_name, queries)
-    warm = bench_warm(corpus_uri, index_name, queries)
+    cold = bench_cold(corpus_uri, index_name, queries, discard_first)
+    warm = bench_warm(corpus_uri, index_name, queries, discard_first)
     runtime = _pylance_info()
     return {
         "label": label,
@@ -357,10 +454,11 @@ def run_one(
         "nprobes": NPROBES,
         "k": TOP_K,
         "metric": METRIC,
-        "query_count": len(queries),
+        "query_count": query_count,
         "dataset": HF_DATASET,
         "corpus_uri": corpus_uri,
         "index_writer": runtime["pylance_version"],
+        "protocol": protocol,
         "build": build,
         "cold": cold,
         "warm": warm,
@@ -387,6 +485,17 @@ def main() -> None:
     p_run.add_argument("--out", type=Path, required=True)
     p_run.add_argument("--query-count", type=int, default=DEFAULT_QUERY_COUNT)
     p_run.add_argument("--skip-index", action="store_true")
+    p_run.add_argument(
+        "--drop-caches",
+        action="store_true",
+        help="sync + drop OS page cache before timing this cell",
+    )
+    p_run.add_argument(
+        "--discard-first",
+        type=int,
+        default=DEFAULT_DISCARD_FIRST,
+        help="drop the first N queries of each mode from the summary",
+    )
 
     args = parser.parse_args()
     if args.cmd == "download":
@@ -401,6 +510,8 @@ def main() -> None:
         num_bits=args.bits,
         query_count=args.query_count,
         skip_index=args.skip_index,
+        drop_caches=args.drop_caches,
+        discard_first=args.discard_first,
     )
     _write_json(args.out, result)
     print(json.dumps({

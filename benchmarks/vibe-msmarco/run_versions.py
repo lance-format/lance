@@ -114,8 +114,11 @@ def bench_run_cmd(
     bits: int,
     query_count: int,
     out: Path,
+    skip_index: bool = False,
+    drop_caches: bool = True,
+    discard_first: int = 1,
 ) -> list[str]:
-    return [
+    cmd = [
         str(python),
         str(HERE / "bench.py"),
         "run",
@@ -129,7 +132,14 @@ def bench_run_cmd(
         str(query_count),
         "--out",
         str(out),
+        "--discard-first",
+        str(discard_first),
     ]
+    if skip_index:
+        cmd.append("--skip-index")
+    if drop_caches:
+        cmd.append("--drop-caches")
+    return cmd
 
 
 def latest_label() -> str:
@@ -150,6 +160,12 @@ def main() -> None:
     parser.add_argument("--query-count", type=int, default=100)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-main-build", action="store_true")
+    parser.add_argument(
+        "--skip-index",
+        action="store_true",
+        help="reuse each version's already-built IVF_RQ files",
+    )
+    parser.add_argument("--discard-first", type=int, default=1)
     args = parser.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +205,9 @@ def main() -> None:
                     bits=bits,
                     query_count=args.query_count,
                     out=out,
+                    skip_index=args.skip_index,
+                    drop_caches=True,
+                    discard_first=args.discard_first,
                 )
             )
             results.append(out.name)

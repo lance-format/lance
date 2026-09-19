@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bench import clone_corpus, work_corpus_path
+from bench import advise_dontneed, clone_corpus, split_discard, work_corpus_path
 from plot import load_results, plot_results
 from run_versions import bench_run_cmd, latest_label
 
@@ -122,8 +122,23 @@ def test_version_matrix_always_builds_index(tmp_path: Path) -> None:
         out=tmp_path / "out.json",
     )
     assert "--skip-index" not in cmd
+    assert "--drop-caches" in cmd
+    assert cmd[cmd.index("--discard-first") + 1] == "1"
     assert cmd[cmd.index("--label") + 1] == "v12.0.0"
     assert cmd[cmd.index("--bits") + 1] == "5"
+
+
+def test_split_discard_keeps_only_stable_queries() -> None:
+    discarded, kept = split_discard([0.04, 0.01, 0.012, 0.011], 1)
+    assert discarded == [0.04]
+    assert kept == [0.01, 0.012, 0.011]
+
+
+def test_advise_dontneed_on_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "blob.bin"
+    path.write_bytes(b"x" * 4096)
+    advise_dontneed(path)
+    assert path.read_bytes()[:4] == b"xxxx"
 
 
 def test_latest_label_names_engine_revision_not_bench_commit() -> None:

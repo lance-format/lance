@@ -5,9 +5,14 @@ Compare Lance IVF_RQ vector-search latency across recent releases on
 
 The chart covers **IVF_RQ1** and **IVF_RQ5** in two cache states:
 
-- **warm** — every index partition is loaded with `prewarm_index` before timing
-- **cold** — the index metadata is opened (`describe_indices` / `index_stats`)
-  but partitions are not prewarmed
+- **warm** — `prewarm_index`, then time on that handle
+- **cold** — fresh dataset per query; metadata opened untimed; partitions not
+  prewarmed
+
+Each (version, index) cell starts with `sync` + OS page-cache drop so a
+previous RQ5 file does not leave another cell half-resident. The first query
+of each mode is discarded (file open / JIT). Timed cold queries are therefore
+lance-cold with **this** index already in the page cache.
 
 Queries project only `_rowid` so the timed path does not read payload columns.
 
@@ -48,9 +53,9 @@ version performance.
 
 ## Measured results (2026-09-19)
 
-Machine: 4 vCPU, 15 GiB RAM. 100 queries, `k=10`, `nprobes=20`, `_rowid` only.
-Each pylance version writes its own `IVF_RQ1` / `IVF_RQ5` in a private work
-corpus.
+Machine: 4 vCPU, 15 GiB RAM. 100 **timed** queries after discarding the first,
+`k=10`, `nprobes=20`, `_rowid` only. Each version writes its own indexes.
+OS page cache is dropped at the start of every cell.
 
 | Index | Version | Cold mean (ms) | Cold median (ms) | Warm mean (ms) | Warm QPS |
 | --- | --- | ---: | ---: | ---: | ---: |
