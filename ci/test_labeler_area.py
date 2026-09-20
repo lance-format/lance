@@ -24,11 +24,19 @@ def test_format_labels_use_the_same_paths():
 
 
 def test_only_persisted_protos_are_format_changes():
+    """Every persisted proto is gated, and nothing else is.
+
+    The config entries are globs and protos live in subdirectories, so both
+    sides are resolved to concrete files before being compared.
+    """
     detected_proto_paths = {
-        path for path in paths_for("format-change") if path.startswith("protos/")
+        matched.relative_to(ROOT).as_posix()
+        for glob in paths_for("format-change")
+        if glob.startswith("protos/")
+        for matched in ROOT.glob(glob)
     }
     all_proto_paths = {
-        path.relative_to(ROOT).as_posix() for path in (ROOT / "protos").glob("*.proto")
+        path.relative_to(ROOT).as_posix() for path in (ROOT / "protos").rglob("*.proto")
     }
 
     assert detected_proto_paths == all_proto_paths - EXECUTION_PROTO_PATHS
