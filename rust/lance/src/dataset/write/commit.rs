@@ -62,6 +62,8 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// Whether the caller has opted in to committing a [`CompositeOperation`].
+    allow_composite_operations: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -90,6 +92,7 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
+            allow_composite_operations: false,
         }
     }
 
@@ -348,7 +351,47 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Opt in to committing an action-based transaction.
+    ///
+    /// Transaction V2 -- a [`Transaction`] whose operation is a
+    /// [`CompositeOperation`](lance_table::transaction::action::CompositeOperation)
+    /// -- is a pre-vote draft. Its wire format carries no compatibility
+    /// contract, and a reader that predates it rejects the commit outright, so
+    /// a dataset that has one in its history cannot be read by an older
+    /// library. Committing one is therefore something a caller asks for
+    /// explicitly rather than something a version of the library turns on.
+    ///
+    /// Without this, [`Self::execute`] rejects such a transaction with
+    /// [`Error::NotSupported`]. It has no effect on any other operation.
+    ///
+    /// ```
+    /// # use lance::dataset::CommitBuilder;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_table::transaction::Transaction;
+    /// # use std::sync::Arc;
+    /// # async fn commit(dataset: Arc<Dataset>, transaction: Transaction) -> Result<Dataset> {
+    /// CommitBuilder::new(dataset)
+    ///     .with_experimental_composite_operations(true)
+    ///     .execute(transaction)
+    ///     .await
+    /// # }
+    /// ```
+    pub fn with_experimental_composite_operations(mut self, allow: bool) -> Self {
+        self.allow_composite_operations = allow;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        if !self.allow_composite_operations
+            && matches!(transaction.operation, Operation::CompositeOperation(_))
+        {
+            return Err(Error::not_supported_source(
+                "Transaction V2 is an unstable draft: a CompositeOperation can only be \
+                 committed after opting in with \
+                 CommitBuilder::with_experimental_composite_operations"
+                    .into(),
+            ));
+        }
         let timeout = self.timeout;
         if let Some(t) = timeout
             && t.is_zero()
