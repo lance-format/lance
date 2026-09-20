@@ -119,6 +119,18 @@ use lance_core::deepsize::DeepSizeOf;
 /// Local tokens are scoped to one [`CompositeOperation`] and must be distinct within
 /// it. The three id spaces do not share a token namespace: a fragment token 0
 /// and a field token 0 are unrelated.
+///
+/// ```
+/// # use lance_table::transaction::action::Ref;
+/// // A fragment the dataset already has.
+/// let existing = Ref::Committed(3);
+/// assert_eq!(existing.committed(), Some(3));
+///
+/// // A fragment this operation is about to mint. It has no id until apply
+/// // resolves it against whichever version the commit lands on.
+/// let minted = Ref::Local(0);
+/// assert_eq!(minted.committed(), None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, DeepSizeOf)]
 pub enum Ref {
     Committed(u64),
@@ -149,6 +161,52 @@ impl Ref {
 /// The `uuid` and `read_version` carried on the wire mirror the enclosing
 /// [`Transaction`](super::Transaction) and are filled in from it, so they are
 /// not repeated here.
+///
+/// The steps are applied in order, and a step may name what an earlier one
+/// minted: below, the data file is attached to the fragment added in the step
+/// before it, which has no committed id yet. Doing that as two named
+/// operations would take two commits, and a reader could observe the empty
+/// fragment in between.
+///
+/// ```
+/// # use lance_file::version::ConcreteFileVersion;
+/// # use lance_table::format::DataFile;
+/// use lance_table::transaction::action::{
+///     Action, AddDataFile, AddFragment, CompositeOperation, Ref, UserAction,
+/// };
+///
+/// let operation = CompositeOperation::new(vec![
+///     UserAction::new(
+///         "add a fragment",
+///         vec![Action::AddFragment(AddFragment {
+///             id: Ref::Local(0),
+///             physical_rows: 10,
+///             row_id_meta: None,
+///             last_updated_at_version_meta: None,
+///             created_at_version_meta: None,
+///             data_change: true,
+///         })],
+///     ),
+///     UserAction::new(
+///         "back its one column",
+///         vec![Action::AddDataFile(AddDataFile {
+///             fragment: Ref::Local(0),
+///             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+///             field_ids: vec![Ref::Committed(0)],
+///             data_change: true,
+///         })],
+///     ),
+/// ]);
+///
+/// // The steps are what a user did; the actions are the deltas they became.
+/// assert_eq!(operation.actions.len(), 2);
+/// assert_eq!(operation.iter_actions().count(), 2);
+/// ```
+///
+/// Committing one goes through
+/// `CommitBuilder::with_experimental_composite_operations`, which is the
+/// caller's acknowledgement that this is a draft format (see
+/// [Stability](self#stability)).
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct CompositeOperation {
     /// The ordered steps this operation applies.
