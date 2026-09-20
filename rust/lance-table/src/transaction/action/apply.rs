@@ -109,6 +109,7 @@ impl Transaction {
             current_manifest,
             current_indices,
             config,
+            self.read_version,
             ReadMarks::of(read_manifest),
         );
         for action in composite_operation.iter_actions() {
@@ -208,6 +209,11 @@ pub(super) struct ApplyState<'a> {
     /// by fragment and field, so a re-encode can be checked to re-bind what it
     /// tombstoned.
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
+
+    /// The version the transaction was built against. Not the current
+    /// manifest's version: on a retry the set is replayed onto something newer,
+    /// and what an action saw is still the version it read.
+    read_version: u64,
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -223,10 +229,12 @@ impl<'a> ApplyState<'a> {
         manifest: &'a Manifest,
         indices: Vec<IndexMetadata>,
         build_config: &'a ManifestBuildConfig,
+        read_version: u64,
         read_marks: ReadMarks,
     ) -> Self {
         Self {
             current_manifest: manifest,
+            read_version,
             read_marks,
             build_config,
             schema: manifest.schema.clone(),
@@ -356,10 +364,15 @@ impl<'a> ApplyState<'a> {
         self.current_manifest.uses_stable_row_ids()
     }
 
-    /// The version this delta applies to, which is the newest data an index
+    /// The version the transaction read, which is the newest data an index
     /// segment added by this operation can have been built from.
+    ///
+    /// Deliberately not the current manifest's version. A set that loses a race
+    /// is replayed against whatever won, and a segment built before that still
+    /// reflects only what its writer could see -- stamping it with the newer
+    /// version would claim coverage of rows it never read.
     pub(super) fn read_version(&self) -> u64 {
-        self.current_manifest.version
+        self.read_version
     }
 
     /// Add an index segment. A segment's uuid identifies it, so re-adding one
