@@ -71,7 +71,8 @@ impl Transaction {
             .any(|index| index.name == MEM_WAL_INDEX_NAME)
             .then(|| Self::logical_index_segments(&current_indices));
 
-        let mut state = ApplyState::new(current_manifest, current_indices, config);
+        let mut state =
+            ApplyState::new(current_manifest, current_indices, config, self.read_version);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
@@ -134,6 +135,11 @@ pub(super) struct ApplyState<'a> {
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
+
+    /// The version the transaction was built against. Not the current
+    /// manifest's version: on a retry the set is replayed onto something newer,
+    /// and what an action saw is still the version it read.
+    read_version: u64,
 }
 
 impl<'a> ApplyState<'a> {
@@ -141,9 +147,11 @@ impl<'a> ApplyState<'a> {
         manifest: &'a Manifest,
         indices: Vec<IndexMetadata>,
         build_config: &'a ManifestBuildConfig,
+        read_version: u64,
     ) -> Self {
         Self {
             current_manifest: manifest,
+            read_version,
             build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
@@ -261,10 +269,15 @@ impl<'a> ApplyState<'a> {
         Ok((manifest, indices))
     }
 
-    /// The version this delta applies to, which is the newest data an index
+    /// The version the transaction read, which is the newest data an index
     /// segment added by this operation can have been built from.
+    ///
+    /// Deliberately not the current manifest's version. A set that loses a race
+    /// is replayed against whatever won, and a segment built before that still
+    /// reflects only what its writer could see -- stamping it with the newer
+    /// version would claim coverage of rows it never read.
     pub(super) fn read_version(&self) -> u64 {
-        self.current_manifest.version
+        self.read_version
     }
 
     /// Add an index segment. A segment's uuid identifies it, so re-adding one

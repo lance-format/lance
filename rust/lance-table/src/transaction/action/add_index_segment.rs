@@ -346,7 +346,8 @@ mod tests {
     use crate::transaction::action::{
         Action, AddField, AddFragment, CompositeOperation, DropField, Footprint, UserAction,
     };
-    use crate::transaction::test_support::sample_index_metadata;
+    use crate::transaction::test_support::{default_build_config, sample_index_metadata};
+    use crate::transaction::{Operation, Transaction};
     use rstest::rstest;
 
     fn segment(name: &str, fields: Vec<Ref>) -> AddIndexSegment {
@@ -395,6 +396,74 @@ mod tests {
         // operation read, so replaying it elsewhere restamps it.
         assert_eq!(index.dataset_version, manifest.version);
         assert!(index.dataset_version < next.version);
+    }
+
+    /// A segment that does not say what it reflects reflects the version its
+    /// writer read -- not whatever version the set ends up landing on. The two
+    /// are the same only when the commit is uncontended; after a lost race the
+    /// manifest has moved on while the segment has not.
+    #[test]
+    fn test_a_relocated_segment_reflects_the_version_it_was_built_against() {
+        // Stand in for a retry: the set was built against `read_version` and is
+        // being applied to a manifest two commits further along.
+        let mut manifest = backed_manifest();
+        manifest.version += 2;
+        let read_version = manifest.version - 2;
+
+        let transaction = Transaction::new(
+            read_version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                vec![Action::AddIndexSegment(segment(
+                    "by_a",
+                    vec![Ref::Committed(0)],
+                ))],
+            )])),
+            None,
+        );
+        let (_, indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                Vec::new(),
+                "tx.txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        assert_eq!(indices[0].dataset_version, read_version);
+    }
+
+    /// The bound on an explicit `dataset_version` is the version the set read,
+    /// for the same reason: a segment cannot reflect data its writer could not
+    /// have seen, however far the manifest has moved since.
+    #[test]
+    fn test_a_segment_cannot_reflect_a_version_committed_after_the_one_it_read() {
+        let mut manifest = backed_manifest();
+        manifest.version += 2;
+        let read_version = manifest.version - 2;
+
+        let transaction = Transaction::new(
+            read_version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                vec![Action::AddIndexSegment(AddIndexSegment {
+                    dataset_version: Some(read_version + 1),
+                    ..segment("by_a", vec![Ref::Committed(0)])
+                })],
+            )])),
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                Vec::new(),
+                "tx.txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("could not have seen"), "{error}");
     }
 
     #[test]
