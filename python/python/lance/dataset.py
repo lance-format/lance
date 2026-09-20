@@ -6477,6 +6477,34 @@ class LanceOperation:
         version: int
 
     @dataclass
+    class Clone(BaseOperation):
+        """Operation that creates a clone or branch from a dataset reference.
+
+        This operation is created internally by clone and branch APIs. It is
+        exposed so transactions returned by :meth:`LanceDataset.get_transactions`
+        can represent clone metadata without losing information.
+
+        Attributes
+        ----------
+        is_shallow: bool
+            Whether data files are shared with the source dataset.
+        ref_name: str, optional
+            Source branch name, or ``None`` for the main branch.
+        ref_version: int
+            Source dataset version.
+        ref_path: str
+            Source dataset URI.
+        branch_name: str, optional
+            Destination branch name, when the clone creates a branch.
+        """
+
+        is_shallow: bool
+        ref_name: Optional[str]
+        ref_version: int
+        ref_path: str
+        branch_name: Optional[str]
+
+    @dataclass
     class RewriteGroup:
         """
         Collection of rewritten files
