@@ -1744,18 +1744,20 @@ mod composite {
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::datatypes::Field as LanceField;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
-    use lance_table::format::DataFile;
-    use lance_table::format::IndexMetadata;
-    use lance_table::format::RowIdMeta;
+    use lance_table::format::{
+        BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
+    };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
         ConfigUpdate, DropField, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
         ResetTable, SetDeletionFile, TombstoneFieldData, UserAction,
     };
-    use lance_table::transaction::{Operation, Transaction};
+    use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
+    use std::collections::HashSet;
     use uuid::Uuid;
 
     /// A two-fragment dataset, so its two data files can stand in for the files an
@@ -1779,6 +1781,10 @@ mod composite {
 
     fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
         dataset.fragments()[fragment].files[0].clone()
+    }
+
+    fn int32_field(name: &str) -> LanceField {
+        LanceField::try_from(Field::new(name, DataType::Int32, true)).unwrap()
     }
 
     fn composite_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
@@ -1912,6 +1918,302 @@ mod composite {
                 .to_string()
                 .contains("with_experimental_composite_operations"),
             "{error}"
+        );
+    }
+
+    /// Version independence: the same action set, committed after losing any
+    /// number of races, lands the same change it would have landed alone.
+    ///
+    /// This is the property [`Ref::Local`] exists for. Each replay re-resolves
+    /// the local tokens against whatever version won, so the ids come out
+    /// different every time while the shape -- which field the minted fragment
+    /// carries data for, and where it sits in the schema -- does not. A writer
+    /// that stamped ids in itself would either collide with a racer or silently
+    /// bind its data to the racer's field.
+    #[rstest::rstest]
+    #[case::uncontended(0)]
+    #[case::one_loss(1)]
+    #[case::three_losses(3)]
+    #[tokio::test]
+    async fn test_an_action_set_lands_the_same_change_however_many_races_it_loses(
+        #[case] losses: usize,
+    ) {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragments_before = dataset.fragments().len();
+        let borrowed_file = existing_data_file(&dataset, 0);
+
+        // Each racer mints in the same three id spaces this action set does, so
+        // every one of them moves the ids it would otherwise have taken.
+        for racer in 0..losses {
+            CommitBuilder::new(dataset.clone())
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(
+                    dataset.version().version,
+                    vec![
+                        Action::AddField(AddField {
+                            local: 0,
+                            parent: None,
+                            def: int32_field(&format!("racer_{racer}")),
+                        }),
+                        Action::AddFragment(AddFragment {
+                            id: Ref::Local(0),
+                            physical_rows: 5,
+                            row_id_meta: None,
+                            last_updated_at_version_meta: None,
+                            created_at_version_meta: None,
+                            data_change: true,
+                        }),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Still reading the version it was built against, so it has to relocate
+        // onto everything the racers committed.
+        let committed = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(
+                read_version,
+                vec![
+                    Action::AddField(AddField {
+                        local: 0,
+                        parent: None,
+                        def: int32_field("mine"),
+                    }),
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(0),
+                        physical_rows: 5,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(0),
+                        file: borrowed_file,
+                        field_ids: vec![Ref::Local(0)],
+                        data_change: true,
+                    }),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The change itself: one new field named "mine", one new fragment, and
+        // that fragment's one data file backing exactly that field. None of it
+        // depends on how many commits landed in between.
+        let mine = committed
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.name == "mine")
+            .expect("the field this action set added should be in the schema");
+        assert_eq!(
+            committed.fragments().len(),
+            fragments_before + losses + 1,
+            "every racer and this set should each have added one fragment"
+        );
+
+        let minted = committed.fragments().last().unwrap();
+        assert_eq!(minted.files.len(), 1);
+        assert_eq!(
+            minted.files[0].fields.as_ref(),
+            &[mine.id],
+            "the data file must be bound to the field this set minted, not a racer's"
+        );
+
+        // Distinct ids all round: relocation re-resolved rather than reused.
+        let field_ids: HashSet<i32> = committed.schema().fields.iter().map(|f| f.id).collect();
+        assert_eq!(field_ids.len(), committed.schema().fields.len());
+        let fragment_ids: HashSet<u64> = committed.fragments().iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids.len(), committed.fragments().len());
+    }
+
+    /// The rest of the vocabulary, one commit each. These carry no
+    /// cross-referencing between steps -- that is covered above -- and exist so
+    /// that every action is exercised through the real commit path, not only
+    /// through `build_manifest`.
+    #[tokio::test]
+    async fn test_one_commit_adds_a_base() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddBase(AddBase {
+                local: 0,
+                base: BasePath::new(
+                    0,
+                    "s3://elsewhere/data".into(),
+                    Some("staging".into()),
+                    false,
+                ),
+            })],
+        )
+        .await;
+
+        let base = dataset
+            .manifest()
+            .base_paths
+            .values()
+            .find(|base| base.name.as_deref() == Some("staging"))
+            .expect("the base should be in the manifest");
+        assert_eq!(base.path, "s3://elsewhere/data");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_removes_a_fragment() {
+        let dataset = test_dataset(false).await;
+        let removed = dataset.fragments()[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(removed),
+                data_change: true,
+            })],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 1);
+        assert!(dataset.fragments().iter().all(|f| f.id != removed));
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_sets_a_deletion_file() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let read_version = dataset.version().version;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: fragment_id,
+                deletion_file: Some(DeletionFile {
+                    read_version,
+                    id: 1,
+                    file_type: DeletionFileType::Array,
+                    num_deleted_rows: Some(2),
+                    base_id: None,
+                }),
+                data_change: true,
+            })],
+        )
+        .await;
+
+        let deletion = dataset.fragments()[0]
+            .deletion_file
+            .as_ref()
+            .expect("the fragment should carry a deletion file");
+        assert_eq!(deletion.num_deleted_rows, Some(2));
+        assert_eq!(deletion.read_version, read_version);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_alters_a_field() {
+        let dataset = test_dataset(false).await;
+        let field_id = dataset.schema().fields[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AlterField(AlterField {
+                field: Ref::Committed(field_id as u64),
+                name: Some("renamed".into()),
+                logical_type: None,
+                nullable: Some(true),
+            })],
+        )
+        .await;
+
+        let field = dataset.schema().field_by_id(field_id).unwrap();
+        assert_eq!(field.name, "renamed");
+        assert!(field.nullable);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_resets_the_table() {
+        let dataset = test_dataset(false).await;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let dataset = commit(dataset, vec![Action::ResetTable(ResetTable)]).await;
+
+        assert!(dataset.fragments().is_empty());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_updates_the_config() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: "owner".into(),
+                        value: Some("analytics".into()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata: None,
+                schema_metadata: None,
+                field_metadata: Vec::new(),
+            })],
+        )
+        .await;
+
+        assert_eq!(
+            dataset.manifest().config.get("owner").map(String::as_str),
+            Some("analytics")
+        );
+    }
+
+    /// `SetDeletionFile` carries an absolute post-image -- the whole deletion
+    /// file, computed against the read version -- and apply writes it in
+    /// blindly. That is only safe because two sets touching the same fragment's
+    /// deletions collide on `Coordinate::FragmentDeletions`: without the
+    /// conflict, the loser's deletions would be silently dropped rather than
+    /// recomputed. This pins that.
+    #[tokio::test]
+    async fn test_two_action_sets_setting_the_same_deletion_file_conflict() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.fragments()[0].id;
+
+        let delete = |id: u64| {
+            composite_txn(
+                read_version,
+                vec![Action::SetDeletionFile(SetDeletionFile {
+                    fragment: fragment_id,
+                    deletion_file: Some(DeletionFile {
+                        read_version,
+                        id,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                    }),
+                    data_change: true,
+                })],
+            )
+        };
+
+        CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(delete(1))
+            .await
+            .unwrap();
+
+        let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(delete(2))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
         );
     }
 
