@@ -1740,18 +1740,23 @@ mod composite {
 
     use std::sync::Arc;
 
-    use crate::Dataset;
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
     use lance_table::format::DataFile;
+    use lance_table::format::IndexMetadata;
     use lance_table::format::RowIdMeta;
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Ref,
-        ReserveFragmentIds, ReserveRowIds, TombstoneFieldData, UserAction,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
+        ConfigUpdate, DropField, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
+        ResetTable, SetDeletionFile, TombstoneFieldData, UserAction,
     };
     use lance_table::transaction::{Operation, Transaction};
+    use roaring::RoaringBitmap;
+    use uuid::Uuid;
 
     /// A two-fragment dataset, so its two data files can stand in for the files an
     /// action set would otherwise have had to write.
@@ -1776,18 +1781,138 @@ mod composite {
         dataset.fragments()[fragment].files[0].clone()
     }
 
-    async fn commit(dataset: Dataset, actions: Vec<Action>) -> Dataset {
+    fn composite_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step", actions,
+            )])),
+            None,
+        )
+    }
+
+    async fn try_commit(dataset: Dataset, actions: Vec<Action>) -> Result<Dataset> {
         let read_version = dataset.version().version;
         CommitBuilder::new(Arc::new(dataset))
-            .execute(Transaction::new(
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    async fn commit(dataset: Dataset, actions: Vec<Action>) -> Dataset {
+        try_commit(dataset, actions).await.unwrap()
+    }
+
+    /// The covering fence is re-derived from the published index list on every
+    /// commit rather than inherited -- `Manifest::new_from_previous` zeroes both
+    /// flag words -- so every build path has to re-derive it. See
+    /// `test_covering_commit_fences_the_table_with_a_feature_flag` for what the
+    /// fence protects; without this, the first composite operation on a covered
+    /// table republishes its covering indices with the fence down.
+    #[tokio::test]
+    async fn test_a_composite_commit_keeps_the_covering_fence() {
+        // Two columns, so the index can be keyed on one and merely carry the
+        // other -- a covering index needs at least one field left indexed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered_idx".to_string(),
+            fields: vec![0, 1],
+            covering_fields: vec![1],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "precondition: the covering commit fenced the table"
+        );
+
+        // Any action set will do -- the fence is a property of the index list
+        // this commit publishes, not of what the actions touch.
+        let dataset = commit(
+            dataset,
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+        )
+        .await;
+
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the covering fence"
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the writer half of the fence"
+        );
+    }
+
+    /// Transaction V2 has no compatibility contract, so a caller has to say so
+    /// before a composite operation is written into a dataset's history.
+    #[tokio::test]
+    async fn test_committing_a_composite_operation_requires_opting_in() {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .execute(composite_txn(
                 read_version,
-                Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
-                    "step", actions,
-                )])),
-                None,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
             ))
             .await
-            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("with_experimental_composite_operations"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2043,6 +2168,7 @@ mod composite {
         };
 
         let first = CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
             .execute(Transaction::new(
                 read_version,
                 Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
@@ -2058,6 +2184,7 @@ mod composite {
         // checked against the first. Both only mint, so neither writes anything
         // the other does.
         let second = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
             .execute(Transaction::new(
                 read_version,
                 Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
@@ -2095,11 +2222,13 @@ mod composite {
         };
 
         CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
             .execute(tombstone())
             .await
             .unwrap();
 
         let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
             .with_max_retries(0)
             .execute(tombstone())
             .await
