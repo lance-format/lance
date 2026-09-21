@@ -98,7 +98,10 @@ async fn reject_row_id_domain_index_under_frag_reuse(
         | IndexType::LabelList
         | IndexType::NGram
         | IndexType::RTree
-        | IndexType::Vector => {}
+        | IndexType::Vector
+        // For now, err on disallowing.  Easier than digging through params.
+        // Can relax once a majority of scalar indexes support addresses.
+        | IndexType::Scalar => {}
         _ => {
             return Ok(());
         }

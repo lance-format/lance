@@ -6328,7 +6328,7 @@ mod tests {
     /// its keep.
     #[tokio::test]
     async fn test_zonemap_loses_coverage_compacting_stable_row_ids() {
-        let mut dataset = zonemap_stable_row_id_dataset().await;
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
 
         compact_files(
             &mut dataset,
@@ -6361,7 +6361,7 @@ mod tests {
     /// load, then bakes them in when the segments are merged.
     #[tokio::test]
     async fn test_defer_index_remap_zonemap_with_stable_row_ids() {
-        let mut dataset = zonemap_stable_row_id_dataset().await;
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         let coverage_before = zonemap_coverage(&dataset).await;
 
         let metrics = compact_files(
@@ -6420,7 +6420,7 @@ mod tests {
     /// the commit boundary.
     #[tokio::test]
     async fn test_defer_index_remap_rejected_while_row_id_index_present() {
-        let mut dataset = zonemap_stable_row_id_dataset().await;
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         dataset
             .create_index(
                 &["id"],
@@ -6458,7 +6458,7 @@ mod tests {
     /// added, because the FRI would be applied to it on load.
     #[tokio::test]
     async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
-        let mut dataset = zonemap_stable_row_id_dataset().await;
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         compact_files(
             &mut dataset,
             CompactionOptions {
@@ -6506,8 +6506,235 @@ mod tests {
         assert_zonemap_answers_match_scan(&dataset).await;
     }
 
+    /// Index creation and a deferred compaction race, and each one's guard looks
+    /// at a snapshot taken before the other committed.
+    ///
+    /// The compaction plans and rewrites while no row-id-domain index exists, so
+    /// its plan-time guard passes. A btree is then created and commits: no FRI
+    /// exists yet, so its guard passes too. The compaction finally commits from
+    /// the handle it planned on, which still cannot see the btree, and the
+    /// rewrite rebases on top of the `CreateIndex`.
+    ///
+    /// The result is the combination both guards exist to prevent: stable row
+    /// ids, an FRI, and a row-id-domain index whose row ids the FRI will rewrite
+    /// on load.
+    ///
+    /// Fails two ways, both real. In a debug build the invariant's
+    /// `debug_assert` in `manifest_build` trips first. In a release build there
+    /// is nothing to stop it: the commit returns `Ok` and the invalid
+    /// combination is durably committed, which the final assertion here catches.
+    #[tokio::test]
+    async fn test_defer_index_remap_racing_row_id_index_creation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Plan and rewrite against a dataset that carries no row-id-domain index.
+        let completed = execute_compaction_plan(&dataset, &options).await;
+
+        // A concurrent writer adds one and commits first. No FRI exists yet, so
+        // nothing refuses it.
+        let mut concurrent = Dataset::open(test_uri).await.unwrap();
+        concurrent
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(concurrent.manifest.version > dataset.manifest.version);
+
+        // The compaction commits from its own, now-stale handle.
+        let commit_result = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await;
+
+        // Only the rebase can see both sides, so it is what must refuse.
+        let commit_err = commit_result.expect_err(
+            "the rewrite must conflict with the concurrently created row-id-domain index",
+        );
+        assert!(
+            matches!(commit_err, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {commit_err:?}"
+        );
+
+        // And the invalid combination must not be on disk.
+        let after = Dataset::open(test_uri).await.unwrap();
+        assert!(after.manifest.uses_stable_row_ids());
+        let has_frag_reuse = after
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        let row_id_indices = row_id_domain_indices(&after).await.unwrap();
+        assert!(
+            !has_frag_reuse || row_id_indices.is_empty(),
+            "committed the invalid combination: stable row ids + fragment reuse index + \
+             row-id-domain index(es) {row_id_indices:?}"
+        );
+        assert_btree_answers_every_row(&after).await;
+    }
+
+    /// The mirror ordering: the rewrite commits its FRI first, and the index
+    /// creation -- planned against a version with no FRI -- rebases on top of it.
+    /// The rebase is again the only place that sees both.
+    #[tokio::test]
+    async fn test_row_id_index_creation_racing_defer_index_remap() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        // A second handle pinned to the pre-compaction version.
+        let mut concurrent = Dataset::open(test_uri).await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // `create_index` sees no FRI at its own version, so its guard passes and
+        // the transaction reaches the rebase.
+        let err = concurrent
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .expect_err("creating a row-id-domain index must conflict with the committed FRI");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::InvalidInput { .. }
+            ),
+            "expected a conflict or a refusal, got: {err:?}"
+        );
+
+        let after = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            row_id_domain_indices(&after).await.unwrap().is_empty(),
+            "a row-id-domain index landed alongside the fragment reuse index"
+        );
+        assert_zonemap_answers_match_scan(&after).await;
+    }
+
+    /// The mirror ordering only conflicts today by accident: the rebase rejects
+    /// a `CreateIndex` whose coverage overlaps the rewritten fragments. An index
+    /// built over fragments the compaction left alone does not overlap, so
+    /// nothing stops it -- and the `Rewrite` transaction read back from its file
+    /// reports no fragment-reuse index at all, because the proto has no field
+    /// for one, so the rebase cannot even tell an FRI landed.
+    #[tokio::test]
+    async fn test_row_id_index_creation_racing_defer_index_remap_disjoint_coverage() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        let concurrent = Dataset::open(test_uri).await.unwrap();
+
+        // Compact only fragments 0 and 1, leaving 2 untouched.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                excluded_fragment_ids: vec![2],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A btree over only the untouched fragment. Its coverage is disjoint from
+        // the rewrite, so the incidental overlap rule does not fire.
+        let mut concurrent = concurrent;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let result = crate::index::CreateIndexBuilder::new(
+            &mut concurrent,
+            &["id"],
+            IndexType::BTree,
+            &params,
+        )
+        .name("id_idx".into())
+        .fragments(vec![2])
+        .await;
+
+        let after = Dataset::open(test_uri).await.unwrap();
+        let has_frag_reuse = after
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        let row_id_indices = row_id_domain_indices(&after).await.unwrap();
+        assert!(
+            !has_frag_reuse || row_id_indices.is_empty(),
+            "committed the invalid combination: stable row ids + fragment reuse index + \
+             row-id-domain index(es) {row_id_indices:?} (create returned {result:?})"
+        );
+    }
+
+    /// Every row must be reachable through the btree, whose row ids no FRI may
+    /// have rewritten.
+    async fn assert_btree_answers_every_row(dataset: &Dataset) {
+        if !dataset
+            .load_indices_by_name("id_idx")
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            for id in 0..12i32 {
+                let mut scanner = dataset.scan();
+                scanner.filter(&format!("id = {id}")).unwrap();
+                scanner.project(&["id"]).unwrap();
+                scanner.use_scalar_index(true);
+                let found = scanner.try_into_batch().await.unwrap()["id"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                assert_eq!(found, vec![id], "btree lost row {id}");
+            }
+        }
+    }
+
     /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
-    async fn zonemap_stable_row_id_dataset() -> Dataset {
+    async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
         let batch = arrow_array::record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
             (
@@ -6533,7 +6760,7 @@ mod tests {
         let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
         let mut dataset = Dataset::write(
             reader,
-            "memory://",
+            uri,
             Some(WriteParams {
                 max_rows_per_file: 4,
                 max_rows_per_group: 4,

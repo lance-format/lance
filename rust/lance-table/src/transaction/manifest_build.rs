@@ -922,10 +922,16 @@ impl Transaction {
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
+                    // If there is an FRI and the index uses addresses then we can
+                    // migrate fragment support.
+                    //
+                    // If there is an FRI and the index uses row ids (this is getting phased
+                    // out) then we can migrate fragment support without need for remap.
+                    let deferred_remap = frag_reuse_index.is_some();
                     for index in final_indices.iter_mut() {
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs {
+                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
                                 // address-domain index cannot: its stored addresses point into
@@ -936,8 +942,6 @@ impl Transaction {
                                 // scan for them.
                                 Self::drop_rewritten_fragments(fragment_bitmap, groups)
                             } else {
-                                // We should never allow stable row id, FRI, and row-id-domain indexes
-                                debug_assert!(frag_reuse_index.is_none());
                                 Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
                             };
                         }
@@ -1710,6 +1714,8 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
+        Self::validate_frag_reuse_index_domains(&manifest, &final_indices)?;
+
         Ok((manifest, final_indices))
     }
 
@@ -1723,6 +1729,47 @@ impl Transaction {
             });
         }
     }
+    /// Refuse a manifest that pairs a fragment-reuse index with a row-id-domain index.
+    ///
+    /// The FRI remaps row addresses and is applied to every index on load. With
+    /// stable row ids a row id is numerically indistinguishable from an address into
+    /// fragment 0, so the FRI would silently rewrite a row-id-domain index's row ids.
+    ///
+    /// Compaction and `create_index` each refuse to create that pair, and the rebase
+    /// refuses it when the compaction commits last. None of them catches the other
+    /// ordering: the `Rewrite` proto carries no field for the FRI, so a rewrite read
+    /// back from its transaction file reports none, and a concurrent `CreateIndex`
+    /// whose coverage does not overlap the rewrite is compatible by every other rule.
+    /// This is the one place that always sees the finished state.
+    ///
+    /// Always satisfied once every index stores row addresses.
+    fn validate_frag_reuse_index_domains(
+        manifest: &Manifest,
+        final_indices: &[IndexMetadata],
+    ) -> Result<()> {
+        if !manifest.uses_stable_row_ids()
+            || !final_indices
+                .iter()
+                .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        {
+            return Ok(());
+        }
+        let blocked = final_indices
+            .iter()
+            .filter(|index| !is_system_index(index) && !index.results_are_row_addrs())
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        if blocked.is_empty() {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "index(es) {blocked:?} report matches as row ids, which cannot coexist with the \
+             fragment-reuse index on a dataset with stable row IDs: the fragment-reuse index \
+             remaps row addresses and would be applied to them, rewriting valid row ids. This \
+             commit raced a concurrent compaction or index creation; retry it."
+        )))
+    }
+
     /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
     /// removed and the fragments they became are *not* added.
     fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {

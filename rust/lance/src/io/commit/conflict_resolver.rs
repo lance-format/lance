@@ -16,6 +16,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::system_index::is_system_index;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -37,6 +38,18 @@ pub struct TransactionRebase<'a> {
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
+    /// Whether the dataset uses stable row ids, at the transaction's read version.
+    ///
+    /// Only needed to spot an SRID/FRI/row-id-domain-index conflict below;
+    /// the feature cannot be turned on or off by a concurrent commit.
+    uses_stable_row_ids: bool,
+}
+
+/// Whether a fragment-reuse index would corrupt `index` rather than repair it.
+///
+/// This happens when we have SRID, FRI, and row-id based indexes
+fn corrupted_by_frag_reuse(index: &IndexMetadata) -> bool {
+    !is_system_index(index) && !index.results_are_row_addrs()
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -99,6 +112,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -117,6 +131,7 @@ impl<'a> TransactionRebase<'a> {
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids,
             }),
             Operation::Delete {
                 updated_fragments,
@@ -145,6 +160,7 @@ impl<'a> TransactionRebase<'a> {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        uses_stable_row_ids,
                     });
                 }
 
@@ -158,6 +174,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    uses_stable_row_ids,
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -176,6 +193,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    uses_stable_row_ids,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -191,6 +209,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    uses_stable_row_ids,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -206,6 +225,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    uses_stable_row_ids,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -220,6 +240,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    uses_stable_row_ids,
                 })
             }
         }
@@ -1071,6 +1092,18 @@ impl<'a> TransactionRebase<'a> {
                         // would produce a bitmap with a mix of indexed and
                         // non-indexed fragments, which load_indices rejects.
                         (None, Some(_)) => {
+                            // The compaction planned before this index existed, so
+                            // its own guard could not see it. Refuse the pair here.
+                            //
+                            // This should be relatively rare as we are moving indexes
+                            // away from row ids
+                            if self.uses_stable_row_ids
+                                && new_indices.iter().any(corrupted_by_frag_reuse)
+                            {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
                             for index in new_indices {
                                 let Some(frag_bitmap) = &index.fragment_bitmap else {
                                     return Err(self
@@ -3565,6 +3598,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -3769,6 +3803,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3828,6 +3863,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3969,6 +4005,7 @@ mod tests {
                 affected_rows: affected_rows.as_ref(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4011,6 +4048,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -4026,6 +4064,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4106,6 +4145,7 @@ mod tests {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        uses_stable_row_ids: false,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4287,6 +4327,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
         let update = Transaction::new(
             1,
@@ -4363,6 +4404,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -4384,6 +4426,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -4428,6 +4471,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let same_name = Transaction::new(
@@ -4483,6 +4527,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -4541,6 +4586,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -4582,6 +4628,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -4624,6 +4671,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -4693,6 +4741,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -5374,6 +5423,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                uses_stable_row_ids: false,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -5437,6 +5487,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5475,6 +5526,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5514,6 +5566,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5553,6 +5606,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5603,6 +5657,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5628,6 +5683,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -5674,6 +5730,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
