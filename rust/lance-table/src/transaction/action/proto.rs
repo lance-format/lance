@@ -57,10 +57,6 @@ impl TryFrom<pb::Ref> for Ref {
 impl From<&CompositeOperation> for pb::CompositeOperation {
     fn from(value: &CompositeOperation) -> Self {
         Self {
-            // uuid and read_version mirror the enclosing Transaction and are
-            // stamped in by its conversion.
-            uuid: None,
-            read_version: 0,
             actions: value.actions.iter().map(pb::UserAction::from).collect(),
         }
     }

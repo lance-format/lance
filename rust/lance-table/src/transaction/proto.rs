@@ -709,16 +709,9 @@ impl From<&Transaction> for pb::Transaction {
                 })
             }
             Operation::CompositeOperation(composite_operation) => {
-                let mut message = pb::CompositeOperation::from(composite_operation);
-                // The operation's identity and read version are the enclosing
-                // transaction's; the wire carries them in both places so a
-                // squashed operation keeps its own provenance.
-                message.uuid = Uuid::parse_str(&value.uuid)
-                    .ok()
-                    .as_ref()
-                    .map(pb::Uuid::from);
-                message.read_version = value.read_version;
-                pb::transaction::Operation::CompositeOperation(message)
+                pb::transaction::Operation::CompositeOperation(pb::CompositeOperation::from(
+                    composite_operation,
+                ))
             }
         };
 
@@ -894,17 +887,18 @@ mod tests {
         };
 
         let message = pb::Transaction::from(&transaction);
-        // The operation repeats the envelope's identity so a squashed operation
-        // keeps the provenance of the commit it came from.
+        // The identity lives on the envelope alone. The operation carries the
+        // steps, and their descriptions are what keeps history readable.
+        assert_eq!(message.uuid, uuid);
+        assert_eq!(message.read_version, 4);
         match &message.operation {
             Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
-                assert_eq!(
-                    Uuid::try_from(composite_operation.uuid.as_ref().unwrap())
-                        .unwrap()
-                        .to_string(),
-                    uuid
-                );
-                assert_eq!(composite_operation.read_version, 4);
+                let descriptions: Vec<&str> = composite_operation
+                    .actions
+                    .iter()
+                    .map(|step| step.description.as_str())
+                    .collect();
+                assert_eq!(descriptions, ["append batch"]);
             }
             other => panic!("expected CompositeOperation, got {other:?}"),
         }
