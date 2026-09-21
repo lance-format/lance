@@ -15765,45 +15765,46 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
-        // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
-        // pushes into the unindexed-fragment scan too — no more `FilterExec` on
-        // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
-        // shape, v2 uses `LanceRead` with `full_filter` set.
+        // The shared scorer reads the full unindexed text corpus for BM25 statistics.
+        // Keep the BTree prefilter in separate candidate inputs so it restricts
+        // emitted matches without changing corpus statistics.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
+      MatchCorpus
+        SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+          CoalescePartitionsExec
+            UnionExec
+              MatchQuery: column=s, query=[hello]
+                CoalescePartitionsExec
+                  UnionExec
+                    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                    ProjectionExec: expr=[_rowid@1 as _rowid]
+                      FilterExec: i@0 > 10
+                        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
+              FlatMatchQuery: column=s, query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None
+                CoalescePartitionsExec
+                  UnionExec
+                    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                    ProjectionExec: expr=[_rowid@1 as _rowid]
+                      FilterExec: i@0 > 10
+                        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    MatchCorpus
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
-              CoalescePartitionsExec
-                UnionExec
-                  MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@1 as _rowid]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
+              LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
-              CoalescePartitionsExec
-                UnionExec
-                  Take: columns="_rowid, (s)"
-                    CoalesceBatchesExec: target_batch_size=8192
-                      MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-      CoalescePartitionsExec
-        UnionExec
-          MatchQuery: column=s, query=[hello]
-            LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
-          FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+              LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
         assert_plan_equals(
             &dataset.dataset,
