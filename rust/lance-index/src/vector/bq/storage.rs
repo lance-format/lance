@@ -40,8 +40,9 @@ use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::pb;
+use crate::scalar::RowIdRemapper;
 use crate::vector::ApproxMode;
 use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
@@ -980,20 +981,39 @@ impl<'a> RabitDistCalculator<'a> {
         };
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
-        quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        unsafe {
-            // Storage construction proves the code and table layouts, and the
-            // reserved output has exactly one slot per SIMD row.
-            simd::dist_table::sum_4bit_dist_table_uninit(
-                simd_len,
-                code_len,
-                self.codes,
-                quantized_dists_table,
-                &mut quantized_dists.spare_capacity_mut()[..simd_len],
-            );
-            // The distance-table kernel initialized every SIMD output slot.
-            quantized_dists.set_len(simd_len);
+        // Past `SAFE_U16_CODE_LEN` a full-range LUT overflows the `u16`
+        // accumulator; the wide sum is what the narrow one would have produced.
+        // Storage construction proves the code and table layouts, and the
+        // reserved output has exactly one slot per SIMD row.
+        let is_wide = code_len > simd::dist_table::SAFE_U16_CODE_LEN;
+        if is_wide {
+            hacc_quantized_dists.clear();
+            hacc_quantized_dists.reserve(simd_len);
+            unsafe {
+                simd::dist_table::sum_4bit_dist_table_u32_uninit(
+                    simd_len,
+                    code_len,
+                    self.codes,
+                    quantized_dists_table,
+                    &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
+                );
+                // The kernel initialized every SIMD output slot.
+                hacc_quantized_dists.set_len(simd_len);
+            }
+        } else {
+            quantized_dists.clear();
+            quantized_dists.reserve(simd_len);
+            unsafe {
+                simd::dist_table::sum_4bit_dist_table_uninit(
+                    simd_len,
+                    code_len,
+                    self.codes,
+                    quantized_dists_table,
+                    &mut quantized_dists.spare_capacity_mut()[..simd_len],
+                );
+                // The kernel initialized every SIMD output slot.
+                quantized_dists.set_len(simd_len);
+            }
         }
 
         let range = (qmax - qmin) / 255.0;
@@ -1002,12 +1022,21 @@ impl<'a> RabitDistCalculator<'a> {
         dists.clear();
         dists.reserve(n);
         let uninit_dists = &mut dists.spare_capacity_mut()[..n];
-        uninit_dists[..simd_len]
-            .iter_mut()
-            .zip(quantized_dists.iter())
-            .for_each(|(dist, q_dist)| {
-                dist.write((*q_dist as f32) * range + sum_min);
-            });
+        if is_wide {
+            uninit_dists[..simd_len]
+                .iter_mut()
+                .zip(hacc_quantized_dists.iter())
+                .for_each(|(dist, q_dist)| {
+                    dist.write((*q_dist as f32) * range + sum_min);
+                });
+        } else {
+            uninit_dists[..simd_len]
+                .iter_mut()
+                .zip(quantized_dists.iter())
+                .for_each(|(dist, q_dist)| {
+                    dist.write((*q_dist as f32) * range + sum_min);
+                });
+        }
 
         uninit_dists[simd_len..]
             .iter_mut()
@@ -2391,13 +2420,10 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
 /// to `Some(new_id)` for surviving rows or `None` for rows whose covering
 /// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
 fn build_frag_reuse_mapping(
-    fri: Option<&FragReuseIndex>,
+    fri: Option<&dyn RowIdRemapper>,
     row_ids: &UInt64Array,
 ) -> Option<HashMap<u64, Option<u64>>> {
     let fri = fri?;
-    if fri.row_id_maps.is_empty() {
-        return None;
-    }
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
     for row_id in row_ids.values().iter() {
         match fri.remap_row_id(*row_id) {
@@ -2424,15 +2450,56 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let fri = fri.map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, fri)
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
             _ => distance_type,
         };
         validate_rq_num_bits(metadata.num_bits)?;
+        // The FastScan LUT is `4 * rotated_dim` bytes while the kernels index it
+        // as `BATCH_SIZE * rotated_dim.div_ceil(8)`, so the two agree only when
+        // the dimension is a multiple of 8. `RabitQuantizer::build` has rejected
+        // a non-multiple since #6024, but an index written before that still
+        // loads here, and the AVX-512, AVX2 and NEON kernels read the LUT
+        // through unchecked raw pointers. Only the scalar fallback panics.
+        //
+        // This has to go through `rotated_dim()`, not `metadata.code_dim`:
+        // `code_dim` was added by #6024 itself, so it deserializes to 0 for the
+        // very indices this rejects, and `rotated_dim()` recovers the real
+        // dimension from the rotation matrix that `parse_buffer` backfills.
+        let rotated_dim = metadata.rotated_dim();
+        if rotated_dim % 8 != 0 {
+            return Err(Error::invalid_input(format!(
+                "RabitQ vector dimension must be divisible by 8, got {rotated_dim}. \
+                 Rebuild the index."
+            )));
+        }
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+        // `rotated_dim() == 0` means the metadata never recorded a code
+        // dimension, so the width check below could only ever report that the
+        // column needs 0 bytes. Reject up front with the real cause.
+        if metadata.rotated_dim() == 0 {
+            return Err(Error::corrupt_file_named(
+                "rabitq metadata",
+                format!(
+                    "no code dimension: code_dim is 0 and the rotation matrix is not loaded \
+                     (rotation_type={:?}, rotate_mat_position={:?})",
+                    metadata.rotation_type, metadata.rotate_mat_position
+                ),
+            ));
+        }
         let expected_code_bytes = metadata.binary_code_bytes();
-        if expected_code_bytes > 0 && codes.value_length() as usize != expected_code_bytes {
+        if codes.value_length() as usize != expected_code_bytes {
             return Err(Error::invalid_input(format!(
                 "RabitQ code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} requires {} bytes",
                 RABIT_CODE_COLUMN,
@@ -2982,6 +3049,37 @@ mod tests {
             .metadata(None)
     }
 
+    /// Indices written before #6024 could carry a `code_dim` that is not a
+    /// multiple of 8. The FastScan LUT is sized `4 * code_dim` while the kernels
+    /// index it as `BATCH_SIZE * code_dim.div_ceil(8)`, so loading one made the
+    /// kernels read past the LUT through raw pointers.
+    #[test]
+    fn test_try_from_batch_rejects_dim_not_multiple_of_eight() {
+        let code_dim = 12usize;
+        let metadata = make_test_metadata(code_dim);
+        assert_eq!(metadata.code_dim as usize, code_dim);
+        let code_bytes = metadata.binary_code_bytes();
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0u8; 2 * code_bytes]),
+            code_bytes as i32,
+        )
+        .unwrap();
+        let batch = make_test_batch(codes);
+
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .expect_err("a dimension that is not a multiple of 8 must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected variant: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("divisible by 8") && message.contains("12"),
+            "unexpected error: {message}"
+        );
+    }
+
     #[test]
     fn test_rabit_metadata_defaults_old_indexes_to_residual_query() {
         let metadata: RabitQuantizationMetadata = serde_json::from_str(
@@ -2995,6 +3093,57 @@ mod tests {
     fn test_new_rabit_metadata_uses_raw_query_estimator() {
         let metadata = make_test_metadata(64);
         assert_eq!(metadata.query_estimator, RabitQueryEstimator::RawQuery);
+    }
+
+    #[test]
+    fn test_degenerate_metadata_rejects_any_code_width() {
+        // Metadata with no code dimension (code_dim absent, so 0, and the
+        // rotation matrix not loaded) made the code-width check below it
+        // compare against 0, which the check read as "nothing to compare" and
+        // skipped, so a code column of any width loaded.
+        let metadata: RabitQuantizationMetadata =
+            serde_json::from_str(r#"{"num_bits":1,"packed":true}"#).unwrap();
+        assert_eq!(metadata.rotated_dim(), 0);
+
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0u8; 16]), 8).unwrap();
+        let batch = make_test_batch(codes);
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .expect_err("metadata without a code dimension must be rejected");
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got {err:?}"
+        );
+        assert!(err.to_string().contains("no code dimension"), "got: {err}");
+    }
+
+    /// Metadata written before #6024 carries no `code_dim` and depends on the
+    /// rotation matrix for the dimension, so the rejection above must not fire
+    /// once `parse_buffer` has installed it.
+    #[test]
+    fn test_metadata_without_code_dim_loads_from_the_rotation_matrix() {
+        const DIM: usize = 64;
+        let mut metadata: RabitQuantizationMetadata =
+            serde_json::from_str(r#"{"num_bits":1,"packed":true}"#).unwrap();
+        metadata.rotate_mat = Some(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0; DIM * DIM]),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        assert_eq!(metadata.rotated_dim(), DIM);
+
+        let code_bytes = metadata.binary_code_bytes();
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0u8; 2 * code_bytes]),
+            code_bytes as i32,
+        )
+        .unwrap();
+        let batch = make_test_batch(codes);
+        RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+            .expect("a code dimension recovered from the rotation matrix must still load");
     }
 
     fn make_test_batch(codes: FixedSizeListArray) -> RecordBatch {
@@ -4535,5 +4684,113 @@ mod tests {
             remapped.ex_codes.as_ref().unwrap().value_length() as usize,
             blocked_ex_code_bytes(code_dim, rabit_ex_bits(num_bits).unwrap())
         );
+    }
+
+    /// Past 128 code bytes (rotated dim above 1024) a row's binary sum no
+    /// longer fits a `u16`, and the ranking collapses.
+    /// See https://github.com/lance-format/lance/issues/7157.
+    #[rstest]
+    #[case::narrow(1024, false, false)]
+    #[case::wide_ragged_chunk(1536, true, false)]
+    #[case::wide_overflowing(4096, true, true)]
+    fn test_binary_distances_match_exact_at_high_dim(
+        #[case] code_dim: usize,
+        #[case] expect_wide: bool,
+        #[case] expect_u16_overflow: bool,
+    ) {
+        let num_rows = 64;
+        let code_len = rabit_binary_code_bytes(code_dim);
+        // Not `make_test_codes`: its per-row ramp is nearly parallel to the
+        // all-ones vector, leaving every row sharing over 80% of its bits.
+        let mut rng = SmallRng::seed_from_u64(7157);
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..num_rows * code_len).map(|_| rng.random::<u8>())),
+            code_len as i32,
+        )
+        .unwrap();
+        let metadata = make_test_metadata(code_dim);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let query = Arc::new(Float32Array::from_iter_values(
+            (0..code_dim).map(|idx| ((idx % 17) as f32 - 8.0) / 8.0),
+        )) as ArrayRef;
+        let calc = storage.dist_calculator(query, 4.0);
+
+        let mut binary_ips = Vec::new();
+        let mut u16_scratch = Vec::new();
+        let mut u8_scratch = Vec::new();
+        let mut u32_scratch = Vec::new();
+        let simd_len = calc.binary_distances_with_scratch(
+            num_rows,
+            code_len,
+            &mut binary_ips,
+            &mut u16_scratch,
+            &mut u8_scratch,
+            &mut u32_scratch,
+        );
+        assert_eq!(simd_len, num_rows, "every row should take the kernel path");
+
+        let sums: Vec<u32> = if expect_wide {
+            assert_eq!(u32_scratch.len(), num_rows, "dim {code_dim} should be wide");
+            u32_scratch.clone()
+        } else {
+            assert_eq!(
+                u16_scratch.len(),
+                num_rows,
+                "dim {code_dim} should stay narrow"
+            );
+            u16_scratch.iter().map(|sum| *sum as u32).collect()
+        };
+
+        let wide_table: Vec<u16> = u8_scratch.iter().map(|entry| *entry as u16).collect();
+        let mut expected_sums = vec![0u32; num_rows];
+        lance_linalg::simd::dist_table::sum_4bit_dist_table_u16_scalar(
+            code_len,
+            &calc.codes[..num_rows * code_len],
+            &wide_table,
+            &mut expected_sums,
+        );
+        assert_eq!(
+            sums, expected_sums,
+            "dim {code_dim}: quantized sums diverge"
+        );
+
+        // Or the case quietly stops exercising the overflow it was written for.
+        let widest = expected_sums.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            widest > u16::MAX as u32,
+            expect_u16_overflow,
+            "dim {code_dim}: widest sum {widest} against the u16 ceiling"
+        );
+
+        // Half a step of rounding on each of `2 * code_len` terms.
+        let qmin = calc
+            .dist_table
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let qmax = calc
+            .dist_table
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let quantization_bound = code_len as f32 * (qmax - qmin) / 255.0;
+        assert!(quantization_bound > 0.0, "the test query must vary the LUT");
+
+        for (id, binary_ip) in binary_ips.iter().enumerate() {
+            let exact =
+                compute_single_rq_distance(calc.codes, id, num_rows, code_len, &calc.dist_table);
+            let error = (binary_ip - exact).abs();
+            assert!(
+                error <= quantization_bound + 1e-4 * exact.abs(),
+                "row {id} at dim {code_dim}: binary ip {binary_ip} vs exact {exact}, \
+                 error {error} over the {quantization_bound} quantization bound",
+            );
+        }
     }
 }

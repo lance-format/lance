@@ -9,6 +9,11 @@ updates:
       - "/python"
       - "/java/lance-jni"
     versioning-strategy: lockfile-only
+    # Matches the 48h floor enforced by ci/check_dependency_age.py, so grouped
+    # bumps do not land a version that CI will then reject. Cooldown does not
+    # apply to security updates, which we still want as fast as possible.
+    cooldown:
+      default-days: 2
     schedule:
       interval: "weekly"
       day: "wednesday"

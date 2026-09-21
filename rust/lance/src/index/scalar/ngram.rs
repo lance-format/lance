@@ -4,13 +4,14 @@
 use std::sync::Arc;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_index::frag_reuse::CompactFragReuseIndexHandle;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::NGramIndex;
 use lance_index::scalar::{
-    BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndexParams,
-    index_files_to_table,
+    BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper,
+    ScalarIndexParams, index_files_to_table,
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
@@ -160,7 +161,9 @@ pub(in crate::index) async fn open_and_merge_segments(
     let segments = segments.iter().map(|&s| s.clone()).collect::<Vec<_>>();
     let segment_stores = collect_ngram_segment_stores(dataset, &segments).await?;
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    NGramIndex::merge_segments(
+    let frag_reuse_index = frag_reuse_index
+        .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+    NGramIndex::merge_segments_with_remapper(
         &segment_stores,
         new_data,
         new_store,

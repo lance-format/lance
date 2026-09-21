@@ -17,7 +17,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{DistanceType, dot_u8::dot_u8, l2_u8::l2_u8};
+use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64, l2_u8::l2_u8_u64};
 use lance_table::format::SelfDescribingFileReader;
 use num_traits::AsPrimitive;
 use object_store::path::Path;
@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{ScalarQuantizer, scale_to_u8};
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
@@ -175,6 +176,18 @@ impl ScalarQuantizationStorage {
         batches: impl IntoIterator<Item = RecordBatch>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_new_with_remapper(num_bits, distance_type, bounds, batches, frag_reuse_index)
+    }
+
+    fn try_new_with_remapper(
+        num_bits: u16,
+        distance_type: DistanceType,
+        bounds: Range<f64>,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
@@ -271,6 +284,21 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         Self: Sized,
     {
         Self::try_new(
+            metadata.num_bits,
+            distance_type,
+            metadata.bounds.clone(),
+            [batch],
+            frag_reuse_index,
+        )
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        Self::try_new_with_remapper(
             metadata.num_bits,
             distance_type,
             metadata.bounds.clone(),
@@ -617,7 +645,7 @@ impl<'a> SQDistCalculator<'a> {
                 sum: query_code_sum,
             } => {
                 let dim = sq_code.len() as f32;
-                let code_dot = dot_u8(sq_code, query_sq_code) as f32;
+                let code_dot = dot_u8_u64(sq_code, query_sq_code) as f32;
                 let code_sum = sq_code_sum(sq_code);
                 dim * self.lower_bound * self.lower_bound
                     + self.lower_bound * self.value_scale * (code_sum + *query_code_sum)
@@ -635,7 +663,7 @@ impl DistCalculator for SQDistCalculator<'_> {
         let query_sq_code = self.query_sq_code.as_slice();
         match self.storage.distance_type {
             DistanceType::L2 | DistanceType::Cosine => {
-                l2_u8(sq_code, query_sq_code) as f32 * self.scale
+                l2_u8_u64(sq_code, query_sq_code) as f32 * self.scale
             }
             DistanceType::Dot => self.dot_distance(sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
@@ -653,7 +681,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| l2_u8(sq_codes, query_sq_code) as f32)
+                        .map(|sq_codes| l2_u8_u64(sq_codes, query_sq_code) as f32)
                 })
                 .map(|dist| dist * self.scale)
                 .collect(),

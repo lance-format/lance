@@ -40,6 +40,7 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
+pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,
     UpdatedFragmentOffsets,

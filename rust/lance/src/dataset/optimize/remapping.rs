@@ -126,10 +126,9 @@ impl<I: Iterator<Item = u64>> Iterator for MissingAddrs<'_, I> {
                 self.last = None;
                 last
             } else {
-                // If we've exhausted row_addrs but we aren't done then use 0 which
-                // is guaranteed to not match because that would mean that row_addrs
-                // was empty and we check for that earlier.
-                self.row_addrs.next().unwrap_or(0)
+                // The tombstone fragment id cannot match a real fragment, so all
+                // remaining expected addresses are reported as missing.
+                self.row_addrs.next().unwrap_or(RowAddress::TOMBSTONE_ROW)
             };
 
             let current_fragment = &self.fragments[self.current_fragment_idx];
@@ -203,7 +202,7 @@ pub fn transpose_row_ids_from_digest(
 /// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
 /// If the frag reuse index exists but is empty, the operation succeeds without a commit.
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
-    let indices = dataset.load_indices().await.unwrap();
+    let indices = dataset.load_indices().await?;
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
         None => Err(Error::not_supported_source(
             "Fragment reuse index not found, cannot remap an index post compaction".into(),
@@ -211,15 +210,11 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
     }?;
 
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
-        .await
-        .unwrap();
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
     let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref()).await?;
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.is_empty() {
         return Ok(());
     }
 
@@ -299,27 +294,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         return Ok(());
     }
 
-    // Compose the row-address remap across all versions. `remap_row_id` already
-    // chains every version (and passes through addresses a version does not
-    // touch), so mapping the union of all versions' keys yields a single
-    // baseline -> final address map applied in one rebuild.
-    //
-    // Map every old address; do NOT filter by the current `fragment_bitmap`. In
-    // the sibling-coverage-remap case the bitmap was already advanced onto the
-    // new fragments while the index data still holds old addresses, so filtering
-    // by it would drop exactly the keys this index needs and leave its data
-    // stale (an empty map makes `index::remap_index` return `Keep`). The map is
-    // bounded by the rows the reuse index touched; addresses this index does not
-    // store are simply never looked up.
-    let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
-        .row_id_maps
-        .iter()
-        .flat_map(|row_id_map| row_id_map.keys().copied())
-        .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
-        .collect();
-
-    let remapper = RowAddrRemap::direct(composed_row_id_map);
-    let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
+    // Apply the compact version chain directly while rebuilding the index. The
+    // remapper passes intermediate moved addresses into later FRI versions and
+    // leaves missing mappings unchanged, so no composed per-row map is needed.
+    // This also handles the sibling-coverage-remap case: remapping is driven by
+    // the row addresses stored in the index, not by its already-advanced bitmap.
+    let remap_result =
+        index::remap_index(dataset, index_id, frag_reuse_index.row_addr_remap()).await?;
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
@@ -464,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_compact_matches_transpose() {
-        use lance_core::utils::row_addr_remap::GroupInput;
+        use lance_core::utils::row_addr_remap::GroupInputWithLayout;
         // Ascending old fragments (compaction's scan order), with deletions.
         let old = vec![
             FragDigest {
@@ -515,9 +496,12 @@ mod tests {
         ];
 
         let expected = transpose_row_ids_from_digest(addrs.clone(), &old, &new);
-        let compact = RowAddrRemap::compact([GroupInput {
+        let compact = RowAddrRemap::compact_with_layout([GroupInputWithLayout {
             rewritten_old_row_addrs: addrs,
-            old_frag_ids: old.iter().map(|f| f.id as u32).collect(),
+            old_frags: old
+                .iter()
+                .map(|f| (f.id as u32, f.physical_rows as u32))
+                .collect(),
             new_frags: new
                 .iter()
                 .map(|f| (f.id as u32, f.physical_rows as u32))
@@ -541,6 +525,31 @@ mod tests {
         // A fragment outside the group is unaffected by both.
         let outside = u64::from(RowAddress::new_from_parts(99, 0));
         assert_eq!(compact.get(outside), expected.get(&outside).copied());
+
+        // A fully deleted rewrite group has no rewritten addresses. Direct and
+        // compact remapping must still report every old address as deleted,
+        // including fragment 0 offset 0.
+        let old = vec![FragDigest {
+            id: 0,
+            physical_rows: 3,
+            num_deleted_rows: 3,
+        }];
+        let expected = transpose_row_ids_from_digest(RoaringTreemap::new(), &old, &[]);
+        let compact = RowAddrRemap::compact_with_layout([GroupInputWithLayout {
+            rewritten_old_row_addrs: RoaringTreemap::new(),
+            old_frags: vec![(0, 3)],
+            new_frags: vec![],
+        }])
+        .unwrap();
+
+        for offset in 0..3 {
+            let addr = u64::from(RowAddress::new_from_parts(0, offset));
+            assert_eq!(
+                compact.get(addr),
+                expected.get(&addr).copied(),
+                "mismatch at (0, {offset})"
+            );
+        }
     }
 
     #[test]

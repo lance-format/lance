@@ -377,7 +377,10 @@ def test_ivf_centroids_multivector_fragment_ids(tmpdir):
         ivf_centroids=centroids,
     )
 
+    from lance.bitmap import Bitmap
+
     assert index.uuid == "00000000-0000-4000-8000-000000000001"
+    assert isinstance(index.fragment_ids, Bitmap)
     assert index.fragment_ids == set(fragment_ids)
     assert index.name == "embeddings_idx"
 
@@ -554,6 +557,23 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     reader = LanceFileReader(uri)
 
     assert reader.metadata().num_rows == SMALL_NUM_ROWS
+
+
+def test_vector_transform_mismatched_codebook(
+    tmpdir, small_rand_dataset, small_rand_ivf
+):
+    # The dimension comes from the column and the codebook from the caller, and
+    # the codebook is sliced with column-derived offsets.
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    codebook = np.random.default_rng(42).random(DIMENSION * 256 * 2).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
+    pq = PqModel(NUM_SUBVECTORS, codebook)
+
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
+    with pytest.raises(ValueError, match="PQ codebook has"):
+        builder.transform_vectors(
+            small_rand_ivf, pq, str(tmpdir / "transformed"), fragments=None
+        )
 
 
 @pytest.mark.cuda

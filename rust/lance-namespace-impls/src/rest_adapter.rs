@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
-    extract::{FromRequest, Path, Query, Request, State},
+    extract::{FromRequest, Path, Query, RawQuery, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
+use url::form_urlencoded;
 
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
@@ -699,10 +700,12 @@ async fn insert_into_table(
     }
 }
 
+/// `on` is absent here on purpose: it repeats once per column of a composite match key,
+/// and `serde_urlencoded` (what axum's `Query` is built on) cannot deserialize a sequence.
+/// It is collected from the raw query string by [`merge_insert_on_params`] instead.
 #[derive(Debug, Deserialize)]
 struct MergeInsertQuery {
     delimiter: Option<String>,
-    on: Option<String>,
     when_matched_update_all: Option<bool>,
     when_matched_update_all_filt: Option<String>,
     when_not_matched_insert_all: Option<bool>,
@@ -712,16 +715,25 @@ struct MergeInsertQuery {
     use_index: Option<bool>,
 }
 
+fn merge_insert_on_params(raw_query: Option<&str>) -> Option<Vec<String>> {
+    let on: Vec<String> = form_urlencoded::parse(raw_query?.as_bytes())
+        .filter(|(key, _)| key == "on")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    (!on.is_empty()).then_some(on)
+}
+
 async fn merge_insert_into_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<MergeInsertQuery>,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Response {
     let request = MergeInsertIntoTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
-        on: params.on,
+        on: merge_insert_on_params(raw_query.as_deref()),
         when_matched_update_all: params.when_matched_update_all,
         when_matched_update_all_filt: params.when_matched_update_all_filt,
         when_not_matched_insert_all: params.when_not_matched_insert_all,
@@ -1501,6 +1513,25 @@ mod tests {
         // Filter out empty strings from split results
         let id = parse_id("$$table$$", None);
         assert_eq!(id, vec!["table"]);
+    }
+
+    #[test]
+    fn test_merge_insert_on_params() {
+        assert_eq!(merge_insert_on_params(None), None);
+        assert_eq!(merge_insert_on_params(Some("delimiter=%24")), None);
+        assert_eq!(
+            merge_insert_on_params(Some("on=id&use_index=true")),
+            Some(vec!["id".to_string()])
+        );
+        assert_eq!(
+            merge_insert_on_params(Some("on=region&use_index=true&on=id")),
+            Some(vec!["region".to_string(), "id".to_string()])
+        );
+        // A backtick-quoted field path arrives percent-encoded.
+        assert_eq!(
+            merge_insert_on_params(Some("on=%60a.b%60&on=nested.leaf")),
+            Some(vec!["`a.b`".to_string(), "nested.leaf".to_string()])
+        );
     }
 
     // ============================================================================
@@ -3059,6 +3090,92 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             assert_eq!(a_col.values(), &[100, 200]);
+        }
+
+        /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+        fn create_composite_key_arrow_data(rows: &[(&str, i32, &str)]) -> Bytes {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(region, _, _)| *region),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(
+                        rows.iter().map(|(_, id, _)| *id),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(_, _, value)| *value),
+                    )),
+                ],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            Bytes::from(buffer)
+        }
+
+        /// A composite match key survives the round trip through the REST client and the
+        /// adapter's query string, which repeats `on` once per column.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_merge_insert_composite_key_round_trip() {
+            use lance_namespace::LanceNamespace;
+
+            let fixture = RestServerFixture::new().await;
+            let table_id = vec!["merge_ns".to_string(), "merge_table".to_string()];
+            let on = vec!["region".to_string(), "id".to_string()];
+
+            let mut create_ns = CreateNamespaceRequest::new();
+            create_ns.id = Some(vec!["merge_ns".to_string()]);
+            fixture.namespace.create_namespace(create_ns).await.unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(
+                    create_table_req,
+                    create_composite_key_arrow_data(&[
+                        ("us", 1, "a"),
+                        ("us", 2, "b"),
+                        ("eu", 1, "c"),
+                    ]),
+                )
+                .await
+                .unwrap();
+
+            let mut merge_req = MergeInsertIntoTableRequest::new();
+            merge_req.id = Some(table_id);
+            merge_req.on = Some(on);
+            merge_req.when_matched_update_all = Some(true);
+            let response = fixture
+                .namespace
+                .merge_insert_into_table(
+                    merge_req,
+                    create_composite_key_arrow_data(&[("us", 1, "updated"), ("eu", 2, "inserted")]),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.num_updated_rows, Some(1));
+            assert_eq!(response.num_inserted_rows, Some(1));
         }
 
         // ============================================================================

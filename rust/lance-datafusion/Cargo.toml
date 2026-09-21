@@ -24,6 +24,7 @@ datafusion-physical-expr.workspace = true
 datafusion-substrait = {workspace = true, optional = true}
 datafusion.workspace = true
 futures.workspace = true
+half.workspace = true
 jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}

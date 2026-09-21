@@ -227,7 +227,7 @@ pub fn data_file_columns(version: ConcreteFileVersion, schema: &Schema) -> (Vec<
 ///
 /// The caller supplies the version-free I/O operation. V2.0 may suppress that
 /// operation when a structural header page has already been copied.
-pub(crate) async fn copy_external_metadata_column<Copy, CopyFuture>(
+pub async fn copy_external_metadata_column<Copy, CopyFuture>(
     version: ConcreteFileVersion,
     schema: &Schema,
     column_index: usize,
@@ -257,7 +257,7 @@ where
 }
 
 /// Normalize one copied column before an exact-version footer is written.
-pub(crate) fn finalize_external_metadata_column(
+pub fn finalize_external_metadata_column(
     version: ConcreteFileVersion,
     schema: &Schema,
     column_index: usize,

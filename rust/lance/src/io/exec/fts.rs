@@ -790,6 +790,32 @@ impl CompoundQueryExec {
         self.base_scorer.as_ref()
     }
 
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
+            segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
@@ -965,7 +991,7 @@ fn residual_bm25_scorer(
 /// flat-search approximation without rescanning the residual input or rebuilding
 /// exact corpus statistics.
 #[derive(Debug)]
-pub(crate) struct HybridCompoundQueryExec {
+pub struct HybridCompoundQueryExec {
     dataset: Arc<Dataset>,
     query: FtsQuery,
     params: FtsSearchParams,
@@ -977,7 +1003,7 @@ pub(crate) struct HybridCompoundQueryExec {
 }
 
 impl HybridCompoundQueryExec {
-    pub(crate) fn new(
+    pub fn new(
         dataset: Arc<Dataset>,
         query: FtsQuery,
         params: FtsSearchParams,
@@ -1000,6 +1026,35 @@ impl HybridCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// The indexed segments this scorer reads. Paired with
+    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
+    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// fetch node, so changing it means reconstruction.
+    pub fn segments(&self) -> &[IndexMetadata] {
+        &self.segments
+    }
+
+    /// The scan over the fragments no segment covers.
+    pub fn residual_input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.residual_input
     }
 }
 
@@ -1798,6 +1853,30 @@ impl CrossColumnCompoundQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
     }
 }
 
