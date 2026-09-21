@@ -70,6 +70,24 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
+/// Environment variable that opts a release build into committing Transaction
+/// V2 (an action-based [`CompositeOperation`]) before the feature is generally
+/// released.
+///
+/// This gates the writer only. It lives here so every
+/// `LANCE_ENABLE_UNSTABLE_*` switch is discoverable in one place, even though
+/// Transaction V2 has no manifest flag bit of its own.
+///
+/// [`CompositeOperation`]: crate::transaction::action::CompositeOperation
+pub const ENABLE_UNSTABLE_TRANSACTION_V2_ENV: &str = "LANCE_ENABLE_UNSTABLE_TRANSACTION_V2";
+
+/// Whether this build may commit Transaction V2: always in debug builds, so
+/// tests exercise the path, and in release builds only when
+/// [`ENABLE_UNSTABLE_TRANSACTION_V2_ENV`] is set.
+pub fn transaction_v2_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_TRANSACTION_V2_ENV).is_some()
+}
+
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
     manifest: &mut Manifest,

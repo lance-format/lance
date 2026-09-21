@@ -9,6 +9,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
+    feature_flags::{ENABLE_UNSTABLE_TRANSACTION_V2_ENV, transaction_v2_enabled},
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
@@ -301,8 +302,18 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// [#9454]: https://github.com/lance-format/lance/issues/9454
     ///
-    /// Without this, [`Self::execute`] rejects such a transaction with
-    /// [`Error::NotSupported`]. It has no effect on any other operation.
+    /// # Not sufficient on its own
+    ///
+    /// A release build also needs
+    /// [`LANCE_ENABLE_UNSTABLE_TRANSACTION_V2`](ENABLE_UNSTABLE_TRANSACTION_V2_ENV)
+    /// in the environment. This method says the calling code wants V2; the
+    /// variable says the deployment permits it. A library caller can set the
+    /// first and must not be able to grant itself the second. Debug builds
+    /// have the second already, so tests need no setup.
+    ///
+    /// Without either, [`Self::execute`] rejects such a transaction with
+    /// [`Error::NotSupported`], naming the gate that is missing. Neither has
+    /// any effect on any other operation.
     ///
     /// ```
     /// # use lance::dataset::CommitBuilder;
@@ -322,17 +333,11 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
-        if !self.allow_composite_operations
-            && matches!(transaction.operation, Operation::CompositeOperation(_))
-        {
-            return Err(Error::not_supported_source(
-                "Transaction V2 is experimental, and committing one makes this \
-                 dataset version unopenable by Lance before v12.0.0 (see \
-                 https://github.com/lance-format/lance/issues/9454); a \
-                 CompositeOperation can only be committed after opting in with \
-                 CommitBuilder::with_experimental_composite_operations"
-                    .into(),
-            ));
+        if matches!(transaction.operation, Operation::CompositeOperation(_)) {
+            check_composite_operation_gates(
+                self.allow_composite_operations,
+                transaction_v2_enabled(),
+            )?;
         }
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -653,6 +658,37 @@ impl<'a> CommitBuilder<'a> {
     }
 }
 
+/// The two gates on committing Transaction V2.
+///
+/// `allowed_by_caller` is [`CommitBuilder::with_experimental_composite_operations`]:
+/// this code path wants V2. `enabled_by_build` is [`transaction_v2_enabled`]:
+/// this deployment permits it at all. They are separate because a library
+/// caller can set the first and must not be able to grant itself the second.
+///
+/// Taken as parameters rather than read here so both answers are testable
+/// without toggling the build profile or the environment, the way
+/// `feature_flags::supported_flags_when` is for overlay files.
+fn check_composite_operation_gates(allowed_by_caller: bool, enabled_by_build: bool) -> Result<()> {
+    if !allowed_by_caller {
+        return Err(Error::not_supported_source(
+            "Transaction V2 is experimental; a CompositeOperation can only be committed \
+             after opting in with CommitBuilder::with_experimental_composite_operations"
+                .into(),
+        ));
+    }
+    if !enabled_by_build {
+        return Err(Error::not_supported_source(
+            format!(
+                "Transaction V2 is experimental and not enabled in this build. Set \
+                 {ENABLE_UNSTABLE_TRANSACTION_V2_ENV}=1 to allow it. Its wire format \
+                 carries no compatibility contract and may change without a separate vote."
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct BatchCommitResult {
     pub dataset: Dataset,
     /// The final transaction that was committed.
@@ -682,6 +718,31 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteParams};
 
     use super::*;
+
+    /// Both gates on Transaction V2, in both directions. The build gate is
+    /// checked with explicit values rather than through the environment,
+    /// which is process-global and would race other tests.
+    #[rstest::rstest]
+    #[case::neither(false, false, "with_experimental_composite_operations")]
+    // The caller opt-in is reported first: a caller who has not asked for V2
+    // at all should be told that, not told to change the deployment.
+    #[case::build_only(false, true, "with_experimental_composite_operations")]
+    #[case::caller_only(true, false, ENABLE_UNSTABLE_TRANSACTION_V2_ENV)]
+    fn test_composite_operations_need_both_gates(
+        #[case] allowed_by_caller: bool,
+        #[case] enabled_by_build: bool,
+        #[case] expected: &str,
+    ) {
+        let error =
+            check_composite_operation_gates(allowed_by_caller, enabled_by_build).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn test_composite_operations_pass_when_both_gates_are_open() {
+        check_composite_operation_gates(true, true).unwrap();
+    }
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =

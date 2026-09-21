@@ -582,6 +582,11 @@ same id, name, or path.
     opt-in for exactly this reason, and a table that has one anywhere in its
     history raises the minimum reader version for that table to v12.0.0.
 
+    Writing is gated twice while the feature is experimental: the calling code
+    opts in per commit, and the deployment sets
+    `LANCE_ENABLE_UNSTABLE_TRANSACTION_V2` in the environment. Release builds
+    refuse without both.
+
 Every operation above is a single named verb. A transaction may instead carry a
 `CompositeOperation`: an ordered list of granular *actions* that apply
 atomically as one manifest change. This lets one commit express a change no
