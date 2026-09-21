@@ -4028,6 +4028,78 @@ mod tests {
         assert_eq!(batches[0].num_rows(), total_rows);
     }
 
+    /// The writer cuts a column into many small pages when its buffer is
+    /// small (or, for nested columns, when the rep/def levels of a page hit
+    /// the mini-block budget). Reading them must not cost one request per page.
+    #[tokio::test]
+    async fn test_read_batches_page_reads_into_one_request() {
+        let fs = FsFixture::default();
+        // Every batch is 40 KiB of values, so the 64 KiB buffer flushes a page
+        // after every second batch.
+        let reader = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10_000), BatchCount::from(10));
+        write_lance_file(
+            reader,
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions {
+                data_cache_bytes: Some(64 * 1024),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let num_pages = file_reader.metadata().column_infos[0].page_infos.len();
+        assert!(
+            num_pages > 4,
+            "the writer must cut several pages, got {num_pages}"
+        );
+
+        let read_all = || async {
+            file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::RangeFull,
+                    100_000,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        // The first read also initializes the page metadata; the cache keeps
+        // it, so the second read is data I/O only.
+        read_all().await;
+        fs.object_store.io_stats_incremental();
+        let batches = read_all().await;
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            100_000
+        );
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 1,
+            "{num_pages} adjacent pages must be read together, not one request each"
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_blocking_take(

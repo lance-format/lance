@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,6 +49,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+
+use crate::object_store::ObjectStoreParams;
 
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
@@ -558,6 +560,69 @@ impl AimdThrottleState {
             )?),
         })
     }
+
+    fn downgrade(&self) -> WeakThrottleState {
+        WeakThrottleState {
+            read: Arc::downgrade(&self.read),
+            write: Arc::downgrade(&self.write),
+            delete: Arc::downgrade(&self.delete),
+            list: Arc::downgrade(&self.list),
+        }
+    }
+}
+
+/// A cache entry of [`SHARED_THROTTLE_STATES`]: alive exactly as long as some
+/// store still holds the budgets, since a store keeps all four.
+struct WeakThrottleState {
+    read: Weak<OperationThrottle>,
+    write: Weak<OperationThrottle>,
+    delete: Weak<OperationThrottle>,
+    list: Weak<OperationThrottle>,
+}
+
+impl WeakThrottleState {
+    fn upgrade(&self) -> Option<AimdThrottleState> {
+        Some(AimdThrottleState {
+            read: self.read.upgrade()?,
+            write: self.write.upgrade()?,
+            delete: self.delete.upgrade()?,
+            list: self.list.upgrade()?,
+        })
+    }
+}
+
+/// Throttle budgets keyed by the same `(store prefix, params)` identity the
+/// registry caches stores under. The AIMD contract is one budget per bucket, so
+/// stores that are split further, one per dataset in the `dataset` metrics label
+/// mode, must share the bucket's budget rather than each getting a full one.
+static SHARED_THROTTLE_STATES: LazyLock<
+    std::sync::Mutex<HashMap<(String, ObjectStoreParams), WeakThrottleState>>,
+> = LazyLock::new(Default::default);
+
+/// The throttle state for a store of `store_prefix` built with `params`: the one
+/// its sibling stores already use, or a fresh one. `None` when throttling is
+/// disabled by the params.
+pub(crate) fn shared_throttle_state(
+    store_prefix: &str,
+    params: &ObjectStoreParams,
+) -> lance_core::Result<Option<AimdThrottleState>> {
+    let config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+    if config.is_disabled() {
+        return Ok(None);
+    }
+    let key = (store_prefix.to_owned(), params.clone());
+    let mut states = SHARED_THROTTLE_STATES
+        .lock()
+        .expect("SHARED_THROTTLE_STATES lock poisoned");
+    if let Some(state) = states.get(&key).and_then(WeakThrottleState::upgrade) {
+        return Ok(Some(state));
+    }
+    let state = AimdThrottleState::new(config)?;
+    // Entries whose stores are gone can only be replaced, never hit, so drop them
+    // while the map is being grown anyway.
+    states.retain(|_, weak| weak.upgrade().is_some());
+    states.insert(key, state.downgrade());
+    Ok(Some(state))
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -1056,6 +1121,41 @@ impl ObjectStore for AimdThrottledStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store::StorageOptionsAccessor;
+
+    #[test]
+    fn test_shared_throttle_state_follows_store_identity() {
+        let params = ObjectStoreParams::default();
+        let a = shared_throttle_state("s3$shared-bucket", &params)
+            .unwrap()
+            .unwrap();
+        let b = shared_throttle_state("s3$shared-bucket", &params)
+            .unwrap()
+            .unwrap();
+        // Two stores of one bucket, e.g. two datasets in dataset label mode, draw
+        // on one budget per operation category.
+        assert!(Arc::ptr_eq(&a.read, &b.read));
+        assert!(Arc::ptr_eq(&a.write, &b.write));
+        assert!(Arc::ptr_eq(&a.delete, &b.delete));
+        assert!(Arc::ptr_eq(&a.list, &b.list));
+
+        let other = shared_throttle_state("s3$other-bucket", &params)
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a.read, &other.read));
+
+        let disabled = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("lance_aimd_max_retries".to_string(), "0".to_string())]),
+            ))),
+            ..Default::default()
+        };
+        assert!(
+            shared_throttle_state("s3$shared-bucket", &disabled)
+                .unwrap()
+                .is_none()
+        );
+    }
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;

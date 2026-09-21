@@ -17,7 +17,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, FtsQueryNode, Operator};
+use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
 use lance_linalg::distance::DistanceType;
 
@@ -62,13 +62,14 @@ pub struct VectorQuery {
 /// inverted index evaluates — so every shape the index supports (nested
 /// boolean, boost with a negative clause, phrase, fuzzy) reaches it without a
 /// lossy intermediate form. Everything outside the tree here is execution
-/// policy rather than the query: which column, which document unit, and the
-/// recall/latency knobs.
+/// policy rather than the query: which document unit and the recall/latency
+/// knobs. The columns searched live on the tree's leaves — [`Self::columns`]
+/// reads them back out — so there is no second copy to fall out of step with it.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
-    /// Column name to search.
-    pub column: String,
     /// The query tree, evaluated as given by the memtable's inverted index.
+    /// Every leaf names the column it searches; the memtable routes each leaf
+    /// to that column's index.
     pub expr: FtsQueryExpr,
     /// Logical document unit. Defaults to one document per dataset row.
     pub document_granularity: DocumentGranularity,
@@ -88,16 +89,48 @@ pub struct FtsQuery {
 pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
-    /// Wrap an already-built query tree.
+    /// Wrap an already-built query tree, binding every unbound leaf to
+    /// `column`. Leaves that already name a column keep it.
     pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
         Self {
-            column: column.into(),
-            expr,
+            expr: expr.bind_unbound_leaves(&column.into()),
             document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
         }
+    }
+
+    /// Wrap a tree whose leaves name several columns. Every leaf must already
+    /// carry its binding — there is no single column to fall back to.
+    pub fn cross_column(expr: FtsQueryExpr) -> Result<Self> {
+        let num_columns = expr.columns().len();
+        if num_columns < 2 {
+            return Err(Error::invalid_input(format!(
+                "cross-column MemTable full-text search needs at least two bound columns, \
+                 got {num_columns}"
+            )));
+        }
+        if expr.has_unbound_leaf() {
+            return Err(Error::invalid_input(
+                "cross-column MemTable full-text search needs every leaf bound to a column; \
+                 there is no single index to fall back to"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            expr,
+            document_granularity: DocumentGranularity::Row,
+            wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
+            include_tail: true,
+        })
+    }
+
+    /// Distinct columns this query's leaves name, in tree order. A tree with
+    /// no leaves at all (an empty boolean) names none.
+    pub fn columns(&self) -> Vec<&str> {
+        self.expr.columns()
     }
 
     /// Create a simple term match query.
@@ -208,9 +241,10 @@ impl FtsQuery {
 /// entry type.
 ///
 /// Every shape the in-memory inverted index can evaluate is carried across:
-/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth.
-/// Multi-match is the exception — it spans columns, and the memtable's indexes
-/// are per-column, so it has no single tree to evaluate and is refused.
+/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth, and
+/// over one column or several. Multi-match is the exception — its fields are
+/// scored independently and fused by max, which the LSM planner decomposes
+/// above this layer rather than expressing as one tree.
 fn resolve_memtable_document_granularity(
     column: &str,
     requested: Option<DocumentGranularity>,
@@ -257,33 +291,43 @@ fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> 
             )
         })
     };
-    let column = require_column(single_query_column(&query.query)?)?;
-    let document_granularity = resolve_memtable_document_granularity(
-        &column,
-        requested_document_granularity(&query.query)?,
-        indexes,
-    )?;
+    let requested = requested_document_granularity(&query.query)?;
     let expr = to_local_expr(&query.query)?;
-    Ok(FtsQuery::new(column, expr)
-        .with_document_granularity(document_granularity)
-        .with_wand_factor(wand_factor)
-        .with_limit(limit))
-}
-
-/// The single column the query targets, or `None` when it binds none. A query
-/// spanning several columns is refused before this — the memtable holds one
-/// inverted index per column, so there is no single index to evaluate against.
-fn single_query_column(query: &IndexFtsQuery) -> Result<Option<String>> {
-    let mut columns = query.columns().into_iter();
-    let first = columns.next();
-    if columns.next().is_some() {
-        return Err(Error::not_supported(
-            "MemTable full-text search is single-column; a query spanning several \
-             columns has no single in-memory index to evaluate against"
-                .to_string(),
-        ));
-    }
-    Ok(first)
+    // Taken from the mapped tree rather than the index-level query: it is what
+    // the arm evaluates, and its order is the tree's rather than a hash set's.
+    let columns = expr
+        .columns()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let local = if columns.len() > 1 {
+        // Each column resolves its granularity against its own index, and they
+        // have to agree: the arm emits one schema, and `_doc_index` is present
+        // or absent for the whole batch.
+        let mut resolved = None;
+        for column in &columns {
+            let granularity = resolve_memtable_document_granularity(column, requested, indexes)?;
+            match resolved {
+                None => resolved = Some(granularity),
+                Some(previous) if previous != granularity => {
+                    return Err(Error::invalid_input(format!(
+                        "cross-column full-text search resolved {previous:?} document \
+                         granularity for an earlier column and {granularity:?} for \
+                         '{column}'; they must agree"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let document_granularity = resolved.unwrap_or(DocumentGranularity::Row);
+        FtsQuery::cross_column(expr)?.with_document_granularity(document_granularity)
+    } else {
+        let column = require_column(columns.into_iter().next())?;
+        let document_granularity =
+            resolve_memtable_document_granularity(&column, requested, indexes)?;
+        FtsQuery::new(column, expr).with_document_granularity(document_granularity)
+    };
+    Ok(local.with_wand_factor(wand_factor).with_limit(limit))
 }
 
 /// The document granularity the query asks for, erroring if its leaves disagree
@@ -303,10 +347,11 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
                 }
                 return Ok(());
             }
-            IndexFtsQuery::MultiMatch(_) => {
-                return Err(Error::not_supported(
-                    "MemTable full-text search does not support multi-match queries".to_string(),
-                ));
+            IndexFtsQuery::MultiMatch(m) => {
+                for leaf in &m.match_queries {
+                    visit(&IndexFtsQuery::Match(leaf.clone()), current)?;
+                }
+                return Ok(());
             }
         };
         match (*current, requested) {
@@ -328,30 +373,44 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
 
 /// Map an index-level query onto the tree the in-memory index evaluates.
 ///
-/// Structural only — the column and document granularity are resolved once for
-/// the whole query by the caller, because the memtable searches a single index.
+/// Each leaf keeps the column the planner bound it to, so a tree spanning
+/// several fields stays routable. Document granularity is still resolved once
+/// for the whole query by the caller: the arm emits one schema.
 fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+    fn bind(expr: FtsQueryExpr, column: Option<&String>) -> FtsQueryExpr {
+        match column {
+            Some(column) => expr.with_column(column.clone()),
+            None => expr,
+        }
+    }
     Ok(match query {
-        IndexFtsQuery::Match(m) => match m.fuzziness {
-            // `Some(0)` is an exact match in the index model.
-            Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
+        IndexFtsQuery::Match(m) => bind(
+            match m.fuzziness {
+                // `Some(0)` is an exact match in the index model.
+                Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
+                    .with_boost(m.boost),
+                // The fuzzy path expands each term independently and unions the
+                // expansions, so it cannot also require every term to match.
+                _ if m.operator != Operator::Or => {
+                    return Err(Error::not_supported(
+                        "MemTable fuzzy full-text search only supports OR match operators"
+                            .to_string(),
+                    ));
+                }
+                fuzziness => FtsQueryExpr::fuzzy_with_options(
+                    m.terms.clone(),
+                    fuzziness,
+                    m.prefix_length,
+                    m.max_expansions,
+                )
                 .with_boost(m.boost),
-            // The fuzzy path expands each term independently and unions the
-            // expansions, so it cannot also require every term to match.
-            _ if m.operator != Operator::Or => {
-                return Err(Error::not_supported(
-                    "MemTable fuzzy full-text search only supports OR match operators".to_string(),
-                ));
-            }
-            fuzziness => FtsQueryExpr::fuzzy_with_options(
-                m.terms.clone(),
-                fuzziness,
-                m.prefix_length,
-                m.max_expansions,
-            )
-            .with_boost(m.boost),
-        },
-        IndexFtsQuery::Phrase(p) => FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+            },
+            m.column.as_ref(),
+        ),
+        IndexFtsQuery::Phrase(p) => bind(
+            FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+            p.column.as_ref(),
+        ),
         IndexFtsQuery::Boost(b) => FtsQueryExpr::boosting_with_negative(
             to_local_expr(&b.positive)?,
             to_local_expr(&b.negative)?,
@@ -370,11 +429,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
             }
             builder.build()
         }
-        IndexFtsQuery::MultiMatch(_) => {
-            return Err(Error::not_supported(
-                "MemTable full-text search does not support multi-match queries".to_string(),
-            ));
-        }
+        IndexFtsQuery::MultiMatch(m) => FtsQueryExpr::MultiMatch {
+            children: m
+                .match_queries
+                .iter()
+                .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
+                .collect::<Result<_>>()?,
+        },
     })
 }
 
@@ -1199,7 +1260,13 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_fts_index(&query.column, query.document_granularity) {
+        // Every queried column needs an index: a cross-column predicate is one
+        // predicate, so a missing arm is a missing answer, not a smaller one.
+        if !query
+            .columns()
+            .into_iter()
+            .all(|column| self.has_fts_index(column, query.document_granularity))
+        {
             return self.empty_fts_plan(query.document_granularity);
         }
 
@@ -1867,7 +1934,7 @@ mod tests {
             .with_column("text".to_string())
             .unwrap();
         let local = local_fts_query(q, None).unwrap();
-        assert_eq!(local.column, "text");
+        assert_eq!(local.columns(), ["text"]);
         assert!(
             matches!(local.expr, FtsQueryExpr::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
@@ -1928,7 +1995,7 @@ mod tests {
         ));
         let local = local_fts_query(exact_and, None).unwrap();
         assert!(
-            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost, .. }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
         );
 
@@ -2032,8 +2099,8 @@ mod tests {
             "nesting flattened: {must:?}"
         );
 
-        // Multi-match spans columns -> still refused; the memtable holds one
-        // inverted index per column.
+        // Multi-match maps to a best-child node whose leaves keep their own
+        // columns, so a tree spanning fields still routes leaf by leaf.
         let multi = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
             MultiMatchQuery::try_new(
                 "x".to_string(),
@@ -2041,10 +2108,18 @@ mod tests {
             )
             .unwrap(),
         ));
-        assert!(
-            local_fts_query(multi, None).is_err(),
-            "multi-match must be rejected"
+        let local = local_fts_query(multi, None).unwrap();
+        let FtsQueryExpr::MultiMatch { children } = &local.expr else {
+            panic!("expected a MultiMatch expr, got {:?}", local.expr);
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.column())
+                .collect::<Vec<_>>(),
+            [Some("text"), Some("other")]
         );
+        assert_eq!(local.columns(), ["text", "other"]);
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());

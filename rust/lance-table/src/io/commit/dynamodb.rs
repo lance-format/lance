@@ -4,7 +4,7 @@
 //! DynamoDB based external manifest store
 //!
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -134,6 +134,29 @@ macro_rules! committer {
     () => {
         "committer"
     };
+}
+
+/// Read the `size` attribute of a manifest row.
+///
+/// Rows written before the column existed omit it, so an absent attribute is not
+/// an error: the reader falls back to a `HEAD` request for the manifest length.
+/// A present value is a different case - both writers store it as
+/// [`AttributeValue::N`] alongside `path` - so report a malformed one instead of
+/// dropping the hint and paying for that `HEAD` on every read of the row.
+fn parse_size_attribute(item: &HashMap<String, AttributeValue>) -> Result<Option<u64>> {
+    let Some(attribute) = item.get("size") else {
+        return Ok(None);
+    };
+    let AttributeValue::N(size) = attribute else {
+        return Err(Error::invalid_input(format!(
+            "dynamodb error: the size column is {attribute:?}, expected a number"
+        )));
+    };
+    size.parse().map(Some).map_err(|e| {
+        Error::invalid_input(format!(
+            "dynamodb error: could not parse the size returned {size}, error: {e}"
+        ))
+    })
 }
 
 impl DynamoDBExternalManifestStore {
@@ -301,9 +324,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .as_str();
         let path = Path::from(path);
 
-        let size = item
-            .get("size")
-            .and_then(|attr| attr.as_n().ok().and_then(|v| v.parse().ok()));
+        let size = parse_size_attribute(&item)?;
 
         let naming_scheme = detect_naming_scheme_from_path(&path)?;
 
@@ -370,10 +391,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                         format!("dynamodb error: found entries for {} but the returned data does not contain {} column", base_uri, path!())
                     ))?;
 
-                let size = item.get("size").and_then(|attr| match attr {
-                    AttributeValue::N(size) => size.parse().ok(),
-                    _ => None,
-                });
+                let size = parse_size_attribute(&item)?;
 
                 match (version_attribute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => {
@@ -491,5 +509,78 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(size: Option<AttributeValue>) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::from([
+            (
+                base_uri!().to_string(),
+                AttributeValue::S("s3://bucket/table".into()),
+            ),
+            (version!().to_string(), AttributeValue::N("7".into())),
+            (
+                path!().to_string(),
+                AttributeValue::S("_versions/7.manifest".into()),
+            ),
+        ]);
+        if let Some(size) = size {
+            item.insert("size".to_string(), size);
+        }
+        item
+    }
+
+    /// Rows predate the column, so an absent value keeps the `HEAD` fallback
+    /// rather than becoming an error.
+    #[test]
+    fn test_absent_size_is_not_an_error() {
+        assert_eq!(parse_size_attribute(&item(None)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_size_roundtrips_through_the_attribute() {
+        for size in [0u64, 1, 4096, u64::MAX] {
+            let attribute = AttributeValue::N(size.to_string());
+            assert_eq!(
+                parse_size_attribute(&item(Some(attribute))).unwrap(),
+                Some(size),
+                "size {size}"
+            );
+        }
+    }
+
+    /// A present value is written by both put helpers, so a malformed one means a
+    /// corrupt row: report it instead of silently dropping the length hint.
+    #[test]
+    fn test_unreadable_size_is_reported() {
+        for raw in ["", "abc", "-1", "1.5", "99999999999999999999999"] {
+            let attribute = AttributeValue::N(raw.to_string());
+            let err = parse_size_attribute(&item(Some(attribute)))
+                .expect_err(&format!("size {raw:?} should be rejected"));
+            assert!(
+                err.to_string().contains("could not parse the size"),
+                "size {raw:?}: unexpected message {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_numeric_size_attribute_is_reported() {
+        for attribute in [
+            AttributeValue::S("4096".into()),
+            AttributeValue::Bool(true),
+            AttributeValue::Null(true),
+        ] {
+            let err = parse_size_attribute(&item(Some(attribute.clone())))
+                .expect_err(&format!("{attribute:?} should be rejected"));
+            assert!(
+                err.to_string().contains("expected a number"),
+                "{attribute:?}: unexpected message {err}"
+            );
+        }
     }
 }

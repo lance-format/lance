@@ -54,24 +54,35 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// versions. Readers and writers must both understand the per-file version
 /// contract before either can safely access the dataset.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// The table uses stable row ids and carries a fragment reuse index.
+///
+/// Reserved ahead of its implementation. This build treats the bit as unknown
+/// (see `supported_flags_when`), so a build that knows the flag but not the
+/// handling behind it cannot open such a table.
+pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
+/// Tagged FRI requires a reader that interprets its mappings and a writer that
+/// preserves them during maintenance. Legacy-only FRI does not set this bit.
+/// Bit 9 is taken by the stable-row-id FRI compatibility flag.
+pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// Blob v2 descriptors may independently address Lance-owned objects. Readers
+/// must resolve their explicit bases and writers/GC must preserve those references.
+/// This capability is sticky, including across restore, and requires both words.
+pub const FLAG_MANAGED_BLOBS: u64 = 1 << 11;
+
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 9;
+pub const FLAG_UNKNOWN: u64 = 1 << 12;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
-
-/// Tagged FRI requires a reader that interprets its mappings and a writer that
-/// preserves them during maintenance. Legacy-only FRI does not set this bit.
-/// Bit 9 is taken by the stable-row-id FRI compatibility flag.
-pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
-
-/// Blob v2 descriptors may independently address Lance-owned objects. Readers
-/// must resolve their explicit bases and writers/GC must preserve those references.
-/// This capability is sticky, including across restore, and requires both words.
-pub const FLAG_MANAGED_BLOBS: u64 = 1 << 11;
+// Same fence for the stable-row-id fragment-reuse bit: the released build's
+// boundary is bit 8, so anything at or above it is refused there.
+const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
+const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_MANAGED_BLOBS;
 
@@ -196,12 +207,17 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
-    let mut supported = (FLAG_UNKNOWN - 1) | FLAG_MANAGED_BLOBS;
+    let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
+    // Reserved, not implemented: see the flag's doc comment.
+    mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
+    // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
+    // until its reader/writer handling lands.
+    mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
     supported
 }
 
@@ -309,6 +325,42 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    /// Reserved ahead of its implementation: refused for reading and writing
+    /// until the handling lands, so a build from the gap cannot open the table.
+    #[test]
+    fn test_frag_reuse_with_stable_row_ids_flag_is_reserved_not_supported() {
+        use crate::format::{DataStorageFormat, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        assert!(!can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+        assert!(!can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+        manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+        assert!(matches!(
+            ensure_can_read_manifest(&manifest).unwrap_err(),
+            Error::NotSupported { .. }
+        ));
+        assert!(matches!(
+            ensure_can_write_manifest(&manifest).unwrap_err(),
+            Error::NotSupported { .. }
+        ));
+    }
 
     #[test]
     fn test_read_check() {
@@ -607,11 +659,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_capability_is_below_the_unknown_boundary() {
+    fn paired_capabilities_are_below_the_unknown_boundary() {
         assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_read_dataset(FLAG_MANAGED_BLOBS));
+        assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 }

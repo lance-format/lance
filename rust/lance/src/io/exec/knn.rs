@@ -553,6 +553,38 @@ impl KNNVectorDistanceExec {
         })
     }
 
+    /// Rebuild this node with a different per-query `k`.
+    ///
+    /// A batch node bounds every query's candidates by its own `k` and carries no
+    /// enclosing top-k `SortExec`, so a caller that rewrites the plan to widen the
+    /// candidate set has nothing else to move. `k` feeds only the execute-time cut,
+    /// never the schema or plan properties, so the rest of the node carries over.
+    ///
+    /// Returns an error for a zero `k` on a batch node, matching `try_new_batch`.
+    pub fn with_k(&self, k: usize) -> Result<Self> {
+        if self.is_batch && k == 0 {
+            return Err(Error::invalid_input(
+                "k must be positive for batch KNN".to_string(),
+            ));
+        }
+        Ok(Self {
+            input: self.input.clone(),
+            query: self.query.clone(),
+            is_batch: self.is_batch,
+            query_count: self.query_count,
+            k,
+            lower_bound: self.lower_bound,
+            upper_bound: self.upper_bound,
+            column: self.column.clone(),
+            distance_type: self.distance_type,
+            retain_vector: self.retain_vector,
+            input_schema: self.input_schema.clone(),
+            output_schema: self.output_schema.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
     fn take_vector_row(vectors: &dyn Array, row_index: u32) -> DataFusionResult<ArrayRef> {
         let indices = UInt32Array::from_iter([Some(row_index)]);
         arrow_select::take::take(vectors, &indices, None)
@@ -2475,7 +2507,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via [`build_dataset_prefilter`],
+/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
@@ -2530,6 +2562,32 @@ impl ANNIvfBatchExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Returns a reference to the vector query. Its `key` holds all
+    /// [`Self::query_count`] vectors concatenated.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Returns the number of query vectors packed into [`Self::query`].
+    pub fn query_count(&self) -> usize {
+        self.query_count
+    }
+
+    /// Returns a reference to the dataset.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Returns a reference to the index metadata.
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
     }
 }
 
@@ -4365,6 +4423,51 @@ mod tests {
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
+    }
+
+    #[test]
+    fn test_batch_with_k_rebuilds_the_cut_and_keeps_the_schema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
+        let query = Arc::new(Float32Array::from(vec![
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+        ])) as ArrayRef;
+        let plan = KNNVectorDistanceExec::try_new_batch(
+            input,
+            "vec",
+            query,
+            KnnBatchParams {
+                is_batch: true,
+                query_count: 2,
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+                distance_type: DistanceType::L2,
+                retain_vector: false,
+            },
+        )
+        .unwrap();
+
+        let widened = plan.with_k(7).unwrap();
+        assert_eq!(widened.k, 7);
+        assert_eq!(widened.query_count, 2);
+        assert!(widened.is_batch);
+        assert_eq!(widened.schema(), plan.schema());
+        assert_eq!(plan.k, 2, "the original node is left alone");
+
+        assert!(plan.with_k(0).is_err(), "batch k must stay positive");
     }
 
     #[test]
