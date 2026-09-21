@@ -17,6 +17,8 @@ package lance.transaction;
  * A `CompositeOperation` replaces the legacy `Operation` (see
  * transaction.proto) with an ordered list of `UserStep`s, each expanding to
  * an ordered list of `Action`s, committing atomically as one manifest change.
+ * Reading is fail-closed: an action this build does not recognize aborts the
+ * load rather than being skipped. Writing is opt-in, for the reason below.
  *
  * COMPATIBILITY. Any reader can open a table version carrying one of these,
  * since the inline transaction is in a manifest field older readers ignore
