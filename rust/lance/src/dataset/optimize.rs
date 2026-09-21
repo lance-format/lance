@@ -2255,24 +2255,11 @@ async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, R
     Ok(coverage)
 }
 
-/// The indices that a fragment-reuse index would corrupt rather than repair.
+/// Indexes that use the row ids instead of row addresses.
 ///
-/// The FRI remaps row *addresses*. Without stable row ids an address is the row
-/// id, so every index is a valid target. With stable row ids the two domains
-/// diverge, and they are not merely redundant but unsafe to confuse: stable row
-/// ids start at zero and increment, so a row id is numerically
-/// indistinguishable from an address into fragment 0. An FRI applied to a
-/// row-id-domain index would silently rewrite valid row ids rather than fail.
-///
-/// So an FRI and a row-id-domain index cannot coexist on a stable-row-id
-/// dataset. Compaction refuses to write one while such an index is present, and
-/// `create_index` refuses to add one while an FRI is present.
-///
-/// Empty once every index stores row addresses.
+/// Row id indexes are a legacy we are migrating away from.  These are not compatible
+/// with stable row id and the fragment reuse index.
 async fn row_id_domain_indices(dataset: &Dataset) -> Result<Vec<String>> {
-    if !dataset.manifest.uses_stable_row_ids() {
-        return Ok(Vec::new());
-    }
     Ok(load_all_indices(dataset)
         .await?
         .iter()
@@ -2281,18 +2268,12 @@ async fn row_id_domain_indices(dataset: &Dataset) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Refuse a deferred remap that would strand a row-id-domain index under a FRI.
-///
-/// Checked at the plan boundary so nothing is rewritten, and again at the commit
-/// boundary: `CompactionPlan` is public and serializable, a caller may supply
-/// its own [`CompactionPlanner`], and a distributed driver hands
-/// [`commit_compaction`] results planned elsewhere -- possibly before the index
-/// existed.
+/// Refuse a deferred remap that would strand a row-id-domain index under an FRI.
 async fn reject_deferred_remap_with_row_id_indices(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<()> {
-    if !options.defer_index_remap {
+    if !options.defer_index_remap || !dataset.manifest.uses_stable_row_ids() {
         return Ok(());
     }
     let blocked = row_id_domain_indices(dataset).await?;
