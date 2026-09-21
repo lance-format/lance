@@ -140,11 +140,9 @@ impl IndexMetadata {
     /// Such an index cannot follow its data through a rewrite: the addresses it stores
     /// name fragments and offsets, and neither kind supports remap.
     ///
-    /// Answers for an existing index from its persisted details.
-    /// `BuiltinIndexType::results_are_row_addrs` answers the same question for an index
-    /// about to be created, from its type; the two must agree. A type missing from
-    /// either list is treated as row-id-domain, which costs a refused deferred remap or
-    /// a refused index creation rather than silent corruption.
+    /// Currently this is a rather short list.  We will soon be migrating the remaining
+    /// row-id-domain indexes to use row addresses.  At that point this list will grow and
+    /// likely turn from an allow-list into a block-list.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             let is_fm = details
