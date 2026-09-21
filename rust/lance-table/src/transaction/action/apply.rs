@@ -35,24 +35,19 @@ pub(super) const TOMBSTONED_FIELD: i32 = -2;
 impl Transaction {
     /// Build the next manifest by applying an action set.
     ///
-    /// Unlike the legacy path this always requires a current manifest: an action
-    /// set describes a delta, so there is nothing for it to be a delta against
-    /// when the dataset does not exist yet.
+    /// Takes the current manifest by reference, unlike the legacy path: an
+    /// action set is a delta, so there is nothing for it to be a delta against
+    /// when the dataset does not exist yet. The caller turns the absent case
+    /// into an error, which is where the `Option` it holds actually lives.
     pub(in crate::transaction) fn build_manifest_from_actions(
         &self,
         composite_operation: &CompositeOperation,
-        current_manifest: Option<&Manifest>,
+        current_manifest: &Manifest,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        let current_manifest = current_manifest.ok_or_else(|| {
-            Error::invalid_input(
-                "an action-based transaction describes a change to an existing dataset; \
-                 it cannot create one",
-            )
-        })?;
         if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
             return Err(Error::not_supported_source(
                 "Cannot enable stable row ids on existing dataset".into(),

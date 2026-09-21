@@ -411,6 +411,12 @@ impl Transaction {
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if let Operation::CompositeOperation(composite_operation) = &self.operation {
+            let current_manifest = current_manifest.ok_or_else(|| {
+                Error::invalid_input(
+                    "an action-based transaction describes a change to an existing dataset; \
+                     it cannot create one",
+                )
+            })?;
             return self.build_manifest_from_actions(
                 composite_operation,
                 current_manifest,
