@@ -48,9 +48,15 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // No `migration_next_row_id` escape, unlike the legacy guard in
+        // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
+        // activates the flag with an `Operation::Merge`, so an action set
+        // never carries that watermark.
         if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
             return Err(Error::not_supported_source(
-                "Cannot enable stable row ids on existing dataset".into(),
+                "This dataset was not created with the stable row ids feature.  Please run \
+                 `migrate_to_stable_row_ids` before attempting to use stable row ids"
+                    .into(),
             ));
         }
 
