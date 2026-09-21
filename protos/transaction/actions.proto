@@ -13,102 +13,42 @@ package lance.table;
 /*
  * Action-based transactions (Transaction V2) — DRAFT.
  *
- * A `CompositeOperation` replaces the single legacy `Operation` (see
- * transaction.proto) with an ordered list of granular `Action`s that commit
- * atomically as one manifest change. This file is the wire draft only.
+ * A `CompositeOperation` replaces the legacy `Operation` (see
+ * transaction.proto) with an ordered list of `Action`s committing
+ * atomically as one manifest change. This file is the wire draft only: the
+ * field numbers are not yet a stable contract, and support here is read-side
+ * fail-closed — rejected on load, with no write path.
  *
- * STATUS
- * ------
- * The messages and field numbers here are NOT yet a stable contract. Library
- * support is read-side fail-closed only: a transaction carrying a
- * `CompositeOperation` is rejected on load, and there is no write path. Apply,
- * id translation, and conflict resolution are intentionally absent.
+ * Why it is shaped this way:
  *
- * DESIGN RATIONALE
- * ----------------
- * The reasoning below is the durable record of why the wire format is shaped
- * this way; it is deliberately kept in-tree rather than in an external tracker.
+ * 1. Actions are deltas, not post-images: each records *the change* to the
+ *    manifest, not the resulting state. That is what lets actions compose
+ *    into one commit, and replay onto another branch, with no special cases.
  *
- * 1. Actions are deltas, not post-images. Each action records *the change* to
- *    the manifest (add this file, tombstone this field), not the resulting
- *    state. Deltas are what make two things fall out uniformly with no special
- *    cases: composing several actions into one atomic commit, and merging or
- *    rebasing a branch (replay the deltas against the target). A few actions
- *    that carry non-derivable preconditions are the exception (see 8).
+ * 2. `Ref = Committed | Local`. A minting action cannot know its
+ *    counter-allocated id (field, fragment, base) until commit, and gets a
+ *    different one when replayed onto another target, so it names the id with
+ *    a `Local` token resolved against the target's counters at apply. A
+ *    writer that must bake an id into a file it writes in the same commit
+ *    instead takes `Committed` ids from a range an earlier commit reserved
+ *    (`ReserveFragmentIds`, `ReserveRowIds`).
  *
- * 2. Minting vs. reference-stable actions. Minting actions allocate a new
- *    counter-based id (a field id, fragment id, or base id). Because the final
- *    id is not known until commit — and differs when the same action is
- *    replayed onto a different target during merge/rebase — a minting action
- *    names its new id with a `Local` token (see `Ref`) rather than a concrete
- *    value. Reference-stable actions touch already-committed ids at stable
- *    coordinates (a fragment's deletion vector, a config key); their target is
- *    unambiguous, so they may safely carry a post-image at rest.
+ * 3. Schema changes are per field (`AddField` / `DropField` / `AlterField`),
+ *    never a wholesale replacement, so disjoint edits commute. `AlterField`
+ *    preserves the field id and makes each mutable facet an independent
+ *    optional, so concurrent alters of different facets commute too.
  *
- *    The exception is a writer that has to know an id *before* it commits,
- *    because it bakes that id into a file it writes in the same commit — an
- *    index whose payload holds row addresses or row ids cannot be written
- *    against a `Local` token. Such a writer takes ids from a range an earlier
- *    commit reserved (`ReserveFragmentIds`, `ReserveRowIds`) and names them as
- *    `Committed`. The reservation is what makes that safe: the ids are the
- *    writer's alone, so they stay valid at every later version and nothing has
- *    to be re-resolved when the operation is replayed. It costs an extra
- *    commit, which is why it is the exception and not the rule.
+ * 4. Index actions target a segment by UUID: the format has no index apart
+ *    from its segments, and a logical index is the set of segments sharing a
+ *    `name`.
  *
- * 3. One reference type, `Ref = Committed | Local`. `Committed` is a concrete,
- *    already-assigned id. `Local` is a placeholder minted by an earlier `Add*`
- *    action in the same operation. `Local` resolves to a freshly-allocated
- *    committed id at apply time, and re-resolves against the *target's*
- *    counters on merge/rebase — which is exactly what lets two independent
- *    `AddField`s on divergent branches become two distinct fields on merge.
+ * 5. Assertions carry only preconditions no post-image can reconstruct, e.g.
+ *    the keys a merge-insert inserted (`AssertUniqueKeys`).
  *
- * 4. Relocation by counter watermark. When an operation is replayed onto a
- *    newer version, minting actions are re-applied against the target's
- *    counters and their `Local` refs re-resolve; ids assigned above the
- *    read-version watermark are known to be freshly minted and are rewritten
- *    consistently across every action that referenced them.
- *
- * 5. Field-level schema. Schema changes are expressed per field
- *    (`AddField` / `DropField` / `AlterField`), never as a wholesale
- *    replacement, so concurrent schema edits to disjoint fields commute.
- *
- * 6. Identity-preserving `AlterField`. Altering a field is distinct from
- *    dropping it and adding a new one: the field keeps its id. Each mutable
- *    facet (name, type, nullability) is an independent optional, so two
- *    concurrent alters of *different* facets of the same field commute
- *    (e.g. a widening cast alongside a non-null -> nullable relaxation).
- *
- * 7. Index segments, not indices. The format has no first-class "index"
- *    separate from its segments; a new index is written as its first segment,
- *    and a logical index is the set of segments sharing a `name`. The actions
- *    mirror that: add/remove/adjust operate on a segment (by UUID). The
- *    resulting per-segment config duplication is a pre-existing limitation this
- *    draft does not attempt to fix.
- *
- * 8. Assertions carry only non-derivable preconditions. Most conflict checks
- *    are computed from the actions themselves. The exception is a fact that
- *    cannot be reconstructed from any post-image — e.g. the set of keys a
- *    merge-insert inserted — which is carried explicitly as an assertion
- *    (`AssertUniqueKeys`) and checked against concurrent commits.
- *
- * WHAT STAYS OFF THE WIRE
- * -----------------------
- * Two classes of information are deliberately not serialized, and are
- * recomputed at conflict time instead:
- *   - Conflict *footprints* (which fields/fragments/keys an action touches).
- *     These are a pure function of each action, so storing them would only risk
- *     drift.
- *   - Large derivable row-level deltas, e.g. a deletion's affected rows or an
- *     update's matched row offsets. These can be recomputed by diffing against
- *     the read-version state, and serializing them would bloat transactions
- *     with potentially huge integer lists.
- *
- * ADDITIVE-SAFETY
- * ---------------
- * The schema is meant to evolve additively: message identities and the core
- * mutation fields are pinned, and anything discovered during implementation
- * should arrive as an *added* optional field rather than a reshaping of what is
- * here.
+ * Deliberately off the wire and recomputed instead: conflict footprints, a
+ * pure function of each action, and large derivable row-level deltas,
+ * recoverable by diffing against the read-version state. The schema evolves
+ * additively — new optional fields, not a reshaping of what is here.
  */
 
 /*
@@ -161,10 +101,6 @@ message UserAction {
 /*
  * A single granular change (a delta) or assertion. Legacy operations decompose
  * into an ordered list of these.
- *
- * TODO: the `data_change` markers on the actions below are drafted per-action
- * for maximum flexibility; revisit whether per-action or per-UserAction
- * granularity is the right unit before the format stabilizes.
  */
 message Action {
   oneof action {
