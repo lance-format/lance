@@ -73,6 +73,12 @@ impl Updater {
         batch_size: Option<u32>,
         write_version: ConcreteFileVersion,
     ) -> Result<Self> {
+        if batch_size == Some(0) {
+            return Err(Error::invalid_input(format!(
+                "batch_size must be greater than zero, got 0 for fragment {}",
+                fragment.id()
+            )));
+        }
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
         } else {

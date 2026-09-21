@@ -24,7 +24,7 @@ use crate::{
         CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     },
     format::ProtobufUtils21,
-    repdef::{DefinitionInterpretation, RepDefUnraveler},
+    repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
 pub(crate) fn encode_constant_page(
@@ -133,11 +133,7 @@ impl ConstantPageScheduler {
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Result<Self> {
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
-        let max_visible_def = def_meaning
-            .iter()
-            .take_while(|d| !d.is_list())
-            .map(|d| d.num_def_levels())
-            .sum();
+        let max_visible_def = max_visible_level(&def_meaning);
 
         let (scalar_source, rep_buf_idx, def_buf_idx) =
             match (inline_value, buffer_offsets_and_sizes.len()) {

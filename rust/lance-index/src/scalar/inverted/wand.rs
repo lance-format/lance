@@ -1185,6 +1185,10 @@ impl PostingIterator {
     }
 
     fn position_cursor(&self) -> Result<PositionCursor<'_>> {
+        #[cfg(test)]
+        {
+            POSITION_CURSOR_CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
         match self.list {
             PostingList::Plain(ref list) => {
                 let positions = list.positions.as_ref().ok_or_else(|| {
@@ -1402,9 +1406,17 @@ impl PostingIterator {
                     if new_offset < compressed.doc_ids.len() {
                         self.index = (block_idx << shift) + new_offset;
                         self.block_idx = block_idx;
+                        // Frequencies stay lazy, but once this block's stream is
+                        // decoded every later candidate in it can carry its
+                        // frequency for free instead of re-materializing in `doc`.
+                        let frequency = if compressed.frequency_block_idx == Some(block_idx) {
+                            compressed.freqs[new_offset]
+                        } else {
+                            0
+                        };
                         self.current_doc = Some(DocInfo::Raw(RawDocInfo {
                             doc_id: compressed.doc_ids[new_offset],
-                            frequency: 0,
+                            frequency,
                         }));
                         return;
                     }
@@ -1800,6 +1812,82 @@ fn score_sum_cannot_compete(
 }
 
 type ScoreContribution = ((u32, u32), f32);
+
+/// Largest `f32` partial score that `score_sum_cannot_compete` still rejects
+/// under the exclusive floor, given the other clauses' upper bound. The
+/// rejection predicate is monotone in the partial score, so every score at or
+/// below the returned limit is rejected and every score above it competes.
+/// Returns `None` when no finite score is rejected.
+fn exclusive_partial_score_limit(
+    remaining_upper_bound: f64,
+    floor: f32,
+    upper_bound_factor: f64,
+) -> Option<f32> {
+    let rejects = |score: f32| {
+        score_sum_cannot_compete(
+            score,
+            remaining_upper_bound,
+            floor,
+            upper_bound_factor,
+            CompetitiveFloorMode::Exclusive,
+        )
+    };
+    if !remaining_upper_bound.is_finite() || !floor.is_finite() {
+        return None;
+    }
+    // Start from the real-valued boundary and walk at most a few ULPs to the
+    // exact f32 boundary of the (monotone) predicate.
+    let mut limit = ((f64::from(floor) / upper_bound_factor) - remaining_upper_bound) as f32;
+    if !limit.is_finite() {
+        return None;
+    }
+    if rejects(limit) {
+        for _ in 0..8 {
+            let up = next_up_f32(limit);
+            if up == limit || !rejects(up) {
+                return Some(limit);
+            }
+            limit = up;
+        }
+    } else {
+        for _ in 0..8 {
+            let down = next_down_f32(limit);
+            if down == limit {
+                return None;
+            }
+            if rejects(down) {
+                return Some(down);
+            }
+            limit = down;
+        }
+    }
+    // The walk did not converge (pathological inputs); fall back to an exact
+    // binary search over the ordered f32 bit patterns.
+    let mut lo = f32::MIN;
+    let mut hi = f32::MAX;
+    if !rejects(lo) {
+        return None;
+    }
+    if rejects(hi) {
+        return Some(hi);
+    }
+    for _ in 0..64 {
+        let mid = f32::from_bits(((lo.to_bits() as i64 + hi.to_bits() as i64) / 2) as u32);
+        if mid == lo || mid == hi {
+            break;
+        }
+        if rejects(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
+fn next_down_f32(value: f32) -> f32 {
+    -next_up_f32(-value)
+}
 
 #[inline]
 fn score_contributions_in_query_order(mut contributions: SmallVec<[ScoreContribution; 8]>) -> f32 {
@@ -2236,6 +2324,8 @@ struct AndWindowStats {
     candidates_returned: usize,
     score_first_rejections: usize,
     pairwise_intersections: usize,
+    windows_sliced: usize,
+    windows_frequency_pruned: usize,
 }
 
 impl Eq for TailPosting {}
@@ -3825,6 +3915,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
             });
         let phrase_slop = params.phrase_slop;
+        // The bulk path never evaluates score-first windows, so keep the block
+        // advance from preparing suffix bounds it would not use.
+        self.invalidate_score_first_and_window();
+        self.score_first_and_enabled = false;
         let mut score_order = (0..num_lists).collect::<Vec<_>>();
         score_order.sort_unstable_by_key(|&index| {
             let posting = &self.lead[index];
@@ -3888,7 +3982,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // the clause sup), so every skipped doc would also fail the exact
         // per-candidate prune: results are unchanged, the work never happens.
         macro_rules! merge_kernels {
-            ($name2:ident, $name3:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
+            ($name2:ident, $name3:ident, $name_n:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
                 $(#[$feat])?
                 unsafe fn $name2(
                     wins: &[WindowList],
@@ -3971,6 +4065,50 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
 
                 $(#[$feat])?
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn $name_n(
+                    wins: &[WindowList],
+                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                    cursors: &mut Vec<usize>,
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    cursors.clear();
+                    cursors.extend(wins.iter().map(|win| win.pos));
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let f0 = wins[0].freqs;
+                    unsafe {
+                        'outer: while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                            if freq_cannot_beat[freq] {
+                                p0 += 1;
+                                continue 'outer;
+                            }
+                            for j in 1..wins.len() {
+                                let win = wins.get_unchecked(j);
+                                let pos = $geq(win.docs, *cursors.get_unchecked(j), win.end, doc);
+                                *cursors.get_unchecked_mut(j) = pos;
+                                if pos >= win.end {
+                                    return;
+                                }
+                                let clause_doc = *win.docs.add(pos);
+                                if clause_doc > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, clause_doc);
+                                    continue 'outer;
+                                }
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            for j in 1..wins.len() {
+                                offs_out.push(*cursors.get_unchecked(j) as u8);
+                            }
+                            p0 += 1;
+                        }
+                    }
+                }
+
+                $(#[$feat])?
                 unsafe fn $docs_name2(
                     wins: &[WindowList],
                     docs_out: &mut Vec<u32>,
@@ -4041,6 +4179,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         merge_kernels!(
             merge_window_2,
             merge_window_3,
+            merge_window_n,
             merge_window_docs_2,
             merge_window_docs_3,
             find_next_geq_scalar
@@ -4049,6 +4188,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         merge_kernels!(
             merge_window_2_avx2,
             merge_window_3_avx2,
+            merge_window_n_avx2,
             merge_window_docs_2_avx2,
             merge_window_docs_3_avx2,
             find_next_geq_avx2,
@@ -4061,48 +4201,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             for pos in win.pos..win.end {
                 docs_out.push(unsafe { *win.docs.add(pos) });
                 offs_out.push(pos as u8);
-            }
-        }
-
-        #[inline]
-        #[allow(clippy::too_many_arguments)]
-        fn merge_window_n(
-            wins: &[WindowList],
-            freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
-            cursors: &mut Vec<usize>,
-            docs_out: &mut Vec<u32>,
-            offs_out: &mut Vec<u8>,
-        ) {
-            cursors.clear();
-            cursors.extend(wins.iter().map(|win| win.pos));
-            'outer: while cursors[0] < wins[0].end {
-                let doc = unsafe { *wins[0].docs.add(cursors[0]) };
-                let freq =
-                    unsafe { *wins[0].freqs.add(cursors[0]) as usize }.min(FREQ_LUT_BUCKETS - 1);
-                if freq_cannot_beat[freq] {
-                    cursors[0] += 1;
-                    continue 'outer;
-                }
-                for j in 1..wins.len() {
-                    let win = &wins[j];
-                    let pos = unsafe { find_next_geq(win.docs, cursors[j], win.end, doc) };
-                    cursors[j] = pos;
-                    if pos >= win.end {
-                        return;
-                    }
-                    let clause_doc = unsafe { *win.docs.add(pos) };
-                    if clause_doc > doc {
-                        cursors[0] = unsafe {
-                            find_next_geq(wins[0].docs, cursors[0] + 1, wins[0].end, clause_doc)
-                        };
-                        continue 'outer;
-                    }
-                }
-                docs_out.push(doc);
-                for &pos in cursors.iter() {
-                    offs_out.push(pos as u8);
-                }
-                cursors[0] += 1;
             }
         }
 
@@ -4221,6 +4319,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
         let mut intersection_scratch: Vec<u32> = Vec::new();
+        // The frequency-bucket prune decisions only depend on the floor and
+        // the followers' block maxes, which rarely change between windows.
+        let mut freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+        // Keyed separately from the score limit: the per-candidate prune can
+        // refresh the limit in the middle of a window without touching the
+        // table, so an unchanged limit key does not mean the table is current.
+        let mut freq_cannot_beat_key: Option<(u32, u64)> = None;
+        // Per clause: the block that was sliced last and the end of that
+        // slice. Windows are contiguous, so the next slice of the same block
+        // starts where the previous one ended instead of at a binary search.
+        let mut slice_prev: SmallVec<[(usize, usize); 8]> =
+            std::iter::repeat_n((usize::MAX, 0), num_lists).collect();
         // Norm cache: one byte-norm load plus a cached addend replaces the
         // per-clause BM25 denominator recompute in pass B.
         let mut norm_k = None;
@@ -4237,6 +4347,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // candidate still goes through the exact per-candidate prune below.
         const FREQ_LUT_BUCKETS: usize = 64;
         let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
+        // Exclusive limit on the first clause's partial score for the current
+        // window: scores at or below it cannot beat the floor. Recomputed only
+        // when the floor or the followers' block maxes change.
+        let mut first_score_limit: Option<f32> = None;
+        let mut first_score_limit_key: Option<(u32, u64)> = None;
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
@@ -4248,6 +4363,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         'window: loop {
+            #[cfg(test)]
+            {
+                self.and_window_stats.windows_sliced += 1;
+            }
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
@@ -4295,26 +4414,49 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             wins.clear();
             let mut skip_window = false;
             let mut exhausted = false;
-            for posting in &self.lead {
+            // When a clause has no document in the window, the conjunction
+            // cannot match before that clause's next document, so the next
+            // window starts there instead of at the next block boundary. A
+            // sparse lead then drives the traversal and dense followers skip
+            // whole blocks by metadata instead of being sliced block by block.
+            let mut jump_to: u64 = 0;
+            for (j, posting) in self.lead.iter().enumerate() {
                 let PostingList::Compressed(ref list) = posting.list else {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let block_idx = posting.block_idx;
                 let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
-                let lo = state.doc_ids.partition_point(|&doc| doc < target32);
-                let hi = if win_end32 == u32::MAX {
-                    state.doc_ids.len()
+                let doc_ids = state.doc_ids.as_slice();
+                let len = doc_ids.len();
+                // Everything before the previous slice's end of this block is
+                // below the current target, so resume from there.
+                let (prev_block, prev_hi) = slice_prev[j];
+                let start = if prev_block == block_idx {
+                    prev_hi.min(len)
                 } else {
-                    lo + state.doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+                    0
                 };
+                let lo = if start < len && doc_ids[start] >= target32 {
+                    start
+                } else {
+                    start + doc_ids[start..].partition_point(|&doc| doc < target32)
+                };
+                let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+                    len
+                } else {
+                    lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+                };
+                slice_prev[j] = (block_idx, hi);
                 if lo == hi {
                     // No docs of this clause in the window: the whole window
                     // has no conjunction match. If this was the clause's last
                     // block and it is fully behind the target, the clause is
                     // exhausted and the conjunction is done.
-                    if block_idx + 1 >= list.blocks.len()
-                        && state.doc_ids.last().is_none_or(|&doc| doc < target32)
-                    {
+                    if lo < state.doc_ids.len() {
+                        jump_to = u64::from(state.doc_ids[lo]);
+                    } else if block_idx + 1 < list.blocks.len() {
+                        jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
+                    } else {
                         exhausted = true;
                     }
                     skip_window = true;
@@ -4351,7 +4493,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // Precompute the conservative decision once per frequency
                 // bucket so the scalar and SIMD merge kernels stay
                 // floating-point-free.
-                let freq_cannot_beat = if window_started_with_floor && num_lists >= 2 {
+                if window_started_with_floor && num_lists >= 2 {
                     let posting = &self.lead[0];
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
@@ -4360,21 +4502,37 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
                     };
                     wins[0].freqs = state.freqs.as_ptr();
-                    let freq_bound_lut = freq_bound_lut
-                        .as_ref()
-                        .expect("positive threshold should initialize the frequency bound LUT");
-                    std::array::from_fn(|frequency| {
-                        score_sum_cannot_compete(
-                            freq_bound_lut[frequency],
-                            others_block_max.expect("positive floor should initialize bounds"),
+                    let others_block_max =
+                        others_block_max.expect("positive floor should initialize bounds");
+                    let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                    if first_score_limit_key != Some(key) {
+                        first_score_limit = exclusive_partial_score_limit(
+                            others_block_max,
                             self.threshold,
                             score_sum_upper_bound_factor(num_lists),
-                            CompetitiveFloorMode::Exclusive,
-                        )
-                    })
-                } else {
-                    [false; FREQ_LUT_BUCKETS]
-                };
+                        );
+                        first_score_limit_key = Some(key);
+                    }
+                    if freq_cannot_beat_key != Some(key) {
+                        let freq_bound_lut = freq_bound_lut
+                            .as_ref()
+                            .expect("positive threshold should initialize the frequency bound LUT");
+                        freq_cannot_beat = match first_score_limit {
+                            Some(limit) => {
+                                std::array::from_fn(|frequency| freq_bound_lut[frequency] <= limit)
+                            }
+                            None => [false; FREQ_LUT_BUCKETS],
+                        };
+                        freq_cannot_beat_key = Some(key);
+                    }
+                } else if freq_cannot_beat_key.is_some() {
+                    freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+                    freq_cannot_beat_key = None;
+                }
+                #[cfg(test)]
+                if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                    self.and_window_stats.windows_frequency_pruned += 1;
+                }
                 #[cfg(target_arch = "x86_64")]
                 let use_avx2 = *HAS_AVX2;
                 #[cfg(not(target_arch = "x86_64"))]
@@ -4437,13 +4595,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, _, true) => unsafe {
                         merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
                     },
-                    (_, _, true) => merge_window_n(
-                        &wins,
-                        &freq_cannot_beat,
-                        &mut cursor_scratch,
-                        &mut batch_docs,
-                        &mut batch_offs,
-                    ),
+                    #[cfg(target_arch = "x86_64")]
+                    (_, true, true) => unsafe {
+                        merge_window_n_avx2(
+                            &wins,
+                            &freq_cannot_beat,
+                            &mut cursor_scratch,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
+                    (_, _, true) => unsafe {
+                        merge_window_n(
+                            &wins,
+                            &freq_cannot_beat,
+                            &mut cursor_scratch,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
                 }
 
                 if !batch_docs.is_empty() {
@@ -4522,13 +4692,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             None => self.lead[0].score(&self.scorer, first_freq, doc_length),
                         };
-                        if score_sum_cannot_compete(
-                            first_score,
-                            others_block_max,
-                            self.threshold,
-                            score_sum_upper_bound_factor(num_lists),
-                            CompetitiveFloorMode::Exclusive,
-                        ) {
+                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                        if first_score_limit_key != Some(key) {
+                            first_score_limit = exclusive_partial_score_limit(
+                                others_block_max,
+                                self.threshold,
+                                score_sum_upper_bound_factor(num_lists),
+                            );
+                            first_score_limit_key = Some(key);
+                        }
+                        if first_score_limit.is_some_and(|limit| first_score <= limit) {
                             continue;
                         }
                     }
@@ -4621,7 +4794,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if win_end == TERMINATED_DOC_ID {
                 break;
             }
-            target = win_end + 1;
+            target = (win_end + 1).max(jump_to);
         }
 
         metrics.record_comparisons(num_comparisons);
@@ -5294,106 +5467,223 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Allocation-free exact-phrase check for the bulk conjunction path,
-    /// where every clause is a parked `lead` iterator. Semantically identical
-    /// to [`Self::check_exact_positions`] — some base position must align all
-    /// clauses at their query offsets — without the per-candidate cursor vec
-    /// and sort.
+    /// Exact-phrase check for the bulk conjunction path, where every clause
+    /// is a parked `lead` iterator. Semantically identical to
+    /// [`Self::check_exact_positions`].
     fn check_exact_positions_bulk(&self) -> Result<bool> {
         #[cfg(test)]
         {
             self.phrase_position_checks
                 .set(self.phrase_position_checks.get() + 1);
         }
-        const MAX_INLINE_CLAUSES: usize = 16;
-        let num_clauses = self.lead.len();
-        if num_clauses > MAX_INLINE_CLAUSES {
-            return self.check_exact_positions();
-        }
-        // Cursors stay alive in the stack array so owned position buffers
-        // (legacy per-doc storage) remain valid while we scan.
-        let mut cursors: [Option<PositionCursor<'_>>; MAX_INLINE_CLAUSES] =
-            std::array::from_fn(|_| None);
-        let mut anchor_idx = 0usize;
-        let mut anchor_len = usize::MAX;
-        for (index, (slot, posting)) in cursors.iter_mut().zip(self.lead.iter()).enumerate() {
-            let cursor = posting.position_cursor()?;
-            if cursor.len() < anchor_len {
-                anchor_len = cursor.len();
-                anchor_idx = index;
-            }
-            *slot = Some(cursor);
-        }
-
-        let anchor = cursors[anchor_idx]
-            .as_ref()
-            .expect("anchor cursor was just populated");
-        let anchor_offset = anchor.position_in_query as u32;
-        'anchor: for &anchor_position in anchor.positions.as_slice() {
-            let Some(base) = anchor_position.checked_sub(anchor_offset) else {
-                continue;
-            };
-            for (index, slot) in cursors[..num_clauses].iter().enumerate() {
-                if index == anchor_idx {
-                    continue;
-                }
-                let cursor = slot.as_ref().expect("clause cursor was just populated");
-                let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                if cursor.positions.as_slice().binary_search(&target).is_err() {
-                    continue 'anchor;
-                }
-            }
-            return Ok(true);
-        }
-        Ok(false)
+        exact_phrase_positions_match(
+            self.lead.len(),
+            |index| {
+                self.lead[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            },
+            |index| self.lead[index].position_cursor(),
+        )
     }
 
     fn check_exact_positions(&self) -> Result<bool> {
-        let mut position_iters = self
-            .current_doc_postings()
-            .into_iter()
-            .map(PostingIterator::position_cursor)
-            .collect::<Result<Vec<_>>>()?;
-        position_iters.sort_unstable_by_key(|iter| iter.len());
-        let Some(lead) = position_iters.first() else {
-            return Ok(false);
-        };
-        let lead_position = lead.position_in_query;
+        let postings = self.current_doc_postings();
+        exact_phrase_positions_match(
+            postings.len(),
+            |index| {
+                postings[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            },
+            |index| postings[index].position_cursor(),
+        )
+    }
+}
 
-        loop {
-            let Some(anchor) = position_iters[0].absolute_position() else {
+/// Decode exact-phrase position lists in current-doc frequency order.
+///
+/// Term frequency equals the position count, so a stopword on this document
+/// is decoded last. If the two rarest lists share no phrase base, the rest
+/// (typically `"the"` / `"of"`) are never unpacked.
+fn exact_phrase_positions_match<'a>(
+    num_clauses: usize,
+    frequency: impl Fn(usize) -> u32,
+    decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
+) -> Result<bool> {
+    const MAX_INLINE_CLAUSES: usize = 16;
+    if num_clauses == 0 {
+        return Ok(false);
+    }
+    if num_clauses > MAX_INLINE_CLAUSES {
+        let mut order: Vec<usize> = (0..num_clauses).collect();
+        order.sort_unstable_by_key(|&index| frequency(index));
+        let mut cursors: Vec<Option<PositionCursor<'a>>> = (0..num_clauses).map(|_| None).collect();
+        return exact_phrase_scan(&order, &mut cursors, decode);
+    }
+    let mut order = [0usize; MAX_INLINE_CLAUSES];
+    for (index, slot) in order.iter_mut().enumerate().take(num_clauses) {
+        *slot = index;
+    }
+    order[..num_clauses].sort_unstable_by_key(|&index| frequency(index));
+    let mut cursors: [Option<PositionCursor<'a>>; MAX_INLINE_CLAUSES] =
+        std::array::from_fn(|_| None);
+    exact_phrase_scan(&order[..num_clauses], &mut cursors, decode)
+}
+
+fn exact_phrase_scan<'a>(
+    order: &[usize],
+    cursors: &mut [Option<PositionCursor<'a>>],
+    mut decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
+) -> Result<bool> {
+    let num_clauses = order.len();
+    if num_clauses == 0 {
+        return Ok(false);
+    }
+    let rarest = order[0];
+    cursors[rarest] = Some(decode(rarest)?);
+    let (n_pos, anchor_offset) = {
+        let cursor = cursors[rarest]
+            .as_ref()
+            .expect("rarest clause cursor was just populated");
+        (cursor.len(), cursor.position_in_query as u32)
+    };
+    if num_clauses == 1 {
+        return Ok(n_pos > 0);
+    }
+
+    // Every clause's target is `anchor_position - anchor_offset + query_offset`,
+    // which is strictly increasing in the anchor. Two consequences the loop
+    // below exploits:
+    //
+    //   * a follower is never searched from the start. Each cursor keeps its own
+    //     index and only moves forward, so a failed probe leaves it sitting on
+    //     the first position above the target - which is also the smallest
+    //     position any *later* anchor can align with.
+    //   * the anchor can therefore be jumped straight to that position instead
+    //     of stepping over every candidate in between. None of them can match:
+    //     their targets all land in the gap the follower was just shown to have.
+    //
+    // Both moves start from the current index and only move forward, so the
+    // per-document cost is bounded by the decoded position counts rather than
+    // by their product. The jump is taken only when it skips at least one
+    // anchor position, which needs no counter, budget or mode switch: the two
+    // regimes (far-apart lists vs interleaved lists) separate themselves.
+    let mut anchor_idx = 0usize;
+    'anchor: while anchor_idx < n_pos {
+        #[cfg(test)]
+        {
+            count_anchor_steps();
+        }
+        let anchor_position = cursors[rarest]
+            .as_ref()
+            .expect("rarest clause cursor was just populated")
+            .positions
+            .as_slice()[anchor_idx];
+        let Some(base) = anchor_position.checked_sub(anchor_offset) else {
+            anchor_idx += 1;
+            continue 'anchor;
+        };
+        for &index in &order[1..num_clauses] {
+            if cursors[index].is_none() {
+                cursors[index] = Some(decode(index)?);
+            }
+            let query_offset = cursors[index]
+                .as_ref()
+                .expect("phrase clause cursor was just populated")
+                .position_in_query as u32;
+            let Some(target) = base.checked_add(query_offset) else {
                 return Ok(false);
             };
-            let Some(base) = anchor.checked_sub(lead_position as u32) else {
-                position_iters[0].advance_next();
-                continue;
+            let Some(position) = cursors[index]
+                .as_mut()
+                .expect("phrase clause cursor was just populated")
+                .advance_to_at_least(target)
+            else {
+                // No follower position reaches `target`, and every later anchor
+                // only raises it, so no remaining base can align either.
+                return Ok(false);
             };
-
-            let mut next_lead_relative = None;
-            let mut matched = true;
-            for follower in position_iters.iter_mut().skip(1) {
-                let Some(target) = base.checked_add(follower.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                let Some(position) = follower.advance_to_absolute(target) else {
-                    return Ok(false);
-                };
-                if position != target {
-                    next_lead_relative = Some(position as i32 - follower.position_in_query);
-                    matched = false;
-                    break;
+            if position == target {
+                continue;
+            }
+            let next_anchor = position
+                .saturating_sub(query_offset)
+                .saturating_add(anchor_offset);
+            anchor_idx = {
+                let anchor_positions = cursors[rarest]
+                    .as_ref()
+                    .expect("rarest clause cursor was just populated")
+                    .positions
+                    .as_slice();
+                // Only pay for the jump when it actually skips something. If the
+                // very next anchor position is already below the bound, the jump
+                // would land one step ahead anyway, and a plain step gets there
+                // without the extra binary search. This is what separates the
+                // two regimes: on disjoint lists the first jump crosses the whole
+                // anchor, while on interleaved lists every bound lands one
+                // position ahead and the scan degrades to stepping.
+                match anchor_positions.get(anchor_idx + 1) {
+                    Some(&next_position) if next_position < next_anchor => {
+                        anchor_idx
+                            + anchor_positions[anchor_idx..].partition_point(|&p| p < next_anchor)
+                    }
+                    _ => anchor_idx + 1,
                 }
-            }
-
-            if matched {
-                return Ok(true);
-            }
-
-            position_iters[0].advance_to_relative(next_lead_relative.unwrap());
+            };
+            continue 'anchor;
         }
+        return Ok(true);
     }
+    Ok(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static POSITION_CURSOR_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PHRASE_ANCHOR_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-only: counting anchor steps is off unless a test arms it, because the
+    // scan loop runs it once per anchor position. Rustdoc does not document
+    // macro invocations, so this is a plain comment.
+    static COUNT_ANCHOR_STEPS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Armed per test thread: a process-wide flag would let one parallel test that
+/// finishes early switch counting off for another still running.
+#[cfg(test)]
+fn count_anchor_steps() {
+    if COUNT_ANCHOR_STEPS.with(|armed| armed.get()) {
+        PHRASE_ANCHOR_STEPS.with(|steps| steps.set(steps.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn take_position_cursor_calls() -> usize {
+    POSITION_CURSOR_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Anchor positions visited by the last `exact_phrase_scan`. Test-only: it is
+/// the only way to assert that the scan skips without a timing threshold.
+#[cfg(test)]
+fn take_anchor_steps() -> usize {
+    PHRASE_ANCHOR_STEPS.with(|steps| steps.replace(0))
+}
+
+/// Run an exact-phrase check with anchor-step counting armed.
+#[cfg(test)]
+fn counted_anchor_steps<F: FnOnce() -> bool>(check: F) -> (bool, usize) {
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(true));
+    let _ = take_anchor_steps();
+    let matched = check();
+    let steps = take_anchor_steps();
+    COUNT_ANCHOR_STEPS.with(|armed| armed.set(false));
+    (matched, steps)
 }
 
 #[derive(Debug)]
@@ -5469,15 +5759,47 @@ impl<'a> PositionCursor<'a> {
         self.positions.len()
     }
 
-    fn absolute_position(&self) -> Option<u32> {
-        self.positions.as_slice().get(self.index).copied()
-    }
-
     fn relative_position(&self) -> Option<i32> {
         self.positions
             .as_slice()
             .get(self.index)
             .map(|position| *position as i32 - self.position_in_query)
+    }
+
+    /// Advance to the first position at or above `target` and return it, or
+    /// `None` once the cursor is exhausted.
+    ///
+    /// `target` must be non-decreasing across calls: the search is confined to
+    /// the not-yet-consumed suffix, so the cursor never rewinds and a returned
+    /// position is never below `target`. When the cursor already sits past
+    /// `target` the search is skipped entirely.
+    fn advance_to_at_least(&mut self, target: u32) -> Option<u32> {
+        if self.index >= self.len() {
+            return None;
+        }
+        let values = self.positions.as_slice();
+        // The cursor has reached `target`, or is already past it. Every earlier
+        // position is below the previous target and hence below this one, so the
+        // insertion point has not moved: no search is needed, and the current
+        // position is either the match or the bound the caller wants.
+        if values[self.index] >= target {
+            return Some(values[self.index]);
+        }
+        // Targets only grow, so the next position is a frequent answer. Check it
+        // before paying for a search: a suffix binary search costs a dependent
+        // load per level and its landmarks move as `index` advances, which is
+        // what makes interleaved lists slow. On a mismatch here the cursor ends
+        // up one position short of the target on every step.
+        if let Some(next) = values
+            .get(self.index + 1)
+            .copied()
+            .filter(|&next| next >= target)
+        {
+            self.index += 1;
+            return Some(next);
+        }
+        self.index += values[self.index..].partition_point(|&pos| pos < target);
+        values.get(self.index).copied()
     }
 
     fn advance_to_relative(&mut self, least_relative_pos: i32) {
@@ -5488,19 +5810,6 @@ impl<'a> PositionCursor<'a> {
         let least_pos = least_pos.max(0) as u32;
         let values = self.positions.as_slice();
         self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-    }
-
-    fn advance_to_absolute(&mut self, least_pos: u32) -> Option<u32> {
-        if self.index >= self.len() {
-            return None;
-        }
-        let values = self.positions.as_slice();
-        self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-        self.absolute_position()
-    }
-
-    fn advance_next(&mut self) {
-        self.index = self.index.saturating_add(1).min(self.len());
     }
 }
 
@@ -5891,6 +6200,100 @@ fn next_up_f64(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `exclusive_partial_score_limit` must agree with `score_sum_cannot_compete`
+    /// for every f32 partial score: scores at or below the limit are rejected,
+    /// scores above it compete. Sweeps ULP neighbourhoods of the boundary plus
+    /// coarse samples, over floors, remaining bounds and clause counts.
+    #[test]
+    fn exclusive_partial_score_limit_matches_predicate() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0usize;
+        for case in 0..2_000 {
+            let floor = if case % 7 == 0 {
+                f32::from_bits((next() as u32) & 0x7F7F_FFFF)
+            } else {
+                (next() % 10_000) as f32 / 37.0 + 1e-6
+            };
+            let remaining = if case % 5 == 0 {
+                f64::from(f32::from_bits((next() as u32) & 0x7F7F_FFFF))
+            } else {
+                (next() % 10_000) as f64 / 41.0
+            };
+            let num_lists = 2 + (next() % 6) as usize;
+            let factor = score_sum_upper_bound_factor(num_lists);
+            let rejects = |score: f32| {
+                score_sum_cannot_compete(
+                    score,
+                    remaining,
+                    floor,
+                    factor,
+                    CompetitiveFloorMode::Exclusive,
+                )
+            };
+            let limit = exclusive_partial_score_limit(remaining, floor, factor);
+            let mut probes = vec![
+                0.0_f32,
+                f32::MIN_POSITIVE,
+                floor,
+                f32::MAX,
+                f32::MIN,
+                ((f64::from(floor) / factor) - remaining) as f32,
+            ];
+            if let Some(limit) = limit {
+                let mut up = limit;
+                let mut down = limit;
+                for _ in 0..4 {
+                    probes.push(up);
+                    probes.push(down);
+                    up = next_up_f32(up);
+                    down = next_down_f32(down);
+                }
+            }
+            for _ in 0..16 {
+                probes.push(f32::from_bits((next() as u32) & 0x7F7F_FFFF));
+            }
+            for score in probes {
+                let expected = rejects(score);
+                let actual = limit.is_some_and(|limit| score <= limit);
+                assert_eq!(
+                    expected, actual,
+                    "score={score:?} limit={limit:?} floor={floor:?} remaining={remaining:?} num_lists={num_lists}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50_000);
+    }
+
+    #[test]
+    fn exclusive_partial_score_limit_handles_non_finite_inputs() {
+        let factor = score_sum_upper_bound_factor(3);
+        assert_eq!(
+            exclusive_partial_score_limit(f64::INFINITY, 1.0, factor),
+            None
+        );
+        assert_eq!(exclusive_partial_score_limit(1.0, f32::NAN, factor), None);
+        assert_eq!(
+            exclusive_partial_score_limit(1.0, f32::INFINITY, factor),
+            None
+        );
+        // A floor no partial score can fail to beat rejects nothing.
+        let limit = exclusive_partial_score_limit(1.0e30, 1.0, factor);
+        assert!(limit.is_none_or(|limit| !score_sum_cannot_compete(
+            next_up_f32(limit),
+            1.0e30,
+            1.0,
+            factor,
+            CompetitiveFloorMode::Exclusive
+        )));
+    }
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
@@ -9790,6 +10193,568 @@ mod tests {
         assert!(wand.check_positions(0).unwrap());
     }
 
+    #[rstest]
+    fn exact_phrase_skips_stopword_decode_when_rare_pair_misses(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..100_u32).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![50_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![99_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(!wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 2);
+        assert!(!wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 2);
+    }
+
+    #[rstest]
+    fn exact_phrase_decodes_stopword_when_rare_pair_aligns(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        let hit_the: Vec<u32> = (0..100).collect();
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(vec![0], vec![hit_the], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![11_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![12_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+        assert!(wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    #[rstest]
+    fn exact_phrase_rejects_when_stopword_misses_aligned_pair(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 16);
+
+        // "news journal" aligns at base 10, but "the" has no position 10.
+        let the_positions: Vec<u32> = (0..10).chain(11..100).collect();
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![the_positions],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("news"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![11_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("journal"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![12_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let _ = take_position_cursor_calls();
+        assert!(!wand.check_exact_positions().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+        assert!(!wand.check_exact_positions_bulk().unwrap());
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The follower sits entirely past the anchor, so the very first probe
+    /// proves no base can align: the scan must jump instead of walking.
+    #[rstest]
+    fn exact_phrase_scan_skips_anchor_past_disjoint_follower(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(2 * n..3 * n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase");
+        assert!(steps <= 2, "anchor was walked ({steps} steps), not skipped");
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(!matched, "disjoint lists cannot form a phrase (bulk)");
+        assert!(
+            steps <= 2,
+            "bulk anchor was walked ({steps} steps), not skipped"
+        );
+    }
+
+    /// The only match sits at the far end of a long anchor. Reaching it in a
+    /// couple of steps is what proves the jump lands on the right candidate
+    /// instead of over-shooting it.
+    #[rstest]
+    fn exact_phrase_scan_jumps_to_a_late_match(#[values(false, true)] is_compressed: bool) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(n / 2 + 1..n + 1).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(matched, "the late match must be found");
+        assert!(
+            steps <= 3,
+            "late match took {steps} steps; the jump missed it"
+        );
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions_bulk().unwrap());
+        assert!(matched, "the late match must be found (bulk)");
+        assert!(steps <= 3, "bulk late match took {steps} steps");
+    }
+
+    /// Interleaved lists: no bound can skip anything, so the scan must fall back
+    /// to stepping and still visit every candidate exactly once (and terminate).
+    #[rstest]
+    fn exact_phrase_scan_steps_when_no_bound_can_skip(#[values(false, true)] is_compressed: bool) {
+        let n = 1024u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..n).map(|k| 3 * k + 2).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "interleaved lists cannot form a phrase");
+        assert!(
+            (1..=n as usize).contains(&steps),
+            "expected a single walk of {n} anchors, got {steps}"
+        );
+    }
+
+    /// The anchor jumps over a candidate before the last clause has ever been
+    /// probed, so that clause is decoded with a target already far into its
+    /// list: the lazy decode and the monotone probe have to agree.
+    #[rstest]
+    fn exact_phrase_scan_decodes_a_follower_after_the_anchor_jumps(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut middle = vec![300_u32, 901];
+        middle.extend(1000..1050);
+        let mut last = vec![902_u32];
+        last.extend(3000..3100);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![100_u32, 200, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(vec![0], vec![middle], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(
+            matched,
+            "the clause decoded after the jump must still align"
+        );
+        assert_eq!(
+            steps, 2,
+            "the anchor must jump straight to 900, got {steps} steps"
+        );
+        assert_eq!(take_position_cursor_calls(), 3);
+    }
+
+    /// The anchor clause is not the first word of the phrase, so the jump has to
+    /// account for `anchor_offset`. Without it the bound lands one position
+    /// short and the scan needs an extra step.
+    #[rstest]
+    fn exact_phrase_scan_jumps_with_a_nonzero_anchor_offset(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let mut first = vec![100_u32, 497, 899];
+        first.extend(1000..1050);
+        let mut last = vec![500_u32];
+        last.extend(2000..2050);
+        last.push(5000);
+        let postings = vec![
+            PostingIterator::new(
+                String::from("a"),
+                0,
+                0,
+                generate_posting_list_with_positions(vec![0], vec![first], 1.0, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("b"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![101_u32, 498, 900]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("c"),
+                2,
+                2,
+                generate_posting_list_with_positions(vec![0], vec![last], 1.0, is_compressed),
+                docs.len(),
+            ),
+        ];
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+
+        let (matched, steps) = counted_anchor_steps(|| wand.check_exact_positions().unwrap());
+        assert!(!matched, "the last clause never reaches the phrase");
+        assert_eq!(
+            steps, 2,
+            "the jump must carry anchor_offset (bound 499, not 498), got {steps} steps"
+        );
+    }
+
+    /// The compound-phrase request from review: drive the exact-phrase check the
+    /// way `WandCursor::matches()` does - a phrase leaf inside a compound query -
+    /// instead of calling the entries directly.
+    #[rstest]
+    fn wand_cursor_confirmation_rejects_disjoint_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(2 * n..3 * n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(!matched, "disjoint positions cannot form a phrase");
+        assert!(
+            steps <= 2,
+            "the compound path must skip too, took {steps} steps"
+        );
+    }
+
+    /// Same path, but the phrase really is present: the confirmation has to
+    /// survive the jump instead of over-shooting the match.
+    #[rstest]
+    fn wand_cursor_confirmation_accepts_aligned_phrase_positions(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let n = 4096u32;
+        let mut docs = DocSet::default();
+        docs.append(0, 1_000_001);
+        let make_postings = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(0..n).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![(1..n + 1).collect()],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..Default::default()
+        };
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            make_postings(),
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), Some(0));
+
+        let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
+        assert!(matched, "the phrase is present at base 0");
+        assert!(
+            steps <= 2,
+            "took {steps} steps to confirm a first-position match"
+        );
+    }
+
+    #[rstest]
+    fn exact_phrase_heap_path_matches_wide_clause_count(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 32);
+        let num_clauses = 17usize;
+        let postings = (0..num_clauses)
+            .map(|index| {
+                PostingIterator::new(
+                    format!("t{index}"),
+                    index as u32,
+                    index as u32,
+                    generate_posting_list_with_positions(
+                        vec![0],
+                        vec![vec![index as u32]],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        assert!(wand.check_exact_positions().unwrap());
+        assert!(wand.check_exact_positions_bulk().unwrap());
+    }
+
     /// The bulk conjunction path must return exactly the classic loop's
     /// results — same docs, freqs, and doc lengths — for both plain AND and
     /// phrase queries, across multi-block lists with heap/threshold pruning
@@ -10081,6 +11046,81 @@ mod tests {
                 .map(|posting| posting.impact_bound_computations())
                 .sum::<usize>(),
             0
+        );
+    }
+
+    /// A sparse lead over dense followers must drive the window traversal:
+    /// after an empty window the next one starts at the lead's next document,
+    /// so the number of sliced windows tracks the lead's documents rather than
+    /// the followers' block count. Results stay identical to the classic loop.
+    #[rstest]
+    fn bulk_and_windows_jump_to_next_lead_document(
+        #[values(2, 4)] num_clauses: usize,
+        #[values(0.0, 0.05)] initial_floor: f32,
+    ) {
+        let num_docs = MAX_POSTING_BLOCK_SIZE * 64;
+        let lead_stride = 2_000;
+        let docs = CostOnlyDocuments {
+            total_docs: num_docs,
+            visible_cost_upper_bound: num_docs,
+        };
+        let run = |mode| {
+            let postings = (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = if term == 0 {
+                        (0..num_docs as u32)
+                            .step_by(lead_stride)
+                            .collect::<Vec<_>>()
+                    } else {
+                        (0..num_docs as u32)
+                            .filter(|doc| doc % 3 != term as u32)
+                            .collect()
+                    };
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            (0..len).map(|index| 1 + (index % 5) as u32).collect(),
+                            vec![1; len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shared_floor = Arc::new(AtomicU32::new(initial_floor.to_bits()));
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_shared_threshold(shared_floor.clone());
+            let mut rows = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (
+                rows,
+                shared_floor.load(Ordering::Relaxed),
+                wand.and_window_stats.windows_sliced,
+            )
+        };
+        let (classic, classic_floor, _) = run(BulkAndMode::Off);
+        let (bulk, bulk_floor, windows) = run(BulkAndMode::On);
+        assert_eq!(bulk, classic);
+        assert_eq!(bulk_floor, classic_floor);
+        let lead_docs = num_docs / lead_stride + 1;
+        let follower_blocks = (num_docs * 2 / 3) / MAX_POSTING_BLOCK_SIZE;
+        assert!(
+            windows <= 2 * lead_docs + 2,
+            "sliced {windows} windows for {lead_docs} lead docs; followers have {follower_blocks} blocks each"
         );
     }
 
@@ -10482,5 +11522,86 @@ mod tests {
             "impact bounds must activate on the first window after the heap fills"
         );
         assert!(scored.load(Ordering::Relaxed) > 0);
+    }
+
+    /// The floor turns positive in the middle of the first window, where only
+    /// the per-candidate prune refreshes the score limit. The second window
+    /// has the same floor and the same follower block max, so the frequency
+    /// prune table must still be built for it instead of staying disabled.
+    #[test]
+    fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
+        let num_docs = (MAX_POSTING_BLOCK_SIZE * 2) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let run = |mode| {
+            // One block spanning both windows; only document 0 can win.
+            let sparse_docs = (0..num_docs).step_by(2).collect::<Vec<_>>();
+            let sparse_freqs = sparse_docs
+                .iter()
+                .map(|&doc| if doc == 0 { 10 } else { 1 })
+                .collect::<Vec<_>>();
+            // Two blocks with the same block max, so the follower bound is
+            // identical in both windows. Document 257 keeps the second window
+            // competitive by block max without matching the sparse clause.
+            let dense_docs = (0..num_docs).collect::<Vec<_>>();
+            let dense_freqs = dense_docs
+                .iter()
+                .map(|&doc| if doc == 0 || doc == 257 { 10 } else { 1 })
+                .collect::<Vec<_>>();
+            let postings = [(sparse_docs, sparse_freqs), (dense_docs, dense_freqs)]
+                .into_iter()
+                .enumerate()
+                .map(|(term, (doc_ids, freqs))| {
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            freqs,
+                            vec![1; len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(1)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            (
+                hits,
+                wand.threshold,
+                wand.and_window_stats.windows_sliced,
+                wand.and_window_stats.windows_frequency_pruned,
+            )
+        };
+        let (classic, classic_floor, _, _) = run(BulkAndMode::Off);
+        let (bulk, bulk_floor, windows_sliced, windows_frequency_pruned) = run(BulkAndMode::On);
+        assert_eq!(bulk, classic);
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(bulk[0].0, 0);
+        assert_eq!(bulk_floor, 20.0);
+        assert_eq!(bulk_floor, classic_floor);
+        assert_eq!(
+            windows_sliced, 2,
+            "the dense clause's block boundary splits two windows"
+        );
+        assert_eq!(
+            windows_frequency_pruned, 1,
+            "the second window must apply the frequency prune table"
+        );
     }
 }

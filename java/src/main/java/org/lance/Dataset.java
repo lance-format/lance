@@ -1934,6 +1934,33 @@ public class Dataset implements Closeable {
 
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
+  private static void checkReadBufferSize(long bufferSize) {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+  }
+
+  static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize) throws IOException {
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException | RuntimeException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
   /**
    * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
    * with Rust/Python.
@@ -1969,6 +1996,19 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobs(rowIds, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
    *
    * <pre>{@code
@@ -1995,6 +2035,19 @@ public class Dataset implements Closeable {
           column != null && !column.isEmpty(), "column cannot be null or empty");
       return nativeTakeBlobsByIndices(rowIndices, column);
     }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by row index and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByIndices(rowIndices, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
   }
 
   /**

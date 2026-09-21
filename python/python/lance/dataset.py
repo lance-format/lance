@@ -43,7 +43,7 @@ from lance.log import LOGGER
 # Imported at runtime, not only for the annotations below: importing it here
 # is what registers `Bitmap` as a `collections.abc.MutableSet`.
 from .bitmap import Bitmap  # noqa: TC001
-from .blob import BlobFile
+from .blob import DEFAULT_BLOB_BUFFER_SIZE, BlobFile, _validate_buffer_size
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -2333,6 +2333,8 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
+        *,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
     ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
@@ -2344,6 +2346,9 @@ class LanceDataset(pa.dataset.Dataset):
         If you plan to read each selected blob completely with ``read()`` or
         ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
         payloads with Lance's planned batched reader.
+
+        ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+        do not change the sequential cursor.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2357,6 +2362,8 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to select in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
+        buffer_size : int, default 512 KiB
+            Sequential read-ahead size in bytes. ``0`` disables read-ahead.
 
         Returns
         -------
@@ -2364,6 +2371,7 @@ class LanceDataset(pa.dataset.Dataset):
             One element per selected row. Null blob values return ``None``;
             valid empty blobs return a ``BlobFile`` with size zero.
         """
+        buffer_size = _validate_buffer_size(buffer_size)
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
         )
@@ -2379,7 +2387,9 @@ class LanceDataset(pa.dataset.Dataset):
                 selection_values, blob_column
             )
         return [
-            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            BlobFile(lance_blob_file, buffer_size=buffer_size)
+            if lance_blob_file is not None
+            else None
             for lance_blob_file in lance_blob_files
         ]
 
@@ -4188,13 +4198,25 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
+                    if len(ivf_centroids.shape) != 2:
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if (
+                        num_partitions is not None
+                        and ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids has {ivf_centroids.shape[0]} clusters, "
+                            f"but num_partitions={num_partitions}"
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
@@ -4348,8 +4370,9 @@ class LanceDataset(pa.dataset.Dataset):
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
             :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
+            A ``num_clusters x dimension`` array of existing K-mean centroids
+            for IVF clustering. The row count determines the number of IVF
+            partitions. If not provided, a new KMeans model will be trained.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -6452,6 +6475,34 @@ class LanceOperation:
         """
 
         version: int
+
+    @dataclass
+    class Clone(BaseOperation):
+        """Operation that creates a clone or branch from a dataset reference.
+
+        This operation is created internally by clone and branch APIs. It is
+        exposed so transactions returned by :meth:`LanceDataset.get_transactions`
+        can represent clone metadata without losing information.
+
+        Attributes
+        ----------
+        is_shallow: bool
+            Whether data files are shared with the source dataset.
+        ref_name: str, optional
+            Source branch name, or ``None`` for the main branch.
+        ref_version: int
+            Source dataset version.
+        ref_path: str
+            Source dataset URI.
+        branch_name: str, optional
+            Destination branch name, when the clone creates a branch.
+        """
+
+        is_shallow: bool
+        ref_name: Optional[str]
+        ref_version: int
+        ref_path: str
+        branch_name: Optional[str]
 
     @dataclass
     class RewriteGroup:

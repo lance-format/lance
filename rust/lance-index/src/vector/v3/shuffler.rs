@@ -4,6 +4,7 @@
 //! Shuffler is a component that takes a stream of record batches and shuffles them into
 //! the corresponding IVF partitions.
 
+use std::env::VarError;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
@@ -491,7 +492,25 @@ const DEFAULT_SHUFFLE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 /// This covers tens of millions of offsets while bounding the additional memory
 /// held for unusually large shuffles. Larger tables are still validated once as
 /// a stream and then read on demand.
-const MAX_PRELOADED_OFFSETS_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_MAX_PRELOADED_OFFSETS_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PRELOADED_OFFSETS_BYTES_ENV: &str = "LANCE_SHUFFLE_MAX_PRELOADED_OFFSETS_BYTES";
+
+fn parse_max_preloaded_offsets_bytes(
+    value: std::result::Result<String, VarError>,
+) -> Result<usize> {
+    match value {
+        Ok(value) => value.trim().parse::<usize>().map_err(|error| {
+            Error::invalid_input(format!(
+                "{MAX_PRELOADED_OFFSETS_BYTES_ENV} must be a non-negative integer number of bytes \
+                 (0 disables preloading), got {value:?}: {error}"
+            ))
+        }),
+        Err(VarError::NotPresent) => Ok(DEFAULT_MAX_PRELOADED_OFFSETS_BYTES),
+        Err(VarError::NotUnicode(value)) => Err(Error::invalid_input(format!(
+            "{MAX_PRELOADED_OFFSETS_BYTES_ENV} must contain a UTF-8 integer number of bytes, got {value:?}"
+        ))),
+    }
+}
 
 /// Number of rows per output batch when streaming sorted data via interleave.
 /// Small enough to keep the output chunk's memory footprint modest relative to
@@ -537,7 +556,6 @@ pub struct TwoFileShuffler {
     output_dir: Path,
     num_partitions: usize,
     batch_size_bytes: usize,
-    max_preloaded_offsets_bytes: usize,
 
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
@@ -549,7 +567,6 @@ impl TwoFileShuffler {
             output_dir,
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
-            max_preloaded_offsets_bytes: MAX_PRELOADED_OFFSETS_BYTES,
             progress: crate::progress::noop_progress(),
         }
     }
@@ -562,12 +579,6 @@ impl TwoFileShuffler {
     #[cfg(test)]
     fn with_batch_size_bytes(mut self, batch_size_bytes: usize) -> Self {
         self.batch_size_bytes = batch_size_bytes;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_max_preloaded_offsets_bytes(mut self, max_preloaded_offsets_bytes: usize) -> Self {
-        self.max_preloaded_offsets_bytes = max_preloaded_offsets_bytes;
         self
     }
 }
@@ -633,6 +644,8 @@ impl Shuffler for TwoFileShuffler {
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>> {
+        let max_preloaded_offsets_bytes =
+            parse_max_preloaded_offsets_bytes(std::env::var(MAX_PRELOADED_OFFSETS_BYTES_ENV))?;
         let num_partitions = self.num_partitions;
         // No need to write partition ids since we can infer this from offsets
         let schema = data.schema().without_column(PART_ID_COLUMN);
@@ -672,7 +685,7 @@ impl Shuffler for TwoFileShuffler {
         // the sidecar. Drop the in-memory copy once it would exceed
         // `max_preloaded_offsets_bytes`; the sidecar remains the bounded
         // on-demand fallback.
-        let mut written_offsets = BoundedWrittenOffsets::new(self.max_preloaded_offsets_bytes);
+        let mut written_offsets = BoundedWrittenOffsets::new(max_preloaded_offsets_bytes);
 
         let mut data = std::pin::pin!(data);
         while let Some(batch) = data.next().await {
@@ -741,7 +754,7 @@ impl Shuffler for TwoFileShuffler {
             num_batches,
             partition_counts,
             total_loss,
-            self.max_preloaded_offsets_bytes,
+            max_preloaded_offsets_bytes,
             written_offsets.into_offsets(),
         )
         .await
@@ -875,7 +888,7 @@ impl TwoFileShuffleReader {
             num_batches,
             partition_counts,
             total_loss,
-            MAX_PRELOADED_OFFSETS_BYTES,
+            parse_max_preloaded_offsets_bytes(std::env::var(MAX_PRELOADED_OFFSETS_BYTES_ENV))?,
             OffsetPreloadSource::Sidecar,
         )
         .await
@@ -2409,13 +2422,41 @@ mod tests {
         assert_eq!(values.values(), &[20, 30]);
     }
 
+    #[rstest::rstest]
+    #[case::disabled(0, 1)]
+    #[case::too_small(47, 1)]
+    #[case::exact_fit(48, 3)]
+    #[case::raised(536_870_912, 3)]
     #[tokio::test]
-    async fn test_shuffle_spills_offsets_when_preload_limit_is_zero() {
+    async fn test_shuffle_offset_preload_environment(
+        #[case] limit: usize,
+        #[case] window_end: usize,
+    ) {
+        const CHILD_ENV: &str = "LANCE_TEST_SHUFFLE_OFFSET_PRELOAD_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(MAX_PRELOADED_OFFSETS_BYTES_ENV, limit.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let dir = TempStrDir::default();
         let output_dir = Path::from(dir.as_ref());
-        let reader = TwoFileShuffler::new(output_dir, 3)
+        let reader = TwoFileShuffler::new(output_dir.clone(), 3)
             .with_batch_size_bytes(1)
-            .with_max_preloaded_offsets_bytes(0)
             .shuffle(batches_to_stream(vec![
                 make_batch(&[0, 1], &[10, 20], None),
                 make_batch(&[1, 2], &[30, 40], None),
@@ -2429,12 +2470,59 @@ mod tests {
         let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
         let values: &Int32Array = p1["val"].as_primitive();
         assert_eq!(values.values(), &[20, 30]);
-        // On-demand offsets cannot coalesce a window.
         let window = reader
             .read_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
             .await
             .unwrap();
-        assert_eq!(window.partition_range, 0..1);
+        assert_eq!(window.partition_range, 0..window_end);
+
+        let reopened = TwoFileShuffleReader::try_new(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+        )
+        .await
+        .unwrap();
+        let window = reopened
+            .read_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(window.partition_range, 0..window_end);
+        let p1 = collect_partition(reopened.as_ref(), 1).await.unwrap();
+        let values: &Int32Array = p1["val"].as_primitive();
+        assert_eq!(values.values(), &[20, 30]);
+    }
+
+    #[rstest::rstest]
+    #[case::unset(None, 256 * 1024 * 1024)]
+    #[case::disabled(Some("0"), 0)]
+    #[case::raised(Some("536870912"), 512 * 1024 * 1024)]
+    #[case::whitespace(Some(" 48 "), 48)]
+    fn test_parse_max_preloaded_offsets_bytes(
+        #[case] value: Option<&str>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            parse_max_preloaded_offsets_bytes(value.map(str::to_owned).ok_or(VarError::NotPresent))
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::negative("-1")]
+    #[case::suffix("512MiB")]
+    #[case::overflow("18446744073709551616")]
+    fn test_parse_max_preloaded_offsets_bytes_rejects_invalid(#[case] value: &str) {
+        let error = parse_max_preloaded_offsets_bytes(Ok(value.to_owned())).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains(MAX_PRELOADED_OFFSETS_BYTES_ENV));
+        assert!(message.contains(&format!("{value:?}")));
     }
 
     #[tokio::test]
@@ -2461,7 +2549,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
-            MAX_PRELOADED_OFFSETS_BYTES,
+            DEFAULT_MAX_PRELOADED_OFFSETS_BYTES,
             OffsetPreloadSource::ForcedOnDemand,
         )
         .await
@@ -2482,7 +2570,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
-            MAX_PRELOADED_OFFSETS_BYTES,
+            DEFAULT_MAX_PRELOADED_OFFSETS_BYTES,
             OffsetPreloadSource::Sidecar,
         )
         .await
