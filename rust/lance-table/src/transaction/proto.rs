@@ -960,19 +960,19 @@ mod tests {
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_transaction::CompositeOperation {
-                    uuid: Some(pb::Uuid::from(&Uuid::new_v4())),
-                    read_version: 1,
                     actions: vec![pb_transaction::UserAction {
                         description: "append batch".to_string(),
                         actions: vec![pb_transaction::Action {
-                            action: Some(pb_transaction::action::Action::AddFragment(pb_transaction::AddFragment {
-                                id: Some(pb_transaction::Ref {
-                                    kind: Some(pb_transaction::r#ref::Kind::Local(0)),
-                                }),
-                                physical_rows: 1,
-                                data_change: Some(true),
-                                ..Default::default()
-                            })),
+                            action: Some(pb_transaction::action::Action::AddFragment(
+                                pb_transaction::AddFragment {
+                                    id: Some(pb_transaction::Ref {
+                                        kind: Some(pb_transaction::r#ref::Kind::Local(0)),
+                                    }),
+                                    physical_rows: 1,
+                                    data_change: Some(true),
+                                    ..Default::default()
+                                },
+                            )),
                         }],
                     }],
                 },

@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-
 use crate::format::pb_transaction;
 use arrow_array::cast::AsArray;
 use arrow_array::{
