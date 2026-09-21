@@ -26,6 +26,8 @@ def test_kmeans_dot():
     kmeans = lance.util.KMeans(32, metric_type="dot")
     data = np.random.randn(1000, 128).astype(np.float32)
     kmeans.fit(data)
+    norms = np.linalg.norm(kmeans.centroids.to_numpy_ndarray(), axis=1)
+    np.testing.assert_allclose(norms, 1.0, rtol=1e-5)
 
 
 def test_precomputed_kmeans():
