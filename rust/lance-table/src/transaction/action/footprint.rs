@@ -133,10 +133,12 @@ pub struct Footprint {
     /// Coordinates this set reads and needs to still hold what it read, without
     /// writing them itself.
     ///
-    /// Data written for a committed field is the case this exists for: the
-    /// values are encoded in the type the schema names, so the definition has
-    /// to still say what it said. Unlike a write, two sets may require the same
-    /// coordinate -- two readers of one column do not collide.
+    /// Data written for a committed field is one case: the values are encoded
+    /// in the type the schema names, so the definition has to still say what it
+    /// said. An index segment is the other: it describes values it does not
+    /// change, and the format gives a reader no way to notice that those values
+    /// were replaced underneath it. Unlike a write, two sets may require the
+    /// same coordinate -- two readers of one column do not collide.
     requires: HashSet<Coordinate>,
     /// String maps this set replaces outright rather than merging into. Like a
     /// fragment removal, this writes every key in the map, including keys it
@@ -215,6 +217,12 @@ impl Footprint {
     /// held when it committed, and it serializes first, so nothing this set
     /// writes can retroactively break it. This set's requirements are the open
     /// question, because it read before `committed` landed.
+    ///
+    /// The distinction is not academic. An index segment requires the data it
+    /// describes; a rewrite of that data writes it. Checking both directions
+    /// would also reject the rewrite that arrives *after* a segment -- an order
+    /// the system already handles, by pruning the stale fragment out of the
+    /// segment's coverage as the rewrite applies.
     ///
     /// Everything else is a claim on the same coordinate from both sides and
     /// stays symmetric.
@@ -301,6 +309,22 @@ impl Footprint {
                 }
             }
             None => self.required_fields.extend(fields),
+        }
+    }
+
+    /// Record that this set reads `fields` in `fragment` and needs them to
+    /// still hold what it read.
+    ///
+    /// A fragment this operation mints records nothing: no concurrent writer
+    /// can have replaced data that did not exist when they planned.
+    pub(super) fn require_field_data(
+        &mut self,
+        fragment: u64,
+        fields: impl IntoIterator<Item = Ref>,
+    ) {
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.requires
+                .insert(Coordinate::FieldData { fragment, field });
         }
     }
 

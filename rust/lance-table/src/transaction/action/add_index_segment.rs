@@ -199,15 +199,24 @@ impl AddIndexSegment {
         self.data_change
     }
 
-    /// A claim on the logical index: this is what the index is, and these are
-    /// the fragments the new segment describes.
+    /// A claim on the logical index -- this is what the index is, and these are
+    /// the fragments the new segment describes -- plus a requirement on the
+    /// data the segment was built from.
     ///
     /// An index is derived state whose segments the query path unions, so two
-    /// writers may extend the same index at once, and either may run alongside
-    /// any change to the data it covers -- a segment that has fallen behind is
-    /// pruned rather than being wrong. What they may not do is describe the same
-    /// fragment twice, which would double-count rows, or disagree about what the
-    /// index is.
+    /// writers may extend the same index at once. What they may not do is
+    /// describe the same fragment twice, which would double-count rows, or
+    /// disagree about what the index is.
+    ///
+    /// A segment that has fallen behind is pruned rather than being wrong, but
+    /// only the commit that does the changing can prune: a rewrite rebinds the
+    /// field and drops it from every segment the manifest carries. A segment
+    /// arriving *after* the rewrite prunes nothing, and the format gives a
+    /// reader no way to catch it -- an in-place column rewrite "cannot be
+    /// detected just by examining metadata", so a reader trusts
+    /// `fragment_bitmap` as it finds it. Requiring the data keeps that trust
+    /// earned. Deletions and overlays are excluded on purpose: both leave a
+    /// trace a reader can act on, so both may still run alongside a build.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.build_index(
             self.name.clone(),
@@ -219,6 +228,24 @@ impl AddIndexSegment {
             },
             self.covered_fragments.clone(),
         );
+
+        // Keyed and carried columns alike: a carried column can be rewritten
+        // while the keyed one is untouched, and the segment would then answer
+        // from an obsolete carried value.
+        let Some(covered) = &self.covered_fragments else {
+            // Unstated reach. The claim already collides with every other claim
+            // on the index; there is no fragment list to require.
+            return;
+        };
+        let dependencies: Vec<Ref> = self
+            .fields
+            .iter()
+            .chain(self.covering_fields.iter())
+            .copied()
+            .collect();
+        for fragment in covered.iter().filter_map(|fragment| fragment.committed()) {
+            footprint.require_field_data(fragment, dependencies.iter().copied());
+        }
     }
 }
 
@@ -344,7 +371,8 @@ mod tests {
         added_field, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint, UserAction,
+        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint,
+        TombstoneFieldData, UserAction,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -695,6 +723,68 @@ mod tests {
         .unwrap();
 
         assert!(indices.is_empty());
+    }
+
+    /// Two builds over one column do not collide: a requirement is a claim
+    /// that nothing moved, not a claim on the column.
+    #[test]
+    fn test_two_indices_over_one_column_and_fragment_do_not_conflict() {
+        let ours = index_footprint(covering("by_a", Some(vec![0])));
+        let theirs = index_footprint(covering("by_b", Some(vec![0])));
+
+        assert!(!ours.conflicts_with(&theirs));
+        assert!(!theirs.conflicts_with(&ours));
+    }
+
+    /// The direction is the whole point, so it gets its own test.
+    ///
+    /// A segment requires the data it describes; a rewrite of that data writes
+    /// it. Arriving after the rewrite, the segment would publish coverage of
+    /// values it never saw and a reader has no way to detect that, so it must
+    /// be rejected. Arriving before, the rewrite prunes the segment's coverage
+    /// as it applies, so rejecting it would be a conflict over nothing.
+    #[test]
+    fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let rewrite = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            "step",
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            })],
+        )]));
+
+        assert!(
+            build.conflicts_with(&rewrite),
+            "a segment cannot describe values a committed rewrite replaced"
+        );
+        assert!(
+            !rewrite.conflicts_with(&build),
+            "the rewrite prunes the committed segment's coverage as it applies"
+        );
+    }
+
+    /// A rewrite of a column the segment merely carries invalidates it just as
+    /// a keyed one does -- the segment would answer from an obsolete carried
+    /// value. `covering_fields` is independent of `fields`, so the requirement
+    /// is over the union.
+    #[test]
+    fn test_a_build_requires_the_columns_it_carries_too() {
+        let mut segment = covering("by_a", Some(vec![0]));
+        segment.covering_fields = vec![Ref::Committed(1)];
+        let build = index_footprint(segment);
+
+        let rewrite = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            "step",
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(1)],
+                data_change: true,
+            })],
+        )]));
+
+        assert!(build.conflicts_with(&rewrite));
     }
 
     fn index_footprint(action: AddIndexSegment) -> Footprint {
