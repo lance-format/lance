@@ -23,14 +23,21 @@ impl AddBase {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let id = state.mint_base(self.local)?;
 
-        let conflicting = state
-            .bases()
-            .find(|base| base.name == self.base.name || base.path == self.base.path);
-        if let Some(conflicting) = conflicting {
+        // Two separate uniqueness rules, reported separately: a caller that
+        // trips one needs to know which, and the two are fixed differently.
+        if let Some(conflicting) = state.bases().find(|base| base.name == self.base.name) {
             return Err(Error::invalid_input(format!(
-                "Conflict detected: Base path with name '{:?}' or path '{}' already exists. \
-                 Existing: name='{:?}', path='{}'",
-                self.base.name, self.base.path, conflicting.name, conflicting.path
+                "a base path named {:?} already exists (id {}, at '{}'); base names are \
+                 unique within a dataset. Two bases that both leave the name unset count \
+                 as the same name, matching Operation::UpdateBases",
+                self.base.name, conflicting.id, conflicting.path
+            )));
+        }
+        if let Some(conflicting) = state.bases().find(|base| base.path == self.base.path) {
+            return Err(Error::invalid_input(format!(
+                "a base path at '{}' already exists (id {}, named {:?}); base locations \
+                 are unique within a dataset",
+                self.base.path, conflicting.id, conflicting.name
             )));
         }
 
@@ -94,6 +101,7 @@ mod tests {
         assert_eq!(next.base_paths.len(), 1);
         assert_eq!(next.base_paths[&1].path, "s3://bucket/a");
 
+        // A fresh name, but the location is taken.
         let error = apply(
             &next,
             vec![Action::AddBase(AddBase {
@@ -103,11 +111,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("already exists"),
+            error
+                .to_string()
+                .contains("base path at 's3://bucket/a' already exists"),
             "unexpected error: {error}"
         );
     }
 
+    /// Both bases leave the name unset, which counts as the same name. Carried
+    /// over from `Operation::UpdateBases`, which compares the `Option`s
+    /// directly; worth pinning so a change to it is a decision rather than a
+    /// side effect.
+    #[test]
+    fn test_two_unnamed_bases_collide_on_the_empty_name() {
+        let manifest = sample_manifest();
+        let error = apply(
+            &manifest,
+            vec![
+                Action::AddBase(AddBase {
+                    local: 0,
+                    base: BasePath::new(0, "s3://bucket/a".into(), None, false),
+                }),
+                Action::AddBase(AddBase {
+                    local: 1,
+                    base: BasePath::new(0, "s3://bucket/b".into(), None, false),
+                }),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("base path named None already exists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The second base takes a different id and a different location, but the
+    /// same name, and the first is only visible to it because both land in one
+    /// operation.
     #[test]
     fn test_two_add_bases_in_one_operation_see_each_other() {
         let manifest = sample_manifest();
@@ -126,7 +168,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("already exists"),
+            error
+                .to_string()
+                .contains("base path named Some(\"a\") already exists"),
             "unexpected error: {error}"
         );
     }
