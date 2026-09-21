@@ -537,6 +537,7 @@ impl RabitQuantizationStorage {
         match self.distance_type {
             DistanceType::L2 | DistanceType::Cosine => RabitQueryFactors {
                 add_scale: 1.0,
+                add_offset: 0.0,
                 add: if self.distance_type == DistanceType::Cosine {
                     dist_q_c - 1.0
                 } else {
@@ -560,25 +561,31 @@ impl RabitQuantizationStorage {
                 });
                 RabitQueryFactors {
                     add_scale: alpha,
-                    add: 1.0 - alpha - ip,
+                    // Center the stored factor before scaling: splitting the
+                    // constant as alpha*A + (1-alpha-ip) loses it for large alpha.
+                    add_offset: 1.0,
+                    add: 1.0 - ip,
                     error: if gated {
-                        let norm_square = dot(rotated_query, rotated_query) - alpha * ip;
-                        if norm_square.is_finite() {
-                            // The squared orthogonal norm can round below zero.
-                            norm_square.max(0.0).sqrt()
+                        // Subtract components before squaring. The difference
+                        // ||q||²-alpha*(q·c) cancels for nearly parallel vectors,
+                        // which can erase the margin and incorrectly prune rows.
+                        // f64 also keeps finite f32 queries from overflowing here.
+                        let norm_square: f64 = if let Some(c) = rotated_centroid {
+                            rotated_query
+                                .iter()
+                                .zip(c)
+                                .map(|(&q, &c)| (q as f64 - alpha as f64 * c as f64).powi(2))
+                                .sum()
                         } else {
-                            // Finite q can overflow its squared f32 norm. In
-                            // particular, inf-inf must not become a zero bound.
-                            let norm_square: f64 = if let Some(c) = rotated_centroid {
-                                rotated_query
-                                    .iter()
-                                    .zip(c)
-                                    .map(|(&q, &c)| (q as f64 - alpha as f64 * c as f64).powi(2))
-                                    .sum()
-                            } else {
-                                rotated_query.iter().map(|&q| (q as f64).powi(2)).sum()
-                            };
-                            norm_square.sqrt() as f32
+                            rotated_query.iter().map(|&q| (q as f64).powi(2)).sum()
+                        };
+                        let norm = norm_square.sqrt();
+                        let rounded = norm as f32;
+                        // Rounding the query norm downward would narrow the bound.
+                        if (rounded as f64) < norm {
+                            rounded.next_up()
+                        } else {
+                            rounded
                         }
                     } else {
                         0.0
@@ -644,6 +651,7 @@ impl RabitQuantizationStorage {
             approx_mode,
         );
         calculator.add_factor_scale = query_factors.add_scale;
+        calculator.add_factor_offset = query_factors.add_offset;
         calculator
     }
 
@@ -812,6 +820,7 @@ fn copy_subtract_f32(lhs: &[f32], rhs: &[f32], output: &mut [f32]) {
 
 struct RabitQueryFactors {
     add_scale: f32,
+    add_offset: f32,
     add: f32,
     error: f32,
 }
@@ -877,6 +886,7 @@ pub struct RabitDistCalculator<'a> {
     query_factor: f32,
     query_error: f32,
     add_factor_scale: f32,
+    add_factor_offset: f32,
     approx_mode: ApproxMode,
 
     sum_q: f32,
@@ -926,6 +936,7 @@ impl<'a> RabitDistCalculator<'a> {
             query_error,
             approx_mode,
             add_factor_scale: 1.0,
+            add_factor_offset: 0.0,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
@@ -1170,7 +1181,7 @@ impl<'a> RabitDistCalculator<'a> {
             let binary_dist = *dist;
             *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
                 * self.scale_factors[id]
-                + self.add_factor_scale * self.add_factors[id]
+                + self.add_factor_scale * (self.add_factors[id] - self.add_factor_offset)
                 + self.query_factor;
         });
     }
@@ -1234,7 +1245,8 @@ impl<'a> RabitDistCalculator<'a> {
                             let ex_dist = (*q_ex_dist as f32) * range + sum_min;
                             let full_dot = code_scale * *dist + ex_dist + code_bias * self.sum_q;
                             *dist = full_dot * ex_scale_factors[id]
-                                + self.add_factor_scale * ex_add_factors[id]
+                                + self.add_factor_scale
+                                    * (ex_add_factors[id] - self.add_factor_offset)
                                 + self.query_factor;
                         });
                     fastscan_len
@@ -1252,7 +1264,7 @@ impl<'a> RabitDistCalculator<'a> {
                 let ex_dist = self.ex_code_dot(ex_codes, id);
                 let full_dot = code_scale * *dist + ex_dist + code_bias * self.sum_q;
                 *dist = full_dot * ex_scale_factors[id]
-                    + self.add_factor_scale * ex_add_factors[id]
+                    + self.add_factor_scale * (ex_add_factors[id] - self.add_factor_offset)
                     + self.query_factor;
             });
     }
@@ -1260,7 +1272,7 @@ impl<'a> RabitDistCalculator<'a> {
     #[inline]
     fn raw_query_binary_distance(&self, id: usize, binary_ip: f32) -> f32 {
         (binary_ip - 0.5 * self.sum_q) * self.scale_factors[id]
-            + self.add_factor_scale * self.add_factors[id]
+            + self.add_factor_scale * (self.add_factors[id] - self.add_factor_offset)
             + self.query_factor
     }
 
@@ -1285,7 +1297,7 @@ impl<'a> RabitDistCalculator<'a> {
         let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
         let full_dot = (1u32 << ex_bits) as f32 * binary_ip + ex_dist + code_bias * self.sum_q;
         full_dot * ex_scale_factors[id]
-            + self.add_factor_scale * ex_add_factors[id]
+            + self.add_factor_scale * (ex_add_factors[id] - self.add_factor_offset)
             + self.query_factor
     }
 
@@ -1481,6 +1493,7 @@ impl<'a> RabitDistCalculator<'a> {
         let terms = ScaledLowerBoundTerms {
             half_sum_q: 0.5 * self.sum_q,
             add_factor_scale: self.add_factor_scale,
+            add_factor_offset: self.add_factor_offset,
             query_factor: self.query_factor,
             query_error: self.query_error,
         };
@@ -2130,6 +2143,7 @@ impl VectorStore for RabitQuantizationStorage {
         let query_factors = match self.metadata.query_estimator {
             RabitQueryEstimator::ResidualQuery => RabitQueryFactors {
                 add_scale: 1.0,
+                add_offset: 0.0,
                 add: self.residual_query_factor(dist_q_c),
                 error: 0.0,
             },
@@ -2223,6 +2237,7 @@ impl VectorStore for RabitQuantizationStorage {
             query_factors = match (self.metadata.query_estimator, residual) {
                 (RabitQueryEstimator::ResidualQuery, _) => RabitQueryFactors {
                     add_scale: 1.0,
+                    add_offset: 0.0,
                     add: self.residual_query_factor(dist_q_c),
                     error: 0.0,
                 },
@@ -4515,6 +4530,139 @@ mod tests {
         assert_eq!(factors.add_scale, 0.0);
         if num_bits > 1 {
             assert!((factors.error - dot(&query, &query).sqrt()).abs() < 1e-5);
+        }
+    }
+
+    #[rstest]
+    fn test_dot_projection_preserves_zero_residual_distance(
+        #[values(1, 5, 9)] num_bits: u8,
+        #[values(ApproxMode::Fast, ApproxMode::Normal, ApproxMode::Accurate)]
+        approx_mode: ApproxMode,
+        #[values(-1e-8, 1e-8)] centroid_value: f32,
+    ) {
+        const DIM: usize = 64;
+        const ROWS: usize = 35;
+        let mut metadata = make_test_metadata(DIM);
+        metadata.num_bits = num_bits;
+        let codes = make_test_codes(ROWS, DIM as i32);
+        let batch = if num_bits == 1 {
+            make_test_batch(codes)
+        } else {
+            make_test_batch_with_ex(codes, make_test_ex_codes(ROWS, DIM, num_bits))
+        };
+        let mut storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot, None)
+                .unwrap();
+        // A vector equal to its centroid has a zero residual, regardless of codes.
+        storage.add_factors = Float32Array::from(vec![1.0; ROWS]);
+        storage.scale_factors = Float32Array::from(vec![0.0; ROWS]);
+        storage.error_factors = Some(Float32Array::from(vec![0.0; ROWS]));
+        if num_bits > 1 {
+            storage.ex_add_factors = Some(Float32Array::from(vec![1.0; ROWS]));
+            storage.ex_scale_factors = Some(Float32Array::from(vec![0.0; ROWS]));
+        }
+        let query = vec![1.0; DIM];
+        let centroid = vec![centroid_value; DIM];
+        let expected = 1.0 - dot(&query, &centroid);
+        let calc = storage.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: DIM,
+            dist_table: Cow::Owned(build_dist_table_direct::<Float32Type>(&query)),
+            ex_query: Cow::Borrowed(&query),
+            sum_q: query.iter().sum(),
+            query_factors: storage.raw_query_factors(expected, &query, Some(&centroid)),
+            approx_mode,
+        });
+        for (id, distance) in calc.distance_all(ROWS).into_iter().enumerate() {
+            assert_eq!(distance, expected, "bulk row={id}");
+            assert_eq!(calc.distance(id as u32), expected, "scalar row={id}");
+        }
+        let mut heap = BinaryHeap::new();
+        calc.accumulate_topk_with_scratch(
+            ROWS,
+            None,
+            Some(0.5),
+            |id| id as u64,
+            &mut heap,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(heap.is_empty(), "all distances exceed the upper bound");
+    }
+
+    #[rstest]
+    #[case::near_parallel(1e-5)]
+    #[case::parallel(0.0)]
+    fn test_dot_projection_residual_bound_near_parallel(#[case] perturbation: f32) {
+        const DIM: usize = 64;
+        let mut metadata = make_test_metadata(DIM);
+        metadata.num_bits = 5;
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(
+                make_test_codes(1, DIM as i32),
+                make_test_ex_codes(1, DIM, 5),
+            ),
+            &metadata,
+            DistanceType::Dot,
+            None,
+        )
+        .unwrap();
+        let centroid = vec![0.125; DIM];
+        let query = (0..DIM)
+            .map(|i| {
+                0.125
+                    + if i % 2 == 0 {
+                        perturbation
+                    } else {
+                        -perturbation
+                    }
+            })
+            .collect::<Vec<_>>();
+        let factors = storage.raw_query_factors(1.0, &query, Some(&centroid));
+        let residual_norm = query
+            .iter()
+            .zip(&centroid)
+            .map(|(&q, &c)| (q as f64 - factors.add_scale as f64 * c as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(factors.error as f64 >= residual_norm);
+        assert!((factors.error as f64 - residual_norm).abs() < 1e-10);
+        let calc = storage.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: DIM,
+            dist_table: Cow::Owned(build_dist_table_direct::<Float32Type>(&query)),
+            ex_query: Cow::Borrowed(&query),
+            sum_q: query.iter().sum(),
+            query_factors: factors,
+            approx_mode: ApproxMode::Normal,
+        });
+        // The bound must retain the margin even when the two squared energies
+        // round to the same f32 value. A heap threshold inside it must not prune.
+        let binary_ip = 0.5 * calc.sum_q;
+        let binary_distance = calc.raw_query_binary_distance(0, binary_ip);
+        let bound = calc.raw_query_lower_bound(0, binary_ip).unwrap();
+        let margin = calc.error_factors.unwrap()[0] as f64 * residual_norm;
+        if perturbation > 0.0 {
+            let threshold = (binary_distance as f64 - margin * 0.5) as f32;
+            assert!(bound < threshold);
+            let masks = scaled_prune_mask_kernel()(
+                &[binary_ip; PRUNE_LANES],
+                &[calc.scale_factors[0]; PRUNE_LANES],
+                &[calc.add_factors[0]; PRUNE_LANES],
+                &[calc.error_factors.unwrap()[0]; PRUNE_LANES],
+                ScaledLowerBoundTerms {
+                    half_sum_q: 0.5 * calc.sum_q,
+                    add_factor_scale: calc.add_factor_scale,
+                    add_factor_offset: calc.add_factor_offset,
+                    query_factor: calc.query_factor,
+                    query_error: calc.query_error,
+                },
+                f32::INFINITY,
+                Some(threshold),
+            );
+            assert_eq!(masks, (0, 0), "the residual margin must keep every lane");
+        } else {
+            assert_eq!(bound, binary_distance);
         }
     }
 
