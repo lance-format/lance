@@ -14,7 +14,6 @@ use lance::dataset::transaction::{
 use lance::datatypes::{Field, Schema};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
-use lance_table::transaction::TRANSACTION_SCHEMA_SOURCE_RAW_ARROW;
 use pyo3::exceptions::PyValueError;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
@@ -1101,10 +1100,8 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
                 "Failed to convert Arrow schema to Lance schema: {e}"
             ))
         })?;
-    let mut metadata = arrow_schema.metadata.clone();
-    metadata.insert(
-        TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-        String::new(),
-    );
-    Ok(Schema { fields, metadata })
+    Ok(Schema {
+        fields,
+        metadata: arrow_schema.metadata.clone(),
+    })
 }

@@ -402,7 +402,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_read_dataset(super::FLAG_STABLE_FIELD_IDS));
-        assert!(!can_read_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_read_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -480,7 +480,7 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_write_dataset(super::FLAG_STABLE_FIELD_IDS));
-        assert!(!can_write_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_write_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
