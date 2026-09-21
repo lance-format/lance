@@ -29,7 +29,7 @@ use lance_io::traits::Writer;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
-use lance_table::transaction::{Operation, SchemaInputKind, canonicalize_stable_field_ids};
+use lance_table::transaction::{Operation, resolve_arrow_field_ids};
 use object_store::path::Path;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1530,19 +1530,14 @@ pub(super) fn prepare_write_schema(
     {
         // Uncommitted fragment APIs return files without the schema used to
         // write them, so their mappings must already use commit-time IDs.
-        // The converted Arrow schema carries positional IDs, not trusted Lance
-        // field IDs, so explicitly select Arrow input semantics.
+        // Resolve positional Arrow IDs before the schema enters the writer.
         let mut operation = Operation::Overwrite {
             fragments: Vec::new(),
             schema: normalized_converted_schema,
             config_upsert_values: None,
             initial_bases: None,
         };
-        canonicalize_stable_field_ids(
-            Some(&dataset.manifest),
-            &mut operation,
-            SchemaInputKind::Arrow,
-        )?;
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut operation)?;
         match operation {
             Operation::Overwrite { schema, .. } => schema,
             _ => {

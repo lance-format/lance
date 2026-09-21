@@ -48,7 +48,7 @@ pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,
 };
 pub use validate::{
-    SchemaInputKind, canonicalize_stable_field_ids, validate_detached_stable_field_ids,
+    canonicalize_stable_field_ids, resolve_arrow_field_ids, validate_detached_stable_field_ids,
     validate_operation, validate_stable_field_id_manifest, validate_stable_field_id_transition,
 };
 

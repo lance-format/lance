@@ -61,7 +61,7 @@ use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
 use lance_table::transaction::{
-    SchemaInputKind, canonicalize_stable_field_ids, validate_stable_field_id_transition,
+    canonicalize_stable_field_ids, validate_stable_field_id_transition,
 };
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
@@ -2024,7 +2024,7 @@ impl ManifestNamespace {
             if let Err(err) = canonicalize_stable_field_ids(
                 Some(dataset.manifest()),
                 &mut transaction.operation,
-                SchemaInputKind::Lance,
+                None,
             ) {
                 self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
                     .await;

@@ -11,7 +11,6 @@ use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
-    transaction::SchemaInputKind,
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -56,7 +55,6 @@ pub struct CommitBuilder<'a> {
     migration_next_row_id: Option<u64>,
     /// Whether this commit atomically activates stable field IDs.
     activate_stable_field_ids: bool,
-    schema_input_kind: SchemaInputKind,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -82,25 +80,7 @@ impl<'a> CommitBuilder<'a> {
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
             activate_stable_field_ids: false,
-            schema_input_kind: SchemaInputKind::Lance,
         }
-    }
-
-    /// Interpret transaction schema IDs according to their input source.
-    ///
-    /// Defaults to [`SchemaInputKind::Lance`]. Arrow Project inputs must retain
-    /// explicit IDs and leave missing IDs unassigned. This setting applies to
-    /// every commit attempt and is not persisted in the transaction.
-    ///
-    /// ```no_run
-    /// # use lance::dataset::CommitBuilder;
-    /// use lance::dataset::transaction::SchemaInputKind;
-    /// let builder = CommitBuilder::new("memory://")
-    ///     .with_schema_input_kind(SchemaInputKind::Arrow);
-    /// ```
-    pub fn with_schema_input_kind(mut self, input_kind: SchemaInputKind) -> Self {
-        self.schema_input_kind = input_kind;
-        self
     }
 
     /// Whether to use stable row ids. This makes the `_rowid` column stable
@@ -449,7 +429,6 @@ impl<'a> CommitBuilder<'a> {
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
             activate_stable_field_ids: self.activate_stable_field_ids,
-            schema_input_kind: self.schema_input_kind,
             ..Default::default()
         };
 
@@ -628,6 +607,7 @@ mod tests {
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
     use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
+    use lance_table::transaction::resolve_arrow_field_ids;
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -648,7 +628,7 @@ mod tests {
             fields: vec![field],
             metadata: metadata.clone(),
         };
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             0,
             Operation::Overwrite {
                 schema,
@@ -658,8 +638,8 @@ mod tests {
             },
             None,
         );
+        resolve_arrow_field_ids(None, &mut transaction.operation).unwrap();
         let dataset = CommitBuilder::new("memory://")
-            .with_schema_input_kind(SchemaInputKind::Arrow)
             .execute(transaction)
             .await
             .unwrap();
@@ -675,7 +655,7 @@ mod tests {
 
     #[rstest::rstest]
     #[tokio::test]
-    async fn raw_arrow_merge_uses_commit_input_kind(#[values(false, true)] detached: bool) {
+    async fn raw_arrow_merge_resolved_before_commit(#[values(false, true)] detached: bool) {
         let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [3, 4])).unwrap();
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
@@ -690,7 +670,7 @@ mod tests {
         for field in &mut raw_schema.fields {
             field.id += 10;
         }
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             dataset.version().version,
             Operation::Merge {
                 schema: raw_schema,
@@ -699,8 +679,8 @@ mod tests {
             },
             None,
         );
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut transaction.operation).unwrap();
         let committed = CommitBuilder::new(Arc::new(dataset.clone()))
-            .with_schema_input_kind(SchemaInputKind::Arrow)
             .with_detached(detached)
             .execute(transaction)
             .await

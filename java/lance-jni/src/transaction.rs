@@ -28,9 +28,10 @@ use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_table::format::Manifest;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
-use lance_table::transaction::SchemaInputKind;
+use lance_table::transaction::resolve_arrow_field_ids;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
@@ -838,7 +839,7 @@ fn inner_commit_to_dataset<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         BlockingDataset::new(dataset_guard.inner.clone())
     };
-    let (transaction, schema_input_kind) = convert_to_rust_transaction(
+    let transaction = convert_to_rust_transaction(
         env,
         java_transaction,
         Some(&java_allocator),
@@ -869,7 +870,6 @@ fn inner_commit_to_dataset<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         dataset_guard.commit_transaction(
             transaction,
-            schema_input_kind,
             store_params,
             detached,
             enable_v2_manifest_paths,
@@ -889,7 +889,7 @@ fn convert_to_rust_transaction(
     java_transaction: JObject,
     allocator: Option<&JObject>,
     dataset: Option<&mut BlockingDataset>,
-) -> Result<(Transaction, SchemaInputKind)> {
+) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env
@@ -900,8 +900,7 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let (op, schema_input_kind) =
-        convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
+    let op = convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
 
     let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
         let tag_str = JString::from(tag_obj);
@@ -916,14 +915,11 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    Ok((
-        TransactionBuilder::new(read_ver, op)
-            .uuid(uuid)
-            .tag(tag)
-            .transaction_properties(transaction_properties.map(Arc::new))
-            .build(),
-        schema_input_kind,
-    ))
+    Ok(TransactionBuilder::new(read_ver, op)
+        .uuid(uuid)
+        .tag(tag)
+        .transaction_properties(transaction_properties.map(Arc::new))
+        .build())
 }
 
 #[derive(Clone, Copy)]
@@ -949,7 +945,6 @@ type SchemaReadContext = (LanceSchema, i32, bool);
 struct ConvertedSchema {
     schema: LanceSchema,
     field_id_remap: HashMap<i32, i32>,
-    input_kind: SchemaInputKind,
 }
 
 fn convert_arrow_schema(
@@ -983,7 +978,6 @@ fn convert_arrow_schema(
         return Ok(ConvertedSchema {
             schema: original_schema,
             field_id_remap: HashMap::new(),
-            input_kind: SchemaInputKind::Arrow,
         });
     }
 
@@ -991,7 +985,6 @@ fn convert_arrow_schema(
         return Ok(ConvertedSchema {
             schema: original_schema,
             field_id_remap: HashMap::new(),
-            input_kind: SchemaInputKind::Lance,
         });
     }
 
@@ -1009,7 +1002,6 @@ fn convert_arrow_schema(
     Ok(ConvertedSchema {
         schema,
         field_id_remap,
-        input_kind: SchemaInputKind::Lance,
     })
 }
 
@@ -1017,8 +1009,7 @@ fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
     java_allocator: &JObject,
-    dataset: Option<&mut BlockingDataset>,
-    read_version: u64,
+    manifest: Option<&Manifest>,
     options: SchemaConversionOptions,
 ) -> Result<ConvertedSchema> {
     let schema_ptr = env
@@ -1033,52 +1024,18 @@ fn convert_schema_from_operation(
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let arrow_schema = Schema::try_from(&c_schema)?;
 
-    let read_context = match dataset {
-        Some(dataset) if dataset.inner.version().version == read_version => Some((
-            dataset.inner.schema().clone(),
-            dataset.inner.manifest().max_field_id(),
-            dataset.inner.manifest().uses_stable_field_ids(),
-        )),
-        Some(dataset) => {
-            let read_dataset = dataset.checkout_version(read_version)?;
-            Some((
-                read_dataset.inner.schema().clone(),
-                read_dataset.inner.manifest().max_field_id(),
-                read_dataset.inner.manifest().uses_stable_field_ids(),
-            ))
-        }
-        None => None,
-    };
+    let read_context = manifest.map(|manifest| {
+        (
+            manifest.schema.clone(),
+            manifest.max_field_id(),
+            manifest.uses_stable_field_ids(),
+        )
+    });
 
     convert_arrow_schema(&arrow_schema, read_context, options)
 }
 
 type DataFileIdentity = (Option<u32>, String);
-
-fn retained_file_identities(
-    dataset: Option<&mut BlockingDataset>,
-    read_version: u64,
-) -> Result<HashSet<DataFileIdentity>> {
-    let Some(dataset) = dataset else {
-        return Ok(HashSet::new());
-    };
-    let collect = |dataset: &BlockingDataset| {
-        dataset
-            .inner
-            .manifest()
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.referenced_lance_files())
-            .map(|file| (file.base_id, file.path.clone()))
-            .collect()
-    };
-    if dataset.inner.version().version == read_version {
-        Ok(collect(dataset))
-    } else {
-        let read_dataset = dataset.checkout_version(read_version)?;
-        Ok(collect(&read_dataset))
-    }
-}
 
 fn remap_fragment_field_ids(
     fragments: &mut [Fragment],
@@ -1224,16 +1181,27 @@ fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
     allocator: Option<&JObject<'_>>,
-    mut dataset: Option<&mut BlockingDataset>,
+    dataset: Option<&mut BlockingDataset>,
     read_version: u64,
-) -> Result<(Operation, SchemaInputKind)> {
-    let mut schema_input_kind = SchemaInputKind::Lance;
+) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
-    let op = match op_name.as_str() {
+    let read_dataset = if matches!(op_name.as_str(), "Project" | "Overwrite" | "Merge") {
+        match dataset {
+            Some(dataset) if dataset.inner.version().version != read_version => {
+                Some(dataset.checkout_version(read_version)?)
+            }
+            Some(dataset) => Some(dataset.clone()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let manifest = read_dataset
+        .as_ref()
+        .map(|dataset| dataset.inner.manifest());
+    let mut op = match op_name.as_str() {
         "Project" => {
-            let ConvertedSchema {
-                schema, input_kind, ..
-            } = convert_schema_from_operation(
+            let ConvertedSchema { schema, .. } = convert_schema_from_operation(
                 env,
                 java_operation,
                 allocator.ok_or_else(|| {
@@ -1241,14 +1209,12 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Project operations".to_string(),
                     )
                 })?,
-                dataset.as_deref_mut(),
-                read_version,
+                manifest,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
                     legacy_field_id_mode: LegacyFieldIdMode::Inherit,
                 },
             )?;
-            schema_input_kind = input_kind;
             Operation::Project {
                 preserves_nullability: env
                     .get_boolean_from_method(java_operation, "preservesNullability")?,
@@ -1377,7 +1343,6 @@ fn convert_to_rust_operation(
             let ConvertedSchema {
                 schema,
                 field_id_remap,
-                input_kind,
             } = convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1386,14 +1351,12 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Overwrite operations".to_string(),
                     )
                 })?,
-                dataset.as_deref_mut(),
-                read_version,
+                manifest,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
                     legacy_field_id_mode: LegacyFieldIdMode::Standalone,
                 },
             )?;
-            schema_input_kind = input_kind;
             remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
             Operation::Overwrite {
                 fragments,
@@ -1543,7 +1506,6 @@ fn convert_to_rust_operation(
             let ConvertedSchema {
                 schema,
                 field_id_remap,
-                input_kind,
             } = convert_schema_from_operation(
                 env,
                 java_operation,
@@ -1552,18 +1514,21 @@ fn convert_to_rust_operation(
                         "BufferAllocator is required for Merge operations".to_string(),
                     )
                 })?,
-                dataset.as_deref_mut(),
-                read_version,
+                manifest,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
                     legacy_field_id_mode: LegacyFieldIdMode::Inherit,
                 },
             )?;
-            schema_input_kind = input_kind;
             let retained_files = if field_id_remap.is_empty() {
                 HashSet::new()
             } else {
-                retained_file_identities(dataset, read_version)?
+                manifest
+                    .into_iter()
+                    .flat_map(|manifest| manifest.fragments.iter())
+                    .flat_map(|fragment| fragment.referenced_lance_files())
+                    .map(|file| (file.base_id, file.path.clone()))
+                    .collect()
             };
             remap_fragment_field_ids(&mut fragments, &field_id_remap, &retained_files);
             Operation::Merge {
@@ -1601,7 +1566,8 @@ fn convert_to_rust_operation(
         }
         _ => unimplemented!(),
     };
-    Ok((op, schema_input_kind))
+    resolve_arrow_field_ids(manifest, &mut op)?;
+    Ok(op)
 }
 
 fn extract_update_map(env: &mut JNIEnv, update_map_obj: &JObject) -> Result<Option<UpdateMap>> {
@@ -1837,12 +1803,11 @@ fn inner_commit_to_uri<'local>(
     } else {
         Some(allocator_obj)
     };
-    let (transaction, schema_input_kind) =
+    let transaction =
         convert_to_rust_transaction(env, java_transaction, allocator_ref.as_ref(), ds.as_mut())?;
 
     // Build CommitBuilder with URI
     let mut builder = CommitBuilder::new(&*uri_str)
-        .with_schema_input_kind(schema_input_kind)
         .with_store_params(store_params)
         .with_detached(detached)
         .enable_v2_manifest_paths(enable_v2_manifest_paths)
@@ -1928,7 +1893,6 @@ mod tests {
         let ConvertedSchema {
             schema,
             field_id_remap,
-            input_kind,
         } = convert_arrow_schema(
             &arrow_schema,
             Some((base_schema, 0, true)),
@@ -1939,7 +1903,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(input_kind, SchemaInputKind::Arrow);
         assert!(schema.metadata.is_empty());
         assert_eq!(schema.field("a").unwrap().id, -1);
         assert!(field_id_remap.is_empty());
@@ -1969,7 +1932,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(converted.input_kind, SchemaInputKind::Arrow);
         assert_eq!(converted.schema.field("renamed").unwrap().id, 0);
         assert_eq!(converted.schema.metadata, metadata);
         assert!(converted.field_id_remap.is_empty());
@@ -1988,7 +1950,6 @@ mod tests {
         let ConvertedSchema {
             schema,
             field_id_remap,
-            input_kind,
         } = convert_arrow_schema(
             &arrow_schema,
             Some((base_schema, 0, false)),
@@ -2000,7 +1961,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(schema.field("a").unwrap().data_type(), ArrowDataType::Utf8);
-        assert_eq!(input_kind, SchemaInputKind::Lance);
         assert!(schema.metadata.is_empty());
         assert!(field_id_remap.is_empty());
     }

@@ -361,11 +361,7 @@ async fn do_commit_new_dataset(
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(
-        None,
-        &mut transaction.operation,
-        write_config.schema_input_kind,
-    )?;
+    canonicalize_stable_field_ids(None, &mut transaction.operation, None)?;
     let transaction = &transaction;
     validate_operation(None, &transaction.operation)?;
     let pb_transaction = pb::Transaction::from(transaction);
@@ -1097,11 +1093,7 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(
-        Some(&dataset.manifest),
-        &mut transaction.operation,
-        write_config.schema_input_kind,
-    )?;
+    canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
     validate_detached_stable_field_ids(&dataset.manifest, &transaction.operation)?;
     validate_operation(Some(&dataset.manifest), &transaction.operation)?;
@@ -1463,13 +1455,15 @@ pub(crate) async fn commit_transaction(
             ensure_can_write_manifest(&dataset.manifest)?;
         }
 
-        // Assign IDs on an attempt-local copy: a retry must bind the original
-        // input IDs and file mappings against the new manifest's high-water mark.
+        // Preserve identities from the read version, but allocate new IDs above
+        // the latest high-water mark. Each attempt remaps its own copy of the
+        // staged files, so a retry never mistakes a provisional ID for a field
+        // introduced by a concurrent commit.
         let mut attempt_transaction = transaction.clone();
         canonicalize_stable_field_ids(
             Some(&dataset.manifest),
             &mut attempt_transaction.operation,
-            write_config.schema_input_kind,
+            Some(read_version_dataset.schema()),
         )?;
         validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
 
@@ -1739,7 +1733,7 @@ mod tests {
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
     };
-    use lance_table::transaction::SchemaInputKind;
+    use lance_table::transaction::resolve_arrow_field_ids;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
@@ -1966,12 +1960,8 @@ mod tests {
             schema: raw_schema.clone(),
             preserves_nullability: true,
         };
-        canonicalize_stable_field_ids(
-            Some(&foreign_manifest),
-            &mut expected,
-            SchemaInputKind::Arrow,
-        )
-        .unwrap();
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut expected).unwrap();
+        let operation = expected.clone();
         let Operation::Project {
             schema: expected_schema,
             ..
@@ -1982,15 +1972,7 @@ mod tests {
 
         let committed = CommitBuilder::new(Arc::new(dataset.clone()))
             .with_commit_handler(handler)
-            .with_schema_input_kind(SchemaInputKind::Arrow)
-            .execute(Transaction::new(
-                dataset.version().version,
-                Operation::Project {
-                    schema: raw_schema,
-                    preserves_nullability: true,
-                },
-                None,
-            ))
+            .execute(Transaction::new(dataset.version().version, operation, None))
             .await
             .unwrap();
 
@@ -2001,8 +1983,11 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn raw_arrow_merge_retry_rebinds_after_allocator_advance() {
+    async fn raw_arrow_retry_rebinds_after_allocator_advance(
+        #[values(false, true)] overwrite: bool,
+    ) {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
         let mut dataset = Dataset::write(
@@ -2039,31 +2024,45 @@ mod tests {
             ],
             metadata: HashMap::new(),
         };
-        let operation = Operation::Merge {
-            fragments: vec![merged_fragment],
-            schema: raw_schema,
-            preserves_nullability: true,
+        let mut operation = if overwrite {
+            Operation::Overwrite {
+                fragments: vec![merged_fragment],
+                schema: raw_schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            }
+        } else {
+            Operation::Merge {
+                fragments: vec![merged_fragment],
+                schema: raw_schema,
+                preserves_nullability: true,
+            }
         };
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut operation).unwrap();
         let mut expected = operation.clone();
         canonicalize_stable_field_ids(
             Some(&foreign_manifest),
             &mut expected,
-            SchemaInputKind::Arrow,
+            Some(dataset.schema()),
         )
         .unwrap();
 
         let committed = CommitBuilder::new(Arc::new(dataset.clone()))
             .with_commit_handler(handler)
-            .with_schema_input_kind(SchemaInputKind::Arrow)
             .execute(Transaction::new(dataset.version().version, operation, None))
             .await
             .unwrap();
 
-        let Operation::Merge {
+        let (Operation::Merge {
             schema: expected_schema,
             fragments: expected_fragments,
             ..
-        } = expected
+        }
+        | Operation::Overwrite {
+            schema: expected_schema,
+            fragments: expected_fragments,
+            ..
+        }) = expected
         else {
             unreachable!();
         };

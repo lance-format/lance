@@ -24,51 +24,35 @@ struct FieldIdRemap {
     raw_source_ids: HashMap<i32, i32>,
 }
 
-/// How to interpret field IDs in the schema supplied to a commit.
+/// Resolve an Arrow-derived operation against the dataset it was read from.
 ///
-/// This is input context, not part of the persisted schema or transaction.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SchemaInputKind {
-    /// IDs describe Lance fields, including fields preserved across renames.
-    #[default]
-    Lance,
-    /// IDs come from Arrow conversion or caller metadata. Overwrite and Merge
-    /// match existing fields by name and type, not by these input IDs. Project
-    /// may use explicit IDs to rename existing fields; missing IDs must remain
-    /// unassigned rather than receiving positional IDs during conversion.
-    Arrow,
-}
-
-/// Assign field IDs for an operation before validation.
+/// Overwrite and Merge match fields by name and type, not positional Arrow IDs.
+/// Project may use explicit IDs for renames; its conversion must leave missing
+/// IDs unassigned. New file mappings follow the resolved schema; retained files
+/// are unchanged. Call this at the conversion boundary, before committing the
+/// resulting Lance operation. Commit-time allocation still handles retries.
 ///
-/// - New datasets receive field IDs starting at zero.
-/// - Stable datasets preserve IDs for compatible existing fields and assign new
-///   fields IDs above the persisted high-water mark.
-/// - Arrow field-ID metadata cannot choose the ID of a new field.
-/// - Raw Arrow Project operations must match existing fields: they write no data
-///   and cannot add fields.
-/// - New files' field mappings follow the assigned IDs; files retained by a merge
-///   are never remapped.
-pub fn canonicalize_stable_field_ids(
+/// ```no_run
+/// # use lance_table::{format::Manifest, transaction::{Operation, resolve_arrow_field_ids}};
+/// # fn convert(manifest: &Manifest, operation: &mut Operation) -> lance_core::Result<()> {
+/// resolve_arrow_field_ids(Some(manifest), operation)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn resolve_arrow_field_ids(
     manifest: Option<&Manifest>,
     operation: &mut Operation,
-    input_kind: SchemaInputKind,
 ) -> Result<()> {
-    let raw_arrow_schema = input_kind == SchemaInputKind::Arrow;
     if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
-        if raw_arrow_schema {
-            match operation {
-                Operation::Overwrite { schema, .. }
-                | Operation::Project { schema, .. }
-                | Operation::Merge { schema, .. } => {
-                    // Legacy datasets retain the standalone Arrow conversion
-                    // contract. Missing IDs still need to be assigned.
-                    schema.try_set_field_id(None)?;
-                    schema.validate()?;
-                    schema.verify_primary_key()?;
-                }
-                _ => {}
+        match operation {
+            Operation::Overwrite { schema, .. }
+            | Operation::Project { schema, .. }
+            | Operation::Merge { schema, .. } => {
+                schema.try_set_field_id(None)?;
+                schema.validate()?;
+                schema.verify_primary_key()?;
             }
+            _ => {}
         }
         return Ok(());
     }
@@ -77,11 +61,10 @@ pub fn canonicalize_stable_field_ids(
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let field_id_remap =
-                canonicalize_schema(manifest, schema, !raw_arrow_schema, raw_arrow_schema)?;
+            let field_id_remap = canonicalize_schema(manifest, schema, None, true)?;
             remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new())?;
         }
-        Operation::Project { schema, .. } if raw_arrow_schema => {
+        Operation::Project { schema, .. } => {
             let Some(manifest) = manifest else {
                 return Ok(());
             };
@@ -99,11 +82,63 @@ pub fn canonicalize_stable_field_ids(
                 .flat_map(|fragment| fragment.referenced_lance_files())
                 .map(|file| (file.base_id, file.path.clone()))
                 .collect();
-            if raw_arrow_schema {
-                let field_id_remap = canonicalize_schema(Some(manifest), schema, false, true)?;
-                remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
+            let field_id_remap = canonicalize_schema(Some(manifest), schema, None, true)?;
+            remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Assign IDs and update new file mappings before committing a Lance operation.
+///
+/// `manifest` is the latest version. On a retry, `read_schema` identifies which
+/// input IDs referred to existing fields when the transaction was prepared;
+/// `None` uses the manifest's schema. New fields are allocated above the latest
+/// high-water mark, without binding their provisional IDs to fields introduced
+/// by a concurrent commit. Arrow inputs must first use [`resolve_arrow_field_ids`].
+///
+/// ```no_run
+/// # use lance_table::{format::Manifest, transaction::{Operation, canonicalize_stable_field_ids}};
+/// # fn commit(read: &Manifest, latest: &Manifest, operation: &mut Operation) -> lance_core::Result<()> {
+/// canonicalize_stable_field_ids(Some(latest), operation, Some(&read.schema))?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn canonicalize_stable_field_ids(
+    manifest: Option<&Manifest>,
+    operation: &mut Operation,
+    read_schema: Option<&Schema>,
+) -> Result<()> {
+    if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
+        return Ok(());
+    }
+    match operation {
+        Operation::Overwrite {
+            schema, fragments, ..
+        } => {
+            let identity_schema = read_schema.or_else(|| manifest.map(|manifest| &manifest.schema));
+            let remap = canonicalize_schema(manifest, schema, identity_schema, false)?;
+            remap_fragment_field_ids(fragments, &remap, &HashSet::new())?;
+        }
+        Operation::Merge {
+            schema, fragments, ..
+        } => {
+            if let Some(manifest) = manifest {
+                let retained_files = manifest
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.referenced_lance_files())
+                    .map(|file| (file.base_id, file.path.clone()))
+                    .collect();
+                canonicalize_merge_replacements(
+                    manifest,
+                    schema,
+                    fragments,
+                    &retained_files,
+                    read_schema.unwrap_or(&manifest.schema),
+                )?;
             }
-            canonicalize_merge_replacements(manifest, schema, fragments, &retained_files)?;
         }
         _ => {}
     }
@@ -115,6 +150,7 @@ fn canonicalize_merge_replacements(
     schema: &mut Schema,
     fragments: &mut [Fragment],
     retained_files: &HashSet<DataFileIdentity>,
+    read_schema: &Schema,
 ) -> Result<()> {
     let mut replaced_field_ids = HashSet::new();
     for fragment in fragments.iter() {
@@ -131,16 +167,11 @@ fn canonicalize_merge_replacements(
                 .filter(|field_id| retained_field_ids.contains(field_id)),
         );
     }
-    if replaced_field_ids.is_empty() {
-        return Ok(());
-    }
-
     let original = schema.clone();
-    let max_field_id = manifest.max_field_id();
     for field in &mut schema.fields {
-        clear_replaced_and_new_field_ids(field, max_field_id, &replaced_field_ids);
+        clear_replaced_and_new_field_ids(field, read_schema, &replaced_field_ids);
     }
-    schema.try_set_field_id(Some(max_field_id))?;
+    schema.try_set_field_id(Some(manifest.max_field_id()))?;
     schema.validate()?;
     schema.verify_primary_key()?;
 
@@ -159,22 +190,22 @@ fn canonicalize_merge_replacements(
 
 fn clear_replaced_and_new_field_ids(
     field: &mut Field,
-    max_field_id: i32,
+    base_schema: &Schema,
     replaced_field_ids: &HashSet<i32>,
 ) {
-    if field.id > max_field_id || replaced_field_ids.contains(&field.id) {
+    if base_schema.field_by_id(field.id).is_none() || replaced_field_ids.contains(&field.id) {
         clear_field_ids(field);
         return;
     }
     for child in &mut field.children {
-        clear_replaced_and_new_field_ids(child, max_field_id, replaced_field_ids);
+        clear_replaced_and_new_field_ids(child, base_schema, replaced_field_ids);
     }
 }
 
 fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> Result<()> {
     let mut unmatched_fields = Vec::new();
     for field in &mut schema.fields {
-        if !canonicalize_field(field, -1, &manifest.schema, None, true) {
+        if !canonicalize_field(field, -1, &manifest.schema, None, Some(&manifest.schema)) {
             unmatched_fields.push(field.name.clone());
         }
     }
@@ -192,7 +223,7 @@ fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> 
 fn canonicalize_schema(
     manifest: Option<&Manifest>,
     schema: &mut Schema,
-    allow_id_binding: bool,
+    identity_schema: Option<&Schema>,
     remap_raw_source_ids: bool,
 ) -> Result<FieldIdRemap> {
     let original = schema.clone();
@@ -209,7 +240,7 @@ fn canonicalize_schema(
         schema.try_reassign_field_ids(max_existing_id)?;
     } else if let Some(manifest) = manifest {
         for field in &mut schema.fields {
-            canonicalize_field(field, -1, &manifest.schema, None, allow_id_binding);
+            canonicalize_field(field, -1, &manifest.schema, None, identity_schema);
         }
         schema.try_set_field_id(max_existing_id)?;
     }
@@ -241,7 +272,7 @@ fn canonicalize_field(
     parent_id: i32,
     base_schema: &Schema,
     base_parent: Option<&Field>,
-    allow_id_binding: bool,
+    identity_schema: Option<&Schema>,
 ) -> bool {
     let same_name = match base_parent {
         Some(parent) => parent.children.iter().find(|base| base.name == field.name),
@@ -250,6 +281,8 @@ fn canonicalize_field(
             .iter()
             .find(|base| base.name == field.name),
     };
+    let allow_id_binding =
+        identity_schema.is_some_and(|schema| schema.field_by_id(field.id).is_some());
     let by_id = (allow_id_binding && field.id >= 0)
         .then(|| base_schema.field_by_id(field.id))
         .flatten()
@@ -276,7 +309,7 @@ fn canonicalize_field(
             field.id,
             base_schema,
             Some(base_field),
-            allow_id_binding,
+            identity_schema,
         ) {
             all_children_match = false;
         }
@@ -1119,8 +1152,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
-            .unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1144,8 +1176,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1155,6 +1186,55 @@ mod tests {
         };
         assert_eq!(schema.fields[0].id, 0);
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+    }
+
+    #[rstest::rstest]
+    #[case::concurrent_add(false, vec![0, 2])]
+    #[case::concurrent_replace(true, vec![2, 3])]
+    fn canonicalize_overwrite_retry_preserves_only_live_read_identities(
+        #[case] replace: bool,
+        #[case] expected_ids: Vec<i32>,
+    ) {
+        let read = activated_manifest();
+        let mut staged = read.schema.clone();
+        let mut new_field = Field::new_arrow("new_column", DataType::Int32, true).unwrap();
+        new_field.id = 1;
+        staged.fields.push(new_field.clone());
+        let mut latest_schema = read.schema.clone();
+        if replace {
+            latest_schema.fields.clear();
+        }
+        new_field.name = "concurrent_column".to_string();
+        latest_schema.fields.push(new_field);
+        let latest_ids = latest_schema.field_ids().into_iter().collect();
+        let mut latest = manifest_with_file_fields(latest_schema, latest_ids);
+        latest.activate_stable_field_ids();
+        let mut operation = Operation::Overwrite {
+            schema: staged,
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0, 1])],
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&latest), &mut operation, Some(&read.schema)).unwrap();
+        validate_operation(Some(&latest), &operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            schema
+                .fields
+                .iter()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(fragments[0].files[0].fields.as_ref(), expected_ids);
+        assert_eq!(schema.fields[1].name, "new_column");
     }
 
     #[test]
@@ -1181,8 +1261,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Overwrite { schema, .. } = operation else {
             unreachable!();
@@ -1209,8 +1288,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1250,8 +1328,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1287,9 +1364,7 @@ mod tests {
             initial_bases: None,
         };
 
-        let err =
-            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-                .unwrap_err();
+        let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
         assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }
@@ -1305,9 +1380,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        let err =
-            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-                .unwrap_err();
+        let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
         assert!(err.to_string().contains("writes no data"), "{err}");
     }
@@ -1322,8 +1395,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Project { schema, .. } = operation else {
             unreachable!();
@@ -1342,8 +1414,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-            .unwrap();
+        resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap();
 
         let Operation::Project { schema, .. } = operation else {
             unreachable!();
@@ -1367,8 +1438,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
-            .unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1405,8 +1475,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
-            .unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1443,9 +1512,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        let err =
-            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
-                .unwrap_err();
+        let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
         assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }
