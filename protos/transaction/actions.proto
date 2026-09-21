@@ -21,11 +21,15 @@ package lance.table;
  * the stabilization vote does not pass. Support here is read-side
  * fail-closed — rejected on load, with no write path.
  *
+ * COMPATIBILITY WARNING. A table version carrying one of these cannot be
+ * opened at all by Lance before v12.0.0, and the fix is not backported
+ * (issue #9454). Writing V2 is opt-in for that reason.
+ *
  * Why this shape:
  *
  * 1. Actions are deltas, not post-images: each records *the change* to the
  *    manifest, not the resulting state. That is what lets actions compose
- *    into one commit, and replay onto another branch, with no special cases.
+ *    into one commit and replay onto another branch with no special cases.
  *
  * 2. `Ref = Committed | Local`. A minting action cannot know its
  *    counter-allocated id (field, fragment, base) until commit, and gets a
@@ -40,16 +44,12 @@ package lance.table;
  *    preserves the field id and makes each mutable facet an independent
  *    optional, so concurrent alters of different facets commute too.
  *
- * 4. Index actions target a segment by UUID: the format has no index apart
- *    from its segments, and a logical index is the set of segments sharing a
- *    `name`.
- *
- * 5. Assertions carry only preconditions no post-image can reconstruct, e.g.
+ * 4. Assertions carry only preconditions no post-image can reconstruct, e.g.
  *    the keys a merge-insert inserted (`AssertUniqueKeys`).
  *
  * Off the wire and recomputed instead: conflict footprints, a pure function
- * of each action, and large derivable row-level deltas, recoverable by
- * diffing against the read-version state.
+ * of each action, and large row-level deltas recoverable from the
+ * read-version state.
  */
 
 /*

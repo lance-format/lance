@@ -567,6 +567,21 @@ same id, name, or path.
     stabilization vote does not pass. Discussion:
     [#5960](https://github.com/lance-format/lance/discussions/5960).
 
+!!! danger "Writing Transaction V2 breaks compatibility with readers before v12.0.0"
+
+    A table version committed as a `CompositeOperation` **cannot be opened** by
+    Lance before v12.0.0 — not merely read as history. Those releases decode the
+    manifest's inline transaction section while opening the table, and an
+    operation they do not recognize decodes to no operation at all, which fails
+    the open. The fix
+    ([#7740](https://github.com/lance-format/lance/pull/7740)) shipped in
+    v12.0.0 and is not expected to be backported to earlier release lines; see
+    [#9454](https://github.com/lance-format/lance/issues/9454).
+
+    Treat this as durable, not transitional. Writing a `CompositeOperation` is
+    opt-in for exactly this reason, and a table that has one anywhere in its
+    history raises the minimum reader version for that table to v12.0.0.
+
 Every operation above is a single named verb. A transaction may instead carry a
 `CompositeOperation`: an ordered list of granular *actions* that apply
 atomically as one manifest change. This lets one commit express a change no
@@ -612,8 +627,10 @@ feature. Readers are affected in two places:
 - Transactions are usually inlined into the manifest. A reader that fails when
   an inline transaction does not decode cannot open such a table at all.
   Implementations must tolerate an undecodable inline transaction and continue
-  opening the table. In the Rust implementation this has been true since
-  v12.0.0.
+  opening the table, because the transaction contents are not needed to read
+  data. In the Rust implementation this has been true only since v12.0.0, which
+  is what makes writing Transaction V2 a compatibility break against earlier
+  releases rather than a graceful degradation.
 
 Conflict resolution between two `CompositeOperation`s is computed from the
 actions themselves. Between a `CompositeOperation` and any named operation it

@@ -367,7 +367,15 @@ message Transaction {
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
     /* Action-based transaction (Transaction V2). See actions.proto.
+     *
      * EXPERIMENTAL: currently rejected on load; no write path.
+     *
+     * A table version carrying this arm cannot be opened at all by Lance
+     * before v12.0.0. Those releases decode the inline transaction while
+     * opening the table, and an arm they do not know decodes to no operation,
+     * which fails the open (issue #9454). The fix landed in v12.0.0 and is not
+     * backported, so this is a durable compatibility break rather than a
+     * transitional one.
      */
     CompositeOperation composite_operation = 116;
   }
