@@ -125,11 +125,11 @@ macro_rules! define_action_proto {
                     $(Some(pb::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
-                    // The drafted vocabulary is larger than what is implemented.
+                    // The specified vocabulary is larger than what is implemented.
                     // Reject rather than skip: silently dropping an action would
                     // apply a partial transaction.
                     Some(other) => Err(Error::not_supported(format!(
-                        "the action-based transaction uses action {other:?}, which is drafted \
+                        "the action-based transaction uses action {other:?}, which is specified \
                          but not implemented by this version of Lance",
                     ))),
                     None => Err(Error::invalid_input(
