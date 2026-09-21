@@ -2725,6 +2725,112 @@ mod composite {
         );
     }
 
+    /// Replace field 0's data in fragment 0, the way an in-place column
+    /// rewrite does.
+    fn rewrite_field_zero(file: DataFile) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file,
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ]
+    }
+
+    /// The coverage of `name`, or `None` when no segment carries the name.
+    async fn index_coverage_opt(dataset: &Dataset, name: &str) -> Option<Vec<u32>> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == name)?;
+        Some(
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("coverage should be recorded")
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// Control for the test below: when the rewrite is the *later* commit, the
+    /// coverage is repaired. `TombstoneFieldData::apply` rebinds the field,
+    /// which prunes the fragment from every index the manifest carries.
+    #[tokio::test]
+    async fn test_a_rewrite_prunes_an_index_segment_committed_before_it() {
+        let dataset = test_dataset(false).await;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(dataset, rewrite_field_zero(file)).await;
+
+        assert_eq!(
+            index_coverage_opt(&dataset, "by_a").await.unwrap_or_default(),
+            Vec::<u32>::new(),
+            "the rewrite should have dropped fragment 0 from the coverage"
+        );
+    }
+
+    /// The same two commits in the other order must reach the same place.
+    ///
+    /// The format spec's third invalidation case -- a fragment has had one of
+    /// the index's columns updated in place -- "cannot be detected just by
+    /// examining metadata", so a reader trusts `fragment_bitmap` and has no
+    /// recourse. Keeping it honest is a write-path obligation.
+    ///
+    /// Apply-time pruning only discharges that obligation when the rewrite is
+    /// the later commit, as the control above shows. A segment built before the
+    /// rewrite but committed after it carries no rebind of its own, so nothing
+    /// prunes it -- and its footprint records only an index claim, which is
+    /// never compared against the `FieldData` coordinates the rewrite writes.
+    #[tokio::test]
+    async fn test_an_index_segment_staged_before_a_rewrite_does_not_cover_it() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        // The rewrite wins the race.
+        commit(dataset, rewrite_field_zero(file)).await;
+
+        // The loser built its segment from the values the rewrite replaced.
+        let committed = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        // Either outcome is sound: reject the commit, or land the segment
+        // without the fragment it can no longer describe. What it may not do is
+        // publish coverage of fragment 0, which a reader would then trust.
+        match committed {
+            Err(error) => assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            ),
+            Ok(dataset) => assert_eq!(
+                index_coverage_opt(&dataset, "by_a").await.unwrap_or_default(),
+                Vec::<u32>::new(),
+                "the segment describes field 0 as it was before the rewrite"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn test_a_commit_extends_an_index_segments_coverage() {
         let dataset = test_dataset(false).await;
