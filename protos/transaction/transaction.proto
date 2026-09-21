@@ -367,7 +367,7 @@ message Transaction {
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
     /* Action-based transaction (Transaction V2). See actions.proto.
-     * DRAFT: currently rejected on load; no write path.
+     * EXPERIMENTAL: currently rejected on load; no write path.
      */
     CompositeOperation composite_operation = 116;
   }

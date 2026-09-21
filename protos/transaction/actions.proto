@@ -11,15 +11,17 @@ import "google/protobuf/any.proto";
 package lance.table;
 
 /*
- * Action-based transactions (Transaction V2) — DRAFT.
+ * Action-based transactions (Transaction V2) — EXPERIMENTAL.
  *
  * A `CompositeOperation` replaces the legacy `Operation` (see
  * transaction.proto) with an ordered list of `Action`s committing
- * atomically as one manifest change. This file is the wire draft only: the
- * field numbers are not yet a stable contract, and support here is read-side
+ * atomically as one manifest change. This is an experimental feature under
+ * the process in docs/src/community/voting.md: the field numbers are not a
+ * stable contract, may change without a separate vote, and are removed if
+ * the stabilization vote does not pass. Support here is read-side
  * fail-closed — rejected on load, with no write path.
  *
- * Why it is shaped this way:
+ * Why this shape:
  *
  * 1. Actions are deltas, not post-images: each records *the change* to the
  *    manifest, not the resulting state. That is what lets actions compose
@@ -27,7 +29,7 @@ package lance.table;
  *
  * 2. `Ref = Committed | Local`. A minting action cannot know its
  *    counter-allocated id (field, fragment, base) until commit, and gets a
- *    different one when replayed onto another target, so it names the id with
+ *    different one on replay onto another target, so it names the id with
  *    a `Local` token resolved against the target's counters at apply. A
  *    writer that must bake an id into a file it writes in the same commit
  *    instead takes `Committed` ids from a range an earlier commit reserved
@@ -45,10 +47,9 @@ package lance.table;
  * 5. Assertions carry only preconditions no post-image can reconstruct, e.g.
  *    the keys a merge-insert inserted (`AssertUniqueKeys`).
  *
- * Deliberately off the wire and recomputed instead: conflict footprints, a
- * pure function of each action, and large derivable row-level deltas,
- * recoverable by diffing against the read-version state. The schema evolves
- * additively — new optional fields, not a reshaping of what is here.
+ * Off the wire and recomputed instead: conflict footprints, a pure function
+ * of each action, and large derivable row-level deltas, recoverable by
+ * diffing against the read-version state.
  */
 
 /*

@@ -556,6 +556,69 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
+## Action-Based Transactions (Transaction V2)
+
+!!! warning "Experimental"
+
+    Transaction V2 is an experimental format feature under the process in
+    [Voting](../../community/voting.md). Its protobuf field numbers are not a
+    stable contract, breaking changes may be made without a separate vote, and
+    the feature is removed from the specification and the codebase if its
+    stabilization vote does not pass. Discussion:
+    [#5960](https://github.com/lance-format/lance/discussions/5960).
+
+Every operation above is a single named verb. A transaction may instead carry a
+`CompositeOperation`: an ordered list of granular *actions* that apply
+atomically as one manifest change. This lets one commit express a change no
+single named operation covers, such as appending a fragment and updating an
+index together, and makes the transaction a true diff of the manifest rather
+than a description of intent.
+
+<details>
+<summary>CompositeOperation protobuf message</summary>
+
+```protobuf
+%%% proto.message.CompositeOperation %%%
+```
+
+</details>
+
+A `CompositeOperation` holds `UserAction`s, each a human-recognizable step with
+a description, which in turn hold the granular `Action`s applied to the
+manifest. The two levels exist so the transaction history stays readable when
+several operations are squashed into one: the descriptions survive, while the
+action lists are flattened on apply.
+
+Actions are deltas rather than post-images, and an action that allocates a new
+identifier (a field, fragment, or base id) names it with a local placeholder
+that resolves against the target's counters at apply time. Both properties are
+what let a composite operation be replayed against a newer version, or onto a
+different branch, without rewriting it.
+
+The full action vocabulary and the reasoning behind its shape are defined in
+`protos/transaction/actions.proto`.
+
+### Compatibility
+
+A `CompositeOperation` produces an ordinary manifest, so a reader that scans a
+table whose latest version was written this way needs no knowledge of the
+feature. Readers are affected in two places:
+
+- A reader that decodes the transaction itself — reading the transaction
+  history, or checking a concurrent commit for conflicts — sees an operation it
+  does not recognize. Implementations must reject it rather than treat it as a
+  no-op, so that a concurrent V2 commit aborts an in-flight commit instead of
+  being silently skipped.
+- Transactions are usually inlined into the manifest. A reader that fails when
+  an inline transaction does not decode cannot open such a table at all.
+  Implementations must tolerate an undecodable inline transaction and continue
+  opening the table. In the Rust implementation this has been true since
+  v12.0.0.
+
+Conflict resolution between two `CompositeOperation`s is computed from the
+actions themselves. Between a `CompositeOperation` and any named operation it
+fails closed: the commit is rejected as a conflict rather than compared.
+
 ## Conflict Resolution
 
 ### Terminology
