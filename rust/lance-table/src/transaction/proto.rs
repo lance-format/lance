@@ -871,8 +871,6 @@ mod tests {
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb::CompositeOperation {
-                    uuid: Some(pb::Uuid::from(&Uuid::new_v4())),
-                    read_version: 1,
                     actions: vec![pb::UserAction {
                         description: "append batch".to_string(),
                         actions: vec![pb::Action {

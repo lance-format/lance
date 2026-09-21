@@ -75,12 +75,8 @@ message Ref {
  * commit atomically as a single manifest change.
  */
 message CompositeOperation {
-  // Unique identifier for this operation (matches Transaction.uuid semantics).
-  UUID uuid = 1;
-  // The dataset version this operation was planned against.
-  uint64 read_version = 2;
   // The ordered list of user actions applied by this operation.
-  repeated UserAction actions = 3;
+  repeated UserAction actions = 1;
 }
 
 /*
