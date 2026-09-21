@@ -74,6 +74,13 @@ rewrite group's ID.
 Hilbert curve. Every rewrite group in one clustering operation uses the same
 model so its output fragments share one coordinate space.
 
+The model population is every live row in every source fragment selected by
+the clustering operation, as visible at the table version on which the
+operation is based. Rows hidden by deletions and rows in fragments outside the
+operation are excluded. Partial samples must cover disjoint subsets whose union
+is exactly this population. If a partition is retried, the coordinator uses
+exactly one successful result for that partition.
+
 For each clustering field, construct the model as follows:
 
 1. Order non-null values ascending according to their Arrow logical type.
@@ -91,20 +98,47 @@ For each clustering field, construct the model as follows:
    last block, and append `0xff` after each non-final block and the unpadded
    length after the final block. The encoded-value width below includes these
    marker, padding, and block-length bytes.
-2. Associate each candidate with its stable physical row address. Set `x` to
+2. A non-null field value is a sampling candidate; a null field value is not.
+   Associate each candidate with its physical row address in the operation's
+   table version: `(fragment_id << 32) | row_offset`.
+   `column_index` is the zero-based position of the field in the ordered
+   clustering key, not its schema position or field ID. Set `x` to
    `row_address XOR (column_index * 0x9e3779b97f4a7c15) XOR
    0x4c414e43455f514e`. Then set `x` to
    `(x XOR (x >> 30)) * 0xbf58476d1ce4e5b9`, set `x` to
    `(x XOR (x >> 27)) * 0x94d049bb133111eb`, and finally set `x` to
    `x XOR (x >> 31)`. Multiplication wraps modulo 2^64 and shifts are logical.
-   Retain the candidates with the smallest `(x, row_address)` pairs.
-3. Retain at most 65,536 samples per field. The retained sample state must also
-   fit within 8 MiB per field, charging each entry its maximum encoded-value
-   width plus 40 bytes. If a single entry cannot fit, the rewrite is invalid.
-   These rules make independently collected samples mergeable without depending
-   on worker or retry order.
-4. Sort the retained encoded values in ascending order. Duplicate values remain
+3. Let `W` be the maximum encoded-value width among all candidates for the
+   field, including candidates that are not ultimately retained. Charge every
+   retained entry `W + 40` bytes and set
+   `K = min(65,536, floor((8 * 1024 * 1024) / (W + 40)))`. If the field has no
+   candidates, use `W = 0` and an empty sample. If it has candidates and `K` is
+   zero, the rewrite is invalid. Retain the `K` candidates with the smallest
+   `(x, row_address)` pairs, or all candidates when there are fewer than `K`.
+4. A partial sample records its local `W` and the smallest `K` candidates under
+   that local `W`. To merge partial samples, take the maximum of their `W`
+   values, recompute `K`, form the union of their retained candidates, and keep
+   the smallest `K` `(x, row_address)` pairs. Apply the same rule at every merge
+   level. Because the merged `K` is no greater than either input's `K`, the
+   result is independent of worker partitioning, merge order, and retries.
+5. Sort the retained encoded values in ascending order. Duplicate values remain
    in the sample sequence.
+
+As a sampling conformance vector, use clustering-key position zero and the
+following non-null Utf8 values: addresses 62, 50, 17, 6, 24, and 12 contain
+`a`, `b`, `c`, `d`, `e`, and `f`, respectively; address 35 contains the ASCII
+byte `g` repeated 1,626,848 times. Partition them as `A = {62, 50}`,
+`B = {17, 6}`, and `C = {24, 12, 35}`. The value at address 35 has an encoded
+width of 1,677,691 bytes, so the merged `W + 40` is 1,677,731 bytes and `K` is
+four. In ascending `(x, row_address)` order, the addresses and `x` values are
+`62: 0x00190210937e3060`, `17: 0x023d008d552fce12`,
+`24: 0x038e84229007c90d`, `12: 0x060599852005aa22`,
+`50: 0x063d664f158828df`, `35: 0x1320075888da18fe`, and
+`6: 0x1707ae364d30b31e`. A whole-input sample and every partition order and merge
+tree, including `(A merge B) merge C` and `A merge (B merge C)`, retain
+addresses `{62, 17, 24, 12}` in that priority order, then sort their encoded
+values as `a`, `c`, `e`, `f`. Address 35 establishes `W` even though its value
+is not retained.
 
 For a non-null input value, let `upper` be the number of samples less than or
 equal to its encoded value and let `rank = max(upper - 1, 0)`. With `n` retained
