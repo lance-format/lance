@@ -697,16 +697,11 @@ impl Schema {
     ///
     /// Existing IDs are preserved. New IDs start after both this schema's
     /// maximum ID and `max_existing_id`.
+    /// If allocation fails, discard the partially updated schema.
     pub fn try_set_field_id(&mut self, max_existing_id: Option<i32>) -> Result<()> {
         let schema_max_id = self.max_field_id().unwrap_or(-1);
         let max_existing_id = max_existing_id.unwrap_or(-1);
         let mut current_id = i64::from(schema_max_id.max(max_existing_id)) + 1;
-        let unassigned_count = self.fields_pre_order().filter(|field| field.id < 0).count() as i64;
-        if unassigned_count > 0 && current_id + unassigned_count - 1 > i64::from(i32::MAX) {
-            return Err(Error::invalid_input(
-                "No further field ID can be allocated because IDs are exhausted",
-            ));
-        }
         for field in &mut self.fields {
             field.try_set_id(-1, &mut current_id)?;
         }
@@ -717,14 +712,8 @@ impl Schema {
     ///
     /// The first assigned ID is one greater than `max_existing_id`. Use this when
     /// every input field must receive a new identity.
+    /// If allocation fails, discard the partially updated schema.
     pub fn try_reassign_field_ids(&mut self, max_existing_id: Option<i32>) -> Result<()> {
-        let field_count = self.fields_pre_order().count() as i64;
-        let first_id = i64::from(max_existing_id.unwrap_or(-1)) + 1;
-        if field_count > 0 && first_id + field_count - 1 > i64::from(i32::MAX) {
-            return Err(Error::invalid_input(
-                "No further field ID can be allocated because IDs are exhausted",
-            ));
-        }
         self.reset_id();
         self.try_set_field_id(max_existing_id)
     }
@@ -1790,37 +1779,45 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn checked_field_id_allocation_is_atomic_on_exhaustion() {
-        let mut schema = Schema {
-            fields: vec![
-                Field::try_from(&ArrowField::new("a", ArrowDataType::Int32, false)).unwrap(),
-                Field::try_from(&ArrowField::new("b", ArrowDataType::Int32, false)).unwrap(),
-            ],
-            metadata: HashMap::new(),
-        };
-
-        let err = schema.try_set_field_id(Some(i32::MAX - 1)).unwrap_err();
-
-        assert!(err.to_string().contains("IDs are exhausted"), "{err}");
-        assert!(schema.fields.iter().all(|field| field.id == -1));
-    }
-
-    #[test]
-    fn checked_field_id_reassignment_is_atomic_on_exhaustion() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int32, false),
-            ArrowField::new("b", ArrowDataType::Int32, false),
-        ]);
+    #[rstest::rstest]
+    #[case::last_id(i32::MAX - 1, 1, true)]
+    #[case::last_two_ids(i32::MAX - 2, 2, true)]
+    #[case::exhausted_mid_allocation(i32::MAX - 1, 2, false)]
+    #[case::exhausted_before_allocation(i32::MAX, 1, false)]
+    #[case::no_allocation_needed(i32::MAX, 0, true)]
+    fn checked_field_id_allocation_bounds(
+        #[case] max_existing_id: i32,
+        #[case] field_count: usize,
+        #[case] succeeds: bool,
+        #[values(false, true)] reassign: bool,
+    ) {
+        let arrow_schema = ArrowSchema::new(
+            (0..field_count)
+                .map(|i| ArrowField::new(format!("field_{i}"), ArrowDataType::Int32, false))
+                .collect::<Vec<_>>(),
+        );
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
-        let original = schema.clone();
-
-        let err = schema
-            .try_reassign_field_ids(Some(i32::MAX - 1))
-            .unwrap_err();
-
-        assert!(err.to_string().contains("IDs are exhausted"), "{err}");
-        assert_eq!(schema, original);
+        let result = if reassign {
+            schema.try_reassign_field_ids(Some(max_existing_id))
+        } else {
+            schema.reset_id();
+            schema.try_set_field_id(Some(max_existing_id))
+        };
+        if succeeds {
+            result.unwrap();
+            for (i, field) in schema.fields.iter().enumerate() {
+                assert_eq!(
+                    i64::from(field.id),
+                    i64::from(max_existing_id) + 1 + i as i64
+                );
+            }
+            // An exhausted ID space must still allow schemas with all IDs assigned.
+            schema.try_set_field_id(Some(i32::MAX)).unwrap();
+        } else {
+            let err = result.unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("IDs are exhausted"), "{err}");
+        }
     }
 
     #[test]

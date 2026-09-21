@@ -361,7 +361,11 @@ async fn do_commit_new_dataset(
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(None, &mut transaction.operation)?;
+    canonicalize_stable_field_ids(
+        None,
+        &mut transaction.operation,
+        write_config.schema_input_kind,
+    )?;
     let transaction = &transaction;
     validate_operation(None, &transaction.operation)?;
     let pb_transaction = pb::Transaction::from(transaction);
@@ -1093,7 +1097,11 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation)?;
+    canonicalize_stable_field_ids(
+        Some(&dataset.manifest),
+        &mut transaction.operation,
+        write_config.schema_input_kind,
+    )?;
     let transaction = &transaction;
     validate_detached_stable_field_ids(&dataset.manifest, &transaction.operation)?;
     validate_operation(Some(&dataset.manifest), &transaction.operation)?;
@@ -1455,11 +1463,14 @@ pub(crate) async fn commit_transaction(
             ensure_can_write_manifest(&dataset.manifest)?;
         }
 
-        // Keep the rebased transaction as the source operation for the next
-        // attempt. Canonicalization consumes transient binding provenance, so
-        // mutating that source would make a retry depend on the first attempt.
+        // Assign IDs on an attempt-local copy: a retry must bind the original
+        // input IDs and file mappings against the new manifest's high-water mark.
         let mut attempt_transaction = transaction.clone();
-        canonicalize_stable_field_ids(Some(&dataset.manifest), &mut attempt_transaction.operation)?;
+        canonicalize_stable_field_ids(
+            Some(&dataset.manifest),
+            &mut attempt_transaction.operation,
+            write_config.schema_input_kind,
+        )?;
         validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
@@ -1728,13 +1739,13 @@ mod tests {
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
     };
-    use lance_table::transaction::TRANSACTION_SCHEMA_SOURCE_RAW_ARROW;
+    use lance_table::transaction::SchemaInputKind;
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::Dataset;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{CommitBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1949,16 +1960,18 @@ mod tests {
 
         let raw_schema = Schema {
             fields: vec![Field::new_arrow("x", DataType::Int32, false).unwrap()],
-            metadata: HashMap::from([(
-                TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-                String::new(),
-            )]),
+            metadata: HashMap::from([("input-note".to_string(), "project".to_string())]),
         };
         let mut expected = Operation::Project {
             schema: raw_schema.clone(),
             preserves_nullability: true,
         };
-        canonicalize_stable_field_ids(Some(&foreign_manifest), &mut expected).unwrap();
+        canonicalize_stable_field_ids(
+            Some(&foreign_manifest),
+            &mut expected,
+            SchemaInputKind::Arrow,
+        )
+        .unwrap();
         let Operation::Project {
             schema: expected_schema,
             ..
@@ -1967,27 +1980,24 @@ mod tests {
             unreachable!();
         };
 
-        let committed = Dataset::commit(
-            uri,
-            Operation::Project {
-                schema: raw_schema,
-                preserves_nullability: true,
-            },
-            Some(dataset.version().version),
-            None,
-            Some(handler),
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap();
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(handler)
+            .with_schema_input_kind(SchemaInputKind::Arrow)
+            .execute(Transaction::new(
+                dataset.version().version,
+                Operation::Project {
+                    schema: raw_schema,
+                    preserves_nullability: true,
+                },
+                None,
+            ))
+            .await
+            .unwrap();
 
         assert_eq!(committed.schema(), &expected_schema);
-        assert!(
-            !committed
-                .schema()
-                .metadata
-                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+        assert_eq!(
+            committed.schema().metadata.get("input-note").unwrap(),
+            "project"
         );
     }
 
@@ -2027,10 +2037,7 @@ mod tests {
                 Field::new_arrow("x", DataType::Int32, false).unwrap(),
                 Field::new_arrow("new_column", DataType::Int32, true).unwrap(),
             ],
-            metadata: HashMap::from([(
-                TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-                String::new(),
-            )]),
+            metadata: HashMap::new(),
         };
         let operation = Operation::Merge {
             fragments: vec![merged_fragment],
@@ -2038,19 +2045,19 @@ mod tests {
             preserves_nullability: true,
         };
         let mut expected = operation.clone();
-        canonicalize_stable_field_ids(Some(&foreign_manifest), &mut expected).unwrap();
-
-        let committed = Dataset::commit(
-            uri,
-            operation,
-            Some(dataset.version().version),
-            None,
-            Some(handler),
-            Default::default(),
-            false,
+        canonicalize_stable_field_ids(
+            Some(&foreign_manifest),
+            &mut expected,
+            SchemaInputKind::Arrow,
         )
-        .await
         .unwrap();
+
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(handler)
+            .with_schema_input_kind(SchemaInputKind::Arrow)
+            .execute(Transaction::new(dataset.version().version, operation, None))
+            .await
+            .unwrap();
 
         let Operation::Merge {
             schema: expected_schema,

@@ -11,6 +11,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+    transaction::SchemaInputKind,
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -55,6 +56,7 @@ pub struct CommitBuilder<'a> {
     migration_next_row_id: Option<u64>,
     /// Whether this commit atomically activates stable field IDs.
     activate_stable_field_ids: bool,
+    schema_input_kind: SchemaInputKind,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -80,7 +82,25 @@ impl<'a> CommitBuilder<'a> {
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
             activate_stable_field_ids: false,
+            schema_input_kind: SchemaInputKind::Lance,
         }
+    }
+
+    /// Interpret transaction schema IDs according to their input source.
+    ///
+    /// Defaults to [`SchemaInputKind::Lance`]. Arrow Project inputs must retain
+    /// explicit IDs and leave missing IDs unassigned. This setting applies to
+    /// every commit attempt and is not persisted in the transaction.
+    ///
+    /// ```no_run
+    /// # use lance::dataset::CommitBuilder;
+    /// use lance::dataset::transaction::SchemaInputKind;
+    /// let builder = CommitBuilder::new("memory://")
+    ///     .with_schema_input_kind(SchemaInputKind::Arrow);
+    /// ```
+    pub fn with_schema_input_kind(mut self, input_kind: SchemaInputKind) -> Self {
+        self.schema_input_kind = input_kind;
+        self
     }
 
     /// Whether to use stable row ids. This makes the `_rowid` column stable
@@ -429,6 +449,7 @@ impl<'a> CommitBuilder<'a> {
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
             activate_stable_field_ids: self.activate_stable_field_ids,
+            schema_input_kind: self.schema_input_kind,
             ..Default::default()
         };
 
@@ -598,6 +619,7 @@ pub struct BatchCommitResult {
 #[cfg(test)]
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
+    use arrow_array::record_batch;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
     use lance_io::utils::CachedFileSize;
@@ -615,6 +637,86 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteParams};
 
     use super::*;
+
+    #[tokio::test]
+    async fn raw_arrow_new_dataset_preserves_user_metadata() {
+        let mut field =
+            lance_core::datatypes::Field::new_arrow("a", DataType::Int32, false).unwrap();
+        field.id = 42;
+        let metadata = HashMap::from([("source".to_string(), "user metadata".to_string())]);
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field],
+            metadata: metadata.clone(),
+        };
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                schema,
+                fragments: vec![],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new("memory://")
+            .with_schema_input_kind(SchemaInputKind::Arrow)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+        assert_eq!(dataset.schema().metadata, metadata);
+        let committed = dataset.read_transaction().await.unwrap().unwrap();
+        let Operation::Overwrite { schema, .. } = committed.operation else {
+            panic!("expected Overwrite");
+        };
+        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.metadata, metadata);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn raw_arrow_merge_uses_commit_input_kind(#[values(false, true)] detached: bool) {
+        let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [3, 4])).unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        dataset.migrate_to_stable_field_ids().await.unwrap();
+        let mut raw_schema = dataset.schema().clone();
+        for field in &mut raw_schema.fields {
+            field.id += 10;
+        }
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::Merge {
+                schema: raw_schema,
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_schema_input_kind(SchemaInputKind::Arrow)
+            .with_detached(detached)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(is_detached_version(committed.version().version), detached);
+        assert_eq!(committed.schema(), dataset.schema());
+        assert_eq!(committed.manifest.fragments.len(), 2);
+        assert_eq!(committed.manifest.fragments, dataset.manifest.fragments);
+        assert_eq!(committed.scan().try_into_batch().await.unwrap(), batch);
+        let persisted = committed.read_transaction().await.unwrap().unwrap();
+        let Operation::Merge { schema, .. } = persisted.operation else {
+            panic!("expected Merge");
+        };
+        assert_eq!(&schema, dataset.schema());
+        assert_eq!(schema.metadata, dataset.schema().metadata);
+    }
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =

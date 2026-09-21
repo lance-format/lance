@@ -24,29 +24,37 @@ struct FieldIdRemap {
     raw_source_ids: HashMap<i32, i32>,
 }
 
-/// Transient schema-metadata marker used by bindings for raw Arrow input.
-pub const TRANSACTION_SCHEMA_SOURCE_RAW_ARROW: &str = "lance:transaction_schema_source_raw_arrow";
-
-/// Canonicalize schema identities supplied by a transaction before validation.
+/// How to interpret field IDs in the schema supplied to a commit.
 ///
-/// Arrow field-ID metadata is descriptive input, not allocation authority. New
-/// datasets allocate from zero, while stable datasets preserve compatible
-/// existing identities and allocate every new identity above the persisted
-/// high-water mark. File mappings written against the incoming schema are
-/// updated in the same step; files retained by a merge are never rewritten.
+/// This is input context, not part of the persisted schema or transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemaInputKind {
+    /// IDs describe Lance fields, including fields preserved across renames.
+    #[default]
+    Lance,
+    /// IDs come from Arrow conversion or caller metadata. Overwrite and Merge
+    /// match existing fields by name and type, not by these input IDs. Project
+    /// may use explicit IDs to rename existing fields; missing IDs must remain
+    /// unassigned rather than receiving positional IDs during conversion.
+    Arrow,
+}
+
+/// Assign field IDs for an operation before validation.
+///
+/// - New datasets receive field IDs starting at zero.
+/// - Stable datasets preserve IDs for compatible existing fields and assign new
+///   fields IDs above the persisted high-water mark.
+/// - Arrow field-ID metadata cannot choose the ID of a new field.
+/// - Raw Arrow Project operations must match existing fields: they write no data
+///   and cannot add fields.
+/// - New files' field mappings follow the assigned IDs; files retained by a merge
+///   are never remapped.
 pub fn canonicalize_stable_field_ids(
     manifest: Option<&Manifest>,
     operation: &mut Operation,
+    input_kind: SchemaInputKind,
 ) -> Result<()> {
-    let raw_arrow_schema = match operation {
-        Operation::Overwrite { schema, .. }
-        | Operation::Project { schema, .. }
-        | Operation::Merge { schema, .. } => schema
-            .metadata
-            .remove(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
-            .is_some(),
-        _ => false,
-    };
+    let raw_arrow_schema = input_kind == SchemaInputKind::Arrow;
     if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
         if raw_arrow_schema {
             match operation {
@@ -54,8 +62,7 @@ pub fn canonicalize_stable_field_ids(
                 | Operation::Project { schema, .. }
                 | Operation::Merge { schema, .. } => {
                     // Legacy datasets retain the standalone Arrow conversion
-                    // contract. Missing IDs still need to be assigned after the
-                    // transient provenance marker has been removed.
+                    // contract. Missing IDs still need to be assigned.
                     schema.try_set_field_id(None)?;
                     schema.validate()?;
                     schema.verify_primary_key()?;
@@ -1063,6 +1070,7 @@ mod tests {
             preserves_nullability: true,
         };
         let err = validate_operation(Some(&manifest), &reused).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(
             err.to_string()
                 .contains("greater than the high-water mark 5"),
@@ -1111,7 +1119,8 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
+            .unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1128,10 +1137,6 @@ mod tests {
         let manifest = activated_manifest();
         let mut schema = one_field_schema();
         schema.fields[0].id = -1;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Overwrite {
             fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0])],
             schema,
@@ -1139,7 +1144,8 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1165,10 +1171,9 @@ mod tests {
             ArrowField::new("a", DataType::Int32, true),
         ]))
         .unwrap();
-        raw_schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
+        raw_schema
+            .metadata
+            .insert("source".to_string(), "user metadata".to_string());
         let mut operation = Operation::Overwrite {
             fragments: vec![],
             schema: raw_schema,
@@ -1176,13 +1181,15 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Overwrite { schema, .. } = operation else {
             unreachable!();
         };
         assert_eq!(schema.field("b").unwrap().id, 1);
         assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.metadata.get("source").unwrap(), "user metadata");
     }
 
     #[test]
@@ -1195,10 +1202,6 @@ mod tests {
         .unwrap();
         schema.fields[0].id = 1;
         schema.fields[1].id = 2;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Overwrite {
             fragments: vec![fragment_with_file_fields(0, "new.lance", vec![1, 2])],
             schema,
@@ -1206,7 +1209,8 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1235,10 +1239,6 @@ mod tests {
         for field in &mut schema.fields {
             field.id = -1;
         }
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut fragment = fragment_with_file_fields(0, "b.lance", vec![0]);
         fragment
             .files
@@ -1250,7 +1250,8 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1279,10 +1280,6 @@ mod tests {
         .unwrap();
         schema.fields[0].id = 2;
         schema.fields[1].id = 1;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Overwrite {
             fragments: vec![fragment_with_file_fields(0, "new.lance", vec![2, 1])],
             schema,
@@ -1290,7 +1287,9 @@ mod tests {
             initial_bases: None,
         };
 
-        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+        let err =
+            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+                .unwrap_err();
 
         assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }
@@ -1301,16 +1300,14 @@ mod tests {
         let mut schema = one_field_schema();
         schema.fields[0].name = "renamed".to_string();
         schema.fields[0].id = -1;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Project {
             schema,
             preserves_nullability: true,
         };
 
-        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+        let err =
+            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+                .unwrap_err();
 
         assert!(err.to_string().contains("writes no data"), "{err}");
     }
@@ -1320,16 +1317,13 @@ mod tests {
         let manifest = activated_manifest();
         let mut schema = one_field_schema();
         schema.fields[0].name = "renamed".to_string();
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Project {
             schema,
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Project { schema, .. } = operation else {
             unreachable!();
@@ -1343,26 +1337,19 @@ mod tests {
         let manifest = manifest_with_file_fields(one_field_schema(), vec![0]);
         let mut schema = one_field_schema();
         schema.fields[0].id = -1;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut operation = Operation::Project {
             schema,
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+            .unwrap();
 
         let Operation::Project { schema, .. } = operation else {
             unreachable!();
         };
         assert_eq!(schema.fields[0].id, 0);
-        assert!(
-            !schema
-                .metadata
-                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
-        );
+        assert!(schema.metadata.is_empty());
     }
 
     #[test]
@@ -1380,7 +1367,8 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
+            .unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1417,7 +1405,8 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Lance)
+            .unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1442,10 +1431,6 @@ mod tests {
         schema.fields[0].id = 0;
         schema.fields[1].id = 2;
         schema.fields[2].id = 1;
-        schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
         let mut merged_fragment = manifest.fragments[0].clone();
         merged_fragment.files.push(DataFile::new_legacy_from_fields(
             "new.lance",
@@ -1458,7 +1443,9 @@ mod tests {
             preserves_nullability: true,
         };
 
-        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+        let err =
+            canonicalize_stable_field_ids(Some(&manifest), &mut operation, SchemaInputKind::Arrow)
+                .unwrap_err();
 
         assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
     }

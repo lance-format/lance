@@ -247,8 +247,11 @@ feature does not change read behavior.
 A dataset changes to stable field IDs only through an explicit migration commit.
 
 A dataset cannot return to the legacy behavior. After activation, a restore must fail if it targets
-a version that does not set `max_allocated_field_id`. That version does not record retired field
-IDs, so a later commit could reuse one.
+a version that does not set `max_allocated_field_id`. Before activation, different fields may have
+used the same ID in different versions. For example, an old version may assign ID 1 to an integer
+field `x`, while the activation version assigns it to a string field `y`. Restoring the old version
+would make ID 1 refer to `x` again. Keeping the current high-water mark prevents future allocation
+from reusing IDs, but does not resolve this existing conflict. Reading old versions remains supported.
 
 ### Field ID Properties
 
@@ -384,8 +387,11 @@ pa.schema([
 ])
 ```
 
-The data file maps this column with `DataFile.fields = [0]`. The descriptor children are file
-details. Their IDs may be `-1` or file-local, and they do not change `max_allocated_field_id`.
+The entire descriptor is encoded in one physical column. The data file maps it with
+`DataFile.fields = [0]` and `DataFile.column_indices = [k]`, where `k` is that column's index in the
+Lance file. The reader locates column `k` and decodes the descriptor using its Blob page layout;
+the descriptor children do not have separate entries in either mapping. Their IDs may be `-1` or
+file-local, and they do not change `max_allocated_field_id`.
 
 A descriptor scan returns the stored struct. A materialized scan returns this public shape:
 

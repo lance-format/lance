@@ -18,10 +18,10 @@ use lance_table::rowids::read_row_ids;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
 use arrow_array::{
     Array, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator, UInt32Array,
 };
+use arrow_array::{RecordBatch, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
@@ -722,8 +722,22 @@ async fn test_new_datasets_use_legacy_field_ids_until_explicit_migration() {
 
 #[tokio::test]
 async fn test_stable_field_id_restore_boundary_and_high_water_mark() {
-    let source_uri = TempStrDir::default();
-    let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
+    let source_uri = "memory://";
+    let dataset = make_simple_dataset(source_uri, 2).await;
+    let legacy_version = dataset.version().version;
+    let legacy_id = dataset.schema().field("id").unwrap().id;
+    let batch = record_batch!(("replacement", Utf8, ["three", "four"])).unwrap();
+    let expected = batch.clone();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            max_rows_per_file: 1,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+    assert_eq!(dataset.schema().field("replacement").unwrap().id, legacy_id);
     dataset.migrate_to_stable_field_ids().await.unwrap();
     let activation_version = dataset.version().version;
 
@@ -749,6 +763,37 @@ async fn test_stable_field_id_restore_boundary_and_high_water_mark() {
         0
     );
     assert!(activation_snapshot.schema().field("new_field").is_none());
+
+    // The old snapshot is readable, but publishing it would bind the same ID to
+    // a different field even if we retained the current high-water mark.
+    let current_version = activation_snapshot.version().version;
+    let mut legacy_snapshot = dataset.checkout_version(legacy_version).await.unwrap();
+    assert_eq!(legacy_snapshot.schema().field("id").unwrap().id, legacy_id);
+    assert_eq!(
+        legacy_snapshot
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+    let err = legacy_snapshot.restore().await.unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("stable field IDs were activated after that version"),
+        "{err}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, current_version);
+    assert_eq!(dataset.schema().field("replacement").unwrap().id, legacy_id);
+    assert_eq!(dataset.manifest.max_allocated_field_id, Some(1));
+    assert_eq!(dataset.manifest.fragments.len(), 2);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
 }
 
 #[tokio::test]
@@ -813,53 +858,29 @@ async fn test_overwrite_preserves_compatible_stable_field_identities() {
 
 #[tokio::test]
 async fn test_raw_arrow_overwrite_preserves_reordered_stable_field_identities() {
-    let source_uri = TempStrDir::default();
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("a", DataType::Int64, false),
-        ArrowField::new("b", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2])),
-            Arc::new(Int64Array::from(vec![3, 4])),
-        ],
-    )
-    .unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema),
-        source_uri.as_str(),
-        None,
-    )
-    .await
-    .unwrap();
+    let batch = record_batch!(("a", Int64, [1, 2]), ("b", Int64, [3, 4])).unwrap();
+    let mut dataset = InsertBuilder::new("memory://")
+        .execute(vec![batch])
+        .await
+        .unwrap();
     dataset.migrate_to_stable_field_ids().await.unwrap();
 
-    let reordered_schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("b", DataType::Int64, false),
-        ArrowField::new("a", DataType::Int64, false),
-    ]));
-    let reordered_batch = RecordBatch::try_new(
-        reordered_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![30, 40])),
-            Arc::new(Int64Array::from(vec![10, 20])),
-        ],
-    )
-    .unwrap();
-    let overwritten = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(reordered_batch)], reordered_schema),
-        source_uri.as_str(),
-        Some(WriteParams {
+    let reordered_batch = record_batch!(("b", Int64, [30, 40]), ("a", Int64, [10, 20])).unwrap();
+    let expected = reordered_batch.clone();
+    let overwritten = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
             mode: WriteMode::Overwrite,
+            max_rows_per_file: 1,
             ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
+        })
+        .execute(vec![reordered_batch])
+        .await
+        .unwrap();
 
     assert_eq!(overwritten.schema().field("b").unwrap().id, 1);
     assert_eq!(overwritten.schema().field("a").unwrap().id, 0);
+    assert_eq!(overwritten.manifest.fragments.len(), 2);
+    assert_eq!(overwritten.scan().try_into_batch().await.unwrap(), expected);
     assert!(
         overwritten
             .manifest

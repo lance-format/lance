@@ -59,6 +59,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use lance_table::transaction::SchemaInputKind;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::iter::empty;
@@ -396,6 +397,7 @@ impl BlockingDataset {
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
+        schema_input_kind: SchemaInputKind,
         store_params: ObjectStoreParams,
         detached: bool,
         enable_v2_manifest_paths: bool,
@@ -407,6 +409,7 @@ impl BlockingDataset {
         commit_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
+            .with_schema_input_kind(schema_input_kind)
             .with_store_params(store_params)
             .with_detached(detached)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)

@@ -103,9 +103,9 @@ mod take;
 pub mod transaction {
     pub use lance_table::transaction::{
         DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
-        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
-        validate_operation,
+        RewrittenIndex, SchemaInputKind, Transaction, TransactionBuilder, UpdateMap,
+        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+        translate_schema_metadata_updates, validate_operation,
     };
 }
 pub mod udtf;
@@ -4106,6 +4106,8 @@ pub(crate) struct ManifestWriteConfig {
     migration_next_row_id: Option<u64>, // default None
     /// Whether this commit activates stable field IDs.
     activate_stable_field_ids: bool,
+    /// How to interpret the schema supplied to this commit; never persisted.
+    pub(crate) schema_input_kind: lance_table::transaction::SchemaInputKind,
 }
 
 impl Default for ManifestWriteConfig {
@@ -4119,6 +4121,7 @@ impl Default for ManifestWriteConfig {
             storage_format: None,
             migration_next_row_id: None,
             activate_stable_field_ids: false,
+            schema_input_kind: Default::default(),
         }
     }
 }

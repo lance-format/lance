@@ -119,6 +119,8 @@ impl Transaction {
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
         if current_manifest.uses_stable_field_ids() {
+            // Before activation, different fields could share an ID across versions.
+            // Keeping today's high-water mark cannot prevent restoring such a collision.
             let Some(restored_max_field_id) = manifest.max_allocated_field_id else {
                 return Err(Error::invalid_input(format!(
                     "Cannot restore version {version}: stable field IDs were activated after that version"
