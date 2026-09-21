@@ -11,7 +11,7 @@
 //!
 //! The wire format and the reasoning behind it live in
 //! `protos/transaction/actions.proto`; the two definitions must stay in step.
-//! Only the subset of the drafted vocabulary that is implemented appears here --
+//! Only the subset of the specified vocabulary that is implemented appears here --
 //! an action this build does not know is rejected on load rather than skipped.
 //!
 //! Each action lives in its own module and owns everything about itself: its
@@ -28,9 +28,11 @@
 //!
 //! # Stability
 //!
-//! Transaction V2 is a pre-vote draft. Nothing in this module is a compatibility
-//! contract, and a transaction carrying a [`CompositeOperation`] is rejected outright
-//! by libraries that predate it.
+//! Transaction V2 is an experimental format feature: breaking changes may be
+//! made to it without a separate vote, and it is removed outright if its
+//! stabilization vote does not pass. Nothing in this module is a
+//! compatibility contract, and a transaction carrying a
+//! [`CompositeOperation`] is rejected outright by libraries that predate it.
 
 /// The action vocabulary, as one list.
 ///
@@ -205,7 +207,7 @@ impl Ref {
 ///
 /// Committing one goes through
 /// `CommitBuilder::with_experimental_composite_operations`, which is the
-/// caller's acknowledgement that this is a draft format (see
+/// caller's acknowledgement that this is an experimental format (see
 /// [Stability](self#stability)).
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct CompositeOperation {
@@ -249,7 +251,7 @@ macro_rules! define_action {
     ($($variant:ident,)*) => {
         /// A single granular change to the manifest.
         ///
-        /// The drafted vocabulary is larger than this; the variants here are the
+        /// The specified vocabulary is larger than this; the variants here are the
         /// ones this build implements end to end. Each one is defined, applied,
         /// and encoded in the module named after it, and appears here only
         /// because it is listed in `for_each_action!`.
