@@ -18,8 +18,9 @@ package lance.table;
  * atomically as one manifest change. This is an experimental feature under
  * the process in docs/src/community/voting.md: the field numbers are not a
  * stable contract, may change without a separate vote, and are removed if
- * the stabilization vote does not pass. Support here is read-side
- * fail-closed — rejected on load, with no write path.
+ * the stabilization vote does not pass. Reading is fail-closed: an action
+ * this build does not recognize aborts the load rather than being skipped.
+ * Writing is opt-in, for the reason below.
  *
  * COMPATIBILITY WARNING. A table version carrying one of these cannot be
  * opened at all by Lance before v12.0.0, and the fix is not backported
