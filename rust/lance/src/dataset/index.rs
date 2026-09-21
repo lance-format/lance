@@ -19,7 +19,7 @@ use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
-use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{lance_format::LanceIndexStore, table_files_to_index};
 use lance_table::format::IndexMetadata;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -197,7 +197,13 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let object_store = dataset.object_store_for_index(index).await?;
         let store =
             Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
-        Ok(store.with_file_sizes(index.file_size_map()))
+        Ok(store.with_index_files(
+            index
+                .files
+                .clone()
+                .map(table_files_to_index)
+                .unwrap_or_default(),
+        ))
     }
 }
 

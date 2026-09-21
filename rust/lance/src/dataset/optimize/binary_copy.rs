@@ -9,10 +9,10 @@ use crate::dataset::fragment::write::generate_random_filename;
 use crate::datatypes::Schema;
 use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageInfo as DecPageInfo};
-use lance_file::reader::FileReader as LFReader;
+use lance_file::reader::{FileReader as LFReader, FullMetadataReadOptions};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::writer::{FileWriteResult, FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
@@ -83,7 +83,8 @@ async fn finalize_current_output_file(
     let mut writer = current_writer
         .take()
         .ok_or_else(|| Error::internal("binary copy output writer was not initialized"))?;
-    flush_footer(&mut writer, schema, &final_cols, total_rows_in_current).await?;
+    let write_result =
+        flush_footer(&mut writer, schema, &final_cols, total_rows_in_current).await?;
 
     // Register the newly closed output file as a fragment data file
     let mut fragment = Fragment::new(0);
@@ -94,6 +95,9 @@ async fn finalize_current_output_file(
     let mut data_file = DataFile::new_unstarted(filename, version);
     data_file.fields = field_ids.into();
     data_file.column_indices = field_column_indices.into();
+    let write_summary = write_result.summary();
+    data_file.file_size_bytes = lance_io::utils::CachedFileSize::new(write_summary.size_bytes);
+    data_file.file_metadata_size_bytes = Some(write_result.metadata_size_bytes());
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)
@@ -180,7 +184,14 @@ pub async fn rewrite_files_binary_copy(
             let file_scheduler = scan_scheduler
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;
-            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            let metadata_options = df.file_metadata_size_bytes.map_or_else(
+                FullMetadataReadOptions::default,
+                |metadata_size_bytes| {
+                    FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+                },
+            );
+            let file_meta =
+                LFReader::read_all_metadata_with_options(&file_scheduler, metadata_options).await?;
             let src_column_infos = file_meta.column_infos.clone();
             // Initialize current_page_table
             if current_page_table.is_empty() {
@@ -421,7 +432,7 @@ pub async fn rewrite_files_binary_copy(
 /// This function does not manually craft the footer. Instead it:
 /// - Pads the current `ObjectWriter` position to a 64‑byte boundary (required for v2_1+ readers).
 /// - Initializes the active `FileWriter` from the collected column metadata.
-/// - Calls `FileWriter::finish()` to emit column metadata, offset tables, global buffers
+/// - Calls `FileWriter::finish_with_metadata_size()` to emit column metadata, offset tables, global buffers
 ///   (schema descriptor), version, and to close the writer.
 ///
 /// Preconditions:
@@ -433,9 +444,8 @@ async fn flush_footer(
     schema: &Schema,
     final_cols: &[Arc<ColumnInfo>],
     total_rows_in_current: u64,
-) -> Result<()> {
+) -> Result<FileWriteResult> {
     writer.write_external_buffer(&[]).await?;
     writer.initialize_with_external_columns(schema.clone(), final_cols, total_rows_in_current)?;
-    writer.finish().await?;
-    Ok(())
+    writer.finish_with_metadata_size().await
 }

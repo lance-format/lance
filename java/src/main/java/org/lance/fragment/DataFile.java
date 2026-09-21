@@ -29,6 +29,7 @@ public class DataFile implements Serializable {
   private final int fileMinorVersion;
   private final Long fileSizeBytes;
   private final Integer baseId;
+  private final Long fileMetadataSizeBytes;
 
   public DataFile(
       String path,
@@ -38,6 +39,41 @@ public class DataFile implements Serializable {
       int fileMinorVersion,
       Long fileSizeBytes,
       Integer baseId) {
+    this(
+        path,
+        fields,
+        columnIndices,
+        fileMajorVersion,
+        fileMinorVersion,
+        fileSizeBytes,
+        baseId,
+        null);
+  }
+
+  /**
+   * Creates data file metadata with an optional exact metadata suffix size.
+   *
+   * @param path path to the data file
+   * @param fields field IDs stored in the file
+   * @param columnIndices physical column indices for the fields
+   * @param fileMajorVersion major storage format version
+   * @param fileMinorVersion minor storage format version
+   * @param fileSizeBytes total file size, or null if unknown
+   * @param baseId base path ID, or null for the dataset base
+   * @param fileMetadataSizeBytes metadata suffix size; zero or null if unknown
+   */
+  public DataFile(
+      String path,
+      int[] fields,
+      int[] columnIndices,
+      int fileMajorVersion,
+      int fileMinorVersion,
+      Long fileSizeBytes,
+      Integer baseId,
+      Long fileMetadataSizeBytes) {
+    if (fileMetadataSizeBytes != null && fileMetadataSizeBytes < 0) {
+      throw new IllegalArgumentException("fileMetadataSizeBytes must be non-negative");
+    }
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
@@ -45,6 +81,8 @@ public class DataFile implements Serializable {
     this.fileMinorVersion = fileMinorVersion;
     this.fileSizeBytes = fileSizeBytes;
     this.baseId = baseId;
+    this.fileMetadataSizeBytes =
+        fileMetadataSizeBytes != null && fileMetadataSizeBytes == 0 ? null : fileMetadataSizeBytes;
   }
 
   public String getPath() {
@@ -75,6 +113,11 @@ public class DataFile implements Serializable {
     return Optional.ofNullable(baseId);
   }
 
+  /** Returns the exact metadata suffix size, or null if it is unavailable. */
+  public Long getFileMetadataSizeBytes() {
+    return fileMetadataSizeBytes;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -85,7 +128,8 @@ public class DataFile implements Serializable {
         && Objects.equals(path, that.path)
         && Arrays.equals(fields, that.fields)
         && Arrays.equals(columnIndices, that.columnIndices)
-        && Objects.equals(fileSizeBytes, that.fileSizeBytes);
+        && Objects.equals(fileSizeBytes, that.fileSizeBytes)
+        && Objects.equals(fileMetadataSizeBytes, that.fileMetadataSizeBytes);
   }
 
   @Override
@@ -98,6 +142,7 @@ public class DataFile implements Serializable {
         .add("fileMinorVersion", fileMinorVersion)
         .add("fileSizeBytes", fileSizeBytes)
         .add("baseId", baseId)
+        .add("fileMetadataSizeBytes", fileMetadataSizeBytes)
         .toString();
   }
 }

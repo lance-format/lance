@@ -19,6 +19,7 @@ use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -28,7 +29,13 @@ impl FromPyObject<'_, '_> for PyLance<IndexFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let path = ob.getattr("path")?.extract()?;
         let size_bytes = ob.getattr("size_bytes")?.extract()?;
-        Ok(Self(IndexFile { path, size_bytes }))
+        let file_metadata_size_bytes: Option<u64> =
+            ob.getattr("file_metadata_size_bytes")?.extract()?;
+        Ok(Self(IndexFile {
+            path,
+            size_bytes,
+            file_metadata_size_bytes: file_metadata_size_bytes.and_then(NonZeroU64::new),
+        }))
     }
 }
 
@@ -45,7 +52,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexFile> {
         let cls = namespace
             .getattr("IndexFile")
             .expect("Failed to get IndexFile class");
-        cls.call1((self.0.path.clone(), self.0.size_bytes))
+        cls.call1((
+            self.0.path.clone(),
+            self.0.size_bytes,
+            self.0.file_metadata_size_bytes.map(NonZeroU64::get),
+        ))
     }
 }
 
