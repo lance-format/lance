@@ -117,7 +117,9 @@ impl Coordinate {
 enum Mode {
     /// Reads the coordinate and needs it to still hold what it read. Data
     /// written for a committed field requires the field's definition, since
-    /// the values are encoded in the type it names. Unlike a write, two sets
+    /// the values are encoded in the type it names; an index segment requires
+    /// the data it describes, since the format gives a reader no way to notice
+    /// that those values were replaced underneath it. Unlike a write, two sets
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
@@ -276,12 +278,14 @@ impl Footprint {
     /// That is where the one asymmetry lives: a requirement of this set is
     /// tested against what `committed` wrote, never the reverse, because
     /// `committed` serialized first and nothing arriving later can break what
-    /// it required. The distinction is not academic. Data written for a field
-    /// requires the field's definition; a cast of that field writes it.
-    /// Checking both directions would also reject the cast that arrives
-    /// *after* the data -- an order [`AlterField`](super::AlterField) already
-    /// handles, by rebinding the field in every fragment the manifest has by
-    /// then.
+    /// it required. The distinction is not academic. An index segment requires
+    /// the data it describes; a rewrite of that data writes it. Checking both
+    /// directions would also reject the rewrite that arrives *after* a segment
+    /// -- an order the system already handles, by pruning the stale fragment
+    /// out of the segment's coverage as the rewrite applies.
+    ///
+    /// Index claims are not coordinates and are compared on their own terms,
+    /// symmetrically.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -408,6 +412,21 @@ impl Footprint {
         self.require_fragment(fragment);
         for field in fields {
             self.write(Coordinate::FieldData { fragment, field });
+        }
+    }
+
+    /// Record that this set reads `fields` in `fragment` and needs them to
+    /// still hold what it read.
+    ///
+    /// A fragment this operation mints records nothing: no concurrent writer
+    /// can have replaced data that did not exist when they planned.
+    pub(super) fn require_field_data(
+        &mut self,
+        fragment: u64,
+        fields: impl IntoIterator<Item = Ref>,
+    ) {
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.require(Coordinate::FieldData { fragment, field });
         }
     }
 

@@ -2778,7 +2778,9 @@ mod composite {
         let dataset = commit(dataset, rewrite_field_zero(file)).await;
 
         assert_eq!(
-            index_coverage_opt(&dataset, "by_a").await.unwrap_or_default(),
+            index_coverage_opt(&dataset, "by_a")
+                .await
+                .unwrap_or_default(),
             Vec::<u32>::new(),
             "the rewrite should have dropped fragment 0 from the coverage"
         );
@@ -2815,20 +2817,17 @@ mod composite {
         )
         .await;
 
-        // Either outcome is sound: reject the commit, or land the segment
-        // without the fragment it can no longer describe. What it may not do is
-        // publish coverage of fragment 0, which a reader would then trust.
-        match committed {
-            Err(error) => assert!(
-                matches!(error, Error::RetryableCommitConflict { .. }),
-                "{error:?}"
-            ),
-            Ok(dataset) => assert_eq!(
-                index_coverage_opt(&dataset, "by_a").await.unwrap_or_default(),
-                Vec::<u32>::new(),
-                "the segment describes field 0 as it was before the rewrite"
-            ),
-        }
+        // Rejected, because the segment requires the data it describes and the
+        // rewrite wrote it. Dropping fragment 0 from the arriving segment's
+        // coverage would also be sound and would waste less work -- it is what
+        // the legacy path does for `Operation::Update` -- but an action set is
+        // never rewritten to move to a newer version, so there is nowhere to
+        // put that here.
+        let error = committed.expect_err("the segment describes replaced values");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
