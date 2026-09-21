@@ -91,6 +91,8 @@ goosefs = [
     "dep:opendal",
     "opendal/services-goosefs",
     "dep:opendal-service-goosefs",
+    "opendal-service-goosefs/metadata-cache",
+    "opendal-service-goosefs/page-cache-io-uring",
     "dep:goosefs-sdk",
     "dep:object_store_opendal",
 ]
