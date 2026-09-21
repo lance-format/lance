@@ -31,8 +31,16 @@
 //! Transaction V2 is an experimental format feature: breaking changes may be
 //! made to it without a separate vote, and it is removed outright if its
 //! stabilization vote does not pass. Nothing in this module is a
-//! compatibility contract, and a transaction carrying a
-//! [`CompositeOperation`] is rejected outright by libraries that predate it.
+//! compatibility contract.
+//!
+//! Committing a [`CompositeOperation`] is a durable compatibility break, not
+//! merely a feature an older reader ignores: a table version carrying one
+//! cannot be *opened* by Lance before v12.0.0. Those releases decode the
+//! manifest's inline transaction while opening the table, and an operation
+//! they do not know decodes to no operation at all, which fails the open. The
+//! fix shipped in v12.0.0 and is not expected to be backported, so writing one
+//! raises that table's minimum reader version. See
+//! <https://github.com/lance-format/lance/issues/9454>.
 
 /// The action vocabulary, as one list.
 ///
