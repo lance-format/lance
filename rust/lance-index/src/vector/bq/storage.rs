@@ -571,11 +571,24 @@ impl RabitQuantizationStorage {
                         // which can erase the margin and incorrectly prune rows.
                         // f64 also keeps finite f32 queries from overflowing here.
                         let norm_square: f64 = if let Some(c) = rotated_centroid {
-                            rotated_query
+                            let (query_blocks, query_tail) = rotated_query.as_chunks::<8>();
+                            let (centroid_blocks, centroid_tail) = c.as_chunks::<8>();
+                            // Independent accumulators let this per-partition
+                            // reduction vectorize without f32 cancellation.
+                            let mut sums = [0.0f64; 8];
+                            for (query, centroid) in query_blocks.iter().zip(centroid_blocks) {
+                                for lane in 0..8 {
+                                    let residual =
+                                        query[lane] as f64 - alpha as f64 * centroid[lane] as f64;
+                                    sums[lane] += residual * residual;
+                                }
+                            }
+                            let tail: f64 = query_tail
                                 .iter()
-                                .zip(c)
+                                .zip(centroid_tail)
                                 .map(|(&q, &c)| (q as f64 - alpha as f64 * c as f64).powi(2))
-                                .sum()
+                                .sum();
+                            sums.into_iter().sum::<f64>() + tail
                         } else {
                             rotated_query.iter().map(|&q| (q as f64).powi(2)).sum()
                         };
