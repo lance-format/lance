@@ -148,25 +148,18 @@ all-zero descriptor is therefore an empty blob, not a null marker. Payload bytes
 are addressed directly; descriptor page compression does not change their byte
 offsets or introduce payload decompression.
 
-### Managed: `kind = 4`
+### Packed: `kind = 1`
 
-`blob_id` is an explicit base path **ID** in the snapshot's `manifest.base_paths`.
-Every `UInt32` value, including zero, is a possible ID; no value means an implicit
-dataset root. The ID must have a binding in that snapshot.
+This legacy kind identifies a Lance-owned sidecar in the owning data file's
+namespace. `blob_id` selects the sidecar, and `position` and `size` select a byte
+interval within it. `blob_uri = ""`. Multiple values can refer to the same object,
+and a zero-length interval denotes an empty value.
 
-`blob_uri` is a non-empty canonical object path relative to the bound base.
-It must not contain a URI scheme delimiter (`://`), backslashes, a leading or
-trailing slash, empty path components, or `.` or `..` components. Append it
-directly to the base path and use that base's object store and credentials.
-Do not add `data/`, `_blobs/`, or any other prefix during resolution, regardless
-of `BasePath.is_dataset_root`.
+### Dedicated: `kind = 2`
 
-`position` and `size` select the exact byte interval in the object. Their sum
-must not overflow `UInt64`. `size = 0` means an empty blob; it never requests an
-object-length lookup. Multiple descriptors may reference different intervals in
-the same object. A Managed descriptor and its base binding fully identify the
-payload without the identity, path, or continued existence of the data file
-that originally produced it.
+This legacy kind uses `blob_id` to identify a Lance-owned sidecar containing a
+complete raw payload. `position = 0`, `size` is the complete object length, and
+`blob_uri = ""`. Readers read `size` bytes from offset zero.
 
 ### External: `kind = 3`
 
@@ -187,18 +180,25 @@ complete external object set both `position = 0` and `size = 0`.
 This sentinel belongs to the stored format. The logical input restriction
 `size > 0` for explicit ranges must not be used to reject these descriptors.
 
-### Packed: `kind = 1`
+### Managed: `kind = 4`
 
-This legacy kind identifies a Lance-owned sidecar in the owning data file's
-namespace. `blob_id` selects the sidecar, and `position` and `size` select a byte
-interval within it. `blob_uri = ""`. Multiple values can refer to the same object,
-and a zero-length interval denotes an empty value.
+`blob_id` is an explicit base path **ID** in the snapshot's `manifest.base_paths`.
+Every `UInt32` value, including zero, is a possible ID; no value means an implicit
+dataset root. The ID must have a binding in that snapshot.
 
-### Dedicated: `kind = 2`
+`blob_uri` is a non-empty canonical object path relative to the bound base.
+It must not contain a URI scheme delimiter (`://`), backslashes, a leading or
+trailing slash, empty path components, or `.` or `..` components. Append it
+directly to the base path and use that base's object store and credentials.
+Do not add `data/`, `_blobs/`, or any other prefix during resolution, regardless
+of `BasePath.is_dataset_root`.
 
-This legacy kind uses `blob_id` to identify a Lance-owned sidecar containing a
-complete raw payload. `position = 0`, `size` is the complete object length, and
-`blob_uri = ""`. Readers read `size` bytes from offset zero.
+`position` and `size` select the exact byte interval in the object. Their sum
+must not overflow `UInt64`. `size = 0` means an empty blob; it never requests an
+object-length lookup. Multiple descriptors may reference different intervals in
+the same object. A Managed descriptor and its base binding fully identify the
+payload without the identity, path, or continued existence of the data file
+that originally produced it.
 
 ### Null Descriptors
 
@@ -325,9 +325,9 @@ snapshots reference them; updating a value must not overwrite a shared object.
 | Storage kind | Reads | Compaction | Garbage collection |
 |---|---|---|---|
 | Inline | Resolve the owning data file and read its recorded interval. | Copy the bytes and record their destination location. | Payload lifetime follows the data file. |
-| Managed | Resolve the explicit base ID and relative path; read the recorded interval. | Preserve the object and range while rewriting the descriptor. | Retain the whole object while any protected snapshot references it. |
 | Packed / Dedicated | Resolve the sidecar through the owning data file's base, stem, and local ID. | Adopt the original object with a Managed descriptor; payload bytes stay in place. | Retain sidecars for protected legacy data files, and retain any object referenced by Managed descriptors independently of that file. |
 | External | Resolve the absolute URI or explicit base reference. | Preserve the external reference without ingesting bytes. | Lance does not own or delete the referenced object. |
+| Managed | Resolve the explicit base ID and relative path; read the recorded interval. | Preserve the object and range while rewriting the descriptor. | Retain the whole object while any protected snapshot references it. |
 
 ### Compaction
 
