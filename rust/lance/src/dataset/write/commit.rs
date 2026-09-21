@@ -282,11 +282,24 @@ impl<'a> CommitBuilder<'a> {
     /// Transaction V2 -- a [`Transaction`] whose operation is a
     /// [`CompositeOperation`](lance_table::transaction::action::CompositeOperation)
     /// -- is an experimental format feature. Its wire format carries no
-    /// compatibility contract, breaking changes may be made to it without a
-    /// separate vote, and a reader that predates it rejects the commit
-    /// outright, so a dataset that has one in its history cannot be read by an
-    /// older library. Committing one is therefore something a caller asks for
-    /// explicitly rather than something a version of the library turns on.
+    /// compatibility contract and breaking changes may be made to it without a
+    /// separate vote.
+    ///
+    /// # Compatibility
+    ///
+    /// Committing one is a durable compatibility break. A dataset version
+    /// written this way **cannot be opened** by Lance before v12.0.0 -- not
+    /// merely read as history. Those releases decode the manifest's inline
+    /// transaction while opening the dataset, and an operation they do not
+    /// know decodes to no operation at all, which fails the open. The fix
+    /// shipped in v12.0.0 and is not expected to be backported to earlier
+    /// release lines ([#9454]), so a dataset with one anywhere in its history
+    /// has a minimum reader version of v12.0.0 from then on.
+    ///
+    /// That is why this is opt-in per caller rather than something a version
+    /// of the library turns on.
+    ///
+    /// [#9454]: https://github.com/lance-format/lance/issues/9454
     ///
     /// Without this, [`Self::execute`] rejects such a transaction with
     /// [`Error::NotSupported`]. It has no effect on any other operation.
@@ -313,8 +326,10 @@ impl<'a> CommitBuilder<'a> {
             && matches!(transaction.operation, Operation::CompositeOperation(_))
         {
             return Err(Error::not_supported_source(
-                "Transaction V2 is experimental: a CompositeOperation can only be \
-                 committed after opting in with \
+                "Transaction V2 is experimental, and committing one makes this \
+                 dataset version unopenable by Lance before v12.0.0 (see \
+                 https://github.com/lance-format/lance/issues/9454); a \
+                 CompositeOperation can only be committed after opting in with \
                  CommitBuilder::with_experimental_composite_operations"
                     .into(),
             ));
