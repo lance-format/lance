@@ -1014,6 +1014,56 @@ def test_index_type(tmp_path):
         assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
 
 
+@pytest.mark.parametrize("approx_mode", ["normal", "accurate"])
+def test_ivf_rq_dot_query_scale_invariance(tmp_path, approx_mode):
+    rng = np.random.default_rng(20260921)
+    vectors = rng.normal(size=(128, 64)).astype(np.float32)
+    center = rng.normal(size=64).astype(np.float32)
+    vectors[:64] += 2 * center
+    vectors[64:] -= 2 * center
+    centroids = np.stack([2 * center, -2 * center])
+    table = vec_to_table(data=vectors).append_column("id", pa.array(range(128)))
+    ds = lance.write_dataset(table, tmp_path / "scale.lance", max_rows_per_file=64)
+    ds = ds.create_index(
+        "vector",
+        "IVF_RQ",
+        metric="dot",
+        num_bits=5,
+        num_partitions=2,
+        ivf_centroids=centroids,
+    )
+    assert len(ds.get_fragments()) == 2
+    for q in vectors[[3, 97]]:
+        truth = set(np.argsort(-(vectors.astype(np.float64) @ q))[:10])
+        for k in [10, len(vectors)]:
+            reference = None
+            for scale in [1.0, 0.125, 8.0]:
+                result = ds.to_table(
+                    columns=["id", "_distance"],
+                    nearest={
+                        "column": "vector",
+                        "q": q * scale,
+                        "k": k,
+                        "metric": "dot",
+                        "nprobes": 2,
+                        "approx_mode": approx_mode,
+                    },
+                )
+                ids = result["id"].to_numpy()
+                distances = result["_distance"].to_numpy()
+                assert len(set(ids[:10]) & truth) / 10 >= 0.5
+                if reference is None:
+                    reference = (ids, distances)
+                else:
+                    np.testing.assert_array_equal(ids, reference[0])
+                    np.testing.assert_allclose(
+                        distances,
+                        1 + scale * (reference[1] - 1),
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+
+
 def test_create_dot_index(tmp_path):
     rng = np.random.default_rng(42)
     table = vec_to_table(data=rng.standard_normal((64, 32), dtype=np.float32))
