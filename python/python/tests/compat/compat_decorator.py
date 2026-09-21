@@ -201,10 +201,6 @@ class UpgradeDowngradeTest:
         return {}
 
 
-class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
-    """Compatibility contract for datasets."""
-
-
 @contextmanager
 def _temporary_env(overrides: Optional[Dict[str, str]]):
     if not overrides:
@@ -369,7 +365,7 @@ def _make_test_function(cls, param_names, test_type):
     if test_type == "downgrade":
         func_body = f'''
 def test_func({sig_params}):
-    """Test the old-version contract for data written by the current version."""
+    """Test that old Lance version can read data written by current version."""
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
     obj.compat_version = version

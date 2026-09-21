@@ -17,12 +17,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .compat_decorator import DatasetUpgradeDowngradeTest, compat_test
+from .compat_decorator import (
+    UpgradeDowngradeTest,
+    compat_test,
+)
 from .util import safe_data_storage_version
 
 
 @compat_test(min_version="0.29.1.beta2")
-class PqVectorIndex(DatasetUpgradeDowngradeTest):
+class PqVectorIndex(UpgradeDowngradeTest):
     """Test PQ (Product Quantization) vector index compatibility."""
 
     def __init__(self, path: Path):
@@ -98,7 +101,7 @@ class PqVectorIndex(DatasetUpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.39.0")
-class HnswPqVectorIndex(DatasetUpgradeDowngradeTest):
+class HnswPqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_HNSW_PQ vector index compatibility.
 
     Note: Only tests versions >= 0.39.0 because earlier versions don't support
@@ -179,7 +182,7 @@ class HnswPqVectorIndex(DatasetUpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.39.0")
-class HnswSqVectorIndex(DatasetUpgradeDowngradeTest):
+class HnswSqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_HNSW_SQ vector index compatibility.
 
     Note: Only tests versions >= 0.39.0 because earlier versions don't support
@@ -260,7 +263,7 @@ class HnswSqVectorIndex(DatasetUpgradeDowngradeTest):
 
 
 @compat_test(min_version="4.0.0-beta.8")
-class IvfRqVectorIndex(DatasetUpgradeDowngradeTest):
+class IvfRqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
 
     def __init__(self, path: Path):

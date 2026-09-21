@@ -15,7 +15,6 @@ import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
 from .compat_decorator import (
-    DatasetUpgradeDowngradeTest,
     UpgradeDowngradeTest,
     compat_test,
 )
@@ -131,7 +130,7 @@ class FileCompat(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.16.0")
-class BasicTypesLegacy(DatasetUpgradeDowngradeTest):
+class BasicTypesLegacy(UpgradeDowngradeTest):
     """Test legacy data storage version 0.1 compatibility."""
 
     def __init__(self, path: Path):

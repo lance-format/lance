@@ -38,18 +38,14 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Stream;
 
 public class MergeTest extends OperationTestBase {
 
@@ -400,19 +396,6 @@ public class MergeTest extends OperationTestBase {
           Assertions.assertEquals(4, findField(merged.getLanceSchema().fields(), "b").getId());
           Assertions.assertEquals(5, findField(merged.getLanceSchema().fields(), "c").getId());
           Assertions.assertEquals(6, findField(merged.getLanceSchema().fields(), "z").getId());
-        }
-      }
-    }
-  }
-
-  private void copyDirectory(Path source, Path target) throws IOException {
-    try (Stream<Path> paths = Files.walk(source)) {
-      for (Path path : (Iterable<Path>) paths::iterator) {
-        Path destination = target.resolve(source.relativize(path));
-        if (Files.isDirectory(path)) {
-          Files.createDirectories(destination);
-        } else {
-          Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
         }
       }
     }

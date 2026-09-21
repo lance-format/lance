@@ -35,9 +35,7 @@ use crate::system_index::mem_wal::{
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
-use crate::transaction::validate::{
-    merge_fragment_physically_rewritten, validate_stable_field_id_manifest,
-};
+use crate::transaction::validate::merge_fragment_physically_rewritten;
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
     RewriteGroup, Transaction, UpdatedFragmentOffsets,
@@ -1677,7 +1675,6 @@ impl Transaction {
         }
 
         validate_stable_field_id_flags(&manifest)?;
-        validate_stable_field_id_manifest(&manifest)?;
 
         Ok((manifest, final_indices))
     }
@@ -1734,31 +1731,6 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
-    }
-
-    #[test]
-    fn new_dataset_preserves_legacy_field_id_allocation_by_default() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
-        let mut schema = LanceSchema::try_from(&arrow_schema).unwrap();
-        schema.try_set_field_id(None).unwrap();
-        let transaction = Transaction::new(
-            0,
-            Operation::Overwrite {
-                fragments: vec![],
-                schema,
-                config_upsert_values: None,
-                initial_bases: None,
-            },
-            None,
-        );
-
-        let (manifest, _) = transaction
-            .build_manifest(None, vec![], "txn", &default_build_config())
-            .unwrap();
-
-        assert_eq!(manifest.max_allocated_field_id, None);
-        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_eq!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]

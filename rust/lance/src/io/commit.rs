@@ -45,7 +45,7 @@ use lance_table::io::commit::{
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
     canonicalize_stable_field_ids, validate_detached_stable_field_ids, validate_operation,
-    validate_stable_field_id_manifest, validate_stable_field_id_transition,
+    validate_stable_field_id_transition,
 };
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
@@ -1252,10 +1252,8 @@ pub(crate) async fn do_commit_detached_transaction(
         // diagnostics. Finalization repeats this at the manifest write boundary.
         fix_schema(&mut manifest)?;
         validate_stable_field_id_transition(&dataset.manifest, &manifest, &transaction.operation)?;
-        manifest.update_max_field_id();
         crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
-        validate_stable_field_id_manifest(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
         let recovered_coverage = migrate_indices(dataset, &mut indices).await?;
@@ -1628,11 +1626,9 @@ pub(crate) async fn commit_transaction(
             &manifest,
             &attempt_transaction.operation,
         )?;
-        manifest.update_max_field_id();
 
         crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
-        validate_stable_field_id_manifest(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -2043,7 +2039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_arrow_project_retry_matches_single_attempt_ids() {
+    async fn raw_arrow_project_retry_preserves_identity_and_metadata() {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
         let mut dataset = Dataset::write(
@@ -2065,25 +2061,19 @@ mod tests {
             Operation::ReserveFragments { num_fragments: 1 },
             None,
         );
-        let handler = inject_foreign_commit_handler(foreign_manifest.clone(), &foreign_transaction);
+        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
 
         let raw_schema = Schema {
             fields: vec![Field::new_arrow("x", DataType::Int32, false).unwrap()],
             metadata: HashMap::from([("input-note".to_string(), "project".to_string())]),
         };
-        let mut expected = Operation::Project {
-            schema: raw_schema.clone(),
+        let mut expected_schema = raw_schema.clone();
+        expected_schema.fields[0].id = 0;
+        let mut operation = Operation::Project {
+            schema: raw_schema,
             preserves_nullability: true,
         };
-        resolve_arrow_field_ids(Some(&dataset.manifest), &mut expected).unwrap();
-        let operation = expected.clone();
-        let Operation::Project {
-            schema: expected_schema,
-            ..
-        } = expected
-        else {
-            unreachable!();
-        };
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut operation).unwrap();
 
         let committed = CommitBuilder::new(Arc::new(dataset.clone()))
             .with_commit_handler(handler)
@@ -2092,10 +2082,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(committed.schema(), &expected_schema);
-        assert_eq!(
-            committed.schema().metadata.get("input-note").unwrap(),
-            "project"
-        );
     }
 
     #[rstest::rstest]
@@ -2125,7 +2111,7 @@ mod tests {
             Operation::ReserveFragments { num_fragments: 1 },
             None,
         );
-        let handler = inject_foreign_commit_handler(foreign_manifest.clone(), &foreign_transaction);
+        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
 
         let mut merged_fragment = dataset.manifest.fragments[0].clone();
         let mut new_file = merged_fragment.files[0].clone();
@@ -2139,6 +2125,9 @@ mod tests {
             ],
             metadata: HashMap::new(),
         };
+        let mut expected_schema = raw_schema.clone();
+        expected_schema.fields[0].id = 0;
+        expected_schema.fields[1].id = 2;
         let mut operation = if overwrite {
             Operation::Overwrite {
                 fragments: vec![merged_fragment],
@@ -2154,13 +2143,6 @@ mod tests {
             }
         };
         resolve_arrow_field_ids(Some(&dataset.manifest), &mut operation).unwrap();
-        let mut expected = operation.clone();
-        canonicalize_stable_field_ids(
-            Some(&foreign_manifest),
-            &mut expected,
-            Some(dataset.schema()),
-        )
-        .unwrap();
 
         let committed = CommitBuilder::new(Arc::new(dataset.clone()))
             .with_commit_handler(handler)
@@ -2168,24 +2150,15 @@ mod tests {
             .await
             .unwrap();
 
-        let (Operation::Merge {
-            schema: expected_schema,
-            fragments: expected_fragments,
-            ..
-        }
-        | Operation::Overwrite {
-            schema: expected_schema,
-            fragments: expected_fragments,
-            ..
-        }) = expected
-        else {
-            unreachable!();
-        };
         assert_eq!(committed.schema(), &expected_schema);
-        assert_eq!(committed.schema().field("new_column").unwrap().id, 2);
+        assert_eq!(committed.manifest.max_allocated_field_id, Some(2));
         assert_eq!(
-            committed.manifest.fragments[0].files[1].fields,
-            expected_fragments[0].files[1].fields
+            committed.manifest.fragments[0].files[0].fields.as_ref(),
+            &[0]
+        );
+        assert_eq!(
+            committed.manifest.fragments[0].files[1].fields.as_ref(),
+            &[2]
         );
     }
 

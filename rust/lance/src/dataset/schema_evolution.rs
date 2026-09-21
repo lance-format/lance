@@ -742,9 +742,10 @@ pub(super) async fn alter_columns(
     let mut new_schema = dataset.schema().clone();
 
     // Mapping of old to new fields that need to be casted.
-    let mut cast_sources: Vec<Field> = Vec::new();
+    let mut cast_fields: Vec<(Field, Field)> = Vec::new();
     let mut tightens_nullability = false;
 
+    let mut next_field_id = i64::from(dataset.manifest.max_field_id()) + 1;
     let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
@@ -796,43 +797,10 @@ pub(super) async fn alter_columns(
                 field_dest.nullable,
             );
             *field_dest = Field::try_from(&arrow_field)?;
-            // Keep the old id temporarily so the replacement can be located
-            // after every alteration has been applied. Fresh ids are assigned
-            // below in canonical schema order, independent of request order.
-            field_dest.id = field_src.id;
-            field_dest.parent_id = field_src.parent_id;
+            field_dest.try_set_id(field_src.parent_id, &mut next_field_id)?;
 
-            cast_sources.push(field_src.clone());
+            cast_fields.push((field_src.clone(), field_dest.clone()));
         }
-    }
-
-    let mut cast_fields = Vec::with_capacity(cast_sources.len());
-    if !cast_sources.is_empty() {
-        let destination_paths = cast_sources
-            .iter()
-            .map(|source| new_schema.field_path(source.id))
-            .collect::<Result<Vec<_>>>()?;
-
-        for source in &cast_sources {
-            new_schema
-                .mut_field_by_id(source.id)
-                .expect("cast source must still identify its replacement")
-                .id = -1;
-        }
-        new_schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
-
-        cast_fields = cast_sources
-            .into_iter()
-            .zip(destination_paths)
-            .map(|(source, path)| {
-                let destination = new_schema.field(&path).ok_or_else(|| {
-                    Error::internal(format!(
-                        "cast replacement field '{path}' disappeared while assigning field ids"
-                    ))
-                })?;
-                Ok((source, destination.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
     }
 
     new_schema.validate()?;

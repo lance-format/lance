@@ -927,18 +927,8 @@ async fn test_overwrite_preserves_compatible_stable_field_identities() {
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
     dataset.migrate_to_stable_field_ids().await.unwrap();
 
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("id", DataType::Int64, false),
-        ArrowField::new("replacement", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from_iter_values(0..10)),
-            Arc::new(Int64Array::from_iter_values(10..20)),
-        ],
-    )
-    .unwrap();
+    let batch = record_batch!(("id", Int64, [0, 1]), ("replacement", Int64, [10, 11])).unwrap();
+    let schema = batch.schema();
     let overwritten = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         source_uri.as_str(),
@@ -1019,26 +1009,15 @@ async fn test_stable_field_id_rename_and_nullability_preserve_identity() {
 
 #[tokio::test]
 async fn test_stable_field_id_multi_cast_uses_schema_order() {
-    let source_uri = TempStrDir::default();
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("a", DataType::Int32, false),
-        ArrowField::new("b", DataType::Int32, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(Int32Array::from(vec![3, 4])),
-        ],
-    )
-    .unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema),
-        source_uri.as_str(),
-        None,
-    )
-    .await
-    .unwrap();
+    let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [3, 4])).unwrap();
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
     dataset.migrate_to_stable_field_ids().await.unwrap();
 
     dataset
@@ -1053,6 +1032,11 @@ async fn test_stable_field_id_multi_cast_uses_schema_order() {
     assert_eq!(dataset.schema().field("b").unwrap().id, 3);
     assert_eq!(dataset.manifest.max_allocated_field_id, Some(3));
     dataset.validate().await.unwrap();
+    assert_eq!(dataset.manifest.fragments.len(), 2);
+    assert_eq!(
+        dataset.scan().try_into_batch().await.unwrap(),
+        record_batch!(("a", Int64, [1, 2]), ("b", Int64, [3, 4])).unwrap()
+    );
 }
 
 #[tokio::test]

@@ -29,16 +29,12 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -192,19 +188,6 @@ public class ProjectTest extends OperationTestBase {
           assertEquals(5L, root.getVector("c").getObject(1));
           assertEquals(4L, root.getVector("b").getObject(1));
           assertEquals(1L, root.getVector("x").getObject(1));
-        }
-      }
-    }
-  }
-
-  private void copyDirectory(Path source, Path target) throws IOException {
-    try (Stream<Path> paths = Files.walk(source)) {
-      for (Path path : (Iterable<Path>) paths::iterator) {
-        Path destination = target.resolve(source.relativize(path));
-        if (Files.isDirectory(path)) {
-          Files.createDirectories(destination);
-        } else {
-          Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
         }
       }
     }

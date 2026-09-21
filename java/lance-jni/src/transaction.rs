@@ -1513,26 +1513,6 @@ fn convert_to_rust_transaction(
         .build())
 }
 
-#[derive(Clone, Copy)]
-enum RawArrowFieldIdMode {
-    AssignMissing,
-    // Preserve the distinction between explicit IDs and fields without identity metadata.
-    ExplicitOnly,
-}
-
-#[derive(Clone, Copy)]
-enum LegacyFieldIdMode {
-    Inherit,
-    Standalone,
-}
-
-struct SchemaConversionOptions {
-    raw_field_id_mode: RawArrowFieldIdMode,
-    legacy_field_id_mode: LegacyFieldIdMode,
-}
-
-type SchemaReadContext = (LanceSchema, i32, bool);
-
 struct ConvertedSchema {
     schema: LanceSchema,
     field_id_remap: HashMap<i32, i32>,
@@ -1540,11 +1520,11 @@ struct ConvertedSchema {
 
 fn convert_arrow_schema(
     arrow_schema: &Schema,
-    read_context: Option<SchemaReadContext>,
-    options: SchemaConversionOptions,
+    manifest: Option<&Manifest>,
+    operation_name: &str,
 ) -> Result<ConvertedSchema> {
-    let original_schema = if matches!(options.raw_field_id_mode, RawArrowFieldIdMode::ExplicitOnly)
-    {
+    // Project can rename by explicit ID but must not treat positional IDs as identity.
+    let original_schema = if operation_name == "Project" {
         LanceSchema {
             fields: arrow_schema
                 .fields
@@ -1562,26 +1542,19 @@ fn convert_arrow_schema(
         })?
     };
 
-    if read_context
-        .as_ref()
-        .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
-    {
+    let Some(manifest) = manifest
+        .filter(|manifest| !manifest.uses_stable_field_ids() && operation_name != "Overwrite")
+    else {
         return Ok(ConvertedSchema {
             schema: original_schema,
             field_id_remap: HashMap::new(),
         });
-    }
-
-    if matches!(options.legacy_field_id_mode, LegacyFieldIdMode::Standalone) {
-        return Ok(ConvertedSchema {
-            schema: original_schema,
-            field_id_remap: HashMap::new(),
-        });
-    }
-
-    let (read_schema, max_field_id, _) = read_context.expect("legacy dataset context");
-    let schema =
-        LanceSchema::from_arrow_schema(arrow_schema, Some(read_schema), Some(max_field_id))?;
+    };
+    let schema = LanceSchema::from_arrow_schema(
+        arrow_schema,
+        Some(manifest.schema.clone()),
+        Some(manifest.max_field_id()),
+    )?;
 
     let field_id_remap = original_schema
         .fields_pre_order()
@@ -1601,7 +1574,7 @@ fn convert_schema_from_operation(
     java_operation: &JObject,
     java_allocator: &JObject,
     manifest: Option<&Manifest>,
-    options: SchemaConversionOptions,
+    operation_name: &str,
 ) -> Result<ConvertedSchema> {
     let schema_ptr = env
         .call_method(
@@ -1615,15 +1588,7 @@ fn convert_schema_from_operation(
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let arrow_schema = Schema::try_from(&c_schema)?;
 
-    let read_context = manifest.map(|manifest| {
-        (
-            manifest.schema.clone(),
-            manifest.max_field_id(),
-            manifest.uses_stable_field_ids(),
-        )
-    });
-
-    convert_arrow_schema(&arrow_schema, read_context, options)
+    convert_arrow_schema(&arrow_schema, manifest, operation_name)
 }
 
 type DataFileIdentity = (Option<u32>, String);
@@ -1801,10 +1766,7 @@ fn convert_to_rust_operation(
                     )
                 })?,
                 manifest,
-                SchemaConversionOptions {
-                    raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
-                    legacy_field_id_mode: LegacyFieldIdMode::Inherit,
-                },
+                &op_name,
             )?;
             Operation::Project {
                 preserves_nullability: env
@@ -1916,7 +1878,7 @@ fn convert_to_rust_operation(
             }
         }
         "Overwrite" => {
-            let mut fragments: Vec<Fragment> =
+            let fragments: Vec<Fragment> =
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
@@ -1935,10 +1897,7 @@ fn convert_to_rust_operation(
                         base.extract_object(env)
                     })
                 })?;
-            let ConvertedSchema {
-                schema,
-                field_id_remap,
-            } = convert_schema_from_operation(
+            let ConvertedSchema { schema, .. } = convert_schema_from_operation(
                 env,
                 java_operation,
                 allocator.ok_or_else(|| {
@@ -1947,12 +1906,8 @@ fn convert_to_rust_operation(
                     )
                 })?,
                 manifest,
-                SchemaConversionOptions {
-                    raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
-                    legacy_field_id_mode: LegacyFieldIdMode::Standalone,
-                },
+                &op_name,
             )?;
-            remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -2136,10 +2091,7 @@ fn convert_to_rust_operation(
                     )
                 })?,
                 manifest,
-                SchemaConversionOptions {
-                    raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
-                    legacy_field_id_mode: LegacyFieldIdMode::Inherit,
-                },
+                &op_name,
             )?;
             let retained_files = if field_id_remap.is_empty() {
                 HashSet::new()
@@ -2549,18 +2501,18 @@ mod tests {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
 
+        let mut manifest = Manifest::new(
+            base_schema,
+            Arc::default(),
+            Default::default(),
+            HashMap::new(),
+        );
+        manifest.activate_stable_field_ids();
+
         let ConvertedSchema {
             schema,
             field_id_remap,
-        } = convert_arrow_schema(
-            &arrow_schema,
-            Some((base_schema, 0, true)),
-            SchemaConversionOptions {
-                raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
-                legacy_field_id_mode: LegacyFieldIdMode::Inherit,
-            },
-        )
-        .unwrap();
+        } = convert_arrow_schema(&arrow_schema, Some(&manifest), "Project").unwrap();
 
         assert!(schema.metadata.is_empty());
         assert_eq!(schema.field("a").unwrap().id, -1);
@@ -2582,15 +2534,14 @@ mod tests {
             ])),
         ])
         .with_metadata(metadata.clone());
-        let converted = convert_arrow_schema(
-            &arrow_schema,
-            Some((base_schema, 0, true)),
-            SchemaConversionOptions {
-                raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
-                legacy_field_id_mode: LegacyFieldIdMode::Inherit,
-            },
-        )
-        .unwrap();
+        let mut manifest = Manifest::new(
+            base_schema,
+            Arc::default(),
+            Default::default(),
+            HashMap::new(),
+        );
+        manifest.activate_stable_field_ids();
+        let converted = convert_arrow_schema(&arrow_schema, Some(&manifest), "Project").unwrap();
         assert_eq!(converted.schema.field("renamed").unwrap().id, 0);
         assert_eq!(converted.schema.metadata, metadata);
         assert!(converted.field_id_remap.is_empty());
@@ -2606,18 +2557,17 @@ mod tests {
         };
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Utf8, false)]);
 
+        let manifest = Manifest::new(
+            base_schema,
+            Arc::default(),
+            Default::default(),
+            HashMap::new(),
+        );
+
         let ConvertedSchema {
             schema,
             field_id_remap,
-        } = convert_arrow_schema(
-            &arrow_schema,
-            Some((base_schema, 0, false)),
-            SchemaConversionOptions {
-                raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
-                legacy_field_id_mode: LegacyFieldIdMode::Standalone,
-            },
-        )
-        .unwrap();
+        } = convert_arrow_schema(&arrow_schema, Some(&manifest), "Overwrite").unwrap();
 
         assert_eq!(schema.field("a").unwrap().data_type(), ArrowDataType::Utf8);
         assert!(schema.metadata.is_empty());
