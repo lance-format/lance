@@ -534,14 +534,16 @@ class _RawBlobFile(io.RawIOBase):
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         if whence == io.SEEK_SET:
-            self.inner.seek(offset)
+            position = offset
         elif whence == io.SEEK_CUR:
-            self.inner.seek(self.inner.tell() + offset)
+            position = self.inner.tell() + offset
         elif whence == io.SEEK_END:
-            self.inner.seek(self.inner.size() + offset)
+            position = self.inner.size() + offset
         else:
             raise ValueError(f"Invalid whence: {whence}")
-
+        if position < 0:
+            raise ValueError(f"negative seek value {position}")
+        self.inner.seek(position)
         return self.inner.tell()
 
     def seekable(self) -> bool:

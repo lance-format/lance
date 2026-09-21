@@ -843,6 +843,40 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+        assert f.seek(-1, io.SEEK_CUR) == 1
+        assert f.seek(-1, io.SEEK_END) == 2
+
+
+@pytest.mark.parametrize(
+    "whence",
+    [
+        pytest.param(io.SEEK_SET, id="set"),
+        pytest.param(io.SEEK_CUR, id="cur"),
+        pytest.param(io.SEEK_END, id="end"),
+    ],
+)
+def test_blob_file_negative_seek_raises_value_error(dataset_with_blobs, whence):
+    blob = dataset_with_blobs.take_blobs("blobs", indices=[1])[0]
+    offset = -(blob.size() + 1) if whence == io.SEEK_END else -1
+    with pytest.raises(ValueError, match="negative seek value -1"):
+        blob.seek(offset, whence)
+    assert blob.tell() == 0
+
+
+def test_blob_file_negative_seek_does_not_move_cursor(dataset_with_blobs):
+    blob = dataset_with_blobs.take_blobs("blobs", indices=[1])[0]
+    blob.seek(2)
+    with pytest.raises(ValueError, match="negative seek value -1"):
+        blob.seek(-1)
+    assert blob.tell() == 2
+
+
+def test_blob_file_read_past_eof_leaves_cursor(dataset_with_blobs):
+    with dataset_with_blobs.take_blobs("blobs", indices=[1])[0] as blob:
+        past_eof = blob.size() + 1
+        assert blob.seek(past_eof) == past_eof
+        assert blob.read() == b""
+        assert blob.tell() == past_eof
 
 
 @pytest.mark.parametrize(

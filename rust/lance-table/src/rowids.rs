@@ -18,6 +18,7 @@ use std::ops::{Range, RangeInclusive};
 mod bitmap;
 mod encoded_array;
 mod index;
+mod runs;
 pub mod segment;
 mod serde;
 pub mod version;
@@ -315,6 +316,25 @@ impl RowIdSequence {
         }
         // TODO: add other optimizations, such as combining two RangeWithHoles.
         self.0.extend(other.0);
+    }
+
+    /// Re-encode every segment that is smaller as a run of `Range` segments
+    /// than as it is stored now (see [`U64Segment::as_ranges`]). Returns
+    /// whether anything changed.
+    ///
+    /// The result is written as plain `Range` segments, which every reader
+    /// understands, but a reader without the compact in-memory form handles
+    /// thousands of segments per fragment slowly, so this is only called for
+    /// tables that opted in.
+    pub fn use_range_segments(&mut self) -> bool {
+        let mut changed = false;
+        for segment in &mut self.0 {
+            if let Some(ranges) = segment.as_ranges() {
+                *segment = ranges;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Remove a set of row ids from the sequence.
@@ -668,6 +688,24 @@ impl RowIdSequence {
                         offset_start + position_in_range - holes_passed
                     })));
                 }
+                U64Segment::Ranges { range, runs } => {
+                    let offset_start = offset;
+                    offset += runs.present_len() as u64;
+                    let mut ids = RowAddrTreeMap::new();
+                    for present in runs.present_ranges() {
+                        ids.insert_range(
+                            (range.start + present.start as u64)
+                                ..(range.start + present.end as u64),
+                        );
+                    }
+                    ids.mask(mask);
+                    ranges.extend(GroupingIterator::new(ids.into_addr_iter().map(|addr| {
+                        let position = runs
+                            .position((addr - range.start) as u32)
+                            .expect("addresses were inserted from the present ranges");
+                        offset_start + position as u64
+                    })));
+                }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     // TODO: Could probably optimize the sorted array case to be O(N) instead of O(N log N)
                     ranges.extend(GroupingIterator::new(array.iter().enumerate().filter_map(
@@ -747,6 +785,14 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
                     seg.insert_range(range.clone());
                     for hole in holes.iter() {
                         seg.remove(hole);
+                    }
+                }
+                U64Segment::Ranges { range, runs } => {
+                    for present in runs.present_ranges() {
+                        seg.insert_range(
+                            (range.start + present.start as u64)
+                                ..(range.start + present.end as u64),
+                        );
                     }
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
@@ -1828,5 +1874,64 @@ mod test {
         let r = seq.row_id_range().unwrap();
         assert_eq!(*r.start(), 0);
         assert_eq!(*r.end(), 104);
+    }
+
+    #[test]
+    fn test_range_segments_sequence_matches_bitmap_sequence() {
+        let live: Vec<u64> = (0..600u64)
+            .filter(|v| !(50..250).contains(v) && !(300..310).contains(v))
+            .collect();
+        let bitmap_sequence = RowIdSequence::from(live.as_slice());
+        assert!(matches!(
+            bitmap_sequence.0.as_slice(),
+            [U64Segment::RangeWithBitmap { .. }]
+        ));
+        let mut runs_sequence = bitmap_sequence.clone();
+        assert!(runs_sequence.use_range_segments());
+        assert!(matches!(
+            runs_sequence.0.as_slice(),
+            [U64Segment::Ranges { .. }]
+        ));
+        // Idempotent: a second pass has nothing left to convert.
+        let again = runs_sequence.clone();
+        assert!(!runs_sequence.use_range_segments());
+        assert_eq!(runs_sequence, again);
+
+        assert_eq!(runs_sequence.iter().collect::<Vec<_>>(), live);
+        assert_eq!(runs_sequence.len(), bitmap_sequence.len());
+        let mut cursor = runs_sequence.cursor();
+        let mut chunked = Vec::new();
+        for start in (0..live.len()).step_by(37) {
+            let end = (start + 37).min(live.len());
+            chunked.extend(runs_sequence.select_range_with_cursor(&mut cursor, start..end));
+        }
+        assert_eq!(chunked, live);
+        let picks = [0usize, 5, 49, 50, 300];
+        assert_eq!(
+            runs_sequence
+                .select(picks.iter().copied())
+                .collect::<Vec<_>>(),
+            bitmap_sequence
+                .select(picks.iter().copied())
+                .collect::<Vec<_>>()
+        );
+
+        for mask in [
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 49, 50, 100, 250, 251, 599])),
+            RowAddrMask::from_block(RowAddrTreeMap::from_iter(&[0, 250, 305, 599])),
+        ] {
+            assert_eq!(
+                runs_sequence.mask_to_offset_ranges(&mask),
+                bitmap_sequence.mask_to_offset_ranges(&mask)
+            );
+        }
+        assert_eq!(
+            RowAddrTreeMap::from(&runs_sequence),
+            RowAddrTreeMap::from(&bitmap_sequence)
+        );
+        assert_eq!(
+            read_row_ids(write_row_ids(&runs_sequence).as_slice()).unwrap(),
+            runs_sequence
+        );
     }
 }

@@ -396,6 +396,18 @@ impl ObjectStoreParams {
             .and_then(|a| a.initial_storage_options())
     }
 
+    /// The block size to use: the explicit `block_size` parameter, else the
+    /// `block_size` storage option, else `None` for the store's default.
+    pub fn resolved_block_size(&self) -> Result<Option<usize>> {
+        if self.block_size.is_some() {
+            return Ok(self.block_size);
+        }
+        match self.storage_options() {
+            Some(options) => StorageOptions(options.clone()).block_size(),
+            None => Ok(None),
+        }
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -656,7 +668,11 @@ impl ObjectStore {
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
 
             let mut io_tracker = IOTracker::default();
-            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+            meter_store(
+                &mut inner,
+                &mut io_tracker,
+                &metrics_base(&store_prefix, path),
+            );
 
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
@@ -669,7 +685,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 local_dir_operations: None,
                 scheme: path.scheme().to_string(),
-                block_size: params.block_size.unwrap_or(64 * 1024),
+                block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
@@ -1683,6 +1699,24 @@ impl StorageOptions {
         })
     }
 
+    /// Byte gap below which the I/O scheduler merges two reads of one file
+    /// into a single request, overriding the store's default.
+    pub fn block_size(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("block_size"))
+        else {
+            return Ok(None);
+        };
+        let block_size = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option block_size must be a number of bytes, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(block_size))
+    }
+
     /// Number of times to retry a download that fails
     pub fn download_retry_count(&self) -> usize {
         self.0
@@ -1790,7 +1824,11 @@ impl ObjectStore {
             }
         };
         let mut io_tracker = IOTracker::default();
-        meter_store(&mut store, &mut io_tracker, &store_prefix);
+        meter_store(
+            &mut store,
+            &mut io_tracker,
+            &metrics_base(&store_prefix, &location),
+        );
 
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
@@ -1827,18 +1865,26 @@ impl ObjectStore {
 /// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
 /// through here, or through nothing at all.
 #[cfg(feature = "metrics")]
-fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, base: &str) {
     use crate::object_store::metrics::ObjectStoreMetricsExt;
-    io_tracker.set_metrics_base(store_prefix);
-    *inner = inner.clone().metered(store_prefix.to_owned());
+    io_tracker.set_metrics_base(base);
+    *inner = inner.clone().metered(base.to_owned());
 }
 
 #[cfg(not(feature = "metrics"))]
-fn meter_store(
-    _inner: &mut Arc<dyn OSObjectStore>,
-    _io_tracker: &mut IOTracker,
-    _store_prefix: &str,
-) {
+fn meter_store(_inner: &mut Arc<dyn OSObjectStore>, _io_tracker: &mut IOTracker, _base: &str) {}
+
+/// The `base` metrics label for a store opened at `location`; see
+/// [`metrics::metrics_base`]. Without the `metrics` feature the label is unused
+/// and the prefix keeps the registry cache keyed per bucket as before.
+#[cfg(feature = "metrics")]
+pub(crate) fn metrics_base(store_prefix: &str, location: &Url) -> String {
+    metrics::metrics_base(metrics::base_label_mode(), store_prefix, location)
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn metrics_base(store_prefix: &str, _location: &Url) -> String {
+    store_prefix.to_owned()
 }
 
 fn infer_block_size(scheme: &str) -> usize {
@@ -2057,6 +2103,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.block_size, 1024);
+
+        // The storage option applies when no parameter is given...
+        let mut options_with_block_size = storage_options.unwrap_or_default();
+        options_with_block_size.insert(String::from("block_size"), String::from("2048"));
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(
+            options_with_block_size,
+        ));
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 2048);
+
+        // ...and the explicit parameter wins over it.
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_block_size_option_rejects_invalid_values() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [(String::from("block_size"), String::from("64KiB"))],
+        )));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let error =
+            ObjectStore::from_uri_and_params(registry, "memory:///bucket/foo.lance", &params)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("block_size"), "{error}");
     }
 
     #[rstest]

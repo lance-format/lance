@@ -16,7 +16,7 @@ use crate::feature_flags::{
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
 use crate::io::{
@@ -24,6 +24,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::rowids::{read_row_ids, write_row_ids};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
@@ -51,6 +52,72 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Table config key that opts a table into writing clustered deletions as
+/// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
+/// `update_config`.
+///
+/// Manifests written afterwards re-encode bitmap row id segments as runs of
+/// `Range` segments where that is smaller. That is the
+/// existing wire format, so any version reads the result, but a reader without
+/// the compact in-memory form handles thousands of segments per fragment
+/// slowly. That is why it is opt-in rather than the default.
+///
+/// Setting the key back to `false` only stops further conversions. Fragments
+/// already written as `Range` segments keep that encoding until something else
+/// rewrites their row ids (compaction, for example), so coordinate reader
+/// upgrades before enabling it.
+pub const RANGE_SEGMENTS_CONFIG_KEY: &str = "lance.row_ids.range_segments";
+
+fn range_segments_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(RANGE_SEGMENTS_CONFIG_KEY)
+        .is_some_and(|value| str_is_truthy(value))
+}
+
+/// Re-encode inline row id sequences as runs of `Range` segments when the
+/// table has opted in.
+///
+/// Fragments that the previous manifest already re-encoded are left alone
+/// (their inline bytes are the very same allocation), so a commit pays only
+/// for the fragments it changed; enabling the key re-encodes every fragment
+/// once.
+fn apply_range_segments(
+    manifest: &mut Manifest,
+    current_manifest: Option<&Manifest>,
+) -> Result<()> {
+    if !range_segments_enabled(manifest) {
+        return Ok(());
+    }
+    let unchanged: HashMap<u64, *const u8> = current_manifest
+        .filter(|current| range_segments_enabled(current))
+        .map(|current| {
+            current
+                .fragments
+                .iter()
+                .filter_map(|fragment| match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => Some((fragment.id, data.as_ptr())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fragments = Arc::make_mut(&mut manifest.fragments);
+    for fragment in fragments.iter_mut() {
+        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+            continue;
+        };
+        if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
+            continue;
+        }
+        let mut sequence = read_row_ids(&data[..])?;
+        if sequence.use_range_segments() {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+        }
+    }
+    Ok(())
+}
 
 impl Transaction {
     pub(super) fn fragments_with_ids<'a, T>(
@@ -1538,6 +1605,8 @@ impl Transaction {
             }
             _ => {}
         }
+
+        apply_range_segments(&mut manifest, current_manifest)?;
 
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
