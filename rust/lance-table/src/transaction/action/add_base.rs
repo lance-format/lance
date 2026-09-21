@@ -25,13 +25,16 @@ impl AddBase {
 
         // Two separate uniqueness rules, reported separately: a caller that
         // trips one needs to know which, and the two are fixed differently.
-        if let Some(conflicting) = state.bases().find(|base| base.name == self.base.name) {
-            return Err(Error::invalid_input(format!(
-                "a base path named {:?} already exists (id {}, at '{}'); base names are \
-                 unique within a dataset. Two bases that both leave the name unset count \
-                 as the same name, matching Operation::UpdateBases",
-                self.base.name, conflicting.id, conflicting.path
-            )));
+        if let Some(name) = &self.base.name {
+            // Only a name that is actually set: the name is an optional alias,
+            // and the format puts no uniqueness rule on its absence.
+            if let Some(conflicting) = state.bases().find(|base| base.name.as_ref() == Some(name)) {
+                return Err(Error::invalid_input(format!(
+                    "a base path named {:?} already exists (id {}, at '{}'); base names are \
+                     unique within a dataset",
+                    name, conflicting.id, conflicting.path
+                )));
+            }
         }
         if let Some(conflicting) = state.bases().find(|base| base.path == self.base.path) {
             return Err(Error::invalid_input(format!(
@@ -52,10 +55,13 @@ impl AddBase {
         false
     }
 
-    /// The base id is minted, but the name and location are not: the manifest
-    /// requires both to be unique, so two operations claiming either collide.
+    /// The base id is minted, but the name and location are not: both must be
+    /// unique, so two operations claiming either collide. An unset name claims
+    /// nothing -- it is an optional alias, not a name to share.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::BaseName(self.base.name.clone()));
+        if let Some(name) = &self.base.name {
+            footprint.add(Coordinate::BaseName(name.clone()));
+        }
         footprint.add(Coordinate::BaseLocation(self.base.path.clone()));
     }
 }
@@ -118,14 +124,13 @@ mod tests {
         );
     }
 
-    /// Both bases leave the name unset, which counts as the same name. Carried
-    /// over from `Operation::UpdateBases`, which compares the `Option`s
-    /// directly; worth pinning so a change to it is a decision rather than a
-    /// side effect.
+    /// The name is an optional alias, so leaving it unset is not a name two
+    /// bases can share. `Operation::UpdateBases` guards its name comparison
+    /// with `is_some()` for the same reason.
     #[test]
-    fn test_two_unnamed_bases_collide_on_the_empty_name() {
+    fn test_unnamed_bases_do_not_collide_with_each_other() {
         let manifest = sample_manifest();
-        let error = apply(
+        let next = apply(
             &manifest,
             vec![
                 Action::AddBase(AddBase {
@@ -138,13 +143,8 @@ mod tests {
                 }),
             ],
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("base path named None already exists"),
-            "unexpected error: {error}"
-        );
+        .unwrap();
+        assert_eq!(next.base_paths.len(), 2);
     }
 
     /// The second base takes a different id and a different location, but the
@@ -170,7 +170,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("base path named Some(\"a\") already exists"),
+                .contains("base path named \"a\" already exists"),
             "unexpected error: {error}"
         );
     }
