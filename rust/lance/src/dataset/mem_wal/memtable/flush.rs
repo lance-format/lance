@@ -646,38 +646,58 @@ impl MemTableFlusher {
 
         use crate::index::CreateIndexBuilder;
 
-        let btree_configs: Vec<_> = index_configs
+        // Both scalar kinds train from the same `(value, row id)` rows, so they
+        // differ only in the index type asked for and which registry holds the
+        // memtable side.
+        enum ScalarKind {
+            BTree,
+            Bitmap,
+        }
+        let scalar_configs: Vec<(ScalarKind, &str, &str)> = index_configs
             .iter()
             .filter_map(|c| match c {
-                MemIndexConfig::BTree(cfg) => Some(cfg),
+                MemIndexConfig::BTree(cfg) => {
+                    Some((ScalarKind::BTree, cfg.name.as_str(), cfg.column.as_str()))
+                }
+                MemIndexConfig::Bitmap(cfg) => {
+                    Some((ScalarKind::Bitmap, cfg.name.as_str(), cfg.column.as_str()))
+                }
                 MemIndexConfig::Hnsw(_) => None,
                 MemIndexConfig::Fts(_) => None,
             })
             .collect();
 
-        if btree_configs.is_empty() {
+        if scalar_configs.is_empty() {
             return Ok(vec![]);
         }
 
         let mut created_indexes = Vec::new();
 
-        for btree_cfg in btree_configs {
+        for (kind, name, column) in scalar_configs {
             let params = ScalarIndexParams::default();
-            let mut builder = CreateIndexBuilder::new(
-                dataset,
-                &[btree_cfg.column.as_str()],
-                IndexType::BTree,
-                &params,
-            )
-            .name(btree_cfg.name.clone());
+            let index_type = match kind {
+                ScalarKind::BTree => IndexType::BTree,
+                ScalarKind::Bitmap => IndexType::Bitmap,
+            };
+            let mut builder = CreateIndexBuilder::new(dataset, &[column], index_type, &params)
+                .name(name.to_string());
 
-            if let Some(registry) = mem_indexes
-                && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
-            {
+            if let Some(registry) = mem_indexes {
                 // Forward-written data: index row positions line up 1:1 with
                 // the data file, no remap needed.
-                let training_batches = btree_index.to_training_batches(8192)?;
-                if !training_batches.is_empty() {
+                let training_batches = match kind {
+                    ScalarKind::BTree => registry
+                        .get_btree(name)
+                        .map(|index| index.to_training_batches(8192))
+                        .transpose()?,
+                    ScalarKind::Bitmap => registry
+                        .get_bitmap(name)
+                        .map(|index| index.to_training_batches(8192))
+                        .transpose()?,
+                };
+                if let Some(training_batches) = training_batches
+                    && !training_batches.is_empty()
+                {
                     let schema = training_batches[0].schema();
                     let reader =
                         RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);

@@ -754,6 +754,9 @@ async fn build_index_configs(
                 MemIndexConfig::btree_from_metadata(&index_meta, dataset.schema())?
             }
             MemIndexKind::Fts => MemIndexConfig::fts_from_metadata(&index_meta, dataset.schema())?,
+            MemIndexKind::Bitmap => {
+                MemIndexConfig::bitmap_from_metadata(&index_meta, dataset.schema())?
+            }
             MemIndexKind::Hnsw => {
                 let hnsw_params = hnsw_params.get(index_name).cloned();
                 load_vector_index_config(dataset, index_name, &index_meta, hnsw_params).await?
@@ -1080,8 +1083,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_maintained_indexes_rejects_unmaintainable_kind() {
-        // A bitmap index is a valid durable index the memtable cannot build.
-        // The error names it, so a caller validating a set knows which to drop.
+        // A zone map is a valid durable index the memtable cannot build. The
+        // error names it, so a caller validating a set knows which to drop.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["v"],
+                IndexType::ZoneMap,
+                Some("v_zonemap".to_string()),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let error = validate_maintained_indexes(&dataset, &["v_zonemap".to_string()])
+            .await
+            .expect_err("the memtable cannot build a zone map index");
+        assert!(
+            error.to_string().contains("v_zonemap"),
+            "the error must name the index: {error}"
+        );
+    }
+
+    /// A bitmap index is maintainable, so validation accepts it where it used to
+    /// name it as a kind to drop.
+    #[tokio::test]
+    async fn test_validate_maintained_indexes_accepts_bitmap() {
         let tmp = tempfile::tempdir().unwrap();
         let uri = format!("{}/base", tmp.path().to_str().unwrap());
         let schema = id_v_schema();
@@ -1101,13 +1136,9 @@ mod tests {
             .await
             .unwrap();
 
-        let error = validate_maintained_indexes(&dataset, &["v_bitmap".to_string()])
+        validate_maintained_indexes(&dataset, &["v_bitmap".to_string()])
             .await
-            .expect_err("the memtable cannot build a bitmap index");
-        assert!(
-            error.to_string().contains("v_bitmap"),
-            "the error must name the index: {error}"
-        );
+            .expect("a bitmap index is maintainable");
     }
 
     #[tokio::test]

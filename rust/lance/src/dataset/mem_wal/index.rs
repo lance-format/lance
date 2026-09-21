@@ -15,6 +15,7 @@
 #![allow(clippy::type_complexity)]
 
 mod arena_skiplist;
+mod bitmap;
 mod btree;
 mod fts;
 mod hnsw;
@@ -48,6 +49,7 @@ use tracing::instrument;
 pub type RowPosition = u64;
 
 // Re-export public types used externally
+pub use bitmap::{BitmapIndexConfig, BitmapMemIndex};
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions, search_cross_column};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats};
@@ -168,6 +170,10 @@ pub fn validate_index_configs(
             // accepts any column type the schema can hold. Existence is the
             // only precondition.
             MemIndexConfig::BTree(_) => {}
+            // Bitmap extracts a `ScalarValue` per row like BTree, so any column
+            // type the schema can hold is indexable. Cardinality decides whether
+            // the choice is a good one, and that is the caller's to make.
+            MemIndexConfig::Bitmap(_) => {}
             MemIndexConfig::Fts(_) => unreachable!("FTS configs are validated by schema path"),
             MemIndexConfig::Hnsw(_) => match field.data_type() {
                 DataType::FixedSizeList(item, dim) => {
@@ -289,12 +295,14 @@ pub enum MemIndexKind {
     Hnsw,
     /// Full-text search index.
     Fts,
+    /// Bitmap index for low-cardinality scalar fields.
+    Bitmap,
 }
 
 impl MemIndexKind {
     /// Every maintainable kind. A kind missing here is never detected, so it
     /// goes unmaintained rather than reaching a memtable that cannot build it.
-    pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts];
+    pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts, Self::Bitmap];
 
     /// Suffix of the protobuf details message identifying this kind.
     ///
@@ -306,6 +314,7 @@ impl MemIndexKind {
             Self::BTree => "BTreeIndexDetails",
             Self::Hnsw => "VectorIndexDetails",
             Self::Fts => "InvertedIndexDetails",
+            Self::Bitmap => "BitmapIndexDetails",
         }
     }
 
@@ -332,6 +341,8 @@ pub enum MemIndexConfig {
     Hnsw(Box<HnswIndexConfig>),
     /// Full-text search index.
     Fts(FtsIndexConfig),
+    /// Bitmap index for low-cardinality scalar fields.
+    Bitmap(BitmapIndexConfig),
 }
 
 impl MemIndexConfig {
@@ -342,6 +353,7 @@ impl MemIndexConfig {
             Self::BTree(_) => MemIndexKind::BTree,
             Self::Hnsw(_) => MemIndexKind::Hnsw,
             Self::Fts(_) => MemIndexKind::Fts,
+            Self::Bitmap(_) => MemIndexKind::Bitmap,
         }
     }
 
@@ -351,6 +363,7 @@ impl MemIndexConfig {
             Self::BTree(c) => &c.name,
             Self::Hnsw(c) => &c.name,
             Self::Fts(c) => &c.name,
+            Self::Bitmap(c) => &c.name,
         }
     }
 
@@ -360,6 +373,7 @@ impl MemIndexConfig {
             Self::BTree(c) => c.field_id,
             Self::Hnsw(c) => c.field_id,
             Self::Fts(c) => c.field_id,
+            Self::Bitmap(c) => c.field_id,
         }
     }
 
@@ -369,6 +383,7 @@ impl MemIndexConfig {
             Self::BTree(c) => &c.column,
             Self::Hnsw(c) => &c.column,
             Self::Fts(c) => &c.column,
+            Self::Bitmap(c) => &c.column,
         }
     }
 
@@ -376,6 +391,16 @@ impl MemIndexConfig {
     pub fn btree_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
         let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
         Ok(Self::BTree(BTreeIndexConfig {
+            name: index_meta.name.clone(),
+            field_id,
+            column,
+        }))
+    }
+
+    /// Create a bitmap index config from base table IndexMetadata.
+    pub fn bitmap_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
+        let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
+        Ok(Self::Bitmap(BitmapIndexConfig {
             name: index_meta.name.clone(),
             field_id,
             column,
@@ -504,6 +529,8 @@ pub struct IndexStore {
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
+    /// Bitmap indexes keyed by index name.
+    bitmap_indexes: HashMap<String, BitmapMemIndex>,
     /// The primary-key index (single-column or composite), or `None` without a
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
@@ -536,6 +563,7 @@ impl Default for IndexStore {
     fn default() -> Self {
         Self {
             btree_indexes: HashMap::new(),
+            bitmap_indexes: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
             pk_index: None,
@@ -552,6 +580,10 @@ impl std::fmt::Debug for IndexStore {
             .field(
                 "btree_indexes",
                 &self.btree_indexes.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "bitmap_indexes",
+                &self.bitmap_indexes.keys().collect::<Vec<_>>(),
             )
             .field(
                 "hnsw_indexes",
@@ -605,6 +637,12 @@ impl IndexStore {
                 MemIndexConfig::BTree(c) => {
                     let index = Arc::new(BTreeMemIndex::new(c.field_id, c.column.clone()));
                     registry.btree_indexes.insert(c.name.clone(), index);
+                }
+                MemIndexConfig::Bitmap(c) => {
+                    registry.bitmap_indexes.insert(
+                        c.name.clone(),
+                        BitmapMemIndex::new(c.field_id, c.column.clone()),
+                    );
                 }
                 MemIndexConfig::Hnsw(c) => {
                     let index = HnswMemIndex::with_capacity(
@@ -963,6 +1001,9 @@ impl IndexStore {
         for index in self.fts_indexes.values() {
             index.insert(batch, row_offset)?;
         }
+        for index in self.bitmap_indexes.values() {
+            index.insert(batch, row_offset)?;
+        }
         // Single-column PK aliases a `btree_indexes` entry (maintained above);
         // a composite PK has its own index, maintained here.
         let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
@@ -1149,6 +1190,11 @@ impl IndexStore {
         self.hnsw_indexes.get(name)
     }
 
+    /// Get a bitmap index by name.
+    pub fn get_bitmap(&self, name: &str) -> Option<&BitmapMemIndex> {
+        self.bitmap_indexes.get(name)
+    }
+
     /// Get an FTS index by name.
     pub fn get_fts(&self, name: &str) -> Option<&FtsMemIndex> {
         self.fts_indexes.get(name)
@@ -1248,7 +1294,10 @@ impl IndexStore {
 
     /// Check if the registry has any indexes.
     pub fn is_empty(&self) -> bool {
-        self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
+        self.btree_indexes.is_empty()
+            && self.hnsw_indexes.is_empty()
+            && self.fts_indexes.is_empty()
+            && self.bitmap_indexes.is_empty()
     }
 
     /// Name every index this memtable carries, for diagnostics.
@@ -1271,7 +1320,10 @@ impl IndexStore {
 
     /// Get the total number of indexes.
     pub fn len(&self) -> usize {
-        self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
+        self.btree_indexes.len()
+            + self.hnsw_indexes.len()
+            + self.fts_indexes.len()
+            + self.bitmap_indexes.len()
     }
 
     /// Heap bytes held by every index in the registry.
@@ -1364,7 +1416,7 @@ mod tests {
         "type.googleapis.com/lance.index.VectorIndexDetails",
         Some(MemIndexKind::Hnsw)
     )]
-    #[case::bitmap("/lance.table.BitmapIndexDetails", None)]
+    #[case::bitmap("/lance.table.BitmapIndexDetails", Some(MemIndexKind::Bitmap))]
     #[case::label_list("/lance.table.LabelListIndexDetails", None)]
     #[case::ngram("/lance.table.NGramIndexDetails", None)]
     #[case::zone_map("/lance.table.ZoneMapIndexDetails", None)]
