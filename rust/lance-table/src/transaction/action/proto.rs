@@ -10,7 +10,7 @@
 //! Reading is fail-closed: an action this build does not recognize is an error,
 //! never a silently skipped element. The commit path collects concurrent
 //! transactions with `try_collect`, so a transaction carrying an unknown action
-//! must abort the commit rather than be treated as a no-op. Every drafted action
+//! must abort the commit rather than be treated as a no-op. Every specified action
 //! is implemented, so an unrecognized one can only come from a newer Lance --
 //! which protobuf decodes as no variant at all, since it drops the field it does
 //! not know.
