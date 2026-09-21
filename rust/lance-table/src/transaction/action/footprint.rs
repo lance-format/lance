@@ -35,8 +35,10 @@ pub enum Coordinate {
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
     FieldDefinition(i32),
-    /// A base path's name, which the manifest requires to be unique.
-    BaseName(Option<String>),
+    /// A base path's name, where it has one. Names must be unique; an unset
+    /// name is an absent alias rather than a name shared with every other
+    /// unnamed base, so it coordinates nothing.
+    BaseName(String),
     /// A base path's location, which the manifest requires to be unique.
     BaseLocation(String),
     /// One key in one of the manifest's string maps.
@@ -321,6 +323,13 @@ mod tests {
         })
     }
 
+    fn add_unnamed_base(local: u32, path: &str) -> Action {
+        Action::AddBase(AddBase {
+            local,
+            base: BasePath::new(0, path.into(), None, false),
+        })
+    }
+
     #[test]
     fn test_minting_actions_write_nothing() {
         let minting = footprint(vec![
@@ -432,6 +441,18 @@ mod tests {
         vec![add_base(0, "a", "s3://bucket/one")],
         vec![add_base(0, "b", "s3://bucket/two")],
         false,
+    )]
+    // The name is an optional alias. Two writers who both decline to set one
+    // have not picked the same name, so only their locations coordinate.
+    #[case::unnamed_bases_at_different_locations(
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        vec![add_unnamed_base(0, "s3://bucket/two")],
+        false,
+    )]
+    #[case::unnamed_bases_at_the_same_location(
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        vec![add_unnamed_base(0, "s3://bucket/one")],
+        true,
     )]
     // A reservation is meant to be one writer's alone, but nothing in the
     // format enforces that, so claiming a reserved id has to be a write.
