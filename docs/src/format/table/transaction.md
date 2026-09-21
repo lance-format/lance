@@ -613,6 +613,17 @@ different branch, without rewriting it.
 The full action vocabulary and the reasoning behind its shape are defined in
 `protos/transaction/actions.proto`.
 
+One vocabulary detail is a format contract rather than an implementation
+choice. `AddIndexSegment.fields` names only the columns the segment is keyed
+on, and `covering_fields` is an independent declaration of the columns whose
+values it carries, so the segment'''s dependency set is the union of the two.
+This is the contract an index action targets, not the legacy one where
+`IndexMetadata.fields` means keyed columns followed by carried columns. A
+declaration whose two lists overlap can only be represented by a manifest
+declaring `FLAG_INDEPENDENT_COVERING_FIELDS`; until a release implements that
+flag, apply rejects the overlapping form and lowers a disjoint one to the
+legacy subset representation.
+
 ### Compatibility
 
 A `CompositeOperation` produces an ordinary manifest, so a reader that scans a

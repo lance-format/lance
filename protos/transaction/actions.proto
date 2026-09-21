@@ -365,8 +365,30 @@ message AlterField {
 message AddIndexSegment {
   UUID uuid = 1;
   string name = 2;
-  // Indexed field ids (Committed, or Local for same-op minted fields).
+  /*
+   * The field ids this segment is keyed on -- the columns it can be searched
+   * by (Committed, or Local for same-op minted fields). Empty only for a
+   * system index keyed on no column at all, such as mem_wal or frag_reuse.
+   *
+   * Keys only. `IndexMetadata.fields` in a manifest written under the legacy
+   * contract instead means keyed columns followed by carried ones; this
+   * action does not inherit that, because it has no historical encoding to
+   * stay compatible with. Apply derives the manifest's representation.
+   */
   repeated Ref fields = 3;
+  /*
+   * Field ids whose values the segment carries but is not necessarily keyed
+   * on. Independent of `fields` rather than a subset of it, and the segment's
+   * dependency set is the union of the two. Empty for a segment that carries
+   * no extra column.
+   *
+   * An id may appear in both lists, meaning a column the segment is keyed on
+   * *and* carries values for. That form requires the manifest to declare
+   * FLAG_INDEPENDENT_COVERING_FIELDS, which no release implements yet, so
+   * apply rejects an overlapping declaration until it does. A disjoint
+   * declaration lowers to the legacy subset form and commits today.
+   */
+  repeated Ref covering_fields = 12;
   google.protobuf.Any index_details = 4;
   optional int32 index_version = 5;
   /*
