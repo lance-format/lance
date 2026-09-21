@@ -7,6 +7,7 @@ use super::apply::ApplyState;
 use super::proto::required;
 use super::{Footprint, Ref};
 use crate::format::pb;
+use lance_core::datatypes::LogicalType;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -21,8 +22,14 @@ use lance_core::{Error, Result};
 pub struct AlterField {
     pub field: Ref,
     pub name: Option<String>,
-    /// The new Arrow logical type. The cast.
-    pub logical_type: Option<String>,
+    /// The new type. The cast.
+    ///
+    /// A [`LogicalType`], Lance's own string encoding of an Arrow type and
+    /// what [`Field::logical_type`](lance_core::datatypes::Field::logical_type)
+    /// holds, not an [`arrow_schema::DataType`]. The schema persists the string
+    /// form, so the action names the same thing the manifest stores rather than
+    /// a type that would have to be converted at both ends.
+    pub logical_type: Option<LogicalType>,
     pub nullable: Option<bool>,
 }
 
@@ -44,7 +51,7 @@ impl AlterField {
             field.nullable = nullable;
         }
         if let Some(logical_type) = &self.logical_type {
-            field.logical_type = logical_type.as_str().into();
+            field.logical_type = logical_type.clone();
             // The cast leaves any index on the field describing the old type.
             // The data rewrite itself is separate actions; this only records
             // that every fragment's view of the field changed.
@@ -71,7 +78,10 @@ impl From<&AlterField> for pb::AlterField {
         Self {
             field: Some(value.field.into()),
             name: value.name.clone(),
-            logical_type: value.logical_type.clone(),
+            logical_type: value
+                .logical_type
+                .as_ref()
+                .map(|logical_type| logical_type.to_string()),
             nullable: value.nullable,
         }
     }
@@ -84,7 +94,7 @@ impl TryFrom<pb::AlterField> for AlterField {
         Ok(Self {
             field: required(message.field, "AlterField.field")?.try_into()?,
             name: message.name,
-            logical_type: message.logical_type,
+            logical_type: message.logical_type.as_deref().map(LogicalType::from),
             nullable: message.nullable,
         })
     }
