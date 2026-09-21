@@ -43,7 +43,7 @@ pub trait Index: Send + Sync + DeepSizeOf {
 
 /// Index Type
 ///
-/// Do not add further entries to this enum except as a last resoret.  We are attempting
+/// Do not add further entries to this enum except as a last resort.  We are attempting
 /// to move away from using hard-coded enums to represent index types and instead use
 /// index plugins.
 ///
