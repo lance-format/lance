@@ -553,23 +553,33 @@ impl RabitQuantizationStorage {
                 let (ip, alpha) = rotated_centroid.map_or((1.0 - dist_q_c, 0.0), |c| {
                     let ip = dot(rotated_query, c);
                     let norm_square = dot(c, c);
-                    (
-                        ip,
-                        if norm_square > 0.0 {
-                            ip / norm_square
-                        } else {
-                            0.0
-                        },
-                    )
+                    let alpha = ip / norm_square;
+                    // An unrepresentable projection cannot be applied to f32
+                    // factors. Use the uncorrected residual estimator instead.
+                    (ip, if alpha.is_finite() { alpha } else { 0.0 })
                 });
                 RabitQueryFactors {
                     add_scale: alpha,
                     add: 1.0 - alpha - ip,
-                    // The squared orthogonal norm can round slightly below zero.
                     error: if gated {
-                        (dot(rotated_query, rotated_query) - alpha * ip)
-                            .max(0.0)
-                            .sqrt()
+                        let norm_square = dot(rotated_query, rotated_query) - alpha * ip;
+                        if norm_square.is_finite() {
+                            // The squared orthogonal norm can round below zero.
+                            norm_square.max(0.0).sqrt()
+                        } else {
+                            // Finite q can overflow its squared f32 norm. In
+                            // particular, inf-inf must not become a zero bound.
+                            let norm_square: f64 = if let Some(c) = rotated_centroid {
+                                rotated_query
+                                    .iter()
+                                    .zip(c)
+                                    .map(|(&q, &c)| (q as f64 - alpha as f64 * c as f64).powi(2))
+                                    .sum()
+                            } else {
+                                rotated_query.iter().map(|&q| (q as f64).powi(2)).sum()
+                            };
+                            norm_square.sqrt() as f32
+                        }
                     } else {
                         0.0
                     },
@@ -4506,6 +4516,42 @@ mod tests {
         if num_bits > 1 {
             assert!((factors.error - dot(&query, &query).sqrt()).abs() < 1e-5);
         }
+    }
+
+    #[rstest]
+    #[case::projected(Some(0.25))]
+    #[case::zero_centroid(Some(0.0))]
+    #[case::tiny_centroid(Some(1e-20))]
+    #[case::missing_centroid(None)]
+    fn test_dot_query_projection_handles_overflowed_squared_norm(
+        #[case] centroid_value: Option<f32>,
+    ) {
+        const DIM: usize = 64;
+        let mut metadata = make_test_metadata(DIM);
+        metadata.num_bits = 5;
+        let batch = make_test_batch_with_ex(
+            make_test_codes(2, DIM as i32),
+            make_test_ex_codes(2, DIM, 5),
+        );
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot, None)
+                .unwrap();
+        let query = (0..DIM).map(|i| (i % 7) as f32 * 1e20).collect::<Vec<_>>();
+        let centroid = centroid_value.map(|v| vec![v; DIM]);
+        let factors = storage.raw_query_factors(1.0, &query, centroid.as_deref());
+        assert!(factors.add_scale.is_finite());
+        assert!(factors.add.is_finite());
+        assert!(factors.error.is_finite() && factors.error > 0.0);
+        let expected = query
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                let c = centroid.as_ref().map_or(0.0, |c| c[i] as f64);
+                (q as f64 - factors.add_scale as f64 * c).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt();
+        assert!((factors.error as f64 / expected - 1.0).abs() < 1e-6);
     }
 
     #[test]
