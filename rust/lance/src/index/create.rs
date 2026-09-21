@@ -27,7 +27,7 @@ use lance_index::{
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
-        BuiltinIndexType, LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
+        LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
         inverted::tokenizer::InvertedIndexParams, table_files_to_index,
     },
 };
@@ -69,28 +69,41 @@ fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarInd
 /// Refuse a row-id-domain index while a fragment-reuse index is live on a
 /// stable-row-id dataset.
 ///
-/// The FRI remaps row addresses and is applied to every index on load. With
-/// stable row ids the address and row-id domains diverge, and a stable row id is
-/// numerically indistinguishable from an address into fragment 0, so the FRI
-/// would silently rewrite this index's row ids rather than fail. Compaction
-/// refuses the mirror image: it will not write an FRI while such an index
-/// exists.
-///
-/// An unclassifiable type is refused rather than allowed: a plugin index is not
-/// one of the address-domain builtins, and guessing wrong here corrupts data
-/// silently.
+/// The FRI, stable row ids, and row-id-domain indexes are an invalid
+/// combination.  If we are creating a new index and all three of these
+/// things are present then we need to reject the creation.
 ///
 /// Drops out once every index stores row addresses.
 async fn reject_row_id_domain_index_under_frag_reuse(
     dataset: &Dataset,
     index_type: IndexType,
-    builtin: Option<BuiltinIndexType>,
 ) -> Result<()> {
-    if !dataset.manifest.uses_stable_row_ids()
-        || builtin.is_some_and(|builtin| builtin.results_are_row_addrs())
-    {
+    if !dataset.manifest.uses_stable_row_ids() {
         return Ok(());
     }
+
+    // Hard-coded list of row-id-domain indexes.  As we migrate away from
+    // row-id domain indexes this list will shrink and then vanish.
+    match index_type {
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::Inverted
+        | IndexType::IvfFlat
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfPq
+        | IndexType::IvfRq
+        | IndexType::IvfSq
+        | IndexType::LabelList
+        | IndexType::NGram
+        | IndexType::RTree
+        | IndexType::Vector => {}
+        _ => {
+            return Ok(());
+        }
+    };
+
     let Some(frag_reuse) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
         return Ok(());
     };
@@ -200,17 +213,8 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
-        let builtin = if self.index_type == IndexType::Scalar {
-            self.params
-                .as_any()
-                .downcast_ref::<ScalarIndexParams>()
-                .and_then(|params| BuiltinIndexType::from_name(&params.index_type))
-        } else {
-            BuiltinIndexType::try_from(self.index_type).ok()
-        };
-        let index_type = self.index_type;
         async move {
-        reject_row_id_domain_index_under_frag_reuse(self.dataset, index_type, builtin).await?;
+        reject_row_id_domain_index_under_frag_reuse(self.dataset, self.index_type).await?;
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),

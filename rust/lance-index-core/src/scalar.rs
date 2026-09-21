@@ -71,38 +71,6 @@ impl BuiltinIndexType {
             Self::MinHashLsh => "minhashlsh",
         }
     }
-
-    /// Every builtin type, for exhaustive checks over the set.
-    pub const ALL: [Self; 9] = [
-        Self::BTree,
-        Self::Bitmap,
-        Self::LabelList,
-        Self::NGram,
-        Self::ZoneMap,
-        Self::BloomFilter,
-        Self::RTree,
-        Self::Inverted,
-        Self::Fm,
-    ];
-
-    /// Parse a builtin name as `ScalarIndexParams::index_type` spells it.
-    ///
-    /// Returns `None` for a plugin type, which by definition is not builtin.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|builtin| builtin.as_str().eq_ignore_ascii_case(name))
-    }
-
-    /// Whether this index reports matches as physical row addresses
-    /// (`fragment_id << 32 | offset`) rather than row ids.
-    ///
-    /// Answers for an index about to be created, from the type alone. It must
-    /// agree with `IndexMetadata::results_are_row_addrs`, which answers the same
-    /// question for an existing index from its persisted details.
-    pub fn results_are_row_addrs(&self) -> bool {
-        matches!(self, Self::ZoneMap | Self::BloomFilter | Self::Fm)
-    }
 }
 
 impl TryFrom<IndexType> for BuiltinIndexType {

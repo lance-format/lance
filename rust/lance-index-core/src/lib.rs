@@ -42,6 +42,13 @@ pub trait Index: Send + Sync + DeepSizeOf {
 }
 
 /// Index Type
+///
+/// Do not add further entries to this enum except as a last resoret.  We are attempting
+/// to move away from using hard-coded enums to represent index types and instead use
+/// index plugins.
+///
+/// For example, if you need to decide if some index needs capability X then add a
+/// has_capability_x method to one of the index plugin traits.
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf, Serialize, Deserialize)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.

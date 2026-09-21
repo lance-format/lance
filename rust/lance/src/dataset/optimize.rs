@@ -2452,16 +2452,10 @@ async fn rewrite_files(
         .sum::<u64>();
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
-    //
-    // Stable row ids spare the row-id-domain indices a remap, but not the
-    // address-domain ones: a rewrite moves every address they store. The FRI is
-    // how those follow their data, so a deferred remap needs the addresses
-    // whether or not row ids are stable.
     let capture_row_addrs = options.defer_index_remap
-        || (!dataset.manifest.uses_stable_row_ids()
-            && load_indices_for_remapping(dataset.as_ref())
-                .await?
-                .is_some());
+        || (load_indices_for_remapping(dataset.as_ref())
+            .await?
+            .is_some());
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
