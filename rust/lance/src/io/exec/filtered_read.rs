@@ -60,7 +60,7 @@ use tracing::{Instrument, instrument};
 
 use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
-use crate::dataset::fragment::{FileFragment, FragReadConfig};
+use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -224,6 +224,7 @@ struct ScopedFragmentRead {
     physical_filter: Option<Arc<dyn PhysicalExpr>>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
+    base_schedulers: BaseSchedulers,
 }
 
 impl ScopedFragmentRead {
@@ -234,6 +235,7 @@ impl ScopedFragmentRead {
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
+            .with_base_schedulers(self.base_schedulers.clone())
             .with_reader_priority(self.priority);
         if let Some(file_reader_options) = &self.file_reader_options {
             config = config.with_file_reader_options(file_reader_options.clone());
@@ -586,12 +588,15 @@ impl FilteredReadStream {
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         plan: FilteredReadInternalPlan,
         scan_scheduler: Option<Arc<ScanScheduler>>,
+        base_schedulers: Option<BaseSchedulers>,
         priority_offset: Option<u32>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
     ) -> Self {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
+        let base_schedulers =
+            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -629,6 +634,7 @@ impl FilteredReadStream {
             &dataset,
             &options,
             scan_scheduler.clone(),
+            base_schedulers,
         );
         if let Some(priority_offset) = priority_offset.filter(|offset| *offset != 0) {
             for scoped in &mut scoped_fragments {
@@ -744,6 +750,18 @@ impl FilteredReadStream {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
         ScanScheduler::new(obj_store, scheduler_config)
+    }
+
+    /// Create the per-base scheduler cache for a read, sized like the scan
+    /// scheduler (explicit option → env override → max bandwidth)
+    fn make_base_schedulers(options: &FilteredReadOptions) -> BaseSchedulers {
+        match options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
+            Some(io_buffer_size_bytes) => BaseSchedulers::new(io_buffer_size_bytes),
+            None => BaseSchedulers::max_bandwidth(),
+        }
     }
 
     async fn load_fragment(
@@ -966,6 +984,7 @@ impl FilteredReadStream {
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
+        base_schedulers: BaseSchedulers,
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
@@ -1004,6 +1023,7 @@ impl FilteredReadStream {
                     physical_filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
+                    base_schedulers: base_schedulers.clone(),
                 });
             }
         }
@@ -2615,6 +2635,7 @@ impl FilteredReadExec {
                     plan.clone(),
                     None,
                     None,
+                    None,
                     materialization_context,
                     true,
                 );
@@ -2758,6 +2779,7 @@ struct RowStreamRead {
     carried_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
+    base_schedulers: BaseSchedulers,
     materialization_context: Arc<BlobMaterializationContext>,
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
@@ -2776,12 +2798,14 @@ impl RowStreamRead {
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
+        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
         Self {
             dataset,
             source,
             carried_schema,
             output_schema,
             scan_scheduler,
+            base_schedulers,
             materialization_context,
             loaded_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
@@ -2954,6 +2978,7 @@ impl RowStreamRead {
             self.global_metrics.clone(),
             internal_plan,
             Some(self.scan_scheduler.clone()),
+            Some(self.base_schedulers.clone()),
             Some(priority_offset),
             self.materialization_context.clone(),
             false,
@@ -6006,6 +6031,7 @@ mod tests {
             };
             let options = FilteredReadOptions::basic_full_read(dataset);
             let scheduler = FilteredReadStream::make_scan_scheduler(dataset, &options);
+            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
 
             let scoped = FilteredReadStream::plan_to_scoped_fragments(
                 &plan,
@@ -6013,10 +6039,70 @@ mod tests {
                 dataset,
                 &options,
                 scheduler,
+                base_schedulers,
             );
             assert_eq!(scoped.len(), 1);
             assert_eq!(scoped[0].fragment.id(), 2);
             assert_eq!(scoped[0].priority, 2);
+        }
+
+        /// Fragment reads planned for one scan carry the same base scheduler
+        /// cache, so files on another base (a shallow clone) share one
+        /// scheduler instead of building one per opened file
+        #[tokio::test]
+        async fn scoped_fragments_share_one_scheduler_per_base() {
+            let fixture = take_fixture(false).await;
+            let mut source = fixture.dataset.as_ref().clone();
+            source
+                .tags()
+                .create("to_clone", source.version().version)
+                .await
+                .unwrap();
+            let clone_dir = TempStrDir::default();
+            let cloned = Arc::new(
+                source
+                    .shallow_clone(&clone_dir, "to_clone", None)
+                    .await
+                    .unwrap(),
+            );
+            let descriptors = cloned.fragments().clone();
+            assert_eq!(descriptors.len(), 3);
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|frag| frag.files.iter().all(|file| file.base_id.is_some()))
+            );
+
+            let rows = descriptors
+                .iter()
+                .map(|frag| (frag.id as u32, vec![0u64..10]))
+                .collect::<BTreeMap<_, _>>();
+            let plan = FilteredReadInternalPlan {
+                rows,
+                filters: HashMap::new(),
+                scan_range_after_filter: None,
+            };
+            let options = FilteredReadOptions::basic_full_read(&cloned);
+            let scheduler = FilteredReadStream::make_scan_scheduler(&cloned, &options);
+            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
+            let scoped = FilteredReadStream::plan_to_scoped_fragments(
+                &plan,
+                &descriptors,
+                &cloned,
+                &options,
+                scheduler,
+                base_schedulers.clone(),
+            );
+            assert_eq!(scoped.len(), 3);
+
+            for scoped_fragment in &scoped {
+                scoped_fragment
+                    .fragment
+                    .open(cloned.schema(), scoped_fragment.frag_read_config())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(base_schedulers.len(), 1);
         }
 
         /// Output preserves the input's row order, duplicates, and payload

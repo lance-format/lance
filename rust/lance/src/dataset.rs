@@ -3716,6 +3716,15 @@ impl Dataset {
     /// underlying storage. In order to remove the data, you must subsequently
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
+    /// The schema a [`Self::drop_columns`] of `columns` would project to,
+    /// with every validation that drop performs and no mutation of its own.
+    ///
+    /// For a caller that must not write anything until the whole projection
+    /// is known to be valid against this revision.
+    pub fn plan_drop_columns(&self, columns: &[&str]) -> Result<Schema> {
+        schema_evolution::plan_drop_columns(self, columns)
+    }
+
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await

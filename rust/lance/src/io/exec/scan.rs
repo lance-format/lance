@@ -36,7 +36,7 @@ use log::debug;
 use tracing::Instrument;
 
 use crate::dataset::Dataset;
-use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
+use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
     LEGACY_DEFAULT_FRAGMENT_READAHEAD,
@@ -295,6 +295,9 @@ impl LanceStream {
             dataset.object_store.clone(),
             SchedulerConfig::new(config.io_buffer_size),
         );
+        // Shared for this scan so every base file reuses one scheduler per base
+        // at the scan's own io_buffer_size, matching the primary scheduler.
+        let base_schedulers = BaseSchedulers::new(config.io_buffer_size);
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
@@ -308,6 +311,7 @@ impl LanceStream {
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
+                let base_schedulers = base_schedulers.clone();
                 let config = config_for_stream.clone();
                 let force_row_address = materialize_blob_v2_binary;
                 #[allow(clippy::type_complexity)]
@@ -325,6 +329,7 @@ impl LanceStream {
                         if let Some(file_reader_options) = config.file_reader_options {
                             frag_config = frag_config.with_file_reader_options(file_reader_options);
                         }
+                        frag_config = frag_config.with_base_schedulers(base_schedulers);
                         let reader = open_file(
                             file_fragment.fragment,
                             project_schema,

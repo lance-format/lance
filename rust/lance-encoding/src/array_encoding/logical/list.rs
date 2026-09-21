@@ -26,9 +26,9 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, DrainLimit, FieldScheduler, FilterExpression,
+        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -868,6 +868,55 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        if num_rows == 0 {
+            return Ok(DrainLimit { rows: 0, bytes: 0 });
+        }
+        let start_index = self.rows_drained as usize;
+        let end_index = start_index + num_rows as usize;
+        let start_offset = self.offsets[start_index];
+        // The list's own offsets buffer counts items; when it is i32, the cumulative
+        // item count of one output array must stay within the budget.  Offsets are
+        // rebased per output batch, so only the delta from `start_offset` counts.
+        let mut safe_rows = num_rows;
+        if self.offset_type != DataType::Int64 {
+            let max_offset = start_offset.saturating_add(byte_budget);
+            safe_rows = self.offsets[start_index + 1..=end_index]
+                .partition_point(|offset| *offset <= max_offset) as u64;
+        }
+
+        // The item array has its own offset buffers with their own budget; shrink to
+        // the largest whole number of lists whose items also fit.
+        let mut item_bytes = 0u64;
+        let mut safe_end_index = start_index + safe_rows as usize;
+        let requested_items = self.offsets[safe_end_index] - start_offset;
+        if requested_items > 0
+            && let Some(item_decoder) = &self.item_decoder
+        {
+            let item_limit = item_decoder.max_rows_to_drain(requested_items, byte_budget)?;
+            item_bytes = item_limit.bytes;
+            if item_limit.rows < requested_items {
+                let max_item_offset = start_offset + item_limit.rows;
+                safe_rows = self.offsets[start_index + 1..=safe_end_index]
+                    .partition_point(|offset| *offset <= max_item_offset)
+                    as u64;
+                safe_end_index = start_index + safe_rows as usize;
+            }
+        }
+        let items_consumed = self.offsets[safe_end_index] - start_offset;
+        let bytes = if self.offset_type != DataType::Int64 {
+            // One shared budget covers both nesting levels conservatively: charge
+            // whichever level consumes more.
+            items_consumed.max(item_bytes)
+        } else {
+            item_bytes
+        };
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
+        })
+    }
+
     fn num_rows(&self) -> u64 {
         self.num_rows
     }
@@ -1337,7 +1386,7 @@ mod tests {
     use arrow_buffer::BooleanBuffer;
     use arrow_schema::{DataType, Field};
 
-    use super::{ListPageDecoder, oversized_batch_error};
+    use super::*;
     use crate::decoder::LogicalPageDecoder;
 
     #[test]
@@ -1398,5 +1447,59 @@ mod tests {
         assert!(message.contains("requesting rows 2..4"));
         assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
         assert!(message.contains("batch_size"));
+    }
+
+    fn list_page_decoder(offsets: Vec<u64>) -> ListPageDecoder {
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        ListPageDecoder {
+            unloaded: None,
+            validity: BooleanBuffer::new_set(offsets.len() - 1),
+            num_rows: offsets.len() as u64 - 1,
+            offsets: offsets.into(),
+            item_decoder: None,
+            rows_drained: 0,
+            rows_loaded: 0,
+            data_type: DataType::List(items_field.clone()),
+            items_field,
+            offset_type: DataType::Int32,
+        }
+    }
+
+    const FULL_BUDGET: u64 = i32::MAX as u64;
+
+    #[test]
+    fn test_list_page_limits_i32_offset_batches() {
+        let mut decoder = list_page_decoder(vec![0, i32::MAX as u64, i32::MAX as u64 + 1]);
+        let limit = decoder.max_rows_to_drain(2, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 1);
+        assert_eq!(limit.bytes, i32::MAX as u64);
+
+        // Offsets are rebased for each output batch, so the following row is safe.
+        decoder.rows_drained = 1;
+        let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 1);
+        assert_eq!(limit.bytes, 1);
+    }
+
+    #[test]
+    fn test_list_page_stays_within_reduced_budget() {
+        // Mid-batch a page sees only the budget the batch has left; splitting is
+        // by actual consumption, not page boundaries.
+        let decoder = list_page_decoder(vec![0, 10, 20, 30, 40]);
+        let limit = decoder.max_rows_to_drain(4, 25).unwrap();
+        assert_eq!(limit.rows, 2);
+        assert_eq!(limit.bytes, 20);
+        let limit = decoder.max_rows_to_drain(4, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 4);
+        assert_eq!(limit.bytes, 40);
+    }
+
+    #[test]
+    fn test_list_page_reports_zero_rows_for_single_row_over_i32_offset_limit() {
+        // The stream root emits a zero-row limit as a single-row batch, letting a
+        // genuinely oversized row fail at the arrow layer as it always did.
+        let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
+        let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 0);
     }
 }
