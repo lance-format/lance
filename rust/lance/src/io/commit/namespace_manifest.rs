@@ -63,7 +63,7 @@ impl LanceNamespaceExternalManifestStore {
         table_uri: &str,
     ) -> Result<Self> {
         let table_root = lance_io::object_store::ObjectStore::extract_path_from_uri(
-            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+            crate::session::default_object_store_registry(),
             table_uri,
         )?;
         Ok(Self::new(namespace_client, table_id, table_root))

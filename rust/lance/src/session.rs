@@ -21,6 +21,17 @@ pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
+/// The registry used whenever a caller did not supply a [`Session`].
+///
+/// External object store providers depend on `lance-io`, so they are registered
+/// here at the dataset layer instead of inside `lance-io` itself.
+pub(crate) fn default_object_store_registry() -> Arc<ObjectStoreRegistry> {
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    #[cfg(feature = "hdfs")]
+    lance_hdfs_backend::register(&registry);
+    registry
+}
+
 /// Cache selection for one session cache tier.
 #[derive(Clone, Debug)]
 pub enum CacheSpec {
@@ -40,6 +51,9 @@ pub enum CacheSpec {
 ///
 /// This can be used to share caches between multiple datasets, increasing the hit
 /// rate and reducing the amount of memory used.
+///
+/// With the `hdfs` feature enabled, a session registers the third-party HDFS
+/// provider unless the supplied registry already has a provider for `hdfs`.
 ///
 /// A session contains two different caches:
 ///  - The index cache is used to cache opened indices and will cache index data
@@ -118,17 +132,11 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(index_cache_size),
-            ))),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(metadata_cache_size),
-            ))),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Size(index_cache_size),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            spill_store: Arc::new(LocalSpillStore::default()),
-        }
+        )
     }
 
     /// Create a session with a custom index cache backend.
@@ -140,15 +148,11 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(metadata_cache_size),
-            ))),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Backend(index_cache_backend),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            spill_store: Arc::new(LocalSpillStore::default()),
-        }
+        )
     }
 
     /// Replace the spill store used by this session.
@@ -211,6 +215,13 @@ impl Session {
         metadata_cache: CacheSpec,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
+        #[cfg(feature = "hdfs")]
+        if store_registry
+            .get_provider(lance_hdfs_backend::HDFS_SCHEME)
+            .is_none()
+        {
+            lance_hdfs_backend::register(&store_registry);
+        }
         let index_cache = Self::build_cache(index_cache, DEFAULT_INDEX_CACHE_SIZE);
         let metadata_cache = Self::build_cache(metadata_cache, DEFAULT_METADATA_CACHE_SIZE);
         Self {
@@ -333,8 +344,62 @@ mod tests {
     use super::*;
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_index::vector::VectorIndex;
+    use rstest::rstest;
     use std::borrow::Cow;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn test_default_registry_hdfs_feature_gate() {
+        assert_eq!(
+            default_object_store_registry()
+                .get_provider("hdfs")
+                .is_some(),
+            cfg!(feature = "hdfs")
+        );
+        assert_eq!(
+            crate::dataset::WriteParams::default()
+                .store_registry()
+                .get_provider("hdfs")
+                .is_some(),
+            cfg!(feature = "hdfs")
+        );
+    }
+
+    #[rstest]
+    #[case::default(Session::default())]
+    #[case::sized(Session::new(0, 0, Default::default()))]
+    #[case::index_backend(Session::with_index_cache_backend(
+        Arc::new(QuickCacheBackend::with_capacity(0)),
+        0,
+        Default::default()
+    ))]
+    #[case::both_backends(Session::with_cache_backends(
+        CacheSpec::Size(0),
+        CacheSpec::Size(0),
+        Default::default()
+    ))]
+    fn test_session_registers_hdfs_for_every_constructor(#[case] session: Session) {
+        assert_eq!(
+            session.store_registry().get_provider("hdfs").is_some(),
+            cfg!(feature = "hdfs")
+        );
+    }
+
+    #[test]
+    fn test_session_preserves_custom_hdfs_provider() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let provider: Arc<dyn lance_io::object_store::ObjectStoreProvider> =
+            Arc::new(lance_io::object_store::providers::memory::MemoryStoreProvider);
+        registry.insert("hdfs", provider.clone());
+
+        let session = Session::new(0, 0, registry.clone());
+
+        assert!(Arc::ptr_eq(&registry, &session.store_registry()));
+        assert!(Arc::ptr_eq(
+            &provider,
+            &session.store_registry().get_provider("hdfs").unwrap()
+        ));
+    }
 
     struct TestKey(&'static str);
     impl CacheKey for TestKey {

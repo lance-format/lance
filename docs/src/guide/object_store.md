@@ -277,6 +277,84 @@ These keys can be used as both environment variables or keys in the `storage_opt
 | `azure_use_azure_cli` / `use_azure_cli` | Use azure cli for acquiring access token. |
 | `azure_disable_tagging` / `disable_tagging` | Disables tagging objects. This can be desirable if not supported by the backing store. | 
 
+## HDFS Configuration
+
+HDFS support comes from the third-party
+[`lance-hdfs-backend`](https://github.com/hfutatzhanghb/lance-hdfs-backend) crate
+and is disabled by default. Enable the `hdfs` Cargo feature on `lance`, `pylance`,
+or `lance-jni` when building an HDFS-enabled artifact. Prebuilt packages do not
+include it. Building the feature also requires Java 11 or newer plus the Hadoop
+client libraries, because the OpenDAL HDFS service talks to `libhdfs`.
+
+Lance registers the provider automatically for dataset reads and writes, and
+selects `RenameCommitHandler` for `hdfs://` URIs so concurrent writers publish
+versions with HDFS atomic renames instead of clobbering each other. A provider
+you register yourself and a commit handler you pass explicitly both take
+precedence. Index file moves on HDFS use native rename rather than streaming
+file contents through the client.
+
+!!! warning "Builds without the `hdfs` feature are not commit-safe"
+
+    The feature is off by default, so a stock Lance build has no provider for
+    `hdfs://` at all. If you register your own provider against such a build,
+    commit selection falls through to `UnsafeCommitHandler`, which writes the
+    version manifest unconditionally and can clobber a commit another writer
+    has already won. Build every writer of an HDFS dataset with `hdfs` enabled.
+
+For a Python build from source, after setting up the Java and Hadoop
+environment:
+
+```bash
+cd python
+make install
+uv run maturin develop --uv --features hdfs
+```
+
+Use a NameNode address, or a nameservice configured in your Hadoop XML files:
+
+```python
+import lance
+
+ds = lance.dataset(
+    "hdfs://namenode:9000/user/lance/my-dataset",
+    storage_options={"hdfs_user": "lance"},
+)
+# HA nameservice example: hdfs://mycluster/user/lance/my-dataset
+```
+
+| `storage_options` key | Environment variable | Description |
+|-----------------------|----------------------|-------------|
+| `hdfs_name_node` | `HDFS_NAME_NODE` | NameNode URI or HA nameservice. Defaults to the URI authority. |
+| `hdfs_user` | `HADOOP_USER_NAME`, then `HDFS_USER` | HDFS user identity. |
+| `hdfs_kerberos_ticket_cache_path` | None | Kerberos ticket cache path. |
+| `hdfs_atomic_write_dir` | None | HDFS temporary directory for atomic writes. |
+
+Explicit storage options take precedence over environment variables. Configure
+`JAVA_HOME`, `HADOOP_HOME`, `HADOOP_CONF_DIR`, `CLASSPATH`, and your platform's
+native library path for your Hadoop installation; see the backend's
+documentation linked above.
+
+The backend depends on Lance's storage types, so it is wired in at the `lance`
+layer rather than inside `lance-io`, which would be a dependency cycle. Code that
+builds a `lance_io::object_store::ObjectStoreRegistry` directly, without a
+`Session`, must register the provider itself with
+`lance_hdfs_backend::register(&registry)`.
+
+This repository's Rust, Python, and JNI workspace roots patch the backend's
+`lance-core` and `lance-io` dependencies to the local crates, so the backend and
+Lance always share one set of types. Rust applications that depend on this
+checkout through a path or Git dependency must add equivalent overrides in their
+own root manifest, because dependency patches are not transitive:
+
+```toml
+[dependencies]
+lance = { path = "/path/to/lance/rust/lance", features = ["hdfs"] }
+
+[patch.crates-io]
+lance-core = { path = "/path/to/lance/rust/lance-core" }
+lance-io = { path = "/path/to/lance/rust/lance-io" }
+```
+
 ## AliCloud Object Storage Service Configuration
 
 OSS credentials can be set in the environment variables `OSS_ACCESS_KEY_ID`,

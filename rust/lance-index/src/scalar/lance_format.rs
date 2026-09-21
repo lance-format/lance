@@ -22,7 +22,7 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::format::list_index_files_with_sizes;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -524,14 +524,22 @@ impl IndexStore for LanceIndexStore {
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
-        let result = self
-            .object_store
-            .copy_bulk(&path, &self.object_store, &new_path)
-            .await?;
-        self.object_store.delete(&path).await?;
+        let size_bytes = if self.object_store.scheme() == "hdfs" {
+            // HDFS moves index partitions atomically without streaming their
+            // contents, and has no server-side copy.
+            self.object_store.inner.rename(&path, &new_path).await?;
+            self.object_store.size(&new_path).await?
+        } else {
+            let result = self
+                .object_store
+                .copy_bulk(&path, &self.object_store, &new_path)
+                .await?;
+            self.object_store.delete(&path).await?;
+            result.size as u64
+        };
         Ok(IndexFile {
             path: new_name.to_string(),
-            size_bytes: result.size as u64,
+            size_bytes,
         })
     }
 
@@ -709,6 +717,63 @@ mod tests {
         let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::hdfs("hdfs://namenode:9000/ds")]
+    #[case::memory("memory://")]
+    async fn test_rename_index_file(#[case] uri: &str) {
+        let object_store = Arc::new(ObjectStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            uri.parse().unwrap(),
+            None,
+            None,
+            false,
+            false,
+            1,
+            0,
+            None,
+        ));
+        let index_store = LanceIndexStore::new(
+            object_store.clone(),
+            Path::from("indices"),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let mut writer = index_store
+            .new_index_file("original.lance", Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        let expected = Bytes::from_static(b"rename-payload");
+        let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
+        let original = writer.finish().await.unwrap();
+        object_store.io_stats_incremental();
+
+        let renamed = index_store
+            .rename_index_file("original.lance", "renamed.lance")
+            .await
+            .unwrap();
+
+        assert_eq!(renamed.path, "renamed.lance");
+        assert_eq!(renamed.size_bytes, original.size_bytes);
+        if object_store.scheme() == "hdfs" {
+            // A single rename, with no read/write of the file's bytes.
+            let stats = object_store.io_stats_incremental();
+            assert_eq!(stats.read_bytes, 0);
+            assert_eq!(stats.written_bytes, 0);
+            assert_eq!(stats.write_iops, 1);
+        }
+        assert!(
+            !object_store
+                .exists(&Path::from("indices/original.lance"))
+                .await
+                .unwrap()
+        );
+        let reader = index_store.open_index_file("renamed.lance").await.unwrap();
+        assert_eq!(
+            reader.read_global_buffer(buffer_idx).await.unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]

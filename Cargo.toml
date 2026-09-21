@@ -32,6 +32,13 @@ exclude = ["python", "java/lance-jni"]
 resolver = "3"
 
 
+# The HDFS backend is a separate crate that depends on published Lance releases.
+# Point those dependencies at this checkout so the backend shares the workspace's
+# storage and error types while `main` is ahead of the latest release.
+[patch.crates-io]
+lance-core = { path = "rust/lance-core" }
+lance-io = { path = "rust/lance-io" }
+
 [workspace.package]
 version = "13.0.0-beta.7"
 edition = "2024"
@@ -67,6 +74,12 @@ lance-derive = { version = "=13.0.0-beta.7", path = "./rust/lance-derive" }
 lance-encoding = { version = "=13.0.0-beta.7", path = "./rust/lance-encoding" }
 lance-file = { version = "=13.0.0-beta.7", path = "./rust/lance-file" }
 lance-geo = { version = "=13.0.0-beta.7", path = "./rust/lance-geo" }
+# Lance 13 is not published yet, so the backend comes from the branch that tracks
+# it. The `version` is what a published `lance` manifest keeps once cargo strips
+# the Git specification; drop the Git fields when 0.2.0 reaches crates.io.
+lance-hdfs-backend = { version = "=0.2.0", git = "https://github.com/hfutatzhanghb/lance-hdfs-backend.git", branch = "codex/upgrade-lance-13", default-features = false, features = [
+    "hdfs",
+] }
 lance-index = { version = "=13.0.0-beta.7", path = "./rust/lance-index" }
 lance-index-core = { version = "=13.0.0-beta.7", path = "./rust/lance-index-core" }
 lance-io = { version = "=13.0.0-beta.7", path = "./rust/lance-io", default-features = false }

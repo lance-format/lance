@@ -14,6 +14,11 @@ publish = false
 # inside another cargo project (e.g. a git worktree placed under the main checkout).
 [workspace]
 
+# Keep the third-party HDFS backend on the same Lance types as the extension.
+[patch.crates-io]
+lance-core = { path = "../rust/lance-core" }
+lance-io = { path = "../rust/lance-io" }
+
 [lib]
 name = "lance"
 crate-type = ["cdylib"]
@@ -90,6 +95,7 @@ default = ["extension-module"]
 datagen = ["lance-datagen"]
 extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
+hdfs = ["lance/hdfs"]
 
 [profile.ci]
 debug = "line-tables-only"

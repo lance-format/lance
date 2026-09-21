@@ -26,6 +26,7 @@ lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
+lance-hdfs-backend = { workspace = true, optional = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
@@ -161,6 +162,7 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
+hdfs = ["dep:lance-hdfs-backend", "lance-table/hdfs"]
 # Publish object store metrics via the `metrics` crate.
 metrics = ["lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]

@@ -434,9 +434,19 @@ impl ObjectStore for IoTrackingStore {
             Some(GetRange::Bounded(range)) => Some(range.clone()),
             _ => None, // TODO: fill in other options.
         };
+        // `head()` is a `get_opts` call with `head = true`, and its `GetResult`
+        // still reports the object's full range even though no body is
+        // transferred. Counting that range would bill every `exists()` and
+        // `size()` as a whole-object read; `MeteredObjectStore` draws the same
+        // distinction between HEAD and GET.
+        let is_head = options.head;
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
+            let num_bytes = if is_head {
+                0
+            } else {
+                result.range.end - result.range.start
+            };
 
             self.record_read("get_opts", location.to_owned(), num_bytes, range);
         }
@@ -590,5 +600,32 @@ impl Drop for StageGuard {
             let mut stats = self.stats.lock().unwrap();
             stats.num_stages += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_head_counts_an_iop_but_no_object_bytes() {
+        let tracker = IOTracker::default();
+        let store = tracker.wrap("", Arc::new(InMemory::new()));
+        let path = Path::from("file.bin");
+        store.put(&path, vec![7u8; 138].into()).await.unwrap();
+        tracker.incremental_stats();
+
+        assert_eq!(store.head(&path).await.unwrap().size, 138);
+        let stats = tracker.incremental_stats();
+        assert_eq!(stats.read_iops, 1);
+        assert_eq!(stats.read_bytes, 0);
+
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        let stats = tracker.incremental_stats();
+        assert_eq!(stats.read_iops, 1);
+        assert_eq!(stats.read_bytes, 138);
     }
 }

@@ -1196,6 +1196,8 @@ pub async fn commit_handler_from_url(
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
         "cos" => Ok(Arc::new(TencentCosCommitHandler)),
+        #[cfg(feature = "hdfs")]
+        "hdfs" => Ok(Arc::new(RenameCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -2182,6 +2184,54 @@ mod tests {
             "ConditionalPutCommitHandler",
             "{url} should route to ConditionalPutCommitHandler",
         );
+    }
+
+    #[cfg(feature = "hdfs")]
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::v1(ManifestNamingScheme::V1)]
+    #[case::v2(ManifestNamingScheme::V2)]
+    async fn test_commit_handler_from_url_hdfs_uses_rename(
+        #[case] naming_scheme: ManifestNamingScheme,
+    ) {
+        let handler = commit_handler_from_url("hdfs://namenode:9000/ds", &None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{handler:?}"), "RenameCommitHandler");
+
+        let store = ObjectStore::memory();
+        let base = Path::from("dataset");
+        let mut manifest = test_manifest();
+        let location = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base,
+                &store,
+                write_manifest_file_to_path,
+                naming_scheme,
+                None,
+            )
+            .await
+            .unwrap();
+        let original = store.read_one_all(&location.path).await.unwrap();
+
+        // Committing the same version again must conflict instead of clobbering
+        // the manifest that is already published at that location.
+        let error = handler
+            .commit(
+                &mut manifest,
+                None,
+                &base,
+                &store,
+                write_manifest_file_to_path,
+                naming_scheme,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CommitError::CommitConflict));
+        assert_eq!(store.read_one_all(&location.path).await.unwrap(), original);
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can

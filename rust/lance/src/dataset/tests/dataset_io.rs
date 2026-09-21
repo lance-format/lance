@@ -73,6 +73,99 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     format!("file-object-store://{path_prefix}{path}")
 }
 
+#[tokio::test]
+async fn test_hdfs_default_provider_feature_gate() {
+    // A missing authority is rejected before the native HDFS client is created.
+    let uri = "hdfs:///dataset";
+    let read_error = DatasetBuilder::from_uri(uri)
+        .build_object_store()
+        .await
+        .unwrap_err();
+    let write_error = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1)),
+        uri,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    for error in [read_error, write_error] {
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let expected = if cfg!(feature = "hdfs") {
+            "namenode host"
+        } else {
+            "No object store provider found for scheme: 'hdfs'"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[cfg(feature = "hdfs")]
+#[tokio::test]
+async fn test_hdfs_scheme_read_write_with_custom_provider() {
+    // Exercise HDFS routing and commit selection without contacting a cluster.
+    let session = Arc::new(Session::default());
+    session.store_registry().insert(
+        "hdfs",
+        Arc::new(lance_io::object_store::providers::memory::MemoryStoreProvider),
+    );
+    let uri = "hdfs://namenode:9000/dataset";
+    let params = WriteParams {
+        session: Some(session.clone()),
+        max_rows_per_file: 2,
+        max_rows_per_group: 2,
+        ..Default::default()
+    };
+
+    let original = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1)),
+        uri,
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(original.count_fragments(), 2);
+    assert_eq!(
+        format!("{:?}", original.commit_handler),
+        "RenameCommitHandler"
+    );
+
+    let appended = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1)),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..params
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(appended.count_fragments(), 3);
+
+    let reopened = DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
+    assert_eq!(
+        reopened
+            .checkout_version(original.version().version)
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        4
+    );
+}
+
 #[rstest]
 #[case::empty("")]
 #[case::zero("0")]

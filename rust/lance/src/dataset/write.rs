@@ -53,7 +53,7 @@ use crate::dataset::blob::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::session::Session;
+use crate::session::{Session, default_object_store_registry};
 
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
@@ -753,7 +753,7 @@ impl WriteParams {
         self.session
             .as_ref()
             .map(|s| s.store_registry())
-            .unwrap_or_default()
+            .unwrap_or_else(default_object_store_registry)
     }
 
     /// Set exact runtime object store params for a registered base path.
@@ -1373,11 +1373,7 @@ pub async fn validate_and_resolve_target_bases(
     };
 
     // Step 4: Prepare TargetBaseInfo structs
-    let store_registry = params
-        .session
-        .as_ref()
-        .map(|s| s.store_registry())
-        .unwrap_or_default();
+    let store_registry = params.store_registry();
 
     if let Some(target_bases) = &target_base_ids {
         // An empty list would panic in round-robin selection; reject it

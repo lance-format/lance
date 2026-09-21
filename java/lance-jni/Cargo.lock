@@ -415,6 +415,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-task"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
 name = "async-trait"
 version = "0.1.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,6 +1003,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "blocking"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a70e4329df6cb94385eed412ec92375c3cdd8a6e502493d1229b6414e4036dfa"
+dependencies = [
+ "async-channel",
+ "async-task",
+ "futures-io",
+ "futures-lite",
+ "piper",
 ]
 
 [[package]]
@@ -2684,6 +2703,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
+name = "futures-lite"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "futures-macro"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,6 +3100,30 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hdfs-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33e2d5cefba2d51a26b44d2a493f963a32725a0f6593c91be4a610ad449c49cb"
+dependencies = [
+ "cc",
+ "java-locator",
+]
+
+[[package]]
+name = "hdrs"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c42a693bfe5dc8fcad1f24044c5ec355c5f157b8ce63c7d62f51cecbc7878d"
+dependencies = [
+ "blocking",
+ "errno",
+ "futures",
+ "hdfs-sys",
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -3639,6 +3692,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "java-locator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09c46c1fe465c59b1474e665e85e1256c3893dd00927b8d55f63b09044c1e64f"
+dependencies = [
+ "glob",
+]
+
+[[package]]
 name = "jieba-macros"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3885,6 +3947,7 @@ dependencies = [
  "lance-datafusion",
  "lance-encoding",
  "lance-file",
+ "lance-hdfs-backend",
  "lance-index",
  "lance-io",
  "lance-linalg",
@@ -4124,6 +4187,22 @@ dependencies = [
  "geodatafusion",
  "lance-core",
  "serde",
+]
+
+[[package]]
+name = "lance-hdfs-backend"
+version = "0.2.0"
+source = "git+https://github.com/hfutatzhanghb/lance-hdfs-backend.git?branch=codex%2Fupgrade-lance-13#f0b059acb44fe24237973a53b9325d9978803356"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "lance-core",
+ "lance-io",
+ "object_store 0.14.1",
+ "object_store_opendal",
+ "opendal",
+ "url",
 ]
 
 [[package]]
@@ -5145,6 +5224,7 @@ dependencies = [
  "object_store 0.14.1",
  "opendal",
  "pin-project",
+ "send_wrapper",
  "tokio",
 ]
 
@@ -5184,6 +5264,7 @@ dependencies = [
  "opendal-service-cos",
  "opendal-service-gcs",
  "opendal-service-goosefs",
+ "opendal-service-hdfs",
  "opendal-service-hf",
  "opendal-service-oss",
  "opendal-service-s3",
@@ -5376,6 +5457,21 @@ dependencies = [
  "log",
  "opendal-core",
  "serde",
+]
+
+[[package]]
+name = "opendal-service-hdfs"
+version = "0.59.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f84772cc0339c756f2bdb351d18fef79eff656d77de17e5c834c3663502cc9"
+dependencies = [
+ "bytes",
+ "futures",
+ "hdrs",
+ "log",
+ "opendal-core",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -5721,6 +5817,17 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "piper"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c835479a4443ded371d6c535cbfd8d31ad92c5d23ae9770a61bc155e4992a3c1"
+dependencies = [
+ "atomic-waker",
+ "fastrand",
+ "futures-io",
+]
 
 [[package]]
 name = "pkcs1"
@@ -6877,6 +6984,15 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 dependencies = [
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
 ]
 
 [[package]]

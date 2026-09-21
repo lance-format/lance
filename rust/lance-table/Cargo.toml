@@ -60,6 +60,9 @@ prost-build.workspace = true
 protobuf-src = { workspace = true, optional = true }
 
 [features]
+# `lance` enables the third-party HDFS provider and this commit-selection
+# feature together so `hdfs://` URIs pick `RenameCommitHandler`.
+hdfs = []
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
 

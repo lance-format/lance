@@ -92,7 +92,8 @@ jobs:
           tool: protoc
       - name: Get features
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | sort | uniq | paste -s -d "," -`
+          # `hdfs` needs the Hadoop native libraries, which the runners do not have.
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e hdfs | sort | uniq | paste -s -d "," -`
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
         run: cargo clippy --profile ci --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
@@ -138,7 +139,7 @@ jobs:
           tool: nextest
       - name: Build tests
         run: |
-          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -)
           cargo nextest run \
             --cargo-profile ci \
             --locked \
@@ -149,7 +150,7 @@ jobs:
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -)
           cargo nextest run \
             --cargo-profile ci \
             --locked \
@@ -173,13 +174,13 @@ jobs:
           tool: protoc
       - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: ubuntu-24.04-8x
@@ -204,7 +205,7 @@ jobs:
           tool: protoc
       - name: Build all
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: warp-macos-14-arm64-6x
@@ -391,5 +392,5 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.msrv }}
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e hdfs | sort | uniq | paste -s -d "," -`
           cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}

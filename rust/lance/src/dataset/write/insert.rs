@@ -378,11 +378,7 @@ impl<'a> InsertBuilder<'a> {
                     .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
-                let registry = params
-                    .session
-                    .as_ref()
-                    .map(|s| s.store_registry())
-                    .unwrap_or_else(|| Arc::new(Default::default()));
+                let registry = params.store_registry();
                 let (object_store, base_path) = ObjectStore::from_uri_and_params(
                     registry,
                     uri,

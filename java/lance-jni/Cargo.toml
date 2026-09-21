@@ -15,12 +15,18 @@ description = "JNI bindings for Lance Columnar format"
 # another cargo project (e.g. a git worktree placed under the main checkout).
 [workspace]
 
+# Keep the third-party HDFS backend on the same Lance types as the JNI library.
+[patch.crates-io]
+lance-core = { path = "../../rust/lance-core" }
+lance-io = { path = "../../rust/lance-io" }
+
 [lib]
 crate-type = ["cdylib"]
 
 [features]
 default = []
 backtrace = ["lance/backtrace", "lance-core/backtrace"]
+hdfs = ["lance/hdfs"]
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait", "metrics"] }

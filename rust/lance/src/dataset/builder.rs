@@ -9,6 +9,7 @@ use super::versions;
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
+use crate::session::default_object_store_registry;
 use crate::{Dataset, Error, Result, session::Session};
 use futures::{FutureExt, TryStreamExt};
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
@@ -551,7 +552,7 @@ impl DatasetBuilder {
             .session
             .as_ref()
             .map(|s| s.store_registry())
-            .unwrap_or_default();
+            .unwrap_or_else(default_object_store_registry);
 
         #[allow(deprecated)]
         let (object_store, base_path) = match &self.options.object_store {
