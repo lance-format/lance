@@ -166,6 +166,8 @@ impl HashJoiner {
                 }
                 arrays.push(Arc::new(new_null_array(arrays[0].data_type(), 1)));
 
+                let column_name = self.batches[0].schema().field(column_i).name().clone();
+
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
 
@@ -178,7 +180,7 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            Self::check_lance_support_null(&array, dataset)?;
+                            Self::check_lance_support_null(&column_name, &array, dataset)?;
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
@@ -193,9 +195,14 @@ impl HashJoiner {
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
 
-    pub fn check_lance_support_null(array: &ArrayRef, dataset: &Dataset) -> Result<()> {
+    pub fn check_lance_support_null(
+        column_name: &str,
+        array: &ArrayRef,
+        dataset: &Dataset,
+    ) -> Result<()> {
         super::versions::validate_nulls(
             dataset.manifest().data_storage_format.lance_file_format(),
+            column_name,
             array.data_type(),
             array.null_count() > 0,
         )
@@ -244,6 +251,7 @@ impl HashJoiner {
                     arrays.push(batch.column(column_i).clone());
                 }
                 arrays.push(left_batch.column(column_i).clone());
+                let column_name = self.batches[0].schema().field(column_i).name().clone();
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
                 async move {
@@ -255,7 +263,7 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            Self::check_lance_support_null(&array, dataset)?;
+                            Self::check_lance_support_null(&column_name, &array, dataset)?;
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
@@ -304,18 +312,25 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V1,
+                "i",
                 &DataType::Int32,
                 true,
             )
             .is_err()
         );
         assert!(
-            super::super::versions::validate_nulls(ConcreteFileVersion::V1, &DataType::Utf8, true,)
-                .is_ok()
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V1,
+                "s",
+                &DataType::Utf8,
+                true,
+            )
+            .is_ok()
         );
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V2_0,
+                "st",
                 &DataType::Struct(arrow_schema::Fields::empty()),
                 true,
             )
@@ -324,6 +339,7 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V2_1,
+                "st",
                 &DataType::Struct(arrow_schema::Fields::empty()),
                 true,
             )
@@ -332,6 +348,7 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V1,
+                "i",
                 &DataType::Int32,
                 false,
             )

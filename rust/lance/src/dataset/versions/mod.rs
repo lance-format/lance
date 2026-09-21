@@ -56,6 +56,19 @@ use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
 };
 
+/// Keep per-operation targets within the dataset's existing reader family.
+pub fn validate_write_version(
+    default_version: ConcreteFileVersion,
+    target: ConcreteFileVersion,
+) -> Result<()> {
+    if (default_version == ConcreteFileVersion::V1) != (target == ConcreteFileVersion::V1) {
+        return Err(Error::invalid_input(format!(
+            "Cannot write data files in version {target} to a dataset with default version {default_version}: V1 and V2 storage versions cannot be mixed"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
     version: ConcreteFileVersion,
@@ -113,9 +126,9 @@ fn create_current_file_writer(
     schema: Schema,
     filename: String,
     base_id: Option<u32>,
+    options: FileWriterOptions,
 ) -> Result<(FileWriter, DataFile)> {
-    let writer =
-        file_versions::create_writer(version, object_writer, schema, FileWriterOptions::default())?;
+    let writer = file_versions::create_writer(version, object_writer, schema, options)?;
     let mut data_file = DataFile::new_unstarted(filename, version);
     data_file.base_id = base_id;
     Ok((writer, data_file))
@@ -247,7 +260,7 @@ pub async fn write_fragments_direct(
 
 fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
     for fragment in fragments {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             if data_file.file_version()? != expected {
                 return Ok(false);
             }
@@ -539,10 +552,18 @@ pub async fn write_fragment(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
+            let file_writer_options = builder.file_writer_options();
             builder
                 .write_current_impl(
                     move |object_writer, schema, filename| {
-                        create_current_file_writer(version, object_writer, schema, filename, None)
+                        create_current_file_writer(
+                            version,
+                            object_writer,
+                            schema,
+                            filename,
+                            None,
+                            file_writer_options,
+                        )
                     },
                     stream,
                     schema,
@@ -566,8 +587,15 @@ pub async fn open_writer(
         }
         ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::open_current_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
+                move |object_writer, schema, filename, base_id, options| {
+                    create_current_file_writer(
+                        version,
+                        object_writer,
+                        schema,
+                        filename,
+                        base_id,
+                        options,
+                    )
                 },
                 object_store,
                 schema,
@@ -577,16 +605,35 @@ pub async fn open_writer(
             .await
         }
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::open_current_blob_v2_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
-                },
-                object_store,
-                schema,
-                base_dir,
-                options,
-            )
-            .await
+            let create_file_writer = move |object_writer, schema, filename, base_id, options| {
+                create_current_file_writer(
+                    version,
+                    object_writer,
+                    schema,
+                    filename,
+                    base_id,
+                    options,
+                )
+            };
+            if schema.fields_pre_order().any(Field::is_blob_v2) {
+                write::open_current_blob_v2_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            } else {
+                write::open_current_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            }
         }
     }
 }
@@ -782,6 +829,7 @@ fn is_upcast_downcast_impl(
 
 pub fn validate_nulls(
     version: ConcreteFileVersion,
+    column_name: &str,
     datatype: &DataType,
     has_nulls: bool,
 ) -> Result<()> {
@@ -800,8 +848,8 @@ pub fn validate_nulls(
     };
     if has_nulls && !supported {
         return Err(Error::invalid_input(format!(
-            "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
-            datatype, version
+            "Column '{}' has null values of type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
+            column_name, datatype, version
         )));
     }
     Ok(())

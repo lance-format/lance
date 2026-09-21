@@ -3,6 +3,7 @@
 
 //! FtsIndexExec - Full-text search with MVCC visibility.
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -25,9 +26,9 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
-use super::super::builder::{FtsQuery, FtsQueryType};
+use super::super::builder::FtsQuery;
 use super::newest_pk_positions;
-use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::index::{SearchOptions, search_cross_column};
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -41,6 +42,10 @@ struct BatchRange {
     end: usize,
     batch_id: usize,
 }
+
+/// One scored hit: row position, the element ordinal for a list-element
+/// document, and the BM25 score.
+type FtsHit = (u64, Option<Vec<u32>>, f32);
 
 type MaterializedFtsRows = (
     Vec<Arc<dyn arrow_array::Array>>,
@@ -79,8 +84,8 @@ pub struct FtsIndexExec {
 impl Debug for FtsIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FtsIndexExec")
-            .field("column", &self.query.column)
-            .field("query_type", &self.query.query_type)
+            .field("columns", &self.query.columns())
+            .field("expr", &self.query.expr)
             .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
@@ -108,16 +113,19 @@ impl FtsIndexExec {
         base_schema: SchemaRef,
         with_row_id: bool,
     ) -> Result<Self> {
-        // Verify the index exists for this column
-        let column = &query.column;
-        let Some(_index) =
-            indexes.get_fts_by_column_and_granularity(column, query.document_granularity)
-        else {
-            return Err(Error::invalid_input(format!(
-                "No FTS index found for column '{}'",
-                column
-            )));
-        };
+        // Every queried column must resolve an index. A cross-column predicate
+        // is one predicate: a column with no arm is a missing answer rather
+        // than a narrower one.
+        for column in query.columns() {
+            if indexes
+                .get_fts_by_column_and_granularity(column, query.document_granularity)
+                .is_none()
+            {
+                return Err(Error::invalid_input(format!(
+                    "No FTS index found for column '{column}'"
+                )));
+            }
+        }
         let with_doc_index = query.document_granularity.is_list_element();
 
         // Build output schema: base fields + optional _doc_index + _score + optional _rowid
@@ -215,50 +223,26 @@ impl FtsIndexExec {
     }
 
     /// Query the index and return matching rows with BM25 scores.
-    fn query_index(&self) -> Vec<(u64, Option<Vec<u32>>, f32)> {
+    fn query_index(&self) -> Result<Vec<FtsHit>> {
+        let columns = self.query.columns();
+        if columns.len() > 1 {
+            return self.query_across_columns(&columns);
+        }
+        let Some(&column) = columns.first() else {
+            return Err(Error::invalid_input(
+                "full-text search names no column to search".to_string(),
+            ));
+        };
         let Some(index) = self
             .indexes
-            .get_fts_by_column_and_granularity(&self.query.column, self.query.document_granularity)
+            .get_fts_by_column_and_granularity(column, self.query.document_granularity)
         else {
-            return vec![];
+            return Ok(vec![]);
         };
 
-        // Convert FtsQueryType to FtsQueryExpr
-        let query_expr = match &self.query.query_type {
-            FtsQueryType::Match {
-                query,
-                operator,
-                boost,
-            } => FtsQueryExpr::match_query_with_operator(query, *operator).with_boost(*boost),
-            FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
-            FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            } => {
-                let mut builder = FtsQueryExpr::boolean();
-                for term in must {
-                    builder = builder.must(FtsQueryExpr::match_query(term));
-                }
-                for term in should {
-                    builder = builder.should(FtsQueryExpr::match_query(term));
-                }
-                for term in must_not {
-                    builder = builder.must_not(FtsQueryExpr::match_query(term));
-                }
-                builder.build()
-            }
-            FtsQueryType::Fuzzy {
-                query,
-                fuzziness,
-                prefix_length,
-                max_expansions,
-                boost,
-            } => {
-                FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *prefix_length, *max_expansions)
-                    .with_boost(*boost)
-            }
-        };
+        // The scanner carries the tree the index evaluates, so there is nothing
+        // to translate here.
+        let query_expr = self.query.expr.clone();
 
         let all_rows_visible = self.batch_ranges.last().is_none_or(|last| {
             self.max_readable_row
@@ -281,17 +265,45 @@ impl FtsIndexExec {
         let entries = index.search_with_options(&query_expr, options);
 
         // Convert to (row_position, element ordinal, score) tuples.
-        entries
+        Ok(entries
             .into_iter()
             .map(|entry| (entry.row_position, entry.doc_index, entry.score))
-            .collect()
+            .collect())
+    }
+
+    /// Route each leaf of a cross-column tree to the index holding its column.
+    ///
+    /// No WAND pruning and no query limit: the clauses combine over full result
+    /// sets, the same way a single-index compound query already does. The
+    /// visibility ceiling goes *in* rather than being applied after, so leaves
+    /// read from indexes whose tails have advanced differently still meet over
+    /// one cut.
+    fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
+        let mut indexes = HashMap::with_capacity(columns.len());
+        for &column in columns {
+            let Some(index) = self
+                .indexes
+                .get_fts_by_column_and_granularity(column, self.query.document_granularity)
+            else {
+                return Err(Error::invalid_input(format!(
+                    "No FTS index found for column '{column}'"
+                )));
+            };
+            indexes.insert(column, index);
+        }
+        Ok(search_cross_column(
+            &self.query.expr,
+            &indexes,
+            self.query.include_tail,
+            self.max_readable_row,
+        )?
+        .into_iter()
+        .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+        .collect())
     }
 
     /// Filter results by MVCC visibility using max_row_position. O(n).
-    fn filter_by_visibility(
-        &self,
-        results: Vec<(u64, Option<Vec<u32>>, f32)>,
-    ) -> Vec<(u64, Option<Vec<u32>>, f32)> {
+    fn filter_by_visibility(&self, results: Vec<FtsHit>) -> Vec<FtsHit> {
         let Some(max_readable) = self.max_readable_row else {
             return vec![];
         };
@@ -305,10 +317,7 @@ impl FtsIndexExec {
     ///
     /// This method processes results one at a time to preserve the score-sorted order,
     /// then combines them into a single batch.
-    fn materialize_rows_sorted(
-        &self,
-        results: &[(u64, Option<Vec<u32>>, f32)],
-    ) -> DataFusionResult<Vec<RecordBatch>> {
+    fn materialize_rows_sorted(&self, results: &[FtsHit]) -> DataFusionResult<Vec<RecordBatch>> {
         if results.is_empty() {
             return Ok(vec![]);
         }
@@ -611,15 +620,19 @@ impl DisplayAs for FtsIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "FtsIndexExec: column={}, query_type={:?}, with_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    "FtsIndexExec: columns={:?}, query_type={:?}, with_row_id={}",
+                    self.query.columns(),
+                    self.query.expr,
+                    self.with_row_id
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "FtsIndexExec\ncolumn={}\nquery_type={:?}\nwith_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    "FtsIndexExec\ncolumns={:?}\nquery_type={:?}\nwith_row_id={}",
+                    self.query.columns(),
+                    self.query.expr,
+                    self.with_row_id
                 )
             }
         }
@@ -657,7 +670,7 @@ impl ExecutionPlan for FtsIndexExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Query the index
-        let results = self.query_index();
+        let results = self.query_index()?;
 
         // Filter by visibility
         let mut visible_results = self.filter_by_visibility(results);

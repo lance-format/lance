@@ -25,7 +25,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
-use crate::dataset::mem_wal::index::MemTableVisibility;
+use crate::dataset::mem_wal::index::{FtsQueryExpr, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -56,57 +56,21 @@ pub struct VectorQuery {
     pub distance_upper_bound: Option<f32>,
 }
 
-/// Full-text search query type.
-#[derive(Debug, Clone)]
-pub enum FtsQueryType {
-    /// Simple term match.
-    Match {
-        /// The search query string.
-        query: String,
-        /// The operator used to combine tokenized query terms.
-        operator: Operator,
-        /// Boost factor applied to the score.
-        boost: f32,
-    },
-    /// Phrase query with slop.
-    Phrase {
-        /// The phrase to search for.
-        query: String,
-        /// Maximum allowed distance between consecutive tokens.
-        slop: u32,
-    },
-    /// Boolean query with MUST/SHOULD/MUST_NOT.
-    Boolean {
-        /// Terms that must match and contribute to the score.
-        must: Vec<String>,
-        /// Terms that should match (adds to score).
-        should: Vec<String>,
-        /// Terms that must not match.
-        must_not: Vec<String>,
-    },
-    /// Fuzzy match query with typo tolerance.
-    Fuzzy {
-        /// The search query string.
-        query: String,
-        /// Maximum edit distance (Levenshtein distance).
-        /// None means auto-fuzziness based on token length.
-        fuzziness: Option<u32>,
-        /// Number of initial characters that must match exactly.
-        prefix_length: u32,
-        /// Maximum number of terms to expand to.
-        max_expansions: usize,
-        /// Boost factor applied to the score.
-        boost: f32,
-    },
-}
-
 /// Full-text search query parameters.
+///
+/// The query itself is an [`FtsQueryExpr`] — the same tree the in-memory
+/// inverted index evaluates — so every shape the index supports (nested
+/// boolean, boost with a negative clause, phrase, fuzzy) reaches it without a
+/// lossy intermediate form. Everything outside the tree here is execution
+/// policy rather than the query: which document unit and the recall/latency
+/// knobs. The columns searched live on the tree's leaves — [`Self::columns`]
+/// reads them back out — so there is no second copy to fall out of step with it.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
-    /// Column name to search.
-    pub column: String,
-    /// Query type.
-    pub query_type: FtsQueryType,
+    /// The query tree, evaluated as given by the memtable's inverted index.
+    /// Every leaf names the column it searches; the memtable routes each leaf
+    /// to that column's index.
+    pub expr: FtsQueryExpr,
     /// Logical document unit. Defaults to one document per dataset row.
     pub document_granularity: DocumentGranularity,
     /// WAND factor for early termination (0.0 to 1.0).
@@ -121,16 +85,57 @@ pub struct FtsQuery {
     pub include_tail: bool,
 }
 
-/// Default maximum number of fuzzy expansions.
-pub const DEFAULT_MAX_EXPANSIONS: usize = 50;
-
 /// Default WAND factor for full recall (no early termination).
 pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
+    /// Wrap an already-built query tree, binding every unbound leaf to
+    /// `column`. Leaves that already name a column keep it.
+    pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
+        Self {
+            expr: expr.bind_unbound_leaves(&column.into()),
+            document_granularity: DocumentGranularity::Row,
+            wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
+            include_tail: true,
+        }
+    }
+
+    /// Wrap a tree whose leaves name several columns. Every leaf must already
+    /// carry its binding — there is no single column to fall back to.
+    pub fn cross_column(expr: FtsQueryExpr) -> Result<Self> {
+        let num_columns = expr.columns().len();
+        if num_columns < 2 {
+            return Err(Error::invalid_input(format!(
+                "cross-column MemTable full-text search needs at least two bound columns, \
+                 got {num_columns}"
+            )));
+        }
+        if expr.has_unbound_leaf() {
+            return Err(Error::invalid_input(
+                "cross-column MemTable full-text search needs every leaf bound to a column; \
+                 there is no single index to fall back to"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            expr,
+            document_granularity: DocumentGranularity::Row,
+            wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
+            include_tail: true,
+        })
+    }
+
+    /// Distinct columns this query's leaves name, in tree order. A tree with
+    /// no leaves at all (an empty boolean) names none.
+    pub fn columns(&self) -> Vec<&str> {
+        self.expr.columns()
+    }
+
     /// Create a simple term match query.
     pub fn match_query(column: impl Into<String>, query: impl Into<String>) -> Self {
-        Self::match_query_with_operator(column, query, Operator::Or)
+        Self::new(column, FtsQueryExpr::match_query(query))
     }
 
     pub fn match_query_with_operator(
@@ -138,54 +143,36 @@ impl FtsQuery {
         query: impl Into<String>,
         operator: Operator,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Match {
-                query: query.into(),
-                operator,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(
+            column,
+            FtsQueryExpr::match_query_with_operator(query, operator),
+        )
     }
 
     /// Create a phrase query.
     pub fn phrase(column: impl Into<String>, query: impl Into<String>, slop: u32) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Phrase {
-                query: query.into(),
-                slop,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::phrase_with_slop(query, slop))
     }
 
-    /// Create a Boolean query.
+    /// Create a Boolean query over plain terms. Nested clauses go through
+    /// [`Self::new`] with a tree built on [`FtsQueryExpr::boolean`].
     pub fn boolean(
         column: impl Into<String>,
         must: Vec<String>,
         should: Vec<String>,
         must_not: Vec<String>,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
+        let mut builder = FtsQueryExpr::boolean();
+        for term in must {
+            builder = builder.must(FtsQueryExpr::match_query(term));
         }
+        for term in should {
+            builder = builder.should(FtsQueryExpr::match_query(term));
+        }
+        for term in must_not {
+            builder = builder.must_not(FtsQueryExpr::match_query(term));
+        }
+        Self::new(column, builder.build())
     }
 
     /// Create a fuzzy match query with auto-fuzziness.
@@ -195,20 +182,7 @@ impl FtsQuery {
     /// - 3-5 chars: 1 edit allowed
     /// - 6+ chars: 2 edits allowed
     pub fn fuzzy(column: impl Into<String>, query: impl Into<String>) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness: None,
-                prefix_length: 0,
-                max_expansions: DEFAULT_MAX_EXPANSIONS,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::fuzzy(query))
     }
 
     /// Create a fuzzy match query with specified edit distance.
@@ -217,20 +191,7 @@ impl FtsQuery {
         query: impl Into<String>,
         fuzziness: u32,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness: Some(fuzziness),
-                prefix_length: 0,
-                max_expansions: DEFAULT_MAX_EXPANSIONS,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::fuzzy_with_distance(query, fuzziness))
     }
 
     /// Create a fuzzy match query with full options.
@@ -241,20 +202,10 @@ impl FtsQuery {
         prefix_length: u32,
         max_expansions: usize,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness,
-                prefix_length,
-                max_expansions,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(
+            column,
+            FtsQueryExpr::fuzzy_with_options(query, fuzziness, prefix_length, max_expansions),
+        )
     }
 
     /// Set the WAND factor for early termination.
@@ -283,24 +234,17 @@ impl FtsQuery {
         self.document_granularity = document_granularity;
         self
     }
-
-    fn with_boost(mut self, boost: f32) -> Self {
-        match &mut self.query_type {
-            FtsQueryType::Match { boost: b, .. } | FtsQueryType::Fuzzy { boost: b, .. } => {
-                *b = boost;
-            }
-            FtsQueryType::Phrase { .. } | FtsQueryType::Boolean { .. } => {}
-        }
-        self
-    }
 }
 
 /// Convert an index-level [`FullTextSearchQuery`] into the MemTable's local
 /// [`FtsQuery`], so the MemTable scanner shares the dataset `Scanner`'s FTS
-/// entry type. Supports match (exact `fuzziness == Some(0)` and fuzzy) and
-/// phrase leaf queries; the column must be bound on the query. Compound queries
-/// (boolean / boost / multi-match) cannot be modeled by the MemTable path and
-/// return a `not_supported` error rather than failing deep in planning.
+/// entry type.
+///
+/// Every shape the in-memory inverted index can evaluate is carried across:
+/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth, and
+/// over one column or several. Multi-match is the exception — its fields are
+/// scored independently and fused by max, which the LSM planner decomposes
+/// above this layer rather than expressing as one tree.
 fn resolve_memtable_document_granularity(
     column: &str,
     requested: Option<DocumentGranularity>,
@@ -347,46 +291,152 @@ fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> 
             )
         })
     };
-    let local = match query.query {
-        IndexFtsQuery::Match(m) => {
-            let column = require_column(m.column)?;
-            let document_granularity =
-                resolve_memtable_document_granularity(&column, m.document_granularity, indexes)?;
-            let local = match m.fuzziness {
-                // Some(0) is an exact match in the index model.
-                Some(0) => FtsQuery::match_query_with_operator(column, m.terms, m.operator)
+    let requested = requested_document_granularity(&query.query)?;
+    let expr = to_local_expr(&query.query)?;
+    // Taken from the mapped tree rather than the index-level query: it is what
+    // the arm evaluates, and its order is the tree's rather than a hash set's.
+    let columns = expr
+        .columns()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let local = if columns.len() > 1 {
+        // Each column resolves its granularity against its own index, and they
+        // have to agree: the arm emits one schema, and `_doc_index` is present
+        // or absent for the whole batch.
+        let mut resolved = None;
+        for column in &columns {
+            let granularity = resolve_memtable_document_granularity(column, requested, indexes)?;
+            match resolved {
+                None => resolved = Some(granularity),
+                Some(previous) if previous != granularity => {
+                    return Err(Error::invalid_input(format!(
+                        "cross-column full-text search resolved {previous:?} document \
+                         granularity for an earlier column and {granularity:?} for \
+                         '{column}'; they must agree"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let document_granularity = resolved.unwrap_or(DocumentGranularity::Row);
+        FtsQuery::cross_column(expr)?.with_document_granularity(document_granularity)
+    } else {
+        let column = require_column(columns.into_iter().next())?;
+        let document_granularity =
+            resolve_memtable_document_granularity(&column, requested, indexes)?;
+        FtsQuery::new(column, expr).with_document_granularity(document_granularity)
+    };
+    Ok(local.with_wand_factor(wand_factor).with_limit(limit))
+}
+
+/// The document granularity the query asks for, erroring if its leaves disagree
+/// — the memtable evaluates one index, so one granularity.
+fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<DocumentGranularity>> {
+    fn visit(query: &IndexFtsQuery, current: &mut Option<DocumentGranularity>) -> Result<()> {
+        let requested = match query {
+            IndexFtsQuery::Match(m) => m.document_granularity,
+            IndexFtsQuery::Phrase(p) => p.document_granularity,
+            IndexFtsQuery::Boost(b) => {
+                visit(&b.positive, current)?;
+                return visit(&b.negative, current);
+            }
+            IndexFtsQuery::Boolean(b) => {
+                for child in b.must.iter().chain(&b.should).chain(&b.must_not) {
+                    visit(child, current)?;
+                }
+                return Ok(());
+            }
+            IndexFtsQuery::MultiMatch(m) => {
+                for leaf in &m.match_queries {
+                    visit(&IndexFtsQuery::Match(leaf.clone()), current)?;
+                }
+                return Ok(());
+            }
+        };
+        match (*current, requested) {
+            (_, None) => {}
+            (None, Some(requested)) => *current = Some(requested),
+            (Some(current), Some(requested)) if current != requested => {
+                return Err(Error::invalid_input(
+                    "FTS queries cannot mix Row and ListElement document granularities".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut granularity = None;
+    visit(query, &mut granularity)?;
+    Ok(granularity)
+}
+
+/// Map an index-level query onto the tree the in-memory index evaluates.
+///
+/// Each leaf keeps the column the planner bound it to, so a tree spanning
+/// several fields stays routable. Document granularity is still resolved once
+/// for the whole query by the caller: the arm emits one schema.
+fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+    fn bind(expr: FtsQueryExpr, column: Option<&String>) -> FtsQueryExpr {
+        match column {
+            Some(column) => expr.with_column(column.clone()),
+            None => expr,
+        }
+    }
+    Ok(match query {
+        IndexFtsQuery::Match(m) => bind(
+            match m.fuzziness {
+                // `Some(0)` is an exact match in the index model.
+                Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
                     .with_boost(m.boost),
+                // The fuzzy path expands each term independently and unions the
+                // expansions, so it cannot also require every term to match.
                 _ if m.operator != Operator::Or => {
                     return Err(Error::not_supported(
                         "MemTable fuzzy full-text search only supports OR match operators"
                             .to_string(),
                     ));
                 }
-                fuzziness => FtsQuery::fuzzy_with_options(
-                    column,
-                    m.terms,
+                fuzziness => FtsQueryExpr::fuzzy_with_options(
+                    m.terms.clone(),
                     fuzziness,
                     m.prefix_length,
                     m.max_expansions,
                 )
                 .with_boost(m.boost),
-            };
-            local.with_document_granularity(document_granularity)
+            },
+            m.column.as_ref(),
+        ),
+        IndexFtsQuery::Phrase(p) => bind(
+            FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+            p.column.as_ref(),
+        ),
+        IndexFtsQuery::Boost(b) => FtsQueryExpr::boosting_with_negative(
+            to_local_expr(&b.positive)?,
+            to_local_expr(&b.negative)?,
+            b.negative_boost,
+        ),
+        IndexFtsQuery::Boolean(b) => {
+            let mut builder = FtsQueryExpr::boolean();
+            for child in &b.must {
+                builder = builder.must(to_local_expr(child)?);
+            }
+            for child in &b.should {
+                builder = builder.should(to_local_expr(child)?);
+            }
+            for child in &b.must_not {
+                builder = builder.must_not(to_local_expr(child)?);
+            }
+            builder.build()
         }
-        IndexFtsQuery::Phrase(p) => {
-            let column = require_column(p.column)?;
-            let document_granularity =
-                resolve_memtable_document_granularity(&column, p.document_granularity, indexes)?;
-            FtsQuery::phrase(column, p.terms, p.slop)
-                .with_document_granularity(document_granularity)
-        }
-        other => {
-            return Err(Error::not_supported(format!(
-                "MemTable full-text search supports match and phrase queries, got: {other}"
-            )));
-        }
-    };
-    Ok(local.with_wand_factor(wand_factor).with_limit(limit))
+        IndexFtsQuery::MultiMatch(m) => FtsQueryExpr::MultiMatch {
+            children: m
+                .match_queries
+                .iter()
+                .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
+                .collect::<Result<_>>()?,
+        },
+    })
 }
 
 /// Scalar predicate for BTree index queries.
@@ -1177,7 +1227,7 @@ impl MemTableScanner {
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
-            && self.has_vector_index(&query.column)
+            && self.has_vector_index(&query.column, query.distance_type)
         {
             Arc::new(VectorIndexExec::new(
                 self.batch_store.clone(),
@@ -1210,7 +1260,13 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_fts_index(&query.column, query.document_granularity) {
+        // Every queried column needs an index: a cross-column predicate is one
+        // predicate, so a missing arm is a missing answer, not a smaller one.
+        if !query
+            .columns()
+            .into_iter()
+            .all(|column| self.has_fts_index(column, query.document_granularity))
+        {
             return self.empty_fts_plan(query.document_granularity);
         }
 
@@ -1482,8 +1538,17 @@ impl MemTableScanner {
     }
 
     /// Check if a vector index exists for a column.
-    fn has_vector_index(&self, column: &str) -> bool {
-        self.indexes.get_hnsw_by_column(column).is_some()
+    /// Whether an HNSW index on `column` can answer a query in `distance_type`.
+    ///
+    /// The graph's metric is baked into its structure, so a query asking for a
+    /// different one has to brute-force instead — the same fallback
+    /// `Scanner::vector_search` applies when a requested metric disagrees with
+    /// a base index. `None` means "use the index's metric", which always
+    /// matches.
+    fn has_vector_index(&self, column: &str, distance_type: Option<DistanceType>) -> bool {
+        self.indexes
+            .get_hnsw_by_column(column)
+            .is_some_and(|hnsw| distance_type.is_none_or(|dt| dt == hnsw.distance_type()))
     }
 
     /// Check if an FTS index exists for a column.
@@ -1801,10 +1866,66 @@ mod tests {
     /// `full_text_search` now takes a structured `FullTextSearchQuery` (matching
     /// the dataset `Scanner`); `local_fts_query` maps the supported leaf shapes
     /// and rejects compound queries and missing columns.
+    /// A boost query routed through the public entry point has to score the way
+    /// the compound scorer does — `positive - negative_boost * negative` — or
+    /// active rows rank differently from committed rows for the same query, and
+    /// can even differ in sign. Pins the formula, not just the ordering.
+    #[test]
+    fn public_boost_query_keeps_subtractive_scoring_in_memtable() {
+        use crate::dataset::mem_wal::index::FtsMemIndex;
+        use lance_index::scalar::inverted::query::{BoostQuery, MatchQuery};
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![0, 1])),
+                Arc::new(arrow_array::StringArray::from(vec!["alpha", "alpha beta"])),
+            ],
+        )
+        .unwrap();
+        let index = FtsMemIndex::new(1, "text".to_string());
+        index.insert(&batch, 0).unwrap();
+
+        let leaf = |terms: &str| {
+            IndexFtsQuery::Match(
+                MatchQuery::new(terms.to_string()).with_column(Some("text".to_string())),
+            )
+        };
+        let negative_boost = 0.5;
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Boost(BoostQuery::new(
+            leaf("alpha"),
+            leaf("beta"),
+            Some(negative_boost),
+        )));
+        let local = local_fts_query(query, None).unwrap();
+
+        let score_of = |expr: &FtsQueryExpr| {
+            index
+                .search_query(expr)
+                .into_iter()
+                .find(|entry| entry.row_position == 1)
+                .unwrap()
+                .score
+        };
+        // Row 1 matches both clauses, so it is the one the demotion applies to.
+        let actual = score_of(&local.expr);
+        let positive = score_of(&FtsQueryExpr::match_query("alpha"));
+        let negative = score_of(&FtsQueryExpr::match_query("beta"));
+        assert!(
+            (actual - (positive - negative_boost * negative)).abs() < 1e-5,
+            "expected positive - {negative_boost} * negative = {}, got {actual}",
+            positive - negative_boost * negative
+        );
+    }
+
     #[test]
     fn local_fts_query_maps_leaf_shapes_and_rejects_the_rest() {
         use lance_index::scalar::inverted::query::{
-            BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery,
+            BooleanQuery, BoostQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
         };
 
         // Exact match (default fuzziness Some(0)) -> local Match, preserving the
@@ -1813,9 +1934,9 @@ mod tests {
             .with_column("text".to_string())
             .unwrap();
         let local = local_fts_query(q, None).unwrap();
-        assert_eq!(local.column, "text");
+        assert_eq!(local.columns(), ["text"]);
         assert!(
-            matches!(local.query_type, FtsQueryType::Match { query, operator, .. }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
         );
 
@@ -1874,7 +1995,7 @@ mod tests {
         ));
         let local = local_fts_query(exact_and, None).unwrap();
         assert!(
-            matches!(local.query_type, FtsQueryType::Match { query, operator, boost }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost, .. }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
         );
 
@@ -1888,7 +2009,7 @@ mod tests {
         ));
         let local = local_fts_query(fuzzy, None).unwrap();
         assert!(
-            matches!(local.query_type, FtsQueryType::Fuzzy { fuzziness, prefix_length, boost, .. }
+            matches!(local.expr, FtsQueryExpr::Fuzzy { fuzziness, prefix_length, boost, .. }
                 if fuzziness == Some(2) && prefix_length == 2 && boost == 2.5)
         );
 
@@ -1908,20 +2029,97 @@ mod tests {
             PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
         ));
         let local = local_fts_query(phrase, None).unwrap();
-        assert!(matches!(local.query_type, FtsQueryType::Phrase { .. }));
+        assert!(matches!(local.expr, FtsQueryExpr::Phrase { .. }));
 
-        // Compound (boolean) -> not supported.
+        // Compound (boolean) -> mapped onto the index's own tree, clause for
+        // clause, rather than refused.
+        let leaf = |terms: &str| {
+            IndexFtsQuery::Match(
+                MatchQuery::new(terms.to_string()).with_column(Some("text".to_string())),
+            )
+        };
         let boolean =
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (Occur::Must, leaf("x")),
+                (Occur::MustNot, leaf("y")),
+            ])));
+        let local = local_fts_query(boolean, None).unwrap();
+        let FtsQueryExpr::Boolean {
+            must,
+            should,
+            must_not,
+        } = &local.expr
+        else {
+            panic!("expected a Boolean expr, got {:?}", local.expr);
+        };
+        assert!(should.is_empty());
+        assert!(
+            matches!(&must[..], [FtsQueryExpr::Match { query, .. }] if query == "x"),
+            "MUST clause lost: {must:?}"
+        );
+        assert!(
+            matches!(&must_not[..], [FtsQueryExpr::Match { query, .. }] if query == "y"),
+            "MUST_NOT clause lost: {must_not:?}"
+        );
+
+        // Boost -> positive and negative both carried, with the demotion factor.
+        let boost = FullTextSearchQuery::new_query(IndexFtsQuery::Boost(BoostQuery::new(
+            leaf("keep"),
+            leaf("demote"),
+            Some(0.25),
+        )));
+        let local = local_fts_query(boost, None).unwrap();
+        let FtsQueryExpr::Boost {
+            positive,
+            negative,
+            negative_boost,
+        } = &local.expr
+        else {
+            panic!("expected a Boost expr, got {:?}", local.expr);
+        };
+        assert!(matches!(positive.as_ref(), FtsQueryExpr::Match { query, .. } if query == "keep"));
+        let negative = negative.as_ref().expect("negative clause carried");
+        assert!(
+            matches!(negative.as_ref(), FtsQueryExpr::Match { query, .. } if query == "demote")
+        );
+        assert_eq!(*negative_boost, 0.25);
+
+        // Nested: a boolean whose clause is itself a boolean.
+        let nested =
             FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![(
                 Occur::Must,
-                IndexFtsQuery::Match(
-                    MatchQuery::new("x".to_string()).with_column(Some("text".to_string())),
-                ),
+                IndexFtsQuery::Boolean(BooleanQuery::new(vec![(Occur::Should, leaf("deep"))])),
             )])));
+        let local = local_fts_query(nested, None).unwrap();
+        let FtsQueryExpr::Boolean { must, .. } = &local.expr else {
+            panic!("expected a Boolean expr, got {:?}", local.expr);
+        };
         assert!(
-            local_fts_query(boolean, None).is_err(),
-            "boolean must be rejected"
+            matches!(&must[..], [FtsQueryExpr::Boolean { .. }]),
+            "nesting flattened: {must:?}"
         );
+
+        // Multi-match maps to a best-child node whose leaves keep their own
+        // columns, so a tree spanning fields still routes leaf by leaf.
+        let multi = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "x".to_string(),
+                vec!["text".to_string(), "other".to_string()],
+            )
+            .unwrap(),
+        ));
+        let local = local_fts_query(multi, None).unwrap();
+        let FtsQueryExpr::MultiMatch { children } = &local.expr else {
+            panic!("expected a MultiMatch expr, got {:?}", local.expr);
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.column())
+                .collect::<Vec<_>>(),
+            [Some("text"), Some("other")]
+        );
+        assert_eq!(local.columns(), ["text", "other"]);
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());
@@ -2681,6 +2879,74 @@ mod tests {
             "plan output schema missing `{DISTANCE_COLUMN}` — got {:?}",
             out_schema
         );
+    }
+
+    /// The HNSW graph's metric is baked into its structure, so a query asking
+    /// for a different one must brute-force rather than traverse it. Without
+    /// this the memtable silently answers in the graph's metric while the base
+    /// arm answers in the requested one, and the union merges two scales.
+    #[tokio::test]
+    async fn vector_search_routes_to_brute_force_on_a_metric_mismatch() {
+        use lance_linalg::distance::DistanceType;
+        use std::sync::Arc;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        let plan_rendering_for = |requested: Option<DistanceType>| {
+            let schema = schema.clone();
+            async move {
+                let batch_store = Arc::new(BatchStore::with_capacity(4));
+                let mut indexes = IndexStore::new();
+                indexes.add_hnsw(
+                    "vector_hnsw".to_string(),
+                    1,
+                    "vector".to_string(),
+                    DistanceType::Cosine,
+                    64,
+                    8,
+                );
+                let mut scanner =
+                    MemTableScanner::new(batch_store, Arc::new(indexes), schema.clone());
+                let query: Arc<dyn arrow_array::Array> =
+                    Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+                scanner.nearest("vector", query.as_ref(), 5).unwrap();
+                if let Some(metric) = requested {
+                    scanner.distance_metric(metric);
+                }
+                let plan = scanner.create_plan().await.unwrap();
+                // The chosen exec sits under `apply_post_index_ops`'s wrappers,
+                // so match on the rendered tree rather than the root node.
+                format!(
+                    "{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+                )
+            }
+        };
+
+        let uses_graph = |rendered: &str| rendered.contains("VectorIndex");
+        let uses_brute_force = |rendered: &str| rendered.contains("MemTableBruteForceVector");
+
+        // Unset means "use the index's metric", so the graph is still usable.
+        let unset = plan_rendering_for(None).await;
+        assert!(uses_graph(&unset), "{unset}");
+        // Matching the graph's own metric keeps the graph.
+        let matching = plan_rendering_for(Some(DistanceType::Cosine)).await;
+        assert!(uses_graph(&matching), "{matching}");
+        // Disagreeing with it must not.
+        for mismatched in [DistanceType::Dot, DistanceType::L2] {
+            let rendered = plan_rendering_for(Some(mismatched)).await;
+            assert!(
+                uses_brute_force(&rendered) && !uses_graph(&rendered),
+                "{mismatched:?} query must not traverse a cosine graph: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]

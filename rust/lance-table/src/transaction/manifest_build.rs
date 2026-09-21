@@ -16,7 +16,7 @@ use crate::feature_flags::{
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
 use crate::io::{
@@ -24,6 +24,8 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::rowids::{read_row_ids, write_row_ids};
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -50,6 +52,72 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Table config key that opts a table into writing clustered deletions as
+/// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
+/// `update_config`.
+///
+/// Manifests written afterwards re-encode bitmap row id segments as runs of
+/// `Range` segments where that is smaller. That is the
+/// existing wire format, so any version reads the result, but a reader without
+/// the compact in-memory form handles thousands of segments per fragment
+/// slowly. That is why it is opt-in rather than the default.
+///
+/// Setting the key back to `false` only stops further conversions. Fragments
+/// already written as `Range` segments keep that encoding until something else
+/// rewrites their row ids (compaction, for example), so coordinate reader
+/// upgrades before enabling it.
+pub const RANGE_SEGMENTS_CONFIG_KEY: &str = "lance.row_ids.range_segments";
+
+fn range_segments_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(RANGE_SEGMENTS_CONFIG_KEY)
+        .is_some_and(|value| str_is_truthy(value))
+}
+
+/// Re-encode inline row id sequences as runs of `Range` segments when the
+/// table has opted in.
+///
+/// Fragments that the previous manifest already re-encoded are left alone
+/// (their inline bytes are the very same allocation), so a commit pays only
+/// for the fragments it changed; enabling the key re-encodes every fragment
+/// once.
+fn apply_range_segments(
+    manifest: &mut Manifest,
+    current_manifest: Option<&Manifest>,
+) -> Result<()> {
+    if !range_segments_enabled(manifest) {
+        return Ok(());
+    }
+    let unchanged: HashMap<u64, *const u8> = current_manifest
+        .filter(|current| range_segments_enabled(current))
+        .map(|current| {
+            current
+                .fragments
+                .iter()
+                .filter_map(|fragment| match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => Some((fragment.id, data.as_ptr())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fragments = Arc::make_mut(&mut manifest.fragments);
+    for fragment in fragments.iter_mut() {
+        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+            continue;
+        };
+        if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
+            continue;
+        }
+        let mut sequence = read_row_ids(&data[..])?;
+        if sequence.use_range_segments() {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+        }
+    }
+    Ok(())
+}
 
 impl Transaction {
     pub(super) fn fragments_with_ids<'a, T>(
@@ -423,16 +491,24 @@ impl Transaction {
             ));
         }
 
-        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
-            let names: Vec<&str> = current_indices
-                .iter()
-                .map(|idx| idx.name.as_str())
-                .collect();
+        // The fragment-reuse index is internal bookkeeping registered by
+        // compaction with deferred index remap, not something a user can
+        // meaningfully drop and recreate, so it must not gate the migration.
+        // It is dropped from the migrated manifest below, which is what makes
+        // ignoring it here safe. Every other index, including the MemWAL
+        // index, still blocks: only the fragment-reuse index is known to be
+        // discardable.
+        let blocking_indices: Vec<&str> = current_indices
+            .iter()
+            .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+            .map(|idx| idx.name.as_str())
+            .collect();
+        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
                  recreate them afterwards: {}",
-                names.join(", ")
+                blocking_indices.join(", ")
             )));
         }
         let mut reference_paths = match current_manifest {
@@ -493,6 +569,18 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+
+        // A fragment-reuse index maps old row *addresses* to new ones, and the
+        // read path attaches it to every index it opens without checking
+        // whether the dataset uses stable row ids. Carrying it past the
+        // migration would therefore rewrite freshly issued row ids as if they
+        // were addresses, and rows whose new id happens to fall in the old
+        // address range would disappear from indexed queries. Nothing needs it
+        // afterwards either, since compaction rejects deferred index remap on
+        // a stable-row-id dataset.
+        if config.migration_next_row_id.is_some() {
+            final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
+        }
 
         // Snapshot taken before the operation rewrites the list, so coverage can
         // be compared against what each logical index looked like going in. Only
@@ -573,7 +661,10 @@ impl Transaction {
                 final_fragments.retain(|f| !deleted_ids.contains(&f.id));
                 final_fragments.iter_mut().for_each(|f| {
                     if let Some(updated) = updated_by_id.get(&f.id) {
-                        *f = (*updated).clone();
+                        // The post-image was built at the transaction's read
+                        // version. Only its deletion file is new; retain all
+                        // other state from the current fragment when rebasing.
+                        f.deletion_file = updated.deletion_file.clone();
                     }
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
@@ -984,8 +1075,10 @@ impl Transaction {
                 let replaced_fields: Vec<u32> = new_datafiles
                     .first()
                     .map(|f| {
-                        f.fields
+                        f.schema(&schema)
+                            .field_ids()
                             .iter()
+                            .chain(f.fields.iter())
                             .filter(|&&id| id >= 0)
                             .map(|&id| id as u32)
                             .collect()
@@ -1005,6 +1098,16 @@ impl Transaction {
                         })?;
                     let mut new_frag = frag.clone();
 
+                    // Physical mappings differ across V2 encodings (a nested
+                    // parent may have no column of its own). Replacement and
+                    // tombstoning operate on the logical field coverage.
+                    let replacement_ids = new_file
+                        .schema(&schema)
+                        .field_ids()
+                        .into_iter()
+                        .chain(new_file.fields.iter().copied())
+                        .collect::<HashSet<_>>();
+
                     // TODO(rmeng): check new file and fragment are the same length
 
                     let mut columns_covered = HashSet::new();
@@ -1022,7 +1125,8 @@ impl Transaction {
                             file.base_id = new_file.base_id;
                             replaced_in_place = true;
                         }
-                        columns_covered.extend(file.fields.iter());
+                        columns_covered.extend(file.schema(&schema).field_ids());
+                        columns_covered.extend(file.fields.iter().copied());
                     }
                     // Reject a file whose version does not decode before any
                     // arm publishes it.
@@ -1032,23 +1136,17 @@ impl Transaction {
                     // Then it means it's a all-NULL column that is being replaced with real data
                     // just add it to the final fragments. Push the DataFile as
                     // given so every field (including base_id) is preserved.
-                    if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
+                    if columns_covered.is_disjoint(&replacement_ids) {
                         new_frag.files.push(new_file.clone());
                     } else if !replaced_in_place
-                        && new_file.fields.iter().all(|field| {
-                            let mut covering = new_frag
-                                .files
-                                .iter()
-                                .filter(|file| file.fields.contains(field))
-                                .peekable();
-                            // Covered by something, and by nothing we cannot
-                            // tombstone. A field no file covers leaves the
-                            // mixed layout the error below reports.
-                            covering.peek().is_some()
-                                && covering.all(|file| {
-                                    file.file_version()
-                                        .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                                })
+                        && replacement_ids.is_subset(&columns_covered)
+                        && new_frag.files.iter().all(|file| {
+                            file.file_version()
+                                .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                                || file
+                                    .fields
+                                    .iter()
+                                    .all(|field| !replacement_ids.contains(field))
                         })
                     {
                         // Tombstone the replaced fields where they live and
@@ -1071,7 +1169,7 @@ impl Transaction {
                                 .fields
                                 .iter()
                                 .map(|field| {
-                                    if new_file.fields.contains(field) {
+                                    if replacement_ids.contains(field) {
                                         TOMBSTONE_FIELD_ID
                                     } else {
                                         *field
@@ -1508,6 +1606,8 @@ impl Transaction {
             _ => {}
         }
 
+        apply_range_segments(&mut manifest, current_manifest)?;
+
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
             // Validate and add new base paths to the manifest
@@ -1581,7 +1681,9 @@ mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
-    use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+    use crate::format::{
+        DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+    };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
         default_build_config, last_updated_at_versions, make_stable_row_id_manifest,
@@ -1723,14 +1825,32 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_build_manifest_replaces_and_removes_fragments() {
-        let manifest = sample_manifest_with_fragments(0..5);
+    fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
+        let mut manifest = sample_manifest_with_fragments(0..5);
+        manifest.version = 2;
+        let current_fragment = &mut Arc::make_mut(&mut manifest.fragments)[2];
+        current_fragment.physical_rows = Some(42);
+        current_fragment.overlays = vec![overlay_with_field(0, 2)];
+        current_fragment.last_updated_at_version_meta = Some(
+            RowDatasetVersionMeta::from_sequence(
+                &RowDatasetVersionSequence::from_uniform_row_count(42, 2),
+            )
+            .unwrap(),
+        );
 
         let mut updated2 = Fragment::new(2);
         updated2.physical_rows = Some(42);
+        let deletion_file = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        updated2.deletion_file = Some(deletion_file.clone());
 
         let transaction = Transaction::new(
-            manifest.version,
+            1,
             Operation::Delete {
                 updated_fragments: vec![updated2],
                 deleted_fragment_ids: vec![1, 3],
@@ -1751,6 +1871,11 @@ mod tests {
             .map(|f| f.physical_rows)
             .collect();
         assert_eq!(rows, vec![None, Some(42), None]);
+        let overlays = &new_manifest.fragments[1].overlays;
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].committed_version, 2);
+        assert_eq!(new_manifest.fragments[1].deletion_file, Some(deletion_file));
+        assert_eq!(last_updated_at_versions(&new_manifest, 2), vec![2; 42]);
     }
 
     #[test]

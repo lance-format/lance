@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::fragment::FileFragment;
+use super::hash_joiner::HashJoiner;
 use super::{
     Dataset,
     transaction::{Operation, Transaction},
@@ -695,6 +696,13 @@ async fn add_columns_from_stream(
                 let new_batch =
                     arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
 
+                // Reject nulls the dataset's file format cannot store (e.g. integer
+                // nulls on Legacy), matching the hash-join based merge path, instead
+                // of silently writing them as default values.
+                for (field, column) in new_batch.schema().fields().iter().zip(new_batch.columns()) {
+                    HashJoiner::check_lance_support_null(field.name(), column, updater.dataset())?;
+                }
+
                 updater.update(new_batch).await?;
             }
             updater.finish().await
@@ -738,7 +746,7 @@ pub(super) async fn alter_columns(
     let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -767,8 +775,13 @@ pub(super) async fn alter_columns(
         }
 
         if let Some(data_type) = &alteration.data_type {
+            // Casts rewrite the column using the default output version.
             if !(can_cast_types(&field_src.data_type(), data_type)
-                && super::versions::is_upcast_downcast(version, &field_src.data_type(), data_type))
+                && super::versions::is_upcast_downcast(
+                    fallback_version,
+                    &field_src.data_type(),
+                    data_type,
+                ))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -1034,10 +1047,56 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         }
     }
 
-    let version = dataset.manifest.data_storage_format.lance_file_format();
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema =
-        super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
+    let mut new_schema = dataset.manifest.schema.clone();
+    for field in &columns_to_remove.fields {
+        let source = dataset.manifest.schema.project_by_ids(&[field.id], true);
+        let removed = columns_to_remove.project_by_ids(&[field.id], true);
+        let mut projected = None;
+        for data_file in dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .filter(|file| {
+                file.fields
+                    .iter()
+                    .any(|id| source.field_by_id(*id).is_some())
+            })
+        {
+            let file_version = data_file.file_version()?;
+            let candidate = super::versions::exclude_schema(file_version, &source, &removed)?;
+            if projected
+                .as_ref()
+                .is_some_and(|schema| schema != &candidate)
+            {
+                return Err(Error::not_supported_source(
+                    format!(
+                        "Dropping columns from '{}' has different metadata semantics for data file '{}' using exact version {}",
+                        field.name, data_file.path, file_version
+                    )
+                    .into(),
+                ));
+            }
+            projected = Some(candidate);
+        }
+        let projected = match projected {
+            Some(schema) => schema,
+            None => super::versions::exclude_schema(fallback_version, &source, &removed)?,
+        };
+        new_schema.fields.retain_mut(|existing| {
+            if existing.id != field.id {
+                return true;
+            }
+            if let Some(replacement) = projected.fields.first() {
+                *existing = replacement.clone();
+                true
+            } else {
+                false
+            }
+        });
+    }
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -1177,7 +1236,7 @@ mod test {
         }
     }
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
     };
@@ -1453,6 +1512,47 @@ mod test {
         assert_eq!(
             data.column_by_name("j").unwrap().as_ref(),
             &Int32Array::from_iter_values(0..100)
+        );
+
+        Ok(())
+    }
+
+    /// A zero batch size cannot slice the fragment read into batches, so it must be
+    /// rejected as invalid input instead of panicking in the read planner.
+    #[tokio::test]
+    async fn test_add_columns_rejects_zero_batch_size() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await?;
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema);
+
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero"),
+            "{err}"
         );
 
         Ok(())
@@ -2799,6 +2899,67 @@ mod test {
         let struct_array = list_value.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(struct_array.column_by_name("city").is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_versions_reject_ambiguous_nested_drop() -> Result<()> {
+        let dataset = prepare_dataset(LanceFileVersion::V2_0).await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .execute(vec![batch])
+            .await?;
+
+        let error = dataset
+            .drop_columns(&["people.item.city"])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("different metadata semantics"));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::V2_0, ConcreteFileVersion::V2_2, true)]
+    #[case(LanceFileVersion::V2_2, ConcreteFileVersion::V2_0, false)]
+    #[tokio::test]
+    async fn nested_drop_uses_only_affected_file_versions(
+        #[case] default: LanceFileVersion,
+        #[case] target: ConcreteFileVersion,
+        #[case] preserves_people: bool,
+    ) -> Result<()> {
+        let dataset = prepare_dataset(default).await?;
+        let batch = dataset
+            .scan()
+            .project(&["people"])?
+            .try_into_batch()
+            .await?;
+        let schema = dataset.schema().project(&["people"])?;
+        let replacement = dataset.get_fragments()[0]
+            .write_column_with_version(futures::stream::iter([Ok(batch)]), &schema, target)
+            .await?;
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::DataReplacement {
+                replacements: vec![replacement],
+            },
+            None,
+        );
+        let mut dataset = crate::dataset::CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await?;
+        dataset.drop_columns(&["people.item.city"]).await?;
+        assert_eq!(dataset.schema().field("people").is_some(), preserves_people);
+        assert!(dataset.schema().field("people.item.city").is_none());
+        assert_eq!(dataset.scan().try_into_batch().await?.num_rows(), 3);
+        dataset.validate().await?;
         Ok(())
     }
 
@@ -4420,5 +4581,62 @@ mod test {
         assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
 
         Ok(())
+    }
+
+    #[rstest]
+    #[case::reader(false)]
+    #[case::stream(true)]
+    #[tokio::test]
+    async fn test_add_columns_via_stream_rejects_unsupported_nulls(#[case] use_stream: bool) {
+        // Legacy files cannot store integer nulls: a new column of [1, NULL, 3] must
+        // fail, matching the hash-join based merge path, instead of being silently
+        // written and read back as [1, 0, 3].
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let values =
+            arrow_array::record_batch!(("value", Int32, [Some(1), None, Some(3)])).unwrap();
+        let values_schema = values.schema();
+        // `Reader` and `Stream` share `add_columns_from_stream` today, but a future
+        // refactor could split them, so both variants are exercised directly.
+        let values_reader: Box<dyn RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(values)], values_schema));
+        let transform = if use_stream {
+            NewColumnTransform::Stream(values_reader.into_stream())
+        } else {
+            NewColumnTransform::Reader(values_reader)
+        };
+
+        let err = dataset
+            .add_columns(transform, None, None)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Column 'value'") && message.contains("not supported"),
+            "unexpected error: {}",
+            message
+        );
     }
 }

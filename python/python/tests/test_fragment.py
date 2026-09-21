@@ -21,7 +21,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
-from lance.file import LanceFileWriter
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -143,6 +143,75 @@ def test_write_fragments(tmp_path: Path):
     # progress hook was called for each fragment
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+def _write_single_fragment(write_api, batches, uri, **kwargs):
+    schema = pa.schema([pa.field("a", pa.int64())])
+    reader = pa.RecordBatchReader.from_batches(
+        schema,
+        [pa.record_batch([pa.array(values)], schema=schema) for values in batches],
+    )
+    if write_api == "dataset":
+        dataset = write_dataset(reader, uri, **kwargs)
+        return dataset.get_fragments()[0].metadata
+    return write_fragments(reader, uri, **kwargs)[0]
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+@pytest.mark.parametrize(
+    "options,batches,expected_pages",
+    [
+        pytest.param(
+            {"data_cache_bytes": 1},
+            [[1, 2, 3], [4, 5, 6]],
+            2,
+            id="data-cache",
+        ),
+        pytest.param(
+            {"max_page_bytes": 1},
+            [[1, 2, 3]],
+            3,
+            id="max-page",
+        ),
+    ],
+)
+def test_write_page_options(
+    tmp_path: Path, write_api, options, batches, expected_pages
+):
+    fragment = _write_single_fragment(
+        write_api,
+        batches,
+        tmp_path,
+        data_storage_version="2.0",
+        **options,
+    )
+    data_file = tmp_path / "data" / fragment.files[0].path
+    metadata = LanceFileReader(str(data_file)).metadata()
+    assert len(metadata.columns[0].pages) == expected_pages
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+def test_write_rejects_zero_max_page_bytes(tmp_path: Path, write_api):
+    with pytest.raises(OSError, match="max_page_bytes must be greater than 0, got 0"):
+        _write_single_fragment(
+            write_api,
+            [[1, 2, 3]],
+            tmp_path,
+            data_storage_version="2.0",
+            max_page_bytes=0,
+        )
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+def test_write_page_options_ignored_for_legacy(tmp_path: Path, write_api):
+    fragment = _write_single_fragment(
+        write_api,
+        [[1, 2, 3]],
+        tmp_path,
+        data_storage_version="legacy",
+        max_page_bytes=0,
+    )
+    assert fragment.physical_rows == 3
 
 
 def test_write_fragments_schema_holes(tmp_path: Path):
