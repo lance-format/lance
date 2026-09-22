@@ -156,12 +156,15 @@ public class VectorSearchTest {
     }
   }
 
-  @Test
-  void test_batch_knn() throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void test_batch_knn(boolean createVectorIndex) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("test_batch_knn"))) {
       try (Dataset dataset = testVectorDataset.create()) {
-        testVectorDataset.createIndex(dataset);
+        if (createVectorIndex) {
+          testVectorDataset.createIndex(dataset);
+        }
 
         // Two query vectors, each an exact match for a distinct set of rows. Every
         // fragment repeats the same per-row vectors, so each query has exactly five
@@ -180,7 +183,7 @@ public class VectorSearchTest {
                         .setColumn(TestVectorDataset.vectorColumnName)
                         .setKeys(new float[][] {key0, key1})
                         .setK(k)
-                        .setUseIndex(true)
+                        .setUseIndex(createVectorIndex)
                         .build())
                 .build();
         try (Scanner scanner = dataset.newScan(options)) {
@@ -242,6 +245,17 @@ public class VectorSearchTest {
         }
       }
     }
+  }
+
+  @Test
+  void test_batch_knn_rejects_invalid_keys() {
+    Query.Builder builder = new Query.Builder().setColumn(TestVectorDataset.vectorColumnName);
+    // An empty batch has no query vectors.
+    assertThrows(IllegalArgumentException.class, () -> builder.setKeys(new float[][] {}));
+    // Ragged rows: query vectors must all share one dimension.
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> builder.setKeys(new float[][] {{1.0f, 2.0f}, {1.0f, 2.0f, 3.0f}}));
   }
 
   @Test

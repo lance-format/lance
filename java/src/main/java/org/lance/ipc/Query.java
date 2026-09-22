@@ -174,8 +174,8 @@ public class Query {
      * Sets the vector to be searched.
      *
      * <p>This API accepts a single query vector. The array length must match the target vector
-     * column dimension. Batch nearest-neighbor search with multiple query vectors requires a
-     * list-shaped query input and is not available through this {@code float[]} entry point.
+     * column dimension. To search multiple query vectors in one scan, use {@link
+     * #setKeys(float[][])}.
      *
      * @param key The search vector.
      * @return The Builder instance for method chaining.
@@ -190,10 +190,13 @@ public class Query {
      * Sets multiple query vectors for a batch nearest-neighbor search.
      *
      * <p>Every row must be non-null and share the same length, which must match the target vector
-     * column dimension. The rows are flattened row-major into a single query buffer. Unlike {@link
-     * #setKey(float[])}, results of a batch query carry an additional non-nullable {@code
-     * query_index} column (the zero-based offset of the query vector that produced each row) and
-     * contain up to {@code k} rows per query vector.
+     * column dimension. The rows are flattened row-major into a single query buffer.
+     *
+     * <p>Unlike {@link #setKey(float[])}, a batch query prepends a non-nullable {@code query_index}
+     * column holding the zero-based offset of the query vector that produced each row, and returns
+     * up to {@code k} rows per query vector (results are grouped by {@code query_index}, ordered by
+     * distance within each group). This column is added even when a single query vector is
+     * supplied. The scan fails if the dataset already contains a column named {@code query_index}.
      *
      * @param keys The search vectors, one per row.
      * @return The Builder instance for method chaining.
