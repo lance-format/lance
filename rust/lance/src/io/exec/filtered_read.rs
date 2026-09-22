@@ -69,6 +69,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
@@ -2073,7 +2074,10 @@ pub struct FilteredReadExec {
 }
 
 /// Describes which rows a [`FilteredReadExec`] should read
-#[derive(Debug)]
+///
+/// `Clone` shares the input plan rather than copying it, which is what
+/// [`FilteredReadExec::with_measured_widths`] needs.
+#[derive(Debug, Clone)]
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
@@ -2166,6 +2170,41 @@ impl FilteredReadInternalPlan {
 
 impl FilteredReadExec {
     /// Create a new filtered read
+    /// Carries this node's width onto `rebuilt`, when the two report the same
+    /// schema.
+    ///
+    /// `try_new` seeds the width from the schema alone, so every rebuild -- a
+    /// limit pushed down, a child rewritten -- would otherwise discard what an
+    /// earlier scan measured and fall back to no byte size at all.
+    fn carry_measured_width(&self, mut rebuilt: Self) -> Self {
+        if rebuilt.schema() == self.schema() {
+            rebuilt.bytes_per_row = self.bytes_per_row;
+        }
+        rebuilt
+    }
+
+    /// Returns this node with widths measured by earlier reads folded in.
+    ///
+    /// Separate from [`Self::try_new`] because reading them is async. The plan and
+    /// running stream are shared: this node stands in for the original.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            options: self.options.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.schema().as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            materialization_context: self.materialization_context.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            input: self.input.clone(),
+            plan: self.plan.clone(),
+            running_stream: self.running_stream.clone(),
+        }
+    }
+
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -2280,7 +2319,11 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2436,7 +2479,11 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -3550,7 +3597,7 @@ impl ExecutionPlan for FilteredReadExec {
             let child = children.into_iter().next();
             let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            Ok(Arc::new(rebuilt))
+            Ok(Arc::new(self.carry_measured_width(rebuilt)))
         }
     }
 
@@ -3583,9 +3630,37 @@ impl ExecutionPlan for FilteredReadExec {
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         });
+        // Measure what the read decodes and record it when the read finishes.
+        // A filter, a refine, an index input, a range or a fragment subset all mean
+        // this read saw a sample. Only an unrestricted read measures the column.
+        let representative = self.options.full_filter.is_none()
+            && self.options.refine_filter.is_none()
+            // Every selector but `AllRows` carries a chosen subset: a row set from
+            // an index, or a stream of rows another node already filtered.
+            && matches!(self.input, RowSelector::AllRows)
+            && self.options.scan_range_before_filter.is_none()
+            && self.options.scan_range_after_filter.is_none()
+            && !self.options.only_indexed_fragments
+            && !self.options.with_deleted_rows
+            && self.options.fragments.is_none()
+            // Each partition wraps its own slice of the shared task stream and
+            // writes the same cache key, so the last one to finish would speak for
+            // the column. Only a single-partition read observes all of it.
+            && !matches!(
+                self.options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            );
+        let measured = column_width::measuring(
+            stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            output_schema.clone(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            measured,
         )))
     }
 
@@ -3653,7 +3728,7 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options,
             self.input.row_set_plan().cloned(),
         ) {
-            Ok(exec) => Some(Arc::new(exec)),
+            Ok(exec) => Some(Arc::new(self.carry_measured_width(exec))),
             Err(e) => {
                 log::warn!(
                     "Failed to create FilteredReadExec for {} with fetch limit: {}",

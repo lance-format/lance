@@ -40,6 +40,7 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
+use super::column_width::MeasuredWidths;
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 #[derive(Debug, Clone)]
@@ -575,7 +576,11 @@ impl TakeExec {
         );
 
         let schema_to_take = projection.into_schema_ref();
-        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_arrow.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         Ok(Some(Self {
             dataset,

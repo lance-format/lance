@@ -7,6 +7,7 @@
 
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
+pub(crate) mod column_width;
 pub mod count_from_mask;
 pub mod count_pushdown;
 mod filter;

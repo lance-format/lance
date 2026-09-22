@@ -44,6 +44,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{
     IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
 };
@@ -682,6 +683,30 @@ impl DisplayAs for LanceScanExec {
 
 impl LanceScanExec {
     #[allow(clippy::too_many_arguments)]
+    /// Returns this node with widths measured by earlier scans folded in.
+    ///
+    /// Separate from [`Self::new`] because reading them is async. A caller that
+    /// does not call this keeps the schema-only estimate.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            fragments: self.fragments.clone(),
+            range: self.range.clone(),
+            projection: self.projection.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.output_schema.as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            output_schema: self.output_schema.clone(),
+            properties: self.properties.clone(),
+            config: self.config.clone(),
+            // Shared: the rewritten node stands in for this one, so execution
+            // must report through the metrics handle the caller already holds.
+            metrics: self.metrics.clone(),
+        }
+    }
+
     pub fn new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
@@ -712,7 +737,11 @@ impl LanceScanExec {
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -808,9 +837,24 @@ impl ExecutionPlan for LanceScanExec {
             )
         });
         let lance_stream = lance_fut_stream.try_flatten();
+
+        // Measure what the scan decodes and record it when the scan finishes.
+        // Only a scan over every row of every fragment measures the column rather
+        // than a slice of it.
+        let representative = self.range.is_none()
+            && self.fragments.len() == self.dataset.fragments().len()
+            && !self.config.with_make_deletions_null;
+        let measured_stream = column_width::measuring(
+            lance_stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            self.schema(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            lance_stream,
+            measured_stream,
         )))
     }
 
@@ -1138,6 +1182,130 @@ mod tests {
             physical.get_value(),
             "the disagreement is the reason this cannot be exact: reported \
              {physical:?}, emitted {emitted}"
+        );
+    }
+
+    /// Execution is the only place that sees a string column's real width, so a
+    /// completed scan has to leave it behind.
+    #[tokio::test]
+    async fn executing_a_scan_records_a_measured_width() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width::MeasuredWidthKey;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = Arc::new(
+            gen_batch()
+                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+                .into_dataset(
+                    tmp.as_str(),
+                    FragmentCount::from(1),
+                    FragmentRowCount::from(100),
+                )
+                .await
+                .unwrap(),
+        );
+        let schema = dataset.schema().into();
+        let name: &arrow_schema::Schema = &schema;
+        let name = name.field_with_name("name").unwrap();
+        let key = MeasuredWidthKey {
+            version: dataset.version().version,
+            column: name.name(),
+            layout: name.data_type(),
+        };
+
+        assert!(
+            dataset.metadata_cache.get_with_key(&key).await.is_none(),
+            "nothing is measured before the scan runs"
+        );
+
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+        let stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let emitted: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(emitted, 100, "fixture no longer emits what it claims");
+
+        let measured = dataset.metadata_cache.get_with_key(&key).await;
+        let width = measured.expect("the drained scan must record a width").0;
+        assert!(
+            width > 0.0,
+            "a string column cannot measure as free, got {width}"
+        );
+    }
+
+    /// A scan over a string column reports no byte size until one has measured it.
+    #[tokio::test]
+    async fn a_scan_reports_a_byte_size_once_a_width_has_been_measured() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = Arc::new(
+            gen_batch()
+                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+                .into_dataset(
+                    tmp.as_str(),
+                    FragmentCount::from(1),
+                    FragmentRowCount::from(100),
+                )
+                .await
+                .unwrap(),
+        );
+        let version = dataset.version().version;
+        let build = || {
+            LanceScanExec::new(
+                dataset.clone(),
+                dataset.fragments().clone(),
+                None,
+                Arc::new(dataset.schema().clone()),
+                LanceScanConfig::default(),
+            )
+        };
+
+        let uninformed = build();
+        // Unmeasured, the string column reports the decoder's 64-byte seed.
+        let Precision::Inexact(seeded) = uninformed
+            .partition_statistics(None)
+            .unwrap()
+            .total_byte_size
+        else {
+            panic!("an unmeasured string column still reports the seed");
+        };
+
+        let stream = uninformed
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let _: Vec<_> = stream.try_collect().await.unwrap();
+
+        let measured = column_width::resolve(
+            &dataset.metadata_cache,
+            version,
+            build().schema().fields().iter().map(|f| f.as_ref()),
+        )
+        .await;
+        let stats = build()
+            .with_measured_widths(&measured)
+            .partition_statistics(None)
+            .unwrap();
+
+        let Precision::Inexact(measured) = stats.total_byte_size else {
+            panic!("expected a byte size, got {:?}", stats.total_byte_size);
+        };
+        assert!(measured > 0, "100 rows of text cannot cost nothing");
+        assert!(
+            measured < seeded,
+            "the measurement must replace the seed: seeded={seeded}, measured={measured}"
         );
     }
 
