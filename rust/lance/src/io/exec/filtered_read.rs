@@ -21,10 +21,11 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
+use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
@@ -2243,13 +2244,23 @@ impl FilteredReadExec {
             ),
         ));
 
+        // Row-stream reads preserve input order, but can drop identity columns.
+        // Remap sort expressions to the output schema and retain only valid prefixes.
+        let orderings = input
+            .equivalence_properties()
+            .oeq_class()
+            .iter()
+            .filter_map(|ordering| project_ordering(ordering, &output_schema));
+        let equivalence_properties =
+            EquivalenceProperties::new_with_orderings(output_schema.clone(), orderings);
+
         // Partitioning and emission behavior follow the input
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema)),
+                .with_eq_properties(equivalence_properties),
         );
 
         let bare_lance_schema = fields_to_read.to_bare_schema();
@@ -3298,6 +3309,12 @@ impl ExecutionPlan for FilteredReadExec {
         // Partitioning a row-stream read would create multiple I/O schedulers
         // (RAM heavy); the other selectors have no row input
         vec![false; self.children().len()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Row-stream reads realign fetched rows to the incoming keys and emit
+        // concurrent batches in input order. Row-set inputs only select scan rows.
+        vec![self.row_stream_input().is_some(); self.children().len()]
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -5837,6 +5854,9 @@ mod tests {
         use super::*;
         use arrow_array::{Float32Array, LargeBinaryArray, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::physical_plan::sorts::sort::SortExec;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use lance_datafusion::exec::OneShotExec;
         use rstest::rstest;
@@ -5958,6 +5978,74 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
+        }
+
+        #[rstest]
+        #[case::retain_ordering(true, false)]
+        #[case::remap_and_keep_prefix(false, false)]
+        #[case::retain_key_ordering(true, true)]
+        #[case::drop_missing_leading_key(false, true)]
+        #[tokio::test]
+        async fn row_stream_preserves_ordering_properties(
+            #[case] retain_row_id: bool,
+            #[case] order_by_row_id_first: bool,
+        ) {
+            let fixture = take_fixture(false).await;
+            let batch = arrow_array::record_batch!(
+                ("_rowid", UInt64, [2, 0, 1]),
+                ("payload", Float32, [1.0, 3.0, 2.0])
+            )
+            .unwrap();
+            let input = rows_input(vec![batch]);
+            let columns = if order_by_row_id_first {
+                [ROW_ID, "payload"]
+            } else {
+                ["payload", ROW_ID]
+            };
+            let ordering =
+                LexOrdering::new(columns.iter().map(|name| {
+                    PhysicalSortExpr::new_default(col(name, &input.schema()).unwrap())
+                }))
+                .unwrap();
+            let sorted = Arc::new(SortExec::new(ordering, input.clone()));
+            let mut projection = fixture
+                .dataset
+                .empty_projection()
+                .union_column("i", OnMissing::Error)
+                .unwrap();
+            projection.with_row_id = retain_row_id;
+            let plan = Arc::new(
+                FilteredReadExec::try_new(
+                    fixture.dataset.clone(),
+                    FilteredReadOptions::new(projection),
+                    Some(sorted),
+                )
+                .unwrap(),
+            );
+            assert_eq!(plan.maintains_input_order(), vec![true]);
+
+            let expected = LexOrdering::new(
+                columns
+                    .iter()
+                    .take_while(|name| **name != ROW_ID || retain_row_id)
+                    .map(|name| PhysicalSortExpr::new_default(col(name, &plan.schema()).unwrap()))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(plan.properties().output_ordering(), expected.as_ref());
+
+            // Replacing the input must not leave stale ordering properties.
+            let rebuilt = plan.with_new_children(vec![input]).unwrap();
+            assert!(rebuilt.output_ordering().is_none());
+            assert_eq!(rebuilt.maintains_input_order(), vec![true]);
+
+            let scan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::basic_full_read(&fixture.dataset),
+                None,
+            )
+            .unwrap();
+            assert!(scan.maintains_input_order().is_empty());
+            assert!(scan.properties().output_ordering().is_none());
         }
 
         #[rstest]

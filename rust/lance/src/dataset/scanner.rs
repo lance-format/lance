@@ -7636,6 +7636,7 @@ mod test {
     use arrow_schema::Fields;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use half::f16;
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
@@ -11137,55 +11138,97 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
+    #[case::nearest_only(false, None, false)]
+    #[case::late_materialization(true, None, false)]
+    #[case::late_materialization_limit(true, Some(0), false)]
+    #[case::late_materialization_offset(true, Some(37), false)]
+    #[case::nulls_and_ties(true, Some(37), true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_flat_knn_large_limit_preserves_global_order() {
-        // Regression test for https://github.com/lance-format/lance/issues/7865.
-        //
-        // An exact (flat, no vector index) KNN search with a limit larger than one
-        // output batch (BATCH_SIZE_FALLBACK = 8192 rows) used to be able to return
-        // results in the wrong global order: `execute_plan` coalesced the
-        // partitions the physical optimizer parallelizes above the top-k `SortExec`
-        // with a plain `CoalescePartitionsExec`, which does not preserve order.
-        // This only reproduces at real (> 1) parallelism, which is why the
-        // plan-shape tests elsewhere (pinned to `target_parallelism(1)`) never
-        // caught it.
-        let dim = 16u32;
-        let frag_count = 4u32;
-        let rows_per_fragment = 5_000u32;
-        let k = 12_000usize; // > BATCH_SIZE_FALLBACK, so results span multiple batches
-
+    async fn test_flat_knn_large_limit_preserves_global_order(
+        #[case] materialize_id: bool,
+        #[case] offset: Option<usize>,
+        #[case] nulls_and_ties: bool,
+    ) {
+        // Cover both the root merge (#7865) and a merge below GlobalLimitExec
+        // followed by late materialization (lancedb/lancedb#4214).
+        let rows = 12_288usize;
+        let k = 9_000usize; // Span multiple default-sized output batches.
+        let vector_value = |id: usize| {
+            if nulls_and_ties {
+                (rows - id).div_ceil(2)
+            } else {
+                rows - id
+            }
+        };
+        let mut vectors = array::cycle_vec(
+            array::cycle::<Float32Type>((0..rows).map(|id| vector_value(id) as f32).collect()),
+            Dimension::from(1),
+        );
+        if nulls_and_ties {
+            vectors = vectors.with_nulls(&[false, false, false, true]);
+        }
         let dataset = gen_batch()
-            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(dim)))
-            .into_ram_dataset(
-                FragmentCount::from(frag_count),
-                FragmentRowCount::from(rows_per_fragment),
-            )
+            .col("id", array::step::<UInt32Type>())
+            .col("vec", vectors)
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(4_096))
             .await
             .unwrap();
 
-        let query = Float32Array::from(vec![0.0_f32; dim as usize]);
+        let query = Float32Array::from(vec![0.0]);
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k + offset.unwrap_or(0))
+            .unwrap();
+        scan.target_parallelism(8);
+        if materialize_id {
+            scan.project(&["id"]).unwrap();
+        } else {
+            scan.project(&["vec"]).unwrap();
+        }
+        if let Some(offset) = offset {
+            scan.limit(Some(k as i64), Some(offset as i64)).unwrap();
+        }
 
-        // The bug is a scheduling race between parallel partitions, so run
-        // several iterations to reliably catch it if the ordering guarantee
-        // regresses.
-        for _ in 0..10 {
-            let mut scan = dataset.scan();
-            scan.nearest("vec", &query, k).unwrap();
-            scan.target_parallelism(8);
-
-            let batch = scan.try_into_batch().await.unwrap();
-            assert_eq!(batch.num_rows(), k);
-
-            let distances = batch[DIST_COL].as_primitive::<Float32Type>();
-            for pair in distances.values().windows(2) {
-                assert!(
-                    pair[0] <= pair[1],
-                    "flat KNN results must be globally sorted by distance, found {} before {}",
-                    pair[0],
-                    pair[1]
+        let plan = scan.create_plan().await.unwrap();
+        let displayed = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(displayed.matches("SortExec:").count(), 1, "{displayed}");
+        assert_eq!(
+            displayed.contains("source=stream(_rowid)"),
+            materialize_id,
+            "{displayed}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), k);
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+        assert_eq!(distances.null_count(), 0);
+        let mut expected_ids = (0..rows)
+            .filter(|id| !nulls_and_ties || id % 4 != 3)
+            .collect::<Vec<_>>();
+        expected_ids.sort_by_key(|id| (vector_value(*id), *id));
+        for (rank, id) in expected_ids
+            .into_iter()
+            .skip(offset.unwrap_or(0))
+            .take(k)
+            .enumerate()
+        {
+            let value = vector_value(id) as f32;
+            assert_eq!(distances.value(rank), value * value);
+            if materialize_id {
+                // Distances decrease with row id; ties use ascending row id.
+                assert_eq!(
+                    batch["id"].as_primitive::<UInt32Type>().value(rank),
+                    id as u32
                 );
             }
         }
+        // Catch the ordering contract deterministically even if this execution
+        // happened to receive the parallel batches in distance order.
+        assert!(
+            plan.output_ordering().is_some(),
+            "flat KNN must retain its output ordering:\n{displayed}"
+        );
     }
 
     #[rstest]
