@@ -68,6 +68,9 @@ macro_rules! for_each_action {
             SetDeletionFile,
             AlterField,
             DropField,
+            AddIndexSegment,
+            RemoveIndexSegment,
+            AdjustIndexCoverage,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
@@ -80,6 +83,8 @@ mod add_base;
 mod add_data_file;
 mod add_field;
 mod add_fragment;
+mod add_index_segment;
+mod adjust_index_coverage;
 mod alter_field;
 mod apply;
 mod config_update;
@@ -87,6 +92,7 @@ mod drop_field;
 mod footprint;
 mod proto;
 mod remove_fragment;
+mod remove_index_segment;
 mod reserve_fragment_ids;
 mod reserve_row_ids;
 mod reset_table;
@@ -100,11 +106,14 @@ pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
+pub use add_index_segment::AddIndexSegment;
+pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
+pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;

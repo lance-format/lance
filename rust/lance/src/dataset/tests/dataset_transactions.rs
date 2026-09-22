@@ -1741,6 +1741,7 @@ mod composite {
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::load_all_indices;
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -1751,9 +1752,10 @@ mod composite {
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserAction,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, Ref, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserAction,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -2539,5 +2541,314 @@ mod composite {
             error.to_string().contains("preempted"),
             "unexpected error: {error}"
         );
+    }
+
+    /// An index segment naming `covered`, with no files of its own -- these
+    /// tests inspect the manifest's index section rather than opening the index.
+    fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {
+        AddIndexSegment {
+            uuid: Uuid::new_v4(),
+            name: name.into(),
+            fields: vec![Ref::Committed(0)],
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(covered),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        }
+    }
+
+    async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .expect("index segment should be committed");
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .expect("coverage should be recorded")
+            .iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_indexes_what_it_appended() {
+        let dataset = test_dataset(false).await;
+        let existing = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+                // The index covers the fragment this same commit minted, which
+                // has no id until the commit lands.
+                Action::AddIndexSegment(index_segment(
+                    "by_a",
+                    vec![Ref::Committed(existing), Ref::Local(0)],
+                )),
+            ],
+        )
+        .await;
+
+        let appended = dataset.fragments().last().unwrap().id;
+        assert_eq!(
+            index_coverage(&dataset, "by_a").await,
+            vec![existing as u32, appended as u32]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_replaces_an_index_segment() {
+        let dataset = test_dataset(false).await;
+        let old = index_segment("by_a", vec![Ref::Committed(0)]);
+        let old_uuid = old.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(old)]).await;
+
+        let new = index_segment("by_a", vec![Ref::Committed(0), Ref::Committed(1)]);
+        let new_uuid = new.uuid;
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::RemoveIndexSegment(RemoveIndexSegment {
+                    uuid: old_uuid,
+                    name: "by_a".into(),
+                    data_change: false,
+                }),
+                Action::AddIndexSegment(new),
+            ],
+        )
+        .await;
+
+        let uuids = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![new_uuid]);
+    }
+
+    /// Commit `actions` against `dataset` as it was, whatever has landed since.
+    /// This is what a concurrent writer does: it planned at that version and
+    /// arrives at the commit after someone else got there first.
+    async fn commit_from_stale(dataset: Arc<Dataset>, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_extend_one_index_over_disjoint_fragments() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        // The first writer wins the race; the second arrives against a version
+        // it has not seen.
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let dataset = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(1)],
+            ))],
+        )
+        .await
+        .expect("segments over disjoint fragments both belong to the index");
+
+        let mut coverage = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "by_a")
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().iter().collect())
+            .collect::<Vec<Vec<u32>>>();
+        coverage.sort();
+        assert_eq!(coverage, vec![vec![0], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_indexing_the_same_fragment_conflict() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let error = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await
+        .expect_err("two segments describing one fragment would double-count its rows");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Replace field 0's data in fragment 0, the way an in-place column
+    /// rewrite does.
+    fn rewrite_field_zero(file: DataFile) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file,
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ]
+    }
+
+    /// The coverage of `name`, or `None` when no segment carries the name.
+    async fn index_coverage_opt(dataset: &Dataset, name: &str) -> Option<Vec<u32>> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == name)?;
+        Some(
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("coverage should be recorded")
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// Control for the test below: when the rewrite is the *later* commit, the
+    /// coverage is repaired. `TombstoneFieldData::apply` rebinds the field,
+    /// which prunes the fragment from every index the manifest carries.
+    #[tokio::test]
+    async fn test_a_rewrite_prunes_an_index_segment_committed_before_it() {
+        let dataset = test_dataset(false).await;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(dataset, rewrite_field_zero(file)).await;
+
+        assert_eq!(
+            index_coverage_opt(&dataset, "by_a")
+                .await
+                .unwrap_or_default(),
+            Vec::<u32>::new(),
+            "the rewrite should have dropped fragment 0 from the coverage"
+        );
+    }
+
+    /// The same two commits in the other order must reach the same place.
+    ///
+    /// The format spec's third invalidation case -- a fragment has had one of
+    /// the index's columns updated in place -- "cannot be detected just by
+    /// examining metadata", so a reader trusts `fragment_bitmap` and has no
+    /// recourse. Keeping it honest is a write-path obligation.
+    ///
+    /// Apply-time pruning only discharges that obligation when the rewrite is
+    /// the later commit, as the control above shows. A segment built before the
+    /// rewrite but committed after it carries no rebind of its own, so nothing
+    /// prunes it -- and its footprint records only an index claim, which is
+    /// never compared against the `FieldData` coordinates the rewrite writes.
+    #[tokio::test]
+    async fn test_an_index_segment_staged_before_a_rewrite_does_not_cover_it() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        // The rewrite wins the race.
+        commit(dataset, rewrite_field_zero(file)).await;
+
+        // The loser built its segment from the values the rewrite replaced.
+        let committed = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        // Rejected, because the segment requires the data it describes and the
+        // rewrite wrote it. Dropping fragment 0 from the arriving segment's
+        // coverage would also be sound and would waste less work -- it is what
+        // the legacy path does for `Operation::Update` -- but an action set is
+        // never rewritten to move to a newer version, so there is nowhere to
+        // put that here.
+        let error = committed.expect_err("the segment describes replaced values");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_extends_an_index_segments_coverage() {
+        let dataset = test_dataset(false).await;
+        let segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        let uuid = segment.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid,
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+            })],
+        )
+        .await;
+
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
     }
 }
