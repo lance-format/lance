@@ -268,6 +268,41 @@ impl<'a> ApplyState<'a> {
         &mut self.schema
     }
 
+    /// Reject `name` if a field with that name already sits under `parent_id`
+    /// (or at the top level, for `None`). Field names are unique among
+    /// siblings, and this is the one place the schema is at hand to check it:
+    /// the footprint keeps two concurrent writers from taking one name, but a
+    /// name already committed is only visible here.
+    pub(super) fn reject_duplicate_sibling_name(
+        &self,
+        parent_id: Option<i32>,
+        name: &str,
+        action: &str,
+    ) -> Result<()> {
+        let siblings = match parent_id {
+            None => &self.schema.fields,
+            Some(parent_id) => {
+                &self
+                    .schema
+                    .field_by_id(parent_id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "{action} names parent field {parent_id}, which does not exist"
+                        ))
+                    })?
+                    .children
+            }
+        };
+        if let Some(existing) = siblings.iter().find(|field| field.name == name) {
+            return Err(Error::invalid_input(format!(
+                "{action} names a field {name:?}, but field {} already has that name at the same \
+                 level; field names are unique among siblings",
+                existing.id
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn config_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.config
     }
@@ -757,10 +792,16 @@ mod tests {
             }),
         ];
 
-        // Replaying the very same actions against the manifest the first run
+        // Replaying the same actions against the manifest the first run
         // produced re-resolves both local tokens against the newer counters.
+        // Only the field's name differs, since the first run took "added".
         let first = apply(&backed_manifest(), actions.clone()).unwrap();
-        let second = apply(&first, actions).unwrap();
+        let mut replayed = actions;
+        let Action::AddField(add_field) = &mut replayed[0] else {
+            unreachable!("the first action is the AddField built above");
+        };
+        add_field.def.name = "added_again".into();
+        let second = apply(&first, replayed).unwrap();
 
         assert_eq!(
             second.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
