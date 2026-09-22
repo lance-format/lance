@@ -1128,6 +1128,22 @@ impl BlobPreprocessor {
         pack_file_threshold: usize,
         writer_metadata: &HashMap<String, String>,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        // Legacy byte input follows the same per-leaf preparation as logical v2 input.
+        let array = if matches!(
+            array.data_type(),
+            ArrowDataType::Binary | ArrowDataType::LargeBinary
+        ) {
+            Arc::new(StructArray::try_new(
+                lance_core::datatypes::BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
+                vec![
+                    arrow::compute::cast(&array, &ArrowDataType::LargeBinary)?,
+                    arrow_array::new_null_array(&ArrowDataType::Utf8, array.len()),
+                ],
+                array.nulls().cloned(),
+            )?) as ArrayRef
+        } else {
+            array
+        };
         let struct_arr = array
             .as_any()
             .downcast_ref::<StructArray>()
@@ -6059,6 +6075,231 @@ mod tests {
         for (read_blob, expected) in read_blobs.iter().zip(payloads) {
             assert_eq!(read_blob.data.as_deref(), Some(expected));
         }
+    }
+
+    #[rstest]
+    #[case::v20("v2.0.lance")]
+    #[case::v21("v2.1.lance")]
+    #[tokio::test]
+    async fn test_legacy_blob_append_without_metadata(#[case] fixture: &str) {
+        let test_dir =
+            crate::utils::test::copy_test_data_to_tmp(&format!("v8.0.0/blobs/{fixture}")).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("blob", DataType::LargeBinary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"appended".as_slice())])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                &test_dir.path_str(),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let handles = dataset.take_blobs_by_indices(&[3], "blob").await.unwrap();
+        assert_eq!(
+            handles[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"appended"
+        );
+        assert!(!dataset.schema().field("blob").unwrap().is_blob_v2());
+    }
+
+    #[rstest]
+    #[case::v20_bytes("v2.0.lance", false)]
+    #[case::v20_struct("v2.0.lance", true)]
+    #[case::v21_bytes("v2.1.lance", false)]
+    #[case::v21_struct("v2.1.lance", true)]
+    #[tokio::test]
+    async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: bool) {
+        let test_dir =
+            crate::utils::test::copy_test_data_to_tmp(&format!("v8.0.0/blobs/{fixture}")).unwrap();
+        let dir = test_dir.path_str();
+        let dataset = Dataset::open(&dir).await.unwrap();
+        let schema = Arc::new(Schema::from(dataset.schema()));
+        let id_field = schema.field_with_name("id").unwrap().clone();
+        let legacy_field = schema.field_with_name("blob").unwrap();
+        let old_values = [Some(b"legacy bytes".as_slice()), None, Some(b"".as_slice())];
+        let old_snapshot = dataset.version_id();
+        let field_id = dataset.schema().field("blob").unwrap().id;
+        let old_fragment = dataset.manifest.fragments[0].clone();
+        let old_path = std::path::Path::new(dir.as_str())
+            .join("data")
+            .join(&old_fragment.files[0].path);
+        let old_file_bytes = std::fs::read(&old_path).unwrap();
+
+        let new_values = [
+            Some(b"packed!!".as_slice()),
+            Some(b"dedicated blob bytes".as_slice()),
+            None,
+            Some(b"".as_slice()),
+        ];
+        let batch = if struct_input {
+            let mut builder = BlobArrayBuilder::new(new_values.len());
+            for value in new_values {
+                match value {
+                    Some(bytes) => builder.push_bytes(bytes).unwrap(),
+                    None => builder.push_null().unwrap(),
+                }
+            }
+            let mut field = lance_core::datatypes::Field::try_from(legacy_field).unwrap();
+            field.promote_blob_v2().unwrap();
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![id_field, Field::from(&field)])),
+                vec![
+                    Arc::new(UInt32Array::from(vec![3, 4, 5, 6])),
+                    builder.finish().unwrap(),
+                ],
+            )
+            .unwrap()
+        } else {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![3, 4, 5, 6])),
+                    Arc::new(LargeBinaryArray::from(new_values.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut dataset = Dataset::open(&dir).await.unwrap();
+        assert_eq!(dataset.schema().field("blob").unwrap().id, field_id);
+        assert_eq!(dataset.manifest.fragments[0], old_fragment);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_file_bytes);
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+        dataset.validate().await.unwrap();
+        // The table default remains the original version. A subsequent byte append
+        // must preserve the promoted schema while writing another legacy file.
+        let legacy_again = Some(b"legacy again".as_slice());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![7])),
+                Arc::new(LargeBinaryArray::from(vec![legacy_again])),
+            ],
+        )
+        .unwrap();
+        dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+        assert_eq!(dataset.schema().field("blob").unwrap().id, field_id);
+        assert_eq!(dataset.manifest.fragments.len(), 3);
+        dataset.validate().await.unwrap();
+        let expected = old_values
+            .into_iter()
+            .chain(new_values)
+            .chain([legacy_again])
+            .collect::<Vec<_>>();
+
+        for compact in [false, true] {
+            if compact {
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 100,
+                        data_storage_version: Some(LanceFileVersion::V2_2),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(dataset.manifest.fragments.len(), 1);
+                dataset = Dataset::open(&dir).await.unwrap();
+            }
+            let dataset = Arc::new(dataset.clone());
+            let descriptors = dataset.scan().try_into_batch().await.unwrap();
+            assert_eq!(
+                descriptors["blob"].as_struct().fields(),
+                &*lance_core::datatypes::BLOB_V2_DESC_FIELDS
+            );
+            for fragment in dataset.get_fragments() {
+                let batch = fragment.scan().try_into_batch().await.unwrap();
+                assert_eq!(batch.schema(), descriptors.schema());
+            }
+            let mut scanner = dataset.scan();
+            scanner.blob_handling(BlobHandling::AllBinary);
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(
+                batch["blob"].as_binary::<i64>().iter().collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                batch["id"]
+                    .as_primitive::<arrow_array::types::UInt32Type>()
+                    .values(),
+                &[0, 1, 2, 3, 4, 5, 6, 7]
+            );
+            let indices = [4, 0, 6, 1, 3, 2, 5, 7];
+            let handles = dataset
+                .take_blobs_by_indices(&indices, "blob")
+                .await
+                .unwrap();
+            for (index, handle) in indices.into_iter().zip(handles) {
+                match (expected[index as usize], handle) {
+                    (Some(bytes), Some(handle)) => {
+                        assert_eq!(handle.read().await.unwrap().as_ref(), bytes)
+                    }
+                    (None, None) => {}
+                    _ => panic!("blob nullability changed at row {index}"),
+                }
+            }
+            let ranges = dataset
+                .read_blob_ranges("blob")
+                .unwrap()
+                .with_row_indices(vec![
+                    BlobRangeRequest::new(4, 1, 3),
+                    BlobRangeRequest::new(0, 1, 3),
+                ])
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(ranges[0].data.as_deref(), Some(&b"edi"[..]));
+            assert_eq!(ranges[1].data.as_deref(), Some(&b"ega"[..]));
+        }
+        let historical = Arc::new(dataset.checkout_version(old_snapshot).await.unwrap());
+        assert!(!historical.schema().field("blob").unwrap().is_blob_v2());
+        let handles = historical
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            handles[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"legacy bytes"
+        );
+        assert!(handles[1].is_none());
+        assert_eq!(handles[2].as_ref().unwrap().size(), 0);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_file_bytes);
     }
 
     #[test]

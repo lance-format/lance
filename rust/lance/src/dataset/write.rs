@@ -1789,6 +1789,15 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     .await
 }
 
+pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
+    let mut schema = schema.clone();
+    for field in &mut schema.fields {
+        field.promote_blob_v2()?;
+    }
+    schema.set_field_id(schema.max_field_id());
+    Ok(schema)
+}
+
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
     normalized_converted_schema: Schema,
@@ -1801,16 +1810,59 @@ pub(super) fn prepare_write_schema(
         schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
         schema_compare_options.allow_missing_if_nullable = true;
         schema_compare_options.ignore_field_order = true;
-        normalized_converted_schema.check_compatible(dataset.schema(), &schema_compare_options)?;
         validate_blob_threshold_metadata_for_append(
             &normalized_converted_schema,
             dataset.schema(),
         )?;
-        dataset.schema().project_by_schema(
-            &normalized_converted_schema,
+        if normalized_converted_schema
+            .check_compatible(dataset.schema(), &schema_compare_options)
+            .is_ok()
+        {
+            return dataset.schema().project_by_schema(
+                &normalized_converted_schema,
+                OnMissing::Error,
+                OnTypeMismatch::Error,
+            );
+        }
+        let comparison_schema = promote_legacy_blob_schema(&normalized_converted_schema)?;
+        let dataset_schema = promote_legacy_blob_schema(dataset.schema())?;
+        comparison_schema.check_compatible(&dataset_schema, &schema_compare_options)?;
+        let mut projected = dataset_schema.project_by_schema(
+            &comparison_schema,
             OnMissing::Error,
             OnTypeMismatch::Error,
-        )?
+        )?;
+        // Inputs for 2.2+ were already promoted before schema preparation.
+        // Remaining byte inputs retain the legacy physical layout and the table's field IDs.
+        fn restore_legacy_blob_inputs(
+            field: &mut lance_core::datatypes::Field,
+            input: &lance_core::datatypes::Field,
+        ) {
+            if input.is_blob() && !input.is_blob_v2() {
+                field.logical_type = input.logical_type.clone();
+                field.children = input.children.clone();
+                field.metadata = input.metadata.clone();
+                field.encoding = input.encoding.clone();
+            } else if !field.is_blob() {
+                for child in &mut field.children {
+                    if let Some(input) =
+                        input.children.iter().find(|input| input.name == child.name)
+                    {
+                        restore_legacy_blob_inputs(child, input);
+                    }
+                }
+            }
+        }
+        for field in &mut projected.fields {
+            if let Some(input) = normalized_converted_schema
+                .fields
+                .iter()
+                .find(|input| input.name == field.name)
+            {
+                restore_legacy_blob_inputs(field, input);
+            }
+        }
+        projected
     } else {
         normalized_converted_schema
     };

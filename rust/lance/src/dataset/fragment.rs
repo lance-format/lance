@@ -309,9 +309,121 @@ impl GenericFileReader for V1Reader {
 }
 
 mod v2_adapter {
+    use arrow_array::{ArrayRef, GenericListArray, OffsetSizeTrait, cast::AsArray};
+    use lance_core::datatypes::{
+        BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_FIELDS, BlobKind, Field as LanceField,
+    };
     use lance_encoding::decoder::FilterExpression;
 
     use super::*;
+
+    /// Request the original descriptor layout from an older file. Adaptation belongs at
+    /// the dataset boundary so the released file readers retain their original behavior.
+    pub(super) fn legacy_blob_read_schema(schema: &Schema) -> Schema {
+        fn adapt(field: &mut LanceField) {
+            if field.is_blob_v2() {
+                field.metadata.remove(lance_arrow::ARROW_EXT_NAME_KEY);
+                field
+                    .metadata
+                    .insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+                field.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+                field.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            } else {
+                for child in &mut field.children {
+                    adapt(child);
+                }
+            }
+        }
+        let mut schema = schema.clone();
+        for field in &mut schema.fields {
+            adapt(field);
+        }
+        schema
+    }
+
+    /// A legacy payload is an Inline Blob v2 extent in the same data file. Normalize
+    /// before batches from different file versions are concatenated or materialized.
+    fn normalize_legacy_blob_batch(batch: RecordBatch, schema: &Schema) -> Result<RecordBatch> {
+        fn adapt(array: &ArrayRef, field: &LanceField) -> Result<ArrayRef> {
+            if field.is_blob_v2() {
+                let descriptors = array.as_struct();
+                let positions = descriptors.column(0).as_primitive::<UInt64Type>();
+                let sizes = descriptors.column(1).as_primitive::<UInt64Type>();
+                let valid = (0..array.len())
+                    .map(|i| {
+                        descriptors.is_valid(i)
+                            && positions.is_valid(i)
+                            && sizes.is_valid(i)
+                            && !(sizes.value(i) == 0 && positions.value(i) != 0)
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Arc::new(StructArray::try_new(
+                    BLOB_V2_DESC_FIELDS.clone(),
+                    vec![
+                        Arc::new(arrow_array::UInt8Array::from(vec![
+                            BlobKind::Inline as u8;
+                            array.len()
+                        ])),
+                        Arc::new(arrow_array::UInt64Array::new(
+                            positions.values().clone(),
+                            None,
+                        )),
+                        Arc::new(arrow_array::UInt64Array::new(sizes.values().clone(), None)),
+                        Arc::new(arrow_array::UInt32Array::from(vec![0; array.len()])),
+                        Arc::new(arrow_array::StringArray::from(vec![""; array.len()])),
+                    ],
+                    Some(arrow_buffer::NullBuffer::from(valid)),
+                )?));
+            }
+            match field.data_type() {
+                DataType::Struct(_) => {
+                    let values = array.as_struct();
+                    let columns = values
+                        .columns()
+                        .iter()
+                        .zip(&field.children)
+                        .map(|(array, field)| adapt(array, field))
+                        .collect::<Result<Vec<_>>>()?;
+                    let fields = field
+                        .children
+                        .iter()
+                        .map(ArrowField::from)
+                        .collect::<Vec<_>>();
+                    Ok(Arc::new(StructArray::try_new(
+                        fields.into(),
+                        columns,
+                        values.nulls().cloned(),
+                    )?))
+                }
+                DataType::List(_) => adapt_list::<i32>(array, field),
+                DataType::LargeList(_) => adapt_list::<i64>(array, field),
+                _ => Ok(array.clone()),
+            }
+        }
+        fn adapt_list<O: OffsetSizeTrait>(
+            array: &ArrayRef,
+            field: &LanceField,
+        ) -> Result<ArrayRef> {
+            let list = array.as_list::<O>();
+            let child = &field.children[0];
+            Ok(Arc::new(GenericListArray::<O>::try_new(
+                Arc::new(ArrowField::from(child)),
+                list.offsets().clone(),
+                adapt(list.values(), child)?,
+                list.nulls().cloned(),
+            )?))
+        }
+        let columns = batch
+            .columns()
+            .iter()
+            .zip(&schema.fields)
+            .map(|(array, field)| adapt(array, field))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(
+            Arc::new(ArrowSchema::from(schema)),
+            columns,
+        )?)
+    }
 
     #[derive(Debug, Clone)]
     pub struct Reader {
@@ -338,37 +450,69 @@ mod v2_adapter {
                 file_scheduler,
             }
         }
+        async fn read_tasks(
+            &self,
+            reader: &ProjectedFileReader,
+            params: ReadBatchParams,
+            batch_size: u32,
+            output_schema: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let has_legacy_blobs = matches!(
+                reader.version(),
+                ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+            ) && output_schema
+                .fields_pre_order()
+                .any(|field| field.is_blob_v2());
+            let physical_schema = if has_legacy_blobs {
+                legacy_blob_read_schema(&output_schema)
+            } else {
+                output_schema.as_ref().clone()
+            };
+            let projection = file_versions::reader_projection_from_field_ids(
+                reader.version(),
+                &physical_schema,
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            Ok(reader
+                .read_tasks(
+                    params,
+                    batch_size,
+                    Some(projection),
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .map(move |task| {
+                    let output_schema = output_schema.clone();
+                    ReadBatchTask {
+                        task: async move {
+                            let batch = task.task.await?;
+                            if has_legacy_blobs {
+                                normalize_legacy_blob_batch(batch, &output_schema)
+                            } else {
+                                Ok(batch)
+                            }
+                        }
+                        .boxed(),
+                        num_rows: task.num_rows,
+                    }
+                })
+                .boxed())
+        }
     }
 
     impl GenericFileReader for Reader {
-        /// Reads the requested range of rows from the file, returning as a stream
         fn read_range_tasks(
             &self,
             range: Range<u64>,
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::Range(range.start as usize..range.end as usize),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::Range(range.start as usize..range.end as usize),
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -378,27 +522,12 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::Ranges(ranges),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::Ranges(ranges),
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -407,27 +536,12 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::RangeFull,
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::RangeFull,
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -440,12 +554,6 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-
                 let reader = if let Some(take_priority) = take_priority {
                     let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
                     let scheduler = self.file_scheduler.with_priority(op_priority);
@@ -456,20 +564,13 @@ mod v2_adapter {
                 } else {
                     self.reader.clone()
                 };
-
-                Ok(reader
-                    .read_tasks(
-                        ReadBatchParams::Indices(indices),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
+                self.read_tasks(
+                    &reader,
+                    ReadBatchParams::Indices(indices),
+                    batch_size,
+                    projection,
+                )
+                .await
             }
             .boxed()
         }
@@ -1315,9 +1416,17 @@ impl FileFragment {
                 }),
         ));
         let file_version = data_file.file_version()?;
+        let physical_schema = if matches!(
+            file_version,
+            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+        ) {
+            v2_adapter::legacy_blob_read_schema(&schema_per_file)
+        } else {
+            schema_per_file.as_ref().clone()
+        };
         let reader_projection = file_versions::reader_projection_from_field_ids(
             file_version,
-            schema_per_file.as_ref(),
+            &physical_schema,
             field_id_to_column_idx.as_ref(),
         )?;
         let file_reader_options = read_config

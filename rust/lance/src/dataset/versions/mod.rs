@@ -146,6 +146,12 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    let normalized_schema = match version {
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            write::promote_legacy_blob_schema(&normalized_schema)?
+        }
+        _ => normalized_schema,
+    };
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
         dataset,

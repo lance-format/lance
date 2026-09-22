@@ -910,7 +910,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_reject_legacy_blob_schema_on_v2_2() {
+    async fn test_take_legacy_blob_input_on_v2_2() {
         let mut metadata = HashMap::new();
         metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
 
@@ -931,12 +931,16 @@ mod test {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(batch)], schema);
-        let err = Dataset::write(batches, "memory://", Some(write_params))
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Legacy blob columns"));
-        assert!(msg.contains("lance.blob.v2"));
+        let dataset = Arc::new(
+            Dataset::write(batches, "memory://", Some(write_params))
+                .await
+                .unwrap(),
+        );
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"hello"
+        );
     }
 
     #[tokio::test]

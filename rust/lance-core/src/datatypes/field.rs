@@ -566,6 +566,40 @@ impl Field {
             || self.is_blob_v2_descriptor()
     }
 
+    /// Represent legacy blobs in this field tree as Blob v2 logical inputs, preserving their identities.
+    ///
+    /// The new logical children have unassigned IDs; callers persisting the schema
+    /// must assign them with [`Self::set_id`]. Existing Blob v2 fields are unchanged.
+    ///
+    /// ```
+    /// # use lance_core::datatypes::Field;
+    /// # fn prepare(field: &mut Field) -> lance_core::Result<()> {
+    /// field.promote_blob_v2()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn promote_blob_v2(&mut self) -> Result<()> {
+        if !self.is_blob() {
+            for child in &mut self.children {
+                child.promote_blob_v2()?;
+            }
+            return Ok(());
+        }
+        if self.is_blob_v2() {
+            return Ok(());
+        }
+        self.logical_type = LogicalType::from("struct");
+        self.encoding = None;
+        self.children = super::BLOB_V2_LOGICAL_MINIMAL_FIELDS
+            .iter()
+            .map(|field| Self::try_from(field.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        self.metadata.remove(BLOB_META_KEY);
+        self.metadata
+            .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        Ok(())
+    }
+
     fn blob_v2_layout(&self) -> Option<BlobV2Layout> {
         if self.extension_name() != Some(BLOB_V2_EXT_NAME) {
             return None;
