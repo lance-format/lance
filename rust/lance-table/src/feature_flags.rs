@@ -64,8 +64,17 @@ pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// The transaction that created a version is stored only in
+/// `Manifest.transaction_section_v2`; no external transaction file is available.
+/// Writers must understand the V2 inline section so concurrent commits can load
+/// the intervening transaction. This accompanies
+/// [`FLAG_DISABLE_TRANSACTION_FILE`]; readers do not require this capability.
+///
+/// Reserved ahead of its implementation. This build treats the bit as unknown
+/// (see `supported_flags_when`), so it cannot write a dataset that requires it.
+pub const FLAG_TRANSACTION_SECTION_V2: u64 = 1 << 11;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 11;
+pub const FLAG_UNKNOWN: u64 = 1 << 12;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -77,6 +86,7 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_TRANSACTION_SECTION_V2 < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -212,6 +222,9 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
     // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
     // until its reader/writer handling lands.
     mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
+    // Reserved for manifests whose transaction exists only in the V2 inline
+    // section. Keep writers fenced out until that section is implemented.
+    mark_supported(&mut supported, FLAG_TRANSACTION_SECTION_V2, false);
     supported
 }
 
@@ -348,6 +361,20 @@ mod tests {
             ensure_can_write_manifest(&manifest).unwrap_err(),
             Error::NotSupported { .. }
         ));
+    }
+
+    /// Reserved ahead of its implementation so this build cannot claim writer
+    /// compatibility with a transaction it would be unable to load on retry.
+    #[test]
+    fn test_transaction_section_v2_flag_is_reserved_not_supported() {
+        assert_eq!(FLAG_TRANSACTION_SECTION_V2, 2048);
+        assert!(!can_write_dataset(FLAG_TRANSACTION_SECTION_V2));
+
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_TRANSACTION_SECTION_V2;
+        let err = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        assert!(err.to_string().contains("cannot be written"), "{err}");
     }
 
     #[test]

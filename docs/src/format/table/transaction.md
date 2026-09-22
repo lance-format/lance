@@ -45,6 +45,12 @@ position of the length-prefixed Transaction message in `transaction_section_v2` 
 Readers that do not recognize this manifest field ignore it, so adding a Transaction operation
 cannot prevent those readers from opening the dataset.
 
+If `transaction_file` is empty and field 22 is the only stored transaction record, the manifest
+must set `FLAG_TRANSACTION_SECTION_V2` (bit 2048) in `writer_feature_flags` in addition to
+`FLAG_DISABLE_TRANSACTION_FILE` (bit 32). The new bit is not required in
+`reader_feature_flags`. This rejects writers that cannot load the inline transaction when
+resolving a concurrent commit while allowing older readers to open the dataset.
+
 Decoding an inline transaction while opening a manifest is an optional cache optimization. An
 undecodable or unsupported Transaction message must not make the manifest unreadable. Code paths
 that explicitly require the transaction may report the decode error.

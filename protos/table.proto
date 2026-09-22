@@ -135,6 +135,10 @@ message Manifest {
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
    * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
+   * * 1 << 10: the fragment reuse index records tagged transitions.
+   * * 1 << 11: transaction_section_v2 is the only stored transaction record.
+   *   This capability is required only for writers; they must understand field 22
+   *   so a concurrent commit can load the intervening transaction.
    */
   uint64 reader_feature_flags = 9;
 
@@ -181,12 +185,15 @@ message Manifest {
   /* The file position of the inline Transaction message. The section begins with
    * the message length as a little-endian u32, followed by that many protobuf bytes.
    *
-   * New writers must use this field for inline transactions. Readers that predate
-   * this field ignore it, so extending Transaction cannot prevent them from opening
-   * the dataset. A reader may decode this section opportunistically, but a decode
-   * failure must not make the manifest unreadable. When absent, the manifest has no
-   * inline transaction at this position; readers may still consult the legacy field
-   * above when the transaction is explicitly requested.
+   * New writers must use this field for inline transactions. When transaction_file
+   * is empty and this is the only stored transaction record, writers must set the
+   * FLAG_TRANSACTION_SECTION_V2 bit (1 << 11) in writer_feature_flags in addition
+   * to FLAG_DISABLE_TRANSACTION_FILE (1 << 5). Readers that predate this field ignore
+   * it, so extending Transaction cannot prevent them from opening the dataset. A
+   * reader may decode this section opportunistically, but a decode failure must not
+   * make the manifest unreadable. When absent, the manifest has no inline transaction
+   * at this position; readers may still consult the legacy field above when the
+   * transaction is explicitly requested.
    */
   optional uint64 transaction_section_v2 = 22;
 
