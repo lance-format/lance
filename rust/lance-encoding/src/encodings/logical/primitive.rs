@@ -8,7 +8,7 @@ use std::{
     fmt::Debug,
     iter,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::Arc,
     vec,
 };
 
@@ -30,18 +30,13 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
-use futures::{
-    FutureExt, TryStreamExt,
-    channel::oneshot,
-    future::{BoxFuture, Shared},
-    stream::FuturesOrdered,
-};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
 use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache},
-    error::{CloneableError, Error, LanceOptionExt},
+    error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
 use log::{debug, trace};
@@ -55,6 +50,7 @@ use crate::{
         compress_required_block, create_rle_decompressor,
     },
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
+    decoder::{IO_REQUEST_BATCH_BYTES, RequestBatch},
     utils::bytepack::BytepackedIntegerEncoder,
 };
 use crate::{
@@ -4201,159 +4197,6 @@ impl DecodePageTask for FixedFullZipDecodeTask {
     }
 }
 
-/// The writer accumulates about this many bytes of values per column before it
-/// cuts pages (`EncodingOptions::cache_bytes_per_column`), and the rep/def
-/// budget of a mini-block chunk then splits that block into many small pages
-/// for nested columns. Batching page reads back up to this size restores one
-/// I/O request per accumulated block.
-const PAGE_READ_BATCH_BYTES: u64 = 8 * 1024 * 1024;
-
-type SharedPageRead =
-    Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
-
-struct PendingPageRead {
-    ranges: Vec<Range<u64>>,
-    priority: u64,
-    /// Receives the batched read and the position of each range in it.
-    tx: oneshot::Sender<(SharedPageRead, Vec<usize>)>,
-}
-
-/// Collects the reads that several page schedulers submit while one
-/// `schedule_next` call schedules them and submits them as a single request.
-///
-/// The I/O scheduler only coalesces ranges within one request, so pages that
-/// sit next to each other in the file would otherwise cost one request each.
-/// A batch is submitted when the job stops scheduling pages or as soon as the
-/// queued reads reach `PAGE_READ_BATCH_BYTES`, so a page that shards its own
-/// reads to bound buffering (blob pages) keeps every shard in a bounded read.
-/// Reads submitted after the final flush (indirect reads issued from inside a
-/// page's load future) pass straight through.
-struct PageReadBatch {
-    inner: Arc<dyn EncodingsIo>,
-    /// Reads collected so far; `None` once the batch was flushed.
-    pending: Mutex<Option<Vec<PendingPageRead>>>,
-}
-
-impl Debug for PageReadBatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PageReadBatch").finish_non_exhaustive()
-    }
-}
-
-impl PageReadBatch {
-    fn new(inner: Arc<dyn EncodingsIo>) -> Self {
-        Self {
-            inner,
-            pending: Mutex::new(Some(Vec::new())),
-        }
-    }
-
-    fn queued_bytes(pending: &[PendingPageRead]) -> u64 {
-        pending
-            .iter()
-            .flat_map(|read| &read.ranges)
-            .map(|range| range.end - range.start)
-            .sum()
-    }
-
-    /// Bytes requested by the reads collected so far.
-    fn pending_bytes(&self) -> u64 {
-        self.pending
-            .lock()
-            .unwrap()
-            .as_deref()
-            .map_or(0, Self::queued_bytes)
-    }
-
-    /// Submits the collected reads and lets later reads pass straight through.
-    fn flush(&self) {
-        if let Some(pending) = self.pending.lock().unwrap().take() {
-            Self::submit_batch(&self.inner, pending);
-        }
-    }
-
-    /// Submits `pending` as one request, sorted by file offset, and hands each
-    /// read its own slice of the result.
-    fn submit_batch(inner: &Arc<dyn EncodingsIo>, pending: Vec<PendingPageRead>) {
-        if pending.is_empty() {
-            return;
-        }
-        // The lowest row number any of the batched pages delivers data for.
-        let priority = pending.iter().map(|read| read.priority).min().unwrap();
-        let mut ordered = pending
-            .iter()
-            .enumerate()
-            .flat_map(|(read_idx, read)| {
-                read.ranges
-                    .iter()
-                    .enumerate()
-                    .map(move |(range_idx, range)| (range.clone(), read_idx, range_idx))
-            })
-            .collect::<Vec<_>>();
-        ordered.sort_by_key(|(range, _, _)| (range.start, range.end));
-        let ranges = ordered
-            .iter()
-            .map(|(range, _, _)| range.clone())
-            .collect::<Vec<_>>();
-        // For every read, where each of its ranges landed in the sorted request.
-        let mut positions = pending
-            .iter()
-            .map(|read| vec![0; read.ranges.len()])
-            .collect::<Vec<_>>();
-        for (position, (_, read_idx, range_idx)) in ordered.iter().enumerate() {
-            positions[*read_idx][*range_idx] = position;
-        }
-        let batched: SharedPageRead = inner
-            .submit_request(ranges, priority)
-            .map(|result| result.map(Arc::new).map_err(CloneableError))
-            .boxed()
-            .shared();
-        for (read, read_positions) in pending.into_iter().zip(positions) {
-            // The receiver is gone only when the page's load future was dropped.
-            let _ = read.tx.send((batched.clone(), read_positions));
-        }
-    }
-}
-
-impl EncodingsIo for PageReadBatch {
-    fn submit_request(
-        &self,
-        ranges: Vec<Range<u64>>,
-        priority: u64,
-    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        let mut pending = self.pending.lock().unwrap();
-        let Some(pending) = pending.as_mut() else {
-            return self.inner.submit_request(ranges, priority);
-        };
-        // Keep every batch within the budget: a page that shards its reads
-        // must not have all its shards collapse into one unbounded read.
-        let bytes = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        if !pending.is_empty() && Self::queued_bytes(pending) + bytes > PAGE_READ_BATCH_BYTES {
-            Self::submit_batch(&self.inner, std::mem::take(pending));
-        }
-        let (tx, rx) = oneshot::channel();
-        pending.push(PendingPageRead {
-            ranges,
-            priority,
-            tx,
-        });
-        async move {
-            let (batched, positions) = rx.await.map_err(|_| {
-                Error::internal("a batched page read was dropped before the batch was submitted")
-            })?;
-            let bytes = batched.await.map_err(|err| err.0)?;
-            Ok(positions
-                .into_iter()
-                .map(|position| bytes[position].clone())
-                .collect())
-        }
-        .boxed()
-    }
-}
-
 #[derive(Debug)]
 struct StructuralPrimitiveFieldSchedulingJob<'a> {
     scheduler: &'a StructuralPrimitiveFieldScheduler,
@@ -4381,7 +4224,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         // Pages are scheduled in row order until their reads add up to a
         // batch, then submitted together so the I/O scheduler can coalesce
         // neighbouring pages.
-        let batch = Arc::new(PageReadBatch::new(context.io().clone()));
+        let batch = Arc::new(RequestBatch::new(context.io().clone()));
         let batch_io: Arc<dyn EncodingsIo> = batch.clone();
         let cur_path = context.current_path();
         let mut scan_lines = Vec::new();
@@ -4423,7 +4266,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
                 }
             }));
 
-            if batch.pending_bytes() < PAGE_READ_BATCH_BYTES {
+            if batch.pending_bytes() < IO_REQUEST_BATCH_BYTES {
                 mapping = self.mappings.next();
             }
         }
@@ -8191,6 +8034,7 @@ mod tests {
         dense_levels_from_block, map_ranges_to_pages, pages_overlapping_ranges,
         validate_complex_all_null_levels,
     };
+    use crate::EncodingsIo;
     use crate::buffer::LanceBuffer;
     use crate::compression::{
         BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
@@ -8202,7 +8046,7 @@ mod tests {
     };
     use crate::data::BlockInfo;
     use crate::decoder::{
-        FilterExpression, PageEncoding, SchedulerContext, StructuralFieldDecoder,
+        FilterExpression, PageEncoding, RequestBatch, SchedulerContext, StructuralFieldDecoder,
         StructuralFieldScheduler,
     };
     use crate::encodings::logical::primitive::fullzip::PerValueCompressor;
@@ -9799,7 +9643,6 @@ mod tests {
             PageInfoAndScheduler, PageInitialization, PageInitializationBuffers, PageLoadTask,
             StructuralPrimitiveFieldScheduler,
         };
-        use crate::EncodingsIo;
         use crate::decoder::{FilterExpression, SchedulerContext, StructuralFieldScheduler};
 
         // Give each fake page one fixed-size metadata buffer. The ranges are far
@@ -10132,7 +9975,6 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_builds_only_requested_page_schedulers() {
-        use crate::EncodingsIo;
         use crate::compression::DefaultDecompressionStrategy;
         use crate::decoder::{
             ColumnInfo, FilterExpression, PageEncoding, PageInfo, SchedulerContext,
@@ -10278,11 +10120,8 @@ mod tests {
 
     #[tokio::test]
     async fn page_read_batch_submits_pending_reads_as_one_request() {
-        use super::PageReadBatch;
-        use crate::EncodingsIo;
-
         let io = Arc::new(RecordingScheduler::default());
-        let batch = PageReadBatch::new(io.clone());
+        let batch = RequestBatch::new(io.clone());
         let first = batch.submit_request(vec![100..108, 300..308], 7);
         let second = batch.submit_request(vec![200..208], 3);
         assert_eq!(batch.pending_bytes(), 24);
@@ -10314,7 +10153,7 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].as_ref(), &200_u64.to_le_bytes());
 
-        // Reads submitted after the flush go straight to the wrapped I/O.
+        // A read submitted after the flush is batched until it is awaited.
         let late = batch.submit_request(vec![400..408], 9).await.unwrap();
         assert_eq!(late[0].as_ref(), &400_u64.to_le_bytes());
         assert_eq!(io.requests.lock().unwrap().len(), 2);
@@ -10322,8 +10161,8 @@ mod tests {
         // Queued reads that would exceed the budget are submitted first, so
         // no batch grows past it.
         let io = Arc::new(RecordingScheduler::default());
-        let batch = PageReadBatch::new(io.clone());
-        let budget = super::PAGE_READ_BATCH_BYTES;
+        let batch = RequestBatch::new(io.clone());
+        let budget = crate::decoder::IO_REQUEST_BATCH_BYTES;
         let first = batch.submit_request(vec![0..budget], 1);
         assert!(io.requests.lock().unwrap().is_empty());
         let second = batch.submit_request(vec![budget..(budget + 8)], 2);
@@ -10339,13 +10178,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_batch_flush_keeps_collecting_and_awaiting_flushes() {
+        let io = Arc::new(RecordingScheduler::default());
+        let batch = RequestBatch::new(io.clone());
+        let first = batch.submit_request(vec![100..108], 1);
+        let second = batch.submit_request(vec![300..308], 2);
+        batch.flush();
+        assert_eq!(
+            io.requests.lock().unwrap().as_slice(),
+            &[vec![100..108, 300..308]],
+            "a flush submits the collected reads as one request"
+        );
+        // The batch keeps collecting after a flush.
+        let third = batch.submit_request(vec![500..508], 3);
+        let fourth = batch.submit_request(vec![700..708], 4);
+        assert_eq!(batch.pending_bytes(), 16);
+        assert_eq!(io.requests.lock().unwrap().len(), 1);
+        // Awaiting a read submits whatever is queued, so a read queued outside
+        // a scheduling step (indirect I/O) is never stuck behind a missing flush.
+        assert_eq!(third.await.unwrap()[0].as_ref(), &500_u64.to_le_bytes());
+        assert_eq!(
+            io.requests.lock().unwrap().as_slice(),
+            &[vec![100..108, 300..308], vec![500..508, 700..708]]
+        );
+        assert_eq!(fourth.await.unwrap()[0].as_ref(), &700_u64.to_le_bytes());
+        assert_eq!(first.await.unwrap()[0].as_ref(), &100_u64.to_le_bytes());
+        assert_eq!(second.await.unwrap()[0].as_ref(), &300_u64.to_le_bytes());
+        assert_eq!(io.requests.lock().unwrap().len(), 2);
+
+        // Futures that submit when first polled and are polled in the same
+        // pass (struct children initializing, list columns fetching items)
+        // end up in one request: the flush waits for one yield.
+        let (fifth, sixth) = futures::join!(
+            async { batch.submit_request(vec![900..908], 5).await.unwrap() },
+            async { batch.submit_request(vec![1100..1108], 6).await.unwrap() },
+        );
+        assert_eq!(fifth[0].as_ref(), &900_u64.to_le_bytes());
+        assert_eq!(sixth[0].as_ref(), &1100_u64.to_le_bytes());
+        assert_eq!(
+            io.requests.lock().unwrap().last().unwrap(),
+            &vec![900..908, 1100..1108],
+            "reads submitted by sibling futures share one request"
+        );
+        assert_eq!(io.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn schedule_next_batches_page_reads_up_to_the_budget() {
         use super::{
-            CachedPageData, PAGE_READ_BATCH_BYTES, PageInfoAndScheduler, PageInitialization,
+            CachedPageData, IO_REQUEST_BATCH_BYTES, PageInfoAndScheduler, PageInitialization,
             PageInitializationBuffers, PageLoadTask, StructuralPageScheduler,
             StructuralPrimitiveFieldScheduler,
         };
-        use crate::EncodingsIo;
         use crate::decoder::{FilterExpression, SchedulerContext, StructuralFieldScheduler};
 
         /// A page that reads `data_ranges`, one shard (and one load task) per
@@ -10433,6 +10317,7 @@ mod tests {
         let mut context = SchedulerContext::new(io.clone(), cache.clone());
         let mut job = scheduler.schedule_ranges(&[5..45], &filter).unwrap();
         let scan_lines = job.schedule_next(&mut context).unwrap();
+        context.flush_io();
         assert_eq!(scan_lines.len(), 5, "one scan line per touched page");
         assert_eq!(
             scan_lines
@@ -10459,13 +10344,15 @@ mod tests {
 
         // Pages as large as the batch budget are read one request at a time.
         let io = Arc::new(RecordingScheduler::default());
-        let scheduler = scheduler_with_pages(PAGE_READ_BATCH_BYTES, 2);
+        let scheduler = scheduler_with_pages(IO_REQUEST_BATCH_BYTES, 2);
         let mut context = SchedulerContext::new(io.clone(), cache);
         let mut job = scheduler.schedule_ranges(&[0..20], &filter).unwrap();
         let first = job.schedule_next(&mut context).unwrap();
+        context.flush_io();
         assert_eq!(first.len(), 1);
         assert_eq!(io.requests.lock().unwrap().len(), 1);
         let second = job.schedule_next(&mut context).unwrap();
+        context.flush_io();
         assert_eq!(second.len(), 1);
         assert_eq!(io.requests.lock().unwrap().len(), 2);
         assert!(job.schedule_next(&mut context).unwrap().is_empty());
@@ -10473,7 +10360,7 @@ mod tests {
         // A page that shards its own reads (like a blob page) keeps every
         // shard in a bounded read instead of one request for the whole page.
         let io = Arc::new(RecordingScheduler::default());
-        let shard = PAGE_READ_BATCH_BYTES;
+        let shard = IO_REQUEST_BATCH_BYTES;
         let scheduler = StructuralPrimitiveFieldScheduler::from_page_schedulers(
             vec![PageInfoAndScheduler {
                 page_index: 0,
@@ -10491,6 +10378,7 @@ mod tests {
         );
         let mut job = scheduler.schedule_ranges(&[0..10], &filter).unwrap();
         let scan_lines = job.schedule_next(&mut context).unwrap();
+        context.flush_io();
         assert_eq!(scan_lines.len(), 2, "one scan line per shard");
         assert_eq!(
             io.requests.lock().unwrap().as_slice(),
