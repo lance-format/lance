@@ -81,13 +81,45 @@ fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
 const EX_QUANTIZATION_EPSILON: f32 = 1.0e-5;
 const EX_TIGHT_START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
 
+#[derive(Default)]
+struct ExQuantizationScratch {
+    abs_normalized: Vec<f32>,
+    current_codes: Vec<usize>,
+    thresholds: Vec<u64>,
+    radix: Vec<u64>,
+    comparison: Vec<(f32, usize)>,
+    offsets: Vec<usize>,
+}
+
+impl ExQuantizationScratch {
+    fn new(dim: usize, ex_bits: u8) -> Self {
+        if ex_bits == 0 {
+            return Self::default();
+        }
+        let max_events = dim * ((1usize << ex_bits) - 1);
+        // Growing buffers on workers can realloc blocks from another malloc
+        // arena. Allocate the known bounds once and reuse them across rows.
+        Self {
+            abs_normalized: Vec::with_capacity(dim),
+            current_codes: Vec::with_capacity(dim),
+            thresholds: Vec::with_capacity(max_events),
+            radix: Vec::with_capacity(max_events),
+            comparison: Vec::with_capacity(max_events),
+            offsets: Vec::with_capacity(dim),
+        }
+    }
+}
+
+// Amortize scratch allocation without changing the global Rayon thread pool.
+const QUANTIZATION_MIN_ROWS_PER_JOB: usize = 64;
+
 /// Sort packed `(positive_f32_bits, index)` values by their floating-point key.
 ///
 /// All thresholds emitted by [`best_ex_rescale_factor`] are positive and finite,
 /// so their IEEE-754 bit patterns have the same order as the represented values.
 /// Four stable byte-wise passes avoid the comparison-heavy tuple sort on every
 /// vector while preserving the exact threshold order.
-fn radix_sort_positive_f32_indices(values: &mut [u64]) {
+fn radix_sort_positive_f32_indices(values: &mut [u64], scratch: &mut Vec<u64>) {
     if values.len() < 2 {
         return;
     }
@@ -110,11 +142,11 @@ fn radix_sort_positive_f32_indices(values: &mut [u64]) {
         }
     }
 
-    let mut scratch = vec![0u64; values.len()];
-    pass(values, &mut scratch, 32);
-    pass(&scratch, values, 40);
-    pass(values, &mut scratch, 48);
-    pass(&scratch, values, 56);
+    scratch.resize(values.len(), 0);
+    pass(values, scratch, 32);
+    pass(scratch, values, 40);
+    pass(values, scratch, 48);
+    pass(scratch, values, 56);
 }
 
 /// Sort RQ threshold events without changing the existing equal-key behavior.
@@ -123,8 +155,14 @@ fn radix_sort_positive_f32_indices(values: &mut [u64]) {
 /// order chosen by the previous unstable comparison sort remains observable when
 /// thresholds tie. Radix sort the common unique-key case, but reconstruct the
 /// original event order and use the previous sort when duplicate keys are found.
-fn sort_ex_thresholds(values: &mut [u64], dim: usize) {
-    radix_sort_positive_f32_indices(values);
+fn sort_ex_thresholds(
+    values: &mut [u64],
+    radix: &mut Vec<u64>,
+    comparison: &mut Vec<(f32, usize)>,
+    offsets: &mut Vec<usize>,
+    dim: usize,
+) {
+    radix_sort_positive_f32_indices(values, radix);
     let has_duplicate_keys = values
         .windows(2)
         .any(|pair| pair[0] >> u32::BITS == pair[1] >> u32::BITS);
@@ -135,7 +173,8 @@ fn sort_ex_thresholds(values: &mut [u64], dim: usize) {
     // Events were emitted by dimension, then increasing threshold. A stable
     // counting scatter restores that order in linear time. Preserve the exact
     // tuple type and comparison sort because its equal-key order is observable.
-    let mut offsets = vec![0usize; dim];
+    offsets.clear();
+    offsets.resize(dim, 0);
     for &value in values.iter() {
         offsets[value as u32 as usize] += 1;
     }
@@ -145,7 +184,7 @@ fn sort_ex_thresholds(values: &mut [u64], dim: usize) {
         *count = offset;
         offset = next;
     }
-    let mut comparison = vec![(0.0, 0); values.len()];
+    comparison.resize(values.len(), (0.0, 0));
     for &value in values.iter() {
         let idx = value as u32 as usize;
         comparison[offsets[idx]] = (f32::from_bits((value >> u32::BITS) as u32), idx);
@@ -157,7 +196,15 @@ fn sort_ex_thresholds(values: &mut [u64], dim: usize) {
     }
 }
 
-fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+fn best_ex_rescale_factor(scratch: &mut ExQuantizationScratch, ex_bits: u8) -> f32 {
+    let ExQuantizationScratch {
+        abs_normalized,
+        current_codes,
+        thresholds,
+        radix,
+        comparison,
+        offsets,
+    } = scratch;
     let max_value = abs_normalized
         .iter()
         .copied()
@@ -171,10 +218,10 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let t_end = ((max_code + 10) as f32) / max_value;
     let t_start = t_end * EX_TIGHT_START[ex_bits as usize];
 
-    let mut current_codes = Vec::with_capacity(abs_normalized.len());
+    current_codes.clear();
     let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
     let mut numerator = 0.0f32;
-    let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+    thresholds.clear();
 
     for (idx, &value) in abs_normalized.iter().enumerate() {
         if value <= 0.0 || !value.is_finite() {
@@ -200,11 +247,11 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         }
     }
 
-    sort_ex_thresholds(&mut thresholds, abs_normalized.len());
+    sort_ex_thresholds(thresholds, radix, comparison, offsets, abs_normalized.len());
 
     let mut best_inner_product = numerator / squared_denominator.sqrt();
     let mut best_t = t_start;
-    for packed_threshold in thresholds {
+    for &packed_threshold in thresholds.iter() {
         let threshold = f32::from_bits((packed_threshold >> u32::BITS) as u32);
         let idx = packed_threshold as u32 as usize;
         current_codes[idx] += 1;
@@ -227,6 +274,7 @@ fn quantize_ex_code(
     ex_bits: u8,
     ex_code_dst: &mut [u8],
     ex_code_values_dst: &mut [u8],
+    scratch: &mut ExQuantizationScratch,
 ) -> f32 {
     debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
     let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
@@ -237,11 +285,11 @@ fn quantize_ex_code(
     }
 
     let norm = norm_squared.sqrt();
-    let abs_normalized = rotated
-        .iter()
-        .map(|value| value.abs() / norm)
-        .collect::<Vec<_>>();
-    let t = best_ex_rescale_factor(&abs_normalized, ex_bits);
+    scratch.abs_normalized.clear();
+    scratch
+        .abs_normalized
+        .extend(rotated.iter().map(|value| value.abs() / norm));
+    let t = best_ex_rescale_factor(scratch, ex_bits);
     let max_code = ((1u16 << ex_bits) - 1) as u8;
     let mask = max_code;
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
@@ -249,7 +297,7 @@ fn quantize_ex_code(
 
     for ((&value, &abs_value), ex_code_value) in rotated
         .iter()
-        .zip(abs_normalized.iter())
+        .zip(scratch.abs_normalized.iter())
         .zip(ex_code_values_dst.iter_mut())
     {
         let mut ex_code = ((t * abs_value) + EX_QUANTIZATION_EPSILON)
@@ -724,9 +772,14 @@ impl RabitQuantizer {
                 .zip(ex_code_values.par_chunks_mut(code_dim))
                 .zip(ex_res_dot_dists.par_iter_mut())
                 .zip(rotated_residuals.par_chunks(code_dim))
-                .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
-                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
-                });
+                .with_min_len(QUANTIZATION_MIN_ROWS_PER_JOB)
+                .for_each_init(
+                    || ExQuantizationScratch::new(code_dim, ex_bits),
+                    |scratch, (((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
+                        *ex_dot_dst =
+                            quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst, scratch);
+                    },
+                );
         }
 
         let binary_codes = UInt8Array::from(encoded_codes);
@@ -1042,7 +1095,7 @@ mod tests {
         let mut expected = values.clone();
         expected.sort_by_key(|value| *value >> u32::BITS);
 
-        radix_sort_positive_f32_indices(&mut values);
+        radix_sort_positive_f32_indices(&mut values, &mut Vec::new());
 
         assert_eq!(values, expected);
     }
@@ -1063,10 +1116,19 @@ mod tests {
         values[2] = f32::INFINITY;
         values[3] = values[4];
 
+        let mut scratch = ExQuantizationScratch::default();
         for ex_bits in 1..=8 {
-            let expected = reference_best_ex_rescale_factor(&values, ex_bits);
-            let actual = best_ex_rescale_factor(&values, ex_bits);
-            assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
+            for len in [1536, 0, 8, 768] {
+                scratch.abs_normalized.clear();
+                scratch.abs_normalized.extend_from_slice(&values[..len]);
+                let expected = reference_best_ex_rescale_factor(&values[..len], ex_bits);
+                let actual = best_ex_rescale_factor(&mut scratch, ex_bits);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "ex_bits={ex_bits}, len={len}"
+                );
+            }
         }
     }
 
@@ -1078,6 +1140,8 @@ mod tests {
         #[case] dim: usize,
         #[case] max_code: usize,
     ) {
+        let mut scratch = ExQuantizationScratch::default();
+        // Reuse buffers across different event counts, including the empty case.
         for rows in [dim, dim / 2, 0, dim] {
             let mut original = Vec::new();
             for idx in 0..rows {
@@ -1091,7 +1155,13 @@ mod tests {
                 .map(|&(key, idx)| ((key.to_bits() as u64) << 32) | idx as u64)
                 .collect::<Vec<_>>();
             original.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
-            sort_ex_thresholds(&mut actual, dim);
+            sort_ex_thresholds(
+                &mut actual,
+                &mut scratch.radix,
+                &mut scratch.comparison,
+                &mut scratch.offsets,
+                dim,
+            );
             let expected = original
                 .iter()
                 .map(|&(key, idx)| ((key.to_bits() as u64) << 32) | idx as u64)
@@ -1114,7 +1184,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         let expected = reference_best_ex_rescale_factor(&abs_normalized, 7);
-        let actual = best_ex_rescale_factor(&abs_normalized, 7);
+        let actual = best_ex_rescale_factor(
+            &mut ExQuantizationScratch {
+                abs_normalized,
+                ..Default::default()
+            },
+            7,
+        );
 
         assert_eq!(actual.to_bits(), expected.to_bits());
     }
