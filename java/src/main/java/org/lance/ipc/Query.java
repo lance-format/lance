@@ -24,6 +24,7 @@ public class Query {
 
   private final String column;
   private final float[] key;
+  private final int queryVectorDim;
   private final int k;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
@@ -38,6 +39,14 @@ public class Query {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
+    Preconditions.checkArgument(
+        builder.queryVectorDim >= 0, "Query vector dimension must not be negative");
+    if (builder.queryVectorDim > 0) {
+      Preconditions.checkArgument(
+          builder.key.length > 0 && builder.key.length % builder.queryVectorDim == 0,
+          "Batch query buffer length must be a positive multiple of the query vector dimension");
+    }
+    this.queryVectorDim = builder.queryVectorDim;
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
     Preconditions.checkArgument(
         builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
@@ -62,6 +71,16 @@ public class Query {
 
   public float[] getKey() {
     return key;
+  }
+
+  /**
+   * Returns the length of each query vector when {@link #getKey()} packs a batch of query vectors,
+   * or {@code 0} for a single-vector query.
+   *
+   * @return The per-vector dimension of a batch query, or {@code 0} for a single-vector query.
+   */
+  public int getQueryVectorDim() {
+    return queryVectorDim;
   }
 
   public int getK() {
@@ -113,6 +132,7 @@ public class Query {
     return MoreObjects.toStringHelper(this)
         .add("column", column)
         .add("key", key)
+        .add("queryVectorDim", queryVectorDim)
         .add("k", k)
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
@@ -128,6 +148,7 @@ public class Query {
   public static class Builder {
     private String column;
     private float[] key;
+    private int queryVectorDim = 0;
     private int k = 10;
     private int minimumNprobes = 1;
     private Optional<Integer> maximumNprobes = Optional.empty();
@@ -161,6 +182,37 @@ public class Query {
      */
     public Builder setKey(float[] key) {
       this.key = key;
+      this.queryVectorDim = 0;
+      return this;
+    }
+
+    /**
+     * Sets multiple query vectors for a batch nearest-neighbor search.
+     *
+     * <p>Every row must be non-null and share the same length, which must match the target vector
+     * column dimension. The rows are flattened row-major into a single query buffer. Unlike {@link
+     * #setKey(float[])}, results of a batch query carry an additional non-nullable {@code
+     * query_index} column (the zero-based offset of the query vector that produced each row) and
+     * contain up to {@code k} rows per query vector.
+     *
+     * @param keys The search vectors, one per row.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setKeys(float[][] keys) {
+      Preconditions.checkNotNull(keys, "Keys must not be null");
+      Preconditions.checkArgument(keys.length > 0, "Keys must not be empty");
+      Preconditions.checkNotNull(keys[0], "Query vector must not be null");
+      int dim = keys[0].length;
+      Preconditions.checkArgument(dim > 0, "Query vector dimension must be greater than 0");
+      float[] flattened = new float[keys.length * dim];
+      for (int i = 0; i < keys.length; i++) {
+        Preconditions.checkNotNull(keys[i], "Query vector must not be null");
+        Preconditions.checkArgument(
+            keys[i].length == dim, "All query vectors must have the same dimension");
+        System.arraycopy(keys[i], 0, flattened, i * dim, dim);
+      }
+      this.key = flattened;
+      this.queryVectorDim = dim;
       return this;
     }
 
