@@ -2432,7 +2432,7 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 
     assert_eq!(cloned.count_rows(None).await.unwrap(), 32);
     assert_ne!(cloned.manifest().transaction_file, source_transaction_file);
-    assert!(cloned.manifest().transaction_section.is_some());
+    assert!(cloned.manifest().transaction_section_position().is_some());
 }
 
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has

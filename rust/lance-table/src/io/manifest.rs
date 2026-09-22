@@ -198,12 +198,16 @@ async fn do_write_manifest(
         // Convert to protobuf at the write boundary to persist inline
         let pb_tx: pb::Transaction = tx.into();
         let pos = writer.write_protobuf(&pb_tx).await?;
-        manifest.transaction_section = Some(pos);
+        // Field 21 must remain absent so pre-v12 readers ignore transaction
+        // operations added after they were released.
+        manifest.transaction_section = None;
+        manifest.transaction_section_v2 = Some(pos);
     } else {
         // No inline copy is written to this file. Clear any offset inherited
         // from a previous manifest (e.g. via restore or clone), which would
         // otherwise point at arbitrary bytes of the file being written.
         manifest.transaction_section = None;
+        manifest.transaction_section_v2 = None;
     }
 
     writer.write_struct(manifest).await

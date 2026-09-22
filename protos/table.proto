@@ -170,11 +170,25 @@ message Manifest {
    */
   string transaction_file = 12;
 
-  /* The file position of the transaction content. None if transaction is empty
-   * This transaction content begins with the transaction content length as u32
-   * If the transaction proto message has a length of `len`, the message ends at `len` + 4
+  /* The legacy file position of the transaction content. New writers must leave
+   * this field absent and use transaction_section_v2 instead. Readers may use this
+   * field when a caller explicitly requests an old transaction, but must not decode
+   * it while opening the manifest: readers before v12.0.0 made an unknown
+   * Transaction operation fatal to opening the dataset.
    */
   optional uint64 transaction_section = 21;
+
+  /* The file position of the inline Transaction message. The section begins with
+   * the message length as a little-endian u32, followed by that many protobuf bytes.
+   *
+   * New writers must use this field for inline transactions. Readers that predate
+   * this field ignore it, so extending Transaction cannot prevent them from opening
+   * the dataset. A reader may decode this section opportunistically, but a decode
+   * failure must not make the manifest unreadable. When absent, the manifest has no
+   * inline transaction at this position; readers may still consult the legacy field
+   * above when the transaction is explicitly requested.
+   */
+  optional uint64 transaction_section_v2 = 22;
 
   /* The next unused row id. If zero, then the table does not have any rows.
    *

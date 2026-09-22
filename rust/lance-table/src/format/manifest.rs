@@ -80,8 +80,17 @@ pub struct Manifest {
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
-    /// The file position of the inline transaction content inside the manifest
+    /// The legacy file position of inline transaction content inside the manifest.
+    ///
+    /// New manifests use [`Self::transaction_section_v2`]. This remains readable
+    /// so callers can explicitly retrieve transactions from older manifests.
     pub transaction_section: Option<usize>,
+
+    /// The file position of forward-compatible inline transaction content.
+    ///
+    /// Readers that predate this field ignore it instead of eagerly decoding a
+    /// transaction operation they may not recognize.
+    pub transaction_section_v2: Option<usize>,
 
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
@@ -194,6 +203,7 @@ impl Manifest {
             max_fragment_id: None,
             transaction_file: None,
             transaction_section: None,
+            transaction_section_v2: None,
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
@@ -225,6 +235,7 @@ impl Manifest {
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
+            transaction_section_v2: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
@@ -293,6 +304,7 @@ impl Manifest {
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
+            transaction_section_v2: None,
             fragment_offsets: self.fragment_offsets.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
@@ -316,6 +328,14 @@ impl Manifest {
                 .unwrap_or_default()
                 .naive_utc(),
         )
+    }
+
+    /// Return the inline transaction position, preferring the current field.
+    ///
+    /// The legacy field is retained only so transactions in older manifests can
+    /// still be retrieved when explicitly requested.
+    pub fn transaction_section_position(&self) -> Option<usize> {
+        self.transaction_section_v2.or(self.transaction_section)
     }
 
     /// Set the `timestamp_nanos` value from a Utc DateTime
@@ -1034,6 +1054,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 Some(p.transaction_file)
             },
             transaction_section: p.transaction_section.map(|i| i as usize),
+            transaction_section_v2: p.transaction_section_v2.map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -1111,6 +1132,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            transaction_section_v2: m.transaction_section_v2.map(|i| i as u64),
         }
     }
 }

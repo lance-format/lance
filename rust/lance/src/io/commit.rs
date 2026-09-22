@@ -313,7 +313,7 @@ async fn read_manifest_transaction(
     manifest: &Manifest,
     location: &ManifestLocation,
 ) -> Result<Option<Transaction>> {
-    if let Some(position) = manifest.transaction_section {
+    if let Some(position) = manifest.transaction_section_position() {
         let reader = if let Some(size) = location.size {
             object_store
                 .open_with_size(&location.path, size as usize)
@@ -2828,7 +2828,8 @@ mod tests {
 
         assert_eq!(manifest.version, 2);
         assert!(manifest.transaction_file.is_none());
-        assert!(manifest.transaction_section.is_some());
+        assert!(manifest.transaction_section.is_none());
+        assert!(manifest.transaction_section_v2.is_some());
     }
 
     /// A commit that errors without landing keeps today's behavior:
