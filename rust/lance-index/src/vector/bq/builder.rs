@@ -22,7 +22,7 @@ use crate::vector::bq::storage::{
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
-    SCALE_FACTORS_FIELD,
+    RabitRowFactors, SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
     RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
@@ -63,8 +63,11 @@ pub struct RabitQuantizer {
 pub(crate) struct RabitQuantizedBatch {
     pub binary_codes: ArrayRef,
     pub ex_codes: Option<ArrayRef>,
+    #[cfg(test)]
     pub ex_res_dot_dists: Option<Vec<f32>>,
+    #[cfg(test)]
     pub rotated_residuals: Option<Vec<f32>>,
+    #[cfg(test)]
     pub ex_code_values: Option<Vec<u8>>,
 }
 
@@ -317,6 +320,129 @@ fn quantize_ex_code(
 }
 
 impl RabitQuantizer {
+    /// Consume each rotated row and its unpacked codes before reusing scratch.
+    pub(crate) fn quantize_with_factors<F>(
+        &self,
+        vectors: &FixedSizeListArray,
+        factors: F,
+    ) -> Result<(RabitQuantizedBatch, Vec<RabitRowFactors>)>
+    where
+        F: Fn(usize, &[f32], Option<&[u8]>, f32) -> RabitRowFactors + Sync,
+    {
+        match vectors.value_type() {
+            DataType::Float16 => self.transform_with_factors::<Float16Type, F>(vectors, factors),
+            DataType::Float32 => self.transform_with_factors::<Float32Type, F>(vectors, factors),
+            DataType::Float64 => self.transform_with_factors::<Float64Type, F>(vectors, factors),
+            value_type => Err(Error::invalid_input(format!(
+                "Unsupported data type: {value_type:?}"
+            ))),
+        }
+    }
+
+    fn transform_with_factors<T, F>(
+        &self,
+        vectors: &FixedSizeListArray,
+        factors: F,
+    ) -> Result<(RabitQuantizedBatch, Vec<RabitRowFactors>)>
+    where
+        T: ArrowFloatType,
+        T::Native: AsPrimitive<f32> + Sync,
+        F: Fn(usize, &[f32], Option<&[u8]>, f32) -> RabitRowFactors + Sync,
+    {
+        let values = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or_else(|| Error::invalid_input("RQ vector value type mismatch"))?;
+        let values = values.as_slice();
+        let dim = self.code_dim();
+        let ex_bits = rabit_ex_bits(self.num_bits())?;
+        let code_bytes = rabit_binary_code_bytes(dim);
+        let ex_code_bytes = if ex_bits == 0 {
+            0
+        } else {
+            crate::vector::bq::ex_dot::blocked_ex_code_bytes(dim, ex_bits)
+        };
+        // A one-byte stride keeps the same row traversal for one-bit quantizers.
+        let ex_stride = ex_code_bytes.max(1);
+        let mut codes = vec![0; vectors.len() * code_bytes];
+        let mut ex_codes = vec![0; vectors.len() * ex_stride];
+        let mut row_factors = vec![RabitRowFactors::default(); vectors.len()];
+        let matrix_rotated = match self.rotation_type() {
+            RQRotationType::Matrix => {
+                let input = ndarray::ArrayView2::from_shape((vectors.len(), self.dim()), values)
+                    .map_err(|error| Error::invalid_input(error.to_string()))?;
+                Some(self.rotate_vectors::<T>(input.t()))
+            }
+            RQRotationType::Fast => None,
+        };
+        let signs =
+            (self.rotation_type() == RQRotationType::Fast).then(|| self.fast_rotation_signs());
+
+        codes
+            .par_chunks_mut(code_bytes)
+            .zip(ex_codes.par_chunks_mut(ex_stride))
+            .zip(row_factors.par_iter_mut())
+            .zip(values.par_chunks_exact(self.dim()))
+            .enumerate()
+            .with_min_len(QUANTIZATION_MIN_ROWS_PER_JOB)
+            .for_each_init(
+                || {
+                    (
+                        vec![0.0f32; dim],
+                        vec![0u8; dim],
+                        ExQuantizationScratch::new(dim, ex_bits),
+                    )
+                },
+                |(rotated, ex_values, scratch),
+                 (row, (((code_dst, ex_dst), factor_dst), input))| {
+                    if let Some(matrix_rotated) = &matrix_rotated {
+                        for (dst, &value) in rotated.iter_mut().zip(matrix_rotated.column(row)) {
+                            *dst = value;
+                        }
+                    } else if let Some(signs) = signs {
+                        apply_fast_rotation(input, rotated, signs);
+                    }
+                    pack_sign_bits(code_dst, rotated);
+                    let ex_dot = if ex_bits != 0 {
+                        quantize_ex_code(rotated, ex_bits, ex_dst, ex_values, scratch)
+                    } else {
+                        0.0
+                    };
+                    *factor_dst = factors(
+                        row,
+                        rotated,
+                        (ex_bits != 0).then_some(ex_values.as_slice()),
+                        ex_dot,
+                    );
+                },
+            );
+
+        Ok((
+            RabitQuantizedBatch {
+                binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(codes),
+                    code_bytes as i32,
+                )?),
+                ex_codes: if ex_bits != 0 {
+                    Some(Arc::new(FixedSizeListArray::try_new_from_values(
+                        UInt8Array::from(ex_codes),
+                        ex_code_bytes as i32,
+                    )?))
+                } else {
+                    None
+                },
+                #[cfg(test)]
+                rotated_residuals: None,
+                #[cfg(test)]
+                ex_code_values: None,
+                #[cfg(test)]
+                ex_res_dot_dists: None,
+            },
+            row_factors,
+        ))
+    }
+
     pub fn new<T: ArrowFloatType>(num_bits: u8, dim: i32) -> Self {
         Self::new_with_rotation::<T>(num_bits, dim, RQRotationType::default())
     }
@@ -795,8 +921,11 @@ impl RabitQuantizer {
                         .map(|array| Arc::new(array) as ArrayRef)
                 })
                 .transpose()?,
+            #[cfg(test)]
             ex_res_dot_dists,
+            #[cfg(test)]
             rotated_residuals: Some(rotated_residuals),
+            #[cfg(test)]
             ex_code_values,
         })
     }
