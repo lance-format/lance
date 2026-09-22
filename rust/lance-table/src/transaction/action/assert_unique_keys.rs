@@ -23,6 +23,13 @@ use lance_core::{Error, Result};
 /// columns and their filters do not intersect. An operation carrying one is not
 /// compatible with a concurrent operation that inserts rows without saying which
 /// keys they carry, because there is nothing to compare against.
+///
+/// An assertion speaks for *every* row the operation inserts, over its key
+/// columns. An operation may carry several, one per key column set, but each
+/// must still cover all of its inserted rows: two merge-inserts over different
+/// keys squashed into one operation cannot each assert only their own rows,
+/// because the other's rows carry values in those columns too. Conflict
+/// detection matches assertions by key column set on that assumption.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertUniqueKeys {
     /// The key columns, in order. This is the authoritative list; the field ids
@@ -99,7 +106,7 @@ mod tests {
     use crate::format::key_existence::FilterType;
     use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{
-        Action, AddFragment, CompositeOperation, RemoveFragment, UserAction,
+        Action, AddFragment, CompositeOperation, RemoveFragment, TombstoneFieldData, UserAction,
     };
 
     fn assertion(key_fields: Vec<Ref>, hashes: &[u64]) -> Action {
@@ -201,6 +208,56 @@ mod tests {
         let theirs = footprint(vec![append(0), assertion(vec![Ref::Committed(1)], &[2])]);
 
         assert!(ours.conflicts_with(&theirs));
+    }
+
+    /// Each assertion speaks for every row the set inserts, over its own key
+    /// columns. A set carrying two of them -- a table with two unique keys,
+    /// each asserted over all the inserted rows -- is compared column set by
+    /// column set, not every assertion against every other.
+    #[test]
+    fn test_assertions_are_matched_by_key_column() {
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![Ref::Committed(0)], &[1]),
+            assertion(vec![Ref::Committed(1)], &[5]),
+        ]);
+        let disjoint = footprint(vec![
+            append(0),
+            assertion(vec![Ref::Committed(0)], &[2]),
+            assertion(vec![Ref::Committed(1)], &[6]),
+        ]);
+        let overlapping_on_the_second = footprint(vec![
+            append(0),
+            assertion(vec![Ref::Committed(0)], &[2]),
+            assertion(vec![Ref::Committed(1)], &[5]),
+        ]);
+        let silent_on_the_second =
+            footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[2])]);
+
+        assert!(!ours.conflicts_with(&disjoint));
+        assert!(ours.conflicts_with(&overlapping_on_the_second));
+        // An insert that says nothing about one of our key columns could have
+        // put anything in it.
+        assert!(ours.conflicts_with(&silent_on_the_second));
+    }
+
+    /// A key does not have to arrive in a new row. Rewriting a key column in
+    /// place -- a column rewrite, an overlay -- can put any value in it, and the
+    /// writer asserts nothing about which, so the assertion cannot be checked.
+    #[test]
+    fn test_an_assertion_conflicts_with_an_in_place_write_to_its_key_column() {
+        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let rewrite = |field: u64| {
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(field)],
+                data_change: true,
+            })])
+        };
+
+        assert!(ours.conflicts_with(&rewrite(0)));
+        assert!(rewrite(0).conflicts_with(&ours));
+        assert!(!ours.conflicts_with(&rewrite(1)));
     }
 
     #[test]

@@ -51,6 +51,11 @@ impl RefreshRowVersionMetadata {
         false
     }
 
+    /// Each fragment's version sequence, whole. The sequence is one value per
+    /// fragment, restamped for every row at once, so two sets refreshing the
+    /// same fragment collide even when the column rewrites that prompted them
+    /// touched different fields. Over-strict, and cheap: the alternative is a
+    /// sequence that records which columns each row's version speaks for.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for fragment_id in &self.fragment_ids {
             footprint.write(Coordinate::FragmentRowVersions(*fragment_id));

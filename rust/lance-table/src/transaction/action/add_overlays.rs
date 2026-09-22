@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Footprint, Ref};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::overlay::DataOverlayFile;
 use crate::format::pb;
 use lance_core::deepsize::DeepSizeOf;
@@ -48,12 +48,37 @@ impl AddOverlays {
         self.data_change
     }
 
-    /// Only that the fragment must still be there. An overlay writes no
-    /// coordinate of its own: two concurrent overlays over the same cells both
-    /// land, and the newer `committed_version` decides which value wins.
+    /// A partial write of each overlaid field's data in the fragment, and a
+    /// requirement on each of those fields' definitions.
+    ///
+    /// Partial, because two concurrent overlays over the same cells both land
+    /// and the newer `committed_version` decides which value wins. A full
+    /// rewrite of the same column is another matter: it replaces every cell
+    /// from a snapshot that never saw this overlay, and
+    /// [`TombstoneFieldData`](super::TombstoneFieldData) tombstones the overlay
+    /// as it applies, so the overlay's values would be lost without a trace.
+    /// That pair conflicts in either order, as the legacy Update-vs-DataOverlay
+    /// check already does.
+    ///
+    /// The definition is required for the same reason a data file requires it:
+    /// the overlay's values are encoded in the type the schema names, and a
+    /// concurrent cast or drop landing first would leave them described as
+    /// something they are not, or over a field the manifest no longer has.
+    ///
+    /// A fragment this operation mints records nothing; no concurrent writer
+    /// can name a cell inside it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        if let Some(fragment) = self.fragment.committed() {
-            footprint.require_fragment(fragment);
+        let Some(fragment) = self.fragment.committed() else {
+            return;
+        };
+        for field in self
+            .overlays
+            .iter()
+            .flat_map(|overlay| overlay.data_file.fields.iter().copied())
+            .filter(|field| *field >= 0)
+        {
+            footprint.write_part(Coordinate::FieldData { fragment, field });
+            footprint.require(Coordinate::FieldDefinition(field));
         }
     }
 }
@@ -95,7 +120,8 @@ mod tests {
     use crate::format::overlay::OverlayCoverage;
     use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{
-        Action, AddFragment, CompositeOperation, RemoveFragment, UserAction,
+        Action, AddFragment, AlterField, CompositeOperation, DropField, RemoveFragment,
+        TombstoneFieldData, UserAction,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
@@ -234,6 +260,51 @@ mod tests {
         let theirs = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
 
         assert!(!ours.conflicts_with(&theirs));
+    }
+
+    /// A full rewrite of the overlaid column replaces every cell from a
+    /// snapshot that never saw the overlay, and tombstones the overlay as it
+    /// applies; the overlay's values would be gone without a trace. Either
+    /// order loses, so the pair is symmetric.
+    #[test]
+    fn test_an_overlay_and_a_rewrite_of_the_same_column_conflict() {
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
+        let rewrite = |field: i32| {
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(field as u64)],
+                data_change: true,
+            })])
+        };
+
+        assert!(overlaid.conflicts_with(&rewrite(0)));
+        assert!(rewrite(0).conflicts_with(&overlaid));
+        // Another column of the same fragment is not touched by the overlay.
+        assert!(!overlaid.conflicts_with(&rewrite(1)));
+        assert!(!rewrite(1).conflicts_with(&overlaid));
+    }
+
+    /// An overlay landing after its field was cast or dropped would carry
+    /// values in a type the schema no longer names, or for a field that is
+    /// gone. Landing first, the cast rebinds the field everywhere and the drop
+    /// tombstones the overlay, so those orders are fine.
+    #[test]
+    fn test_an_overlay_needs_its_field_defined_as_it_was() {
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
+        let cast = footprint(vec![Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: None,
+            logical_type: Some("int64".into()),
+            nullable: None,
+        })]);
+        let dropped = footprint(vec![Action::DropField(DropField {
+            field: Ref::Committed(0),
+        })]);
+
+        assert!(overlaid.conflicts_with(&cast));
+        assert!(!cast.conflicts_with(&overlaid));
+        assert!(overlaid.conflicts_with(&dropped));
+        assert!(!dropped.conflicts_with(&overlaid));
     }
 
     #[test]
