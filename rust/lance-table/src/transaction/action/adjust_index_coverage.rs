@@ -103,13 +103,31 @@ impl AdjustIndexCoverage {
 
     /// The segment, by uuid, plus a claim on the fragments this brings under
     /// the index. The claim is what stops one writer widening a segment onto a
-    /// fragment another writer is covering with a segment of its own.
+    /// fragment another writer is covering with a segment of its own. Those
+    /// fragments are also required to still be there: coverage of a fragment a
+    /// concurrent set removed describes rows the dataset no longer has.
     ///
     /// Removals claim nothing: coverage the index gives up cannot collide with
     /// coverage another writer takes on.
+    ///
+    /// What this cannot require is the fragments' *data*. The action names no
+    /// fields -- the segment already has them -- so the footprint cannot say
+    /// which columns the widened coverage depends on, and a concurrent rewrite
+    /// of an indexed column in one of these fragments is not caught here. The
+    /// caller widening coverage over committed fragments is answerable for
+    /// having indexed them as they stand; the safe shape is to widen in the
+    /// same operation that writes the fragments, where they are minted and no
+    /// concurrent writer can touch them.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write(Coordinate::IndexSegment(self.uuid));
         footprint.extend_index_coverage(self.name.clone(), self.add_fragments.iter().copied());
+        for fragment in self
+            .add_fragments
+            .iter()
+            .filter_map(|fragment| fragment.committed())
+        {
+            footprint.require_fragment(fragment);
+        }
     }
 }
 
@@ -160,7 +178,8 @@ mod tests {
     use crate::format::IndexMetadata;
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddFragment, AddIndexSegment, CompositeOperation, Footprint, UserAction,
+        Action, AddFragment, AddIndexSegment, CompositeOperation, Footprint, RemoveFragment,
+        UserAction,
     };
     use crate::transaction::test_support::sample_index_metadata;
 
@@ -362,6 +381,28 @@ mod tests {
         assert!(widen.conflicts_with(&footprint(vec![build("by_a", 7)])));
         assert!(!widen.conflicts_with(&footprint(vec![build("by_a", 8)])));
         assert!(!widen.conflicts_with(&footprint(vec![build("by_b", 7)])));
+    }
+
+    #[test]
+    fn test_widening_onto_a_fragment_a_concurrent_set_removes_conflicts() {
+        let widen = footprint(vec![adjust(
+            Uuid::from_u128(1),
+            "by_a",
+            vec![Ref::Committed(7)],
+            vec![],
+        )]);
+        let remove = |fragment: u64| {
+            footprint(vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(fragment),
+                data_change: false,
+            })])
+        };
+
+        // Either order: coverage of a fragment that is gone describes rows the
+        // dataset no longer has.
+        assert!(widen.conflicts_with(&remove(7)));
+        assert!(remove(7).conflicts_with(&widen));
+        assert!(!widen.conflicts_with(&remove(8)));
     }
 
     #[test]

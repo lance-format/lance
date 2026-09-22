@@ -232,17 +232,26 @@ impl AddIndexSegment {
         // Keyed and carried columns alike: a carried column can be rewritten
         // while the keyed one is untouched, and the segment would then answer
         // from an obsolete carried value.
-        let Some(covered) = &self.covered_fragments else {
-            // Unstated reach. The claim already collides with every other claim
-            // on the index; there is no fragment list to require.
-            return;
-        };
         let dependencies: Vec<Ref> = self
             .fields
             .iter()
             .chain(self.covering_fields.iter())
             .copied()
             .collect();
+        // The segment describes values in the type the schema named when it
+        // was built. A cast landing first would leave it describing values as
+        // something they are not, and a drop would leave it over a field the
+        // manifest no longer has; both write the definition. Landing second,
+        // either prunes or discards the segment as it applies, so this is only
+        // required, not written.
+        for field in dependencies.iter().copied() {
+            footprint.require_field_definition(field);
+        }
+        let Some(covered) = &self.covered_fragments else {
+            // Unstated reach. The claim already collides with every other claim
+            // on the index; there is no fragment list to require.
+            return;
+        };
         for fragment in covered.iter().filter_map(|fragment| fragment.committed()) {
             footprint.require_field_data(fragment, dependencies.iter().copied());
         }
@@ -371,8 +380,8 @@ mod tests {
         added_field, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint,
-        TombstoneFieldData, UserAction,
+        Action, AddField, AddFragment, AlterField, CompositeOperation, DropField, Footprint,
+        RemoveFragment, TombstoneFieldData, UserAction,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -785,6 +794,54 @@ mod tests {
         )]));
 
         assert!(build.conflicts_with(&rewrite));
+    }
+
+    /// A cast landing first leaves the segment describing values in a type the
+    /// schema no longer names; a cast landing second rebinds the field in every
+    /// fragment and prunes the segment's coverage as it applies. Same shape as
+    /// the rewrite case above, one level up: the definition rather than the
+    /// data.
+    #[test]
+    fn test_a_build_loses_to_a_committed_cast_but_not_the_reverse() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let cast = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            "step",
+            vec![Action::AlterField(AlterField {
+                field: Ref::Committed(0),
+                name: None,
+                logical_type: Some("int64".into()),
+                nullable: None,
+            })],
+        )]));
+
+        assert!(build.conflicts_with(&cast));
+        assert!(!cast.conflicts_with(&build));
+
+        // A segment of unstated reach depends on the definition just the same.
+        assert!(index_footprint(covering("by_a", None)).conflicts_with(&cast));
+    }
+
+    /// A segment requires the data of the fragments it covers, and that data
+    /// is gone if the fragment is: a compaction landing first would leave the
+    /// segment describing rows the dataset no longer has, in a fragment the
+    /// replacement does not cover. Landing second, the compaction is the one
+    /// answerable for the index, and the footprint has nothing to say.
+    #[test]
+    fn test_a_build_loses_to_a_committed_removal_of_a_covered_fragment() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let removal = |fragment: u64| {
+            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+                "step",
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(fragment),
+                    data_change: false,
+                })],
+            )]))
+        };
+
+        assert!(build.conflicts_with(&removal(0)));
+        assert!(!removal(0).conflicts_with(&build));
+        assert!(!build.conflicts_with(&removal(1)));
     }
 
     fn index_footprint(action: AddIndexSegment) -> Footprint {
