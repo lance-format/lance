@@ -40,6 +40,11 @@ impl ReserveRowIds {
 
     /// Nothing. Ids come off a monotonic counter, so two operations reserving
     /// at once get disjoint ranges rather than colliding.
+    ///
+    /// Unlike a fragment id, a reserved row id is never a coordinate: the
+    /// sequence a fragment carries is opaque to the footprint, so two writers
+    /// spending the same reservation are not caught. A reservation has to be
+    /// spent by the writer that made it, and only once.
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
 }
 

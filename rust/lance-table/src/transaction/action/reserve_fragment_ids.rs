@@ -17,6 +17,12 @@ use lance_core::{Error, Result};
 /// manifest's high-water mark: the range is the `count` ids ending there.
 /// Fragments written against the range name those ids as
 /// [`Ref::Committed`](super::Ref::Committed).
+///
+/// Ending there, not starting where the reserving writer's read version left
+/// off: a concurrent commit may have moved the counter in between, and the
+/// range is wherever apply found it. A writer that derives its range from the
+/// version it read rather than the manifest it committed may name ids that
+/// belong to someone else.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct ReserveFragmentIds {
     pub count: u32,
@@ -34,7 +40,10 @@ impl ReserveFragmentIds {
     }
 
     /// Nothing. Ids come off a monotonic counter, so two operations reserving
-    /// at once get disjoint ranges rather than colliding.
+    /// at once get disjoint ranges rather than colliding, and a reserved id is
+    /// not a coordinate until a fragment claims it -- at which point
+    /// [`AddFragment`](super::AddFragment) writes its existence, so two writers
+    /// spending the same reservation are caught there.
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
 }
 
