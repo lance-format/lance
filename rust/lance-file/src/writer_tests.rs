@@ -25,7 +25,7 @@ mod tests {
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
     use lance_arrow::ARROW_EXT_NAME_KEY;
-    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, json_field};
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
@@ -620,18 +620,20 @@ mod tests {
                 field
             }
         };
-        let file_field = in_struct(json_field("j", true));
-        let input_field = in_struct(arrow_json);
-        let input: ArrayRef = match input_field.data_type() {
-            DataType::Struct(fields) => {
-                Arc::new(StructArray::new(fields.clone(), vec![text], None))
-            }
-            _ => text,
+        let jsonb: ArrayRef = Arc::new(JsonArray::try_from(text.clone()).unwrap().into_inner());
+        let batch_of = |field: ArrowField, values: ArrayRef| {
+            let field = in_struct(field);
+            let values: ArrayRef = match field.data_type() {
+                DataType::Struct(fields) => {
+                    Arc::new(StructArray::new(fields.clone(), vec![values], None))
+                }
+                _ => values,
+            };
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap()
         };
-        let file_schema = LanceSchema::try_from(&ArrowSchema::new(vec![file_field])).unwrap();
-        let batch =
-            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![input_field])), vec![input])
-                .unwrap();
+        let converted = batch_of(json_field("j", true), jsonb);
+        let batch = batch_of(arrow_json, text);
+        let file_schema = LanceSchema::try_from(converted.schema().as_ref()).unwrap();
 
         let fs = FsFixture::default();
         let mut writer = create_writer(
@@ -641,6 +643,9 @@ mod tests {
             FileWriterOptions::default(),
         )
         .unwrap();
+        // A batch with an accepted schema must not let a later, different
+        // schema through.
+        writer.write_batch(&converted).await.unwrap();
         let mismatch = field_type_mismatch(writer.write_batch(&batch).await.unwrap_err());
         assert_eq!(mismatch.field_path, if nested { "s.j" } else { "j" });
         assert_eq!(
@@ -660,7 +665,7 @@ mod tests {
             }
         );
         // The rejected batch reached no encoder.
-        assert_eq!(writer.finish().await.unwrap().num_rows, 0);
+        assert_eq!(writer.finish().await.unwrap().num_rows, 1);
     }
 
     #[tokio::test]
