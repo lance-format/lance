@@ -909,3 +909,43 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+
+
+def test_compact_files_column_groups(tmp_path: Path):
+    data = pa.table({"a": range(8), "b": [str(i) for i in range(8)], "c": range(8)})
+    dataset = lance.write_dataset(
+        data, tmp_path / "dataset", max_rows_per_file=2, data_storage_version="2.0"
+    )
+    dataset.delete("a = 5")
+    expected = dataset.to_table()
+
+    with pytest.raises(OSError, match="more than once"):
+        dataset.optimize.compact_files(column_groups=[["c"], ["c"]])
+    with pytest.raises(OSError, match="not a top-level column"):
+        dataset.optimize.compact_files(column_groups=[["missing"]])
+    with pytest.raises(OSError, match="binary copy is not supported"):
+        dataset.optimize.compact_files(
+            column_groups=[["c"]], compaction_mode="force_binary_copy"
+        )
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=100,
+        column_groups=[["c"]],
+        data_storage_version="2.2",
+    )
+    assert metrics.fragments_added == 1
+    assert metrics.files_added == 2
+    (fragment,) = dataset.get_fragments()
+    files = fragment.data_files()
+    assert [f.fields for f in files] == [[0, 1], [2]]
+    assert all((f.file_major_version, f.file_minor_version) == (2, 2) for f in files)
+    assert dataset.to_table() == expected
+    assert dataset.data_storage_version == "2.0"
+
+    # The persisted config makes later compactions keep the layout.
+    dataset.update_config({"lance.compaction.column_groups": "c"})
+    dataset.insert(pa.table({"a": [8], "b": ["8"], "c": [8]}))
+    dataset.optimize.compact_files(target_rows_per_fragment=100)
+    (fragment,) = dataset.get_fragments()
+    assert [f.fields for f in fragment.data_files()] == [[0, 1], [2]]
+    assert dataset.count_rows() == 8

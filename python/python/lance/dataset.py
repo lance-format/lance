@@ -2878,6 +2878,52 @@ class LanceDataset(pa.dataset.Dataset):
         # Indices might have changed
         self._list_indices_res = None
 
+    def rewrite_columns(
+        self,
+        columns: List[str],
+        *,
+        data_storage_version: Optional[str] = None,
+    ):
+        """Rewrite columns into their own data files, leaving other files alone.
+
+        Every fragment gets one new data file holding exactly ``columns``, and
+        those columns are tombstoned in the files they came from. The files
+        holding the other columns are not read or written, so this migrates
+        narrow columns to a newer data file version without re-encoding the
+        wide columns that dominate a table's size. Rows, fragment ids, row
+        addresses and indices are unchanged.
+
+        Fragments whose ``columns`` already sit alone in a file of the requested
+        version are skipped, so an interrupted rewrite can be rerun. Fragments
+        are rewritten one after another; to spread the work over many workers,
+        call :meth:`lance.fragment.LanceFragment.rewrite_columns` per fragment
+        and commit the returned metadata in one
+        :class:`LanceOperation.Update` with ``update_mode="rewrite_columns"``.
+
+        A later ``compact_files`` folds the new files back into one file per
+        fragment unless its ``column_groups`` lists the same columns.
+
+        Parameters
+        ----------
+        columns : list of str
+            Top-level column names to rewrite.
+        data_storage_version : str, optional
+            Data file version for the new files, such as ``"2.2"`` or
+            ``"stable"``. Defaults to the dataset's default write version and
+            never changes it. Must be a V2 version.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        >>> dataset = lance.write_dataset(table, "example", data_storage_version="2.0")
+        >>> dataset.rewrite_columns(["b"], data_storage_version="2.2")
+        >>> [f.fields for f in dataset.get_fragments()[0].data_files()]
+        [[0, -2], [1]]
+        """
+        self._ds.rewrite_columns(columns, data_storage_version)
+
     def delete(
         self,
         predicate: Union[str, Expression],
@@ -7562,6 +7608,7 @@ class DatasetOptimizer:
         max_source_bytes: Optional[int] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
+        column_groups: Optional[list[list[str]]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7596,7 +7643,9 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
-        ``lance.compaction.data_storage_version``.
+        ``lance.compaction.data_storage_version``,
+        ``lance.compaction.column_groups`` (groups separated by ``;``,
+        columns by ``,``, e.g. ``"embedding;caption,tags"``).
 
         Parameters
         ----------
@@ -7677,6 +7726,16 @@ class DatasetOptimizer:
             Uses the compaction config target when set, otherwise the dataset's
             default write version. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
+        column_groups: list[list[str]], optional
+            Top-level columns to keep in their own data files. Each inner list
+            becomes one data file per compacted fragment holding exactly those
+            columns; every column not listed goes to one shared file. This is
+            the layout :meth:`LanceDataset.rewrite_columns` produces, so a
+            compaction configured with the same groups preserves it instead of
+            folding wide columns back next to narrow ones. Binary copy is
+            disabled when set, and ``max_bytes_per_file`` is ignored so every
+            group splits at the same rows. Uses the manifest config value when
+            not specified.
 
         Returns
         -------
@@ -7705,6 +7764,7 @@ class DatasetOptimizer:
                 max_source_bytes=max_source_bytes,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
+                column_groups=column_groups,
             ).items()
             if v is not None
         }

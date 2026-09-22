@@ -1015,6 +1015,30 @@ class LanceFragment(pa.dataset.Fragment):
             return metadata, fields_modified, matched_offsets
         return metadata, fields_modified
 
+    def rewrite_columns(
+        self,
+        columns: List[str],
+        *,
+        data_storage_version: Optional[str] = None,
+    ) -> Optional[FragmentMetadata]:
+        """Rewrite columns of this fragment into one new data file.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
+        The per-fragment half of
+        :meth:`lance.dataset.LanceDataset.rewrite_columns`, for spreading a
+        rewrite over many workers. The new file is written but nothing is
+        committed: collect the returned metadata from every fragment and commit
+        it in one :class:`lance.dataset.LanceOperation.Update` with
+        ``update_mode="rewrite_columns"`` and no ``fields_modified``.
+
+        Returns ``None`` when ``columns`` already sit alone in a file of the
+        requested version.
+        """
+        return self._fragment.rewrite_columns(columns, data_storage_version)
+
     def merge_columns(
         self,
         value_func: (

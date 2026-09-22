@@ -85,6 +85,26 @@ the target version, actual version, and file path. A persistent compaction targe
 can be set through `lance.compaction.data_storage_version` in the table config;
 an explicit operation target takes precedence.
 
+Compaction re-encodes every column of the fragments it rewrites. To migrate
+only some columns, `rewrite_columns` (Python: `LanceDataset.rewrite_columns`,
+Rust: `Dataset::rewrite_columns`) reads just the named top-level columns of each
+fragment, writes them to one new data file per fragment in the requested V2
+version, and tombstones them in the files they came from. The files holding the
+other columns are neither read nor written, and rows, fragment ids, row
+addresses and indices are unchanged. Fragments already in the requested layout
+are skipped, so an interrupted rewrite can be rerun; `LanceFragment.rewrite_columns`
+does the same for one fragment so the work can be spread over workers and
+committed as a single `Update` in `rewrite_columns` mode.
+
+A compaction folds those files back into one per fragment unless it is told to
+keep them apart: the `column_groups` compaction option (config key
+`lance.compaction.column_groups`, groups separated by `;` and columns by `,`)
+writes each listed group of columns to its own data file per fragment and the
+remaining columns to one shared file. Setting the config key once makes every
+later compaction preserve the layout that `rewrite_columns` produced. Binary
+copy is disabled when groups are set, and `max_bytes_per_file` is ignored so
+all groups split at the same rows.
+
 ### Upgrading clients before mixed-version writes
 
 Before writing files that differ from the dataset default, upgrade every reader
