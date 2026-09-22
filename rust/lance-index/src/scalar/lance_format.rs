@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
@@ -228,6 +228,32 @@ impl IndexReader for V1IndexReader {
         self.0.read_range(range, &projection).await
     }
 
+    /// V1 files are organised in row groups, so a "batch" is a row group and
+    /// `batch_size` is ignored; the row groups are read in order, `batch_readahead`
+    /// at a time.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        _batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
+        let num_batches = self.0.num_batches() as i32;
+        let schema: Arc<Schema> = Arc::new(self.0.schema().into());
+        let stream = futures::stream::iter(0..num_batches)
+            .map(move |n| {
+                let reader = self.clone();
+                async move {
+                    reader
+                        .0
+                        .read_batch(n, ReadBatchParams::RangeFull, reader.0.schema())
+                        .await
+                }
+            })
+            .buffered(batch_readahead.max(1) as usize);
+        Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+            schema, stream,
+        )))
+    }
+
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.0.num_batches() as u32
     }
@@ -382,6 +408,8 @@ impl IndexReader for CurrentIndexReader {
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
+        batch_size: u64,
+        batch_readahead: u32,
     ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
         if range.is_empty() {
             return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
@@ -401,14 +429,30 @@ impl IndexReader for CurrentIndexReader {
                 self.0.metadata().version(),
             )
         };
+        // The v2 decoder emits exactly `batch_size` rows per batch for a range read
+        // (only the final batch is shorter), so the stream is page-aligned with
+        // `read_record_batch` when the range starts on a page boundary.
+        let batch_size = u32::try_from(batch_size.max(1)).unwrap_or(u32::MAX);
         self.0
             .read_stream_projected(
                 ReadBatchParams::Range(range),
-                4096,
-                2,
+                batch_size,
+                batch_readahead.max(1),
                 projection,
                 FilterExpression::no_filter(),
             )
+            .await
+    }
+
+    /// One sequential read of the whole file, chunked into `batch_size` rows so
+    /// batch `n` of the stream equals `read_record_batch(n, batch_size)`.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
+        let num_rows = CurrentFileReader::num_rows(&self.0) as usize;
+        self.read_range_stream(0..num_rows, None, batch_size, batch_readahead)
             .await
     }
 
