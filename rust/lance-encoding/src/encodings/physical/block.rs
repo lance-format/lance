@@ -306,11 +306,19 @@ mod zstd {
         }
 
         fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
-            // compress() always writes an 8-byte LE decompressed-length prefix first.
-            if compressed.len() < 8 {
-                return None;
+            if self.is_raw_stream_format(compressed) {
+                // Legacy raw Zstd frames (see `decompress`) have no length prefix of
+                // our own; read the content size out of the Zstd frame header itself.
+                ::zstd::zstd_safe::get_frame_content_size(compressed)
+                    .ok()
+                    .flatten()
+            } else {
+                // compress() always writes an 8-byte LE decompressed-length prefix first.
+                if compressed.len() < 8 {
+                    return None;
+                }
+                Some(u64::from_le_bytes(compressed[..8].try_into().unwrap()))
             }
-            Some(u64::from_le_bytes(compressed[..8].try_into().unwrap()))
         }
     }
 }
@@ -652,7 +660,12 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
         }))
     }
 
-    fn decompressed_size(&self, data: &[u8], offsets_bytes: &[u8], bits_per_offset: u8) -> Option<u64> {
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        offsets_bytes: &[u8],
+        bits_per_offset: u8,
+    ) -> Option<u64> {
         // Iterate the per-value offset pairs and sum frame-header sizes.
         // Each value was independently compressed so each has its own frame header.
         let bytes_per_offset = bits_per_offset as usize / 8;
@@ -668,8 +681,7 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             // Rebase: offsets stored in self.offsets are absolute into self.data, but
             // offsets_bytes here is the raw slice starting at offset_starts[row_start],
             // so the first offset value is the base we subtract.
-            let base =
-                usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
+            let base = usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
             let val_start = start.checked_sub(base)?;
             let val_end = end.checked_sub(base)?;
             if val_start == val_end {
@@ -856,6 +868,41 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+
+            // `decompressed_size_of_value` must detect the raw stream format and read
+            // the content size out of the Zstd frame header itself, instead of
+            // misreading the frame's leading bytes as our 8-byte length prefix (which
+            // used to report a nonsensical size like `29651633825625384` for a 13-byte
+            // value). This particular frame is produced by the streaming encoder,
+            // which does not pledge a source size, so the honest answer is `None`
+            // rather than a guess.
+            assert_eq!(
+                compressor.decompressed_size_of_value(&compressed_data),
+                None
+            );
+        }
+
+        #[test]
+        fn test_zstd_decompressed_size_of_value_raw_stream_with_known_content_size() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let input_data = b"Hello, world!";
+
+            // Unlike the streaming `Encoder` used above, the one-shot bulk API pledges
+            // the source size up front, so the resulting raw Zstd frame embeds its
+            // content size and `decompressed_size_of_value` can report it exactly
+            // without decompressing.
+            let compressed_data = ::zstd::bulk::compress(input_data, 0).unwrap();
+
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(&compressed_data, &mut decompressed_data)
+                .unwrap();
+            assert_eq!(input_data, decompressed_data.as_slice());
+
+            assert_eq!(
+                compressor.decompressed_size_of_value(&compressed_data),
+                Some(input_data.len() as u64)
+            );
         }
     }
 

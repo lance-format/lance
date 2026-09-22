@@ -343,24 +343,27 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         if data.len() < needed {
             return None;
         }
+        // A corrupt (decreasing) offset must not be treated as a huge value via
+        // wrapping arithmetic: use checked subtraction and surface `None` (unavailable)
+        // instead, the same as the monotonicity check `decompress` performs.
         let data_bytes = if self.bits_per_offset == 64 {
             let offsets = data.borrow_to_typed_slice::<u64>();
             let slice = offsets.as_ref();
             if slice.len() <= end {
                 return None;
             }
-            slice[end].wrapping_sub(slice[start])
+            slice[end].checked_sub(slice[start])?
         } else {
             let offsets = data.borrow_to_typed_slice::<u32>();
             let slice = offsets.as_ref();
             if slice.len() <= end {
                 return None;
             }
-            (slice[end].wrapping_sub(slice[start])) as u64
+            (slice[end].checked_sub(slice[start])?) as u64
         };
         // Total: the string data bytes + the slice of offset entries (num_rows + 1 offsets).
         let offset_bytes = (num_rows + 1) * bytes_per_offset as u64;
-        Some(data_bytes + offset_bytes)
+        data_bytes.checked_add(offset_bytes)
     }
 
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
@@ -601,7 +604,12 @@ impl VariablePerValueDecompressor for VariableDecoder {
         Ok(DataBlock::VariableWidth(data))
     }
 
-    fn decompressed_size(&self, data: &[u8], _offsets_bytes: &[u8], _bits_per_offset: u8) -> Option<u64> {
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
         // Plain encoding: stored bytes == decoded bytes.
         Some(data.len() as u64)
     }
@@ -1377,6 +1385,15 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("overlaps"), "{err}");
+
+        // `decoded_bytes_from_chunk` must reject decreasing offsets the same way
+        // `decompress` does, rather than wrapping to a huge value (which used to
+        // panic on the subsequent addition in debug builds, or silently
+        // underestimate the byte count in release builds).
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[chunk_u64(&[16, 8], &[])], 0, 1),
+            None
+        );
 
         // A valid chunk still decodes: offsets rebase to [0, 5, 9, 14].
         let decompressor = BinaryMiniBlockDecompressor::new(32);
