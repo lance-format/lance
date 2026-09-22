@@ -69,7 +69,8 @@ pub(crate) struct RabitQuantizedBatch {
 }
 
 #[inline]
-fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
+#[doc(hidden)]
+pub fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
     codes.fill(0);
     for (bit_idx, value) in rotated.iter().enumerate() {
         if value.is_sign_positive() {
@@ -149,7 +150,8 @@ fn sort_ex_thresholds(values: &mut [u64]) {
     }
 }
 
-fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+#[doc(hidden)]
+pub fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let max_value = abs_normalized
         .iter()
         .copied()
@@ -214,6 +216,18 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     best_t
 }
 
+/// `|v_d| / ||v||` for every dimension, or `None` for a zero / non-finite
+/// vector (which encodes as all-zero ex codes).
+#[doc(hidden)]
+pub fn ex_abs_normalized(rotated: &[f32]) -> Option<Vec<f32>> {
+    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
+    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+        return None;
+    }
+    let norm = norm_squared.sqrt();
+    Some(rotated.iter().map(|value| value.abs() / norm).collect())
+}
+
 fn quantize_ex_code(
     rotated: &[f32],
     ex_bits: u8,
@@ -221,19 +235,37 @@ fn quantize_ex_code(
     ex_code_values_dst: &mut [u8],
 ) -> f32 {
     debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
-    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
-    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+    let Some(abs_normalized) = ex_abs_normalized(rotated) else {
         ex_code_dst.fill(0);
         ex_code_values_dst.fill(0);
         return 0.0;
-    }
-
-    let norm = norm_squared.sqrt();
-    let abs_normalized = rotated
-        .iter()
-        .map(|value| value.abs() / norm)
-        .collect::<Vec<_>>();
+    };
     let t = best_ex_rescale_factor(&abs_normalized, ex_bits);
+    quantize_ex_code_with_scale(
+        rotated,
+        &abs_normalized,
+        ex_bits,
+        t,
+        ex_code_dst,
+        ex_code_values_dst,
+    )
+}
+
+/// Quantize the ex codes of one rotated residual with an explicit rescale
+/// factor `t` (normally the output of [`best_ex_rescale_factor`]). Writes the
+/// blocked-layout codes into `ex_code_dst`, the per-dim code values into
+/// `ex_code_values_dst`, and returns `sum_d rotated[d] * (full_code[d] + code_bias)`.
+#[doc(hidden)]
+pub fn quantize_ex_code_with_scale(
+    rotated: &[f32],
+    abs_normalized: &[f32],
+    ex_bits: u8,
+    t: f32,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+) -> f32 {
+    debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
+    debug_assert_eq!(rotated.len(), abs_normalized.len());
     let max_code = ((1u16 << ex_bits) - 1) as u8;
     let mask = max_code;
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
@@ -293,6 +325,7 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    layered: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
@@ -304,6 +337,7 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                layered: false,
                 query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
@@ -717,7 +751,26 @@ impl RabitQuantizer {
                 .zip(ex_res_dot_dists.par_iter_mut())
                 .zip(rotated_residuals.par_chunks(code_dim))
                 .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
-                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
+                    *ex_dot_dst = if self.metadata.layered {
+                        let layout = super::layered::RQLayout::try_new(self.metadata.num_bits)
+                            .expect("layered layout validated at build");
+                        if let Some(abs) = ex_abs_normalized(rotated) {
+                            let t = best_ex_rescale_factor(&abs, layout.search_bits)
+                                * (1u32 << (ex_bits - layout.search_bits)) as f32;
+                            quantize_ex_code_with_scale(
+                                rotated,
+                                &abs,
+                                ex_bits,
+                                t,
+                                ex_dst,
+                                ex_values_dst,
+                            )
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst)
+                    };
                 });
         }
 
@@ -752,6 +805,9 @@ impl Quantization for RabitQuantizer {
         params: &Self::BuildParams,
     ) -> Result<Self> {
         validate_rq_num_bits(params.num_bits)?;
+        if params.layered {
+            super::layered::RQLayout::try_new(params.num_bits)?;
+        }
 
         let dim = data.as_fixed_size_list().value_length() as usize;
         if !dim.is_multiple_of(u8::BITS as usize) {
@@ -759,11 +815,12 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
-        if let Some(q) = Self::from_supplied_rotation(params, dim)? {
+        if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
+            q.metadata.layered = params.layered;
             return Ok(q);
         }
 
-        let q = match data.as_fixed_size_list().value_type() {
+        let mut q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
                 params.num_bits,
                 data.as_fixed_size_list().value_length(),
@@ -786,6 +843,7 @@ impl Quantization for RabitQuantizer {
                 )));
             }
         };
+        q.metadata.layered = params.layered;
         Ok(q)
     }
 
@@ -848,6 +906,14 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
     ) -> Result<Quantizer> {
         validate_rq_num_bits(metadata.num_bits)?;
+        if metadata.layered {
+            super::layered::RQLayout::try_new(metadata.num_bits)?;
+            if metadata.query_estimator != RabitQueryEstimator::RawQuery {
+                return Err(Error::invalid_input(
+                    "layered IVF_RQ requires the raw-query estimator",
+                ));
+            }
+        }
         Ok(Quantizer::Rabit(Self {
             metadata: metadata.clone(),
         }))
@@ -861,6 +927,10 @@ impl Quantization for RabitQuantizer {
         let mut fields = vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()];
         if self.metadata.query_estimator == RabitQueryEstimator::RawQuery {
             fields.push(ERROR_FACTORS_FIELD.clone());
+        }
+        if self.metadata.layered {
+            return super::layered::storage_fields(self.code_dim(), self.metadata.num_bits, fields)
+                .expect("layered layout validated at build");
         }
         if let Some(ex_code_field) = rabit_ex_code_field(self.code_dim(), self.metadata.num_bits)
             .expect("RabitQ num_bits should be validated")

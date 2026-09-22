@@ -378,7 +378,15 @@ pub async fn init_writer_for_rq(
     if rq_meta.query_estimator == RabitQueryEstimator::RawQuery {
         fields.push(ERROR_FACTORS_FIELD.clone());
     }
-    if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
+    if rq_meta.layered {
+        fields = crate::vector::bq::layered::storage_fields(
+            rq_meta.rotated_dim(),
+            rq_meta.num_bits,
+            fields,
+        )?;
+    } else if let Some(ex_code_field) =
+        rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)?
+    {
         fields.push(ex_code_field);
         fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
@@ -1169,17 +1177,20 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if let Some(existing_rq) = rq_meta.as_ref()
                     && (existing_rq.code_dim != rq_meta_parsed.code_dim
                         || existing_rq.num_bits != rq_meta_parsed.num_bits
+                        || existing_rq.layered != rq_meta_parsed.layered
                         || existing_rq.rotation_type != rq_meta_parsed.rotation_type
                         || existing_rq.query_estimator != rq_meta_parsed.query_estimator
                         || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
-                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
+                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, layered={}, rotation_type={:?}), current(code_dim={}, num_bits={}, layered={}, rotation_type={:?})",
                         existing_rq.code_dim,
                         existing_rq.num_bits,
+                        existing_rq.layered,
                         existing_rq.rotation_type,
                         rq_meta_parsed.code_dim,
                         rq_meta_parsed.num_bits,
+                        rq_meta_parsed.layered,
                         rq_meta_parsed.rotation_type
                     )));
                 }
@@ -1628,12 +1639,12 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     Some(meta) if meta.num_bits > 1 => batches
                         .into_iter()
                         .map(|batch| {
-                            crate::vector::bq::storage::load_blocked_ex_codes(
+                            crate::vector::bq::storage::load_ex_code_planes(
                                 batch,
                                 meta.rotated_dim(),
                                 meta.num_bits,
                             )
-                            .map(|(batch, _)| batch)
+                            .map(|(batch, _, _)| batch)
                         })
                         .collect::<Result<Vec<_>>>()?,
                     _ => batches,
@@ -2428,7 +2439,14 @@ mod tests {
         distance_type: DistanceType,
     ) -> Result<usize> {
         let num_bytes = (metadata.code_dim as usize).div_ceil(u8::BITS as usize);
-        let ex_code_field = rabit_ex_code_field(metadata.code_dim as usize, metadata.num_bits)?;
+        let layout = metadata
+            .layered
+            .then(|| crate::vector::bq::layered::RQLayout::try_new(metadata.num_bits))
+            .transpose()?;
+        let ex_code_field = rabit_ex_code_field(
+            metadata.code_dim as usize,
+            layout.map_or(metadata.num_bits, |layout| layout.high_bits + 1),
+        )?;
         let ex_code_bytes = ex_code_field.as_ref().map(|field| {
             let DataType::FixedSizeList(_, num_bytes) = field.data_type() else {
                 panic!("RQ ex-code field should be FixedSizeList");
@@ -2451,7 +2469,13 @@ mod tests {
         if metadata.query_estimator == RabitQueryEstimator::RawQuery {
             fields.push(ERROR_FACTORS_FIELD.clone());
         }
-        if let Some(field) = ex_code_field {
+        if metadata.layered {
+            fields = crate::vector::bq::layered::storage_fields(
+                metadata.code_dim as usize,
+                metadata.num_bits,
+                fields,
+            )?;
+        } else if let Some(field) = ex_code_field {
             fields.push(field);
             fields.push(EX_ADD_FACTORS_FIELD.clone());
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
@@ -2529,8 +2553,22 @@ mod tests {
                 UInt8Array::from(ex_codes),
                 ex_code_bytes as i32,
             )?));
+            if let Some(layout) = layout {
+                let bytes = crate::vector::bq::ex_dot::blocked_ex_code_bytes(
+                    metadata.code_dim as usize,
+                    layout.low_bits,
+                );
+                columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(vec![0x55; total_rows * bytes]),
+                    bytes as i32,
+                )?));
+            }
             columns.push(Arc::new(Float32Array::from(ex_add_factors)));
             columns.push(Arc::new(Float32Array::from(ex_scale_factors)));
+            if metadata.layered {
+                columns.push(Arc::new(Float32Array::from(vec![100.; total_rows])));
+                columns.push(Arc::new(Float32Array::from(vec![10.; total_rows])));
+            }
         }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
@@ -2752,6 +2790,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            layered: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2884,6 +2923,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: true,
+            layered: false,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2925,8 +2965,16 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::single(4, false)]
+    #[case::rq5(5, true)]
+    #[case::rq7(7, true)]
+    #[case::rq9(9, true)]
     #[tokio::test]
-    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
+    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns(
+        #[case] num_bits: u8,
+        #[case] layered: bool,
+    ) {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_multi_bit");
 
@@ -2944,8 +2992,9 @@ mod tests {
             fast_rotation_signs: Some(vec![0xAA; 2]),
             rotation_type: RQRotationType::Fast,
             code_dim: 16,
-            num_bits: 4,
+            num_bits,
             packed: false,
+            layered,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -3000,7 +3049,8 @@ mod tests {
         let meta = reader.metadata();
         let rq_meta_json = meta.file_schema.metadata.get(RABIT_METADATA_KEY).unwrap();
         let merged_rq_meta: RabitQuantizationMetadata = serde_json::from_str(rq_meta_json).unwrap();
-        assert_eq!(merged_rq_meta.num_bits, 4);
+        assert_eq!(merged_rq_meta.num_bits, num_bits);
+        assert_eq!(merged_rq_meta.layered, layered);
         assert!(merged_rq_meta.packed);
 
         let mut total_rows = 0usize;
@@ -3025,7 +3075,32 @@ mod tests {
                     panic!("RQ ex-code field should be FixedSizeList");
                 };
                 // code_dim=16 padded to one 64-dim block at ex_bits=3.
-                assert_eq!(*ex_code_bytes, 24);
+                let high_bits = if layered {
+                    crate::vector::bq::layered::RQLayout::try_new(num_bits)
+                        .unwrap()
+                        .high_bits
+                } else {
+                    num_bits - 1
+                };
+                assert_eq!(
+                    *ex_code_bytes,
+                    crate::vector::bq::ex_dot::blocked_ex_code_bytes(16, high_bits) as i32
+                );
+                if layered {
+                    assert!(
+                        schema
+                            .field_with_name(
+                                crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_LO_COLUMN
+                            )
+                            .is_ok()
+                    );
+                    assert_eq!(
+                        batch[crate::vector::bq::layered::HIGH_ADD_FACTORS_COLUMN]
+                            .as_primitive::<Float32Type>()
+                            .value(0),
+                        100.
+                    );
+                }
                 assert!(schema.field_with_name(ERROR_FACTORS_FIELD.name()).is_ok());
                 assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
                 assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
@@ -3040,6 +3115,49 @@ mod tests {
             .map(|(a, b)| (*a + *b) as usize)
             .sum();
         assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rq_rejects_mixed_layouts() {
+        let store = ObjectStore::memory();
+        let root = Path::from("mixed-rq");
+        let a = root
+            .clone()
+            .join("partial_0")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let b = root
+            .clone()
+            .join("partial_1")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let mut metadata = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 5,
+            packed: false,
+            layered: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        write_rq_partial_aux(&store, &a, &metadata, &[2], 0, DistanceType::L2)
+            .await
+            .unwrap();
+        metadata.layered = true;
+        write_rq_partial_aux(&store, &b, &metadata, &[2], 10, DistanceType::L2)
+            .await
+            .unwrap();
+        let error = merge_partial_vector_auxiliary_files(
+            &store,
+            &[a, b],
+            &root,
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(error.to_string().contains("structural mismatch"));
+        assert!(error.to_string().contains("layered=true"));
     }
 
     #[tokio::test]

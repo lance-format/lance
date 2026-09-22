@@ -16,6 +16,9 @@ use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
+use crate::vector::bq::layered::{
+    HIGH_ADD_FACTORS_COLUMN, HIGH_SCALE_FACTORS_COLUMN, RQLayout, split_codes, storage_fields,
+};
 use crate::vector::bq::rabit_ex_bits;
 use crate::vector::bq::storage::{
     RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator,
@@ -87,12 +90,13 @@ impl RQTransformer {
     }
 }
 
-struct RabitRawQueryFactors {
-    add_factors: Float32Array,
-    scale_factors: Float32Array,
-    error_factors: Float32Array,
-    ex_add_factors: Option<Float32Array>,
-    ex_scale_factors: Option<Float32Array>,
+#[doc(hidden)]
+pub struct RabitRawQueryFactors {
+    pub add_factors: Float32Array,
+    pub scale_factors: Float32Array,
+    pub error_factors: Float32Array,
+    pub ex_add_factors: Option<Float32Array>,
+    pub ex_scale_factors: Option<Float32Array>,
 }
 
 #[inline]
@@ -136,7 +140,8 @@ fn error_factor_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_raw_query_factors(
+#[doc(hidden)]
+pub fn compute_raw_query_factors(
     distance_type: DistanceType,
     res_norm_square: &Float32Array,
     rotated_residuals: &[f32],
@@ -285,7 +290,13 @@ impl Transformer for RQTransformer {
         let has_split_codes = self.rq.num_bits() == 1
             || (batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
-                && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
+                && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
+                && (!self.rq.metadata_ref().layered
+                    || (batch
+                        .column_by_name(super::storage::RABIT_BLOCKED_EX_CODE_LO_COLUMN)
+                        .is_some()
+                        && batch.column_by_name(HIGH_ADD_FACTORS_COLUMN).is_some()
+                        && batch.column_by_name(HIGH_SCALE_FACTORS_COLUMN).is_some())));
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
             return Ok(batch.clone());
         }
@@ -443,6 +454,43 @@ impl Transformer for RQTransformer {
                 self.rq.dim(),
             )?;
 
+            let layered = if self.rq.metadata_ref().layered {
+                let layout = RQLayout::try_new(self.rq.num_bits())?;
+                let values = ex_code_values
+                    .as_deref()
+                    .ok_or_else(|| Error::internal("missing full ex codes"))?;
+                let (hi, lo, hi_values) = split_codes(values, self.rq.dim(), layout)?;
+                let bias = -((1u32 << layout.high_bits) as f32 - 0.5);
+                let hi_res_dot: Vec<f32> = rotated_residuals
+                    .chunks_exact(self.rq.dim())
+                    .zip(hi_values.chunks_exact(self.rq.dim()))
+                    .map(|(residual, codes)| {
+                        residual
+                            .iter()
+                            .zip(codes)
+                            .map(|(&r, &c)| {
+                                let sign = u32::from(r.is_sign_positive());
+                                r * (((sign << layout.high_bits) + u32::from(c)) as f32 + bias)
+                            })
+                            .sum()
+                    })
+                    .collect();
+                let factors = compute_raw_query_factors(
+                    self.distance_type,
+                    &res_norm_square,
+                    &rotated_residuals,
+                    rotated_centroids,
+                    part_ids,
+                    Some(&hi_values),
+                    Some(&hi_res_dot),
+                    layout.high_bits,
+                    self.rq.dim(),
+                )?;
+                Some((hi, lo, factors))
+            } else {
+                None
+            };
+
             batch = batch
                 .try_with_column(
                     ADD_FACTORS_FIELD.clone(),
@@ -457,7 +505,28 @@ impl Transformer for RQTransformer {
                     Arc::new(raw_query_factors.error_factors),
                 )?;
 
-            if let Some(ex_codes) = ex_codes {
+            if let Some((hi, lo, factors)) = layered {
+                let fields = storage_fields(self.rq.dim(), self.rq.num_bits(), Vec::new())?;
+                batch = batch
+                    .try_with_column(fields[0].clone(), hi)?
+                    .try_with_column(fields[1].clone(), lo)?
+                    .try_with_column(
+                        fields[4].clone(),
+                        Arc::new(
+                            factors
+                                .ex_add_factors
+                                .ok_or_else(|| Error::internal("missing high add factors"))?,
+                        ),
+                    )?
+                    .try_with_column(
+                        fields[5].clone(),
+                        Arc::new(
+                            factors
+                                .ex_scale_factors
+                                .ok_or_else(|| Error::internal("missing high scale factors"))?,
+                        ),
+                    )?;
+            } else if let Some(ex_codes) = ex_codes {
                 batch = batch.try_with_column(
                     crate::vector::bq::storage::rabit_ex_code_field(
                         self.rq.dim(),
@@ -496,6 +565,7 @@ mod tests {
 
     use crate::vector::bq::RQRotationType;
     use crate::vector::bq::builder::RabitQuantizer;
+
     use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
     use crate::vector::transform::Transformer;

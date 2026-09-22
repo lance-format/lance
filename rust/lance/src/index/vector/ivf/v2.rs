@@ -917,6 +917,7 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
+    cache_whole_partition: bool,
     /// Memoized size of the immutable parts (this struct, the sub-index and the
     /// quantized storage): every query that prepares this partition needs its
     /// size to budget scoring chunks, and the walk over the storage's arrays
@@ -937,6 +938,7 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
+            cache_whole_partition: true,
             immutable_bytes: OnceLock::new(),
             coverage_bytes: OnceLock::new(),
         }
@@ -1111,7 +1113,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition: &Arc<PartitionEntry<S, Q>>,
     ) -> Result<Arc<RowAddrTreeMap>> {
         let rows = partition.partition_rows();
-        if !partition.partition_rows_accounted.load(Ordering::Acquire) {
+        if partition.cache_whole_partition
+            && !partition.partition_rows_accounted.load(Ordering::Acquire)
+        {
             let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
             if index_cache
                 .insert_with_key(&cache_key, partition.clone())
@@ -1224,7 +1228,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let (part_entry, ()) = tokio::try_join!(
-            self.load_partition(partition_id, true, metrics),
+            self.load_initial_partition(partition_id, query, metrics),
             pre_filter.wait_for_ready(),
         )?;
         let pre_filter =
@@ -1251,7 +1255,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let part_entry = self
+            .load_initial_partition(partition_id, query, metrics)
+            .await?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
@@ -1740,10 +1746,342 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
+    /// Cut candidates across all probed partitions before fetching lower planes.
+    pub async fn quantized_candidates(
+        &self,
+        query: &Query,
+        partitions: &UInt32Array,
+        centroid_dists: &Float32Array,
+        range: Range<usize>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<lance_index::vector::bq::layered::QuantizedCandidate>> {
+        use lance_index::vector::storage::DistanceCalculatorOptions;
+        let start = range.start;
+        let end = range.end;
+        self.initial_precision(query)?;
+        if !self.storage.is_layered_rq() || !self.storage.supports_candidate_reads() {
+            return Err(Error::invalid_input(
+                "quantized candidates require a layered index without a row-id remapper",
+            ));
+        }
+        if partitions.len() != centroid_dists.len() || start > end || end > partitions.len() {
+            return Err(Error::invalid_input(
+                "invalid quantized candidate partition range",
+            ));
+        }
+        let factor = query
+            .rq_cascade_factor
+            .ok_or_else(|| Error::internal("missing cascade factor"))?;
+        let k = query
+            .k
+            .checked_mul(query.refine_factor.unwrap_or(1) as usize)
+            .ok_or_else(|| Error::invalid_input("cascade k overflow"))?;
+        let limit = k
+            .checked_mul(factor as usize)
+            .ok_or_else(|| Error::invalid_input("cascade candidate count overflow"))?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        pre_filter.wait_for_ready().await?;
+        let raw_query = self.prepare_rq_raw_query_context(&query.key)?;
+        let mut coarse_heap: BinaryHeap<
+            OrderedNode<(usize, u32, u64, lance_index::vector::graph::OrderedFloat)>,
+        > = BinaryHeap::with_capacity(limit);
+        let mut distances = HashMap::new();
+        for index in start..end {
+            let part_id = partitions.value(index) as usize;
+            let mut local_query = query.clone();
+            local_query.dist_q_c = centroid_dists.value(index);
+            distances.insert(part_id, local_query.dist_q_c);
+            let entry = self
+                .load_initial_partition(part_id, &local_query, metrics)
+                .await?;
+            let filter = pre_filter.clone();
+            let raw_query = raw_query.clone();
+            let cache = self.rq_search_cache.clone();
+            coarse_heap = spawn_cpu(move || -> Result<_> {
+                let mut scratch = Vec::new();
+                let context = QueryResidual::RabitRawQuery {
+                    rotated_centroid: rotated_partition_centroid_slice(cache.as_deref(), part_id),
+                    query: raw_query.as_deref(),
+                };
+                let storage = entry
+                    .storage
+                    .as_any()
+                    .downcast_ref::<lance_index::vector::bq::storage::RabitQuantizationStorage>()
+                    .ok_or_else(|| Error::internal("layered candidate storage is not RaBitQ"))?;
+                let calc = storage.dist_calculator_with_scratch(
+                    local_query.key,
+                    local_query.dist_q_c,
+                    Some(context),
+                    &mut scratch,
+                    DistanceCalculatorOptions {
+                        approx_mode: local_query.approx_mode,
+                        ..Default::default()
+                    },
+                );
+                let binary_inner_products = calc.binary_inner_products();
+                for row in filter.filter_row_ids(Box::new(entry.storage.row_ids())) {
+                    let node = OrderedNode::new(
+                        (
+                            part_id,
+                            row as u32,
+                            entry.storage.row_id(row as u32),
+                            binary_inner_products[row as usize].into(),
+                        ),
+                        calc.distance_with_binary_inner_product(
+                            row as u32,
+                            binary_inner_products[row as usize],
+                        )
+                        .into(),
+                    );
+                    if coarse_heap.len() < limit {
+                        coarse_heap.push(node);
+                    } else if coarse_heap.peek().is_some_and(|top| node.dist < top.dist) {
+                        coarse_heap.pop();
+                        coarse_heap.push(node);
+                    }
+                }
+                Ok(coarse_heap)
+            })
+            .await?;
+        }
+        Ok(coarse_heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(
+                |node| lance_index::vector::bq::layered::QuantizedCandidate {
+                    index_uuid: self.uuid,
+                    partition_id: node.id.0,
+                    row_offset: node.id.1,
+                    row_id: node.id.2,
+                    distance: node.dist.0,
+                    centroid_distance: distances[&node.id.0],
+                    binary_inner_product: node.id.3.0,
+                },
+            )
+            .collect())
+    }
+
+    /// Rerank a global cut of quantized candidates with the original query, without data-file reads.
+    pub async fn rerank_quantized_candidates(
+        &self,
+        query: &Query,
+        input: Vec<lance_index::vector::bq::layered::QuantizedCandidate>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        use lance_index::vector::storage::DistanceCalculatorOptions;
+        let k = query
+            .k
+            .checked_mul(query.refine_factor.unwrap_or(1) as usize)
+            .ok_or_else(|| Error::invalid_input("candidate rerank k overflow"))?;
+        if k == 0 {
+            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+        }
+        let raw_query = self.prepare_rq_raw_query_context(&query.key)?;
+        let mut candidates: std::collections::BTreeMap<
+            usize,
+            Vec<lance_index::vector::bq::layered::QuantizedCandidate>,
+        > = std::collections::BTreeMap::new();
+        let mut distances = HashMap::new();
+        for candidate in input {
+            if candidate.index_uuid != self.uuid
+                || candidate.partition_id >= self.ivf.num_partitions()
+            {
+                return Err(Error::invalid_input(
+                    "quantized candidate belongs to a different index or invalid partition",
+                ));
+            }
+            distances.insert(candidate.partition_id, candidate.centroid_distance);
+            candidates
+                .entry(candidate.partition_id)
+                .or_default()
+                .push(candidate);
+        }
+        let mut full_heap: BinaryHeap<OrderedNode<u64>> = BinaryHeap::with_capacity(k);
+        for (part_id, mut rows) in candidates {
+            rows.sort_unstable_by_key(|row| row.row_offset);
+            if rows
+                .windows(2)
+                .any(|pair| pair[0].row_offset == pair[1].row_offset)
+            {
+                return Err(Error::invalid_input("duplicate quantized candidate offset"));
+            }
+            let offsets = rows.iter().map(|row| row.row_offset).collect();
+            let storage = self
+                .storage
+                .load_candidates(part_id, offsets, &self.index_cache, metrics.io_stats())
+                .await?;
+            let dist_q_c = distances[&part_id];
+            let key = query.key.clone();
+            let cache = self.rq_search_cache.clone();
+            let raw_query = raw_query.clone();
+            let approx_mode = query.approx_mode;
+            let lower_bound = query.lower_bound;
+            let upper_bound = query.upper_bound;
+            full_heap = spawn_cpu(move || -> Result<_> {
+                let mut scratch = Vec::new();
+                let context = QueryResidual::RabitRawQuery {
+                    rotated_centroid: rotated_partition_centroid_slice(cache.as_deref(), part_id),
+                    query: raw_query.as_deref(),
+                };
+                let rq_storage = storage
+                    .as_any()
+                    .downcast_ref::<lance_index::vector::bq::storage::RabitQuantizationStorage>()
+                    .ok_or_else(|| Error::internal("layered rerank storage is not RaBitQ"))?;
+                let calc = rq_storage.dist_calculator_with_scratch(
+                    key,
+                    dist_q_c,
+                    Some(context),
+                    &mut scratch,
+                    DistanceCalculatorOptions {
+                        approx_mode,
+                        ..Default::default()
+                    },
+                );
+                for (row, candidate) in rows.iter().enumerate() {
+                    if storage.row_id(row as u32) != candidate.row_id {
+                        return Err(Error::invalid_input(
+                            "candidate row id does not match its physical offset",
+                        ));
+                    }
+                    let distance = calc.distance_with_binary_inner_product(
+                        row as u32,
+                        candidate.binary_inner_product,
+                    );
+                    if lower_bound.is_some_and(|bound| distance < bound)
+                        || upper_bound.is_some_and(|bound| distance >= bound)
+                    {
+                        continue;
+                    }
+                    let node = OrderedNode::new(storage.row_id(row as u32), distance.into());
+                    if full_heap.len() < k {
+                        full_heap.push(node);
+                    } else if full_heap.peek().is_some_and(|top| node.dist < top.dist) {
+                        full_heap.pop();
+                        full_heap.push(node);
+                    }
+                }
+                Ok(full_heap)
+            })
+            .await?;
+        }
+        spawn_cpu(move || Self::global_heap_to_batch(full_heap)).await
+    }
+
+    async fn cascade_partitions(
+        &self,
+        query: &Query,
+        partitions: &UInt32Array,
+        centroid_dists: &Float32Array,
+        range: Range<usize>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let candidates = self
+            .quantized_candidates(
+                query,
+                partitions,
+                centroid_dists,
+                range,
+                pre_filter,
+                metrics,
+            )
+            .await?;
+        self.rerank_quantized_candidates(query, candidates, metrics)
+            .await
+    }
+
+    async fn load_initial_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        use lance_index::vector::bq::layered::{PlaneKey, RQPrecision};
+        let mut precision = self.initial_precision(query)?;
+        if query.rq_cascade_factor.is_some()
+            && precision == RQPrecision::High
+            && self.storage.supports_candidate_reads()
+            && self
+                .index_cache
+                .get_resident_with_key(&PlaneKey {
+                    partition: partition_id,
+                    plane: 1,
+                })
+                .await
+                .is_none()
+        {
+            precision = RQPrecision::Sign;
+        }
+        self.load_query_partition(partition_id, precision, metrics)
+            .await
+    }
+
+    fn initial_precision(
+        &self,
+        query: &Query,
+    ) -> Result<lance_index::vector::bq::layered::RQPrecision> {
+        use lance_index::vector::bq::layered::RQPrecision;
+        if let Some(factor) = query.rq_cascade_factor {
+            if factor == 0
+                || query.rq_precision != RQPrecision::Full
+                || !self.storage.is_layered_rq()
+                || query.approx_mode == lance_index::vector::ApproxMode::Fast
+            {
+                return Err(Error::invalid_input(
+                    "rq_cascade_factor requires a positive factor, full precision and normal/accurate mode on a layered IVF_RQ index",
+                ));
+            }
+            if self.storage.supports_candidate_reads()
+                && query.lower_bound.is_none()
+                && query.upper_bound.is_none()
+            {
+                return Ok(RQPrecision::High);
+            }
+        }
+        Ok(query.rq_precision)
+    }
+
+    async fn load_query_partition(
+        &self,
+        partition_id: usize,
+        precision: lance_index::vector::bq::layered::RQPrecision,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        if !self.storage.is_layered_rq() {
+            if precision != lance_index::vector::bq::layered::RQPrecision::Full {
+                return Err(Error::invalid_input(
+                    "rq_precision requires a layered IVF_RQ index",
+                ));
+            }
+            return self.load_partition(partition_id, true, metrics).await;
+        }
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input("partition id out of range"));
+        }
+        let mut entry = self
+            .load_partition_entry_at_precision(partition_id, metrics.io_stats(), Some(precision))
+            .await?;
+        entry.cache_whole_partition = false;
+        Ok(Arc::new(entry))
+    }
+
     async fn load_partition_entry(
         &self,
         partition_id: usize,
         io_stats: Option<IoStats>,
+    ) -> Result<PartitionEntry<S, Q>> {
+        self.load_partition_entry_at_precision(partition_id, io_stats, None)
+            .await
+    }
+
+    async fn load_partition_entry_at_precision(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+        precision: Option<lance_index::vector::bq::layered::RQPrecision>,
     ) -> Result<PartitionEntry<S, Q>> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
@@ -1799,7 +2137,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             self.sub_index_metadata[partition_id].clone(),
         )?;
         let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        let storage = if let Some(precision) = precision {
+            Box::pin(self.storage.load_partition_at_precision(
+                partition_id,
+                precision,
+                &self.index_cache,
+                io_stats,
+            ))
+            .await?
+        } else {
+            self.load_partition_storage(partition_id, io_stats).await?
+        };
         Ok(PartitionEntry::new(idx, storage))
     }
 
@@ -2002,6 +2350,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
+        if self.storage.is_layered_rq() {
+            return self.storage.prewarm_planes(&self.index_cache).await;
+        }
         let cpu_parallelism = get_num_compute_intensive_cpus();
         let target_bytes = prewarm_window_size_bytes()?;
         let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
@@ -2177,7 +2528,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        self.initial_precision(query)?;
+        if query.rq_cascade_factor.is_some()
+            && self.storage.supports_candidate_reads()
+            && query.lower_bound.is_none()
+            && query.upper_bound.is_none()
+        {
+            return self
+                .cascade_partitions(
+                    query,
+                    &UInt32Array::from(vec![partition_id as u32]),
+                    &Float32Array::from(vec![query.dist_q_c]),
+                    0..1,
+                    pre_filter,
+                    metrics,
+                )
+                .await;
+        }
+        let part_entry = self
+            .load_initial_partition(partition_id, query, metrics)
+            .await?;
         pre_filter.wait_for_ready().await?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
@@ -2300,6 +2670,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             return Err(Error::invalid_input(format!(
                 "invalid partition search range [{start_idx}, {end_idx}) for {} partitions",
                 partitions.len()
+            )));
+        }
+
+        self.initial_precision(&query)?;
+        if query.rq_cascade_factor.is_some()
+            && self.storage.supports_candidate_reads()
+            && query.lower_bound.is_none()
+            && query.upper_bound.is_none()
+        {
+            let batch = self
+                .cascade_partitions(
+                    &query,
+                    &partitions,
+                    &q_c_dists,
+                    start_idx..end_idx,
+                    pre_filter,
+                    metrics.as_ref(),
+                )
+                .await?;
+            if let Some(control) = control {
+                control.record_batch(&batch);
+            }
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                VECTOR_RESULT_SCHEMA.clone(),
+                stream::once(async { Ok(batch) }),
             )));
         }
 
@@ -2621,6 +3016,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             )));
         }
         let dim = query.key.len() / query_count;
+        self.initial_precision(&query)?;
+        if query.rq_cascade_factor.is_some()
+            && self.storage.supports_candidate_reads()
+            && query.lower_bound.is_none()
+            && query.upper_bound.is_none()
+        {
+            let mut results = Vec::with_capacity(query_count);
+            for query_idx in 0..query_count {
+                let mut single = query.clone();
+                single.key = query.key.slice(query_idx * dim, dim);
+                results.push(
+                    self.cascade_partitions(
+                        &single,
+                        &partitions_per_query[query_idx],
+                        &q_c_dists_per_query[query_idx],
+                        0..partitions_per_query[query_idx].len(),
+                        pre_filter.clone(),
+                        metrics.as_ref(),
+                    )
+                    .await?,
+                );
+            }
+            return Ok(results);
+        }
 
         // Per-query immutable search state: the query vector slice and the
         // optional Rabit raw-query context both depend only on the query vector,
@@ -2685,13 +3104,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
+        let precision = query.rq_precision;
         let mut loaded_chunks = stream::iter(assignment_list)
             .map(move |(part_id, probing_queries)| {
                 let index = load_index.clone();
                 let metrics = load_metrics.clone();
                 async move {
                     let part_entry = index
-                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .load_query_partition(part_id as usize, precision, metrics.as_ref())
                         .await?;
                     Result::Ok((part_id as usize, part_entry, probing_queries))
                 }
@@ -2951,6 +3371,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::bq::builder::RabitQuantizer;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
         ex_dot::{blocked_ex_code_bytes, padded_query_len},
@@ -2958,7 +3379,7 @@ mod tests {
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::ivf::storage::IvfModel;
-    use lance_index::vector::storage::VectorStore;
+    use lance_index::vector::storage::{DistCalculator, IvfQuantizationStorage, VectorStore};
     use lance_index::vector::v3::subindex::IvfSubIndex;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
@@ -6198,6 +6619,153 @@ mod tests {
     }
 
     #[rstest]
+    #[case(5)]
+    #[case(7)]
+    #[case(9)]
+    #[tokio::test]
+    async fn test_layered_rq_create_search_cascade_and_remap(
+        #[case] bits: u8,
+        #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)]
+        distance_type: DistanceType,
+    ) {
+        use lance_index::vector::bq::layered::RQPrecision;
+        let dir = TempStrDir::default();
+        let (mut dataset, vectors) =
+            generate_test_dataset::<Float32Type>(dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            distance_type,
+            IvfBuildParams::new(4),
+            RQBuildParams::new(bits).with_layered(true),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let query = vectors.value(0);
+        let gt = ground_truth(&dataset, "vector", &query, 100, distance_type).await;
+        let mut full = None;
+        for precision in [RQPrecision::Sign, RQPrecision::High, RQPrecision::Full] {
+            let result = dataset
+                .scan()
+                .nearest("vector", query.as_ref(), 100)
+                .unwrap()
+                .nprobes(4)
+                .rq_precision(precision)
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let ids = result[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            assert!(
+                ids.intersection(&gt).count() >= 50,
+                "precision={precision:?}"
+            );
+            if precision == RQPrecision::Full {
+                full = Some(result);
+            }
+        }
+        let cold = crate::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::new(
+                0,
+                1024 * 1024,
+                Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+            )))
+            .load()
+            .await
+            .unwrap();
+        let cascade = cold
+            .scan()
+            .nearest("vector", query.as_ref(), 100)
+            .unwrap()
+            .nprobes(4)
+            .rq_cascade_factor(100)
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let full = full.unwrap();
+        assert_eq!(cascade[ROW_ID].as_ref(), full[ROW_ID].as_ref());
+        assert_eq!(cascade[DIST_COL].as_ref(), full[DIST_COL].as_ref());
+        let upper = full[DIST_COL].as_primitive::<Float32Type>().value(50);
+        let mut range_results = Vec::new();
+        for cascade_factor in [None, Some(4)] {
+            let mut scan = cold.scan();
+            scan.nearest("vector", query.as_ref(), 100)
+                .unwrap()
+                .nprobes(4)
+                .distance_range(None, Some(upper))
+                .with_row_id();
+            if let Some(factor) = cascade_factor {
+                scan.rq_cascade_factor(factor).unwrap();
+            }
+            range_results.push(scan.try_into_batch().await.unwrap());
+        }
+        assert_eq!(
+            range_results[0][ROW_ID].as_ref(),
+            range_results[1][ROW_ID].as_ref()
+        );
+        assert_eq!(
+            range_results[0][DIST_COL].as_ref(),
+            range_results[1][DIST_COL].as_ref()
+        );
+
+        let index = &dataset.load_indices().await.unwrap()[0];
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::local()),
+            SchedulerConfig::default_for_testing(),
+        );
+        let reader = open_rq_aux_reader(&dataset, scheduler, &index.uuid.to_string()).await;
+        let loader = IvfQuantizationStorage::<RabitQuantizer>::try_new(reader, None)
+            .await
+            .unwrap();
+        let source = loader.load_partition(0, None).await.unwrap();
+        let offsets: Vec<u32> = (0..source.len() as u32).step_by(3).take(5).collect();
+        assert!(offsets.len() > 1);
+        let no_cache = LanceCache::no_cache();
+        let selected = loader
+            .load_candidates(0, offsets.clone(), &WeakLanceCache::from(&no_cache), None)
+            .await
+            .unwrap();
+        let source_calc = source.dist_calculator(query.clone(), 0.0);
+        let selected_calc = selected.dist_calculator(query.clone(), 0.0);
+        for (row, offset) in offsets.into_iter().enumerate() {
+            assert_eq!(selected.row_id(row as u32), source.row_id(offset));
+            assert_eq!(
+                selected_calc.distance(row as u32).to_bits(),
+                source_calc.distance(offset).to_bits()
+            );
+        }
+        append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::local()),
+            SchedulerConfig::default_for_testing(),
+        );
+        for index in indices.iter() {
+            assert!(
+                get_rq_metadata(&dataset, scheduler.clone(), &index.uuid.to_string())
+                    .await
+                    .layered
+            );
+        }
+        test_remap(params, 4, 0.5).await;
+    }
+
+    #[rstest]
     #[case::fast(RQRotationType::Fast)]
     #[case::matrix(RQRotationType::Matrix)]
     #[tokio::test]
@@ -6813,6 +7381,8 @@ mod tests {
             .prepared_partitions();
 
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key: query_vector,
             k: K,

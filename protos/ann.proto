@@ -61,6 +61,10 @@ message VectorQueryProto {
    * indexes, such as IVF_RQ. Other index types ignore this setting.
    */
   VectorApproxMode approx_mode = 14;
+  // Empty selects full precision; otherwise sign, high or full.
+  string rq_precision = 16;
+  // Absent scans full codes; present reranks k times this positive factor.
+  optional uint32 rq_cascade_factor = 17;
   /* Which covering columns the index must materialize for this query. Absent means
    * "not computed" -- see CoveringProjection. Carried across the wire so a remote
    * executor declares the same search output schema the planner did; without it the

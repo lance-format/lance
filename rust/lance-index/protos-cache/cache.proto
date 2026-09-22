@@ -217,4 +217,5 @@ message RabitPartitionHeader {
   optional bytes fast_rotation_signs = 5;
   // Estimator the RabitQ storage uses at query time (residual vs raw query).
   RabitQueryEstimator query_estimator = 6;
+  bool layered = 7;
 }

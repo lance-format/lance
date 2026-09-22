@@ -77,6 +77,7 @@ pub struct FlatQueryParams {
     upper_bound: Option<f32>,
     dist_q_c: f32,
     approx_mode: ApproxMode,
+    rq_precision: super::super::bq::layered::RQPrecision,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -86,6 +87,7 @@ impl From<&Query> for FlatQueryParams {
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
             approx_mode: q.approx_mode,
+            rq_precision: q.rq_precision,
         }
     }
 }
@@ -147,6 +149,7 @@ impl IvfSubIndex for FlatIndex {
             residual,
             &mut scratch.query_f32,
             DistanceCalculatorOptions {
+                rq_precision: params.rq_precision,
                 approx_mode: params.approx_mode,
             },
         );
@@ -269,6 +272,7 @@ impl IvfSubIndex for FlatIndex {
             residual,
             &mut scratch.query_f32,
             DistanceCalculatorOptions {
+                rq_precision: params.rq_precision,
                 approx_mode: params.approx_mode,
             },
         );

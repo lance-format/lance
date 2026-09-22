@@ -1017,6 +1017,8 @@ mod tests {
             frag_reuse_index: None,
         };
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key: Arc::new(Float32Array::from(vec![0.0])) as ArrayRef,
             k: 2,

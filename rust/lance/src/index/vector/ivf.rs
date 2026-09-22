@@ -5487,6 +5487,8 @@ mod tests {
             for row_id in row_ids_to_test {
                 let row = self.get_vector(row_id as u32);
                 let query = Query {
+                    rq_cascade_factor: None,
+                    rq_precision: Default::default(),
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
                     k: 5,

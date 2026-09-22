@@ -414,6 +414,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let metadata = self.storage.metadata();
         let header = RabitPartitionHeader {
+            layered: metadata.layered,
             distance_type: distance_type_to_proto(self.storage.distance_type()) as i32,
             num_bits: metadata.num_bits as u32,
             code_dim: metadata.code_dim,
@@ -469,6 +470,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             num_bits: header.num_bits as u8,
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
+            layered: header.layered,
             query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
