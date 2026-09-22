@@ -146,6 +146,9 @@ message Manifest {
    *
    * The flag identities are the same as for reader_feature_flags, but the values of
    * reader_feature_flags and writer_feature_flags are not required to be identical.
+   * * 1 << 11: the manifest also sets max_allocated_field_id. A writer must
+   *   assign new field IDs above that value and advance it in the same commit.
+   *   The field and flag must either both be set or both be absent.
    */
   uint64 writer_feature_flags = 10;
 
@@ -243,6 +246,17 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  /* The stable field-ID allocator high-water mark.
+   *
+   * The first manifest that sets this field initializes it to the largest
+   * field ID the manifest references. Later writers assign new IDs above it.
+   * A dropped ID remains covered by this value and must not be reused.
+   *
+   * This field and FLAG_STABLE_FIELD_IDS in writer_feature_flags must either
+   * both be set or both be absent. A mismatch is invalid.
+   */
+  optional int32 max_allocated_field_id = 22;
 } // Manifest
 
 // external dataset base path

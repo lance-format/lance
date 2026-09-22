@@ -1290,6 +1290,11 @@ class TestWriteFragmentsWithTargetBases:
         )
 
         assert len(fragments) > 0
+        assert all(
+            data_file.fields == [0, 1]
+            for fragment in fragments
+            for data_file in fragment.files
+        )
 
         # Commit with Overwrite operation
         operation = lance.LanceOperation.Overwrite(

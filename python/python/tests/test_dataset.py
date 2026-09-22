@@ -1984,15 +1984,25 @@ def test_cleanup_with_rate_limit(tmp_path):
     assert (finished - start) >= 2_000_000_000  # 2s
 
 
-def test_create_from_commit(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+@pytest.mark.parametrize("as_transaction", [False, True])
+def test_create_from_commit(tmp_path: Path, as_transaction: bool):
+    metadata = {b"source": b"user metadata"}
+    table = pa.Table.from_pydict(
+        {"a": range(100), "b": range(100)}
+    ).replace_schema_metadata(metadata)
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    fragments = [
+        lance.fragment.LanceFragment.create(base_dir, table.slice(offset, 50))
+        for offset in (0, 50)
+    ]
 
-    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    transaction = lance.Transaction(0, operation) if as_transaction else operation
+    dataset = lance.LanceDataset.commit(base_dir, transaction)
     tbl = dataset.to_table()
     assert tbl == table
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.schema.metadata == metadata
 
 
 def test_strict_overwrite(tmp_path: Path):
@@ -5788,6 +5798,25 @@ def test_detached_commits(tmp_path: Path):
     )
 
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
+
+
+def test_detached_raw_arrow_merge_preserves_schema_metadata(tmp_path: Path):
+    metadata = {b"source": b"user metadata"}
+    table = pa.table({"x": [0, 1]}).replace_schema_metadata(metadata)
+    dataset = lance.write_dataset(table, tmp_path)
+    fragment = dataset.get_fragments()[0].metadata
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([fragment], dataset.schema, True)
+
+    detached = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=dataset.version,
+        detached=True,
+    )
+
+    assert detached.to_table() == dataset.to_table()
+    assert detached.schema.metadata == metadata
 
 
 def test_dataset_drop(tmp_path: Path):

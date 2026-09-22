@@ -60,6 +60,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
+use lance_table::transaction::validate_stable_field_id_transition;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -2026,6 +2027,16 @@ impl ManifestNamespace {
                 schema.clone(),
                 fragments,
             );
+            if let Err(err) = validate_stable_field_id_transition(
+                dataset.manifest(),
+                &manifest,
+                &transaction.operation,
+            ) {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(err);
+            }
+            manifest.update_max_field_id();
             let target_version = manifest.version;
 
             let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];

@@ -1356,7 +1356,7 @@ async fn test_write_manifest(
     let write_fut = require_send(write_fut);
     let mut dataset = write_fut.await.unwrap();
 
-    // Check it has no flags
+    // New datasets retain legacy field-ID allocation until explicitly migrated.
     let manifest = read_manifest(
         dataset.object_store.as_ref(),
         &dataset
@@ -1379,6 +1379,7 @@ async fn test_write_manifest(
         "stable" | "next"
     ));
     assert_eq!(manifest.reader_feature_flags, 0);
+    assert_eq!(manifest.writer_feature_flags, 0);
 
     // Create one with deletions
     dataset.delete("i < 10").await.unwrap();
@@ -1424,6 +1425,7 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            activate_stable_field_ids: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1458,6 +1460,59 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_clone_rejects_unknown_writer_requirements() {
+    let source_uri = TempStrDir::default();
+    let shallow_clone_uri = TempStrDir::default();
+    let deep_clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unknown_writer = dataset.manifest.as_ref().clone();
+    unknown_writer.version += 1;
+    unknown_writer.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_writer,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut source = Dataset::open(&source_uri).await.unwrap();
+    let error = source
+        .shallow_clone(shallow_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    let error = source
+        .deep_clone(deep_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
 #[tokio::test]
@@ -3954,6 +4009,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            activate_stable_field_ids: false,
         },
         dataset.manifest_location.naming_scheme,
         None,

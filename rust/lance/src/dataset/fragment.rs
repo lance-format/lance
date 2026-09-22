@@ -2164,7 +2164,7 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(max_field_id));
+        new_schema.try_set_field_id(Some(max_field_id))?;
 
         let new_fragment = self
             .clone()

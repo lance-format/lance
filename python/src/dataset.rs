@@ -95,6 +95,7 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::transaction::resolve_arrow_field_ids;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -3049,7 +3050,7 @@ impl Dataset {
     #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit(
         dest: PyWriteDest,
-        operation: PyLance<Operation>,
+        operation: &Bound<'_, PyAny>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -3063,18 +3064,22 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
-        let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
+        let transaction = operation
+            .py()
+            .import(intern!(operation.py(), "lance"))?
+            .getattr("Transaction")?
+            .call1((read_version.unwrap_or_default(), operation))?;
 
         if let Some(commit_message) = commit_message {
-            transaction.transaction_properties = Some(Arc::new(HashMap::from([(
-                LANCE_COMMIT_MESSAGE_KEY.to_string(),
-                commit_message,
-            )])));
+            transaction.setattr(
+                "transaction_properties",
+                HashMap::from([(LANCE_COMMIT_MESSAGE_KEY.to_string(), commit_message)]),
+            )?;
         }
 
         Self::commit_transaction(
             dest,
-            PyLance(transaction),
+            &transaction,
             commit_lock,
             storage_options,
             enable_v2_manifest_paths,
@@ -3094,7 +3099,7 @@ impl Dataset {
     #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit_transaction(
         dest: PyWriteDest,
-        transaction: PyLance<Transaction>,
+        transaction: &Bound<'_, PyAny>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
@@ -3106,6 +3111,16 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
+        let mut rust_transaction = transaction.extract::<PyLance<Transaction>>()?.0;
+        let operation = transaction.getattr("operation")?;
+        let input_schema = match &rust_transaction.operation {
+            Operation::Overwrite { .. } => Some(operation.getattr("new_schema")?),
+            Operation::Merge { .. } | Operation::Project { .. } => {
+                Some(operation.getattr("schema")?)
+            }
+            _ => None,
+        };
+        let is_arrow = input_schema.is_some_and(|schema| !schema.is_instance_of::<LanceSchema>());
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
@@ -3149,7 +3164,55 @@ impl Dataset {
                 None
             };
 
-        let mut builder = CommitBuilder::new(dest.as_dest())
+        // Resolve Arrow IDs while the Python input type is still available.
+        // The core commit path receives only ordinary Lance operations.
+        let read_dataset = if is_arrow {
+            rt().block_on(Some(transaction.py()), async {
+                let dataset = match &dest {
+                    PyWriteDest::Dataset(dataset) => Some(dataset.ds.clone()),
+                    PyWriteDest::Uri(uri) => {
+                        match DatasetBuilder::from_uri(&**uri)
+                            .with_read_params(ReadParams {
+                                store_options: object_store_params.clone(),
+                                commit_handler: commit_handler.clone(),
+                                ..Default::default()
+                            })
+                            .load()
+                            .await
+                        {
+                            Ok(dataset) => Some(Arc::new(dataset)),
+                            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => None,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+                let dataset = match dataset {
+                    Some(dataset)
+                        if rust_transaction.read_version != 0
+                            && dataset.version().version != rust_transaction.read_version =>
+                    {
+                        Some(Arc::new(
+                            dataset
+                                .checkout_version(rust_transaction.read_version)
+                                .await?,
+                        ))
+                    }
+                    dataset => dataset,
+                };
+                resolve_arrow_field_ids(
+                    dataset.as_ref().map(|dataset| dataset.manifest()),
+                    &mut rust_transaction.operation,
+                )?;
+                Ok::<_, Error>(dataset)
+            })?
+            .infer_error()?
+        } else {
+            None
+        };
+        let destination = read_dataset
+            .map(WriteDestination::Dataset)
+            .unwrap_or_else(|| dest.as_dest());
+        let mut builder = CommitBuilder::new(destination)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20))
@@ -3170,7 +3233,7 @@ impl Dataset {
         let ds = rt()
             .block_on(
                 commit_lock.map(|cl| cl.py()),
-                builder.execute(transaction.0),
+                builder.execute(rust_transaction),
             )?
             .io_or_timeout_error()?;
 

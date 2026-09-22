@@ -97,6 +97,16 @@ def test_lance_schema_from_protos_rejects_missing_parent():
         LanceSchema._from_protos("{}", field_proto)
 
 
+def test_lance_schema_from_pyarrow_ignores_field_id_metadata():
+    arrow_schema = pa.schema(
+        [pa.field("x", pa.int32(), metadata={b"lance:field_id": b"42"})]
+    )
+
+    schema = LanceSchema.from_pyarrow(arrow_schema)
+
+    assert schema.fields()[0].id() == 0
+
+
 def test_lance_schema_field_lookup(tmp_path: Path):
     dataset = lance.write_dataset(
         pa.table({"x": range(2), "s": [{"a": 1}, {"a": 2}]}), tmp_path

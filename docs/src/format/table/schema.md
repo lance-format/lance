@@ -221,15 +221,57 @@ Assigned IDs with parent relationships:
 Note: A `parent_id` of -1 indicates a top-level field. For nested fields, `parent_id` references the ID of the parent field. Child fields reference their parent via `parent_id` rather than being stored as separate "children" arrays in the protobuf message (though the Rust in-memory representation maintains a children vector for convenience).
 
 **New field assignment (incremental):**
-When fields are added later (e.g., through schema evolution), they receive the next available ID
-incrementally. This preserves the history of field additions.
+
+`Manifest.max_allocated_field_id` selects between two behaviors:
+
+- If the manifest does not set the field, the dataset uses the legacy behavior. A writer may choose
+  the next ID from fields the current version still references. It may therefore reuse the ID of a
+  dropped field.
+- If the manifest sets the field, the dataset uses stable field IDs. A writer assigns each new field
+  an ID greater than `max_allocated_field_id`. It does not reuse an ID dropped or replaced after
+  activation.
+
+For stable field IDs, a caller cannot choose the ID of a new field. An Arrow schema may carry
+field-ID metadata, but the writer discards that metadata for new fields and assigns the IDs. The IDs
+do not have to be consecutive, which leaves room for a future reservation mechanism.
+
+The first manifest that sets `max_allocated_field_id` initializes it to the largest field ID of 0
+or greater in the manifest schema, base data files, and overlay files. Earlier versions keep the
+legacy behavior. Activation cannot recover an ID that an earlier version dropped or reused.
+
+`max_allocated_field_id` stores the allocator state. `FLAG_STABLE_FIELD_IDS` tells writers that they
+must honor that state. A legacy manifest sets neither value. A stable manifest sets both. A manifest
+that sets only one is invalid. The reader flag for stable field IDs must remain unset because the
+feature does not change read behavior.
+
+A dataset changes to stable field IDs only through an explicit migration commit.
+
+A dataset cannot return to the legacy behavior. After activation, a restore must fail if it targets
+a version that does not set `max_allocated_field_id`. Before activation, different fields may have
+used the same ID in different versions. For example, an old version may assign ID 1 to an integer
+field `x`, while the activation version assigns it to a string field `y`. Restoring the old version
+would make ID 1 refer to `x` again. Keeping the current high-water mark prevents future allocation
+from reusing IDs, but does not resolve this existing conflict. Reading old versions remains supported.
 
 ### Field ID Properties
 
-- **Immutable**: Once assigned, a field's ID never changes
-- **Unique**: Each field within a table has a unique ID
-- **Stable**: IDs are preserved across schema evolution operations
-- **Sparse**: Field IDs may not form a contiguous sequence after schema evolution
+- **Stable**: A field keeps the same ID for as long as the field exists.
+- **Unique**: No two fields in one dataset version have the same ID.
+- **Sparse**: The field IDs in one version do not have to be consecutive.
+
+When `max_allocated_field_id` is set, two more properties apply:
+
+- **Not reused**: After activation, no later version uses the ID of a dropped or replaced field.
+- **Increasing**: Every new ID is greater than the activation high-water mark and every ID assigned
+  after activation.
+
+A field ID is unique within one branch of one dataset. It is not unique across datasets or across
+branches that changed independently. A reference stored outside the dataset must name the dataset
+and branch as well as the field ID.
+
+Two branches can assign the same field ID after they diverge. Lance does not yet merge branches. A
+future merge operation must fail if the branches assigned the same ID to different fields. It must
+not pick one field, change an ID stored by an existing version, or match the fields by name.
 
 ### Using Field IDs
 
@@ -296,12 +338,69 @@ The complete schema is represented as a collection of top-level fields plus meta
 Field IDs enable efficient schema evolution:
 
 - **Add Column**: Assign a new field ID and add to schema
-- **Drop Column**: Remove field from schema; its ID may be reused in some systems
+- **Drop Column**: Remove the field from the schema; when `max_allocated_field_id` is set, later
+  versions must not reuse its ID
 - **Rename Column**: Change field name; ID remains the same
 - **Reorder Columns**: Change field order in schema; IDs remain the same
-- **Type Evolution**: Data type can be changed. This might require rewriting the column in the data, depending on how the type was changed.
+- **Metadata or Nullability Change**: Preserve the field ID
+- **Type Replacement**: A cast creates a replacement field with a new ID and retires the old
+  identity. This keeps one logical type bound to an ID in every version that references it
+- **Overwrite**: Preserve compatible logical identities; allocate new IDs for added fields and type
+  replacements
 
 The use of field IDs ensures that data files can be correctly interpreted even as the schema changes over time.
+
+### Blob Identity Namespace
+
+The rules above apply to a Blob field in the manifest schema and to its logical children. For
+example, assume `image` has field ID 0, `data` has ID 1, and `uri` has ID 2. Writer input and the
+manifest schema have this logical shape:
+
+```python
+pa.schema([
+    pa.field(
+        "image",
+        pa.struct([
+            pa.field("data", pa.large_binary()),
+            pa.field("uri", pa.string()),
+        ]),
+        metadata={b"ARROW:extension:name": b"lance.blob.v2"},
+    ),
+])
+```
+
+The writer may temporarily add `kind`, `blob_id`, `blob_size`, and `position`. A Lance data file
+stores this descriptor shape:
+
+```python
+pa.schema([
+    pa.field(
+        "image",
+        pa.struct([
+            pa.field("kind", pa.uint8(), nullable=False),
+            pa.field("position", pa.uint64(), nullable=False),
+            pa.field("size", pa.uint64(), nullable=False),
+            pa.field("blob_id", pa.uint32(), nullable=False),
+            pa.field("blob_uri", pa.string(), nullable=False),
+        ]),
+    ),
+])
+```
+
+The entire descriptor is encoded in one physical column. The data file maps it with
+`DataFile.fields = [0]` and `DataFile.column_indices = [k]`, where `k` is that column's index in the
+Lance file. The reader locates column `k` and decodes the descriptor using its Blob page layout;
+the descriptor children do not have separate entries in either mapping. Their IDs may be `-1` or
+file-local, and they do not change `max_allocated_field_id`.
+
+A descriptor scan returns the stored struct. A materialized scan returns this public shape:
+
+```python
+pa.schema([pa.field("image", pa.large_binary())])
+```
+
+Both scans refer to the top-level field ID 0. The synthetic descriptor children do not become
+dataset fields. The `blob_id` value identifies a stored Blob object; it is not a field ID.
 
 ## Example Schemas
 

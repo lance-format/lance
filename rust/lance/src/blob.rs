@@ -1534,6 +1534,37 @@ mod tests {
     }
 
     #[test]
+    fn blob_runtime_and_descriptor_fields_do_not_enter_logical_field_id_space() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
+        let prepared = LanceSchema::try_from(&ArrowSchema::new(vec![prepared_field])).unwrap();
+
+        // Prepared-only children such as `blob_id` and `blob_size` are writer
+        // representation details. Normalization retains IDs only for the
+        // persistent logical identities (`blob`, `data`, and `uri`).
+        let logical = prepared_to_logical_blob_schema(&prepared).unwrap();
+        assert_eq!(logical.fields[0].id, 0);
+        assert_eq!(logical.fields[0].children[0].id, 2);
+        assert_eq!(logical.fields[0].children[1].id, 3);
+        assert_eq!(logical.max_field_id(), Some(3));
+
+        // Descriptor projection creates a file/read-local representation. Its
+        // children deliberately remain synthetic and cannot advance a manifest
+        // field-ID high-water mark.
+        let mut descriptor = logical;
+        descriptor.fields[0].unloaded_mut();
+        assert_eq!(descriptor.fields[0].id, 0);
+        assert!(
+            descriptor.fields[0]
+                .children
+                .iter()
+                .all(|child| child.id == -1)
+        );
+        assert_eq!(descriptor.max_field_id(), Some(0));
+    }
+
+    #[test]
     fn test_prepared_blob_schema_normalizes_by_semantic_child_name() {
         let mut metadata = HashMap::new();
         metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());

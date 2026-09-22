@@ -693,6 +693,31 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
+    /// Assign IDs to every unassigned field using checked arithmetic.
+    ///
+    /// Existing IDs are preserved. New IDs start after both this schema's
+    /// maximum ID and `max_existing_id`.
+    /// If allocation fails, discard the partially updated schema.
+    pub fn try_set_field_id(&mut self, max_existing_id: Option<i32>) -> Result<()> {
+        let schema_max_id = self.max_field_id().unwrap_or(-1);
+        let max_existing_id = max_existing_id.unwrap_or(-1);
+        let mut current_id = i64::from(schema_max_id.max(max_existing_id)) + 1;
+        for field in &mut self.fields {
+            field.try_set_id(-1, &mut current_id)?;
+        }
+        Ok(())
+    }
+
+    /// Replace every field ID with a fresh checked allocation.
+    ///
+    /// The first assigned ID is one greater than `max_existing_id`. Use this when
+    /// every input field must receive a new identity.
+    /// If allocation fails, discard the partially updated schema.
+    pub fn try_reassign_field_ids(&mut self, max_existing_id: Option<i32>) -> Result<()> {
+        self.reset_id();
+        self.try_set_field_id(max_existing_id)
+    }
+
     fn reset_id(&mut self) {
         self.fields.iter_mut().for_each(|f| f.reset_id());
     }
@@ -888,7 +913,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
         };
-        schema.set_field_id(None);
+        schema.try_set_field_id(None)?;
         schema.validate()?;
 
         schema.verify_primary_key()?;
@@ -1748,10 +1773,52 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::datatypes::field::LANCE_FIELD_ID_KEY;
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::last_id(i32::MAX - 1, 1, true)]
+    #[case::last_two_ids(i32::MAX - 2, 2, true)]
+    #[case::exhausted_mid_allocation(i32::MAX - 1, 2, false)]
+    #[case::exhausted_before_allocation(i32::MAX, 1, false)]
+    #[case::no_allocation_needed(i32::MAX, 0, true)]
+    fn checked_field_id_allocation_bounds(
+        #[case] max_existing_id: i32,
+        #[case] field_count: usize,
+        #[case] succeeds: bool,
+        #[values(false, true)] reassign: bool,
+    ) {
+        let arrow_schema = ArrowSchema::new(
+            (0..field_count)
+                .map(|i| ArrowField::new(format!("field_{i}"), ArrowDataType::Int32, false))
+                .collect::<Vec<_>>(),
+        );
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        let result = if reassign {
+            schema.try_reassign_field_ids(Some(max_existing_id))
+        } else {
+            schema.reset_id();
+            schema.try_set_field_id(Some(max_existing_id))
+        };
+        if succeeds {
+            result.unwrap();
+            for (i, field) in schema.fields.iter().enumerate() {
+                assert_eq!(
+                    i64::from(field.id),
+                    i64::from(max_existing_id) + 1 + i as i64
+                );
+            }
+            // An exhausted ID space must still allow schemas with all IDs assigned.
+            schema.try_set_field_id(Some(i32::MAX)).unwrap();
+        } else {
+            let err = result.unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("IDs are exhausted"), "{err}");
+        }
+    }
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -2399,8 +2466,14 @@ mod tests {
         assert_eq!(schema.max_field_id(), Some(5));
 
         let to_merged_arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("d", DataType::Int32, false),
-            ArrowField::new("e", DataType::Binary, false),
+            ArrowField::new("d", DataType::Int32, false).with_metadata(HashMap::from([(
+                LANCE_FIELD_ID_KEY.to_string(),
+                "100".to_string(),
+            )])),
+            ArrowField::new("e", DataType::Binary, false).with_metadata(HashMap::from([(
+                LANCE_FIELD_ID_KEY.to_string(),
+                "101".to_string(),
+            )])),
         ]);
         let mut merged = schema.merge(&to_merged_arrow_schema).unwrap();
         merged.set_field_id(None);
