@@ -3753,8 +3753,10 @@ mod tests {
     #[rstest]
     #[case::l2("l2", true)]
     #[case::cosine("cosine", true)]
-    #[case::dot("dot", false)]
+    #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
+    #[case::bounded_dot("bounded_dot", false)]
+    #[case::large_k_dot("large_k_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
@@ -3773,14 +3775,18 @@ mod tests {
         #[case] reads_config: bool,
     ) {
         let mut query = base_query();
-        query.k = if scenario == "large_k" { 101 } else { 1 };
+        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
+            101
+        } else {
+            1
+        };
         query.key = match scenario {
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
             "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
             "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if scenario == "bounded" {
+        if matches!(scenario, "bounded" | "bounded_dot") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3801,7 +3807,7 @@ mod tests {
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
                 "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" => DistanceType::Dot,
+                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
