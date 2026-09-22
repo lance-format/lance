@@ -10,6 +10,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{ScalarUDF, Volatility};
 use datafusion::physical_plan::ColumnarValue;
 use datafusion::prelude::create_udf;
+use lance_arrow::json::{json_path_exists, select_json_path, select_json_path_values};
 use std::sync::Arc;
 
 /// Represents the type of a JSONB value
@@ -137,8 +138,7 @@ mod common {
 
     /// Parse JSONPath with proper error handling (no false returns)
     pub fn parse_json_path(path: &str) -> Result<jsonb::jsonpath::JsonPath<'_>> {
-        jsonb::jsonpath::parse_json_path(path.as_bytes())
-            .map_err(|e| execution_error(format!("Invalid JSONPath '{}': {}", path, e)))
+        lance_arrow::json::parse_json_path(path).map_err(|e| execution_error(e.to_string()))
     }
 }
 
@@ -364,9 +364,7 @@ fn json_extract_with_type_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<(Vec<u8>, u8)>> {
     let json_path = common::parse_json_path(path)?;
 
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_value(&json_path) {
+    match select_json_path(jsonb_bytes, &json_path) {
         Ok(Some(owned_value)) => {
             let raw = owned_value.as_raw();
 
@@ -411,9 +409,7 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
 fn extract_json_path(jsonb_bytes: &[u8], path: &str) -> Result<Option<String>> {
     let json_path = common::parse_json_path(path)?;
 
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_value(&json_path) {
+    match select_json_path(jsonb_bytes, &json_path) {
         Ok(value) => Ok(value.map(|value| value.to_string())),
         Err(e) => Err(common::execution_error(format!(
             "Failed to select value from path '{}': {}",
@@ -475,9 +471,7 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 fn check_json_path_exists(jsonb_bytes: &[u8], path: &str) -> Result<bool> {
     let json_path = common::parse_json_path(path)?;
 
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.exists(&json_path) {
+    match json_path_exists(jsonb_bytes, &json_path) {
         Ok(exists) => Ok(exists),
         Err(e) => Err(common::execution_error(format!(
             "Failed to check existence of path '{}': {}",
@@ -824,9 +818,7 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 fn check_array_contains(jsonb_bytes: &[u8], path: &str, value: &str) -> Result<bool> {
     let json_path = common::parse_json_path(path)?;
 
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_values(&json_path) {
+    match select_json_path_values(jsonb_bytes, &json_path) {
         Ok(values) => {
             for v in values {
                 // Convert to raw JSONB for direct access
@@ -912,9 +904,7 @@ fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
     let json_path = common::parse_json_path(path)?;
 
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_values(&json_path) {
+    match select_json_path_values(jsonb_bytes, &json_path) {
         Ok(values) => {
             if values.is_empty() {
                 return Ok(None);
