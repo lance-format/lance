@@ -391,8 +391,9 @@ impl FlatIndex {
 
 impl CacheCodecImpl for FlatIndex {
     const TYPE_ID: &'static str = "lance.scalar.FlatIndex";
-    /// v1 prefixed the batch with two roaring blobs (all ids / null ids) that
-    /// are no longer materialized; v2 is the data batch alone.
+    /// v2 is the data batch alone. Entries written with the earlier layout
+    /// (two roaring blobs ahead of the batch) fail to decode and are treated as
+    /// cache misses, so the page is simply re-read from the index file.
     const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
@@ -406,13 +407,6 @@ impl CacheCodecImpl for FlatIndex {
     where
         Self: Sized,
     {
-        if r.version() < 2 {
-            // v1: RAW_BLOB all_addrs_map, RAW_BLOB null_addrs_map, then the
-            // batch. Both maps are derivable from the batch, so skip them.
-            r.read_raw()?;
-            r.read_raw()?;
-        }
-
         let batch = r.read_ipc()?;
 
         let df_schema = DFSchema::try_from(batch.schema())?;
@@ -470,33 +464,6 @@ mod tests {
         let mut reader = CacheEntryReader::new(&data, 0, FlatIndex::CURRENT_VERSION);
         let restored = FlatIndex::deserialize(&mut reader).unwrap();
 
-        assert_eq!(restored.data, index.data);
-        assert_eq!(restored.all().unwrap(), index.all().unwrap());
-    }
-
-    /// A v1 entry (two roaring blobs ahead of the batch) written by an older
-    /// build must still decode: the blobs are skipped and the page is rebuilt
-    /// from the batch alone.
-    #[test]
-    fn test_cache_codec_reads_v1_body() {
-        let index = example_index();
-        let mut buf = Vec::new();
-        {
-            let mut w = CacheEntryWriter::new(&mut buf);
-            let all = RowAddrTreeMap::from_iter(index.ids().values().iter());
-            let mut all_bytes = Vec::new();
-            all.serialize_into(&mut all_bytes).unwrap();
-            w.write_raw(&all_bytes).unwrap();
-            let mut null_bytes = Vec::new();
-            RowAddrTreeMap::new()
-                .serialize_into(&mut null_bytes)
-                .unwrap();
-            w.write_raw(&null_bytes).unwrap();
-            w.write_ipc(index.data.as_ref()).unwrap();
-        }
-        let data = bytes::Bytes::from(buf);
-        let mut reader = CacheEntryReader::new(&data, 0, 1);
-        let restored = FlatIndex::deserialize(&mut reader).unwrap();
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all().unwrap(), index.all().unwrap());
     }
