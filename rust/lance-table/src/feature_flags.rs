@@ -64,8 +64,13 @@ pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// Blob v2 descriptors may independently address Lance-owned objects. Readers
+/// must resolve their explicit bases and writers/GC must preserve those references.
+/// This capability is sticky, including across restore, and requires both words.
+pub const FLAG_MANAGED_BLOBS: u64 = 1 << 11;
+
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 11;
+pub const FLAG_UNKNOWN: u64 = 1 << 12;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -77,8 +82,9 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_MANAGED_BLOBS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -272,14 +278,20 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
-    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    if reader != writer {
-        return Err(Error::corrupt_file_named(
-            "manifest",
-            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
-             so its semantics are undefined",
-        ));
+    for (flag, name) in [
+        (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
+        (FLAG_MANAGED_BLOBS, "Managed Blob"),
+    ] {
+        let reader = manifest.reader_feature_flags & flag != 0;
+        let writer = manifest.writer_feature_flags & flag != 0;
+        if reader != writer {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "Manifest has only one of the {name} reader and writer feature bits set, so its semantics are undefined"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -598,6 +610,38 @@ mod tests {
         assert!(err.to_string().contains("cannot be written"), "{err}");
     }
 
+    #[rstest::rstest]
+    #[case::reader_only(true, false)]
+    #[case::writer_only(false, true)]
+    #[case::paired(true, true)]
+    fn managed_capability_is_paired_and_sticky(#[case] reader: bool, #[case] writer: bool) {
+        let mut source = empty_manifest();
+        source.reader_feature_flags = if reader { FLAG_MANAGED_BLOBS } else { 0 };
+        source.writer_feature_flags = if writer { FLAG_MANAGED_BLOBS } else { 0 };
+        if reader != writer {
+            for error in [
+                ensure_can_read_manifest(&source).unwrap_err(),
+                ensure_can_write_manifest(&source).unwrap_err(),
+            ] {
+                assert!(matches!(error, Error::CorruptFile { .. }));
+                assert!(error.to_string().contains("Managed Blob"));
+            }
+            return;
+        }
+        ensure_can_read_manifest(&source).unwrap();
+        ensure_can_write_manifest(&source).unwrap();
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        apply_feature_flags(&mut destination, false, false).unwrap();
+        assert!(destination.has_managed_blobs());
+        assert_eq!(
+            destination.writer_feature_flags & FLAG_MANAGED_BLOBS,
+            FLAG_MANAGED_BLOBS
+        );
+        // The released v11.0.0 client only accepts bits below 128.
+        assert_ne!(destination.reader_feature_flags & !(128 - 1), 0);
+    }
+
     fn empty_manifest() -> Manifest {
         use crate::format::DataStorageFormat;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -615,11 +659,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_capability_is_below_the_unknown_boundary() {
+    fn paired_capabilities_are_below_the_unknown_boundary() {
         assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_read_dataset(FLAG_MANAGED_BLOBS));
+        assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 }

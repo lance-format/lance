@@ -463,6 +463,22 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                 }
                 validate_blob_id(blob_id_col.value(row))?;
             }
+            BlobKind::Managed => {
+                if uri_col.is_null(row)
+                    || blob_id_col.is_null(row)
+                    || blob_size_col.is_null(row)
+                    || position_col.is_null(row)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Prepared Managed blob row {row} must set `uri`, `blob_id`, `blob_size`, and `position`"
+                    )));
+                }
+                lance_core::utils::blob::validate_managed_reference(
+                    uri_col.value(row),
+                    position_col.value(row),
+                    blob_size_col.value(row),
+                )?;
+            }
             BlobKind::External => {
                 if uri_col.is_null(row) || uri_col.value(row).is_empty() {
                     return Err(Error::invalid_input(format!(
@@ -535,6 +551,14 @@ pub enum BlobDescriptor {
     },
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
+    /// A known range in an immutable Lance-owned object. The exact `base_id`
+    /// must be bound in the same committed snapshot as this descriptor.
+    Managed {
+        base_id: u32,
+        uri: String,
+        offset: u64,
+        size: u64,
+    },
     /// Payload bytes referenced from an external object or registered base.
     External {
         base_id: u32,
@@ -722,6 +746,20 @@ impl BlobDescriptorArrayBuilder {
                     blob_size_builder.append_value(size);
                     position_builder.append_null();
                 }
+                BlobDescriptor::Managed {
+                    base_id,
+                    uri,
+                    offset,
+                    size,
+                } => {
+                    validity.append_non_null();
+                    kind_builder.append_value(BlobKind::Managed as u8);
+                    data_builder.append_null();
+                    uri_builder.append_value(uri);
+                    blob_id_builder.append_value(base_id);
+                    blob_size_builder.append_value(size);
+                    position_builder.append_value(offset);
+                }
                 BlobDescriptor::External {
                     base_id,
                     uri,
@@ -778,6 +816,12 @@ fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
             Ok(())
         }
         BlobDescriptor::Dedicated { blob_id, .. } => validate_blob_id(*blob_id),
+        BlobDescriptor::Managed {
+            uri, offset, size, ..
+        } => {
+            lance_core::utils::blob::validate_managed_reference(uri, *offset, *size)?;
+            Ok(())
+        }
         BlobDescriptor::External {
             uri, offset, size, ..
         } => {
@@ -828,6 +872,14 @@ impl PackedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -969,6 +1021,14 @@ impl DedicatedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,

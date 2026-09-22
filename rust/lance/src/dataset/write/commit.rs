@@ -468,13 +468,14 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
-                commit_handler.as_ref(),
+                &commit_handler,
                 &base_path,
+                &dest.uri(),
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
-                session.store_registry(),
+                session.clone(),
             )
             .await?
         };

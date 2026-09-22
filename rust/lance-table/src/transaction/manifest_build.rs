@@ -11,7 +11,7 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_MANAGED_BLOBS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
@@ -1460,6 +1460,36 @@ impl Transaction {
             )
         };
 
+        // Only newly published Blob data files activate the capability. Comparing
+        // physical files also covers column rewrites and overlays while leaving
+        // metadata-only changes and deletion vectors on old tables alone.
+        let blob_fields: Vec<_> = manifest
+            .schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob_v2())
+            .map(|field| field.id)
+            .collect();
+        if !blob_fields.is_empty() {
+            let old_files: HashSet<_> = current_manifest
+                .into_iter()
+                .flat_map(|manifest| manifest.fragments.iter())
+                .flat_map(|fragment| fragment.referenced_lance_files())
+                .map(|file| (file.base_id, file.path.as_str()))
+                .collect();
+            if manifest
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+                .any(|file| {
+                    !old_files.contains(&(file.base_id, file.path.as_str()))
+                        && file.fields.iter().any(|id| blob_fields.contains(id))
+                })
+            {
+                manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
+                manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
+            }
+        }
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -1667,13 +1697,20 @@ impl Transaction {
                 // Assign a new ID if not already assigned
                 let mut base_to_add = new_base.clone();
                 if base_to_add.id == 0 {
-                    let next_id = manifest
-                        .base_paths
-                        .keys()
-                        .max()
-                        .map(|&id| id + 1)
-                        .unwrap_or(1);
-                    base_to_add.id = next_id;
+                    base_to_add.id = crate::format::BasePath::unused_id(
+                        manifest
+                            .base_paths
+                            .keys()
+                            .copied()
+                            .chain(std::iter::once(0)),
+                    )?;
+                } else if manifest.has_managed_blobs()
+                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot replace base ID {} bound to {:?} with {:?}",
+                        base_to_add.id, existing.path, base_to_add.path
+                    )));
                 }
 
                 manifest.base_paths.insert(base_to_add.id, base_to_add);

@@ -1745,6 +1745,17 @@ impl MergeInsertJob {
                         &write_schema,
                         &dataset.base,
                         super::WriterOptions {
+                            base_id: if matches!(
+                                write_version,
+                                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                            ) && write_schema
+                                .fields_pre_order()
+                                .any(|field| field.is_blob_v2())
+                            {
+                                Some(dataset.managed_default_base()?.id)
+                            } else {
+                                None
+                            },
                             add_data_dir: true,
                             ..Default::default()
                         },

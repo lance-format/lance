@@ -507,6 +507,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
 #[case::blob_registered(true, Some(7))]
 #[tokio::test]
 async fn restores_target_and_completed_parts_from_checkpoint(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     #[case] has_blob: bool,
     #[case] base_id: Option<u32>,
 ) {
@@ -538,7 +539,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
             RecordBatchIterator::new([Ok(original.clone())], original.schema()),
             dataset_uri.as_str(),
             Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::V2_2),
+                data_storage_version: Some(version),
                 max_rows_per_file: 2,
                 initial_bases: base_id.map(|id| {
                     vec![BasePath {
@@ -837,14 +838,12 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     let mut invalid = serde_json::to_value(&first).unwrap();
     invalid["blob_ids"] = serde_json::json!({"start": 20, "end": 30});
     let invalid: DataFilePart = serde_json::from_value(invalid).unwrap();
-    let error = dataset
+    // Managed references use base IDs, so their identity is independent of the
+    // file-local sidecar lease recorded in the checkpoint.
+    dataset
         .concat_data_file_parts(&target, &[invalid])
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("outside declared range"),
-        "{error}"
-    );
+        .unwrap();
     let second = write_part(
         &dataset,
         &target,

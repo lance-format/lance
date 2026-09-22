@@ -1982,6 +1982,9 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
     .await
     .unwrap();
 
+    assert!(dataset.manifest.base_paths.is_empty());
+    assert!(!dataset.manifest.has_managed_blobs());
+
     let clone = dataset
         .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
         .await
