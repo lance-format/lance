@@ -32,7 +32,10 @@ use tracing::instrument;
 use crate::{
     datatypes::FieldsWithMeta,
     format::{pb, pbfile},
-    writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT,
+        check_batch_types, check_column_type,
+    },
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -602,6 +605,12 @@ impl EncodingPipeline {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
+        check_batch_types(
+            self.schema
+                .as_ref()
+                .expect("the pipeline is initialized before writing"),
+            batch,
+        )?;
         self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
@@ -663,6 +672,7 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        check_column_type(field, &array)?;
         Self::verify_field_nullability(array.as_ref(), field)?;
         if array.is_empty() {
             return Ok(());

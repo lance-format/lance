@@ -1333,17 +1333,6 @@ impl BlobPreprocessor {
     }
 }
 
-pub async fn preprocess_blob_batches(
-    batches: &[RecordBatch],
-    pre: &mut BlobPreprocessor,
-) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        out.push(pre.preprocess_batch(batch).await?);
-    }
-    Ok(out)
-}
-
 /// Shared physical read context for blob handles that resolve to the same object.
 ///
 /// Blob descriptors are logical slices over a backing object (data file, packed

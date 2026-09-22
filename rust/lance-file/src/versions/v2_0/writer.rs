@@ -35,7 +35,7 @@ use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::writer::{
     ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteSummary, FileWriterOptions,
-    PAGE_BUFFER_ALIGNMENT,
+    PAGE_BUFFER_ALIGNMENT, check_batch_types, check_column_type,
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -453,7 +453,8 @@ impl Writer {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
-        self.ensure_initialized(batch)?;
+        let schema = self.ensure_initialized(batch)?;
+        check_batch_types(schema, batch)?;
         let field_arrays = self.field_arrays(batch)?;
         let field_arrays = self.prepare_field_arrays(field_arrays)?;
         let num_rows = batch.num_rows() as u64;
@@ -546,6 +547,7 @@ impl Writer {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        check_column_type(&schema.fields[column_index], &array)?;
         let array = self.column_writers[column_index].prepare_array(array)?;
 
         // A never-advanced field simply remains a zero-length column, which the

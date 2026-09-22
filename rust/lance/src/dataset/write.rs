@@ -25,7 +25,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions::v1::writer::{
     FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
 };
-use lance_file::writer::{self as current_writer};
+use lance_file::writer::{self as current_writer, FileWriteSummary};
 use lance_file::{versions as file_versions, writer::FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
@@ -49,7 +49,7 @@ use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
-    blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
+    blob_pack_file_threshold_from_metadata,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
@@ -171,7 +171,7 @@ impl Dataset {
             ));
         }
 
-        let mut preprocessor = if let Some(blob_ids) = blob_ids {
+        let preprocessor = if let Some(blob_ids) = blob_ids {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
             let object_store = self.object_store(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(
@@ -204,27 +204,22 @@ impl Dataset {
             .parts_dir(&self.data_file_dir_for_base(target.base_id)?)
             .join(file_name.as_str());
         let store = self.object_store(target.base_id).await?;
-        let mut writer = file_versions::create_writer(
-            target.version,
-            store.create(&path).await?,
-            target.schema.as_ref().clone(),
-            FileWriterOptions::default(),
-        )?;
+        let mut writer = V2WriterAdapter::new(
+            file_versions::create_writer(
+                target.version,
+                store.create(&path).await?,
+                target.schema.as_ref().clone(),
+                FileWriterOptions::default(),
+            )?,
+            None,
+            preprocessor,
+        );
         let mut data = Box::pin(data);
         let write_result = async {
             while let Some(batch) = data.next().await {
-                let batch = batch?;
-                if let Some(preprocessor) = preprocessor.as_mut() {
-                    let batch = preprocessor.preprocess_batch(&batch).await?;
-                    writer.write_batch(&batch).await?;
-                } else {
-                    writer.write_batch(&batch).await?;
-                }
+                writer.write_batch(&batch?).await?;
             }
-            if let Some(preprocessor) = preprocessor.as_mut() {
-                preprocessor.finish().await?;
-            }
-            writer.finish().await
+            writer.finish_file().await
         }
         .await;
 
@@ -240,9 +235,6 @@ impl Dataset {
             }),
             Err(error) => {
                 writer.abort().await;
-                if let Some(preprocessor) = preprocessor.as_mut() {
-                    preprocessor.abort();
-                }
                 Err(error)
             }
         }
@@ -1757,30 +1749,18 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
-    let adapter = SchemaAdapter::new(data.schema());
-
-    let (data, converted_schema) = if adapter.requires_physical_conversion() {
-        let data = adapter.to_physical_stream(data);
-        // Update the schema to match the converted data
-        let arrow_schema = data.schema();
-        let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
-        (data, converted_schema)
-    } else {
-        // No conversion needed, use original schema to preserve dictionary info
-        (data, schema)
-    };
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
-    let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
+    let normalized_schema = prepared_to_logical_blob_schema(&schema)?;
 
     versions::write_fragments(
         storage_version,
         dataset,
         object_store,
         base_dir,
-        normalized_converted_schema,
+        normalized_schema,
         data,
         params,
         target_bases_info,
@@ -2031,24 +2011,67 @@ where
     }
 }
 
-struct V2WriterAdapter {
+/// Writes dataset data files in the current (V2) file formats.
+///
+/// Every current-format data file a dataset writes goes through this type, so
+/// it is the single write boundary: each batch is converted from the
+/// representation the caller supplied to the one Lance stores (Arrow JSON to
+/// Lance JSONB, top-level view arrays to offset arrays) before blob
+/// preprocessing and encoding. The file writer then rejects any array that
+/// still differs from the file schema.
+pub(in crate::dataset) struct V2WriterAdapter {
     writer: current_writer::FileWriter,
     data_file: Option<DataFile>,
     preprocessor: Option<BlobPreprocessor>,
 }
 
+impl V2WriterAdapter {
+    /// `data_file` describes the file being written and is completed by
+    /// [`GenericWriter::finish`]. Writers that describe their output
+    /// themselves pass `None` and use [`Self::finish_file`].
+    pub(in crate::dataset) fn new(
+        writer: current_writer::FileWriter,
+        data_file: Option<DataFile>,
+        preprocessor: Option<BlobPreprocessor>,
+    ) -> Self {
+        Self {
+            writer,
+            data_file,
+            preprocessor,
+        }
+    }
+
+    pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
+        let batch = match self.preprocessor.as_mut() {
+            Some(pre) => pre.preprocess_batch(&batch).await?,
+            None => batch,
+        };
+        self.writer.write_batch(&batch).await
+    }
+
+    /// Finish the blob sidecars and the data file.
+    pub(in crate::dataset) async fn finish_file(&mut self) -> Result<FileWriteSummary> {
+        if let Some(pre) = self.preprocessor.as_mut() {
+            pre.finish().await?;
+        }
+        self.writer.finish().await
+    }
+
+    /// Abandon the data file and any blob sidecars in progress.
+    pub(in crate::dataset) async fn abort(&mut self) {
+        self.writer.abort().await;
+        if let Some(pre) = self.preprocessor.as_mut() {
+            pre.abort();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl GenericWriter for V2WriterAdapter {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            let processed = preprocess_blob_batches(batches, pre).await?;
-            for batch in processed {
-                self.writer.write_batch(&batch).await?;
-            }
-        } else {
-            for batch in batches {
-                self.writer.write_batch(batch).await?;
-            }
+        for batch in batches {
+            self.write_batch(batch).await?;
         }
         Ok(())
     }
@@ -2073,9 +2096,6 @@ impl GenericWriter for V2WriterAdapter {
         Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            pre.finish().await?;
-        }
         let field_ids = self
             .writer
             .field_id_to_column_indices()
@@ -2088,7 +2108,7 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let write_summary = self.writer.finish().await?;
+        let write_summary = self.finish_file().await?;
         let mut data_file = self
             .data_file
             .take()
@@ -2195,11 +2215,11 @@ where
         base_id,
         file_writer_options,
     )?;
-    Ok(Box::new(V2WriterAdapter {
-        writer: file_writer,
-        data_file: Some(data_file),
-        preprocessor: None,
-    }))
+    Ok(Box::new(V2WriterAdapter::new(
+        file_writer,
+        Some(data_file),
+        None,
+    )))
 }
 
 pub(in crate::dataset) async fn open_current_blob_v2_writer<F>(
@@ -2251,11 +2271,11 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
-    Ok(Box::new(V2WriterAdapter {
-        writer: file_writer,
-        data_file: Some(data_file),
-        preprocessor: Some(preprocessor),
-    }))
+    Ok(Box::new(V2WriterAdapter::new(
+        file_writer,
+        Some(data_file),
+        Some(preprocessor),
+    )))
 }
 
 fn prepare_data_file_path(base_dir: &Path, add_data_dir: bool) -> (String, String, Path, Path) {

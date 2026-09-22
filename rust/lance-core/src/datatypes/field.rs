@@ -1278,6 +1278,12 @@ impl TryFrom<&ArrowField> for Field {
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
+            // A `json` field is stored as Lance JSONB whatever the input
+            // representation, so record the stored extension.
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::JSON_EXT_NAME.to_string(),
+            );
             LogicalType::from("json")
         } else if is_blob_v2 {
             LogicalType::from("struct")
