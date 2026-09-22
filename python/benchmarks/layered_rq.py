@@ -281,9 +281,24 @@ for bits in map(int, args.bits.split(",")):
         else:
             modes += [("full", None, 2)]
         for precision, cascade, refine in modes:
-            ds = lance.dataset(uri, index_cache_size_bytes=64 * 1024**3)
+            ds = lance.dataset(uri, index_cache_size_bytes=128 * 1024**3)
             for index in ds.list_indices():
                 ds.prewarm_index(index["name"])
+            resident_bytes = ds.session().index_cache_size_bytes()
+            assert resident_bytes < 0.95 * 128 * 1024**3, (
+                "warm-memory run requires a larger cache"
+            )
+            emit(
+                {
+                    "event": "prewarm",
+                    "name": name,
+                    "precision": precision,
+                    "cascade_factor": cascade,
+                    "refine_factor": refine,
+                    "resident_bytes": resident_bytes,
+                    "cache_capacity_bytes": 128 * 1024**3,
+                }
+            )
             for k in [100, 1000, 10000]:
                 # Untimed warm-up for every measured mode/k pair.
                 for q in queries:
