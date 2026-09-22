@@ -9,10 +9,12 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader as CurrentFileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::{self, OpenedFileReader};
@@ -27,6 +29,39 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
+
+/// Cache key for the decoded metadata (footer, schema, column metadata) of an
+/// index file.
+///
+/// Index files are immutable and live under a per-index-uuid directory, so the
+/// full object path uniquely identifies the file contents and is safe to cache
+/// by. Caching the metadata lets repeated opens of the same file (for example a
+/// BTree page-cache miss, which re-opens the pages file) skip the tail read(s)
+/// against object storage entirely.
+#[derive(Debug)]
+struct IndexFileMetadataKey<'a> {
+    path: &'a Path,
+}
+
+impl CacheKey for IndexFileMetadataKey<'_> {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.path.as_ref().into()
+    }
+
+    fn type_name() -> &'static str {
+        "IndexFileMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.lance-format.index-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.path.as_ref());
+    }
+}
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -460,15 +495,40 @@ impl IndexStore for LanceIndexStore {
             .scheduler
             .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
+        let options = FileReaderOptions::default();
+        let metadata_key = IndexFileMetadataKey { path: &path };
+
+        // Fast path: the file's metadata was decoded by an earlier open of this
+        // same (immutable) file. Build the reader from it directly so that no
+        // footer/schema/column-metadata bytes are fetched again.
+        if let Some(metadata) = self.metadata_cache.get_with_key(&metadata_key).await {
+            let io = Arc::new(
+                LanceEncodingsIo::new(file_scheduler).with_read_chunk_size(options.read_chunk_size),
+            );
+            let reader = CurrentFileReader::try_open_with_file_metadata(
+                io,
+                path,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                metadata,
+                &self.metadata_cache,
+                options,
+            )
+            .await?;
+            return Ok(Arc::new(CurrentIndexReader(reader)));
+        }
+
         match versions::open_self_described_reader(
             file_scheduler,
             Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
-            FileReaderOptions::default(),
+            options,
         )
         .await?
         {
             OpenedFileReader::V1 { .. } => {
+                // Legacy files are not cached; they are opened through the v1
+                // reader which has its own (manifest-based) metadata handling.
                 let reader = V1FileReader::try_new_self_described(
                     &self.object_store,
                     &path,
@@ -477,7 +537,12 @@ impl IndexStore for LanceIndexStore {
                 .await?;
                 Ok(Arc::new(V1IndexReader(reader)))
             }
-            OpenedFileReader::Current(reader) => Ok(Arc::new(CurrentIndexReader(reader))),
+            OpenedFileReader::Current(reader) => {
+                self.metadata_cache
+                    .insert_with_key(&metadata_key, reader.metadata().clone())
+                    .await;
+                Ok(Arc::new(CurrentIndexReader(reader)))
+            }
         }
     }
 
@@ -572,7 +637,7 @@ mod tests {
     use super::*;
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
-        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
+        Int32Array, ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
         cast::AsArray,
         types::{Int32Type, UInt64Type},
     };
@@ -647,6 +712,172 @@ mod tests {
             before, after,
             "store deep size must exclude the shared metadata cache"
         );
+    }
+
+    /// Build a concrete store over `tempdir` so tests can reach the object store's
+    /// IO counters and the store's scheduler.
+    fn concrete_test_store(tempdir: &TempDir) -> (Arc<ObjectStore>, LanceIndexStore) {
+        let test_path = tempdir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let store = LanceIndexStore::new(object_store.clone(), test_path, cache);
+        (object_store, store)
+    }
+
+    async fn write_int_index_file(store: &dyn IndexStore, name: &str) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "values",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+        let mut writer = store.new_index_file(name, schema).await.unwrap();
+        writer.write_record_batch(batch.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+        batch
+    }
+
+    #[tokio::test]
+    async fn test_open_index_file_reuses_cached_metadata() {
+        const FILE_NAME: &str = "pages.lance";
+        let tempdir = TempDir::default();
+        let (object_store, store) = concrete_test_store(&tempdir);
+        let expected = write_int_index_file(&store, FILE_NAME).await;
+
+        // Provide the file size (as the manifest does in production) so that no
+        // HEAD request is needed and the only I/O left is the metadata read.
+        let file_sizes = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size_bytes))
+            .collect::<HashMap<_, _>>();
+        let store = store.with_file_sizes(file_sizes);
+
+        // Cold open: the footer/schema/column metadata must be read from storage.
+        let _ = object_store.io_stats_incremental();
+        let sched_before = store.scheduler.stats();
+        let first = store.open_index_file(FILE_NAME).await.unwrap();
+        let cold_stats = object_store.io_stats_incremental();
+        let sched_after = store.scheduler.stats();
+        assert!(
+            cold_stats.read_iops > 0,
+            "cold open should read the file tail, got {:?}",
+            cold_stats
+        );
+        assert!(sched_after.iops > sched_before.iops);
+        assert_eq!(first.num_rows(), 1000);
+
+        // Warm open through the same store: the cached metadata must be reused
+        // and no bytes fetched at all.
+        let sched_before = store.scheduler.stats();
+        let second = store.open_index_file(FILE_NAME).await.unwrap();
+        let warm_stats = object_store.io_stats_incremental();
+        let sched_after = store.scheduler.stats();
+        assert_eq!(
+            warm_stats.read_iops, 0,
+            "warm open must not issue reads, got {:?}",
+            warm_stats
+        );
+        assert_eq!(warm_stats.read_bytes, 0);
+        assert_eq!(sched_after.iops, sched_before.iops);
+        assert_eq!(sched_after.bytes_read, sched_before.bytes_read);
+
+        // The reader built from cached metadata still describes and reads the
+        // file correctly.
+        assert_eq!(second.num_rows(), 1000);
+        assert_eq!(
+            &ArrowSchema::from(second.schema()),
+            expected.schema().as_ref()
+        );
+        let batch = second.read_range(0..1000, None).await.unwrap();
+        assert_eq!(batch, expected);
+        let batch = second.read_range(10..20, Some(&["values"])).await.unwrap();
+        assert_eq!(batch, expected.slice(10, 10));
+        let batch = second.read_record_batch(0, 1000).await.unwrap();
+        assert_eq!(batch, expected);
+
+        // Priority views are cheap clones sharing the same cache, so they must
+        // also open without I/O.
+        let prioritized = store.with_io_priority(7);
+        let _ = object_store.io_stats_incremental();
+        let third = prioritized.open_index_file(FILE_NAME).await.unwrap();
+        let prio_stats = object_store.io_stats_incremental();
+        assert_eq!(
+            prio_stats.read_iops, 0,
+            "priority clone must share the metadata cache, got {:?}",
+            prio_stats
+        );
+        assert_eq!(third.num_rows(), 1000);
+
+        // A store with a fresh cache over the same directory has to read the
+        // metadata again, proving the savings come from the cache.
+        let (object_store2, store2) = concrete_test_store(&tempdir);
+        let _ = object_store2.io_stats_incremental();
+        let fresh = store2.open_index_file(FILE_NAME).await.unwrap();
+        let fresh_stats = object_store2.io_stats_incremental();
+        assert!(fresh_stats.read_iops > 0, "got {:?}", fresh_stats);
+        assert_eq!(fresh.num_rows(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_index_file_metadata_cache_is_keyed_by_full_path() {
+        // Two different files in the same store must not share cached metadata.
+        let tempdir = TempDir::default();
+        let (object_store, store) = concrete_test_store(&tempdir);
+        let _small = write_int_index_file(&store, "a.lance").await;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            false,
+        )]));
+        let big = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..5).map(|i| format!("row-{i}")),
+            ))],
+        )
+        .unwrap();
+        let mut writer = store.new_index_file("b.lance", schema).await.unwrap();
+        writer.write_record_batch(big.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+        let file_sizes = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size_bytes))
+            .collect::<HashMap<_, _>>();
+        let store = store.with_file_sizes(file_sizes);
+
+        // Warm the cache with a.lance, then open b.lance: it must be read from
+        // storage and describe b's schema, not a's.
+        store.open_index_file("a.lance").await.unwrap();
+        let _ = object_store.io_stats_incremental();
+        let b = store.open_index_file("b.lance").await.unwrap();
+        let stats = object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0, "got {:?}", stats);
+        assert_eq!(b.num_rows(), 5);
+        assert_eq!(&ArrowSchema::from(b.schema()), big.schema().as_ref());
+        assert_eq!(b.read_range(0..5, None).await.unwrap(), big);
+
+        // And now b is cached too.
+        let _ = object_store.io_stats_incremental();
+        let b2 = store.open_index_file("b.lance").await.unwrap();
+        let stats = object_store.io_stats_incremental();
+        assert_eq!(stats.read_iops, 0, "got {:?}", stats);
+        assert_eq!(b2.read_range(0..5, None).await.unwrap(), big);
     }
 
     async fn train_index(
