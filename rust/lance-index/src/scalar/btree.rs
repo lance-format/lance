@@ -20,7 +20,10 @@ use super::{
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexType};
-use crate::{pbold, scalar::btree::flat::FlatIndex};
+use crate::{
+    pbold,
+    scalar::btree::flat::{FlatIndex, PageMatches},
+};
 use crate::{
     progress::{IndexBuildProgress, noop_progress},
     scalar::{
@@ -1783,24 +1786,26 @@ impl BTreeIndex {
         prebuilt: Option<&Arc<dyn PhysicalExpr>>,
         track_nulls: bool,
         metrics: &dyn MetricsCollector,
-    ) -> Result<NullableRowAddrSet> {
+    ) -> Result<PageMatches> {
         let subindex = self
             .lookup_page(matches.page_id(), index_reader, metrics)
             .await?;
 
+        // Each page hands back plain id arrays; the caller assembles the
+        // final `RowAddrTreeMap` once across all pages (see `search_with_options`).
         match matches {
             // For a large IsIn the predicate is compiled once (see `search`) and
             // reused here, instead of rebuilding the whole IN-list per page.
             Matches::Some(_) => match prebuilt {
-                Some(expr) => subindex.search_prebuilt(expr, track_nulls, metrics),
-                None => subindex.search(query, track_nulls, metrics),
+                Some(expr) => subindex.search_prebuilt_matches(expr, track_nulls, metrics),
+                None => subindex.search_matches(query, track_nulls, metrics),
             },
-            Matches::All(_) => Ok(match query {
+            Matches::All(_) => match query {
                 // This means we hit an all-null page so just grab all row ids as true
-                SargableQuery::IsNull() => subindex.all_ignore_nulls(),
-                _ if track_nulls => subindex.all(),
-                _ => subindex.all_non_null(),
-            }),
+                SargableQuery::IsNull() => Ok(subindex.all_ignore_nulls_matches()),
+                _ if track_nulls => subindex.all_matches(),
+                _ => subindex.all_non_null_matches(),
+            },
         }
     }
 
@@ -2329,27 +2334,33 @@ impl ScalarIndex for BTreeIndex {
         debug!("Searching {} btree pages", page_tasks.len());
 
         // Collect both matching row IDs and null row IDs from all pages
-        let results: Vec<NullableRowAddrSet> = stream::iter(page_tasks)
+        let results: Vec<PageMatches> = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
             .try_collect()
             .await?;
 
-        let selection = if options.track_nulls() {
-            NullableRowAddrSet::union_all(&results)
+        // Assemble the result once. A page holds rows sorted by value, so its
+        // ids are scattered across fragments; a per-page `RowAddrTreeMap`
+        // would be `pages x fragments` tiny bitmaps to allocate and then
+        // union. Instead each page's sorted id array is bucketed by fragment
+        // and one bitmap is built per fragment.
+        //
+        // Every row lives on exactly one page, so a row that is TRUE on its
+        // page is never NULL on another; the union of the per-page null sets
+        // is therefore already the final null set and needs no subtraction
+        // (which is what `NullableRowAddrSet::union_all` would otherwise do).
+        let selected = RowAddrTreeMap::from_sorted_runs(results.iter().map(PageMatches::selected));
+        let nulls = if options.track_nulls() {
+            RowAddrTreeMap::from_sorted_runs(results.iter().map(PageMatches::nulls))
         } else {
-            let selected_rows = results
-                .iter()
-                .map(NullableRowAddrSet::selected_rows)
-                .collect::<Vec<_>>();
-            NullableRowAddrSet::new(
-                RowAddrTreeMap::union_all(&selected_rows),
-                Default::default(),
-            )
+            RowAddrTreeMap::new()
         };
 
-        Ok(SearchResult::Exact(selection))
+        Ok(SearchResult::Exact(NullableRowAddrSet::new(
+            selected, nulls,
+        )))
     }
 
     fn can_remap(&self) -> bool {
@@ -3458,7 +3469,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, ops::Bound, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
@@ -3472,6 +3483,7 @@ mod tests {
     use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
@@ -5710,6 +5722,177 @@ mod tests {
         };
         assert_eq!(tracked.true_rows(), RowAddrTreeMap::from_iter([1]));
         assert_eq!(tracked.null_rows(), &RowAddrTreeMap::from_iter([0]));
+    }
+
+    /// Row ids that span many fragments, interleaved so that every page holds
+    /// rows from (almost) every fragment. The search result is assembled once
+    /// from all pages' id arrays rather than per page, so this checks that the
+    /// bucketing by fragment reproduces exactly the expected TRUE and NULL
+    /// sets for range, IN, equality and IS NULL queries, with and without null
+    /// tracking.
+    #[tokio::test]
+    async fn test_search_assembles_rows_across_many_fragments() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        const NUM_FRAGMENTS: u64 = 200;
+        const ROWS_PER_FRAGMENT: u64 = 64;
+        const NUM_ROWS: u64 = NUM_FRAGMENTS * ROWS_PER_FRAGMENT;
+        // Larger than NUM_FRAGMENTS so each page spans every fragment.
+        const PAGE_SIZE: u64 = 256;
+        const NULL_EVERY: u64 = 50;
+
+        // Row `i` has value `i` (or NULL every 50th row) and lives at offset
+        // `i / NUM_FRAGMENTS` of fragment `i % NUM_FRAGMENTS`, so consecutive
+        // values sit in different fragments.
+        let addr_of = |i: u64| {
+            u64::from(RowAddress::new_from_parts(
+                (i % NUM_FRAGMENTS) as u32,
+                (i / NUM_FRAGMENTS) as u32,
+            ))
+        };
+        let is_null = |i: u64| i.is_multiple_of(NULL_EVERY);
+
+        let values: Int32Array = (0..NUM_ROWS)
+            .map(|i| if is_null(i) { None } else { Some(i as i32) })
+            .collect();
+        let row_ids = UInt64Array::from_iter_values((0..NUM_ROWS).map(addr_of));
+        let data = RecordBatch::try_from_iter(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+        // Training expects value-sorted, page-sized batches (nulls last, as
+        // DataFusion's default sort would produce them).
+        let data = lance_arrow::RecordBatchExt::sort_by_column(
+            &data,
+            0,
+            Some(arrow_schema::SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        )
+        .unwrap();
+        let schema = data.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::once(async { Ok(data) }),
+        )) as SendableRecordBatchStream;
+        let stream = break_stream(stream, PAGE_SIZE as usize).map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        train_btree_index(stream, test_store.as_ref(), PAGE_SIZE, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let num_pages = index.page_lookup.batch.num_rows();
+        assert!(num_pages > 40, "expected many pages, got {num_pages}");
+
+        let expected_rows = |pred: &dyn Fn(u64) -> bool| -> RowAddrTreeMap {
+            (0..NUM_ROWS)
+                .filter(|&i| !is_null(i) && pred(i))
+                .map(addr_of)
+                .collect()
+        };
+        let all_nulls: RowAddrTreeMap =
+            (0..NUM_ROWS).filter(|&i| is_null(i)).map(addr_of).collect();
+        assert_eq!(all_nulls.len(), Some(NUM_ROWS / NULL_EVERY));
+
+        // (query, expected TRUE rows, expected NULL rows when tracked)
+        let int = |i: u64| ScalarValue::Int32(Some(i as i32));
+        let cases: Vec<(SargableQuery, RowAddrTreeMap, RowAddrTreeMap)> = vec![
+            (
+                SargableQuery::Range(Bound::Included(int(3000)), Bound::Excluded(int(9000))),
+                expected_rows(&|i| (3000..9000).contains(&i)),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::Range(Bound::Unbounded, Bound::Included(int(1234))),
+                expected_rows(&|i| i <= 1234),
+                all_nulls.clone(),
+            ),
+            (
+                // 50 is a NULL slot and 99_999 is absent; both must be ignored.
+                SargableQuery::IsIn(
+                    [7_u64, 100, 4999, 12_000, 50, 99_999]
+                        .into_iter()
+                        .map(int)
+                        .collect(),
+                ),
+                expected_rows(&|i| [7, 100, 4999, 12_000].contains(&i)),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::Equals(int(4242)),
+                expected_rows(&|i| i == 4242),
+                all_nulls.clone(),
+            ),
+            (
+                // A value that only ever appears as NULL.
+                SargableQuery::Equals(int(50)),
+                RowAddrTreeMap::new(),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::IsNull(),
+                all_nulls.clone(),
+                RowAddrTreeMap::new(),
+            ),
+        ];
+
+        for (query, expected_true, expected_nulls) in cases {
+            for track_nulls in [true, false] {
+                let result = index
+                    .search_with_options(
+                        &query,
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                let SearchResult::Exact(rows) = result else {
+                    panic!("BTree search should be exact");
+                };
+                assert_eq!(
+                    rows.true_rows(),
+                    expected_true,
+                    "TRUE rows for {query:?} (track_nulls={track_nulls})"
+                );
+                let expected_nulls = if track_nulls {
+                    expected_nulls.clone()
+                } else {
+                    RowAddrTreeMap::new()
+                };
+                assert_eq!(
+                    rows.null_rows(),
+                    &expected_nulls,
+                    "NULL rows for {query:?} (track_nulls={track_nulls})"
+                );
+            }
+        }
+
+        // Sanity: the range result really did have to be stitched together
+        // across fragments and pages. Fragments whose id is a multiple of
+        // NULL_EVERY hold only NULL rows, so they carry no TRUE rows.
+        let fragments_with_true_rows = (NUM_FRAGMENTS - NUM_FRAGMENTS / NULL_EVERY) as usize;
+        let SearchResult::Exact(rows) = index
+            .search(
+                &SargableQuery::Range(Bound::Included(int(3000)), Bound::Excluded(int(9000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("BTree search should be exact");
+        };
+        assert_eq!(rows.true_rows().iter().count(), fragments_with_true_rows);
     }
 
     fn sample_lookup_batch() -> RecordBatch {
