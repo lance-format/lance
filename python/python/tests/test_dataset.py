@@ -7596,3 +7596,101 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+class TestLanceScannerTake:
+    def _make_dataset(self, tmp_path, max_rows_per_file=20):
+        table = pa.table({"id": pa.array(range(0, 20))})
+        return lance.write_dataset(
+            table, tmp_path / "ds", max_rows_per_file=max_rows_per_file
+        )
+
+    def test_take_filtered_relative_positions(self, tmp_path):
+        # issue #9142: take() positions are within the scanner's output, i.e.
+        # after the filter is applied — not absolute dataset row numbers.
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(filter="id % 2 = 0")  # matches id = 0, 2, 4, ...
+
+        # index i selects the i-th matching row: id = 2*i.
+        result = scanner.take(0).to_pylist()
+        assert result == [{"id": 0}]
+
+        result = scanner.take([0, 2, 4]).to_pylist()
+        assert [r["id"] for r in result] == [0, 4, 8]
+
+    def test_take_without_filter_matches_dataset_take(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        expected = ds.take([0, 19]).to_pylist()
+        result = scanner.take([0, 19]).to_pylist()
+        assert result == expected
+
+    def test_take_out_of_bounds_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()  # 20 rows
+
+        with pytest.raises(IndexError):
+            scanner.take(20)
+
+        with pytest.raises(IndexError):
+            scanner.take([0, 20])
+
+    def test_take_empty_indices_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        with pytest.raises(ValueError):
+            scanner.take([])
+
+    def test_take_negative_indices_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        with pytest.raises(ValueError):
+            scanner.take([-1])
+
+    def test_take_respects_scanner_projection(self, tmp_path):
+        table = pa.table(
+            {"id": pa.array(range(20)), "val": [f"v{i}" for i in range(20)]}
+        )
+        ds = lance.write_dataset(table, tmp_path / "ds")
+        scanner = ds.scanner(columns=["val"])
+        result = scanner.take(0).to_pylist()
+        assert result == [{"val": "v0"}]
+        assert "id" not in result[0]
+
+    def test_take_spans_multiple_batches(self, tmp_path):
+        table = pa.table({"id": pa.array(range(20))})
+        ds = lance.write_dataset(table, tmp_path / "ds", max_rows_per_file=4)
+        # 5 fragments of 4 rows each.
+        scanner = ds.scanner()
+        # Take across fragment boundaries.
+        result = scanner.take([2, 6, 10, 18]).to_pylist()
+        assert [r["id"] for r in result] == [2, 6, 10, 18]
+
+    def test_take_duplicates_and_unsorted(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+        result = scanner.take([7, 1, 7, 1]).to_pylist()
+        assert [r["id"] for r in result] == [7, 1, 7, 1]
+
+    def test_take_positions_are_within_limited_output(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(limit=5)
+        result = scanner.take(4).to_pylist()
+        assert result == [{"id": 4}]
+
+    def test_take_out_of_bounds_with_scanner_limit(self, tmp_path):
+        # The out-of-bounds path must not call count_rows, which rejects
+        # scanners carrying a limit (aggregate + limit is invalid).
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(limit=5)
+        with pytest.raises(IndexError):
+            scanner.take(5)
+
+    def test_take_accepts_pyarrow_array(self, tmp_path):
+        # pyarrow Scanner.take() documents pa.Array as an accepted form.
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(filter="id >= 4")
+        assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
