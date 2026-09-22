@@ -12,14 +12,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, SchemaRef};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
-use lance_core::{
-    Error, Result,
-    datatypes::{Field, Schema},
-};
+use lance_core::{Error, Result, datatypes::Schema};
 
 /// The Arrow type and extension of a field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,33 +77,68 @@ impl fmt::Display for FieldTypeMismatch {
 
 impl std::error::Error for FieldTypeMismatch {}
 
-/// Check every column of `batch` that `schema` writes.
-///
-/// Columns are matched by name, the same way the encoders select them. A
-/// missing column is left for the encoder to report.
-pub fn check_batch_types(schema: &Schema, batch: &RecordBatch) -> Result<()> {
-    let batch_schema = batch.schema();
-    for field in &schema.fields {
-        if let Ok(actual) = batch_schema.field_with_name(&field.name) {
-            let expected = ArrowField::from(field);
-            check_field(
-                &mut Vec::new(),
-                &expected,
-                actual.data_type(),
-                Some(actual.metadata()),
-            )?;
-        }
-    }
-    Ok(())
+/// The Arrow fields a file schema expects, built once per writer.
+pub struct ExpectedTypes {
+    fields: Vec<ArrowField>,
+    /// The last batch schema that passed. Batches of one stream normally share
+    /// a schema, so later batches are accepted without walking it again.
+    accepted: Option<SchemaRef>,
 }
 
-/// Check an array written to a single top-level column.
-///
-/// A bare array carries no field metadata, so the column's own extension is
-/// not compared; nested extensions live in the array's data type and are.
-pub fn check_column_type(field: &Field, array: &ArrayRef) -> Result<()> {
-    let expected = ArrowField::from(field);
-    check_field(&mut Vec::new(), &expected, array.data_type(), None)
+impl ExpectedTypes {
+    pub fn new(schema: &Schema) -> Self {
+        Self {
+            fields: schema.fields.iter().map(ArrowField::from).collect(),
+            accepted: None,
+        }
+    }
+
+    /// Check every column of `batch` that the file schema writes.
+    ///
+    /// Columns are matched by name, the same way the encoders select them. A
+    /// missing column is left for the encoder to report.
+    pub fn check_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let batch_schema = batch.schema();
+        if self.accepted.as_ref().is_some_and(|accepted| {
+            Arc::ptr_eq(accepted, &batch_schema) || accepted == &batch_schema
+        }) {
+            return Ok(());
+        }
+        for (index, expected) in self.fields.iter().enumerate() {
+            // Batches usually list columns in schema order; only fall back to
+            // a name search when they do not, so wide schemas stay linear.
+            let actual = batch_schema
+                .fields()
+                .get(index)
+                .filter(|actual| actual.name() == expected.name())
+                .map(|actual| actual.as_ref())
+                .or_else(|| batch_schema.field_with_name(expected.name()).ok());
+            if let Some(actual) = actual {
+                check_field(
+                    &mut Vec::new(),
+                    expected,
+                    actual.data_type(),
+                    Some(actual.metadata()),
+                )?;
+            }
+        }
+        self.accepted = Some(batch_schema);
+        Ok(())
+    }
+
+    /// Check an array written to the top-level column at `index`.
+    ///
+    /// A bare array carries no field metadata, so the column's own extension
+    /// is not compared; nested extensions live in the array's data type and
+    /// are.
+    pub fn check_column(&self, index: usize, array: &ArrayRef) -> Result<()> {
+        check_field(
+            &mut Vec::new(),
+            &self.fields[index],
+            array.data_type(),
+            None,
+        )
+    }
 }
 
 fn check_field<'a>(
