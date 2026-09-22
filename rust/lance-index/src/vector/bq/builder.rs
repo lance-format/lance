@@ -123,7 +123,7 @@ fn radix_sort_positive_f32_indices(values: &mut [u64]) {
 /// order chosen by the previous unstable comparison sort remains observable when
 /// thresholds tie. Radix sort the common unique-key case, but reconstruct the
 /// original event order and use the previous sort when duplicate keys are found.
-fn sort_ex_thresholds(values: &mut [u64]) {
+fn sort_ex_thresholds(values: &mut [u64], dim: usize) {
     radix_sort_positive_f32_indices(values);
     let has_duplicate_keys = values
         .windows(2)
@@ -132,19 +132,27 @@ fn sort_ex_thresholds(values: &mut [u64]) {
         return;
     }
 
-    // Events were originally emitted by index, then by increasing threshold.
-    values.sort_unstable_by_key(|value| (*value as u32, (value >> u32::BITS) as u32));
-    let mut comparison_thresholds = values
-        .iter()
-        .map(|value| {
-            (
-                f32::from_bits((value >> u32::BITS) as u32),
-                *value as u32 as usize,
-            )
-        })
-        .collect::<Vec<_>>();
-    comparison_thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
-    for (value, (threshold, idx)) in values.iter_mut().zip(comparison_thresholds) {
+    // Events were emitted by dimension, then increasing threshold. A stable
+    // counting scatter restores that order in linear time. Preserve the exact
+    // tuple type and comparison sort because its equal-key order is observable.
+    let mut offsets = vec![0usize; dim];
+    for &value in values.iter() {
+        offsets[value as u32 as usize] += 1;
+    }
+    let mut offset = 0;
+    for count in offsets.iter_mut() {
+        let next = offset + *count;
+        *count = offset;
+        offset = next;
+    }
+    let mut comparison = vec![(0.0, 0); values.len()];
+    for &value in values.iter() {
+        let idx = value as u32 as usize;
+        comparison[offsets[idx]] = (f32::from_bits((value >> u32::BITS) as u32), idx);
+        offsets[idx] += 1;
+    }
+    comparison.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+    for (value, &(threshold, idx)) in values.iter_mut().zip(comparison.iter()) {
         *value = ((threshold.to_bits() as u64) << u32::BITS) | idx as u64;
     }
 }
@@ -192,7 +200,7 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         }
     }
 
-    sort_ex_thresholds(&mut thresholds);
+    sort_ex_thresholds(&mut thresholds, abs_normalized.len());
 
     let mut best_inner_product = numerator / squared_denominator.sqrt();
     let mut best_t = t_start;
@@ -1059,6 +1067,36 @@ mod tests {
             let expected = reference_best_ex_rescale_factor(&values, ex_bits);
             let actual = best_ex_rescale_factor(&values, ex_bits);
             assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
+        }
+    }
+
+    #[rstest]
+    #[case(8, 1)]
+    #[case(768, 15)]
+    #[case(32, 255)]
+    fn test_threshold_sort_preserves_complete_tie_order(
+        #[case] dim: usize,
+        #[case] max_code: usize,
+    ) {
+        for rows in [dim, dim / 2, 0, dim] {
+            let mut original = Vec::new();
+            for idx in 0..rows {
+                let value = (idx % 7 + 1) as f32;
+                for next in 1..=max_code {
+                    original.push((next as f32 / value, idx));
+                }
+            }
+            let mut actual = original
+                .iter()
+                .map(|&(key, idx)| ((key.to_bits() as u64) << 32) | idx as u64)
+                .collect::<Vec<_>>();
+            original.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+            sort_ex_thresholds(&mut actual, dim);
+            let expected = original
+                .iter()
+                .map(|&(key, idx)| ((key.to_bits() as u64) << 32) | idx as u64)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
         }
     }
 
