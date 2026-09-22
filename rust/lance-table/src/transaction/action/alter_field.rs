@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Footprint, Ref};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::pb;
 use lance_core::datatypes::LogicalType;
 use lance_core::deepsize::DeepSizeOf;
@@ -36,14 +36,22 @@ pub struct AlterField {
 impl AlterField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let field_id = state.resolve_field(self.field)?;
+        let missing = || {
+            Error::invalid_input(format!(
+                "AlterField names field {field_id}, which does not exist"
+            ))
+        };
+        if let Some(name) = &self.name {
+            let field = state.schema().field_by_id(field_id).ok_or_else(missing)?;
+            if *name != field.name {
+                let parent_id = (field.parent_id >= 0).then_some(field.parent_id);
+                state.reject_duplicate_sibling_name(parent_id, name, "AlterField")?;
+            }
+        }
         let field = state
             .schema_mut()
             .field_by_id_mut(field_id)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "AlterField names field {field_id}, which does not exist"
-                ))
-            })?;
+            .ok_or_else(missing)?;
         if let Some(name) = &self.name {
             field.name.clone_from(name);
         }
@@ -66,10 +74,15 @@ impl AlterField {
         false
     }
 
-    /// The field's definition. The data rewrite a cast needs is separate
-    /// actions, which record their own coordinates.
+    /// The field's definition, and the name a rename takes -- a name is a
+    /// coordinate whether a field is added under it or moved to it. The data
+    /// rewrite a cast needs is separate actions, which record their own
+    /// coordinates.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.add_field_definition(self.field);
+        if let Some(name) = &self.name {
+            footprint.add(Coordinate::FieldName(name.clone()));
+        }
     }
 }
 
@@ -164,6 +177,37 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_alter_field_rejects_renaming_onto_a_sibling() {
+        use crate::transaction::action::AddField;
+        use crate::transaction::action::test_support::added_field;
+
+        let taken = Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: added_field("taken"),
+        });
+        let rename = |name: &str| {
+            Action::AlterField(AlterField {
+                field: Ref::Committed(0),
+                name: Some(name.into()),
+                logical_type: None,
+                nullable: None,
+            })
+        };
+
+        let error = apply(&backed_manifest(), vec![taken.clone(), rename("taken")]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unique among siblings"),
+            "{error}"
+        );
+
+        // Restating a field's own name is not a collision with itself.
+        let next = apply(&backed_manifest(), vec![taken, rename("id")]).unwrap();
+        assert_eq!(next.schema.field_by_id(0).unwrap().name, "id");
     }
 
     #[test]

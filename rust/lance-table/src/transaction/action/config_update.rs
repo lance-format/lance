@@ -4,8 +4,9 @@
 //! Apply config and metadata updates.
 
 use super::apply::ApplyState;
+use super::footprint::UnenforcedKey;
 use super::proto::required;
-use super::{ConfigMap, Footprint, Ref};
+use super::{ConfigMap, Coordinate, Footprint, Ref};
 use crate::format::pb;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
@@ -107,8 +108,8 @@ impl ConfigUpdate {
     }
 
     /// The keys this update names, or the whole map when it replaces one. A
-    /// field's metadata belongs to the field, so dropping the field also
-    /// collides with an update to it.
+    /// field's metadata belongs to the field, so an update to it needs the
+    /// field to still be there when it lands.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for (map, update) in [
             (ConfigMap::Config, &self.config),
@@ -121,12 +122,27 @@ impl ConfigUpdate {
         }
         for update in &self.field_metadata {
             // A field minted in this operation has no committed id, so no
-            // concurrent writer can be naming it.
+            // concurrent writer can be naming it. A committed field's metadata
+            // goes with the field: writing it needs the field to still be
+            // there, and is lost with it if the field is dropped afterwards.
             if let Some(id) = update.field.committed()
                 && let Ok(id) = i32::try_from(id)
             {
                 footprint.add_map_update(ConfigMap::Field(id), &update.updates);
+                footprint.require_field_definition(update.field);
             }
+        }
+        // The reserved keys are declared per field but held once per table, so
+        // two writers declaring one on different fields collide on the key
+        // itself, not on either field's metadata.
+        if self.writes_any(&[
+            LANCE_UNENFORCED_PRIMARY_KEY,
+            LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+        ]) {
+            footprint.add(Coordinate::UnenforcedKey(UnenforcedKey::Primary));
+        }
+        if self.writes_any(&[LANCE_UNENFORCED_CLUSTERING_KEY_POSITION]) {
+            footprint.add(Coordinate::UnenforcedKey(UnenforcedKey::Clustering));
         }
     }
 
@@ -489,8 +505,44 @@ mod tests {
             field: Ref::Committed(2),
         })]);
 
-        assert!(dropped.conflicts_with(&metadata));
+        // Metadata landing after the drop names a field that is gone; the
+        // drop landing after the metadata takes the metadata with the field.
         assert!(metadata.conflicts_with(&dropped));
+        assert!(!dropped.conflicts_with(&metadata));
         assert!(!other.conflicts_with(&metadata));
+        assert!(!metadata.conflicts_with(&other));
+    }
+
+    #[test]
+    fn test_declaring_the_primary_key_on_different_fields_collides() {
+        let primary_key = |field: u64| {
+            footprint(vec![Action::ConfigUpdate(ConfigUpdate {
+                field_metadata: vec![FieldMetadataUpdate {
+                    field: Ref::Committed(field),
+                    updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
+                }],
+                ..Default::default()
+            })])
+        };
+        let clustering_key = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
+            field_metadata: vec![FieldMetadataUpdate {
+                field: Ref::Committed(3),
+                updates: merge(&[(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, Some("0"))]),
+            }],
+            ..Default::default()
+        })]);
+        let comment = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
+            field_metadata: vec![FieldMetadataUpdate {
+                field: Ref::Committed(3),
+                updates: merge(&[("comment", Some("x"))]),
+            }],
+            ..Default::default()
+        })]);
+
+        // The key is one per table, so the fields being different is no help.
+        assert!(primary_key(1).conflicts_with(&primary_key(2)));
+        // A different reserved key, or plain metadata, is a different thing.
+        assert!(!primary_key(1).conflicts_with(&clustering_key));
+        assert!(!primary_key(1).conflicts_with(&comment));
     }
 }

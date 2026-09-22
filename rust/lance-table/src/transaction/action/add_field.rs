@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Footprint, Ref};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::pb;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -34,6 +34,7 @@ impl AddField {
             .parent
             .map(|parent| state.resolve_field(parent))
             .transpose()?;
+        state.reject_duplicate_sibling_name(parent_id, &self.def.name, "AddField")?;
 
         // The definition's own id, parent id, and children are ignored: the
         // minted id and the parent reference carry that structure, and each
@@ -68,9 +69,17 @@ impl AddField {
         false
     }
 
-    /// Nothing: the field does not exist in the read version. Attaching it
-    /// under a committed parent does not rewrite the parent's definition.
-    pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
+    /// The field does not exist in the read version, so its definition is not
+    /// a coordinate. Its name is: two writers adding a column by the same name
+    /// would otherwise both land. Attaching it under a committed parent does
+    /// not rewrite the parent's definition, but it does need the parent to
+    /// still be there.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.add(Coordinate::FieldName(self.def.name.clone()));
+        if let Some(parent) = self.parent {
+            footprint.require_field_definition(parent);
+        }
+    }
 }
 
 impl From<&AddField> for pb::AddField {
@@ -209,6 +218,79 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("parent field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_add_field_rejects_a_name_a_sibling_already_has() {
+        // `sample_manifest` already has a top-level field called "id".
+        let manifest = sample_manifest();
+        let error = apply(
+            &manifest,
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: added_field("id"),
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unique among siblings"),
+            "{error}"
+        );
+
+        // Under a parent, only that parent's children are siblings, so the
+        // top-level name is free again.
+        let nested = Field::try_from(ArrowField::new(
+            "nested",
+            DataType::Struct(Default::default()),
+            true,
+        ))
+        .unwrap();
+        let next = apply(
+            &manifest,
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: nested.clone(),
+                }),
+                Action::AddField(AddField {
+                    local: 1,
+                    parent: Some(Ref::Local(0)),
+                    def: added_field("id"),
+                }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(next.schema.field("nested").unwrap().children[0].name, "id");
+
+        let error = apply(
+            &manifest,
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: nested,
+                }),
+                Action::AddField(AddField {
+                    local: 1,
+                    parent: Some(Ref::Local(0)),
+                    def: added_field("child"),
+                }),
+                Action::AddField(AddField {
+                    local: 2,
+                    parent: Some(Ref::Local(0)),
+                    def: added_field("child"),
+                }),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unique among siblings"),
+            "{error}"
+        );
     }
 
     #[test]

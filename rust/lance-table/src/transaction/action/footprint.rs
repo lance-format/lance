@@ -35,6 +35,13 @@ pub enum Coordinate {
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
     FieldDefinition(i32),
+    /// A field's name. Names only have to be unique among siblings, but a
+    /// footprint has no schema to place a field among its siblings, so a name
+    /// coordinates table-wide: two writers adding a `c` under different structs
+    /// collide as if they had added it at the top level. The cost is a spurious
+    /// conflict in that case; the alternative is two fields called `c` side by
+    /// side, which no reader can tell apart.
+    FieldName(String),
     /// A base path's name, where it has one. Names must be unique; an unset
     /// name is an absent alias rather than a name shared with every other
     /// unnamed base, so it coordinates nothing.
@@ -43,6 +50,10 @@ pub enum Coordinate {
     BaseLocation(String),
     /// One key in one of the manifest's string maps.
     ConfigEntry { map: ConfigMap, key: String },
+    /// One of the table-wide keys declared through field metadata. Each is set
+    /// once, on one set of fields, so two writers declaring it on fields of
+    /// their own collide even though they name different fields' metadata.
+    UnenforcedKey(UnenforcedKey),
 }
 
 /// One of the string maps a manifest carries.
@@ -58,6 +69,14 @@ pub enum ConfigMap {
     Field(i32),
 }
 
+/// A key the table declares once, across its fields, through reserved field
+/// metadata entries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnenforcedKey {
+    Primary,
+    Clustering,
+}
+
 impl Coordinate {
     /// The fragment this coordinate lives in, if it is fragment-scoped.
     fn fragment(&self) -> Option<u64> {
@@ -65,28 +84,11 @@ impl Coordinate {
             Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
             Self::FieldDefinition(_)
+            | Self::FieldName(_)
             | Self::BaseName(_)
             | Self::BaseLocation(_)
-            | Self::ConfigEntry { .. } => None,
-        }
-    }
-
-    /// The field this coordinate belongs to, if it is field-scoped.
-    fn field(&self) -> Option<i32> {
-        match self {
-            Self::FieldData { field, .. } => Some(*field),
-            Self::FieldDefinition(id) => Some(*id),
-            // A field's metadata goes with the field, so dropping the field
-            // writes over a concurrent update to its metadata.
-            Self::ConfigEntry {
-                map: ConfigMap::Field(id),
-                ..
-            } => Some(*id),
-            Self::FragmentExistence(_)
-            | Self::FragmentDeletions(_)
-            | Self::BaseName(_)
-            | Self::BaseLocation(_)
-            | Self::ConfigEntry { .. } => None,
+            | Self::ConfigEntry { .. }
+            | Self::UnenforcedKey(_) => None,
         }
     }
 
@@ -106,24 +108,15 @@ pub struct Footprint {
     /// Fragments this set removes outright. Removing a fragment writes every
     /// coordinate inside it, which cannot be enumerated, so it is tracked
     /// separately and matched against the other set by fragment id.
-    removed_fragments: HashSet<u64>,
-    /// Fields this set drops from the schema. Like a fragment removal, this
-    /// writes every coordinate belonging to the field -- its definition and its
-    /// data in every fragment -- so it is matched by field id.
     ///
-    /// Only the named field, not its descendants: a footprint has no schema to
-    /// expand a struct with. A concurrent write to a child of a dropped struct
-    /// is therefore not caught here and fails when it is applied against the
-    /// version where the child no longer exists.
-    removed_fields: HashSet<i32>,
-    /// Fields this set needs to still be in the schema, without writing their
-    /// definitions. Writing data into a fragment this operation mints is the
-    /// case this exists for: the cells are invisible to a concurrent writer, so
-    /// they are not written coordinates, but the fields they hold data for have
-    /// committed ids that a concurrent [`DropField`](super::DropField) can take
-    /// away -- leaving the new fragment carrying data for a field the manifest
-    /// no longer has.
-    required_fields: HashSet<i32>,
+    /// There is no counterpart for fields. Dropping a field writes its
+    /// definition, and anything that depends on the field -- data written for
+    /// it, its metadata, a child added under it -- requires that definition, so
+    /// the drop-then-write order is caught by `requires`. The write-then-drop
+    /// order is safe, because [`DropField`](super::DropField) applies to every
+    /// fragment the manifest holds by then, including one a concurrent set just
+    /// added, and tombstones the field out of each.
+    removed_fragments: HashSet<u64>,
     /// Coordinates this set reads and needs to still hold what it read, without
     /// writing them itself.
     ///
@@ -132,6 +125,15 @@ pub struct Footprint {
     /// to still say what it said. Unlike a write, two sets may require the same
     /// coordinate -- two readers of one column do not collide.
     requires: HashSet<Coordinate>,
+    /// Fragments this set needs to still be there, without writing anything a
+    /// concurrent set could name inside them. Data for a field this set mints,
+    /// written into a committed fragment, is the case this exists for: the
+    /// field id is invisible to a concurrent writer, so the cells are not a
+    /// coordinate, but they are gone if the fragment is.
+    ///
+    /// Symmetric, unlike `requires`: a removal that lands second destroys the
+    /// cells just as surely as one that lands first.
+    required_fragments: HashSet<u64>,
     /// String maps this set replaces outright rather than merging into. Like a
     /// fragment removal, this writes every key in the map, including keys it
     /// does not name, so it is matched by map rather than by key.
@@ -175,42 +177,60 @@ impl Footprint {
         self.removes_something_touched_by(committed) || committed.removes_something_touched_by(self)
     }
 
-    /// Whether this set wipes out something -- a fragment, a field, a whole
-    /// string map -- that `other` also writes to or needs to still be there.
+    /// Whether this set wipes out something -- a fragment, a whole string map
+    /// -- that `other` also writes to or needs to still be there.
     fn removes_something_touched_by(&self, other: &Self) -> bool {
-        if !self.removed_fields.is_disjoint(&other.required_fields) {
+        if !self
+            .removed_fragments
+            .is_disjoint(&other.required_fragments)
+        {
             return true;
         }
-        other.writes.iter().any(|coordinate| {
-            coordinate
-                .fragment()
-                .is_some_and(|id| self.removed_fragments.contains(&id))
-                || coordinate
-                    .field()
-                    .is_some_and(|id| self.removed_fields.contains(&id))
-                || coordinate
-                    .config_map()
-                    .is_some_and(|map| self.replaced_maps.contains(map))
-        })
+        other
+            .writes
+            .iter()
+            .any(|coordinate| self.removes(coordinate))
+    }
+
+    /// Whether `coordinate` is inside a region this set removes outright.
+    fn removes(&self, coordinate: &Coordinate) -> bool {
+        coordinate
+            .fragment()
+            .is_some_and(|id| self.removed_fragments.contains(&id))
+            || coordinate
+                .config_map()
+                .is_some_and(|map| self.replaced_maps.contains(map))
     }
 
     pub(super) fn add(&mut self, coordinate: Coordinate) {
         self.writes.insert(coordinate);
     }
 
+    /// Record that this set reads `coordinate` and needs it to still hold what
+    /// it read.
+    pub(super) fn require(&mut self, coordinate: Coordinate) {
+        self.requires.insert(coordinate);
+    }
+
     /// The data of each field within `fragment`.
     ///
-    /// A field this operation mints records nothing -- no concurrent writer can
-    /// be naming one. Nor does a fragment this operation mints write a
-    /// coordinate; but the committed fields the data belongs to are still
-    /// required to be there when it lands.
+    /// A field this operation mints writes no coordinate -- no concurrent
+    /// writer can be naming one -- and neither does a fragment this operation
+    /// mints. But data written into a committed fragment lives or dies with
+    /// that fragment whichever kind of field it is for, so the fragment is
+    /// required to still be there: a concurrent compaction that removed it
+    /// would otherwise discard the new column's cells for those rows, and the
+    /// replacement fragment would read them back as null.
     ///
-    /// Either way the field's definition is required. Values are written in the
-    /// type the schema names, so a concurrent
+    /// Every committed field's definition is required. Values are written in
+    /// the type the schema names, so a concurrent
     /// [`AlterField`](super::AlterField) casting it would leave the manifest
-    /// describing these values as something they are not -- and unlike a
-    /// [`DropField`](super::DropField), which `required_fields` catches, a cast
-    /// leaves the field in place for no later check to notice.
+    /// describing these values as something they are not, and a concurrent
+    /// [`DropField`](super::DropField) would leave a file carrying data for a
+    /// field the manifest no longer has. Both write the definition, so both are
+    /// caught when they land first. Landing second, a cast rebinds the field in
+    /// every fragment the manifest has by then and a drop tombstones it out of
+    /// every fragment's files, so neither order needs a symmetric check.
     ///
     /// This requires the whole definition, not the type alone, so it also
     /// rejects a concurrent rename or nullability change that would not have
@@ -219,15 +239,14 @@ impl Footprint {
     pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = Ref>) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
-            self.requires.insert(Coordinate::FieldDefinition(field));
+            self.require(Coordinate::FieldDefinition(field));
         }
-        match fragment.committed() {
-            Some(fragment) => {
-                for field in fields {
-                    self.add(Coordinate::FieldData { fragment, field });
-                }
-            }
-            None => self.required_fields.extend(fields),
+        let Some(fragment) = fragment.committed() else {
+            return;
+        };
+        self.require_fragment(fragment);
+        for field in fields {
+            self.add(Coordinate::FieldData { fragment, field });
         }
     }
 
@@ -236,6 +255,20 @@ impl Footprint {
         if let Some(field) = committed_field(field) {
             self.add(Coordinate::FieldDefinition(field));
         }
+    }
+
+    /// Record that this set depends on `field` still being defined as it was,
+    /// without redefining it: a child added under it, metadata written on it.
+    pub(super) fn require_field_definition(&mut self, field: Ref) {
+        if let Some(field) = committed_field(field) {
+            self.require(Coordinate::FieldDefinition(field));
+        }
+    }
+
+    /// Note that this set only works if `fragment` is still part of the dataset,
+    /// without claiming anything inside it.
+    pub(super) fn require_fragment(&mut self, fragment: u64) {
+        self.required_fragments.insert(fragment);
     }
 
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
@@ -264,11 +297,15 @@ impl Footprint {
         self.exclusive = true;
     }
 
+    /// Record that this set drops `field` from the schema.
+    ///
+    /// Only the definition is written, and only the named field's: a footprint
+    /// has no schema to expand a struct with. A concurrent write to a child of
+    /// a dropped struct requires the child's definition, which this does not
+    /// write, so it is not caught here and fails when it is applied against the
+    /// version where the child no longer exists.
     pub(super) fn remove_field(&mut self, field: Ref) {
-        if let Some(field) = committed_field(field) {
-            self.add(Coordinate::FieldDefinition(field));
-            self.removed_fields.insert(field);
-        }
+        self.add_field_definition(field);
     }
 }
 
@@ -319,14 +356,46 @@ mod tests {
     }
 
     fn add_data_file(fragment: Ref, fields: &[i32]) -> Action {
-        Action::AddDataFile(AddDataFile {
+        add_data_file_for(
             fragment,
-            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-            field_ids: fields
+            fields
                 .iter()
                 .map(|field| Ref::Committed(*field as u64))
                 .collect(),
+        )
+    }
+
+    fn add_data_file_for(fragment: Ref, field_ids: Vec<Ref>) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+            field_ids,
             data_change: true,
+        })
+    }
+
+    fn add_field(local: u32, name: &str, parent: Option<Ref>) -> Action {
+        Action::AddField(AddField {
+            local,
+            parent,
+            def: Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+        })
+    }
+
+    /// The add-column shape: mint a field, then back it in a committed fragment.
+    fn add_column(name: &str, fragment: u64) -> Vec<Action> {
+        vec![
+            add_field(1, name, None),
+            add_data_file_for(Ref::Committed(fragment), vec![Ref::Local(1)]),
+        ]
+    }
+
+    fn rename_field(field: i32, name: &str) -> Action {
+        Action::AlterField(AlterField {
+            field: Ref::Committed(field as u64),
+            name: Some(name.into()),
+            logical_type: None,
+            nullable: None,
         })
     }
 
@@ -336,6 +405,12 @@ mod tests {
             name: None,
             logical_type: Some(LogicalType::from("int64")),
             nullable: None,
+        })
+    }
+
+    fn drop_field(field: i32) -> Action {
+        Action::DropField(DropField {
+            field: Ref::Committed(field as u64),
         })
     }
 
@@ -380,11 +455,6 @@ mod tests {
     fn test_minting_actions_write_nothing() {
         let minting = footprint(vec![
             add_fragment(Ref::Local(0)),
-            Action::AddField(AddField {
-                local: 1,
-                parent: None,
-                def: Field::try_from(ArrowField::new("new", DataType::Int32, true)).unwrap(),
-            }),
             add_data_file(Ref::Local(0), &[0]),
         ]);
 
@@ -428,8 +498,21 @@ mod tests {
         vec![tombstone(1, &[1])],
         false,
     )]
+    // A new column's cells in a committed fragment are not a coordinate -- the
+    // field is minted -- but they are gone if the fragment is, whichever order
+    // the two land in.
+    #[case::adding_a_column_into_a_fragment_a_concurrent_set_removes(
+        add_column("c", 7),
+        vec![remove_fragment(7)],
+        true,
+    )]
+    #[case::adding_a_column_leaves_other_writes_to_the_fragment_alone(
+        add_column("c", 7),
+        vec![tombstone(7, &[2]), set_deletion_file(7)],
+        false,
+    )]
     #[case::same_field_definition(
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: Some("a".into()), logical_type: None, nullable: None })],
+        vec![rename_field(1, "a")],
         vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
         true,
     )]
@@ -439,37 +522,22 @@ mod tests {
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![drop_field(1)],
         vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
         true,
     )]
-    #[case::dropping_a_field_collides_with_rewriting_its_data(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
-        vec![tombstone(0, &[1])],
-        true,
-    )]
     #[case::dropping_a_field_leaves_other_fields_alone(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![drop_field(1)],
         vec![tombstone(0, &[2])],
         false,
     )]
     #[case::dropping_a_field_leaves_deletions_alone(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![drop_field(1)],
         vec![set_deletion_file(0)],
         false,
     )]
-    // An append writes no coordinate -- its fragment is minted, so no
-    // concurrent writer can name a cell inside it -- but the data it carries
-    // still belongs to committed fields. Dropping one of those fields out from
-    // under it would leave the new fragment holding data for a field the
-    // manifest no longer has.
-    #[case::dropping_a_field_a_concurrent_append_writes_data_for(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
-        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
-        true,
-    )]
     #[case::dropping_a_field_a_concurrent_append_does_not_write(
-        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![drop_field(1)],
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
@@ -478,6 +546,33 @@ mod tests {
         vec![cast_field(1)],
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
+    )]
+    // Names coordinate table-wide, whether a writer takes one by adding a
+    // field or by renaming one to it.
+    #[case::adding_two_fields_with_the_same_name(
+        vec![add_field(0, "c", None)],
+        vec![add_field(0, "c", None)],
+        true,
+    )]
+    #[case::adding_two_fields_with_different_names(
+        vec![add_field(0, "c", None)],
+        vec![add_field(0, "d", None)],
+        false,
+    )]
+    #[case::adding_a_field_named_like_a_concurrent_rename(
+        vec![add_field(0, "c", None)],
+        vec![rename_field(1, "c")],
+        true,
+    )]
+    #[case::renaming_two_fields_to_the_same_name(
+        vec![rename_field(1, "c")],
+        vec![rename_field(2, "c")],
+        true,
+    )]
+    #[case::adding_the_same_name_under_different_parents(
+        vec![add_field(0, "c", Some(Ref::Committed(1)))],
+        vec![add_field(0, "c", Some(Ref::Committed(2)))],
+        true,
     )]
     #[case::bases_with_the_same_name(
         vec![add_base(0, "a", "s3://bucket/one")],
@@ -538,13 +633,14 @@ mod tests {
     /// Pairs whose answer depends on which set committed first, so each order
     /// is stated rather than assumed to match the other.
     ///
-    /// Writing data for a field requires that field's definition, and a
-    /// requirement is only checked against what committed *after* the set was
-    /// planned. A cast that arrives second is the unsafe order: the data was
-    /// encoded in the old type and the manifest now names the new one. A cast
-    /// that arrives first is not, because applying it rebinds the field in
-    /// every fragment the manifest has by then, including one a concurrent
-    /// append just added.
+    /// Anything that depends on a field -- data written for it, a child added
+    /// under it -- requires that field's definition, and a requirement is only
+    /// checked against what committed *after* the set was planned. A cast or a
+    /// drop that arrives second is the unsafe order: the data was encoded
+    /// against a definition the manifest no longer carries. Arriving first they
+    /// are not, because applying a cast rebinds the field in every fragment the
+    /// manifest has by then, and applying a drop tombstones the field out of
+    /// every fragment's files -- including one a concurrent set just added.
     #[rstest]
     #[case::an_append_landing_after_a_cast(
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
@@ -564,6 +660,38 @@ mod tests {
     #[case::a_cast_landing_after_a_rewrite(
         vec![cast_field(1)],
         vec![add_data_file(Ref::Committed(7), &[1])],
+        false,
+    )]
+    #[case::an_append_landing_after_a_drop(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_drop_landing_after_an_append(
+        vec![drop_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        false,
+    )]
+    #[case::a_rewrite_landing_after_a_drop(
+        vec![tombstone(0, &[1])],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_drop_landing_after_a_rewrite(
+        vec![drop_field(1)],
+        vec![tombstone(0, &[1])],
+        false,
+    )]
+    // A child added under a struct needs the struct to still be there; the
+    // struct dropped afterwards takes the child with it, as intended.
+    #[case::a_child_landing_after_its_parent_was_dropped(
+        vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        vec![drop_field(1)],
+        true,
+    )]
+    #[case::a_parent_dropped_after_a_child_was_added(
+        vec![drop_field(1)],
+        vec![add_field(0, "child", Some(Ref::Committed(1)))],
         false,
     )]
     fn test_directional_conflicts(
