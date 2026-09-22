@@ -434,3 +434,55 @@ if storage_metadata:
         # Parse the tensor protobuf
         # codebook_tensor = parse_tensor_protobuf(codebook_buffer)
 ```
+
+### Layered RaBitQ prefix planes
+
+Layered storage is opt-in (`layered: true` in `lance:rabit`) and requires a
+reader supporting the layered layout. The default, including missing `layered`,
+is the existing single-plane layout. A layered index supports exactly these
+fixed widths: 5 bits stores sign + 2 + 2, 7 bits stores sign + 4 + 2, and 9 bits
+stores sign + 4 + 4. Widths are derived from `num_bits`; no list of planes is
+persisted. Older readers reject the shorter `__blocked_ex_codes` column with a
+byte-width mismatch instead of decoding it as the full ex code.
+
+The auxiliary file retains its IVF partition row ranges and rotation metadata.
+For a rotated dimension `d`, let `p = 64 * ceil(d / 64)` and `(h, l)` be the fixed
+high and low widths. Each partition has this schema:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `_rowid` | uint64 | Row identity |
+| `_rabit_codes` | fixed-size-list<uint8>[ceil(d/8)] | Transposed sign codes |
+| `__add_factors`, `__scale_factors`, `__error_factors` | float32 each | Binary estimator factors |
+| `__blocked_ex_codes` | fixed-size-list<uint8>[p*h/8] | High prefix plane |
+| `__add_factors_ex_hi`, `__scale_factors_ex_hi` | float32 each | High-level factors |
+| `__blocked_ex_codes_lo` | fixed-size-list<uint8>[p*l/8] | Low plane |
+| `__add_factors_ex`, `__scale_factors_ex` | float32 each | Full-level factors |
+
+All fields retain the existing nullable schema convention. Null codes or factors
+are not valid encoded rows.
+
+Column order is resolved by name. Each ex plane uses its width's existing blocked
+packing, including zero padding to a 64-dimensional boundary. The sign plane
+retains its existing partition-local transposition. Selecting sign rows requires
+undoing that transposition before gathering rows and repacking the result.
+
+For each rotated residual, the encoder chooses one rescale factor `t` by the
+existing threshold search, at 3, 5 or 6 ex bits for total widths 5, 7 or 9,
+respectively. It multiplies that scale by `2^(h+l-search_width)` and quantizes
+one `(h+l)`-bit ex code. The high code is `code >> l`; the low code is
+`code & (2^l-1)`. Negative components use the existing complemented encoding
+`!code & (2^(h+l)-1)`, so truncation also preserves their prefix. The high code
+is the code obtained at `h` bits with scale `t / 2^l`. The scale is build-time
+state and is not stored; a change to the search policy does not change decoding.
+
+The binary estimator keeps its existing factors and error bound. High and full
+levels each store their own raw-query add/scale factors, computed with their own
+code bias and quantized residual/centroid inner products. Full scoring combines
+codes before accumulation as `2^l * high + low`; high scoring omits the low code
+and uses the high factor pair. Reusing full-level factors for a prefix is invalid.
+
+Appending, merging, splitting, reassigning and remapping an index must preserve
+the layout flag and every plane's factors. All segments merged into a single
+index must agree on the layout and shared rotation. A missing required plane,
+factor column, or mismatched plane byte width is an invalid index.

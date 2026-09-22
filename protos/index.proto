@@ -213,6 +213,8 @@ message VectorIndexDetails {
     }
     uint32 num_bits = 1;
     RotationType rotation_type = 2;
+    // Opt-in fixed prefix planes; absent/false retains the single-plane layout.
+    bool layered = 3;
   }
 
   // No quantization; vectors are stored as-is.

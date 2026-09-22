@@ -179,6 +179,7 @@ impl From<&RQBuildParams> for RabitQuantization {
         use crate::pb::vector_index_details::rabit_quantization::RotationType;
         Self {
             num_bits: value.num_bits as u32,
+            layered: false,
             rotation_type: match value.rotation_type {
                 RQRotationType::Fast => RotationType::Fast as i32,
                 RQRotationType::Matrix => RotationType::Matrix as i32,
