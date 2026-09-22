@@ -6501,9 +6501,24 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
-        if filter_plan.is_empty() && self.fragments.is_none() {
-            log::trace!("no filter plan, no prefilter");
-            return Ok(PreFilterSource::None);
+        if filter_plan.is_empty() {
+            let has_full_fragment_coverage = self.fragments.as_ref().is_none_or(|fragments| {
+                let selected: HashSet<_> = fragments.iter().map(|fragment| fragment.id).collect();
+                selected.len() == self.dataset.manifest.fragments.len()
+                    && self
+                        .dataset
+                        .manifest
+                        .fragments
+                        .iter()
+                        .all(|fragment| selected.contains(&fragment.id))
+            });
+            // A full-snapshot scope cannot reject any live row. Avoid materializing its row IDs,
+            // but retain self.fragments for unindexed fallback and leave deletion/overlay masks
+            // to DatasetPreFilter. Comparing IDs also prevents duplicate fragments hiding a gap.
+            if has_full_fragment_coverage {
+                log::trace!("no filter plan or effective fragment restriction, no prefilter");
+                return Ok(PreFilterSource::None);
+            }
         }
 
         // get fragments covered by index
@@ -7081,6 +7096,7 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use std::vec;
 
@@ -15749,6 +15765,128 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
         }
         assert_eq!(get_default_io_buffer_size_override(), None);
+    }
+
+    #[rstest]
+    #[case::all(vec![0, 1], false, true)]
+    #[case::reordered(vec![1, 0], false, true)]
+    #[case::duplicates(vec![0, 0], false, false)]
+    #[case::subset(vec![0], false, false)]
+    #[case::empty(vec![], false, false)]
+    #[case::filtered(vec![0, 1], true, false)]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter(
+        #[case] selected: Vec<usize>,
+        #[case] has_filter: bool,
+        #[case] no_prefilter: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let fragments = &test_ds.dataset.manifest.fragments;
+        assert_eq!(fragments.len(), 2);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.with_fragments(selected.iter().map(|i| fragments[*i].clone()).collect());
+        let filter = if has_filter {
+            ExprFilterPlan::new_refine_only(col("i").gt(lit(100)))
+        } else {
+            ExprFilterPlan::default()
+        };
+        let source = scanner
+            .prefilter_source(&filter, fragments.iter().map(|f| f.id as u32).collect())
+            .await
+            .unwrap();
+        assert_eq!(matches!(source, PreFilterSource::None), no_prefilter);
+        // Planning must preserve the explicit scope used by unindexed-fragment fallback.
+        assert_eq!(scanner.fragments.as_ref().unwrap().len(), selected.len());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter_preserves_deleted_and_unindexed_rows(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] pin_segment: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let indexed_snapshot = test_ds.dataset.clone();
+        test_ds.dataset.delete("i = 7").await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        for dataset in [&indexed_snapshot, &test_ds.dataset] {
+            let mut scanner = dataset.scan();
+            scanner.prefilter(true);
+            scanner.with_fragments(dataset.manifest.fragments.as_ref().clone());
+            scanner
+                .nearest("vec", &Float32Array::from(vec![0.0; 32]), 500)
+                .unwrap();
+            scanner.nprobes(2);
+            if pin_segment {
+                let indices = dataset.load_indices().await.unwrap();
+                scanner.with_index_segments(vec![indices[0].uuid]).unwrap();
+            }
+            let batch = scanner.try_into_batch().await.unwrap();
+            let actual: BTreeSet<i32> = batch["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            let expected: BTreeSet<i32> =
+                if dataset.version().version == indexed_snapshot.version().version {
+                    (0..400).collect()
+                } else {
+                    (0..410).filter(|i| *i != 7).collect()
+                };
+            assert_eq!(actual, expected);
+            assert_eq!(batch.num_rows(), expected.len());
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter_execution_metrics(#[values(false, true)] filtered: bool) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let stats = Arc::new(Mutex::new(None));
+        let collected = stats.clone();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .prefilter(true)
+            .with_fragments(test_ds.dataset.manifest.fragments.as_ref().clone())
+            .scan_stats_callback(Arc::new(move |summary| {
+                *collected.lock().unwrap() = Some(summary.clone());
+            }));
+        scanner
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), 100)
+            .unwrap();
+        scanner.nprobes(2);
+        if filtered {
+            scanner.filter("i >= 200").unwrap();
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 100);
+        let summary = stats.lock().unwrap().take().unwrap();
+        for name in [
+            "prefilter_loads",
+            "prefilter_input_rows",
+            "prefilter_input_batches",
+            "prefilter_row_ids",
+        ] {
+            let value = summary.all_counts.get(name).copied().unwrap_or_default();
+            assert_eq!(value > 0, filtered, "{name}: {value}");
+        }
+        for name in [
+            "prefilter_load_time",
+            "prefilter_input_time",
+            "prefilter_build_time",
+        ] {
+            let value = summary.all_times.get(name).copied().unwrap_or_default();
+            assert_eq!(value > 0, filtered, "{name}: {value}");
+        }
     }
 
     fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {
