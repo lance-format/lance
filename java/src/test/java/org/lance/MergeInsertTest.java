@@ -39,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -91,15 +92,39 @@ public class MergeInsertTest {
     allocator.close();
   }
 
-  @Test
-  public void testWhenNotMatchedInsertAll() throws Exception {
+  @ParameterizedTest
+  @EnumSource(DataStorageVersion.class)
+  public void testWhenNotMatchedInsertAll(DataStorageVersion version) throws Exception {
     // Test insert all unmatched source rows
 
     try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
       try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
-        MergeInsertResult result =
-            dataset.mergeInsert(
-                new MergeInsertParams(Collections.singletonList("id")), sourceStream);
+        MergeInsertParams params =
+            new MergeInsertParams(Collections.singletonList("id")).withDataStorageVersion(version);
+        if (version == DataStorageVersion.LEGACY) {
+          IllegalArgumentException error =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class, () -> dataset.mergeInsert(params, sourceStream));
+          Assertions.assertTrue(error.getMessage().contains("V1 and V2"));
+          return;
+        }
+        String exactVersion =
+            version == DataStorageVersion.STABLE
+                ? "2.2"
+                : version == DataStorageVersion.NEXT ? "2.3" : version.toRustString();
+        MergeInsertResult result = dataset.mergeInsert(params, sourceStream);
+
+        Assertions.assertTrue(
+            result.dataset().getFragments().stream()
+                .filter(
+                    fragment ->
+                        fragment.metadata().getId()
+                            != dataset.getFragments().get(0).metadata().getId())
+                .flatMap(fragment -> fragment.metadata().getFiles().stream())
+                .allMatch(
+                    file ->
+                        exactVersion.equals(
+                            file.getFileMajorVersion() + "." + file.getFileMinorVersion())));
 
         Assertions.assertEquals(
             "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",

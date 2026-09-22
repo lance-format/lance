@@ -402,6 +402,10 @@ impl EncodingPipeline {
         }
     }
 
+    pub(crate) fn validate_options(&self) -> Result<()> {
+        self.options.validate()
+    }
+
     pub fn encoding_options(&self, schema: &Schema) -> EncodingOptions {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64

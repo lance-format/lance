@@ -60,7 +60,7 @@ use tracing::{Instrument, instrument};
 
 use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
-use crate::dataset::fragment::{FileFragment, FragReadConfig};
+use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -71,6 +71,8 @@ use crate::dataset::versions;
 use super::utils::IoMetrics;
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
+type MaterializedReadBatchesFut =
+    futures::future::BoxFuture<'static, Result<Vec<MaterializedBlobBatch>>>;
 
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
@@ -222,6 +224,7 @@ struct ScopedFragmentRead {
     physical_filter: Option<Arc<dyn PhysicalExpr>>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
+    base_schedulers: BaseSchedulers,
 }
 
 impl ScopedFragmentRead {
@@ -232,6 +235,7 @@ impl ScopedFragmentRead {
             .with_row_last_updated_at_version(self.projection.with_row_last_updated_at_version)
             .with_row_created_at_version(self.projection.with_row_created_at_version)
             .with_scan_scheduler(self.scan_scheduler.clone())
+            .with_base_schedulers(self.base_schedulers.clone())
             .with_reader_priority(self.priority);
         if let Some(file_reader_options) = &self.file_reader_options {
             config = config.with_file_reader_options(file_reader_options.clone());
@@ -438,7 +442,7 @@ struct FilteredReadStream {
     /// The stream of filtered rows, expressed as a stream of tasks (batch futures)
     ///
     /// This stream can be shared by multiple partitions
-    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchFut>>>>,
+    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchesFut>>>>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
@@ -546,7 +550,7 @@ pub fn coalesce_batches(
                 return Ok(Some((this.emit()?, this)));
             }
             if this.exhausted {
-                return Ok(None);
+                return Ok::<_, DataFusionError>(None);
             }
             match this.input.try_next().await? {
                 Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
@@ -584,12 +588,15 @@ impl FilteredReadStream {
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         plan: FilteredReadInternalPlan,
         scan_scheduler: Option<Arc<ScanScheduler>>,
+        base_schedulers: Option<BaseSchedulers>,
         priority_offset: Option<u32>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
     ) -> Self {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
+        let base_schedulers =
+            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -627,6 +634,7 @@ impl FilteredReadStream {
             &dataset,
             &options,
             scan_scheduler.clone(),
+            base_schedulers,
         );
         if let Some(priority_offset) = priority_offset.filter(|offset| *offset != 0) {
             for scoped in &mut scoped_fragments {
@@ -696,7 +704,7 @@ impl FilteredReadStream {
         let mut task_stream = self.task_stream.lock().await;
         (&mut *task_stream)
             .try_buffered(decode_parallelism)
-            .try_collect()
+            .try_concat()
             .await
     }
 
@@ -742,6 +750,18 @@ impl FilteredReadStream {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
         ScanScheduler::new(obj_store, scheduler_config)
+    }
+
+    /// Create the per-base scheduler cache for a read, sized like the scan
+    /// scheduler (explicit option → env override → max bandwidth)
+    fn make_base_schedulers(options: &FilteredReadOptions) -> BaseSchedulers {
+        match options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
+            Some(io_buffer_size_bytes) => BaseSchedulers::new(io_buffer_size_bytes),
+            None => BaseSchedulers::max_bandwidth(),
+        }
     }
 
     async fn load_fragment(
@@ -964,6 +984,7 @@ impl FilteredReadStream {
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
+        base_schedulers: BaseSchedulers,
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
@@ -1002,6 +1023,7 @@ impl FilteredReadStream {
                     physical_filter,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
+                    base_schedulers: base_schedulers.clone(),
                 });
             }
         }
@@ -1329,6 +1351,8 @@ impl FilteredReadStream {
                 let partition_metrics_clone = partition_metrics.clone();
                 let base_batch_stream = futures_stream
                     .try_buffered(num_threads)
+                    .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                    .try_flatten()
                     .map_ok(MaterializedBlobBatch::into_batch)
                     .try_filter_map(move |batch| {
                         std::future::ready(Ok(if batch.num_rows() == 0 {
@@ -1392,14 +1416,16 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batch = task.await?.into_batch();
-                                partition_metrics
-                                    .baseline_metrics
-                                    .record_output(batch.num_rows());
+                                let batches = task.await?;
+                                let batch_rows = batches
+                                    .iter()
+                                    .map(|batch| batch.batch().num_rows())
+                                    .sum::<usize>();
+                                partition_metrics.baseline_metrics.record_output(batch_rows);
 
                                 global_metrics.io_metrics.record(&scan_scheduler);
 
-                                Ok(Some((batch, task_stream)))
+                                Ok::<_, lance_core::Error>(Some((batches, task_stream)))
                             } else {
                                 partition_metrics.baseline_metrics.done();
                                 Ok(None)
@@ -1408,6 +1434,9 @@ impl FilteredReadStream {
                         .instrument(tracing::debug_span!("filtered_read_task"))
                     }
                 })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
+                .map_ok(MaterializedBlobBatch::into_batch)
                 .try_filter_map(move |batch| {
                     std::future::ready(Ok(if batch.num_rows() == 0 {
                         None
@@ -1430,7 +1459,11 @@ impl FilteredReadStream {
         fragment_soft_limit: Option<u64>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
-    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchFut>>> {
+    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>> {
+        let batch_size_bytes = fragment_read_task
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let output_schema = if materialize_blob_v2_binary {
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref())
         } else {
@@ -1553,7 +1586,19 @@ impl FilteredReadStream {
                 physical_filter.clone(),
                 output_schema.clone(),
             )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
+            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
+            .map(move |batch_fut_result| {
+                let batch_fut = batch_fut_result?;
+                Ok(batch_fut
+                    .and_then(move |batch| {
+                        futures::future::ready(if let Some(budget) = batch_size_bytes {
+                            batch.split_by_bytes((budget * 2) as usize)
+                        } else {
+                            Ok(vec![batch])
+                        })
+                    })
+                    .boxed())
+            });
 
         let result = if let Some(limit) = fragment_soft_limit {
             Self::apply_soft_limit(fragment_stream, limit).boxed()
@@ -1591,9 +1636,9 @@ impl FilteredReadStream {
     fn apply_soft_limit<S>(
         stream: S,
         limit: u64,
-    ) -> impl Stream<Item = Result<MaterializedReadBatchFut>>
+    ) -> impl Stream<Item = Result<MaterializedReadBatchesFut>>
     where
-        S: Stream<Item = Result<MaterializedReadBatchFut>>,
+        S: Stream<Item = Result<MaterializedReadBatchesFut>>,
     {
         let rows_read = Arc::new(AtomicUsize::new(0));
 
@@ -1607,8 +1652,9 @@ impl FilteredReadStream {
                 batch_fut_result.map(move |batch_fut| {
                     batch_fut
                         .map(move |batch_result| {
-                            batch_result.inspect(|batch| {
-                                let batch_rows = batch.batch().num_rows();
+                            batch_result.inspect(|batches| {
+                                let batch_rows =
+                                    batches.iter().map(|b| b.batch().num_rows()).sum::<usize>();
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
                             })
                         })
@@ -2589,6 +2635,7 @@ impl FilteredReadExec {
                     plan.clone(),
                     None,
                     None,
+                    None,
                     materialization_context,
                     true,
                 );
@@ -2732,6 +2779,7 @@ struct RowStreamRead {
     carried_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
+    base_schedulers: BaseSchedulers,
     materialization_context: Arc<BlobMaterializationContext>,
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
@@ -2750,12 +2798,14 @@ impl RowStreamRead {
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
+        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
         Self {
             dataset,
             source,
             carried_schema,
             output_schema,
             scan_scheduler,
+            base_schedulers,
             materialization_context,
             loaded_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
@@ -2928,6 +2978,7 @@ impl RowStreamRead {
             self.global_metrics.clone(),
             internal_plan,
             Some(self.scan_scheduler.clone()),
+            Some(self.base_schedulers.clone()),
             Some(priority_offset),
             self.materialization_context.clone(),
             false,
@@ -2970,29 +3021,38 @@ impl RowStreamRead {
         batch: RecordBatch,
         batch_index: u32,
         admission: crate::dataset::blob::BlobMaterializationAdmission,
-    ) -> DataFusionResult<MaterializedBlobBatch> {
+    ) -> DataFusionResult<Vec<MaterializedBlobBatch>> {
         if batch.num_rows() == 0 {
-            return Ok(MaterializedBlobBatch::unreserved(RecordBatch::new_empty(
-                self.output_schema.clone(),
-            )));
+            return Ok(vec![MaterializedBlobBatch::unreserved(
+                RecordBatch::new_empty(self.output_schema.clone()),
+            )]);
         }
         let internal_plan = self.plan_batch(self.key_array(&batch, "input")?).await?;
         let read_data = self.read_batch(internal_plan, batch_index).await?;
         let attached = self.attach_columns(batch, read_data)?;
-        if let Some(output_schema) = &self.source.materialization_output_schema {
-            Ok(
-                crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
-                    &self.dataset,
-                    output_schema,
-                    attached.into_batch(),
-                    &self.materialization_context,
-                    admission,
-                )
-                .await?,
+        let batch_size_bytes = self
+            .source
+            .read_options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
+        let result = if let Some(output_schema) = &self.source.materialization_output_schema {
+            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                &self.dataset,
+                output_schema,
+                attached.into_batch(),
+                &self.materialization_context,
+                admission,
             )
+            .await?
         } else {
             drop(admission);
-            Ok(attached)
+            attached
+        };
+        if let Some(budget) = batch_size_bytes {
+            Ok(result.split_by_bytes((budget * 2) as usize)?)
+        } else {
+            Ok(vec![result])
         }
     }
 
@@ -3029,6 +3089,8 @@ impl RowStreamRead {
             })
             .boxed()
             .try_buffered(ROW_STREAM_CONCURRENT_BATCHES)
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
             .map_ok(MaterializedBlobBatch::into_batch)
             .map(move |result| {
                 on_result
@@ -5969,6 +6031,7 @@ mod tests {
             };
             let options = FilteredReadOptions::basic_full_read(dataset);
             let scheduler = FilteredReadStream::make_scan_scheduler(dataset, &options);
+            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
 
             let scoped = FilteredReadStream::plan_to_scoped_fragments(
                 &plan,
@@ -5976,10 +6039,70 @@ mod tests {
                 dataset,
                 &options,
                 scheduler,
+                base_schedulers,
             );
             assert_eq!(scoped.len(), 1);
             assert_eq!(scoped[0].fragment.id(), 2);
             assert_eq!(scoped[0].priority, 2);
+        }
+
+        /// Fragment reads planned for one scan carry the same base scheduler
+        /// cache, so files on another base (a shallow clone) share one
+        /// scheduler instead of building one per opened file
+        #[tokio::test]
+        async fn scoped_fragments_share_one_scheduler_per_base() {
+            let fixture = take_fixture(false).await;
+            let mut source = fixture.dataset.as_ref().clone();
+            source
+                .tags()
+                .create("to_clone", source.version().version)
+                .await
+                .unwrap();
+            let clone_dir = TempStrDir::default();
+            let cloned = Arc::new(
+                source
+                    .shallow_clone(&clone_dir, "to_clone", None)
+                    .await
+                    .unwrap(),
+            );
+            let descriptors = cloned.fragments().clone();
+            assert_eq!(descriptors.len(), 3);
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|frag| frag.files.iter().all(|file| file.base_id.is_some()))
+            );
+
+            let rows = descriptors
+                .iter()
+                .map(|frag| (frag.id as u32, vec![0u64..10]))
+                .collect::<BTreeMap<_, _>>();
+            let plan = FilteredReadInternalPlan {
+                rows,
+                filters: HashMap::new(),
+                scan_range_after_filter: None,
+            };
+            let options = FilteredReadOptions::basic_full_read(&cloned);
+            let scheduler = FilteredReadStream::make_scan_scheduler(&cloned, &options);
+            let base_schedulers = FilteredReadStream::make_base_schedulers(&options);
+            let scoped = FilteredReadStream::plan_to_scoped_fragments(
+                &plan,
+                &descriptors,
+                &cloned,
+                &options,
+                scheduler,
+                base_schedulers.clone(),
+            );
+            assert_eq!(scoped.len(), 3);
+
+            for scoped_fragment in &scoped {
+                scoped_fragment
+                    .fragment
+                    .open(cloned.schema(), scoped_fragment.frag_read_config())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(base_schedulers.len(), 1);
         }
 
         /// Output preserves the input's row order, duplicates, and payload

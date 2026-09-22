@@ -12,7 +12,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -26,10 +26,10 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::stream::FuturesUnordered;
+use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -162,6 +162,46 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     );
     batch_size
 });
+
+/// Prepared partition storage (bytes) handed to a single `spawn_cpu` dispatch on the
+/// global-top-k search path.
+///
+/// That path scores every probed partition into one heap, so it streams prepared
+/// partitions through scoring in chunks; the chunk is what bounds resident partition
+/// memory (together with the prepare window) independently of `nprobes`, see
+/// [`PreparedPartitionTracker`]. Chunking by bytes rather than by partition count
+/// keeps both the memory bound and the dispatch overhead predictable whatever the
+/// partition size: a dispatch costs two thread hops (~100µs), so on a warm cache
+/// the 16-partition streaming batch would spend ~40% of a 1024-probe query on
+/// dispatch overhead for ~800 KiB partitions, while a fixed large partition count
+/// would pin GiBs for the multi-MiB partitions of a billion-row RQ index. 64 MiB is
+/// a few milliseconds of scoring per dispatch across those sizes. Override with the
+/// `LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES` environment variable.
+pub(crate) const DEFAULT_GLOBAL_TOPK_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let chunk_bytes = std::env::var("LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES")
+        })
+        .unwrap_or(DEFAULT_GLOBAL_TOPK_CHUNK_BYTES);
+    assert!(
+        chunk_bytes > 0,
+        "LANCE_IVF_GLOBAL_TOPK_CHUNK_BYTES must be greater than 0, got {chunk_bytes}"
+    );
+    chunk_bytes
+});
+
+/// Upper bound on partitions per global-top-k scoring chunk, so that tiny partitions
+/// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
+/// expressible as a partition count: at most the prepare window plus two chunks.
+pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Largest global-top-k heap converted to the result batch on the async task
+/// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
+const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
@@ -454,7 +494,54 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<PartitionEntry<S, Q>>,
+    /// Released together with `part_entry`, so the tracker's live count is the
+    /// number of partitions whose storage is pinned by in-flight searches.
+    _in_flight: PreparedPartitionGuard,
     _marker: PhantomData<(S, Q)>,
+}
+
+/// Live count and high-water mark of [`PreparedPartitionSearch`] values for one
+/// index.
+///
+/// A prepared partition holds a strong reference to its [`PartitionEntry`] — the
+/// partition's whole quantized storage — until it has been scored and dropped, so
+/// the index cache cannot evict it in the meantime. The count is therefore the
+/// partition memory a query holds *outside* the cache's budget. Every search path
+/// must keep it bounded by its prepare window and scoring chunk size rather than
+/// by `nprobes`: a query that probes thousands of partitions of a large RQ index
+/// would otherwise pin hundreds of GiB before scoring the first one.
+#[derive(Debug, Default)]
+pub(crate) struct PreparedPartitionTracker {
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl PreparedPartitionTracker {
+    fn track(self: &Arc<Self>) -> PreparedPartitionGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        PreparedPartitionGuard(self.clone())
+    }
+
+    /// Prepared partitions currently alive.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Most prepared partitions alive at once over the index's lifetime.
+    #[cfg(test)]
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+struct PreparedPartitionGuard(Arc<PreparedPartitionTracker>);
+
+impl Drop for PreparedPartitionGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -830,6 +917,17 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
+    /// Memoized size of the immutable parts (this struct, the sub-index and the
+    /// quantized storage): every query that prepares this partition needs its
+    /// size to budget scoring chunks, and the walk over the storage's arrays
+    /// costs a few microseconds per partition — measurable on a warm
+    /// probe-everything query — while these never change once loaded.
+    immutable_bytes: OnceLock<usize>,
+    /// Memoized size of `partition_rows`, set when the coverage is built. Kept
+    /// apart from `immutable_bytes` because the coverage can appear after an
+    /// earlier query already memoized the size; folding it in later keeps
+    /// [`Self::size_bytes`] equal to [`DeepSizeOf::deep_size_of`].
+    coverage_bytes: OnceLock<usize>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
@@ -839,13 +937,31 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
+            immutable_bytes: OnceLock::new(),
+            coverage_bytes: OnceLock::new(),
         }
     }
 
+    /// Bytes this entry pins in memory, equal to [`DeepSizeOf::deep_size_of`]
+    /// but memoized: the immutable parts are computed on first use and the
+    /// lazily built partition coverage is added once it exists.
+    fn size_bytes(&self) -> usize {
+        let immutable = *self.immutable_bytes.get_or_init(|| {
+            let mut context = lance_core::deepsize::Context::new();
+            std::mem::size_of::<Self>()
+                + self.index.deep_size_of_children(&mut context)
+                + self.storage.deep_size_of_children(&mut context)
+        });
+        immutable + self.coverage_bytes.get().copied().unwrap_or_default()
+    }
+
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
-        self.partition_rows
-            .get_or_init(|| Arc::new(self.storage.row_ids().collect()))
-            .clone()
+        let rows = self
+            .partition_rows
+            .get_or_init(|| Arc::new(self.storage.row_ids().collect()));
+        self.coverage_bytes
+            .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
+        rows.clone()
     }
 }
 
@@ -953,6 +1069,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_query_residual: bool,
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
+    prepared_partitions: Arc<PreparedPartitionTracker>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1121,6 +1238,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -1145,6 +1263,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
         })
     }
@@ -1164,6 +1283,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -1199,6 +1319,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(batch)
     }
 
+    /// Pull prepared partitions off `prepared` until their pinned storage reaches
+    /// `chunk_bytes` or the chunk holds [`GLOBAL_TOPK_CHUNK_MAX_PARTITIONS`],
+    /// always taking at least one. `None` once the stream is exhausted; a failed
+    /// prepare ends the chunk (and the search) immediately.
+    async fn next_scoring_chunk<St>(
+        prepared: &mut St,
+        chunk_bytes: usize,
+    ) -> Option<Result<Vec<PreparedPartitionSearch<S, Q>>>>
+    where
+        St: Stream<Item = Result<PreparedPartitionSearch<S, Q>>> + Unpin,
+    {
+        let mut chunk = Vec::new();
+        let mut bytes = 0;
+        while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
+            match prepared.next().await {
+                Some(Ok(prepared)) => {
+                    bytes += prepared.part_entry.size_bytes();
+                    chunk.push(prepared);
+                }
+                Some(Err(err)) => return Some(Err(err)),
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(Ok(chunk))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
         use_query_residual: bool,
@@ -1216,6 +1366,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache,
             raw_query_context,
             part_entry,
+            _in_flight: _,
             _marker: _,
         } = prepared;
         let rotated_partition_centroid =
@@ -1485,6 +1636,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
             open_io_stats,
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
     }
@@ -1528,8 +1680,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // the open-time I/O is not attributed here (it is a one-time cost,
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
+            prepared_partitions: Arc::default(),
             _marker: PhantomData,
         })
+    }
+
+    /// Prepared-partition accounting for this index instance; see
+    /// [`PreparedPartitionTracker`].
+    #[cfg(test)]
+    pub(crate) fn prepared_partitions(&self) -> &PreparedPartitionTracker {
+        &self.prepared_partitions
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -2152,7 +2312,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
-            let prepared = stream::iter(start_idx..end_idx)
+            // Stream prepared partitions through scoring in chunks rather than
+            // collecting all of them first. A prepared partition pins its whole
+            // quantized storage, so collecting `nprobes` of them before scoring
+            // makes peak memory scale with `nprobes` (a 4096-probe query over a
+            // large RQ index pinned hundreds of GiB per index segment). Chunking
+            // bounds resident partitions to the prepare window plus two chunks:
+            // one being assembled by `next_scoring_chunk` while another is scored.
+            // `buffered` preserves the probe order, so the heap accumulates
+            // partitions in the same order as before (which decides which of
+            // several rows tied at the k-th distance the capped heap keeps).
+            let mut prepared = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
@@ -2174,32 +2344,54 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     }
                 })
                 .buffered(prepare_parallelism)
-                .try_collect::<Vec<_>>()
-                .await?;
+                .fuse();
+            let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
             let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
-            let search_metrics = metrics.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
-                let mut heap = BinaryHeap::with_capacity(heap_capacity);
-                scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
-                    for prepared in prepared {
-                        Self::accumulate_prepared_partition_search(
-                            use_query_residual,
-                            use_residual_scratch,
-                            prepared,
-                            &mut heap,
-                            scratch,
-                            search_metrics.as_ref(),
-                        )
-                        .map_err(DataFusionError::from)?;
-                    }
-                    Ok(())
-                })?;
-                Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
-            })
-            .await?;
+            let mut heap = BinaryHeap::with_capacity(heap_capacity);
+            // Score each chunk on the CPU pool while the next chunk prepares (the
+            // same overlap `search_partitions_batch` uses): `spawn_cpu` starts the
+            // scoring immediately and the async task, never a CPU-pool thread, does
+            // the waiting (#7642). The heap is threaded through each dispatch so
+            // scoring stays sequential, and a scored chunk is dropped before the
+            // next one is scored.
+            let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
+            while let Some(chunk) = pending {
+                let chunk = chunk?;
+                let search_metrics = metrics.clone();
+                let scratch_pool = self.scratch_pool.clone();
+                let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    scratch_pool.with_scratch(|scratch| -> Result<()> {
+                        for prepared in chunk {
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heap,
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    Ok(heap)
+                });
+                let (scored, next) =
+                    futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
+                heap = scored?;
+                pending = next;
+            }
+
+            // Turning the heap into the result batch is a sort of `k * refine_factor`
+            // entries. Below a few thousand that is well under the ~100µs where a
+            // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
+            // common small-k query at one dispatch (as before the chunked scoring).
+            let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
+                Self::global_heap_to_batch(heap)?
+            } else {
+                spawn_cpu(move || Self::global_heap_to_batch(heap)).await?
+            };
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
@@ -2393,6 +2585,187 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             VECTOR_RESULT_SCHEMA.clone(),
             ReceiverStream::new(batch_rx),
         )))
+    }
+
+    fn supports_batch_partition_search(&self) -> bool {
+        S::supports_global_topk_heap()
+    }
+
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>> {
+        if !S::supports_global_topk_heap() {
+            return Err(Error::not_supported(
+                "batch partition search requires a global top-k heap sub-index",
+            ));
+        }
+        let query_count = partitions_per_query.len();
+        if q_c_dists_per_query.len() != query_count {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: {query_count} query partition lists but {} distance lists",
+                q_c_dists_per_query.len()
+            )));
+        }
+        if query_count == 0 {
+            return Ok(Vec::new());
+        }
+        if !query.key.len().is_multiple_of(query_count) {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: query key length {} is not divisible by query count {query_count}",
+                query.key.len()
+            )));
+        }
+        let dim = query.key.len() / query_count;
+
+        // Per-query immutable search state: the query vector slice and the
+        // optional Rabit raw-query context both depend only on the query vector,
+        // so compute them once up front rather than per probed partition.
+        let mut base_queries = Vec::with_capacity(query_count);
+        let mut raw_query_contexts = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
+                return Err(Error::invalid_input(format!(
+                    "batch partition search: query {query_index} has {} partitions but {} distances",
+                    partitions_per_query[query_index].len(),
+                    q_c_dists_per_query[query_index].len()
+                )));
+            }
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
+            base_queries.push(single_query);
+        }
+        // Shared across every chunk's scoring dispatch below, so wrap once in an
+        // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = Arc::new(base_queries);
+        let raw_query_contexts = Arc::new(raw_query_contexts);
+
+        // Invert the per-query partition lists so each distinct partition is
+        // loaded once and scored against every query that probes it.
+        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+        for (query_index, (parts, dists)) in partitions_per_query
+            .iter()
+            .zip(q_c_dists_per_query.iter())
+            .enumerate()
+        {
+            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
+                assignments
+                    .entry(*part_id)
+                    .or_default()
+                    .push((query_index, *dist_q_c));
+            }
+        }
+
+        pre_filter.wait_for_ready().await?;
+
+        // Score partitions in a deterministic order. `assignments` is a HashMap,
+        // so its iteration order (and hence the order partitions accumulate into
+        // each per-query heap) is otherwise arbitrary. When several rows tie at
+        // the k-th distance, which one the capped heap keeps depends on insertion
+        // order, so a stable partition order is what makes the selected top-k
+        // deterministic across runs. (Any of the tied rows is an equally valid
+        // k-th neighbor, so this does not affect recall.)
+        let mut assignment_list: Vec<(u32, Vec<(usize, f32)>)> = assignments.into_iter().collect();
+        assignment_list.sort_by_key(|(part_id, _)| *part_id);
+
+        // Load each distinct partition's storage exactly once (the shared I/O
+        // that batch search exists to save), but *stream* the loaded partitions
+        // through scoring in chunks rather than materializing them all. A wide
+        // batch probes up to `min(query_count * nprobes, num_partitions)` distinct
+        // partitions, so collecting every loaded partition before scoring would
+        // make peak memory scale with the batch width — up to the whole index.
+        // Streaming bounds resident partition storage to the load window plus one
+        // chunk. `buffered` preserves the sorted load order above, so scoring order
+        // (and thus the k-th-distance tie-break) stays deterministic.
+        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_index = self.clone();
+        let load_metrics = metrics.clone();
+        let mut loaded_chunks = stream::iter(assignment_list)
+            .map(move |(part_id, probing_queries)| {
+                let index = load_index.clone();
+                let metrics = load_metrics.clone();
+                async move {
+                    let part_entry = index
+                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .await?;
+                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                }
+            })
+            .buffered(load_parallelism)
+            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
+            .map(|_| BinaryHeap::with_capacity(heap_capacity))
+            .collect();
+
+        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
+        // dispatches the scoring immediately and only touches CPU-bound state, so
+        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
+        // flight during scoring: the async task, never a CPU-pool thread, does the
+        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
+        // docs recommend with `buffered`). Scoring stays sequential across chunks —
+        // each mutates the same per-query heaps — so a step costs about
+        // max(load, score) rather than their sum, and a scored chunk's storage is
+        // dropped before the next is scored, keeping peak memory bounded.
+        let mut pending = loaded_chunks.next().await;
+        while let Some(chunk) = pending {
+            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+            let index = self.clone();
+            let pre_filter = pre_filter.clone();
+            let base_queries = base_queries.clone();
+            let raw_query_contexts = raw_query_contexts.clone();
+            let scratch_pool = self.scratch_pool.clone();
+            let search_metrics = metrics.clone();
+            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                scratch_pool.with_scratch(|scratch| -> Result<()> {
+                    for (part_id, part_entry, probing_queries) in &chunk {
+                        let partition_centroid = index.ivf.centroid(*part_id);
+                        for (query_index, dist_q_c) in probing_queries {
+                            let mut single_query = base_queries[*query_index].clone();
+                            single_query.dist_q_c = *dist_q_c;
+                            let prepared = PreparedPartitionSearch::<S, Q> {
+                                query: single_query,
+                                pre_filter: pre_filter.clone(),
+                                partition_id: *part_id,
+                                partition_centroid: partition_centroid.clone(),
+                                rq_search_cache: index.rq_search_cache.clone(),
+                                raw_query_context: raw_query_contexts[*query_index].clone(),
+                                part_entry: part_entry.clone(),
+                                _in_flight: index.prepared_partitions.track(),
+                                _marker: PhantomData,
+                            };
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heaps[*query_index],
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(heaps)
+            });
+            // Load the next chunk while this one is scored on the CPU pool.
+            let (scored, next) = futures::join!(score, loaded_chunks.next());
+            heaps = scored?;
+            pending = next;
+        }
+
+        heaps
+            .into_iter()
+            .map(Self::global_heap_to_batch)
+            .collect::<Result<Vec<_>>>()
     }
 
     fn is_loadable(&self) -> bool {
@@ -2603,16 +2976,18 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
+    use futures::TryStreamExt;
     use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache, WeakLanceCache};
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tokio::get_num_compute_intensive_cpus;
     use lance_core::{ROW_ID, Result};
     use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::prefilter::PreFilter;
+    use lance_index::prefilter::{NoFilter, PreFilter};
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -2625,6 +3000,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -2865,6 +3241,9 @@ mod tests {
             .await;
         let weak_cache = WeakLanceCache::from(&cache);
         let size_without_coverage = entry.deep_size_of();
+        // Memoize the chunk-budget size before the coverage exists; it must
+        // still pick the coverage up once a later filter builds it.
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_without_coverage = cache.size_bytes().await;
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
@@ -2899,6 +3278,7 @@ mod tests {
         let second_rows = entry.partition_rows();
         assert!(Arc::ptr_eq(&first_rows, &second_rows));
         assert!(entry.deep_size_of() > size_without_coverage);
+        assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
         let cache_weight_with_coverage = cache.size_bytes().await;
         assert!(cache_weight_with_coverage > cache_weight_without_coverage);
         assert!(cache_weight_with_coverage >= entry.deep_size_of());
@@ -3190,11 +3570,15 @@ mod tests {
         (batch, schema)
     }
 
+    /// Rows of `vectors_per_row` vectors around their cluster's centroid. The
+    /// `straddling_row`, if any, spreads its vectors over the centroids instead,
+    /// one per vector, so it belongs to several partitions at once.
     fn generate_clustered_multivec_batch(
         cluster_sizes: &[usize],
         centroids: &[(f32, f32)],
         vectors_per_row: usize,
         start_id: u64,
+        straddling_row: Option<u64>,
     ) -> (RecordBatch, SchemaRef) {
         assert_eq!(
             cluster_sizes.len(),
@@ -3209,9 +3593,14 @@ mod tests {
         let mut current_id = start_id;
         for (&rows, &(x, y)) in cluster_sizes.iter().zip(centroids.iter()) {
             for _ in 0..rows {
-                ids.push(current_id);
+                let row_id = current_id;
+                ids.push(row_id);
                 current_id += 1;
-                for _ in 0..vectors_per_row {
+                for vector_idx in 0..vectors_per_row {
+                    let (x, y) = match straddling_row {
+                        Some(id) if id == row_id => centroids[vector_idx % centroids.len()],
+                        _ => (x, y),
+                    };
                     for dim in 0..DIM {
                         let base = match dim {
                             0 => x,
@@ -3420,11 +3809,13 @@ mod tests {
         num_partitions: usize,
         refine_factor: u32,
         ef: usize,
+        distance_type: DistanceType,
     ) -> RecordBatch {
         dataset
             .scan()
             .nearest("vector", query, k)
             .unwrap()
+            .distance_metric(distance_type)
             .minimum_nprobes(num_partitions)
             .ef(ef)
             .refine(refine_factor)
@@ -3501,30 +3892,57 @@ mod tests {
             assert_eq!(hnsw_params["ef_construction"], 16);
         }
 
+        // A single k=10 query of 4-bit PQ + Dot sits near the 0.5 bar: Windows
+        // CI has landed at 0.4 (4/10). Average over several queries so one
+        // platform-dependent ranking does not fail the contract.
+        const NUM_QUERIES: usize = 10;
+        // 4-bit PQ ranking is coarser; rescoring more candidates is cheap on
+        // this 256-row fixture and keeps mean recall clear of 0.5.
+        let refine_factor = if num_bits == 4 { 8 } else { 4 };
+        // HNSW requires ef >= k * refine. IVF_PQ ignores ef.
+        let ef = 64.max(K * refine_factor as usize);
+        let mut hits = 0usize;
         let query = vectors.value(0);
-        let ground_truth = ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
         let before_reopen = search_lightweight_pq_index(
             &dataset,
             query.as_ref(),
             K,
             LIGHTWEIGHT_PQ_PARTITIONS,
-            4,
-            64,
+            refine_factor,
+            ef,
+            distance_type,
         )
         .await;
-        assert_eq!(before_reopen.num_rows(), K);
-        let row_ids = before_reopen[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
-        let distances = before_reopen[DIST_COL]
-            .as_primitive::<Float32Type>()
-            .values();
-        assert!(distances.iter().all(|distance| distance.is_finite()));
-        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
-        let recall = row_ids
-            .iter()
-            .filter(|row_id| ground_truth.contains(row_id))
-            .count() as f32
-            / K as f32;
+        for query_idx in 0..NUM_QUERIES {
+            let query = vectors.value(query_idx);
+            let ground_truth =
+                ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
+            let result = if query_idx == 0 {
+                before_reopen.clone()
+            } else {
+                search_lightweight_pq_index(
+                    &dataset,
+                    query.as_ref(),
+                    K,
+                    LIGHTWEIGHT_PQ_PARTITIONS,
+                    refine_factor,
+                    ef,
+                    distance_type,
+                )
+                .await
+            };
+            assert_eq!(result.num_rows(), K);
+            let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+            assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+            let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+            assert!(distances.iter().all(|distance| distance.is_finite()));
+            assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+            hits += row_ids
+                .iter()
+                .filter(|row_id| ground_truth.contains(row_id))
+                .count();
+        }
+        let recall = hits as f32 / (NUM_QUERIES * K) as f32;
         assert_ge!(recall, 0.5, "recall: {recall}");
 
         drop(dataset);
@@ -3538,8 +3956,9 @@ mod tests {
                 query.as_ref(),
                 K,
                 LIGHTWEIGHT_PQ_PARTITIONS,
-                4,
-                64,
+                refine_factor,
+                ef,
+                distance_type,
             )
             .await,
             before_reopen
@@ -3611,7 +4030,7 @@ mod tests {
         delete_ids(dataset, &ids[1..]).await;
         compact_after_deletions(dataset).await;
 
-        append_constant_vector_with_start_id(
+        append_template_vector_with_start_id(
             dataset,
             ROWS_TO_APPEND_FOR_JOIN,
             &template_values,
@@ -3643,13 +4062,13 @@ mod tests {
         (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
-    async fn append_constant_vector_with_start_id(
+    async fn append_template_vector_with_start_id(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         next_id: &mut u64,
     ) {
-        append_constant_vector_batch(dataset, rows, template, *next_id, None).await;
+        append_template_vector_batch(dataset, rows, template, *next_id, None).await;
         *next_id += rows as u64;
     }
 
@@ -3676,10 +4095,15 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + total_rows as u64,
         ));
+        // A tiny per-row drift keeps the appended rows distinct (identical rows
+        // cannot be split by clustering) without moving them off their template's
+        // partition.
         let mut appended_values = Vec::with_capacity(total_rows * DIM);
         for template in templates {
-            for _ in 0..rows_per_template {
-                appended_values.extend_from_slice(template);
+            for row in 0..rows_per_template {
+                let mut values = template.clone();
+                values[0] += row as f32 * 0.0001;
+                appended_values.extend_from_slice(&values);
             }
         }
         let vectors = Arc::new(
@@ -3698,17 +4122,17 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
     }
 
-    async fn append_constant_vector_with_params(
+    async fn append_template_vector_with_params(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         write_params: Option<WriteParams>,
     ) {
         let start_id = dataset.count_all_rows().await.unwrap() as u64;
-        append_constant_vector_batch(dataset, rows, template, start_id, write_params).await;
+        append_template_vector_batch(dataset, rows, template, start_id, write_params).await;
     }
 
-    async fn append_constant_vector_batch(
+    async fn append_template_vector_batch(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
@@ -3725,9 +4149,14 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + rows as u64,
         ));
+        // The same tiny per-row drift as `append_partition_templates`: a split
+        // into `ceil(rows / target)` pieces needs that many distinct rows, and
+        // identical rows would leave some pieces empty at random.
         let mut appended_values = Vec::with_capacity(rows * DIM);
-        for _ in 0..rows {
-            appended_values.extend_from_slice(template);
+        for row in 0..rows {
+            let mut values = template.to_vec();
+            values[0] += row as f32 * 0.0001;
+            appended_values.extend_from_slice(&values);
         }
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(
@@ -3761,7 +4190,7 @@ mod tests {
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        append_constant_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
+        append_template_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -5926,11 +6355,15 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        // Multivector search ranks the final candidates by PQ-approximated
+        // scores before refining, so the M4 code of `lightweight_pq_params`
+        // (unseeded KMeans) drops recall below the threshold in a few percent
+        // of runs. The 4-bit M32 code keeps recall at 1.0.
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
             lightweight_hnsw_params(),
-            lightweight_pq_params(),
+            lightweight_pq_params_with_bits(4),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -5940,7 +6373,16 @@ mod tests {
         let query = vectors.value(0);
         // Three vectors per query amplify the internal candidate k. This
         // bounded budget covers all 64 * 3 vector entries in the fixture.
-        let result = search_lightweight_pq_index(&dataset, query.as_ref(), K, 1, 2, 256).await;
+        let result = search_lightweight_pq_index(
+            &dataset,
+            query.as_ref(),
+            K,
+            1,
+            2,
+            256,
+            DistanceType::Cosine,
+        )
+        .await;
         assert_eq!(result.num_rows(), K);
         let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
         assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
@@ -6310,6 +6752,120 @@ mod tests {
             .unwrap();
         let v3_index = index.as_any().downcast_ref::<super::IvfPq>();
         assert!(v3_index.is_some());
+    }
+
+    /// The global-top-k path (flat sub-index, no early-stop control) must not
+    /// pin every probed partition before scoring: a prepared partition holds the
+    /// partition's whole quantized storage, so with a high explicit `nprobes`
+    /// that made peak memory scale with `nprobes` instead of with the prepare
+    /// window. Probe every partition of an index with more partitions than the
+    /// window and check the in-flight high-water mark stays within it.
+    #[tokio::test]
+    async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const ROWS_PER_PARTITION: usize = 16;
+
+        // Resident partitions are bounded by the prepare window plus two scoring
+        // chunks (one being scored, one being assembled). The partitions here are
+        // far smaller than the chunk byte budget, so the partition cap is what
+        // ends a chunk. Size the index so that the old collect-everything
+        // behavior would clearly exceed the bound.
+        let in_flight_bound =
+            get_num_compute_intensive_cpus().max(1) + 2 * super::GLOBAL_TOPK_CHUNK_MAX_PARTITIONS;
+        let num_partitions = 2 * in_flight_bound;
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(num_partitions * ROWS_PER_PARTITION);
+        let query_vector = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let mut ivf_params = IvfBuildParams::new(num_partitions);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf_params,
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let tracker = index
+            .as_any()
+            .downcast_ref::<super::IvfPq>()
+            .expect("IVF_PQ index")
+            .prepared_partitions();
+
+        let query = Query {
+            column: "vector".to_string(),
+            key: query_vector,
+            k: K,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: num_partitions,
+            maximum_nprobes: Some(num_partitions),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
+        assert_eq!(partitions.len(), num_partitions);
+        let results = index
+            .clone()
+            .search_partitions(
+                query,
+                Arc::new(partitions),
+                Arc::new(q_c_dists),
+                0,
+                num_partitions,
+                Arc::new(NoFilter),
+                None,
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let num_results: usize = results.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(num_results, K);
+        assert_eq!(
+            tracker.in_flight(),
+            0,
+            "every prepared partition must be released once the search completes"
+        );
+        assert!(
+            tracker.peak() >= 1,
+            "the search must have gone through prepared partitions"
+        );
+        assert!(
+            tracker.peak() <= in_flight_bound,
+            "peak in-flight prepared partitions {} exceeds the bound {} (probed {} partitions)",
+            tracker.peak(),
+            in_flight_bound,
+            num_partitions
+        );
     }
 
     #[rstest]
@@ -7001,7 +7557,7 @@ mod tests {
             ..Default::default()
         };
         append_params.mode = WriteMode::Append;
-        append_constant_vector_with_params(
+        append_template_vector_with_params(
             &mut dataset,
             SMALL_APPEND_ROWS,
             &template_values,
@@ -7194,14 +7750,17 @@ mod tests {
         .await;
         expected_rows += NO_SPLIT_APPEND_ROWS;
 
+        // The oversized partition is split straight to the target size in one
+        // optimize: ceil(rows / target) pieces instead of a single halving.
+        let split_rows = expected_rows + SPLIT_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
             &mut next_id,
             SPLIT_APPEND_ROWS,
-            2,
-            expected_rows + SPLIT_APPEND_ROWS,
+            split_rows.div_ceil(IndexType::IvfPq.target_partition_size()),
+            split_rows,
             1,
             true,
         )
@@ -7247,17 +7806,21 @@ mod tests {
             .unwrap();
 
         let expected_rows = NUM_ROWS + APPEND_ROWS;
+        // Every vector of a row counts towards the partition size, and the split
+        // goes straight to the target size: ceil(vectors / target) pieces.
+        let expected_partitions =
+            (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            2,
-            "Expected one oversized multivector partition to split, stats: {}",
+            expected_partitions,
+            "Expected the oversized multivector partition to split into {expected_partitions}, stats: {}",
             final_ctx.stats_json()
         );
         let partitions = final_ctx.stats()["indices"][0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions.len(), expected_partitions);
         assert_eq!(
             partitions
                 .iter()
@@ -7348,10 +7911,14 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
+        // Both partitions hold BASE + APPEND rows and are split straight to the
+        // target size in one optimize: ceil(rows / target) pieces each.
+        let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
+            .div_ceil(IndexType::IvfFlat.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            4,
+            2 * pieces_per_partition,
             "Expected both original partitions to split in one optimize, stats: {}",
             final_ctx.stats_json()
         );
@@ -7369,7 +7936,7 @@ mod tests {
         let partitions = indices[0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions.len(), 2 * pieces_per_partition);
         let expected_rows = 2 * BASE_ROWS_PER_PARTITION + 2 * APPEND_ROWS_PER_PARTITION;
         let total_partition_rows = partitions
             .iter()
@@ -7424,9 +7991,17 @@ mod tests {
         // distinct directions avoid the collinear assignment in the old fixture.
         let centroids = [(-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)];
         let total_rows = cluster_sizes.iter().sum::<usize>();
+        // Row 1600, the one retained below, has one vector in each partition.
+        // Joining the partition that holds one of them must reassign only that
+        // vector, not re-add the two the other partitions keep.
         let mut dataset = {
-            let (batch, schema) =
-                generate_clustered_multivec_batch(&cluster_sizes, &centroids, MULTIVEC_PER_ROW, 0);
+            let (batch, schema) = generate_clustered_multivec_batch(
+                &cluster_sizes,
+                &centroids,
+                MULTIVEC_PER_ROW,
+                0,
+                Some(1600),
+            );
             let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
             Dataset::write(
                 batches,
@@ -7498,6 +8073,7 @@ mod tests {
             &centroids[2..],
             MULTIVEC_PER_ROW,
             total_rows as u64,
+            None,
         );
         dataset
             .append(
@@ -7677,12 +8253,12 @@ mod tests {
     async fn test_optimize_join_after_delete_with_stable_row_ids() {
         // Regression test for https://github.com/lance-format/lance/issues/7701:
         // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
-        // so optimize joins the smallest after a scattered delete.
+        // so one optimize joins all of them but the largest after a scattered delete.
         let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
 
         assert_eq!(
-            run.num_partitions_after, 3,
-            "optimize should have joined the smallest partition, got stats: {}",
+            run.num_partitions_after, 1,
+            "optimize should have joined every undersized partition but one, got stats: {}",
             run.stats_json
         );
 

@@ -53,6 +53,95 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
     assert_eq!(before, after);
 }
 
+#[rstest]
+#[case::default_inputs(LanceFileVersion::V2_0, LanceFileVersion::V2_0)]
+#[case::non_default_inputs(LanceFileVersion::V2_1, LanceFileVersion::V2_1)]
+#[case::mixed_inputs(LanceFileVersion::V2_0, LanceFileVersion::V2_2)]
+#[tokio::test]
+async fn test_compaction_exact_target(
+    #[case] first: LanceFileVersion,
+    #[case] second: LanceFileVersion,
+    #[values(
+        None,
+        Some(LanceFileVersion::V2_0),
+        Some(LanceFileVersion::V2_1),
+        Some(LanceFileVersion::V2_2),
+        Some(LanceFileVersion::V2_3)
+    )]
+    target: Option<LanceFileVersion>,
+    #[values(
+        CompactionMode::Reencode,
+        CompactionMode::TryBinaryCopy,
+        CompactionMode::ForceBinaryCopy
+    )]
+    mode: CompactionMode,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(RecordBatch::new_empty(batch.schema()))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for version in [first, second] {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let read_version = dataset.manifest.version;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 8,
+        compaction_mode: Some(mode),
+        data_storage_version: target,
+        ..Default::default()
+    };
+    let expected = target.unwrap_or(LanceFileVersion::V2_0).resolve();
+    let versions_match = first.resolve() == expected && second.resolve() == expected;
+    assert_eq!(
+        can_use_binary_copy(&dataset, &options, &dataset.manifest.fragments).await,
+        versions_match && mode != CompactionMode::Reencode,
+    );
+    let result = compact_files(&mut dataset, options, None).await;
+    if mode == CompactionMode::ForceBinaryCopy && !versions_match {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains(&format!("target is {expected}")));
+        assert!(message.contains("uses"));
+        assert!(message.contains(".lance"));
+        assert_eq!(dataset.manifest.version, read_version);
+    } else {
+        result.unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == expected)
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_0
+    );
+}
+
 #[tokio::test]
 async fn test_binary_copy_falls_back_for_non_schema_column_order() {
     let decimal_type = DataType::Decimal128(38, 10);

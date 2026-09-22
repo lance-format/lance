@@ -241,6 +241,46 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     )
 
 
+@pytest.mark.parametrize("metric", ["l2", "cosine"])
+@pytest.mark.parametrize("query_count", [3, 1], ids=["three_queries", "single_query"])
+def test_batch_indexed_query_matches_repeated_single_queries(
+    dataset, metric, query_count
+):
+    indexed = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric=metric,
+    )
+    # Give the query vectors deliberately different magnitudes: a cosine batch
+    # that normalized the whole concatenated key by one global norm would scale
+    # them unequally and diverge from per-query single search.
+    scales = np.linspace(0.1, 10.0, query_count).reshape(-1, 1)
+    queries = (np.random.randn(query_count, 128) * scales).astype(np.float32)
+    k = 5
+
+    # nprobes covers every partition so the shared-scan batch path and the
+    # repeated single-query path search the same partitions deterministically.
+    nearest_kwargs = {"use_index": True, "nprobes": 4}
+    batch = indexed.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": queries, "k": k, **nearest_kwargs},
+    )
+
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    assert batch["query_index"].to_pylist() == sum(
+        [[i] * k for i in range(query_count)], []
+    )
+
+    _assert_batch_matches_single_queries(
+        indexed,
+        queries,
+        k=k,
+        nearest_kwargs=nearest_kwargs,
+    )
+
+
 def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
     batch = ds.to_table(
         columns=["id"],
@@ -974,6 +1014,56 @@ def test_index_type(tmp_path):
         assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
 
 
+@pytest.mark.parametrize("approx_mode", ["normal", "accurate"])
+def test_ivf_rq_dot_query_scale_invariance(tmp_path, approx_mode):
+    rng = np.random.default_rng(20260921)
+    vectors = rng.normal(size=(128, 64)).astype(np.float32)
+    center = rng.normal(size=64).astype(np.float32)
+    vectors[:64] += 2 * center
+    vectors[64:] -= 2 * center
+    centroids = np.stack([2 * center, -2 * center])
+    table = vec_to_table(data=vectors).append_column("id", pa.array(range(128)))
+    ds = lance.write_dataset(table, tmp_path / "scale.lance", max_rows_per_file=64)
+    ds = ds.create_index(
+        "vector",
+        "IVF_RQ",
+        metric="dot",
+        num_bits=5,
+        num_partitions=2,
+        ivf_centroids=centroids,
+    )
+    assert len(ds.get_fragments()) == 2
+    for q in vectors[[3, 97]]:
+        truth = set(np.argsort(-(vectors.astype(np.float64) @ q))[:10])
+        for k in [10, len(vectors)]:
+            reference = None
+            for scale in [1.0, 0.125, 8.0]:
+                result = ds.to_table(
+                    columns=["id", "_distance"],
+                    nearest={
+                        "column": "vector",
+                        "q": q * scale,
+                        "k": k,
+                        "metric": "dot",
+                        "nprobes": 2,
+                        "approx_mode": approx_mode,
+                    },
+                )
+                ids = result["id"].to_numpy()
+                distances = result["_distance"].to_numpy()
+                assert len(set(ids[:10]) & truth) / 10 >= 0.5
+                if reference is None:
+                    reference = (ids, distances)
+                else:
+                    np.testing.assert_array_equal(ids, reference[0])
+                    np.testing.assert_allclose(
+                        distances,
+                        1 + scale * (reference[1] - 1),
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+
+
 def test_create_dot_index(tmp_path):
     rng = np.random.default_rng(42)
     table = vec_to_table(data=rng.standard_normal((64, 32), dtype=np.float32))
@@ -1528,6 +1618,49 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert len(partitions) == 5
     partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
+
+    # num_partitions is deprecated in favor of target_partition_size, so
+    # centroids supplied without it must not be rejected. Seven clusters, so the
+    # assertion below tells the new index apart from the five-cluster one above
+    # and from the four target_partition_size would have picked.
+    new_centroids = np.random.randn(7, 128).astype(np.float32)
+    dataset_with_index = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        metric="cosine",
+        ivf_centroids=new_centroids,
+        # 1000 rows / 250 = 4, so this diverges from the centroid count.
+        target_partition_size=250,
+        num_sub_vectors=8,
+        replace=True,
+    )
+    stats = dataset_with_index.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 7
+
+    # A count that disagrees with an explicitly passed num_partitions is still
+    # rejected, and the message now names both numbers.
+    with pytest.raises(ValueError, match="but num_partitions=4"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            metric="cosine",
+            ivf_centroids=new_centroids,
+            num_partitions=4,
+            num_sub_vectors=8,
+        )
+
+    # A zero-row array passes the 2D check, and the Rust residual step panics on
+    # the empty centroid buffer.
+    with pytest.raises(ValueError, match="at least one cluster"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            metric="cosine",
+            ivf_centroids=np.empty((0, 128), dtype=np.float32),
+            num_sub_vectors=8,
+            # Otherwise the duplicate-name check intercepts first.
+            replace=True,
+        )
 
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
@@ -2608,12 +2741,10 @@ def test_knn_deleted_rows(tmp_path):
 
 
 def test_nested_field_vector_index(tmp_path):
-    """Test vector index creation and querying on nested fields
+    """Test IVF_PQ indices on a vector field nested in a struct.
 
-    Note: While scalar indices work on nested fields, vector indices currently
-    have a limitation in the DataFusion integration layer that prevents them
-    from working with nested field paths. The Python validation layer now
-    correctly handles nested paths, but the Rust planner needs additional work.
+    Cover partition reads, nearest queries, appends, index optimization, and
+    cosine distance using the nested field path ``data.embedding``.
     """
     # Create a dataset with nested vector field
     dimensions = 128

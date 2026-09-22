@@ -35,7 +35,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
+    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -125,6 +125,7 @@ impl AwsStoreProvider {
         // matches the prefix the registry uses to key this store.
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        let metrics_base = crate::object_store::metrics_base(&store_prefix, base_path);
 
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
@@ -142,7 +143,7 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
 
         Ok(Arc::new(builder.build()?))
     }
@@ -217,12 +218,10 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let use_constant_size_upload_parts =
             resolved_s3_options.requires_constant_size_upload_parts();
 
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let throttle_state = if throttle_config.is_disabled() {
-            None
-        } else {
-            Some(AimdThrottleState::new(throttle_config)?)
-        };
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
             // Use OpenDAL implementation
@@ -945,7 +944,7 @@ mod tests {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("use_opendal".to_string(), use_opendal.to_string()),
-                    ("region".to_string(), "us-west-2".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
                 ]),
             ))),
             ..Default::default()

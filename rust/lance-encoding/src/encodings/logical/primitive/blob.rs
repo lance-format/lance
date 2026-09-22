@@ -21,7 +21,10 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
-    encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
+    encodings::logical::primitive::{
+        CachedPageData, PageCacheView, PageInitialization, PageInitializationBuffers, PageLoadTask,
+        StructuralPageScheduler,
+    },
     repdef::{DefinitionInterpretation, RepDefUnraveler},
 };
 
@@ -65,15 +68,28 @@ impl BlobDescriptionPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobDescriptionPageScheduler {
-    fn initialize<'a>(
-        &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
-    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        self.inner_scheduler.initialize(io)
+    fn needs_initialization(&self) -> bool {
+        self.inner_scheduler.needs_initialization()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.inner_scheduler.load(data);
+    fn init_layout(&self) -> Result<PageInitialization> {
+        self.inner_scheduler.init_layout()
+    }
+
+    fn init_from_buffers<'a>(
+        &'a mut self,
+        buffers: PageInitializationBuffers,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        self.inner_scheduler.init_from_buffers(buffers, io)
+    }
+
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        self.inner_scheduler.try_load(data)
+    }
+
+    fn cache_view(&self) -> PageCacheView {
+        PageCacheView::BlobDescriptor
     }
 
     fn schedule_ranges(
@@ -201,14 +217,12 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
 struct BlobCacheableState {
     positions: Arc<UInt64Array>,
     sizes: Arc<UInt64Array>,
-    inner_state: Arc<dyn CachedPageData>,
 }
 
 impl DeepSizeOf for BlobCacheableState {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         (self.positions.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
             + (self.sizes.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
-            + self.inner_state.deep_size_of_children(context)
     }
 }
 
@@ -277,14 +291,20 @@ impl BlobPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobPageScheduler {
-    fn initialize<'a>(
+    fn init_layout(&self) -> Result<PageInitialization> {
+        self.inner_scheduler.init_layout()
+    }
+
+    fn init_from_buffers<'a>(
         &'a mut self,
+        buffers: PageInitializationBuffers,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         let io = io.clone();
         let num_rows = self.num_rows;
         async move {
-            let cached = self.inner_scheduler.initialize(&io).await?;
+            let cached = self.inner_scheduler.init_from_buffers(buffers, &io).await?;
+            self.inner_scheduler.try_load(&cached)?;
             let mut desc_decoders = self.inner_scheduler.schedule_ranges(&[0..num_rows], &io)?;
             if desc_decoders.len() != 1 {
                 // This can't happen yet today so being a little lazy but if it did happen we just
@@ -317,27 +337,27 @@ impl StructuralPageScheduler for BlobPageScheduler {
                     .unwrap()
                     .clone(),
             );
-            self.positions = Some(positions.clone());
-            self.sizes = Some(sizes.clone());
-            let state = Arc::new(BlobCacheableState {
-                inner_state: cached,
-                positions,
-                sizes,
-            });
+            let state = Arc::new(BlobCacheableState { positions, sizes });
             Ok(state as Arc<dyn CachedPageData>)
         }
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
         let blob_state = data
             .clone()
             .as_arc_any()
             .downcast::<BlobCacheableState>()
-            .unwrap();
+            .map_err(|_| {
+                Error::invalid_input_source("Cached blob page data has an unexpected type".into())
+            })?;
         self.positions = Some(blob_state.positions.clone());
         self.sizes = Some(blob_state.sizes.clone());
-        self.inner_scheduler.load(&blob_state.inner_state);
+        Ok(())
+    }
+
+    fn cache_view(&self) -> PageCacheView {
+        PageCacheView::BlobPayload
     }
 
     fn schedule_ranges(

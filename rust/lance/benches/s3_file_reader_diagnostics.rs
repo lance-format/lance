@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 #![allow(clippy::print_stdout)]
+// serde_json's `json_internal!` recurses once per nesting level of the
+// diagnostics payload literals below, which exceeds the default limit of 128.
+// Async future depth is not the reason: the crate compiles at the default
+// limit with the payloads flattened.
 #![recursion_limit = "256"]
 
 use std::collections::BTreeMap;

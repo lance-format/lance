@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -606,7 +606,9 @@ pub struct WriteParams {
     /// of lance.
     /// Lance file version 2.3 enables RLE v2 run length widths by default.
     ///
-    /// If not specified then the latest stable version will be used.
+    /// For an existing dataset, an explicit version is the exact target for
+    /// this operation; if omitted, the manifest default storage version is used.
+    /// New datasets default to the latest stable version.
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
@@ -691,6 +693,13 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
+
+    /// File writer options to use when writing data files.
+    ///
+    /// Options set here apply to current-format data files. They have no effect
+    /// when writing legacy V1 files. If not set, the file writer uses its
+    /// configured defaults.
+    pub file_writer_options: Option<FileWriterOptions>,
 }
 
 impl Default for WriteParams {
@@ -721,6 +730,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
+            file_writer_options: None,
         }
     }
 }
@@ -938,6 +948,7 @@ where
 
     // Keep a copy so failure paths can clean up files written to target bases.
     let cleanup_bases = target_bases_info.clone();
+    let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
@@ -950,6 +961,7 @@ where
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
+        file_writer_options,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1898,6 +1910,27 @@ pub trait GenericWriter: Send {
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
 
+    /// Append `array` to a single top-level column, leaving the others where
+    /// they are.
+    ///
+    /// `column_index` is the column's position in the writer's schema. Columns
+    /// advance independently, so a file written this way can end with a
+    /// different number of rows in each column, and the row count
+    /// [`finish`](Self::finish) reports is then the longest column rather than a
+    /// count every column shares. That raggedness is the point: it is what lets
+    /// an overlay carry a different subset of cells per field. Callers that want
+    /// every column to stay aligned should use [`Self::write`] instead.
+    ///
+    /// Only supported on V2 files without blob preprocessing. This is a
+    /// defaulted method rather than a required one so that the writers which
+    /// cannot offer it -- and any implementor outside this crate -- keep
+    /// compiling and reject it at runtime instead.
+    async fn write_column(&mut self, _column_index: usize, _array: ArrayRef) -> Result<()> {
+        Err(Error::not_supported(
+            "writing a single column: this writer only accepts whole batches",
+        ))
+    }
+
     /// Add a global buffer to the current file. Returns the 1-based buffer index.
     /// Must be called before `finish`. No-op on legacy (V1) files (returns `Ok(1)`).
     async fn add_global_buffer(&mut self, _buffer: Bytes) -> Result<u32> {
@@ -1967,6 +2000,17 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
+    async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
+        if self.preprocessor.is_some() {
+            // The preprocessor rewrites a batch as a whole, splitting blob
+            // values out to a sidecar and replacing them with descriptions; it
+            // has no meaning applied to one column in isolation.
+            return Err(Error::not_supported(
+                "writing a single column: this file stores blob data in a sidecar",
+            ));
+        }
+        self.writer.write_column(column_index, array).await
+    }
     fn data_file_path(&self) -> (&str, Option<u32>) {
         self.data_file
             .as_ref()
@@ -2022,6 +2066,7 @@ pub(crate) struct WriterOptions {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
 }
 
 impl WriterOptions {
@@ -2079,17 +2124,25 @@ where
         Schema,
         String,
         Option<u32>,
+        FileWriterOptions,
     ) -> Result<(current_writer::FileWriter, DataFile)>,
 {
     let WriterOptions {
         add_data_dir,
         base_id,
+        file_writer_options,
         ..
     } = options;
     let (_data_file_key, filename, _data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
     let writer = object_store.create(&full_path).await?;
-    let (file_writer, data_file) = create_file_writer(writer, schema.clone(), filename, base_id)?;
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
     Ok(Box::new(V2WriterAdapter {
         writer: file_writer,
         data_file: Some(data_file),
@@ -2110,6 +2163,7 @@ where
         Schema,
         String,
         Option<u32>,
+        FileWriterOptions,
     ) -> Result<(current_writer::FileWriter, DataFile)>,
 {
     let WriterOptions {
@@ -2121,11 +2175,18 @@ where
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
+        file_writer_options,
     } = options;
     let (data_file_key, filename, data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
     let writer = object_store.create(&full_path).await?;
-    let (file_writer, data_file) = create_file_writer(writer, schema.clone(), filename, base_id)?;
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
     let preprocessor = BlobPreprocessor::new(
         object_store.clone(),
         data_dir,
@@ -2194,6 +2255,7 @@ struct WriterGenerator<OpenWriter> {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -2216,6 +2278,7 @@ where
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
+        file_writer_options: FileWriterOptions,
     ) -> Self {
         Self {
             object_store,
@@ -2229,6 +2292,7 @@ where
             source_store_registry,
             source_store_params,
             blob_pack_file_size_threshold,
+            file_writer_options,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -2264,6 +2328,7 @@ where
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -2281,6 +2346,7 @@ where
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -2352,13 +2418,10 @@ mod tests {
         options: WriterOptions,
     ) -> Result<Box<dyn GenericWriter>> {
         open_current_writer(
-            |object_writer, schema, filename, base_id| {
-                let writer = lance_file::versions::v2_1::create_writer(
-                    object_writer,
-                    schema,
-                    lance_file::writer::FileWriterOptions::default(),
-                )?
-                .into();
+            |object_writer, schema, filename, base_id, options| {
+                let writer =
+                    lance_file::versions::v2_1::create_writer(object_writer, schema, options)?
+                        .into();
                 let mut data_file = DataFile::new_unstarted(filename, ConcreteFileVersion::V2_1);
                 data_file.base_id = base_id;
                 Ok((writer, data_file))
@@ -3214,6 +3277,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create a writer
@@ -3332,6 +3396,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create test batch
@@ -4336,6 +4401,7 @@ mod tests {
                 Ok(ListResult {
                     common_prefixes: vec![],
                     objects: vec![],
+                    extensions: Default::default(),
                 })
             }
 

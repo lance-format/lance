@@ -595,34 +595,17 @@ async fn resolve_version_from_listing(
     match (first, object_store.list_is_lexically_ordered) {
         // If the first valid manifest we see is V2, we can assume that we are using
         // V2 naming scheme for all manifests.
+        //
+        // V2 filenames are `u64::MAX - version` zero-padded to 20 digits, so on a
+        // lexically ordered store the first entry is the newest version and nothing
+        // after it can change the answer. We stop there rather than validating the
+        // entries behind it: that check was bounded in *valid manifests*, not keys,
+        // so a directory holding anything the filter drops made it spill into
+        // further listing pages on every open.
         (Some((scheme @ ManifestNamingScheme::V2, meta)), true) => {
             let version = scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
-
-            // Sanity check: verify at least for the first 1k files that they are all V2
-            // and that the version numbers are decreasing. We use the first 1k because
-            // this is the typical size of an object store list endpoint response page.
-            for (scheme, meta) in valid_manifests.take(999).try_collect::<Vec<_>>().await? {
-                if scheme != ManifestNamingScheme::V2 {
-                    warn!(
-                        "Found V1 Manifest in a V2 directory. Use `migrate_manifest_paths_v2` \
-                         to migrate the directory."
-                    );
-                    break;
-                }
-                let next_version = scheme
-                    .parse_version(meta.location.filename().unwrap())
-                    .unwrap();
-                if next_version >= version {
-                    warn!(
-                        "List operation was expected to be lexically ordered, but was not. This \
-                         could mean a corrupt read. Please make a bug report on the lance-format/lance \
-                         GitHub repository."
-                    );
-                    break;
-                }
-            }
 
             Ok(ManifestLocation {
                 version,
@@ -1765,9 +1748,11 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use lance_core::utils::tempfile::TempObjDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 
     use super::*;
 
@@ -2438,6 +2423,68 @@ mod tests {
             release_calls.load(Ordering::SeqCst),
             2,
             "expected the hung explicit release plus one best-effort drop release"
+        );
+    }
+
+    /// The V2 naming scheme sorts the latest version first, so on a lexically
+    /// ordered store the resolver should stop at the first *valid* manifest.
+    /// Anything the filter drops sorts where its name sorts, so junk ahead of the
+    /// answer costs exactly itself and nothing behind the answer is read at all.
+    ///
+    /// Listing streams are lazy, so the entries the resolver pulls are exactly the
+    /// entries a real object store would be billed for.
+    #[rstest::rstest]
+    #[case::clean(false, 1)]
+    #[case::leftover_staging_manifest(true, 2)]
+    #[tokio::test]
+    async fn test_resolve_latest_version_stops_at_first_valid_manifest(
+        #[case] leftover_staging: bool,
+        #[case] expected_entries_listed: usize,
+    ) {
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = true;
+
+        let base = Path::from("base");
+        for version in 0..10u64 {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+        if leftover_staging {
+            // A staging manifest orphaned by an interrupted commit of version 10.
+            // Its inverted version is smaller than version 9's, so it sorts ahead
+            // of the answer, and `detect_scheme` drops it for the `-{uuid}` suffix.
+            let final_path = ManifestNamingScheme::V2.manifest_path(&base, 10);
+            let staging_path = make_staging_manifest_path(&final_path).unwrap();
+            object_store
+                .put(&staging_path, b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        let entries_listed = Arc::new(AtomicUsize::new(0));
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_obj_meta_policy(
+            "count_listed_entries",
+            Arc::new({
+                let entries_listed = entries_listed.clone();
+                move |op: &str, meta: object_store::ObjectMeta| {
+                    if op == "list" {
+                        entries_listed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(meta)
+                }
+            }),
+        );
+        object_store.inner = Arc::new(ProxyObjectStore::new(object_store.inner.clone(), policy));
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 9);
+        assert_eq!(
+            entries_listed.load(Ordering::Relaxed),
+            expected_entries_listed,
+            "the resolver must stop at the first valid manifest: the check that \
+             used to follow it drained up to a thousand more, spilling into \
+             further listing pages"
         );
     }
 }
