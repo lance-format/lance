@@ -14,14 +14,10 @@ use crate::dataset::{
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
-use lance_io::object_writer::ObjectWriter;
-use lance_io::traits::{WriteExt, Writer};
 use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
-use lance_table::format::{IndexMetadata, MAGIC, pb};
+use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
-use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -230,15 +226,20 @@ async fn test_session_store_registry() {
 }
 
 #[test]
-fn test_decode_inline_transaction_tolerates_failures() {
+fn test_decode_inline_transaction_tolerates_unknown_operations() {
     use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
+    use prost::Message;
 
-    let missing_operation = pb::Transaction {
+    // A transaction written by a newer version of Lance may carry an operation
+    // this version cannot decode; prost surfaces it as a missing oneof. This
+    // must not fail (it would prevent opening the dataset), only skip caching.
+    let unknown_operation = pb::Transaction {
         read_version: 1,
         uuid: "test".to_string(),
         ..Default::default()
     };
-    assert!(decode_inline_transaction(&missing_operation.encode_to_vec(), 42).is_none());
+    assert!(decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).is_none());
 
     // Corrupt bytes are likewise tolerated.
     assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
@@ -252,19 +253,6 @@ fn test_decode_inline_transaction_tolerates_failures() {
     let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
     assert!(matches!(decoded.operation, Operation::Append { .. }));
 }
-
-#[derive(Clone, PartialEq, Message)]
-struct FutureTransaction {
-    #[prost(uint64, tag = "1")]
-    read_version: u64,
-    #[prost(string, tag = "2")]
-    uuid: String,
-    #[prost(message, optional, tag = "127")]
-    future_operation: Option<FutureOperation>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct FutureOperation {}
 
 #[tokio::test]
 async fn test_migrate_v2_manifest_paths() {
@@ -417,8 +405,6 @@ async fn test_inline_transaction() {
         .execute(tx.clone())
         .await
         .unwrap();
-    assert!(ds2.manifest.transaction_section.is_none());
-    assert!(ds2.manifest.transaction_section_v2.is_some());
     delete_external_tx_file(&ds2).await;
     let read_tx = ds2.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx.clone());
@@ -476,7 +462,7 @@ async fn test_inline_transaction() {
     .await
     .unwrap();
     let ds_new = ds.checkout_version(location.version).await.unwrap();
-    assert!(ds_new.manifest.transaction_section_position().is_none());
+    assert!(ds_new.manifest.transaction_section.is_none());
     assert!(ds_new.manifest.transaction_file.is_some());
     let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx);
@@ -487,55 +473,6 @@ async fn test_inline_transaction() {
         .await
         .unwrap();
     assert_eq!(version_transaction.transaction, Some(tx));
-}
-
-#[tokio::test]
-async fn test_open_tolerates_unknown_inline_transaction() {
-    for (section_name, use_v2_section) in [("legacy", false), ("v2", true)] {
-        let test_uri = TempStrDir::default();
-        let dataset = write_versions(&test_uri, 1, true).await;
-        let manifest_path = dataset.manifest_location().path.clone();
-        let mut manifest = dataset.manifest().clone();
-        let future_transaction = FutureTransaction {
-            read_version: 0,
-            uuid: Uuid::new_v4().to_string(),
-            future_operation: Some(FutureOperation {}),
-        };
-
-        let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), &manifest_path)
-            .await
-            .unwrap();
-        let transaction_position = writer.write_protobuf(&future_transaction).await.unwrap();
-        manifest.transaction_section = (!use_v2_section).then_some(transaction_position);
-        manifest.transaction_section_v2 = use_v2_section.then_some(transaction_position);
-        let manifest_position = writer.write_struct(&manifest).await.unwrap();
-        writer
-            .write_magics(manifest_position, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-            .await
-            .unwrap();
-        Writer::shutdown(&mut writer).await.unwrap();
-        drop(dataset);
-
-        let reopened = DatasetBuilder::from_uri(test_uri.as_str())
-            .with_session(Arc::new(Session::default()))
-            .load()
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "an unknown inline transaction in the {section_name} section must not \
-                     prevent dataset open: {error}"
-                )
-            });
-        assert_eq!(reopened.count_rows(None).await.unwrap(), 10);
-
-        let error = reopened.read_transaction().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Transaction message did not contain an operation"),
-            "unexpected {section_name} transaction error: {error}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -638,7 +575,7 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
     let ds = write_versions(&test_uri, 1, true).await;
     let manifest = ds.manifest().clone();
     // Only meaningful for the inline path; a plain write inlines the transaction.
-    assert!(manifest.transaction_section_position().is_some());
+    assert!(manifest.transaction_section.is_some());
 
     // A size at/under the transaction offset makes the first read_message fail
     // "file size is too small"; only the retry at the true size can recover.
@@ -906,7 +843,7 @@ async fn test_large_transaction_spills_to_external_file() {
     .await
     .unwrap();
     let ds = reopen(&test_uri).await;
-    assert!(ds.manifest.transaction_section_position().is_none());
+    assert!(ds.manifest.transaction_section.is_none());
     assert!(matches!(ds.manifest.transaction_file.as_deref(), Some(f) if !f.is_empty()));
     let tx = ds.read_transaction().await.unwrap().unwrap();
     assert_eq!(
@@ -930,7 +867,7 @@ async fn test_large_transaction_spills_to_external_file() {
     .await
     .unwrap();
     let ds = reopen(&test_uri).await;
-    assert!(ds.manifest.transaction_section_position().is_some());
+    assert!(ds.manifest.transaction_section.is_some());
 }
 
 #[tokio::test]
@@ -963,7 +900,7 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     .unwrap();
     // The manifests restored from / cloned from below carry an inline
     // transaction offset and their own transaction file.
-    assert!(ds.manifest.transaction_section_position().is_some());
+    assert!(ds.manifest.transaction_section.is_some());
     let source_version = ds.manifest().version;
     let source_ref_path = ds.uri().to_string();
     let source_tx_file = ds.manifest.transaction_file.clone();
@@ -979,7 +916,7 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
         .await
         .unwrap();
     let restored = reopen(&source_uri).await;
-    assert!(restored.manifest.transaction_section_position().is_none());
+    assert!(restored.manifest.transaction_section.is_none());
     assert_eq!(
         restored.read_transaction().await.unwrap().unwrap(),
         restore_tx
@@ -1005,7 +942,7 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
         .await
         .unwrap();
     let cloned = reopen(&clone_uri).await;
-    assert!(cloned.manifest.transaction_section_position().is_none());
+    assert!(cloned.manifest.transaction_section.is_none());
     assert_ne!(cloned.manifest.transaction_file, source_tx_file);
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
 }

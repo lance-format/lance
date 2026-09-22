@@ -833,11 +833,9 @@ impl Dataset {
                 .await;
         }
 
-        // If a forward-compatible transaction section is also in the last block,
-        // we can take the opportunity to decode and cache it. The legacy field is
-        // deliberately excluded: eager decoding it recreates the compatibility
-        // failure that field 22 avoids.
-        if let Some(transaction_offset) = manifest.transaction_section_v2
+        // If transaction is also in the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(transaction_offset) = manifest.transaction_section
             && manifest_size - transaction_offset <= last_block.len()
         {
             let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
@@ -1282,7 +1280,7 @@ impl Dataset {
         manifest_location: &ManifestLocation,
     ) -> Result<Option<Transaction>> {
         // Prefer inline transaction from manifest when available
-        if let Some(pos) = manifest.transaction_section_position() {
+        if let Some(pos) = manifest.transaction_section {
             let reader = match manifest_location.size {
                 Some(size) => {
                     self.object_store

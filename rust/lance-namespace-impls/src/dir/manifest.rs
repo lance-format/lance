@@ -4642,8 +4642,7 @@ mod tests {
         let manifest = dataset_guard.manifest();
         // The overwrite transaction is embedded inline in the manifest, never written as a
         // separate _transactions/*.txn file.
-        assert!(manifest.transaction_section.is_none());
-        assert!(manifest.transaction_section_v2.is_some());
+        assert!(manifest.transaction_section.is_some());
         assert!(manifest.transaction_file.is_none());
     }
 
