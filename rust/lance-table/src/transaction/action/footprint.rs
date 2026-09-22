@@ -124,6 +124,14 @@ pub struct Footprint {
     /// away -- leaving the new fragment carrying data for a field the manifest
     /// no longer has.
     required_fields: HashSet<i32>,
+    /// Coordinates this set reads and needs to still hold what it read, without
+    /// writing them itself.
+    ///
+    /// Data written for a committed field is the case this exists for: the
+    /// values are encoded in the type the schema names, so the definition has
+    /// to still say what it said. Unlike a write, two sets may require the same
+    /// coordinate -- two readers of one column do not collide.
+    requires: HashSet<Coordinate>,
     /// String maps this set replaces outright rather than merging into. Like a
     /// fragment removal, this writes every key in the map, including keys it
     /// does not name, so it is matched by map rather than by key.
@@ -135,22 +143,36 @@ pub struct Footprint {
 }
 
 impl Footprint {
-    pub fn conflicts_with(&self, other: &Self) -> bool {
+    /// Whether this set can still commit on top of `committed`, a set that
+    /// landed after this one read.
+    ///
+    /// Asymmetric, in the requirement check alone: what `committed` required
+    /// held when it committed, and it serializes first, so nothing this set
+    /// writes can retroactively break it. This set's requirements are the open
+    /// question, because it read before `committed` landed.
+    ///
+    /// Everything else is a claim on the same coordinate from both sides and
+    /// stays symmetric.
+    pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
         // depending on which commit won.
-        if self.exclusive || other.exclusive {
+        if self.exclusive || committed.exclusive {
             return true;
         }
-        if !self.writes.is_disjoint(&other.writes) {
+        if !self.writes.is_disjoint(&committed.writes) {
+            return true;
+        }
+        // Only this side's requirements. See the note on direction above.
+        if !self.requires.is_disjoint(&committed.writes) {
             return true;
         }
         // Two sets replacing the same map collide even when neither names a
         // key, since clearing a map is a replacement with no entries.
-        if !self.replaced_maps.is_disjoint(&other.replaced_maps) {
+        if !self.replaced_maps.is_disjoint(&committed.replaced_maps) {
             return true;
         }
-        self.removes_something_touched_by(other) || other.removes_something_touched_by(self)
+        self.removes_something_touched_by(committed) || committed.removes_something_touched_by(self)
     }
 
     /// Whether this set wipes out something -- a fragment, a field, a whole
@@ -182,8 +204,23 @@ impl Footprint {
     /// be naming one. Nor does a fragment this operation mints write a
     /// coordinate; but the committed fields the data belongs to are still
     /// required to be there when it lands.
+    ///
+    /// Either way the field's definition is required. Values are written in the
+    /// type the schema names, so a concurrent
+    /// [`AlterField`](super::AlterField) casting it would leave the manifest
+    /// describing these values as something they are not -- and unlike a
+    /// [`DropField`](super::DropField), which `required_fields` catches, a cast
+    /// leaves the field in place for no later check to notice.
+    ///
+    /// This requires the whole definition, not the type alone, so it also
+    /// rejects a concurrent rename or nullability change that would not have
+    /// invalidated the data. That matches the granularity of the coordinate:
+    /// `AlterField` writes one `FieldDefinition` whichever facet it sets.
     pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = Ref>) {
-        let fields = fields.into_iter().filter_map(committed_field);
+        let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
+        for field in fields.iter().copied() {
+            self.requires.insert(Coordinate::FieldDefinition(field));
+        }
         match fragment.committed() {
             Some(fragment) => {
                 for field in fields {
@@ -260,7 +297,7 @@ mod tests {
         SetDeletionFile, TombstoneFieldData, UserAction,
     };
     use arrow_schema::{DataType, Field as ArrowField};
-    use lance_core::datatypes::Field;
+    use lance_core::datatypes::{Field, LogicalType};
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
@@ -290,6 +327,15 @@ mod tests {
                 .map(|field| Ref::Committed(*field as u64))
                 .collect(),
             data_change: true,
+        })
+    }
+
+    fn cast_field(field: i32) -> Action {
+        Action::AlterField(AlterField {
+            field: Ref::Committed(field as u64),
+            name: None,
+            logical_type: Some(LogicalType::from("int64")),
+            nullable: None,
         })
     }
 
@@ -427,6 +473,12 @@ mod tests {
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
+    // A cast and data for an unrelated field never interact, in either order.
+    #[case::casting_a_field_a_concurrent_append_does_not_write(
+        vec![cast_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        false,
+    )]
     #[case::bases_with_the_same_name(
         vec![add_base(0, "a", "s3://bucket/one")],
         vec![add_base(0, "a", "s3://bucket/two")],
@@ -481,5 +533,47 @@ mod tests {
         assert_eq!(ours.conflicts_with(&theirs), expected);
         // The relation has to hold whichever side is asking.
         assert_eq!(theirs.conflicts_with(&ours), expected);
+    }
+
+    /// Pairs whose answer depends on which set committed first, so each order
+    /// is stated rather than assumed to match the other.
+    ///
+    /// Writing data for a field requires that field's definition, and a
+    /// requirement is only checked against what committed *after* the set was
+    /// planned. A cast that arrives second is the unsafe order: the data was
+    /// encoded in the old type and the manifest now names the new one. A cast
+    /// that arrives first is not, because applying it rebinds the field in
+    /// every fragment the manifest has by then, including one a concurrent
+    /// append just added.
+    #[rstest]
+    #[case::an_append_landing_after_a_cast(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        vec![cast_field(1)],
+        true,
+    )]
+    #[case::a_cast_landing_after_an_append(
+        vec![cast_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        false,
+    )]
+    #[case::a_rewrite_landing_after_a_cast(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        vec![cast_field(1)],
+        true,
+    )]
+    #[case::a_cast_landing_after_a_rewrite(
+        vec![cast_field(1)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        false,
+    )]
+    fn test_directional_conflicts(
+        #[case] ours: Vec<Action>,
+        #[case] committed: Vec<Action>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            footprint(ours).conflicts_with(&footprint(committed)),
+            expected
+        );
     }
 }
