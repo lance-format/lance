@@ -39,7 +39,7 @@ use datafusion::{
     },
 };
 use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{DataFusionError, Statistics, utils::get_available_parallelism};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use futures::{StreamExt, stream};
@@ -310,8 +310,20 @@ const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
+    /// The number of partitions the DataFusion session will actually run with.
+    ///
+    /// When `target_partition` is not set we do not override the session config,
+    /// so the session falls back to DataFusion's default `target_partitions`,
+    /// which is the available parallelism (number of CPU cores). The memory pool
+    /// must be sized for that effective partition count, not for a single
+    /// partition, or sort-heavy plans exhaust the pool.
+    fn effective_target_partition(&self) -> u64 {
+        self.target_partition
+            .unwrap_or_else(get_available_parallelism) as u64
+    }
+
     pub fn mem_pool_size(&self) -> u64 {
-        let num_partitions = self.target_partition.unwrap_or(1) as u64;
+        let num_partitions = self.effective_target_partition();
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
                 .map(|s| match s.parse::<u64>() {
@@ -346,6 +358,7 @@ impl LanceExecutionOptions {
         if !self.use_spilling {
             return false;
         }
+        // Presence enables the bypass; the value is not parsed as a boolean.
         std::env::var("LANCE_BYPASS_SPILLING")
             .map(|_| {
                 info!("Bypassing spilling because LANCE_BYPASS_SPILLING is set");
@@ -362,10 +375,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
-        // The default 10MB sort spill reservation seems to be too small for many common cases.
-        //
-        // There currently is no reasonable guidance provided by DataFusion for setting this value.
-        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
+        // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
+        // to leave room for input batches in small pools. This reservation comes
+        // out of the same pool; it does not guarantee that every batch will fit.
         let sort_spill_reservation_bytes =
             (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
         session_config =
@@ -379,6 +392,8 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
                 NonZero::try_from(16).unwrap(),
             )));
     }
+    // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
+    // reservations. This bypasses the configured pool limit, not actual RAM limits.
     let runtime_env = runtime_env_builder.build_arc().unwrap();
 
     let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
@@ -1104,13 +1119,15 @@ impl ExecutionPlan for StrictBatchSizeExec {
 ///
 /// # Why this exists
 ///
-/// DataFusion's sort operator cannot handle batches larger than the memory
-/// pool size.  When upstream operators produce very large batches this can
-/// cause the sort to fail.  This node caps batch sizes
-/// *before* the sort so the operation succeeds.  The trade-off is a
-/// potentially expensive deep copy of the batch data — see below — but that
-/// is preferable to failing the operation entirely.  This workaround may
-/// become unnecessary if a fix is upstreamed to DataFusion.
+/// DataFusion's sort operator must reserve memory for an entire input batch,
+/// including estimated sort/merge overhead. It can spill buffered batches and
+/// retry, but still fails if the new batch's reservation cannot fit. This is
+/// separate from the historical allocation issues fixed by DataFusion PR #14644
+/// (<https://github.com/apache/datafusion/pull/14644>).
+///
+/// This node bounds input batch sizes before sorting, at the cost of potentially
+/// expensive deep copies. It does not guarantee success for every memory pool:
+/// spill/merge reservations and other consumers also need room in the pool.
 ///
 /// # Deep copy
 ///
@@ -1334,9 +1351,14 @@ mod tests {
     fn test_mem_pool_size_scales_with_partitions() {
         let default_per_partition = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
 
-        // No partitions specified → defaults to 1 partition
+        // No partitions specified → the session runs with DataFusion's default
+        // target_partitions (available parallelism), so the pool must be sized
+        // for that effective partition count.
         let opts = LanceExecutionOptions::default();
-        assert_eq!(opts.mem_pool_size(), default_per_partition);
+        assert_eq!(
+            opts.mem_pool_size(),
+            default_per_partition * get_available_parallelism() as u64
+        );
 
         // 4 partitions → 4x the per-partition size
         let opts = LanceExecutionOptions {

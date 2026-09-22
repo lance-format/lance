@@ -511,10 +511,25 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::Project { schema, .. } => {
+                    // A project can drop fields, and this update writes
+                    // replacement files for the fields it names. Committing
+                    // over a projection that removed one leaves the fragment
+                    // carrying a data file for a field the schema no longer
+                    // has. Same rule `check_data_replacement_txn` applies to
+                    // the other operation that rewrites a field in place.
+                    for field in self_fields_modified {
+                        if schema.field_by_id(*field as i32).is_none() {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::DataOverlay { groups } => {
                     // Our update recomputed rows from the pre-overlay base, so if
                     // it commits over an overlay it would silently undo the
@@ -4044,8 +4059,12 @@ mod tests {
 
         for (writer_name, writer) in &writers {
             for claims in [true, false] {
+                // Keeps field 0, the one every writer here names: this case
+                // is about the nullability claim, not about dropped fields.
                 let project = Operation::Project {
-                    schema: lance_core::datatypes::Schema::default(),
+                    schema: (&Schema::new(vec![Field::new("a", DataType::Int32, true)]))
+                        .try_into()
+                        .unwrap(),
                     preserves_nullability: !claims,
                 };
                 for (order, ours, theirs) in [
@@ -4069,6 +4088,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An in-place column rewrite cannot land on a projection that dropped the
+    /// field it rewrote: the fragment would keep a replacement data file for a
+    /// field the schema no longer has. `check_data_replacement_txn` has always
+    /// refused this for the other operation that rewrites a field in place.
+    #[rstest::rstest]
+    #[case::field_survives_the_projection(0, false)]
+    #[case::field_dropped_by_the_projection(1, true)]
+    fn test_column_rewrite_conflicts_with_a_projection_that_dropped_its_field(
+        #[case] field_modified: u32,
+        #[case] expect_conflict: bool,
+    ) {
+        use crate::dataset::transaction::UpdateMode;
+
+        let rewrite = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![Fragment::new(0)],
+            new_fragments: vec![],
+            fields_modified: vec![field_modified],
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        // The projection keeps field 0 and nothing else.
+        let project = Operation::Project {
+            schema: (&Schema::new(vec![Field::new("a", DataType::Int32, true)]))
+                .try_into()
+                .unwrap(),
+            preserves_nullability: true,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, rewrite.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&rewrite).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
+        assert_eq!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            expect_conflict,
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]

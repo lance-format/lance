@@ -225,6 +225,33 @@ fn inner_blob_seek(env: &mut JNIEnv, jblob: JObject, new_cursor: jlong) -> Resul
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeSetReadBufferSize(
+    mut env: JNIEnv,
+    jblob: JObject,
+    buffer_size: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_blob_set_read_buffer_size(&mut env, jblob, buffer_size)
+    );
+}
+
+fn inner_blob_set_read_buffer_size(
+    env: &mut JNIEnv,
+    jblob: JObject,
+    buffer_size: jlong,
+) -> Result<()> {
+    if buffer_size < 0 {
+        return Err(
+            lance::Error::invalid_input("bufferSize must be non-negative".to_string()).into(),
+        );
+    }
+    let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
+    block_on(blob.inner.set_buffer_size(buffer_size as usize))?;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_BlobFile_nativeTell(
     mut env: JNIEnv,
     jblob: JObject,

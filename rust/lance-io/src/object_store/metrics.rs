@@ -43,6 +43,11 @@
 //! * `scheme` (default) — scheme only, e.g. `s3`; low, bounded cardinality.
 //! * `full` — the full store prefix, e.g. `s3$bucket` or `az$container@account`,
 //!   so multiple buckets on the same cloud can be told apart.
+//! * `dataset` — `base` as in `full`, plus a `dataset` label with the URI the
+//!   store was opened for, e.g. `s3://bucket/path/table.lance`, so IO can be
+//!   attributed to a dataset. Each URI gets its own store (and HTTP client)
+//!   instead of sharing one per bucket, while the AIMD throttle budget stays
+//!   shared per bucket; cardinality grows with the number of datasets opened.
 //! * `off` — omit the `base` label entirely.
 //!
 //! The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
@@ -65,6 +70,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
     UploadPart,
 };
+use url::Url;
 
 /// Total number of object store requests, labelled by `operation` and `base`.
 pub const METRIC_REQUESTS: &str = "lance_object_store_requests_total";
@@ -92,12 +98,16 @@ pub const BASE_LABEL_ENV_VAR: &str = "LANCE_OBJECT_STORE_METRICS_LABEL";
 /// Controls how much of a store's identity the `base` label carries, traded off
 /// against metric cardinality. Selected via [`BASE_LABEL_ENV_VAR`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseLabelMode {
-    /// Full store prefix, e.g. `s3$bucket` or `az$container@account`. Highest
-    /// cardinality: one series family per bucket/container.
+pub(crate) enum BaseLabelMode {
+    /// Full store prefix, e.g. `s3$bucket` or `az$container@account`: one
+    /// series family per bucket/container.
     Full,
     /// Scheme only, e.g. `s3`. The default: low, bounded cardinality.
     Scheme,
+    /// Full store prefix as `base`, plus a `dataset` label with the URI the
+    /// store was opened for, e.g. `s3://bucket/path/table.lance`. Highest
+    /// cardinality: one series family per dataset.
+    Dataset,
     /// Omit the `base` label entirely.
     Off,
 }
@@ -105,12 +115,13 @@ enum BaseLabelMode {
 fn parse_base_label_mode(value: Option<&str>) -> BaseLabelMode {
     match value {
         Some("full") => BaseLabelMode::Full,
+        Some("dataset") => BaseLabelMode::Dataset,
         Some("off") | Some("none") => BaseLabelMode::Off,
         Some("scheme") | None => BaseLabelMode::Scheme,
         Some(other) => {
             tracing::warn!(
                 "Unrecognized {BASE_LABEL_ENV_VAR}={other:?}; \
-                 expected one of full, scheme, off. Defaulting to scheme."
+                 expected one of full, scheme, dataset, off. Defaulting to scheme."
             );
             BaseLabelMode::Scheme
         }
@@ -118,19 +129,43 @@ fn parse_base_label_mode(value: Option<&str>) -> BaseLabelMode {
 }
 
 /// The label mode is read once from the environment and cached for the process.
-fn base_label_mode() -> BaseLabelMode {
+pub(crate) fn base_label_mode() -> BaseLabelMode {
     static MODE: OnceLock<BaseLabelMode> = OnceLock::new();
     *MODE.get_or_init(|| parse_base_label_mode(std::env::var(BASE_LABEL_ENV_VAR).ok().as_deref()))
 }
 
-/// Reduce a full store prefix (`scheme$authority`, or just `scheme` for stores
-/// without buckets) to the configured `base` label value, or `None` when the
-/// label should be omitted.
-fn scoped_base(mode: BaseLabelMode, base: &str) -> Option<String> {
+/// Reduce a store identity from [`metrics_base`] to the configured `base`
+/// label, plus the `dataset` label in dataset mode. Empty when the label should
+/// be omitted. A bare prefix (`scheme$authority`, or just `scheme` for stores
+/// without buckets) in dataset mode, as a caller-metered store hands over, gets
+/// only the `base` label.
+fn base_labels(mode: BaseLabelMode, base: &str) -> Vec<metrics::Label> {
+    let base_label = |base: &str| metrics::Label::new("base", base.to_owned());
     match mode {
-        BaseLabelMode::Full => Some(base.to_owned()),
-        BaseLabelMode::Scheme => Some(base.split('$').next().unwrap_or(base).to_owned()),
-        BaseLabelMode::Off => None,
+        BaseLabelMode::Full => vec![base_label(base)],
+        BaseLabelMode::Scheme => vec![base_label(base.split('$').next().unwrap_or(base))],
+        BaseLabelMode::Dataset => match base.split_once(' ') {
+            Some((prefix, uri)) => vec![
+                base_label(prefix),
+                metrics::Label::new("dataset", uri.to_owned()),
+            ],
+            None => vec![base_label(base)],
+        },
+        BaseLabelMode::Off => vec![],
+    }
+}
+
+/// The identity a store's metrics are labelled with: its prefix
+/// (`scheme$authority`), followed in dataset mode by a space and the URI it was
+/// opened for. A space cannot occur in either part, so [`base_labels`] splits
+/// on it. The registry also keys its store cache by this, so per-dataset labels
+/// come with per-dataset stores.
+pub(crate) fn metrics_base(mode: BaseLabelMode, store_prefix: &str, location: &Url) -> String {
+    match mode {
+        BaseLabelMode::Dataset => {
+            format!("{store_prefix} {}", location.as_str().trim_end_matches('/'))
+        }
+        _ => store_prefix.to_owned(),
     }
 }
 
@@ -138,9 +173,7 @@ fn scoped_base(mode: BaseLabelMode, base: &str) -> Option<String> {
 /// store-level metrics, honoring the configured label mode.
 fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> {
     let mut labels = vec![metrics::Label::new("operation", operation)];
-    if let Some(base) = scoped_base(base_label_mode(), base) {
-        labels.push(metrics::Label::new("base", base));
-    }
+    labels.extend(base_labels(base_label_mode(), base));
     labels
 }
 
@@ -657,9 +690,7 @@ mod http {
     /// honoring the configured label mode.
     fn status_labels(base: &str, status: u16) -> Vec<metrics::Label> {
         let mut labels = vec![metrics::Label::new("status", status.to_string())];
-        if let Some(base) = scoped_base(base_label_mode(), base) {
-            labels.push(metrics::Label::new("base", base));
-        }
+        labels.extend(base_labels(base_label_mode(), base));
         labels
     }
 
@@ -791,6 +822,7 @@ pub use http::MeteringHttpConnector;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     use lance_core::utils::tempfile::TempStdDir;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -898,33 +930,57 @@ mod tests {
         assert_eq!(parse_base_label_mode(None), BaseLabelMode::Scheme);
         assert_eq!(parse_base_label_mode(Some("scheme")), BaseLabelMode::Scheme);
         assert_eq!(parse_base_label_mode(Some("full")), BaseLabelMode::Full);
+        assert_eq!(
+            parse_base_label_mode(Some("dataset")),
+            BaseLabelMode::Dataset
+        );
         assert_eq!(parse_base_label_mode(Some("off")), BaseLabelMode::Off);
         assert_eq!(parse_base_label_mode(Some("none")), BaseLabelMode::Off);
         // Unrecognized values fall back to the conservative default.
         assert_eq!(parse_base_label_mode(Some("bogus")), BaseLabelMode::Scheme);
     }
 
+    #[rstest]
+    #[case::full(BaseLabelMode::Full, "s3$bucket", &[("base", "s3$bucket")])]
+    #[case::scheme(BaseLabelMode::Scheme, "s3$bucket", &[("base", "s3")])]
+    // Azure keeps only the scheme even though its prefix carries the account.
+    #[case::scheme_azure(BaseLabelMode::Scheme, "az$container@account", &[("base", "az")])]
+    // A prefix without `$` (e.g. memory/file) is unchanged by scheme mode.
+    #[case::scheme_no_bucket(BaseLabelMode::Scheme, "memory", &[("base", "memory")])]
+    #[case::off(BaseLabelMode::Off, "s3$bucket", &[])]
+    #[case::dataset(
+        BaseLabelMode::Dataset,
+        "s3$bucket s3://bucket/a/b.lance",
+        &[("base", "s3$bucket"), ("dataset", "s3://bucket/a/b.lance")]
+    )]
+    // A caller-metered store carries no URI, so dataset mode degrades to `full`.
+    #[case::dataset_bare_prefix(BaseLabelMode::Dataset, "s3$bucket", &[("base", "s3$bucket")])]
+    fn test_base_labels(
+        #[case] mode: BaseLabelMode,
+        #[case] base: &str,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let labels = base_labels(mode, base);
+        let got: Vec<(&str, &str)> = labels.iter().map(|l| (l.key(), l.value())).collect();
+        assert_eq!(got, expected);
+    }
+
     #[test]
-    fn test_scoped_base() {
+    fn test_metrics_base() {
+        let url = Url::parse("s3://bucket/a/b.lance/").unwrap();
+        // Only dataset mode appends the URI; a trailing slash does not split a
+        // dataset's series in two.
         assert_eq!(
-            scoped_base(BaseLabelMode::Full, "s3$bucket").as_deref(),
-            Some("s3$bucket")
+            metrics_base(BaseLabelMode::Dataset, "s3$bucket", &url),
+            "s3$bucket s3://bucket/a/b.lance"
         );
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "s3$bucket").as_deref(),
-            Some("s3")
-        );
-        // Azure keeps only the scheme even though its prefix carries the account.
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "az$container@account").as_deref(),
-            Some("az")
-        );
-        // A prefix without `$` (e.g. memory/file) is unchanged by scheme mode.
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "memory").as_deref(),
-            Some("memory")
-        );
-        assert_eq!(scoped_base(BaseLabelMode::Off, "s3$bucket"), None);
+        for mode in [
+            BaseLabelMode::Full,
+            BaseLabelMode::Scheme,
+            BaseLabelMode::Off,
+        ] {
+            assert_eq!(metrics_base(mode, "s3$bucket", &url), "s3$bucket");
+        }
     }
 
     #[test]

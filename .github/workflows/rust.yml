@@ -15,7 +15,12 @@ on:
       - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
+      - python/Cargo.lock
+      - java/lance-jni/Cargo.lock
+      - .cargo/config.toml
+      - clippy.toml
       - deny.toml
+      - ci/check_dependency_age.py
 
 permissions:
   contents: read
@@ -101,6 +106,10 @@ jobs:
         with:
           log-level: warn
           command: check
+      # Runs after cargo-deny so it can reuse the index cargo-deny already
+      # fetched. The script falls back to the network when that misses.
+      - name: Check dependency age
+        run: python3 ci/check_dependency_age.py
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"

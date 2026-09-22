@@ -15,7 +15,6 @@
 //!       truth) vs HNSW top-k via `MemTableScanner::nearest`.
 //!     * Recall@k = |brute ∩ hnsw| / k aggregated over queries.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::sync::Arc;

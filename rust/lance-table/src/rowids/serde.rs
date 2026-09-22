@@ -5,11 +5,14 @@ use crate::{format::pb, rowids::bitmap::Bitmap};
 use lance_core::{Error, Result};
 
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
+use std::ops::Range;
+
 use prost::Message;
+use prost::encoding::{WireType, decode_key, decode_varint};
 
 const ROW_ID_METADATA: &str = "row ID metadata";
 
-fn corrupt_row_id_metadata(message: impl Into<String>) -> Error {
+pub(super) fn corrupt_row_id_metadata(message: impl Into<String>) -> Error {
     Error::corrupt_file_named(ROW_ID_METADATA, message)
 }
 
@@ -35,23 +38,12 @@ fn validate_packed_array_length(array_type: &str, byte_len: usize, width: usize)
     Ok(())
 }
 
-fn first_descending_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
-    match array {
-        EncodedU64Array::U16 { offsets, .. } => offsets
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
-        EncodedU64Array::U32 { offsets, .. } => offsets
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, offsets[index] as u64, offsets[index + 1] as u64)),
-        EncodedU64Array::U64(values) => values
-            .windows(2)
-            .position(|pair| pair[0] > pair[1])
-            .map(|index| (index, values[index], values[index + 1])),
-    }
-}
-
+/// Find the first pair of neighbours that is not strictly increasing.
+///
+/// Both `RangeWithHoles` holes and `SortedArray` values are documented as
+/// strictly increasing, so equal neighbours are as corrupt as descending ones:
+/// `SegmentStats::n_holes` derives the hole count by subtracting the value
+/// count from the slot span, which underflows once a value is repeated.
 fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
     let mut values = array.iter();
     let previous = values.next()?;
@@ -65,29 +57,41 @@ fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64
         .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
 }
 
+/// Add a non-empty range to the run of consecutive, sorted, disjoint `Range`
+/// segments being folded into one [`U64Segment::Ranges`], merging an adjacent
+/// one and flushing the run first when `range` does not continue it.
+///
+/// A table whose deletions cluster is written as many small `Range` segments
+/// (see `RowIdSequence::use_range_segments`). Kept as separate segments they
+/// would cost a heap-allocated enum each and linear scans in every lookup;
+/// folded, they are two `u32` per range and a binary search.
+fn push_range(pending: &mut Vec<Range<u64>>, out: &mut Vec<U64Segment>, range: Range<u64>) {
+    match pending.last_mut() {
+        Some(last) if last.end == range.start => last.end = range.end,
+        Some(last) if last.end > range.start => {
+            flush_ranges(pending, out);
+            pending.push(range);
+        }
+        _ => pending.push(range),
+    }
+}
+
+fn flush_ranges(pending: &mut Vec<Range<u64>>, out: &mut Vec<U64Segment>) {
+    match U64Segment::from_sorted_ranges(pending.as_slice()) {
+        Some(segment) => out.push(segment),
+        // A single range, or a run wider than the compact form can index.
+        None => out.extend(pending.iter().cloned().map(U64Segment::Range)),
+    }
+    pending.clear();
+}
+
 impl TryFrom<pb::RowIdSequence> for RowIdSequence {
     type Error = Error;
 
+    /// Goes through [`read_row_ids`] so the proto and wire paths fold `Range`
+    /// runs the same way.
     fn try_from(pb: pb::RowIdSequence) -> Result<Self> {
-        let segments = pb
-            .segments
-            .into_iter()
-            .map(U64Segment::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        // Each segment length fits a usize on its own, but the total need not fit a u64.
-        // Reject that here so `RowIdSequence::len()` stays total for anything decoded.
-        segments
-            .iter()
-            .try_fold(0_u64, |total, segment| {
-                total.checked_add(segment.len() as u64)
-            })
-            .ok_or_else(|| {
-                corrupt_row_id_metadata(format!(
-                    "row ID sequence of {} segments has a total length exceeding u64::MAX",
-                    segments.len()
-                ))
-            })?;
-        Ok(Self(segments))
+        read_row_ids(&pb.encode_to_vec())
     }
 }
 
@@ -151,9 +155,9 @@ impl TryFrom<pb::U64Segment> for U64Segment {
             }
             Some(SortedArray(array)) => {
                 let array = EncodedU64Array::try_from(array)?;
-                if let Some((index, previous, next)) = first_descending_pair(&array) {
+                if let Some((index, previous, next)) = first_non_increasing_pair(&array) {
                     return Err(corrupt_row_id_metadata(format!(
-                        "SortedArray values are not sorted at indices {index} and {}: {previous} exceeds {next}",
+                        "SortedArray values are not strictly increasing at indices {index} and {}: {previous} is not less than {next}",
                         index + 1
                     )));
                 }
@@ -226,9 +230,26 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
 
 impl From<RowIdSequence> for pb::RowIdSequence {
     fn from(sequence: RowIdSequence) -> Self {
-        Self {
-            segments: sequence.0.into_iter().map(pb::U64Segment::from).collect(),
-        }
+        let segments = sequence
+            .0
+            .into_iter()
+            .flat_map(|segment| match segment {
+                // On the wire a run of ranges is just its `Range` segments, which
+                // every reader understands; `read_row_ids` folds them back
+                // together.
+                U64Segment::Ranges { range, runs } => runs
+                    .present_ranges()
+                    .map(|present| {
+                        U64Segment::Range(
+                            range.start + present.start as u64..range.start + present.end as u64,
+                        )
+                    })
+                    .map(pb::U64Segment::from)
+                    .collect::<Vec<_>>(),
+                other => vec![pb::U64Segment::from(other)],
+            })
+            .collect();
+        Self { segments }
     }
 }
 
@@ -259,6 +280,13 @@ impl From<U64Segment> for pb::U64Segment {
                     },
                 )),
             },
+            // A run of ranges has no message of its own: `pb::RowIdSequence`
+            // writes it as its `Range` segments. Nothing else produces this
+            // variant (`from_slice`, `mask` and `slice` never pick it), so a
+            // standalone conversion is a caller bug rather than an encoding.
+            U64Segment::Ranges { .. } => {
+                unreachable!("U64Segment::Ranges is only serialized as part of a RowIdSequence")
+            }
             U64Segment::SortedArray(array) => Self {
                 segment: Some(pb::u64_segment::Segment::SortedArray(array.into())),
             },
@@ -315,11 +343,85 @@ pub fn write_row_ids(sequence: &RowIdSequence) -> Vec<u8> {
 }
 
 /// Deserialize a rowid sequence from some bytes.
-pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
-    let pb_sequence = pb::RowIdSequence::decode(reader).map_err(|error| {
+///
+/// Walks the `RowIdSequence` wire format directly: a sequence written as
+/// `Range` segments can hold tens of millions of them, and decoding through
+/// `pb::RowIdSequence` would materialize a proto message per segment before
+/// folding. Plain `Range` segments are read straight into the fold, everything
+/// else goes through prost.
+pub fn read_row_ids(mut buf: &[u8]) -> Result<RowIdSequence> {
+    let corrupt = |error: prost::DecodeError| {
         corrupt_row_id_metadata(format!("failed to decode row ID sequence: {error}"))
-    })?;
-    RowIdSequence::try_from(pb_sequence)
+    };
+    let mut segments = Vec::new();
+    let mut pending: Vec<Range<u64>> = Vec::new();
+    while !buf.is_empty() {
+        let (field, wire_type) = decode_key(&mut buf).map_err(corrupt)?;
+        if field != 1 || wire_type != WireType::LengthDelimited {
+            return Err(corrupt_row_id_metadata(format!(
+                "unexpected field {field} with wire type {wire_type:?} in row ID sequence"
+            )));
+        }
+        let len = decode_varint(&mut buf).map_err(corrupt)? as usize;
+        if len > buf.len() {
+            return Err(corrupt_row_id_metadata(format!(
+                "row ID segment of {len} bytes exceeds the {} remaining",
+                buf.len()
+            )));
+        }
+        let (segment, rest) = buf.split_at(len);
+        buf = rest;
+        match plain_range(segment) {
+            Some(range) => push_range(&mut pending, &mut segments, range),
+            None => {
+                flush_ranges(&mut pending, &mut segments);
+                let segment = pb::U64Segment::decode(segment).map_err(corrupt)?;
+                segments.push(U64Segment::try_from(segment)?);
+            }
+        }
+    }
+    flush_ranges(&mut pending, &mut segments);
+    // Each segment length fits a usize on its own, but the total need not fit a u64.
+    // Reject that here so `RowIdSequence::len()` stays total for anything decoded.
+    segments
+        .iter()
+        .try_fold(0_u64, |total, segment| {
+            total.checked_add(segment.len() as u64)
+        })
+        .ok_or_else(|| {
+            corrupt_row_id_metadata(format!(
+                "row ID sequence of {} segments has a total length exceeding u64::MAX",
+                segments.len()
+            ))
+        })?;
+    Ok(RowIdSequence(segments))
+}
+
+/// The non-empty range of a serialized `U64Segment` that holds nothing but a
+/// `Range`; `None` for any other shape, which prost decodes instead.
+fn plain_range(mut bytes: &[u8]) -> Option<Range<u64>> {
+    let (field, wire_type) = decode_key(&mut bytes).ok()?;
+    if field != 1 || wire_type != WireType::LengthDelimited {
+        return None;
+    }
+    let len = decode_varint(&mut bytes).ok()? as usize;
+    if len != bytes.len() {
+        return None;
+    }
+    let (mut start, mut end) = (0_u64, 0_u64);
+    while !bytes.is_empty() {
+        let (field, wire_type) = decode_key(&mut bytes).ok()?;
+        if wire_type != WireType::Varint {
+            return None;
+        }
+        let value = decode_varint(&mut bytes).ok()?;
+        match field {
+            1 => start = value,
+            2 => end = value,
+            _ => return None,
+        }
+    }
+    (start < end).then_some(start..end)
 }
 
 #[cfg(test)]
@@ -418,7 +520,14 @@ mod test {
 
         let sequence2 = read_row_ids(&serialized).unwrap();
 
-        assert_eq!(sequence.0, sequence2.0);
+        // Decoding folds the two leading `Range` segments into one `Ranges`
+        // segment; everything else round-trips unchanged.
+        assert!(matches!(sequence2.0[0], U64Segment::Ranges { .. }));
+        assert_eq!(&sequence2.0[1..], &sequence.0[2..]);
+        assert_eq!(
+            sequence2.iter().collect::<Vec<_>>(),
+            sequence.iter().collect::<Vec<_>>()
+        );
     }
 
     proptest! {
@@ -668,27 +777,107 @@ mod test {
     }
 
     #[rstest]
-    #[case::u16(pb::encoded_u64_array::Array::U16Array(
+    #[case::u16_descending(pb::encoded_u64_array::Array::U16Array(
         pb::encoded_u64_array::U16Array {
             base: 100,
             offsets: vec![2, 0, 1, 0],
         }
     ))]
-    #[case::u32(pb::encoded_u64_array::Array::U32Array(
+    #[case::u32_descending(pb::encoded_u64_array::Array::U32Array(
         pb::encoded_u64_array::U32Array {
             base: 100,
             offsets: vec![2, 0, 0, 0, 1, 0, 0, 0],
         }
     ))]
-    #[case::u64(pb::encoded_u64_array::Array::U64Array(
+    #[case::u64_descending(pb::encoded_u64_array::Array::U64Array(
         pb::encoded_u64_array::U64Array {
             values: vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        }
+    ))]
+    #[case::u16_duplicate(pb::encoded_u64_array::Array::U16Array(
+        pb::encoded_u64_array::U16Array {
+            base: 100,
+            offsets: vec![5, 0, 5, 0],
+        }
+    ))]
+    #[case::u32_duplicate(pb::encoded_u64_array::Array::U32Array(
+        pb::encoded_u64_array::U32Array {
+            base: 100,
+            offsets: vec![5, 0, 0, 0, 5, 0, 0, 0],
+        }
+    ))]
+    #[case::u64_duplicate(pb::encoded_u64_array::Array::U64Array(
+        pb::encoded_u64_array::U64Array {
+            values: vec![5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0],
         }
     ))]
     fn test_rejects_unsorted_sorted_array(#[case] array: pb::encoded_u64_array::Array) {
         assert_corrupt_segment(
             pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
-            "SortedArray values are not sorted at indices 0 and 1: 2 exceeds 1",
+            "SortedArray values are not strictly increasing at indices 0 and 1",
+        );
+    }
+
+    #[test]
+    fn test_ranges_are_written_as_range_segments_and_folded_back() {
+        // 1000..1100, 1300..1500, 1650..2000 as one compact segment.
+        let ranges = vec![1000..1100, 1300..1500, 1650..2000];
+        let sequence = RowIdSequence(vec![U64Segment::from_sorted_ranges(&ranges).unwrap()]);
+        let encoded = write_row_ids(&sequence);
+
+        // On the wire: three plain `Range` segments, readable by any version.
+        let wire = pb::RowIdSequence::decode(encoded.as_slice()).unwrap();
+        let wire_ranges: Vec<Range<u64>> = wire
+            .segments
+            .iter()
+            .map(|segment| match &segment.segment {
+                Some(pb::u64_segment::Segment::Range(range)) => range.start..range.end,
+                other => panic!("expected a Range segment, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(wire_ranges, ranges);
+
+        // Decoding folds them back into the compact segment.
+        let decoded = read_row_ids(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, sequence);
+        assert_eq!(
+            decoded.iter().collect::<Vec<_>>(),
+            sequence.iter().collect::<Vec<_>>()
+        );
+
+        // A lone range, adjacent ranges and non-range neighbours: adjacent
+        // ranges merge, a single range stays a `Range`, others are untouched.
+        let mixed = pb::RowIdSequence {
+            segments: vec![
+                U64Segment::Range(0..10),
+                U64Segment::Range(10..20),
+                U64Segment::SortedArray(vec![100, 200].into()),
+                U64Segment::Range(300..310),
+                U64Segment::Range(320..330),
+                U64Segment::Range(340..350),
+            ]
+            .into_iter()
+            .map(pb::U64Segment::from)
+            .collect(),
+        };
+        let folded = RowIdSequence::try_from(mixed).unwrap();
+        assert!(matches!(
+            folded.0.as_slice(),
+            [
+                U64Segment::Range(_),
+                U64Segment::SortedArray(_),
+                U64Segment::Ranges { .. }
+            ]
+        ));
+        assert_eq!(folded.0[0], U64Segment::Range(0..20));
+        assert_eq!(
+            folded.iter().collect::<Vec<_>>(),
+            (0..20)
+                .chain([100, 200])
+                .chain(300..310)
+                .chain(320..330)
+                .chain(340..350)
+                .collect::<Vec<_>>()
         );
     }
 }

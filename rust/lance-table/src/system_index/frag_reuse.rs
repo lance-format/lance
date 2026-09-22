@@ -169,7 +169,10 @@ impl From<&FragReuseIndexDetails> for InlineContent {
             details.versions.iter().map(|m| m.into()).collect();
         // sort from oldest to latest version
         versions.sort_by_key(|v| v.dataset_version);
-        Self { versions }
+        Self {
+            legacy_versions: versions,
+            transitions: Vec::new(),
+        }
     }
 }
 
@@ -179,7 +182,7 @@ impl TryFrom<InlineContent> for FragReuseIndexDetails {
     fn try_from(content: InlineContent) -> Result<Self> {
         Ok(Self {
             versions: content
-                .versions
+                .legacy_versions
                 .into_iter()
                 .map(|m| m.try_into())
                 .collect::<Result<Vec<_>>>()?,
