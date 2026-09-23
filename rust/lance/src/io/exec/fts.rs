@@ -37,7 +37,7 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, build_prefilter};
+use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
     transform_fts_document_stream,
@@ -792,6 +792,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -828,8 +829,11 @@ impl ExecutionPlan for CompoundQueryExec {
                 &prefilter_source,
                 dataset,
                 &segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -1239,6 +1243,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1268,8 +1273,11 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 &prefilter_source,
                 dataset.clone(),
                 &selected_segments,
-                None,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block: None,
+                    external_mask,
+                },
+                &metrics_set,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2341,6 +2349,7 @@ impl ExecutionPlan for MatchQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -2365,8 +2374,11 @@ impl ExecutionPlan for MatchQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -3639,6 +3651,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -3663,8 +3676,11 @@ impl ExecutionPlan for PhraseQueryExec {
                 &prefilter_source,
                 ds,
                 &segments,
-                overlay_block,
-                external_mask,
+                PreFilterMasks {
+                    overlay_block,
+                    external_mask,
+                },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
