@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -261,7 +261,9 @@ async fn write_lineage_file(
 
 /// Read back `fragment`'s row id sequence from the data file that carries it.
 pub async fn read_spilled_row_ids(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
-    let ids = read_spilled_column(dataset, fragment, ROW_ID_FIELD_ID).await?;
+    let ids = read_spilled_column(dataset, fragment, ROW_ID_FIELD_ID)
+        .boxed()
+        .await?;
     Ok(RowIdSequence::from(ids.as_slice()))
 }
 
@@ -272,12 +274,19 @@ pub async fn read_spilled_versions(
     fragment: &Fragment,
     field_id: i32,
 ) -> Result<RowDatasetVersionSequence> {
-    let versions = read_spilled_column(dataset, fragment, field_id).await?;
+    let versions = read_spilled_column(dataset, fragment, field_id)
+        .boxed()
+        .await?;
     Ok(RowDatasetVersionSequence::from_versions(&versions))
 }
 
 /// Read the hidden `UInt64` column `field_id` of `fragment` in full: one
 /// value per physical row, from the one data file that carries the id.
+///
+/// Callers box this future: it drives the full data file reader, and inlined
+/// into the row id index build (reached from `take`, and from there from index
+/// builds and `optimize_indices`) it makes those futures too deep for the trait
+/// solver to prove `Send`/`Sync` (E0275).
 async fn read_spilled_column(
     dataset: &Dataset,
     fragment: &Fragment,
