@@ -179,13 +179,16 @@ class SemanticTypes(UpgradeDowngradeTest):
         else:
             lance.write_dataset(table, self.path, data_storage_version="2.2")
 
+    # Released versions refuse unknown feature flags with ValueError (read) or
+    # OSError (write); later ones map "not supported" to NotImplementedError.
     def _fenced(self) -> bool:
         return self._created_under_contract.exists() and not _supports_semantic_types()
 
     def check_read(self):
         if self._fenced():
             with pytest.raises(
-                (OSError, NotImplementedError), match="cannot be read by this version"
+                (OSError, NotImplementedError, ValueError),
+                match="cannot be read by this version",
             ):
                 lance.dataset(self.path).to_table()
             return
@@ -196,7 +199,8 @@ class SemanticTypes(UpgradeDowngradeTest):
         batch = pa.table({"s": pa.array(["b"], pa.large_string())})
         if self._fenced():
             with pytest.raises(
-                (OSError, NotImplementedError), match="cannot be (read|written)"
+                (OSError, NotImplementedError, ValueError),
+                match="cannot be (read|written)",
             ):
                 lance.write_dataset(batch, self.path, mode="append")
             return
