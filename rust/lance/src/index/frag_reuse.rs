@@ -288,6 +288,72 @@ async fn fri_query_plan(
         .await
 }
 
+/// Translation plans for segments the manifest does not list: a staged
+/// (uncommitted) build about to be merged, planned as one group by
+/// [`plan_staged_segments`]. Keyed by segment uuid.
+pub(crate) type StagedRemappingPlans = HashMap<Uuid, SegmentRemappingPlan>;
+
+/// Plan `segments` as ONE group with the reader's own algorithm, for segments
+/// the snapshot plan cannot know about (a staged build being merged).
+///
+/// Every step is the one `fri_query_plan` runs per committed group
+/// (`may_need_translation`, `segment_plans`, `translation_fingerprint`), so a
+/// staged segment translates exactly as it would once committed: its
+/// provenance is its stored bitmap, its siblings for direct coverage and
+/// exclusions are the other staged segments, and a destination the group only
+/// partly covers is simply absent from its coverage (the caller shrinks what it
+/// claims; nothing is claimed that the group cannot serve). `None` on a table
+/// without a tagged history, where the snapshot lookup applies.
+pub(crate) async fn plan_staged_segments(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> lance_core::Result<Option<StagedRemappingPlans>> {
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+        .filter(|entry| entry.index_version != 0)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+    lance_index::scalar::check_batch_remapping_entry()?;
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let provenance: Vec<RoaringBitmap> = segments
+        .iter()
+        .map(|segment| {
+            segment.fragment_bitmap.clone().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })
+        })
+        .collect::<lance_core::Result<_>>()?;
+    let parts = mapping.segment_plans(&provenance);
+    let mut plans = HashMap::with_capacity(segments.len());
+    for (segment, parts) in segments.iter().zip(parts) {
+        let plan = if !mapping.may_need_translation(segment.fragment_bitmap.as_ref()) {
+            SegmentRemappingPlan::Identity
+        } else {
+            let fingerprint =
+                mapping.translation_fingerprint(&parts.coverage, &parts.excluded, &parts.path);
+            SegmentRemappingPlan::Translate {
+                coverage: parts.coverage,
+                excluded_fragments: parts.excluded,
+                fingerprint,
+            }
+        };
+        plans.insert(segment.uuid, plan);
+    }
+    Ok(Some(plans))
+}
+
 /// Resolve the FRI remapper shared by scalar and vector index loading.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,

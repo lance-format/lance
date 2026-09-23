@@ -27,6 +27,7 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     is_rebuild_required: bool,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -51,8 +52,19 @@ pub(in crate::index) async fn merge_segments(
     }
 
     // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior.
-    fragment_bitmap &= dataset.fragment_bitmap.as_ref();
+    // fragments, mirroring the btree merge behavior. Under a tagged history the
+    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
+    // dataset, so it rebuilds over the live coverage the tagged reader derives
+    // for them instead.
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    match crate::index::append::tagged_segment_coverage(dataset, &segment_refs, staged).await? {
+        Some(coverage) => {
+            fragment_bitmap = coverage
+                .values()
+                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+        }
+        None => fragment_bitmap &= dataset.fragment_bitmap.as_ref(),
+    }
 
     if fragment_bitmap.is_empty() {
         // All covered fragments have been retired; produce an empty index.

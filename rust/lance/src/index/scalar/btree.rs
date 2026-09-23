@@ -64,11 +64,18 @@ pub(crate) async fn open_and_merge_segments(
     new_data: SendableRecordBatchStream,
     new_store: &LanceIndexStore,
     old_data_filters: &[Option<OldIndexDataFilter>],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<CreatedIndex> {
     let mut source_indices = Vec::with_capacity(segments.len());
     for &segment in segments {
-        let scalar_index =
-            super::open_scalar_index(dataset, field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            &NoOpMetricsCollector,
+        )
+        .await?;
         let btree = scalar_index
             .as_any()
             .downcast_ref::<BTreeIndex>()
@@ -89,6 +96,7 @@ pub(crate) async fn open_and_merge_segments(
 pub(crate) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -119,7 +127,7 @@ pub(crate) async fn merge_segments(
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
@@ -133,6 +141,7 @@ pub(crate) async fn merge_segments(
         empty_new_data,
         &new_store,
         &old_data_filters,
+        staged,
     )
     .await?;
 

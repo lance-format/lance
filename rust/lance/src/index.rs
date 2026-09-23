@@ -158,7 +158,47 @@ async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
     segments: &mut [IndexMetadata],
+    staged: Option<&frag_reuse::StagedRemappingPlans>,
 ) -> Result<bool> {
+    // Under a tagged history the merge opens each source through the
+    // translating loader with its staged plan, so the merged files hold live
+    // addresses; the coverage moves with them to the live fragments the group
+    // serves, as derived by the reader's own planning of the group. Nothing
+    // is claimed that the group cannot serve: a destination the group only
+    // partly covers is absent from that coverage and stays scanned, and a
+    // provenance bitmap left in place would be pruned to nothing at commit.
+    // The v0 handle is never consulted on a tagged table.
+    if let Some(plans) = staged {
+        use frag_reuse::SegmentRemappingPlan;
+        let mut claimed = RoaringBitmap::new();
+        for segment in segments.iter_mut() {
+            let coverage = match plans.get(&segment.uuid) {
+                Some(SegmentRemappingPlan::Translate { coverage, .. }) => coverage.clone(),
+                Some(SegmentRemappingPlan::Identity) => segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .unwrap_or_default(),
+                Some(SegmentRemappingPlan::MissingCoverage) | None => {
+                    return Err(Error::not_supported(format!(
+                        "FRI query coverage is unavailable for staged segment {}",
+                        segment.uuid
+                    )));
+                }
+            };
+            claimed |= &coverage;
+            segment.fragment_bitmap = Some(coverage);
+        }
+        if claimed.is_empty() {
+            tracing::warn!(
+                index_name,
+                "Merged index covers no rows under the tagged fragment reuse history: its \
+                 segments together cover no rewrite destination completely, so nothing is \
+                 claimed and those rows stay on the scan path. Rebuild the index to cover them."
+            );
+        }
+        return Ok(true);
+    }
     let staged_coverage = segments
         .iter()
         .map(|segment| {
@@ -2183,9 +2223,18 @@ impl DatasetIndexExt for Dataset {
         // remapper, but the `all_rtree` branch below writes the same coverage
         // field from its own staleness pruning, so a value set here would not
         // survive. Placing it under the remap means settling how the two compose.
+        // Staged segments are unknown to the snapshot plan: on a tagged table
+        // they are planned here as one group and every open below uses that
+        // plan (see `frag_reuse::plan_staged_segments`).
+        let staged = if all_vector {
+            None
+        } else {
+            frag_reuse::plan_staged_segments(self, &source_segments).await?
+        };
         let has_remapped_source_coverage = if !all_vector && !all_rtree {
             let index_name = source_segments[0].name.clone();
-            remap_merged_segment_coverage(self, &index_name, &mut source_segments).await?
+            remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
+                .await?
         } else {
             false
         };
@@ -2217,39 +2266,41 @@ impl DatasetIndexExt for Dataset {
             source_dataset_version
         };
 
+        let staged = staged.as_ref();
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
-            crate::index::scalar::inverted::merge_segments(self, source_segments).await?
+            crate::index::scalar::inverted::merge_segments(self, source_segments, staged).await?
         } else if all_fmindex {
             crate::index::scalar::fmindex::merge_segments(
                 self,
                 source_segments,
                 has_remapped_source_coverage,
+                staged,
             )
             .await?
         } else if all_bitmap {
-            crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+            crate::index::scalar::bitmap::merge_segments(self, source_segments, staged).await?
         } else if all_bloomfilter {
-            crate::index::scalar::bloomfilter::merge_segments(self, source_segments).await?
+            crate::index::scalar::bloomfilter::merge_segments(self, source_segments, staged).await?
         } else if all_label_list {
-            crate::index::scalar::label_list::merge_segments(self, source_segments).await?
+            crate::index::scalar::label_list::merge_segments(self, source_segments, staged).await?
         } else if all_zonemap {
-            crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
+            crate::index::scalar::zonemap::merge_segments(self, source_segments, staged).await?
         } else if all_ngram {
-            crate::index::scalar::ngram::merge_segments(self, source_segments).await?
+            crate::index::scalar::ngram::merge_segments(self, source_segments, staged).await?
         } else if all_minhashlsh {
-            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments).await?
+            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments, staged).await?
         } else if all_rtree {
             #[cfg(feature = "geo")]
             {
-                crate::index::scalar::rtree::merge_segments(self, source_segments).await?
+                crate::index::scalar::rtree::merge_segments(self, source_segments, staged).await?
             }
             // Refused above, before the coverage work.
             #[cfg(not(feature = "geo"))]
             unreachable!("an RTree merge without `geo` returns before this point")
         } else {
-            crate::index::scalar::btree::merge_segments(self, source_segments).await?
+            crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
         };
         if !all_ngram && !all_fmindex {
             merged_segment.dataset_version = merged_dataset_version;

@@ -154,10 +154,18 @@ pub async fn build_old_data_filter(
 /// therefore sees rows in these derived fragments, and must filter and account
 /// for old data in this domain rather than in `stored ∩ live` (which is empty
 /// for a fully rewritten segment and would drop every translated row).
-async fn tagged_segment_coverage(
+///
+/// `staged` supplies the plan of segments the manifest does not list (a staged
+/// build being merged, see `plan_staged_segments`); their coverage comes from
+/// that plan. A segment that is neither staged nor registered in the manifest
+/// is an error: "not registered" is not "covers nothing".
+pub async fn tagged_segment_coverage(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<Option<HashMap<Uuid, RoaringBitmap>>> {
+    use crate::index::frag_reuse::SegmentRemappingPlan;
+
     let stored = crate::index::load_all_indices(dataset).await?;
     if !stored
         .iter()
@@ -168,9 +176,34 @@ async fn tagged_segment_coverage(
     let derived = dataset.load_indices().await?;
     let mut coverage = HashMap::with_capacity(segments.len());
     for segment in segments {
-        // A segment the tagged reader excludes (no coverage it can honor) has
-        // no old data reachable here; leave it empty rather than fail, the
-        // loader reports the precise reason if it is actually opened.
+        if let Some(plan) = staged.and_then(|plans| plans.get(&segment.uuid)) {
+            let bitmap = match plan {
+                SegmentRemappingPlan::Identity => segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .unwrap_or_default(),
+                SegmentRemappingPlan::Translate { coverage, .. } => coverage.clone(),
+                SegmentRemappingPlan::MissingCoverage => {
+                    return Err(Error::not_supported(format!(
+                        "FRI query coverage is unavailable for staged segment {}",
+                        segment.uuid
+                    )));
+                }
+            };
+            coverage.insert(segment.uuid, bitmap);
+            continue;
+        }
+        if !stored.iter().any(|entry| entry.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "segment {} is not registered in the manifest; a staged segment must be \
+                 merged with its own translation plan",
+                segment.uuid
+            )));
+        }
+        // A registered segment the tagged reader excludes (no coverage it can
+        // honor) has no old data reachable here; leave it empty rather than
+        // fail, the loader reports the precise reason if it is actually opened.
         let bitmap = derived
             .iter()
             .find(|entry| entry.uuid == segment.uuid)
@@ -238,17 +271,26 @@ pub fn fragment_reuse_affects_segment(
 }
 
 /// Build one [`OldIndexDataFilter`] per segment and return their effective coverage.
+///
+/// `staged` carries the plans of segments the manifest does not list (see
+/// [`tagged_segment_coverage`]); committed merges pass `None`.
 pub async fn build_per_segment_filters(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
-    if let Some(coverage) = tagged_segment_coverage(dataset, segments).await? {
+    if let Some(coverage) = tagged_segment_coverage(dataset, segments, staged).await? {
         // Translated addresses live in the derived coverage; retired source
         // fragments never appear in them, so there is nothing to remove.
         let mut effective_union = RoaringBitmap::new();
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
-            let effective = coverage.get(&segment.uuid).cloned().unwrap_or_default();
+            let effective = coverage.get(&segment.uuid).cloned().ok_or_else(|| {
+                Error::internal(format!(
+                    "tagged coverage missing for segment {}",
+                    segment.uuid
+                ))
+            })?;
             effective_union |= &effective;
             filters.push(build_old_data_filter(dataset, &effective, &RoaringBitmap::new()).await?);
         }
@@ -530,7 +572,8 @@ async fn merge_scalar_indices<'a>(
     // On a tagged table the selected segments' old data is instead the coverage
     // the tagged reader derives for them (translated, live), and retired source
     // fragments are not something to remove from translated addresses.
-    let tagged_coverage = tagged_segment_coverage(dataset.as_ref(), &selected_old_indices).await?;
+    let tagged_coverage =
+        tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None).await?;
     let (effective_old_frags, deleted_old_frags) = match &tagged_coverage {
         Some(coverage) => (
             selected_old_indices
@@ -647,7 +690,8 @@ async fn merge_scalar_indices<'a>(
             match index_type {
                 IndexType::BTree => {
                     let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
+                            .await?;
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -655,18 +699,21 @@ async fn merge_scalar_indices<'a>(
                         new_data_stream,
                         &new_store,
                         &old_data_filters,
+                        None,
                     )
                     .await?
                 }
                 IndexType::NGram => {
                     let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None)
+                            .await?;
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
                         &old_data_filters,
+                        None,
                     )
                     .await?
                 }
@@ -995,7 +1042,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             // rows translate to the coverage the tagged reader derives for
             // it, so THAT is its live coverage. A segment the reader excludes
             // (derived coverage empty) is the dormant one.
-            let tagged_coverage = tagged_segment_coverage(dataset.as_ref(), old_indices).await?;
+            let tagged_coverage =
+                tagged_segment_coverage(dataset.as_ref(), old_indices, None).await?;
             let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
                 old_indices.iter().copied().partition(|idx| {
                     let has_stored_rows = idx
