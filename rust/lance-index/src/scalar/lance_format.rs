@@ -724,6 +724,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -789,6 +790,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -817,6 +819,7 @@ mod tests {
             .load_index(
                 updated_index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -905,6 +908,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1147,6 +1151,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1205,6 +1210,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1812,6 +1818,7 @@ mod tests {
                     .load_index(
                         index_store,
                         &default_details::<pbold::LabelListIndexDetails>(),
+                        0,
                         None,
                         &LanceCache::no_cache(),
                     )
@@ -1921,6 +1928,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1986,6 +1994,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )

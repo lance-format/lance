@@ -157,10 +157,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// The index details should match the details that were returned when the index was
     /// originally trained.
+    ///
+    /// `index_version` is this segment's own persisted format version (its
+    /// `IndexMetadata::index_version`), not [`Self::version`] (the plugin's
+    /// current maximum). Most plugins have only ever had one on-disk format and
+    /// can ignore it; a plugin that has changed its on-disk format over time
+    /// (e.g. which domain a stored row identifier is in) uses it to read an
+    /// older segment correctly instead of reinterpreting it under the newest
+    /// format.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;

@@ -116,7 +116,7 @@ async fn create_int_unique_index(
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
 
     (BTreeIndexPlugin
-        .load_index(store, &details, None, &cache)
+        .load_index(store, &details, 0, None, &cache)
         .await
         .unwrap()) as _
 }
@@ -136,7 +136,7 @@ async fn create_int_low_card_index(
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
 
     (BTreeIndexPlugin
-        .load_index(store, &details, None, &cache)
+        .load_index(store, &details, 0, None, &cache)
         .await
         .unwrap()) as _
 }
@@ -156,7 +156,7 @@ async fn create_string_unique_index(
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
 
     (BTreeIndexPlugin
-        .load_index(store, &details, None, &cache)
+        .load_index(store, &details, 0, None, &cache)
         .await
         .unwrap()) as _
 }
@@ -176,7 +176,7 @@ async fn create_string_low_card_index(
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
 
     (BTreeIndexPlugin
-        .load_index(store, &details, None, &cache)
+        .load_index(store, &details, 0, None, &cache)
         .await
         .unwrap()) as _
 }
