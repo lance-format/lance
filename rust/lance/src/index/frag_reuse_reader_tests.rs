@@ -2142,11 +2142,15 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
         )
         .await
         .unwrap();
+    // The appended fragment is the one that is NOT a recluster destination.
+    // (`max()` would pick destination 11 and silently build S3 directly over
+    // F11, where "direct coverage wins" would hand F11 to S3 and narrow S1/S2 to
+    // {10}: a different scenario.)
     let s3_fragment = dataset
         .fragments()
         .iter()
         .map(|f| f.id as u32)
-        .max()
+        .find(|id| !destination_ids.contains(id))
         .unwrap();
     let s3 = CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
         .name("i_idx".into())
@@ -2187,9 +2191,11 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
         "exactly the two reclustered contributors load under an F10 scope; S3 is pruned"
     );
 
-    // Run a real search under that scope and confirm rows from BOTH contributors
-    // (the even source values that landed in F10: 0 and 2 from S1's F0, 4 and 6
-    // from S2's F1) are returned, while F11-only rows (odd values) are not.
+    // Opener layer: the scoped open selects WHICH segments to load; it does NOT
+    // row-filter. S1 and S2 both cover F10 and F11, so a full-range search over
+    // the opened index legitimately returns the COMPLETE contributor address set
+    // (every reclustered row, in both destinations). This proves both
+    // contributors were opened and searched, not that rows are scoped here.
     use lance_index::scalar::{SargableQuery, SearchResult};
     use std::ops::Bound;
     let result = scoped
@@ -2205,16 +2211,62 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
     let SearchResult::Exact(row_addrs) = result else {
         panic!("expected exact scalar search result");
     };
-    let fragments: std::collections::BTreeSet<u32> = row_addrs
+    let found: std::collections::BTreeSet<u32> = row_addrs
         .true_rows()
         .row_addrs()
         .unwrap()
         .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
         .collect();
     assert_eq!(
-        fragments,
-        std::collections::BTreeSet::from([10]),
-        "an F10-scoped search must return only F10 rows, from both contributors, and no F11 rows"
+        found,
+        std::collections::BTreeSet::from([10, 11]),
+        "both contributors are opened, so the opener returns rows in BOTH destinations \
+         (row-level fragment scope is the scanner's job, not the opener's)"
+    );
+    let mut opener_values: Vec<(u32, u32)> = row_addrs
+        .true_rows()
+        .row_addrs()
+        .unwrap()
+        .map(|row_addr| {
+            let addr = RowAddress::from(u64::from(row_addr));
+            (addr.fragment_id(), addr.row_offset())
+        })
+        .collect();
+    opener_values.sort_unstable();
+    assert_eq!(
+        opener_values,
+        vec![
+            (10, 0),
+            (10, 1),
+            (10, 2),
+            (10, 3),
+            (11, 0),
+            (11, 1),
+            (11, 2),
+            (11, 3)
+        ],
+        "the opener search returns every reclustered row from both contributors"
+    );
+
+    // Scanner layer: a full query that scopes to F10 must return EXACTLY the F10
+    // rows (even values 0,2,4,6), excluding F11, proving the downstream consumer
+    // applies the row-level fragment scope on top of the opened segments.
+    let f10 = dataset
+        .fragments()
+        .iter()
+        .find(|f| f.id == 10)
+        .unwrap()
+        .clone();
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![f10]);
+    scan.filter("i >= 0").unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        vec![0, 2, 4, 6],
+        "an F10-scoped scanner query returns exactly F10 rows, from both contributors"
     );
 
     // A scope disjoint from the effective coverage prunes every segment.
@@ -2369,47 +2421,54 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
     }
 }
 
-// Combination: vector search with a SCALAR prefilter over an FRI-reclustered
-// dataset. With no explicit .with_fragments(), the prefilter's ScalarIndexExec
-// gets its fragment_scope from partition_frags_by_coverage (FRI effective
-// coverage), and each opened scalar segment is remapped through the FRI seam.
-// The prefiltered result must match a scan that does not use the scalar index,
-// proving the fragment-scope pruning and FRI translation compose without
-// dropping rows.
-#[tokio::test]
-async fn vector_prefilter_composes_scope_pruning_with_fri_translation() {
-    let mut dataset = lance_datagen::gen_batch()
-        .col("i", lance_datagen::array::step::<Int32Type>())
-        .col(
-            "vector",
-            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
-        )
-        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
-        .await
-        .unwrap();
-
-    // Per-fragment vector segments (so a fragment-scoped ANN needs each
-    // contributor) plus a scalar BTree index on `i` for the prefilter.
-    let vparams = crate::index::vector::VectorIndexParams::ivf_flat(
-        1,
-        lance_linalg::distance::DistanceType::L2,
+// Shared fixture for the vector and FTS prefilter tests: eight rows in two
+// fragments, `vector = [i, 0, 0, 0]` so distances are deterministic, and every
+// row's `text` is "hit" so a text query matches all rows.
+fn scoped_prefilter_batch() -> RecordBatch {
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, StringArray};
+    let i: Vec<i32> = (0..8).collect();
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        i.iter()
+            .map(|v| Some(vec![Some(*v as f32), Some(0.0), Some(0.0), Some(0.0)])),
+        4,
     );
-    let frag_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
-    let mut vsegments = Vec::new();
-    for fragment in &frag_ids {
-        vsegments.push(
-            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &vparams)
-                .name("vector_idx".into())
-                .fragments(vec![*fragment])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-        );
-    }
-    dataset
-        .commit_existing_index_segments("vector_idx", "vector", vsegments)
-        .await
-        .unwrap();
+    RecordBatch::try_from_iter(vec![
+        ("i", Arc::new(Int32Array::from(i)) as ArrayRef),
+        ("vector", Arc::new(vectors) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hit"; 8])) as ArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
+// Build the non-trivial subset-scope scenario: a scalar index on `i` created
+// BEFORE the recluster (so it is FRI-translated and its effective coverage is
+// both destinations {10,11}), then a search index (`build` closure) created
+// AFTER the recluster over destination F10 ONLY. With `fast_search`, the search
+// range is exactly F10 while the scalar prefilter covers F10 and F11, and F11
+// holds rows that satisfy the scalar predicate.
+async fn scoped_prefilter_dataset<F>(build: F) -> Dataset
+where
+    F: for<'a> FnOnce(
+        &'a mut Dataset,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = IndexMetadata> + 'a>>,
+{
+    let batch = scoped_prefilter_batch();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     dataset
         .create_index(
             &["i"],
@@ -2420,35 +2479,65 @@ async fn vector_prefilter_composes_scope_pruning_with_fri_translation() {
         )
         .await
         .unwrap();
-
-    // Recluster the sources, then run a vector search with a scalar prefilter and
-    // NO explicit fragment selection, so the prefilter scope comes from FRI
-    // coverage (scanner partition_frags_by_coverage -> with_fragment_scope).
-    let original = dataset
-        .scan()
-        .filter("i = 6")
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let query = original["vector"].as_fixed_size_list().value(0);
-    let query = query
-        .as_primitive::<arrow_array::types::Float32Type>()
-        .clone();
     let (transition, destinations) = prepare(&dataset).await;
+    assert_eq!(
+        destinations.iter().map(|f| f.id as u32).collect::<Vec<_>>(),
+        vec![10, 11]
+    );
     let content = InlineContent {
         legacy_versions: vec![],
         transitions: vec![transition],
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
+    let direct = build(&mut dataset).await;
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices.push(direct);
+    persist_fixture(&mut dataset, indices).await;
+    dataset
+}
 
-    let run = |use_scalar: bool| {
+// Combination: vector search with a scalar prefilter over an FRI-reclustered
+// dataset, with a NON-TRIVIAL subset scope. The vector index covers only F10
+// and `fast_search` restricts the search to that range, so the scalar prefilter
+// (scanner `partition_frags_by_coverage` -> `with_fragment_scope({10})`) runs
+// under a scope strictly smaller than its {10,11} effective coverage. F11 holds
+// rows that satisfy the predicate AND whose vectors are closer to the query, so
+// any leak of F11 rows, or filtering applied only after top-k, shows up in the
+// result. The control keeps the vector index and only switches the scalar
+// prefilter to its scan-based form (it is not an index-free search).
+#[tokio::test]
+async fn vector_prefilter_scopes_to_subset_with_fri_translation() {
+    let dataset = scoped_prefilter_dataset(|dataset| {
+        Box::pin(async move {
+            let vparams = crate::index::vector::VectorIndexParams::ivf_flat(
+                1,
+                lance_linalg::distance::DistanceType::L2,
+            );
+            CreateIndexBuilder::new(dataset, &["vector"], IndexType::Vector, &vparams)
+                .name("vector_idx".into())
+                .fragments(vec![10])
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        })
+    })
+    .await;
+
+    // Query sits on i = 7 (in F11): distances are 7 -> 0, 6 -> 1, 5 -> 2, 4 -> 3.
+    // Predicate `i >= 4` matches {4,6} in F10 and {5,7} in F11.
+    let query = arrow_array::Float32Array::from(vec![7.0f32, 0.0, 0.0, 0.0]);
+    let run = |k: usize, use_scalar: bool| {
         let query = query.clone();
         let dataset = dataset.clone();
         async move {
             let mut scan = dataset.scan();
-            scan.nearest("vector", &query, 8).unwrap();
+            scan.nearest("vector", &query, k).unwrap();
+            scan.fast_search();
             scan.filter("i >= 4").unwrap();
             scan.prefilter(true);
             scan.use_scalar_index(use_scalar);
@@ -2459,11 +2548,11 @@ async fn vector_prefilter_composes_scope_pruning_with_fri_translation() {
         }
     };
 
-    // Confirm the query actually reaches the scoped scalar prefilter
-    // (ScalarIndexQuery feeding the ANN prefilter), not a filtered-read fallback.
+    // The query reaches the scoped scalar prefilter feeding ANN.
     let plan = {
         let mut scan = dataset.scan();
         scan.nearest("vector", &query, 8).unwrap();
+        scan.fast_search();
         scan.filter("i >= 4").unwrap();
         scan.prefilter(true);
         scan.explain_plan(false).await.unwrap()
@@ -2471,10 +2560,92 @@ async fn vector_prefilter_composes_scope_pruning_with_fri_translation() {
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
     assert!(plan.contains("ANN"), "{plan}");
 
-    // The prefiltered result (scalar index + fragment-scope + FRI translation)
-    // must equal the same query with the scalar index disabled.
-    let with_index = run(true).await;
-    let without_index = run(false).await;
-    assert_eq!(with_index, without_index);
-    assert_eq!(without_index, vec![4, 5, 6, 7], "{without_index:?}");
+    // All F10 matches are kept and no F11 match leaks, even though F11's
+    // vectors are the closest.
+    assert_eq!(run(8, true).await, vec![4, 6]);
+    // Filtering happens before top-k: the single nearest row is 6 (F10), not
+    // the globally closest 7 (F11).
+    assert_eq!(run(1, true).await, vec![6]);
+    // Scan-based scalar prefilter control (vector index still used).
+    assert_eq!(run(8, false).await, vec![4, 6]);
+}
+
+// Combination: full-text search with a scalar prefilter under the same
+// non-trivial subset scope. The inverted index covers only F10 and
+// `fast_search` restricts the search range to it, so the FRI-translated scalar
+// prefilter (effective coverage {10,11}) runs scoped to {10}. Every row's text
+// matches, and F11 holds predicate-satisfying rows, so any F11 leak shows up.
+#[tokio::test]
+async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
+    let dataset = scoped_prefilter_dataset(|dataset| {
+        Box::pin(async move {
+            let direct = CreateIndexBuilder::new(
+                dataset,
+                &["text"],
+                IndexType::Inverted,
+                &lance_index::scalar::InvertedIndexParams::default(),
+            )
+            .name("text_idx".into())
+            .fragments(vec![10])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            // An uncommitted inverted index only has staged partition files; the
+            // CreateIndex commit normally merges them into the root layout the
+            // reader probes (`metadata.lance`). A CreateIndex commit is refused
+            // on a tagged history at this layer and the fixture persists the
+            // manifest directly, so run that finalize step here.
+            use crate::dataset::index::LanceIndexStoreExt;
+            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+                dataset,
+                &direct.uuid,
+            )
+            .unwrap();
+            let index_dir = dataset.indices_dir().join(direct.uuid.to_string());
+            lance_index::scalar::inverted::builder::merge_index_files(
+                dataset.object_store.as_ref(),
+                &index_dir,
+                Arc::new(store),
+                Arc::new(crate::index::NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+            direct
+        })
+    })
+    .await;
+
+    let run = |use_scalar: bool| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+                .unwrap();
+            scan.fast_search();
+            scan.filter("i >= 4").unwrap();
+            scan.prefilter(true);
+            scan.use_scalar_index(use_scalar);
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            values
+        }
+    };
+
+    // The query reaches the scoped scalar prefilter feeding the text search.
+    let plan = {
+        let mut scan = dataset.scan();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+            .unwrap();
+        scan.fast_search();
+        scan.filter("i >= 4").unwrap();
+        scan.prefilter(true);
+        scan.explain_plan(false).await.unwrap()
+    };
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert!(plan.contains("MatchQuery"), "{plan}");
+
+    // All F10 matches, no F11 leak; scan-based scalar prefilter control agrees.
+    assert_eq!(run(true).await, vec![4, 6]);
+    assert_eq!(run(false).await, vec![4, 6]);
 }
