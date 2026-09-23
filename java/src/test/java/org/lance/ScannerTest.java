@@ -33,6 +33,8 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -43,6 +45,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -1454,6 +1458,61 @@ public class ScannerTest {
         assertEquals(rowCount, reader.getVectorSchemaRoot().getRowCount());
         assertFalse(reader.loadNextBatch());
       }
+    }
+  }
+
+  /** Writes one string column `s` to a table on data storage version 2.3. */
+  private static Dataset writeSemanticTypesDataset(BufferAllocator allocator, String path)
+      throws IOException {
+    Schema schema =
+        new Schema(Collections.singletonList(Field.nullable("s", new ArrowType.Utf8())));
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      VarCharVector vector = (VarCharVector) root.getVector("s");
+      vector.setSafe(0, "a".getBytes(StandardCharsets.UTF_8));
+      vector.setNull(1);
+      root.setRowCount(2);
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+      try (ArrowStreamReader reader =
+          new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator)) {
+        return Dataset.write()
+            .allocator(allocator)
+            .reader(reader)
+            .uri(path)
+            .dataStorageVersion("2.3")
+            .execute();
+      }
+    }
+  }
+
+  @Test
+  void testScanOutputEncodings(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("output_encodings").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeSemanticTypesDataset(allocator, path)) {
+      ScanOptions options =
+          new ScanOptions.Builder()
+              .outputEncodings(Collections.singletonMap("s", "large_utf8"))
+              .build();
+      assertEquals(
+          Optional.of(Collections.singletonMap("s", "large_utf8")), options.getOutputEncodings());
+      try (LanceScanner scanner = dataset.newScan(options);
+          ArrowReader reader = scanner.scanBatches()) {
+        assertTrue(reader.loadNextBatch());
+        assertEquals(
+            new ArrowType.LargeUtf8(),
+            reader.getVectorSchemaRoot().getSchema().findField("s").getType());
+      }
+      ScanOptions invalid =
+          new ScanOptions.Builder()
+              .outputEncodings(Collections.singletonMap("s", "decimal128"))
+              .build();
+      assertThrows(RuntimeException.class, () -> dataset.newScan(invalid).close());
     }
   }
 }

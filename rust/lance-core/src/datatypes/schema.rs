@@ -14,8 +14,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 
-use super::OUTPUT_ENCODING_META_KEY;
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
+use super::{OUTPUT_ENCODING_META_KEY, OutputEncoding};
 use crate::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD, ROW_ID,
     ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION_FIELD, ROW_OFFSET,
@@ -1300,6 +1300,9 @@ pub struct Projection {
     pub with_row_last_updated_at_version: bool,
     pub with_row_created_at_version: bool,
     pub blob_handling: BlobHandling,
+    /// Output encodings requested for fields, by field ID, in place of the
+    /// ones the table records.
+    pub output_encodings: HashMap<i32, OutputEncoding>,
 }
 
 impl Debug for Projection {
@@ -1317,6 +1320,7 @@ impl Debug for Projection {
                 &self.with_row_created_at_version,
             )
             .field("blob_handling", &self.blob_handling)
+            .field("output_encodings", &self.output_encodings)
             .finish()
     }
 }
@@ -1332,6 +1336,7 @@ impl Projection {
             with_row_last_updated_at_version: false,
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
+            output_encodings: HashMap::new(),
         }
     }
 
@@ -1362,6 +1367,13 @@ impl Projection {
 
     pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
         self.blob_handling = blob_handling;
+        self
+    }
+
+    /// Return the given fields, by field ID, in these output encodings instead
+    /// of the ones the table records.
+    pub fn with_output_encodings(mut self, output_encodings: HashMap<i32, OutputEncoding>) -> Self {
+        self.output_encodings = output_encodings;
         self
     }
 

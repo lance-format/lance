@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
+use crate::utils::to_rust_map;
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::{JObject, JString, JValueGen};
+use jni::objects::{JMap, JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
@@ -283,6 +284,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub include_deleted_rows: jboolean,
     pub strict_batch_size: jboolean,
     pub disable_scoring_autoprojection: jboolean,
+    pub output_encodings_obj: JObject<'a>,
 }
 
 /// Build a scanner with options applied - shared by blocking and async scanners
@@ -511,6 +513,13 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.disable_scoring_autoprojection();
     }
 
+    env.get_optional(&options.output_encodings_obj, |env, map_obj| {
+        let map = JMap::from_env(env, &map_obj)?;
+        let output_encodings = to_rust_map(env, &map)?;
+        scanner.output_encodings(output_encodings)?;
+        Ok(())
+    })?;
+
     Ok(scanner)
 }
 
@@ -549,6 +558,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     include_deleted_rows: jboolean,      // boolean
     strict_batch_size: jboolean,         // boolean
     disable_scoring_autoprojection: jboolean, // boolean
+    output_encodings_obj: JObject<'local>, // Optional<Map<String, String>>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -582,6 +592,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             include_deleted_rows,
             strict_batch_size,
             disable_scoring_autoprojection,
+            output_encodings_obj,
         )
     )
 }
@@ -617,6 +628,7 @@ fn inner_create_scanner<'local>(
     include_deleted_rows: jboolean,
     strict_batch_size: jboolean,
     disable_scoring_autoprojection: jboolean,
+    output_encodings_obj: JObject<'local>,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -650,6 +662,7 @@ fn inner_create_scanner<'local>(
         include_deleted_rows,
         strict_batch_size,
         disable_scoring_autoprojection,
+        output_encodings_obj,
     };
 
     let scanner = build_scanner_with_options(env, &dataset, options)?;

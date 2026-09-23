@@ -1045,3 +1045,168 @@ async fn check_results(
         .unwrap();
     assert_eq!(ids.values(), expected_ids);
 }
+
+/// A table under the semantic type contract with a string, a decimal, a JSON,
+/// and a nested string column, created on data storage version 2.3.
+async fn semantic_types_dataset(uri: &str, json_output: Option<&str>) -> crate::Dataset {
+    use arrow_array::Decimal128Array;
+
+    let mut json = json_field("j", true);
+    if let Some(encoding) = json_output {
+        let mut metadata = json.metadata().clone();
+        metadata.insert(
+            lance_arrow::OUTPUT_ENCODING_META_KEY.to_string(),
+            encoding.to_string(),
+        );
+        json = json.with_metadata(metadata);
+    }
+    let nested = Fields::from(vec![ArrowField::new("x", DataType::Utf8, true)]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Utf8, true),
+        ArrowField::new("d", DataType::Decimal128(10, 2), true),
+        json,
+        ArrowField::new("st", DataType::Struct(nested.clone()), true),
+    ]));
+    let json_values = JsonArray::try_from_iter([Some(r#"{"a":1}"#), None]).unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(125), None])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(json_values.into_inner()),
+            Arc::new(StructArray::new(
+                nested,
+                vec![Arc::new(StringArray::from(vec![Some("x"), Some("y")]))],
+                None,
+            )),
+        ],
+    )
+    .unwrap();
+    crate::Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// A request override selects the Arrow layout a scan returns, ahead of the
+/// field's recorded output encoding.
+#[tokio::test]
+async fn test_scan_output_encodings() {
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let dataset = semantic_types_dataset(dir.as_str(), None).await;
+
+    let batch = dataset
+        .scan()
+        .output_encodings([
+            ("s", "utf8_view"),
+            ("d", "decimal256"),
+            ("j", "lance.json"),
+            ("st.x", "dictionary:int8:large_utf8"),
+        ])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let schema = batch.schema();
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8View);
+    assert_eq!(schema.field(1).data_type(), &DataType::Decimal256(10, 2));
+    assert_eq!(schema.field(2).data_type(), &DataType::LargeBinary);
+    assert_eq!(
+        schema.field(3).data_type(),
+        &DataType::Struct(Fields::from(vec![ArrowField::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8)),
+            true,
+        )]))
+    );
+    assert_eq!(batch.column(0).as_string_view().value(0), "a");
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Decimal256Type>()
+            .value(0),
+        arrow_buffer::i256::from(125)
+    );
+    // Without an override the scan returns the table's recorded layouts.
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    assert!(is_arrow_json_field(batch.schema().field(2)));
+}
+
+/// A JSON column recorded with the `lance.json` output encoding reads as
+/// JSONB unless a request asks for JSON text.
+#[tokio::test]
+async fn test_scan_json_output_encoding() {
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let dataset = semantic_types_dataset(dir.as_str(), Some("lance.json")).await;
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert!(lance_arrow::json::is_json_field(batch.schema().field(2)));
+    let batch = dataset
+        .scan()
+        .output_encodings([("j", "arrow.json")])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert!(is_arrow_json_field(batch.schema().field(2)));
+    assert_eq!(batch.column(2).as_string::<i32>().value(0), r#"{"a":1}"#);
+}
+
+#[rstest]
+#[case::unknown_field("missing", "utf8", "no such field")]
+#[case::unknown_encoding("s", "utf16", "utf16")]
+#[case::wrong_type("s", "decimal128", "decimal128")]
+#[case::decimal_too_narrow("d", "large_utf8", "large_utf8")]
+#[tokio::test]
+async fn test_scan_output_encodings_rejected(
+    #[case] path: &str,
+    #[case] encoding: &str,
+    #[case] message: &str,
+) {
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let dataset = semantic_types_dataset(dir.as_str(), None).await;
+    let mut scanner = dataset.scan();
+    let err = scanner.output_encodings([(path, encoding)]).err().unwrap();
+    assert!(err.to_string().contains(message), "{err}");
+}
+
+/// Legacy tables name one Arrow type per column, so they take no overrides.
+#[tokio::test]
+async fn test_scan_output_encodings_require_semantic_types() {
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["a"]))],
+    )
+    .unwrap();
+    let dataset = crate::Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut scanner = dataset.scan();
+    let err = scanner
+        .output_encodings([("s", "large_utf8")])
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("semantic type contract"), "{err}");
+}

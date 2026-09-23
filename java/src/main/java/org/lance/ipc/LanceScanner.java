@@ -29,6 +29,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -90,7 +91,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
               options.isCollectStats(),
               options.isIncludeDeletedRows(),
               options.isStrictBatchSize(),
-              options.isDisableScoringAutoprojection());
+              options.isDisableScoringAutoprojection(),
+              options.getOutputEncodings());
     }
     scanner.allocator = allocator;
     scanner.dataset = dataset;
@@ -126,7 +128,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       boolean collectStats,
       boolean includeDeletedRows,
       boolean strictBatchSize,
-      boolean disableScoringAutoprojection);
+      boolean disableScoringAutoprojection,
+      Optional<Map<String, String>> outputEncodings);
 
   /**
    * Closes this scanner and releases any system resources associated with it. If the scanner is

@@ -417,6 +417,9 @@ pub fn arrow_json_to_lance_json(field: &ArrowField) -> ArrowField {
 
 /// Convert a Lance JSON field to Arrow JSON field.
 pub fn lance_json_to_arrow_json(field: &ArrowField) -> ArrowField {
+    if is_jsonb_output(field) {
+        return field.clone();
+    }
     if is_json_field(field) {
         return field_with_extension(field, DataType::Utf8, ARROW_JSON_EXT_NAME);
     }
@@ -603,12 +606,21 @@ fn convert_arrow_json_array(
     })
 }
 
+/// Whether a Lance JSON field is requested as JSONB (the `lance.json` output
+/// encoding) rather than converted to JSON text.
+pub fn is_jsonb_output(field: &ArrowField) -> bool {
+    field
+        .metadata()
+        .get(crate::OUTPUT_ENCODING_META_KEY)
+        .is_some_and(|encoding| encoding == JSON_EXT_NAME)
+}
+
 fn convert_lance_json_array(
     field: &ArrowField,
     array: &ArrayRef,
 ) -> Result<(ArrowField, ArrayRef, bool), ArrowError> {
     convert_json_array(field, array, &|field, array| {
-        if is_json_field(field) {
+        if is_json_field(field) && !is_jsonb_output(field) {
             Ok(Some((
                 lance_json_to_arrow_json(field),
                 Arc::new(decode_jsonb_array::<i32>(array.as_binary())) as ArrayRef,

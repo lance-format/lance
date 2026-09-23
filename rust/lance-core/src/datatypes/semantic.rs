@@ -22,9 +22,7 @@ use super::LogicalType;
 use crate::deepsize::DeepSizeOf;
 use crate::{Error, Result};
 
-/// Field metadata entry naming the Arrow layout that reads return for a field
-/// of a representation-only or value-transforming semantic type.
-pub const OUTPUT_ENCODING_META_KEY: &str = "lance-schema:output-encoding";
+pub use lance_arrow::OUTPUT_ENCODING_META_KEY;
 
 const MAX_DECIMAL128_PRECISION: u8 = 38;
 const MAX_DECIMAL256_PRECISION: u8 = 76;

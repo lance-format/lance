@@ -359,6 +359,9 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
+            if let Some(encoding) = projection.output_encodings.get(&self.id) {
+                new_field.output_encoding = Some(encoding.clone());
+            }
             Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
@@ -1585,6 +1588,14 @@ impl From<&Field> for ArrowField {
                 ARROW_EXT_NAME_KEY.to_string(),
                 lance_arrow::json::JSON_EXT_NAME.to_string(),
             );
+            // A JSON value reaches Arrow as JSONB and reads convert it to text
+            // unless the field asks for JSONB.
+            if field.output_encoding == Some(OutputEncoding::LanceJson) {
+                metadata.insert(
+                    OUTPUT_ENCODING_META_KEY.to_string(),
+                    OutputEncoding::LanceJson.to_string(),
+                );
+            }
         }
 
         out.with_metadata(metadata)
