@@ -1253,6 +1253,7 @@ mod test {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
+        record_batch,
     };
 
     use super::*;
@@ -1344,6 +1345,24 @@ mod test {
         // (Quick validation that the future is Send)
         let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        let version = dataset.version().version;
+        let reserved_batch = record_batch!(("_rowid", Int32, [0, 1, 2, 3, 4]))?;
+        let reserved_schema = reserved_batch.schema();
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(reserved_batch)],
+                    reserved_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.version().version, version);
 
         // Can add a column that is independent of any existing ones
         dataset
@@ -3125,6 +3144,16 @@ mod test {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        for path in ["x", "b.d"] {
+            let err = dataset
+                .alter_columns(&[ColumnAlteration::new(path.into()).rename("_rowid".into())])
+                .await
+                .unwrap_err();
+            assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("reserved name"), "{err}");
+            assert_eq!(dataset.manifest.version, 3);
+        }
 
         Ok(())
     }

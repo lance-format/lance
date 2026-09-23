@@ -325,8 +325,8 @@ impl Schema {
         self.do_project(columns, true, true)
     }
 
-    /// Check that the top level fields don't contain `.` in their names
-    /// to distinguish from nested fields.
+    /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
+    /// names (which cannot contain `.` to distinguish them from nested paths).
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
         let mut seen_names = HashSet::new();
@@ -344,6 +344,20 @@ impl Schema {
                     "Duplicate field name \"{}\" in schema:\n {:#?}",
                     field.name, self
                 )));
+            }
+        }
+
+        // Each child collection has its own namespace. Checking only the root
+        // makes a later sibling with the same name unreachable by field path.
+        for parent in self.fields_pre_order() {
+            let mut seen_children = HashSet::with_capacity(parent.children.len());
+            for child in &parent.children {
+                if !seen_children.insert(child.name.as_str()) {
+                    return Err(Error::schema(format!(
+                        "Duplicate field name \"{}\" under field \"{}\" in schema:\n {:#?}",
+                        child.name, parent.name, self
+                    )));
+                }
             }
         }
 
@@ -368,6 +382,35 @@ impl Schema {
             validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
+        Ok(())
+    }
+
+    /// Validate a schema before storing it in a dataset manifest.
+    ///
+    /// System columns are virtual on reads, so [`Self::validate`] permits their
+    /// names in projection schemas. Stored fields may not use those names at
+    /// any depth.
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let arrow = ArrowSchema::new(vec![Field::new("_rowid", DataType::UInt64, false)]);
+    /// let schema = Schema::try_from(&arrow)?;
+    /// assert!(schema.validate_writable().is_err());
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validate_writable(&self) -> Result<()> {
+        self.validate()?;
+        for field in self.fields_pre_order() {
+            if crate::is_system_column(&field.name) {
+                return Err(Error::invalid_input(format!(
+                    "The column '{}' at path '{}' is a reserved name and cannot be stored in a Lance dataset",
+                    field.name,
+                    self.field_path_minimal(field.id)?
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1749,6 +1792,7 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
+    use rstest::rstest;
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
@@ -1918,6 +1962,84 @@ mod tests {
         let error = schema.validate().unwrap_err();
         assert!(matches!(&error, Error::Schema { .. }));
         assert!(error.to_string().contains("Duplicate field id 0"));
+    }
+
+    #[rstest]
+    #[case::direct(false)]
+    #[case::deeply_nested(true)]
+    fn test_validate_rejects_duplicate_sibling_names(#[case] is_nested: bool) {
+        let duplicate_children = DataType::Struct(ArrowFields::from(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int64, false),
+        ]));
+        let data_type = if is_nested {
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "inner",
+                duplicate_children,
+                false,
+            )]))
+        } else {
+            duplicate_children
+        };
+        let arrow = ArrowSchema::new(vec![ArrowField::new("outer", data_type, false)]);
+        let error = Schema::try_from(&arrow).unwrap_err();
+        assert!(matches!(&error, Error::Schema { .. }));
+        assert!(error.to_string().contains("Duplicate field name \"x\""));
+
+        let valid = ArrowSchema::new(vec![
+            ArrowField::new(
+                "left",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+            ArrowField::new(
+                "right",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int64,
+                    false,
+                )])),
+                false,
+            ),
+        ]);
+        assert!(Schema::try_from(&valid).is_ok());
+    }
+
+    #[rstest]
+    #[case::row_id(ROW_ID)]
+    #[case::row_address(ROW_ADDR)]
+    #[case::row_offset(ROW_OFFSET)]
+    #[case::last_updated(ROW_LAST_UPDATED_AT_VERSION)]
+    #[case::created(ROW_CREATED_AT_VERSION)]
+    fn test_validate_writable_rejects_system_names(
+        #[case] name: &str,
+        #[values(false, true)] is_nested: bool,
+    ) {
+        let field = ArrowField::new(name, DataType::UInt64, false);
+        let arrow = if is_nested {
+            ArrowSchema::new(vec![ArrowField::new(
+                "outer",
+                DataType::Struct(ArrowFields::from(vec![field])),
+                false,
+            )])
+        } else {
+            ArrowSchema::new(vec![field])
+        };
+        let schema = Schema::try_from(&arrow).unwrap();
+        schema.validate().unwrap();
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let path = if is_nested {
+            format!("outer.{name}")
+        } else {
+            name.to_string()
+        };
+        assert!(error.to_string().contains(&format!("path '{path}'")));
+        assert!(error.to_string().contains("reserved name"));
     }
 
     #[test]

@@ -4194,8 +4194,8 @@ pub(crate) async fn write_manifest_file(
     validate_paired_feature_flags(manifest)?;
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
-    // schema, so this is where the invariant holds for a schema that never
-    // passed through that conversion.
+    // schema. Validate names and primary keys at this boundary so all write
+    // paths enforce them.
     //
     // Only for transactions that can change the schema. Released versions could
     // install a key on a nullable column through the metadata path, and
@@ -4211,6 +4211,10 @@ pub(crate) async fn write_manifest_file(
     // once it spilled -- and a MemWAL table spills routinely, since its
     // transactions carry mem-table state.
     if may_change_schema {
+        manifest
+            .schema
+            .validate_writable()
+            .map_err(CommitError::OtherError)?;
         manifest
             .schema
             .verify_primary_key()
