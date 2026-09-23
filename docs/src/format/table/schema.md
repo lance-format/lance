@@ -6,17 +6,16 @@ The schema describes the structure of a Lance table, including all fields, their
 Schemas use a logical type system where data types are represented as strings that map to Apache Arrow data types.
 Each field in the schema has a unique identifier (field ID) that enables robust schema evolution and version tracking.
 
-!!! note
-
-    Logical types are currently being simplified through discussion [#5864](https://github.com/lance-format/lance/discussions/5864).
-    Proposed changes include consolidating encoding-specific variants (e.g., `large_string` and `string`, `large_binary` and `binary`)
-    into single logical types with runtime optimization. Additionally, [#5817](https://github.com/lance-format/lance/discussions/5817) proposes adding
-    `string_view` and `binary_view` types. This document describes the current implementation.
+The meaning of a field's `logical_type` depends on whether the table sets the `FLAG_SEMANTIC_TYPES` [feature flag](versioning.md#feature-flags).
+In a table with the flag, `logical_type` names a [semantic type](#semantic-types), each data file records the physical layout it encodes, and an optional output encoding selects the Arrow layout that reads return.
+In a table without the flag (a legacy table) and in every data file schema, each `logical_type` string names exactly one Arrow type, as listed in [Data Types](#data-types) and the [Type Conversion Reference](#type-conversion-reference).
 
 ## Data Types
 
 Lance supports a comprehensive set of data types that map to Apache Arrow types.
 Data types are represented as strings in the schema and can be grouped into several categories.
+This section lists the Arrow-mapped strings. Legacy tables and data file schemas use them with the exact Arrow types listed here.
+A table that sets `FLAG_SEMANTIC_TYPES` interprets the same strings as described in [Semantic Types](#semantic-types).
 
 ### Primitive Types
 
@@ -61,6 +60,8 @@ Decimal types support arbitrary-precision numeric values. The format is: `decima
 
 - **Precision (P)**: Total number of digits (1-38 for Decimal128, up to 76 for Decimal256)
 - **Scale (S)**: Number of digits after the decimal point (0 ≤ S ≤ P)
+
+In tables that set `FLAG_SEMANTIC_TYPES`, the canonical name of a decimal type is `decimal:<precision>:<scale>`, and the width is an output encoding (see [Semantic Types](#semantic-types)).
 
 ### Date and Time Types
 
@@ -192,6 +193,152 @@ Blob types are stored as large binary data with metadata describing storage loca
 Brain float (bfloat16) is a 16-bit floating point format optimized for ML.
 Used within fixed-size lists: `fixed_size_list:lance.bfloat16:SIZE`
 
+## Semantic Types
+
+This section applies to tables that set `FLAG_SEMANTIC_TYPES`.
+In these tables, `logical_type` names a **semantic type**: the value domain and query semantics that every engine must preserve.
+Arrow layout choices that do not change values, such as 32- or 64-bit offsets, view layouts, dictionary encoding, and decimal width, are not part of the semantic type.
+
+### Admission Rule
+
+A semantic type is distinct from another exactly when it changes the value domain, the precision, or the computation semantics.
+Layout and encoding choices never create a new semantic type.
+By this rule `int32` and `int64` are distinct because the width bounds the values, `float` and `double` are distinct because the width sets the arithmetic precision, and `string` and `large_string` are one type.
+
+### Type Classes
+
+Every semantic type belongs to one of three classes.
+
+**Unchanged types** keep the `logical_type` strings listed in [Data Types](#data-types), and each has exactly one Arrow representation:
+`null`, `bool`, `int8` through `int64`, `uint8` through `uint64`, `halffloat`, `float`, `double`, `date32:day`, `date64:ms`, `time32:*`, `time64:*`, `duration:*`, `timestamp:*`, `struct`, `map`, `fixed_size_list:<element>:<size>` (including `lance.bfloat16` elements), and `fixed_size_binary:<size>`.
+
+**Representation-only types** have several Arrow layouts that hold the same values.
+A writer encodes any listed physical layout unchanged, and different data files of one column may use different layouts.
+
+| Semantic type | Parameters | Physical layouts in data files | Additional accepted input | Output encodings (default first) |
+|---|---|---|---|---|
+| `string` | none | `Utf8`, `LargeUtf8`, `Dictionary<K, Utf8>`, `Dictionary<K, LargeUtf8>` | `Utf8View` | `utf8`, `large_utf8`, `utf8_view`, `dictionary:<key>:<value>` |
+| `binary` | none | `Binary`, `LargeBinary`, `Dictionary<K, Binary>`, `Dictionary<K, LargeBinary>` | `BinaryView` | `binary`, `large_binary`, `binary_view`, `dictionary:<key>:<value>` |
+| `list` | child field | `List`, `LargeList` | none | `list`, `large_list` |
+| `decimal:<p>:<s>` | precision `p` (1 to 76), scale `s` (at most `p`) | `Decimal128(p, s)`, `Decimal256(p, s)` | none | `decimal128`, `decimal256` when `p` ≤ 38; only `decimal256` when `p` > 38 |
+
+`K` is any integer Arrow type.
+Dictionary encoding is a layout of `string` or `binary` values, not a type; values of other semantic types are not dictionary encoded in these tables.
+A view input is written as a non-view layout that holds every value; the writer chooses which one.
+The elements of a `list` are described by its child field, which has its own semantic type.
+
+**Value-transforming types** convert input values to a different stored representation, and reads convert them back.
+Only these types need conversion between input, storage, and output.
+
+| Semantic type | Accepted input | Physical layout | Output encodings (default first) |
+|---|---|---|---|
+| `json` | `arrow.json` extension over `Utf8`, `LargeUtf8`, or `Utf8View`, validated and converted to JSONB; `lance.json` extension over `LargeBinary`, unchanged | `LargeBinary` with the `lance.json` extension (JSONB) | `arrow.json` (JSON text), `lance.json` (JSONB) |
+| `blob` | as defined for blob columns | Blob v1: `LargeBinary` with `lance-encoding:blob`. Blob v2: `struct` with the `lance.blob.v2` extension | the blob read modes |
+
+This specification only classifies `blob`.
+Its representations and read modes are unchanged.
+
+### Output Encoding
+
+The optional field metadata entry `lance-schema:output-encoding` names the Arrow layout that a read returns for the field.
+Its value must be one of the output encodings of the field's semantic type:
+
+| Value | Arrow layout returned | Semantic type |
+|---|---|---|
+| `utf8`, `large_utf8`, `utf8_view` | `Utf8`, `LargeUtf8`, `Utf8View` | `string` |
+| `binary`, `large_binary`, `binary_view` | `Binary`, `LargeBinary`, `BinaryView` | `binary` |
+| `dictionary:<key>:<value>` | `Dictionary<key, value>`. `<key>` is one of `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`. `<value>` is `utf8` or `large_utf8` for `string`, and `binary` or `large_binary` for `binary` | `string`, `binary` |
+| `list`, `large_list` | `List`, `LargeList` of the child field's output layout | `list` |
+| `decimal128` | `Decimal128(p, s)`; valid only when `p` ≤ 38 | `decimal:<p>:<s>` |
+| `decimal256` | `Decimal256(p, s)` | `decimal:<p>:<s>` |
+| `arrow.json`, `lance.json` | JSON text as `Utf8` with the `arrow.json` extension; JSONB as `LargeBinary` with the `lance.json` extension | `json` |
+
+For nested types, each child field carries its own entry.
+A reader picks the output layout of a field in this order:
+
+1. a per-request override from the caller;
+2. the field's `lance-schema:output-encoding` entry;
+3. the default output encoding of the semantic type, which is the first one listed for the type.
+
+When a writer creates a column (table creation, add column, or alter type), it records the Arrow layout of the input as the field's output encoding if that layout differs from the default.
+A `LargeUtf8` input to a new `string` column therefore reads back as `LargeUtf8`.
+Appends never change the entry.
+Changing the entry is a metadata-only schema update.
+
+The output encoding is advisory.
+It never affects which values are stored, schema compatibility, or correctness.
+A writer rejects a schema update that sets a value that is not valid for the field's semantic type and parameters.
+A reader that does not recognize a value, or cannot produce that layout, uses the default output encoding instead.
+
+### Extension Semantic Types
+
+An extension semantic type is a field of a core semantic type that carries `ARROW:extension:name` and, optionally, `ARROW:extension:metadata`.
+The core type is its storage type.
+For example, a field with `logical_type` `fixed_size_list:float:4` and `ARROW:extension:name` `example.bbox` is a bounding box stored as four floats.
+A field carries one extension name, so an extension cannot be layered on a type that already uses one (`json`, Blob v2, or `lance.bfloat16` elements).
+
+- **Value preservation:** an extension type annotates values and does not transform them. Stored values are exactly the values of the storage type, so a reader that does not recognize the extension returns correct data of the storage type.
+- **Metadata preservation:** implementations must keep the extension name and metadata unchanged through schema evolution, compaction, and any other rewrite, including for extensions they do not recognize.
+- **Reserved prefix:** extension names starting with `lance.` are reserved for Lance. A Lance-owned extension may transform values only when a data storage version or a feature flag gates it; for example, `lance.blob.v2` requires data storage version 2.2. Other extensions should use a project prefix such as `lancedb.` or a reverse-DNS name.
+- **No flag:** adding an extension semantic type requires no feature flag and no change to this specification.
+
+### Schema Compatibility
+
+Two fields are compatible for append, merge, and update when their semantic types and semantic parameters are equal.
+Output encodings, physical layouts, and dictionary key types are not compared.
+Field IDs, nullability, and nested structure follow the existing rules, and the children of nested fields are compared field by field.
+As a result:
+
+- An append that supplies any accepted input for a column's semantic type succeeds.
+- An append that supplies `Decimal256(10, 2)` to a `decimal:10:2` column succeeds.
+- An append that supplies `Decimal128(12, 2)` to a `decimal:10:2` column fails, because the value domain differs. Changing the precision is a type change, not a compatible append.
+
+### Data File Schemas
+
+A data file schema records the exact physical layout encoded in that file, using the Arrow-mapped strings from [Data Types](#data-types), such as `large_string`, `dict:string:int16:false`, or `decimal:128:10:2`.
+These strings keep their meaning inside data files, and output encodings do not apply to data file schemas.
+Different data files of one column may record different physical layouts of the column's semantic type.
+
+The table schema is the only source of semantics.
+Readers resolve semantics through field IDs in the table schema and never infer them from the physical layout of a data file.
+The encodings, footer, page metadata, and global buffers of data files are unchanged.
+
+Writers and readers keep these invariants:
+
+- **Writer boundary:** every array handed to the encoder has the exact Arrow type and extension metadata recorded for its field in the data file schema. Representation-only inputs satisfy this by passing through unchanged, except that view inputs are converted to a non-view layout. Value-transforming inputs satisfy it after conversion, applied recursively through `struct`, `list`, and `map` children.
+- **Lossless conversion:** conversions between an accepted input, a physical layout, and an output layout are lossless. An operation that would lose data fails instead of truncating it.
+- **Metadata only:** output encodings and extension metadata never require rewriting data files.
+
+### Failure Semantics
+
+| Condition | Result |
+|---|---|
+| The input Arrow type is not an accepted input for the field's semantic type | The write fails before any data file is written. The error names the field path, the semantic type, and the input type. |
+| A `json` input value is not valid JSON | The write fails. The error names the field path and the row. |
+| An array reaches the encoder in a layout different from the one recorded in the data file schema | Internal invariant violation. The write fails with an error naming the field path, the expected layout and extension, and the actual ones. |
+| The requested output layout cannot hold a value, for example a `utf8` output whose values exceed the 32-bit offset limit | The read fails with an error naming the field, the value size, and the requested output encoding. The caller can request `large_utf8` or `utf8_view` instead. Readers may emit smaller batches so that values fit, but must never truncate. |
+| A writer sets `lance-schema:output-encoding` to a value that is not valid for the field's semantic type or parameters, for example `decimal128` for precision 40 | The schema update fails. |
+| A reader encounters an unrecognized or unsupported `lance-schema:output-encoding` value | The reader uses the default output encoding of the semantic type. |
+
+### Legacy Aliases
+
+Legacy tables name layouts directly in `logical_type`.
+Each such string is an alias for a canonical semantic type plus the output encoding that reproduces its Arrow type:
+
+| Legacy `logical_type` | Canonical type | Implied output encoding |
+|---|---|---|
+| `string`, `binary`, `list` | same | none |
+| `list.struct` | `list`, whose child field is a `struct` | none |
+| `large_string` | `string` | `large_utf8` |
+| `large_binary` | `binary` | `large_binary` |
+| `large_list`, `large_list.struct` | `list` | `large_list` |
+| `dict:<value>:<key>:false` with a `string`, `large_string`, `binary`, or `large_binary` value | the canonical type of `<value>` | `dictionary:<key>:<value layout>`, where the value layout is the output encoding `<value>` implies or the default |
+| `decimal:128:<p>:<s>` | `decimal:<p>:<s>` | none, because `p` ≤ 38 and the default is already `decimal128` |
+| `decimal:256:<p>:<s>` | `decimal:<p>:<s>` | `decimal256` when `p` ≤ 38; none otherwise |
+
+Writers of tables that set `FLAG_SEMANTIC_TYPES` write only canonical names in the table schema.
+Readers of these tables still interpret a legacy alias as its canonical type with the implied output encoding; a `lance-schema:output-encoding` entry on the same field takes precedence over the implied one.
+
 ## Field IDs
 
 Field IDs are unique integer identifiers assigned to each field in a schema.
@@ -260,6 +407,12 @@ optimizations such as storage-partitioned joins.
 
 Column encoding configurations are specified with the `lance-encoding:` prefix.
 See [File Format Encoding Specification](../file/encoding.md) for complete details on available encodings.
+
+### Output Encoding Metadata
+
+In tables that set `FLAG_SEMANTIC_TYPES`, the `lance-schema:output-encoding` entry names the Arrow layout that reads return for the field.
+See [Output Encoding](#output-encoding) for its values and rules.
+Legacy tables and data file schemas do not interpret this entry.
 
 ### Arrow Extension Type Metadata
 
@@ -410,7 +563,9 @@ Field {
 
 ## Type Conversion Reference
 
-When converting between logical types and Arrow types, Lance uses the following mappings:
+When converting between logical types and Arrow types, Lance uses the following mappings.
+Legacy tables and data file schemas use them in both directions.
+Tables that set `FLAG_SEMANTIC_TYPES` interpret these strings as described in [Legacy Aliases](#legacy-aliases).
 
 | Arrow Type | Logical Type Format |
 |---|---|
