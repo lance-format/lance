@@ -544,10 +544,17 @@ pub(crate) async fn count_trainable_vectors(
     while let Some(batch) = batches.try_next().await? {
         let lists = utils::get_column_from_batch(&batch, column)?;
         let lists = lists.as_list::<i32>();
+        // A row's list holds vectors that can be null themselves, and a null
+        // vector is not one to train on -- so the row contributes its elements
+        // less its own nulls, not its length. `value` slices the child without
+        // copying, and the batch is already here.
         for row in 0..lists.len() {
-            if !lists.is_null(row) {
-                vectors = vectors.saturating_add(lists.value_length(row) as usize);
+            if lists.is_null(row) {
+                continue;
             }
+            let elements = lists.value(row);
+            let trainable = elements.len() - elements.null_count();
+            vectors = vectors.saturating_add(trainable);
         }
         if vectors >= enough {
             return Ok(vectors);
@@ -2382,6 +2389,68 @@ mod tests {
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
+
+    /// A null vector inside a multivector row is not one to train on.
+    ///
+    /// The row's list length counts it, so counting lengths reports more
+    /// trainable vectors than exist -- and this count decides whether there is
+    /// enough data to train at all, so erring high is the direction that
+    /// trains an index it should have deferred.
+    #[tokio::test]
+    async fn a_null_vector_inside_a_multivector_row_is_not_trainable() {
+        use arrow_array::RecordBatchIterator;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+
+        const DIM: i32 = 2;
+        let item = Arc::new(Field::new("item", ArrowDataType::Float32, true));
+        let vector = Arc::new(Field::new(
+            "item",
+            ArrowDataType::FixedSizeList(item, DIM),
+            true,
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            ArrowDataType::List(vector),
+            true,
+        )]));
+
+        // Three rows: two vectors, then one vector and one null, then a null
+        // list. Four elements are present; three of them are trainable.
+        let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), DIM));
+        for row in [
+            vec![Some([1.0, 2.0]), Some([3.0, 4.0])],
+            vec![Some([5.0, 6.0]), None],
+        ] {
+            for cell in row {
+                match cell {
+                    Some(v) => {
+                        builder.values().values().append_slice(&v);
+                        builder.values().append(true);
+                    }
+                    None => {
+                        builder.values().values().append_slice(&[0.0; DIM as usize]);
+                        builder.values().append(false);
+                    }
+                }
+            }
+            builder.append(true);
+        }
+        builder.append(false);
+        let array = builder.finish();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, dir.as_str(), None).await.unwrap();
+
+        let counted = count_trainable_vectors(&dataset, "vec", 3, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted, 3,
+            "the null vector in the second row must not be counted"
+        );
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
