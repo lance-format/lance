@@ -267,7 +267,7 @@ Changing the entry is a metadata-only schema update.
 
 The output encoding is advisory.
 It never affects which values are stored, schema compatibility, or correctness.
-A writer rejects a schema update that sets a value that is not valid for the field's semantic type and parameters.
+A writer rejects a schema update that sets a value that is not valid for the field's semantic type and parameters, and keeps an existing entry it does not recognize unchanged.
 A reader that does not recognize a value, or cannot produce that layout, uses the default output encoding instead.
 
 ### Extension Semantic Types
@@ -298,6 +298,7 @@ As a result:
 A data file schema records the exact physical layout encoded in that file, using the Arrow-mapped strings from [Data Types](#data-types), such as `large_string`, `dict:string:int16:false`, or `decimal:128:10:2`.
 These strings keep their meaning inside data files, and output encodings do not apply to data file schemas.
 Different data files of one column may record different physical layouts of the column's semantic type.
+A table that sets `FLAG_SEMANTIC_TYPES` references only data files of version 2.1 or later, whose pages describe their own offset width, value width, and dictionary key width, so a reader can decode each file into the output layout it needs.
 
 The table schema is the only source of semantics.
 Readers resolve semantics through field IDs in the table schema and never infer them from the physical layout of a data file.

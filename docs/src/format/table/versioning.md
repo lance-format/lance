@@ -46,4 +46,5 @@ Flags with bit values 4096 and above are unknown; unknown flags cause implementa
 A writer sets it when it creates a new table whose data storage version is 2.3 or later.
 It never sets the flag implicitly on an existing table, including when the table is overwritten, so tables created with an earlier data storage version, or before this flag existed, stay legacy tables.
 Once set, the flag remains set in every later version of the table, including versions created by a restore.
+An existing table adopts the contract only through an explicit, metadata-only commit: it rewrites each legacy alias in the table schema to its canonical type with the output encoding that keeps the Arrow type reads return, and sets the flag. Data files are not rewritten. A table can adopt the contract only when all of its data files have version 2.1 or later, every field has a semantic type, and no field carries a `lance-schema:output-encoding` entry yet. There is no downgrade.
 Legacy tables interpret each `logical_type` as exactly one Arrow type, compare those types for schema compatibility, and do not apply output encodings.
