@@ -291,6 +291,18 @@ pub(super) async fn open_row_id_remapping(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
+    open_row_id_remapping_with_plan(dataset, index, None, metrics).await
+}
+
+/// [`open_row_id_remapping`] for a segment whose plan the caller supplies
+/// (a staged segment planned by its merge); `None` looks the segment
+/// up in the snapshot plan, which only knows committed segments.
+pub(super) async fn open_row_id_remapping_with_plan(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    staged: Option<&SegmentRemappingPlan>,
+    metrics: &dyn MetricsCollector,
+) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
     // The cheap cached stored listing decides the generation; the filtered
     // listing (whose tagged post-processing recomputes coverage) is only
     // consulted inside the once-per-snapshot plan build.
@@ -318,22 +330,34 @@ pub(super) async fn open_row_id_remapping(
     // Everything below is v1-only code: legacy-only scopes must never get here.
     lance_index::scalar::check_batch_remapping_entry()?;
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
-    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
-    match plan.segments.get(&index.uuid) {
-        None => Err(Error::not_supported(format!(
-            "FRI remapping requires committed segment metadata for {}",
-            index.uuid
-        ))),
-        Some(SegmentRemappingPlan::Identity) => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
-        Some(SegmentRemappingPlan::MissingCoverage) => Err(Error::not_supported(format!(
+    let snapshot_plan;
+    let plan = match staged {
+        Some(plan) => plan,
+        None => {
+            snapshot_plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+            match snapshot_plan.segments.get(&index.uuid) {
+                Some(plan) => plan,
+                None => {
+                    return Err(Error::not_supported(format!(
+                        "FRI remapping requires committed segment metadata for {}; a staged \
+                         segment must be opened with its own plan",
+                        index.uuid
+                    )));
+                }
+            }
+        }
+    };
+    match plan {
+        SegmentRemappingPlan::Identity => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
+        SegmentRemappingPlan::MissingCoverage => Err(Error::not_supported(format!(
             "FRI query coverage is unavailable for segment {}",
             index.uuid
         ))),
-        Some(SegmentRemappingPlan::Translate {
+        SegmentRemappingPlan::Translate {
             coverage,
             excluded_fragments,
             fingerprint,
-        }) => Ok(Some((
+        } => Ok(Some((
             fri.uuid,
             ResolvedRemapping::V1Translate {
                 remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(

@@ -572,13 +572,28 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
+    open_scalar_index_with_plan(dataset, column, index, None, metrics).await
+}
+
+/// [`open_scalar_index`] for a segment the manifest does not list (a staged
+/// build being merged): `staged` is its translation plan from
+/// [`super::frag_reuse::plan_staged_segments`]. With `None` the segment is
+/// looked up in the snapshot plan, which only knows committed segments.
+pub(crate) async fn open_scalar_index_with_plan(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    staged: Option<&super::frag_reuse::SegmentRemappingPlan>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, metrics).await?;
+    let resolved =
+        super::frag_reuse::open_row_id_remapping_with_plan(dataset, index, staged, metrics).await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
