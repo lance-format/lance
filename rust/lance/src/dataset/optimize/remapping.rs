@@ -439,11 +439,18 @@ enum TaggedRemapPlan {
 /// Walk FORWARD from the segment's provenance along consumer edges. A hop
 /// with `sources ⊆ coverage` (compaction or stable partition) applies:
 /// coverage evolves to the hop's destinations. A partial-overlap compaction
-/// takes the v0 straddle fallback: that coverage is dropped from the bitmap
-/// (sources removed, destinations NOT added) and the walk continues; the
-/// dropped rows are served by scan. A partial-overlap stable partition cannot
-/// be restamped and blocks the whole plan ([`TaggedRemapPlan::Blocked`]): the
-/// segment is skipped cleanly and a rebuild catches it up.
+/// takes the v0 straddle fallback, but only before any stable-partition hop
+/// has been applied: that coverage is dropped from the bitmap (sources
+/// removed, destinations NOT added) and the walk continues; the dropped rows
+/// are served by scan. A partial-overlap stable partition cannot be restamped
+/// and blocks the whole plan ([`TaggedRemapPlan::Blocked`]): the segment is
+/// skipped cleanly and a rebuild catches it up. Once a stable-partition hop
+/// has been applied, ANY later partial overlap blocks as well: the fallback is
+/// only sound while the segment's stored addresses are untouched. A restamped
+/// file would carry addresses inside a fragment the later hop consumes while
+/// its bitmap no longer names the partition's sources, so nothing would pin
+/// the partition and a later trim could drop the mapping those addresses need.
+/// A remap is published whole or not at all.
 ///
 /// Iron law (asserted, `Remap` plans): a swapped bitmap only ever claims
 /// destination fragments the segment fully owns -- destinations are added
@@ -454,6 +461,9 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
     let mut hops: Vec<PlannedHop> = Vec::new();
     let mut applied = vec![false; ledger.transitions().len()];
     let mut changed = false;
+    // Set once a stable-partition hop is applied: from then on the segment's
+    // stored addresses are being moved, and no partial hop may be skipped.
+    let mut restamped = false;
     // Transitions are in lineage order (producers before consumers), so one
     // pass reaches a fixpoint.
     for (position, transition) in ledger.transitions().iter().enumerate() {
@@ -479,20 +489,28 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
                 // Fully covered: the segment owns every source of this
                 // transition, so its entering fragment set is exactly the
                 // sources (the free / restamp case).
-                Mapping::StablePartition(_) => PlannedHop::StablePartition {
-                    position,
-                    enter_fragments: overlap.clone(),
-                },
+                Mapping::StablePartition(_) => {
+                    restamped = true;
+                    PlannedHop::StablePartition {
+                        position,
+                        enter_fragments: overlap.clone(),
+                    }
+                }
             });
             applied[position] = true;
         } else {
             match transition.mapping() {
-                Mapping::OrderedCompaction(_) => {
+                // The v0 straddle fallback is only sound while the segment's
+                // stored addresses are untouched.
+                Mapping::OrderedCompaction(_) if !restamped => {
                     coverage -= &overlap;
                 }
-                // A partially covered stable partition cannot be restamped:
-                // skip the segment cleanly and let a rebuild catch it up.
-                Mapping::StablePartition(_) => {
+                // A partially covered stable partition cannot be restamped,
+                // and a partial hop of any kind after a restamp would publish
+                // a file whose addresses depend on a mapping its bitmap no
+                // longer pins: skip the segment cleanly and let a rebuild
+                // catch it up.
+                Mapping::OrderedCompaction(_) | Mapping::StablePartition(_) => {
                     return TaggedRemapPlan::Blocked {
                         fragment: overlap.min().unwrap(),
                     };
@@ -680,9 +698,10 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         TaggedRemapPlan::Identity => return Ok(()),
         TaggedRemapPlan::Blocked { fragment } => {
             log::info!(
-                "Skipping remap of index {} ({}): its coverage reaches a stable-partition \
-                 transition it only partially covers at fragment {}. Queries keep translating \
-                 through the reuse index; rebuild the index to catch it up",
+                "Skipping remap of index {} ({}): its coverage reaches a transition it only \
+                 partially covers at fragment {} (a stable partition, or any hop after a \
+                 stable-partition restamp). Queries keep translating through the reuse \
+                 index; rebuild the index to catch it up",
                 curr_index_meta.name,
                 curr_index_meta.uuid,
                 fragment
@@ -1055,6 +1074,69 @@ mod tests {
             );
         }
 
+        /// A partial compaction reached AFTER a fully covered stable partition
+        /// blocks: the restamped file would hold addresses inside a fragment
+        /// the compaction consumes, while its bitmap no longer names the
+        /// partition's sources, so nothing would pin the mapping those
+        /// addresses need. The chain is connected: the compaction consumes a
+        /// destination of the partition.
+        #[tokio::test]
+        async fn partial_compaction_after_restamp_blocks() {
+            let ledger = ledger(vec![partition(&[1, 2], &[3, 4]), ordered(&[3, 5], &[6])]).await;
+            let plan = plan_tagged_remap(&ledger, &coverage(&[1, 2]));
+            assert!(
+                matches!(plan, TaggedRemapPlan::Blocked { fragment: 3 }),
+                "expected Blocked on fragment 3, got {plan:?}"
+            );
+        }
+
+        /// Order is not a dependency: a partial compaction BEFORE a stable
+        /// partition blocks only when the chain is connected. Here the
+        /// partition's sources include the compaction's destination, which
+        /// the straddle fallback removed from coverage, so the partition is
+        /// no longer fully covered and blocks.
+        #[tokio::test]
+        async fn connected_partial_compaction_before_stable_partition_blocks() {
+            // The compaction packs the eight rows of 1 and 5 into 9; the
+            // partition then consumes 9 (eight rows) together with 2, so its
+            // digests must agree with the compaction's output.
+            let partition_after_compaction = pb_fri::Transition {
+                sources: vec![digest(9, 8, 0), digest(2, 4, 0)],
+                destinations: vec![digest(3, 6, 0), digest(4, 6, 0)],
+                mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                    pb_fri::StablePartition {
+                        map_id: Uuid::new_v4().to_string(),
+                        map_size_bytes: 1,
+                        base_id: None,
+                    },
+                )),
+            };
+            let ledger = ledger(vec![ordered(&[1, 5], &[9]), partition_after_compaction]).await;
+            let plan = plan_tagged_remap(&ledger, &coverage(&[1, 2]));
+            assert!(
+                matches!(plan, TaggedRemapPlan::Blocked { fragment: 2 }),
+                "expected Blocked on fragment 2, got {plan:?}"
+            );
+        }
+
+        /// The same two hops on DISCONNECTED fragment branches do not
+        /// interact: the compaction straddle drops its coverage and the
+        /// unrelated stable partition still applies in full.
+        #[tokio::test]
+        async fn disconnected_partial_compaction_does_not_block_stable_partition() {
+            let ledger = ledger(vec![ordered(&[5, 7], &[8]), partition(&[1, 2], &[3, 4])]).await;
+            let TaggedRemapPlan::Remap { hops, coverage } =
+                plan_tagged_remap(&ledger, &coverage(&[1, 2, 5]))
+            else {
+                panic!("expected a remap plan");
+            };
+            assert_eq!(coverage, RoaringBitmap::from_iter([3u32, 4]));
+            assert!(matches!(
+                hops.as_slice(),
+                [PlannedHop::StablePartition { position: 1, .. }]
+            ));
+        }
+
         /// A5 (revised): the free case composes downstream of a compaction
         /// hop, in chain order.
         #[tokio::test]
@@ -1189,6 +1271,99 @@ mod tests {
                         groups: vec![RewriteGroup {
                             old_fragments,
                             new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap()
+        }
+
+        /// Commit an ordered compaction of `source_ids` into one new fragment
+        /// `dest_id`, appending the transition to the tagged history. The
+        /// planner never bins indexed fragments with unindexed ones, so a
+        /// compaction that consumes a stable-partition destination together
+        /// with an unrelated fragment has to be assembled by hand.
+        async fn commit_ordered_compaction(
+            dataset: Dataset,
+            source_ids: &[u64],
+            dest_id: u64,
+        ) -> Dataset {
+            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+            let old_fragments: Vec<Fragment> = source_ids
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|f| f.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect();
+            let batch = {
+                let mut scan = dataset.scan();
+                scan.with_fragments(old_fragments.clone());
+                scan.try_into_batch().await.unwrap()
+            };
+            let total_rows = batch.num_rows() as u64;
+            let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap();
+            let Operation::Append {
+                fragments: mut new_fragments,
+            } = transaction.operation
+            else {
+                unreachable!()
+            };
+            assert_eq!(new_fragments.len(), 1);
+            new_fragments[0].id = dest_id;
+            let mut changed = RoaringTreemap::new();
+            let mut sources = Vec::new();
+            for fragment in &old_fragments {
+                let rows = fragment.physical_rows.unwrap() as u64;
+                for offset in 0..rows as u32 {
+                    changed.insert(RowAddress::new_from_parts(fragment.id as u32, offset).into());
+                }
+                sources.push(pb_fri::FragmentDigest {
+                    id: fragment.id,
+                    physical_rows: rows,
+                    num_deleted_rows: 0,
+                });
+            }
+            let mut changed_row_addrs = Vec::new();
+            changed.serialize_into(&mut changed_row_addrs).unwrap();
+            let transition = pb_fri::Transition {
+                sources,
+                destinations: vec![pb_fri::FragmentDigest {
+                    id: dest_id,
+                    physical_rows: total_rows,
+                    num_deleted_rows: 0,
+                }],
+                mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                    pb_fri::OrderedCompaction { changed_row_addrs },
+                )),
+            };
+            let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
+            CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments,
                         }],
                         rewritten_indices: vec![],
                         frag_reuse_index,
@@ -1496,6 +1671,56 @@ mod tests {
             assert_eq!(
                 sorted_values(&dataset, None).await,
                 (0..16).collect::<Vec<_>>()
+            );
+        }
+
+        /// A2 integration: a segment fully covering a stable partition whose
+        /// destination is then partially consumed by a compaction is Blocked,
+        /// not half-remapped. The index is left untouched (nothing is
+        /// committed), trim keeps the mappings the segment still needs, and
+        /// queries stay correct through translation.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn partial_compaction_after_restamp_blocks_remap_and_keeps_mappings() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            // {0,1} (all of i_idx) -> {10,11}, then {3,10} -> {20}: the
+            // compaction consumes one partition destination together with an
+            // unindexed fragment, so i_idx covers it only partially. (A
+            // rewrite group must name its fragments in manifest order, which
+            // is [2, 3, 10, 11] after the partition.)
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let mut dataset = commit_ordered_compaction(dataset, &[3, 10], 20).await;
+            let all_values: Vec<i32> = (0..16).collect();
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+
+            let before = stored_index(&dataset, "i_idx").await;
+            let version_before = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            // Blocked is a clean skip: no commit, same segment, same bitmap.
+            assert_eq!(dataset.manifest.version, version_before);
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(after.uuid, before.uuid);
+            assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+            assert_eq!(after.dataset_version, before.dataset_version);
+
+            // Trim keeps both transitions: the segment's provenance names the
+            // partition's sources and its rows reach the compaction through it.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            assert_eq!(
+                ledger.transitions().len(),
+                2,
+                "both mappings are still needed"
+            );
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            assert_eq!(
+                sorted_values(&dataset, Some("i < 8")).await,
+                (0..8).collect::<Vec<_>>()
             );
         }
 
