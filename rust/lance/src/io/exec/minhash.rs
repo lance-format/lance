@@ -211,6 +211,7 @@ impl ExecutionPlan for MinHashSearchExec {
         let external_mask = self.external_mask.clone();
         let index_metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metrics_set = self.metrics.clone();
         let stream = stream::once(async move {
             let _timer = baseline_metrics.elapsed_compute().timer();
             let empty = || hits_batch(&[]);
@@ -242,6 +243,7 @@ impl ExecutionPlan for MinHashSearchExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             pre_filter.wait_for_ready().await?;
             let mask = pre_filter.mask();
@@ -696,6 +698,17 @@ mod tests {
         })
         .await;
         assert_eq!(prefiltered, vec![3, 1]);
+        let mut metric_scan = scan(&dataset, BASE, 2);
+        metric_scan.filter("id >= 1").unwrap().prefilter(true);
+        let analysis = metric_scan.analyze_plan().await.unwrap();
+        let minhash_line = analysis
+            .lines()
+            .find(|line| line.contains("MinHashSearch:"))
+            .unwrap();
+        assert!(
+            minhash_line.contains("prefilter_loads=1"),
+            "MinHash search is missing its prefilter metrics: {analysis}"
+        );
         // Postfiltering ranks first and filters the ranked rows afterwards
         let postfiltered = ids(&dataset, BASE, 2, |scan| {
             scan.filter("id >= 1").unwrap().prefilter(false);
