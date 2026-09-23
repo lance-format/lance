@@ -1057,6 +1057,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1064,8 +1065,21 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
+        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
+        // the target's; `JsonIndexDetails` does not yet record the target's own
+        // version. Every target this wrapper builds comes from a fresh training
+        // pass in this same codebase, so it is always at that plugin's current
+        // format; passing the target's own max version is the accurate stand-in
+        // until the target's version is recorded here directly.
         let target_index = target_plugin
-            .load_index(index_store, target_details, frag_reuse_index, cache)
+            .load_index(
+                index_store,
+                target_details,
+                target_plugin.version(),
+                frag_reuse_index,
+                cache,
+            )
             .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }
@@ -1301,7 +1315,7 @@ mod tests {
             .unwrap();
 
         plugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap()
     }
@@ -1414,6 +1428,7 @@ mod tests {
             .load_index(
                 dest_store,
                 &created.index_details,
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
