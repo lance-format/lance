@@ -931,10 +931,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(merged);
             }
             let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
-            // A segment awaiting training has no file to open, so the column is
-            // trained from its definition rather than appended to. Checked over
-            // every segment because the logical index is opened by name, which
-            // opens all of them.
+            // A deferred build leaves a segment with no file to open, so the
+            // column is trained from its definition rather than appended to.
+            // Opening the index by name opens every segment, so any one of
+            // them settles it.
             let awaits_training = old_indices
                 .iter()
                 .any(|idx| is_definition_only_segment(idx));
