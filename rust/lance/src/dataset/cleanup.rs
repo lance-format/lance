@@ -5639,7 +5639,7 @@ mod tests {
         use lance_table::format::Fragment;
         use lance_table::format::IndexMetadata;
         use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, RewriteGroup};
+        use lance_table::transaction::RewriteGroup;
         use prost::Message;
 
         impl MockDatasetFixture {
@@ -5732,6 +5732,11 @@ mod tests {
             };
             let map_id = mapping.map_id.clone();
             let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
             let dataset = CommitBuilder::new(Arc::new(dataset))
                 .execute(Transaction::new(
                     read_version,
@@ -5741,9 +5746,7 @@ mod tests {
                             new_fragments: destinations,
                         }],
                         rewritten_indices: vec![],
-                        frag_reuse: Some(FragReuseUpdate::AppendTransitions(
-                            FragmentReuseRewrite::new(vec![transition]),
-                        )),
+                        frag_reuse_index,
                     },
                     None,
                 ))
@@ -6112,32 +6115,26 @@ mod tests {
             .collect()
         }
 
-        /// FINDING (pinned): draining through `optimize_indices` merge does
-        /// not work on tagged tables yet. Two failure shapes, both pinned
-        /// here and in the in-module probe history:
+        /// Draining through `optimize_indices` merge on a tagged table. A
+        /// provenance-only segment still owning translated coverage is opened
+        /// through the translating loader, so the merged file holds live
+        /// addresses. The merged segment commits the UNION of the selected
+        /// segments' stored bitmaps (provenance, retired sources included):
+        /// the tagged reader treats a segment's bitmap as provenance, stops
+        /// translating at a live fragment, and derives coverage of a
+        /// destination whenever every contributing source is present, so the
+        /// merged segment keeps the translated destination coverage instead
+        /// of degrading to scan fallback, and the transition it still names
+        /// stays retained.
         ///
-        /// * A provenance-only segment whose translated coverage is fully
-        ///   taken over by a sibling is excluded from the query listing by
-        ///   direct-coverage-wins, so `merge_indices` cannot open it
-        ///   (`open_generic_index`: "does not exist") and silently skips the
-        ///   whole merge with a warning.
-        /// * A provenance-only segment still owning translated coverage IS
-        ///   openable, and an explicit merge combines its RAW pages (stale
-        ///   addresses in retired source fragments) with the sibling's,
-        ///   committing a segment that claims only the live DIRECT coverage:
-        ///   the translated destination coverage is dropped, silently
-        ///   degrading the index to scan fallback for those fragments
-        ///   (results stay correct, coverage regresses).
-        ///
-        /// Until the merge path resolves segments from stored metadata and
-        /// translates their addresses, draining requires an index rebuild
-        /// (see `end_to_end_lifecycle`) or fresh delta segments (see
-        /// `delta_drain_stages_partial_then_full`). When merge learns to
-        /// drain, this test fails: replace it with the real merge-drain
-        /// lifecycle.
+        /// A provenance-only segment whose translated coverage is fully taken
+        /// over by siblings is excluded from the query listing by
+        /// direct-coverage-wins and cannot be selected for a merge; it is
+        /// dead weight that the prune step removes
+        /// (`delta_drain_stages_partial_then_full`).
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
-        async fn merge_drain_not_yet_supported_on_tagged_tables() {
+        async fn merge_keeps_translated_coverage_on_tagged_tables() {
             use lance_index::optimize::OptimizeOptions;
 
             let fixture = MockDatasetFixture::try_new().unwrap();
@@ -6145,50 +6142,236 @@ mod tests {
             // A partial delta: the old segment keeps exclusive translated
             // coverage of destination 11, so it stays openable.
             commit_delta_segment(&mut dataset, Some(&[10])).await;
-            let before: Vec<(Uuid, Option<roaring::RoaringBitmap>)> =
-                stored_segments(&dataset, "i_idx")
-                    .await
-                    .into_iter()
-                    .map(|s| (s.uuid, s.fragment_bitmap))
-                    .collect();
-            assert_eq!(before.len(), 2);
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
             let all_rows = dataset.count_rows(None).await.unwrap();
+            let scan_counts = counts_without_index(&dataset).await;
 
-            // Default optimize is a no-op on this shape.
-            dataset
-                .optimize_indices(&OptimizeOptions::default())
-                .await
-                .unwrap();
-            let after: Vec<(Uuid, Option<roaring::RoaringBitmap>)> =
-                stored_segments(&dataset, "i_idx")
-                    .await
-                    .into_iter()
-                    .map(|s| (s.uuid, s.fragment_bitmap))
-                    .collect();
-            assert_eq!(after, before);
-
-            // An explicit merge runs, but the merged segment claims only the
-            // live direct coverage: destination 11 loses index coverage
-            // entirely instead of gaining a translated, directly-covering
-            // segment.
             dataset
                 .optimize_indices(&OptimizeOptions::merge(2))
                 .await
                 .unwrap();
+
+            // One merged segment; its stored bitmap is provenance: the retired
+            // sources of the old segment plus the delta's direct coverage.
             let merged = stored_segments(&dataset, "i_idx").await;
-            let coverage = merged
-                .iter()
-                .filter_map(|s| s.fragment_bitmap.as_ref())
-                .fold(roaring::RoaringBitmap::new(), |acc, b| acc | b);
+            assert_eq!(merged.len(), 1, "{merged:?}");
+            let stored = merged[0].fragment_bitmap.clone().unwrap();
             assert!(
-                !coverage.contains(11),
-                "pinned failing behavior: the merge drops the translated \
-                 destination coverage instead of producing a directly-covering \
-                 translated segment; found {coverage:?}"
+                stored.contains(0) && stored.contains(1) && stored.contains(10),
+                "{stored:?}"
             );
-            // Queries stay correct through scan fallback.
+
+            // The reader derives coverage of BOTH destinations from that
+            // provenance, so nothing falls back to scan.
+            let derived = derived_coverage(&dataset, "i_idx").await;
+            assert_eq!(
+                derived,
+                dataset.fragment_bitmap.as_ref().clone(),
+                "the merged segment must answer for every live fragment"
+            );
+            assert_index_used(&dataset).await;
             assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
-            assert_eq!(dataset.count_rows(Some("i >= 4".into())).await.unwrap(), 4);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+
+            // Trim keeps the transition: the merged segment's provenance still
+            // names its sources and destination 11 has no direct coverage.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the merged segment still depends on the transition"
+            );
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 1);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+        }
+
+        /// A merge that selects only SOME of the segments contributing to a
+        /// destination must not strip the unselected sibling of its coverage.
+        /// Two per-fragment segments S1 (fragment 0) and S2 (fragment 1) both
+        /// contribute to destinations 10 and 11 after the recluster. Merging
+        /// S2 with newly appended data produces M whose provenance still names
+        /// fragment 1, so the reader keeps resolving 10 and 11 from {S1, M}.
+        /// With a `stored ∩ live` bitmap M would drop fragment 1 and S1 would
+        /// lose both destinations.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn merge_keeps_unselected_sibling_coverage_on_tagged_tables() {
+            use lance_index::optimize::OptimizeOptions;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, _map_id) = make_tagged_per_fragment(&fixture).await;
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2);
+            let s1 = segments
+                .iter()
+                .find(|s| s.fragment_bitmap.as_ref().unwrap().contains(0))
+                .unwrap()
+                .uuid;
+
+            // New data so a one-segment merge has something to fold in.
+            let appended = arrow_array::record_batch!(("i", Int32, [8, 9, 10, 11])).unwrap();
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                    Some(WriteParams {
+                        store_params: Some(fixture.os_params()),
+                        commit_handler: Some(Arc::new(RenameCommitHandler)),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let all_rows = dataset.count_rows(None).await.unwrap();
+            let scan_counts = counts_without_index(&dataset).await;
+
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1))
+                .await
+                .unwrap();
+
+            let after = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2, "{after:?}");
+            assert!(after.iter().any(|s| s.uuid == s1), "S1 was not selected");
+            // Both destinations are still derived for S1 and for the merged
+            // segment, and every live fragment is covered.
+            let derived = dataset.load_indices().await.unwrap();
+            for segment in derived.iter().filter(|s| s.name == "i_idx") {
+                let coverage = segment.fragment_bitmap.as_ref().unwrap();
+                assert!(
+                    coverage.contains(10) && coverage.contains(11),
+                    "segment {} lost translated coverage: {coverage:?}",
+                    segment.uuid
+                );
+            }
+            assert_eq!(
+                derived_coverage(&dataset, "i_idx").await,
+                dataset.fragment_bitmap.as_ref().clone()
+            );
+            assert_index_used(&dataset).await;
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+        }
+
+        /// Sorted per-value row counts through the scalar index.
+        async fn counts_with_index(dataset: &Dataset) -> Vec<usize> {
+            let mut counts = Vec::new();
+            for value in 0..12 {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                counts.push(scan.try_into_batch().await.unwrap().num_rows());
+            }
+            counts
+        }
+
+        /// The same counts with the scalar index disabled: the ground truth.
+        async fn counts_without_index(dataset: &Dataset) -> Vec<usize> {
+            let mut counts = Vec::new();
+            for value in 0..12 {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                scan.use_scalar_index(false);
+                counts.push(scan.try_into_batch().await.unwrap().num_rows());
+            }
+            counts
+        }
+
+        /// Union of the coverage the tagged reader derives for `name`.
+        async fn derived_coverage(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|s| s.name == name)
+                .filter_map(|s| s.fragment_bitmap.clone())
+                .fold(roaring::RoaringBitmap::new(), |acc, b| acc | b)
+        }
+
+        /// A filtered scan plans through the scalar index (no scan fallback).
+        async fn assert_index_used(dataset: &Dataset) {
+            let mut scan = dataset.scan();
+            scan.filter("i >= 4").unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        }
+
+        /// `make_tagged` with `i_idx` built as one segment per source fragment.
+        async fn make_tagged_per_fragment(fixture: &MockDatasetFixture) -> (Dataset, String) {
+            let data = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_reader_rows(
+                    lance_datagen::RowCount::from(4),
+                    lance_datagen::BatchCount::from(2),
+                );
+            Dataset::write(
+                data,
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(fixture.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut dataset = *fixture.open().await.unwrap();
+            let params = ScalarIndexParams::default();
+            let fragment_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+            let mut segments = Vec::new();
+            for fragment in fragment_ids {
+                segments.push(
+                    crate::index::CreateIndexBuilder::new(
+                        &mut dataset,
+                        &["i"],
+                        IndexType::BTree,
+                        &params,
+                    )
+                    .name("i_idx".into())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+                );
+            }
+            dataset
+                .commit_existing_index_segments("i_idx", "i", segments)
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 20).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
+            else {
+                unreachable!()
+            };
+            let map_id = mapping.map_id.clone();
+            let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
+            let dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+            (dataset, map_id)
         }
 
         /// The staged drain the merge tests were after, via delta segments:

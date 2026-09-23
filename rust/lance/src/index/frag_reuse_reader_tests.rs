@@ -3310,3 +3310,232 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
         assert_eq!(actual, expected);
     }
 }
+
+// Vector merge on a tagged table: the merge reads the existing IVF segment
+// through the translating storage loader, so the merged segment holds live
+// addresses, and it commits the union of the selected segments' stored bitmaps
+// (provenance). The reader keeps deriving coverage of both destinations from
+// that provenance, the merged segment answers ANN queries for them together
+// with the newly appended rows, and trim retains the transition the provenance
+// still names. (Segments trained separately do not share IVF centroids and are
+// not mergeable, so the merge folds new data into one translated segment.)
+#[tokio::test]
+async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
+    use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query.as_primitive::<Float32Type>().clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+
+    // New rows to fold into the translated segment; their vectors sit far from
+    // the query so the nearest row stays i = 6.
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        (0..4).map(|_| {
+            Some(vec![
+                Some(1000.0f32),
+                Some(1000.0),
+                Some(1000.0),
+                Some(1000.0),
+            ])
+        }),
+        4,
+    );
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        ("vector", Arc::new(vectors) as ArrayRef),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let nearest = |dataset: Dataset, use_index: bool| {
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 1).unwrap();
+            scan.use_index(use_index);
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            (plan, batch["i"].as_primitive::<Int32Type>().value(0))
+        }
+    };
+    let (_, truth) = nearest(dataset.clone(), false).await;
+    assert_eq!(truth, 6);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+
+    // One merged segment whose stored bitmap keeps the retired provenance and
+    // adds the appended fragment.
+    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .cloned()
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let provenance = stored[0].fragment_bitmap.clone().unwrap();
+    assert!(
+        provenance.contains(0) && provenance.contains(1),
+        "{provenance:?}"
+    );
+
+    // Derived coverage spans every live fragment and the ANN path serves the
+    // query with the right row.
+    let derived = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, b| acc | b);
+    assert_eq!(derived, dataset.fragment_bitmap.as_ref().clone());
+    let (plan, found) = nearest(dataset.clone(), true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, truth);
+
+    // Trim retains the transition the merged segment's provenance still names.
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (plan, found) = nearest(dataset.clone(), true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, truth);
+}
+
+// The untested seam: a legacy-format vector file on a tagged table. Legacy
+// readers only take the v0 remapper handle, which is `None` on a tagged
+// history, so the tagged reader must exclude such a segment from coverage
+// (`vector_supports_batch_remapping` is false for pre-(0,3) files) and the
+// query must scan flat, rather than serve untranslated addresses through ANN.
+#[tokio::test]
+async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+        .await
+        .unwrap();
+    // The legacy file format exists for IVF_PQ; enough rows to train a
+    // 4-bit codebook over two sub-vectors.
+    let mut params = crate::index::vector::VectorIndexParams::ivf_pq(
+        1,
+        4,
+        2,
+        lance_linalg::distance::DistanceType::L2,
+        10,
+    );
+    params.version(crate::index::vector::IndexFileVersion::Legacy);
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    // Excluded from the query listing: no coverage the reader can honor.
+    assert!(
+        !dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == "vector_idx"),
+        "a legacy-format vector segment cannot be translated and must not claim coverage"
+    );
+    let mut scan = dataset.scan();
+    scan.nearest("vector", &query, 1).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(!plan.contains("ANN"), "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 6);
+}
