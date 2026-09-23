@@ -388,8 +388,9 @@ impl Schema {
     /// Validate a schema before storing it in a dataset manifest.
     ///
     /// System columns are virtual on reads, so [`Self::validate`] permits their
-    /// names in projection schemas. Stored fields may not use those names at
-    /// any depth.
+    /// names in projection schemas. Stored top-level fields may not use those
+    /// names; nested fields may use them because virtual columns are added only
+    /// at the schema root.
     ///
     /// ```
     /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -398,11 +399,18 @@ impl Schema {
     /// let arrow = ArrowSchema::new(vec![Field::new("_rowid", DataType::UInt64, false)]);
     /// let schema = Schema::try_from(&arrow)?;
     /// assert!(schema.validate_writable().is_err());
+    ///
+    /// let nested = ArrowSchema::new(vec![Field::new(
+    ///     "outer",
+    ///     DataType::Struct(vec![Field::new("_rowid", DataType::UInt64, false)].into()),
+    ///     false,
+    /// )]);
+    /// Schema::try_from(&nested)?.validate_writable()?;
     /// # Ok::<(), lance_core::Error>(())
     /// ```
     pub fn validate_writable(&self) -> Result<()> {
         self.validate()?;
-        for field in self.fields_pre_order() {
+        for field in &self.fields {
             if crate::is_system_column(&field.name) {
                 return Err(Error::invalid_input(format!(
                     "The column '{}' at path '{}' is a reserved name and cannot be stored in a Lance dataset",
@@ -2015,7 +2023,7 @@ mod tests {
     #[case::row_offset(ROW_OFFSET)]
     #[case::last_updated(ROW_LAST_UPDATED_AT_VERSION)]
     #[case::created(ROW_CREATED_AT_VERSION)]
-    fn test_validate_writable_rejects_system_names(
+    fn test_validate_writable_rejects_system_names_only_at_root(
         #[case] name: &str,
         #[values(false, true)] is_nested: bool,
     ) {
@@ -2031,14 +2039,13 @@ mod tests {
         };
         let schema = Schema::try_from(&arrow).unwrap();
         schema.validate().unwrap();
+        if is_nested {
+            schema.validate_writable().unwrap();
+            return;
+        }
         let error = schema.validate_writable().unwrap_err();
         assert!(matches!(&error, Error::InvalidInput { .. }));
-        let path = if is_nested {
-            format!("outer.{name}")
-        } else {
-            name.to_string()
-        };
-        assert!(error.to_string().contains(&format!("path '{path}'")));
+        assert!(error.to_string().contains(&format!("path '{name}'")));
         assert!(error.to_string().contains("reserved name"));
     }
 

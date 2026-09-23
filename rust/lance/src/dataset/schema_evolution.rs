@@ -3145,15 +3145,36 @@ mod test {
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
 
-        for path in ["x", "b.d"] {
-            let err = dataset
-                .alter_columns(&[ColumnAlteration::new(path.into()).rename("_rowid".into())])
-                .await
-                .unwrap_err();
-            assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
-            assert!(err.to_string().contains("reserved name"), "{err}");
-            assert_eq!(dataset.manifest.version, 3);
-        }
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("_rowid".into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.manifest.version, 3);
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.d".into()).rename("_rowid".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 4);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 5);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b._rowid".into()).rename("d".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 6);
+
+        let mut restored = dataset.checkout_version(5).await?;
+        restored.restore().await?;
+        assert_eq!(restored.manifest.version, 7);
+        assert!(restored.schema().field("b._rowid").is_some());
+        assert!(restored.schema().field("y").is_some());
 
         Ok(())
     }
