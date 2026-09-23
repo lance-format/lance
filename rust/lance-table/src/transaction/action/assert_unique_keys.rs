@@ -104,10 +104,8 @@ impl TryFrom<pb::AssertUniqueKeys> for AssertUniqueKeys {
 mod tests {
     use super::*;
     use crate::format::key_existence::FilterType;
-    use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{
-        Action, AddFragment, CompositeOperation, RemoveFragment, TombstoneFieldData, UserAction,
-    };
+    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
+    use crate::transaction::action::{Action, AddFragment, RemoveFragment, TombstoneFieldData};
 
     fn assertion(key_fields: Vec<Ref>, hashes: &[u64]) -> Action {
         Action::AssertUniqueKeys(AssertUniqueKeys {
@@ -136,12 +134,6 @@ mod tests {
         };
         fragment.data_change = false;
         Action::AddFragment(fragment)
-    }
-
-    fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step", actions,
-        )]))
     }
 
     #[test]

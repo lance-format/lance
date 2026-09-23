@@ -118,10 +118,10 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-    use crate::transaction::action::test_support::{apply, backed_manifest};
+    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{
-        Action, AddFragment, AlterField, CompositeOperation, DropField, RemoveFragment,
-        TombstoneFieldData, UserAction,
+        Action, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
+        TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
@@ -151,12 +151,6 @@ mod tests {
             overlays,
             data_change: true,
         })
-    }
-
-    fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step", actions,
-        )]))
     }
 
     #[test]
@@ -305,6 +299,61 @@ mod tests {
         assert!(!cast.conflicts_with(&overlaid));
         assert!(overlaid.conflicts_with(&dropped));
         assert!(!dropped.conflicts_with(&overlaid));
+    }
+
+    /// An index built over a column an overlay landed on first is accepted:
+    /// the segment is stamped with the version it read, the overlay carries
+    /// the later version it committed at, and the read path masks the
+    /// overlaid cells out of any segment older than the overlay
+    /// (`collect_overlay_stale_frags`). A requirement therefore does not
+    /// collide with a committed partial write, only with a full one.
+    #[test]
+    fn test_an_index_may_be_built_over_a_committed_overlay() {
+        let build = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "by_a".into(),
+            fields: vec![Ref::Committed(0)],
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(vec![Ref::Committed(0)]),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        })]);
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
+
+        assert!(!build.conflicts_with(&overlaid));
+        assert!(!overlaid.conflicts_with(&build));
+    }
+
+    /// One set may overlay a cell and then rewrite the whole column in the
+    /// same operation (an overlay being materialized). The full write is what
+    /// a concurrent set sees: another overlay of the column no longer
+    /// commutes with it, while a rewrite of a different column still does.
+    #[test]
+    fn test_a_full_write_in_the_same_set_dominates_a_partial_one() {
+        let materialize = footprint(vec![
+            add(Ref::Committed(0), vec![overlay("a.lance", &[0])]),
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ]);
+        let other_overlay = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
+        let other_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![Ref::Committed(1)],
+            data_change: true,
+        })]);
+
+        assert!(materialize.conflicts_with(&other_overlay));
+        assert!(other_overlay.conflicts_with(&materialize));
+        assert!(!materialize.conflicts_with(&other_column));
+        assert!(!other_column.conflicts_with(&materialize));
     }
 
     #[test]
