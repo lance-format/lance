@@ -202,6 +202,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     include_deleted_rows: jboolean,
     strict_batch_size: jboolean,
     disable_scoring_autoprojection: jboolean,
+    output_encodings_obj: JObject<'local>,
 ) -> JObject<'local> {
     crate::ok_or_throw!(
         env,
@@ -234,6 +235,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             include_deleted_rows,
             strict_batch_size,
             disable_scoring_autoprojection,
+            output_encodings_obj,
         )
     )
 }
@@ -268,6 +270,7 @@ fn inner_create_async_scanner<'local>(
     include_deleted_rows: jboolean,
     strict_batch_size: jboolean,
     disable_scoring_autoprojection: jboolean,
+    output_encodings_obj: JObject<'local>,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -301,6 +304,7 @@ fn inner_create_async_scanner<'local>(
         include_deleted_rows,
         strict_batch_size,
         disable_scoring_autoprojection,
+        output_encodings_obj,
     };
 
     let scanner = build_scanner_with_options(env, &dataset, options)?;

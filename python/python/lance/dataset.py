@@ -1254,6 +1254,7 @@ class LanceDataset(pa.dataset.Dataset):
         disable_scoring_autoprojection: Optional[bool] = None,
         row_addr_allowlist: Optional[bytes] = None,
         row_addr_blocklist: Optional[bytes] = None,
+        output_encodings: Optional[Dict[str, str]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -1409,6 +1410,13 @@ class LanceDataset(pa.dataset.Dataset):
             - "all_binary": read blob columns as binary / large_binary values
             - "blobs_descriptions": read blob columns as descriptions (default)
             - "all_descriptions": read all binary columns as descriptions
+        output_encodings: dict of str to str, default None
+            The Arrow layout to return for the given fields, keyed by field path
+            (``"a.b"`` for a nested field), in place of the output encoding the
+            table records. Values are output encodings such as ``"large_utf8"``,
+            ``"utf8_view"``, ``"dictionary:int32:utf8"``, ``"decimal256"``, or
+            ``"lance.json"``. Only tables that follow the semantic type contract
+            (created with data storage version 2.3 or later) accept this.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
@@ -1517,6 +1525,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.with_index_segments, index_segments)
         setopt(builder.late_materialization, late_materialization)
         setopt(builder.blob_handling, blob_handling)
+        setopt(builder.output_encodings, output_encodings)
         setopt(builder.with_row_id, with_row_id)
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
@@ -1623,6 +1632,7 @@ class LanceDataset(pa.dataset.Dataset):
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        output_encodings: Optional[Dict[str, str]] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -1676,6 +1686,9 @@ class LanceDataset(pa.dataset.Dataset):
         blob_handling: str, default None
             Controls how blob columns are returned. See ``LanceDataset.scanner`` for
             details.
+        output_encodings: dict of str to str, default None
+            The Arrow layout to return for the given fields. See
+            ``LanceDataset.scanner`` for details.
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
@@ -1752,6 +1765,7 @@ class LanceDataset(pa.dataset.Dataset):
             include_deleted_rows=include_deleted_rows,
             order_by=order_by,
             disable_scoring_autoprojection=disable_scoring_autoprojection,
+            output_encodings=output_encodings,
         ).to_table()
 
     def to_pandas(
@@ -6808,6 +6822,7 @@ class ScannerBuilder:
         self._row_addr_blocklist: Optional[bytes] = None
         self._late_materialization = None
         self._blob_handling = None
+        self._output_encodings: Optional[Dict[str, str]] = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
@@ -7068,6 +7083,19 @@ class ScannerBuilder:
         self, late_materialization: bool | List[str]
     ) -> ScannerBuilder:
         self._late_materialization = late_materialization
+        return self
+
+    def output_encodings(
+        self, output_encodings: Optional[Dict[str, str]]
+    ) -> ScannerBuilder:
+        """Return the given fields in these output encodings.
+
+        Keys are field paths and values are output encodings such as
+        ``"large_utf8"`` or ``"lance.json"``; see :meth:`LanceDataset.scanner`.
+        """
+        self._output_encodings = (
+            None if output_encodings is None else dict(output_encodings)
+        )
         return self
 
     def blob_handling(self, blob_handling: Optional[str]) -> ScannerBuilder:
@@ -7336,6 +7364,7 @@ class ScannerBuilder:
             self._substrait_aggregate,
             self._row_addr_allowlist,
             self._row_addr_blocklist,
+            self._output_encodings,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

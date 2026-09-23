@@ -27,6 +27,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -93,7 +94,8 @@ public class AsyncScanner implements AutoCloseable {
               options.getSubstraitAggregate(),
               options.isIncludeDeletedRows(),
               options.isStrictBatchSize(),
-              options.isDisableScoringAutoprojection());
+              options.isDisableScoringAutoprojection(),
+              options.getOutputEncodings());
     }
     scanner.allocator = allocator;
     return scanner;
@@ -126,7 +128,8 @@ public class AsyncScanner implements AutoCloseable {
       Optional<ByteBuffer> substraitAggregate,
       boolean includeDeletedRows,
       boolean strictBatchSize,
-      boolean disableScoringAutoprojection);
+      boolean disableScoringAutoprojection,
+      Optional<Map<String, String>> outputEncodings);
 
   /**
    * Asynchronously scan batches and return a CompletableFuture.

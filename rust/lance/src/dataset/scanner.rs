@@ -52,7 +52,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
-    BlobHandling, Field, OnMissing, Projection, escape_field_path_for_project,
+    BlobHandling, Field, OnMissing, OutputEncoding, Projection, escape_field_path_for_project,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -1080,6 +1080,9 @@ pub struct Scanner {
     /// - The names of the output columns
     projection_plan: ProjectionPlan,
     blob_handling: BlobHandling,
+    /// Output encodings requested for fields, by field ID, in place of the
+    /// ones the table records.
+    output_encodings: HashMap<i32, OutputEncoding>,
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
@@ -1398,6 +1401,7 @@ impl Scanner {
             dataset,
             projection_plan,
             blob_handling: BlobHandling::default(),
+            output_encodings: HashMap::new(),
             prefilter: false,
             external_row_mask: None,
             materialization_style: MaterializationStyle::Heuristic,
@@ -1433,23 +1437,83 @@ impl Scanner {
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
             target_parallelism: None,
         };
-        scanner.apply_blob_handling();
+        scanner.apply_projection_options();
         scanner
     }
 
-    fn apply_blob_handling(&mut self) {
+    /// Carry the options that shape how projected fields are read into a
+    /// (re)built projection plan.
+    fn apply_projection_options(&mut self) {
         let projection = self
             .projection_plan
             .physical_projection
             .clone()
-            .with_blob_handling(self.blob_handling.clone());
+            .with_blob_handling(self.blob_handling.clone())
+            .with_output_encodings(self.output_encodings.clone());
         self.projection_plan.physical_projection = projection;
     }
 
     pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
         self.blob_handling = blob_handling;
-        self.apply_blob_handling();
+        self.apply_projection_options();
         self
+    }
+
+    /// Return fields in the given output encodings instead of the ones the
+    /// table records.
+    ///
+    /// Keys are field paths (`a.b` for a nested field) and values are output
+    /// encodings such as `large_utf8`, `utf8_view`, `dictionary:int32:utf8`,
+    /// `decimal256`, or `lance.json`. This takes precedence over each field's
+    /// `lance-schema:output-encoding` entry and applies only to tables that
+    /// follow the semantic type contract. A path that names no field, or an
+    /// encoding that is not one of the field type's output encodings, is
+    /// rejected.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let batch = dataset
+    ///     .scan()
+    ///     .output_encodings([("name", "large_utf8")])?
+    ///     .try_into_batch()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn output_encodings(
+        &mut self,
+        encodings: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+    ) -> Result<&mut Self> {
+        let encodings = encodings.into_iter().collect::<Vec<_>>();
+        if !encodings.is_empty() && !self.dataset.manifest.uses_semantic_types() {
+            return Err(Error::invalid_input(
+                "output encodings apply only to tables that follow the semantic type contract",
+            ));
+        }
+        let schema = self.dataset.schema();
+        let mut output_encodings = HashMap::with_capacity(encodings.len());
+        for (path, value) in encodings {
+            let (path, value) = (path.as_ref(), value.as_ref());
+            let field = schema.field(path).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "cannot set the output encoding of '{path}': no such field"
+                ))
+            })?;
+            let encoding = value.parse::<OutputEncoding>()?;
+            field
+                .logical_type
+                .semantic()?
+                .semantic_type
+                .check_output_encoding(&encoding)
+                .map_err(|err| {
+                    Error::invalid_input(format!("cannot read field '{path}' as '{value}': {err}"))
+                })?;
+            output_encodings.insert(field.id, encoding);
+        }
+        self.output_encodings = output_encodings;
+        self.apply_projection_options();
+        Ok(self)
     }
 
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
@@ -1548,7 +1612,7 @@ impl Scanner {
         if self.legacy_with_row_addr {
             self.projection_plan.include_row_addr();
         }
-        self.apply_blob_handling();
+        self.apply_projection_options();
         Ok(self)
     }
 

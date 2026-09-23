@@ -18,6 +18,7 @@ import org.apache.arrow.util.Preconditions;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -50,6 +51,7 @@ public class ScanOptions {
   private final boolean includeDeletedRows;
   private final boolean strictBatchSize;
   private final boolean disableScoringAutoprojection;
+  private final Optional<Map<String, String>> outputEncodings;
 
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -247,7 +249,8 @@ public class ScanOptions {
         fastSearch,
         includeDeletedRows,
         strictBatchSize,
-        disableScoringAutoprojection);
+        disableScoringAutoprojection,
+        Optional.empty());
   }
 
   private ScanOptions(
@@ -277,7 +280,8 @@ public class ScanOptions {
       boolean fastSearch,
       boolean includeDeletedRows,
       boolean strictBatchSize,
-      boolean disableScoringAutoprojection) {
+      boolean disableScoringAutoprojection,
+      Optional<Map<String, String>> outputEncodings) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -325,6 +329,7 @@ public class ScanOptions {
     this.includeDeletedRows = includeDeletedRows;
     this.strictBatchSize = strictBatchSize;
     this.disableScoringAutoprojection = disableScoringAutoprojection;
+    this.outputEncodings = outputEncodings;
   }
 
   /**
@@ -560,6 +565,16 @@ public class ScanOptions {
     return disableScoringAutoprojection;
   }
 
+  /**
+   * Get the output encodings requested for fields.
+   *
+   * @return Optional containing a map from field path to output encoding if specified, otherwise
+   *     empty.
+   */
+  public Optional<Map<String, String>> getOutputEncodings() {
+    return outputEncodings;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -594,6 +609,7 @@ public class ScanOptions {
         .add("includeDeletedRows", includeDeletedRows)
         .add("strictBatchSize", strictBatchSize)
         .add("disableScoringAutoprojection", disableScoringAutoprojection)
+        .add("outputEncodings", outputEncodings.orElse(null))
         .toString();
   }
 
@@ -626,6 +642,7 @@ public class ScanOptions {
     private boolean includeDeletedRows = false;
     private boolean strictBatchSize = false;
     private boolean disableScoringAutoprojection = false;
+    private Optional<Map<String, String>> outputEncodings = Optional.empty();
 
     public Builder() {}
 
@@ -662,6 +679,7 @@ public class ScanOptions {
       this.includeDeletedRows = options.isIncludeDeletedRows();
       this.strictBatchSize = options.isStrictBatchSize();
       this.disableScoringAutoprojection = options.isDisableScoringAutoprojection();
+      this.outputEncodings = options.getOutputEncodings();
     }
 
     /**
@@ -992,6 +1010,25 @@ public class ScanOptions {
     }
 
     /**
+     * Return the given fields in these output encodings instead of the ones the table records.
+     *
+     * <p>Keys are field paths ({@code a.b} for a nested field) and values are output encodings such
+     * as {@code large_utf8}, {@code utf8_view}, {@code dictionary:int32:utf8}, {@code decimal256},
+     * or {@code lance.json}. This takes precedence over each field's {@code
+     * lance-schema:output-encoding} entry and applies only to tables that follow the semantic type
+     * contract (created with data storage version 2.3 or later). A path that names no field, or an
+     * encoding that is not one of the field type's output encodings, is rejected when the scanner
+     * is created.
+     *
+     * @param outputEncodings map from field path to output encoding
+     * @return Builder instance for method chaining.
+     */
+    public Builder outputEncodings(Map<String, String> outputEncodings) {
+      this.outputEncodings = Optional.of(outputEncodings);
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -1024,7 +1061,8 @@ public class ScanOptions {
           fastSearch,
           includeDeletedRows,
           strictBatchSize,
-          disableScoringAutoprojection);
+          disableScoringAutoprojection,
+          outputEncodings);
     }
   }
 }

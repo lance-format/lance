@@ -54,6 +54,11 @@ pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
 /// Arrow extension metadata key for extension metadata
 pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
+/// Field metadata key naming the Arrow layout that reads return for a field of
+/// a table that follows the semantic type contract, such as `large_utf8` or
+/// `lance.json`.
+pub const OUTPUT_ENCODING_META_KEY: &str = "lance-schema:output-encoding";
+
 /// Key used by lance to mark a field as a blob
 /// TODO: Use Arrow extension mechanism instead?
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";

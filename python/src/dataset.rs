@@ -1228,7 +1228,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, output_encodings=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1264,8 +1264,15 @@ impl Dataset {
         substrait_aggregate: Option<Vec<u8>>,
         row_addr_allowlist: Option<Vec<u8>>,
         row_addr_blocklist: Option<Vec<u8>>,
+        output_encodings: Option<HashMap<String, String>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
+
+        if let Some(output_encodings) = output_encodings {
+            scanner
+                .output_encodings(output_encodings)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
