@@ -81,6 +81,7 @@ mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
+pub mod frag_reuse_reader;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -99,7 +100,9 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -1943,6 +1946,39 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
+        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+            match fri.index_version {
+                // Legacy FRI index version 0 already had its fragment coverage
+                // remapped in load_all_indices().
+                0 => {}
+                1 => {
+                    // Cache the coverage-rewritten listing per snapshot identity:
+                    // load_indices sits on the query-planning and merge_insert
+                    // per-batch paths, and the derivation (segment_coverage plus
+                    // the per-index bitmap rewrites) is otherwise redone on every
+                    // call. The raw ledger and mapping readers are already cached
+                    // by frag_reuse_reader; this caches its derived output.
+                    let derived_key = DerivedIndexListingKey {
+                        version: self.version().version,
+                        store_identity: &self.object_store.store_prefix,
+                        e_tag: self.manifest_location.e_tag.as_deref(),
+                    };
+                    return self
+                        .index_cache
+                        .get_or_insert_with_key(derived_key, || async {
+                            let derived =
+                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                            Ok(derived.as_ref().clone())
+                        })
+                        .await;
+                }
+                version => {
+                    return Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    )));
+                }
+            }
+        }
         if indices.iter().all(index_is_usable) {
             return Ok(indices);
         }
@@ -2633,7 +2669,28 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
     ds.index_statistics(index_name).await
 }
 
+/// Find the FRI entry from the raw manifest listing (bookkeeping path).
+///
+/// This is a metadata-only lookup: it must not drive the query reader's coverage
+/// rewrite, parse the mapping, or fail on a corrupt ledger. Callers that then use
+/// the mapping (for example the v0 reader inside `open_frag_reuse_index`) still
+/// validate it and surface corruption; only the by-name lookup skips that work.
+async fn find_frag_reuse_index_meta(ds: &Dataset) -> Result<Option<IndexMetadata>> {
+    Ok(load_all_indices(ds)
+        .await?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .cloned())
+}
+
 async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
+    if let Some(fri) = find_frag_reuse_index_meta(ds).await?
+        && fri.index_version != 0
+    {
+        return Err(Error::not_supported(
+            "FRI index_version 1 statistics are not implemented. Please upgrade to a supporting version",
+        ));
+    }
     let index = ds
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
@@ -2897,6 +2954,28 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         }
     }
 
+    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
+    // For version 1 and above, load_indices handles version checks and filters index
+    // segments for query use; keep their metadata unchanged here.
+    if indices
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        if indices
+            .iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count()
+            != 1
+        {
+            return Err(Error::corrupt_file_named(
+                "FRI metadata",
+                "tagged history requires a single FRI entry",
+            ));
+        }
+        // Commit bookkeeping carries the original Any unchanged. Only query
+        // loading or an operation consuming FRI needs to interpret its encoding.
+        return Ok(indices);
+    }
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
@@ -3438,7 +3517,21 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
-        if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
+        if let Some(frag_reuse_index_meta) = find_frag_reuse_index_meta(self).await? {
+            if frag_reuse_index_meta.index_version != 0 {
+                // Version-1 consumers are installed separately. The planner excludes
+                // affected segments; independent segments need no legacy remapper.
+                // Maintenance is rejected before entering the legacy write path.
+                return match frag_reuse_index_meta.index_version {
+                    // None means this legacy API cannot provide a reader for FRI index
+                    // version 1; it does not mean the dataset has no FRI.
+                    // Callers must not use this result to authorize index maintenance.
+                    1 => Ok(None),
+                    version => Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    ))),
+                };
+            }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
@@ -3499,7 +3592,11 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
-        if let Ok(indices) = self.load_indices().await {
+        // Bookkeeping-only lookup: the uuid comes off the raw manifest listing,
+        // so it must not drive the query reader's coverage rewrite (nor parse the
+        // mapping, nor fail on a corrupt ledger). Use load_all_indices; the FRI
+        // entry itself is identical in the raw and derived listings.
+        if let Ok(indices) = load_all_indices(self).await {
             indices
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
