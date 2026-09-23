@@ -1797,6 +1797,7 @@ pub(super) fn prepare_write_schema(
         schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
         schema_compare_options.allow_missing_if_nullable = true;
         schema_compare_options.ignore_field_order = true;
+        schema_compare_options.type_comparison = dataset.type_comparison();
         validate_blob_threshold_metadata_for_append(
             &normalized_converted_schema,
             dataset.schema(),

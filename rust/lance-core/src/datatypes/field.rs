@@ -25,7 +25,7 @@ use lance_arrow::{
 };
 
 use super::{
-    Dictionary, LogicalType, Projection,
+    Dictionary, LogicalType, OUTPUT_ENCODING_META_KEY, OutputEncoding, Projection, TypeComparison,
     schema::{compare_fields, explain_fields_difference},
 };
 use crate::{
@@ -100,6 +100,8 @@ pub struct SchemaCompareOptions {
     pub ignore_field_order: bool,
     /// Allow the source schema to be a subset of the target schema (default false)
     pub allow_subschema: bool,
+    /// How the types of two fields are compared (default [`TypeComparison::Exact`])
+    pub type_comparison: TypeComparison,
 }
 
 /// Blob column format version.
@@ -344,7 +346,7 @@ impl Field {
                 self_name, expected.id, self.id
             ));
         }
-        if self.logical_type != expected.logical_type {
+        if !self.type_matches(expected, options.type_comparison) {
             differences.push(format!(
                 "`{}` should have type {} but type was {}",
                 self_name, expected.logical_type, self.logical_type
@@ -432,12 +434,69 @@ impl Field {
             })
             .unwrap_or_else(|| compare_fields(&self.children, &expected.children, options));
         self.name == expected.name
-            && self.logical_type == expected.logical_type
+            && self.type_matches(expected, options.type_comparison)
             && Self::compare_nullability(expected.nullable, self.nullable, options)
             && children_match
             && (!options.compare_field_ids || self.id == expected.id)
             && (!options.compare_dictionary || self.dictionary == expected.dictionary)
             && (!options.compare_metadata || self.metadata == expected.metadata)
+    }
+
+    /// Whether this field's own type is compatible with `expected`'s under
+    /// `comparison`. Children are not compared.
+    pub fn type_matches(&self, expected: &Self, comparison: TypeComparison) -> bool {
+        comparison.logical_types_match(&self.logical_type, &expected.logical_type)
+    }
+
+    /// This field as a table that follows the semantic type contract records
+    /// it.
+    ///
+    /// A legacy alias becomes its canonical semantic type, and the layout the
+    /// alias named becomes the field's [`OUTPUT_ENCODING_META_KEY`] entry when
+    /// it is not the type's default, so reads return the same Arrow type. An
+    /// existing entry takes precedence over the implied layout and is kept
+    /// unchanged, including values this build does not recognize. Children are
+    /// converted the same way; everything else is preserved.
+    pub fn to_canonical_type(&self) -> Result<Self> {
+        let semantic = self.logical_type.semantic().map_err(|err| {
+            Error::schema(format!(
+                "field '{}' of type '{}' has no semantic type: {err}",
+                self.name, self.logical_type
+            ))
+        })?;
+        let mut field = self.clone();
+        field.logical_type = semantic.semantic_type.logical_type();
+        if let Some(implied) = semantic.implied_encoding {
+            field
+                .metadata
+                .entry(OUTPUT_ENCODING_META_KEY.to_string())
+                .or_insert_with(|| implied.to_string());
+        }
+        field.children = self
+            .children
+            .iter()
+            .map(Self::to_canonical_type)
+            .collect::<Result<_>>()?;
+        Ok(field)
+    }
+
+    /// The output encoding named by this field's [`OUTPUT_ENCODING_META_KEY`]
+    /// entry, if it is present and valid for the field's semantic type.
+    ///
+    /// Readers ignore an entry they do not recognize or cannot apply, so an
+    /// unusable entry reads as absent.
+    pub fn recorded_output_encoding(&self) -> Option<OutputEncoding> {
+        let encoding = self
+            .metadata
+            .get(OUTPUT_ENCODING_META_KEY)?
+            .parse::<OutputEncoding>()
+            .ok()?;
+        let semantic = self.logical_type.semantic().ok()?;
+        semantic
+            .semantic_type
+            .check_output_encoding(&encoding)
+            .ok()?;
+        Some(encoding)
     }
 
     pub fn extension_name(&self) -> Option<&str> {
@@ -1526,6 +1585,229 @@ mod tests {
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::from(&field), arrow_field);
         }
+    }
+
+    fn item_field(data_type: DataType) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new("item", data_type, true))
+    }
+
+    /// Reading a legacy `logical_type` through the semantic model changes
+    /// nothing a legacy table observes: the field reports the same Arrow type,
+    /// the model names that same layout, and the layout maps back to the same
+    /// string.
+    #[rstest::rstest]
+    #[case::string(DataType::Utf8)]
+    #[case::large_string(DataType::LargeUtf8)]
+    #[case::binary(DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary)]
+    #[case::dict_string(DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)))]
+    #[case::dict_large_binary(DataType::Dictionary(
+        Box::new(DataType::UInt8),
+        Box::new(DataType::LargeBinary)
+    ))]
+    #[case::list(DataType::List(item_field(DataType::Int32)))]
+    #[case::list_struct(DataType::List(item_field(DataType::Struct(
+        vec![ArrowField::new("a", DataType::Utf8, true)].into()
+    ))))]
+    #[case::large_list(DataType::LargeList(item_field(DataType::Utf8)))]
+    #[case::large_list_struct(DataType::LargeList(item_field(DataType::Struct(
+        vec![ArrowField::new("a", DataType::Int8, true)].into()
+    ))))]
+    #[case::decimal128(DataType::Decimal128(10, 2))]
+    #[case::decimal256_narrow(DataType::Decimal256(10, 2))]
+    #[case::decimal256_wide(DataType::Decimal256(60, 4))]
+    fn test_legacy_alias_round_trip(#[case] data_type: DataType) {
+        let field = Field::try_from(ArrowField::new("a", data_type.clone(), true)).unwrap();
+        let legacy_name = field.logical_type.clone();
+        assert_eq!(field.data_type(), data_type);
+
+        let semantic = legacy_name.semantic().unwrap();
+        let item = field.children.first().map(ArrowField::from);
+        let layout = semantic
+            .semantic_type
+            .layout_data_type(&semantic.output_encoding().unwrap(), item.as_ref())
+            .unwrap();
+        assert_eq!(layout, data_type);
+        assert_eq!(LogicalType::try_from(&layout).unwrap(), legacy_name);
+    }
+
+    #[rstest::rstest]
+    #[case::bool("bool", DataType::Boolean)]
+    #[case::int64("int64", DataType::Int64)]
+    #[case::double("double", DataType::Float64)]
+    #[case::string("string", DataType::Utf8)]
+    #[case::large_string("large_string", DataType::LargeUtf8)]
+    #[case::json("json", DataType::LargeBinary)]
+    #[case::blob("blob", DataType::LargeBinary)]
+    #[case::date("date32:day", DataType::Date32)]
+    #[case::timestamp("timestamp:us:UTC", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))]
+    #[case::decimal128("decimal:128:10:2", DataType::Decimal128(10, 2))]
+    #[case::decimal256("decimal:256:10:2", DataType::Decimal256(10, 2))]
+    #[case::dict(
+        "dict:string:int16:false",
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8))
+    )]
+    #[case::fixed_size_binary("fixed_size_binary:16", DataType::FixedSizeBinary(16))]
+    #[case::fixed_size_list(
+        "fixed_size_list:float:4",
+        DataType::FixedSizeList(item_field(DataType::Float32), 4)
+    )]
+    #[case::canonical_decimal("decimal:10:2", DataType::Decimal128(10, 2))]
+    #[case::canonical_wide_decimal("decimal:40:2", DataType::Decimal256(40, 2))]
+    fn test_leaf_data_type(#[case] logical_type: &str, #[case] expected: DataType) {
+        let field = Field {
+            logical_type: LogicalType::from(logical_type),
+            ..Field::new_arrow("a", DataType::Null, true).unwrap()
+        };
+        assert_eq!(field.data_type(), expected);
+    }
+
+    /// The canonical form renames legacy aliases, records the layout they
+    /// named, and keeps everything else, including nested children.
+    #[test]
+    fn test_to_canonical_type() {
+        let arrow_field = ArrowField::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("name", DataType::LargeUtf8, false)
+                        .with_metadata(HashMap::from([("user".to_string(), "kept".to_string())])),
+                    ArrowField::new(
+                        "tags",
+                        DataType::LargeList(item_field(DataType::Dictionary(
+                            Box::new(DataType::Int8),
+                            Box::new(DataType::Utf8),
+                        ))),
+                        true,
+                    ),
+                    ArrowField::new("price", DataType::Decimal128(10, 2), true),
+                    ArrowField::new("wide", DataType::Decimal256(10, 2), true),
+                    ArrowField::new("id", DataType::Int64, false),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let mut schema =
+            crate::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![arrow_field]))
+                .unwrap();
+        schema.set_field_id(None);
+        let canonical = schema.to_canonical_types().unwrap();
+
+        let described = canonical
+            .fields_pre_order()
+            .map(|field| {
+                (
+                    field.id,
+                    field.logical_type.to_string(),
+                    field.metadata.get(OUTPUT_ENCODING_META_KEY).cloned(),
+                    field.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoding = |value: &str| Some(value.to_string());
+        assert_eq!(
+            described,
+            vec![
+                (0, "struct".to_string(), None, true),
+                (1, "string".to_string(), encoding("large_utf8"), false),
+                (2, "list".to_string(), encoding("large_list"), true),
+                (
+                    3,
+                    "string".to_string(),
+                    encoding("dictionary:int8:utf8"),
+                    true
+                ),
+                (4, "decimal:10:2".to_string(), None, true),
+                (5, "decimal:10:2".to_string(), encoding("decimal256"), true),
+                (6, "int64".to_string(), None, false),
+            ]
+        );
+        let name = canonical.field("s.name").unwrap();
+        assert_eq!(name.metadata.get("user").map(String::as_str), Some("kept"));
+        assert_eq!(
+            name.recorded_output_encoding(),
+            Some(OutputEncoding::LargeUtf8)
+        );
+        // The transform is idempotent, so a canonical schema is its own form.
+        assert_eq!(canonical.to_canonical_types().unwrap(), canonical);
+    }
+
+    #[test]
+    fn test_to_canonical_type_keeps_explicit_output_encoding() {
+        let mut field = Field::new_arrow("a", DataType::LargeUtf8, true).unwrap();
+        field.metadata.insert(
+            OUTPUT_ENCODING_META_KEY.to_string(),
+            "utf8_view".to_string(),
+        );
+        let canonical = field.to_canonical_type().unwrap();
+        assert_eq!(canonical.logical_type.to_string(), "string");
+        assert_eq!(
+            canonical.recorded_output_encoding(),
+            Some(OutputEncoding::Utf8View)
+        );
+
+        let dictionary_of_integers = Field::new_arrow(
+            "a",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+            true,
+        )
+        .unwrap();
+        assert!(dictionary_of_integers.to_canonical_type().is_err());
+    }
+
+    /// An entry that is unknown, or invalid for the field's type, reads as
+    /// absent rather than failing.
+    #[rstest::rstest]
+    #[case::valid("string", "large_utf8", Some(OutputEncoding::LargeUtf8))]
+    #[case::unknown("string", "utf16", None)]
+    #[case::wrong_type("string", "large_binary", None)]
+    #[case::decimal128_too_narrow("decimal:40:2", "decimal128", None)]
+    #[case::unchanged_type("int32", "utf8", None)]
+    fn test_recorded_output_encoding(
+        #[case] logical_type: &str,
+        #[case] value: &str,
+        #[case] expected: Option<OutputEncoding>,
+    ) {
+        let mut field = Field {
+            logical_type: LogicalType::from(logical_type),
+            ..Field::new_arrow("a", DataType::Null, true).unwrap()
+        };
+        field
+            .metadata
+            .insert(OUTPUT_ENCODING_META_KEY.to_string(), value.to_string());
+        assert_eq!(field.recorded_output_encoding(), expected);
+    }
+
+    #[test]
+    fn test_compare_type_comparison() {
+        let table = Field::new_arrow(
+            "a",
+            DataType::Struct(vec![ArrowField::new("b", DataType::Utf8, true)].into()),
+            true,
+        )
+        .unwrap();
+        let input = Field::new_arrow(
+            "a",
+            DataType::Struct(vec![ArrowField::new("b", DataType::LargeUtf8, true)].into()),
+            true,
+        )
+        .unwrap();
+        let exact = SchemaCompareOptions::default();
+        assert!(!input.compare_with_options(&table, &exact));
+        assert!(
+            input
+                .explain_difference(&table, &exact)
+                .unwrap()
+                .contains("should have type string but type was large_string")
+        );
+
+        let semantic = SchemaCompareOptions {
+            type_comparison: TypeComparison::Semantic,
+            ..Default::default()
+        };
+        assert!(input.compare_with_options(&table, &semantic));
+        assert_eq!(input.explain_difference(&table, &semantic), None);
     }
 
     #[test]

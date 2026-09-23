@@ -15,6 +15,7 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 
 mod field;
 mod schema;
+mod semantic;
 
 use crate::{Error, Result};
 pub use field::{
@@ -26,6 +27,10 @@ pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
     validate_fixed_size_list_dimensions,
+};
+pub use semantic::{
+    OUTPUT_ENCODING_META_KEY, OutputEncoding, SemanticLogicalType, SemanticType, SemanticTypeClass,
+    TypeComparison,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -243,7 +248,7 @@ pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct LogicalType(String);
 
 impl fmt::Display for LogicalType {
@@ -502,6 +507,15 @@ impl TryFrom<&LogicalType> for DataType {
                         let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
                     }
+                }
+                "decimal" if splits.len() == 3 => {
+                    // The canonical name of a semantic decimal type carries no
+                    // width, so it reads as the default layout.
+                    let semantic = lt.semantic()?;
+                    let encoding = semantic
+                        .output_encoding()
+                        .expect("decimal types have a default output encoding");
+                    semantic.semantic_type.layout_data_type(&encoding, None)
                 }
                 "decimal" => {
                     if splits.len() != 4 {

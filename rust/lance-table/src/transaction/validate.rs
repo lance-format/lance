@@ -10,7 +10,7 @@
 use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{Field, Schema, TypeComparison};
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use std::collections::{HashMap, HashSet};
@@ -293,7 +293,8 @@ fn merge_schema_valid(
                 field.id, prior_path, new_path
             )));
         }
-        if let Some(changes) = shared_field_binding_changes(prior_field, field)
+        if let Some(changes) =
+            shared_field_binding_changes(prior_field, field, manifest.type_comparison())
             && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
         {
             return Err(Error::invalid_input(format!(
@@ -388,9 +389,13 @@ fn is_field_binding_fully_rewritten(
     })
 }
 
-fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
+fn shared_field_binding_changes(
+    prior: &Field,
+    new: &Field,
+    type_comparison: TypeComparison,
+) -> Option<String> {
     let mut changes = Vec::with_capacity(4);
-    if prior.logical_type != new.logical_type {
+    if !new.type_matches(prior, type_comparison) {
         changes.push(format!(
             "logical type {} -> {}",
             prior.logical_type, new.logical_type

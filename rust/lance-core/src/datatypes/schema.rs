@@ -202,6 +202,19 @@ impl Schema {
         self.fields.iter().any(|f| f.has_dictionary_types())
     }
 
+    /// This schema as a table that follows the semantic type contract records
+    /// it. See [`Field::to_canonical_type`].
+    pub fn to_canonical_types(&self) -> Result<Self> {
+        Ok(Self {
+            fields: self
+                .fields
+                .iter()
+                .map(Field::to_canonical_type)
+                .collect::<Result<_>>()?,
+            metadata: self.metadata.clone(),
+        })
+    }
+
     pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);
