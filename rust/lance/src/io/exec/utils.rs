@@ -374,6 +374,7 @@ pub(crate) fn build_prefilter(
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
     masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<DatasetPreFilter>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -389,7 +390,11 @@ pub(crate) fn build_prefilter(
                 None
             } else {
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter::new(stream)) as Box<dyn FilterLoader>)
+                // Attribute physical materialization to this FTS node. Shared loaders
+                // need a separate owner so racing consumers do not receive arbitrary metrics.
+                Some(Box::new(
+                    FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
@@ -463,6 +468,8 @@ impl FilteredRowIdsToPrefilter {
         }
     }
 
+    // Count physical loader executions: batch ANN shares one loader, whereas
+    // multi-vector ANN can materialize one per query node.
     pub(crate) fn with_metrics(
         mut self,
         metrics: &ExecutionPlanMetricsSet,

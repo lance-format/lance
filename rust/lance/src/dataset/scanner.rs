@@ -17695,14 +17695,104 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
     #[rstest]
     #[tokio::test]
+    async fn test_full_snapshot_prefilter_4bit_pq_recall(
+        #[values(MetricType::L2, MetricType::Dot)] metric: MetricType,
+        #[values(false, true)] postfilter: bool,
+    ) {
+        const DIM: usize = 8;
+        const K: usize = 10;
+        let mut dataset = gen_batch()
+            .with_seed(lance_datagen::Seed(42))
+            .col("id", array::step::<UInt64Type>())
+            .col("vec", array::rand_vec::<Float32Type>((DIM as u32).into()))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        );
+        let codebook = Arc::new(Float32Array::from_iter_values(
+            (0..DIM).flat_map(|_| (0..16).map(|i| i as f32 / 15.0)),
+        ));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            metric,
+            IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+            PQBuildParams::with_codebook(DIM, 4, codebook),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let vectors = data["vec"].as_fixed_size_list();
+
+        // One 512-row partition and k=10 exceed max(FLAT_NUM_4BIT_PQ=200, k).
+        // Thus bulk scoring quantizes the middle rows; small fixtures or a large
+        // refinement budget would accidentally test only the exact prefix.
+        for query_row in [240, 360, 480] {
+            let query = vectors.value(query_row);
+            let make_scanner = |use_index| {
+                let mut scanner = dataset.scan();
+                scanner.project(&["id"]).unwrap();
+                scanner
+                    .nearest("vec", query.as_ref(), K)
+                    .unwrap()
+                    .distance_metric(metric)
+                    .nprobes(1)
+                    .use_index(use_index);
+                if postfilter {
+                    // Postfilter predicates are not passed to the ANN prefilter.
+                    scanner.filter("id >= 16").unwrap();
+                } else {
+                    scanner.prefilter(true);
+                }
+                scanner
+            };
+            let expected = make_scanner(false).try_into_batch().await.unwrap();
+            let implicit = make_scanner(true).try_into_batch().await.unwrap();
+            let mut scoped = make_scanner(true);
+            scoped.with_fragments(dataset.manifest.fragments.as_ref().clone());
+            let plan = scoped.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ANNSubIndex"), "{plan}");
+            let actual = scoped.try_into_batch().await.unwrap();
+            assert_eq!(actual, implicit);
+            let ids = |batch: &RecordBatch| {
+                batch["id"]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            };
+            let expected = ids(&expected);
+            assert!(!expected.is_empty());
+            let actual = ids(&actual);
+            let recall = actual.intersection(&expected).count() as f64 / expected.len() as f64;
+            assert!(
+                recall >= 0.5,
+                "{metric:?}, postfilter={postfilter}, query={query_row}: {recall}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::single("single")]
+    #[case::batch("batch")]
+    #[case::fts("fts")]
+    #[tokio::test]
     async fn test_full_snapshot_prefilter_execution_metrics(
         #[values(false, true)] filtered: bool,
-        #[values(false, true)] batch_query: bool,
+        #[case] search_type: &str,
     ) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
-        test_ds.make_vector_index().await.unwrap();
+        if search_type == "fts" {
+            test_ds.make_fts_index().await.unwrap();
+        } else {
+            test_ds.make_vector_index().await.unwrap();
+        }
         let stats = Arc::new(Mutex::new(None));
         let collected = stats.clone();
         let mut scanner = test_ds.dataset.scan();
@@ -17712,11 +17802,17 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .scan_stats_callback(Arc::new(move |summary| {
                 *collected.lock().unwrap() = Some(summary.clone());
             }));
-        if batch_query {
+        if search_type == "batch" {
             let queries =
                 FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 64]), 32)
                     .unwrap();
             scanner.nearest("vec", &queries, 100).unwrap();
+        } else if search_type == "fts" {
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+                .unwrap()
+                .limit(Some(100), None)
+                .unwrap();
         } else {
             scanner
                 .nearest("vec", &Float32Array::from(vec![0.0; 32]), 100)
@@ -17726,7 +17822,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         if filtered {
             scanner.filter("i >= 200").unwrap();
         }
-        if batch_query {
+        if search_type == "batch" {
             assert!(
                 scanner
                     .explain_plan(false)
@@ -17736,7 +17832,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             );
         }
         let batch = scanner.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), if batch_query { 200 } else { 100 });
+        assert_eq!(
+            batch.num_rows(),
+            if search_type == "batch" { 200 } else { 100 }
+        );
         let summary = stats.lock().unwrap().take().unwrap();
         // The batch node must materialize the shared filter once, not once per query.
         for (name, expected) in [
@@ -17747,6 +17846,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             let value = summary.all_counts.get(name).copied().unwrap_or_default();
             assert_eq!(value, if filtered { expected } else { 0 }, "{name}");
         }
+        let batches = summary
+            .all_counts
+            .get("prefilter_input_batches")
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(batches > 0, filtered);
         for name in [
             "prefilter_load_time",
             "prefilter_input_time",
@@ -17804,6 +17909,16 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_has_all_fragments(i_array);
+
+        // A complete explicit scope must preserve indexed hits and unindexed fallback.
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(fragments.to_vec());
+        let scoped = scanner.try_into_batch().await.unwrap();
+        let mut expected = i_array.values().to_vec();
+        let mut actual = scoped["i"].as_primitive::<Int32Type>().values().to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
 
         // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
         let mut scanner = build_scanner(&test_ds.dataset);
