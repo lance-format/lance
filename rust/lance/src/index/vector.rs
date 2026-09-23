@@ -1262,6 +1262,7 @@ async fn build_vector_index_impl(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_transpose(!params.skip_transpose)
             .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
@@ -2213,7 +2214,88 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
+
+    /// `skip_transpose` is honored for IVF_PQ and IVF_RQ. IVF_HNSW_PQ writes PQ
+    /// storage too, so the flag has to reach its builder as well, or setting it
+    /// silently produces a transposed index.
+    #[rstest::rstest]
+    #[case::skip(true, false)]
+    #[case::keep(false, true)]
+    #[tokio::test]
+    async fn test_hnsw_pq_honors_skip_transpose(
+        #[case] skip_transpose: bool,
+        #[case] expect_transposed: bool,
+    ) {
+        use lance_encoding::decoder::DecoderPlugins;
+        use lance_file::reader::{FileReader, FileReaderOptions};
+        use lance_index::INDEX_AUXILIARY_FILE_NAME;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_index::vector::pq::storage::ProductQuantizationMetadata;
+        use lance_index::vector::storage::STORAGE_METADATA_KEY;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+        use lance_io::utils::CachedFileSize;
+
+        let dim = 16;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        let dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(dim)),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(512))
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+
+        let mut params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+            PQBuildParams::new(4, 8),
+        );
+        params.skip_transpose(skip_transpose);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let aux_path = dataset
+            .indices_dir()
+            .join(indices[0].uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::default_for_testing(),
+        );
+        let reader = FileReader::try_open(
+            scheduler
+                .open_file(&aux_path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let metadata = reader
+            .schema()
+            .metadata
+            .get(STORAGE_METADATA_KEY)
+            .expect("PQ storage metadata");
+        let pq_metadata: ProductQuantizationMetadata =
+            serde_json::from_str(&serde_json::from_str::<Vec<String>>(metadata).unwrap()[0])
+                .unwrap();
+        assert_eq!(
+            pq_metadata.transposed, expect_transposed,
+            "skip_transpose={skip_transpose} should decide the stored layout"
+        );
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
