@@ -1042,6 +1042,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {

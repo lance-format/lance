@@ -627,12 +627,15 @@ pub(crate) async fn open_scalar_index_with_plan(
                 .await?;
             }
 
+            let index_version = u32::try_from(index.index_version).unwrap_or(0);
+
             let index = match batch_remapping {
                 Some(remapping) => {
                     plugin
                         .load_index_with_remapping(
                             index_store,
                             &index_details,
+                            index_version,
                             Some(remapping),
                             &index_cache,
                         )
@@ -640,7 +643,13 @@ pub(crate) async fn open_scalar_index_with_plan(
                 }
                 None => {
                     plugin
-                        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                        .load_index(
+                            index_store,
+                            &index_details,
+                            index_version,
+                            frag_reuse_index,
+                            &index_cache,
+                        )
                         .await?
                 }
             };

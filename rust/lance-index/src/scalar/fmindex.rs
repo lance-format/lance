@@ -2329,6 +2329,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
+        _index_version: u32,
         fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -2839,7 +2840,7 @@ mod tests {
             .unwrap();
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -3268,7 +3269,7 @@ mod tests {
         assert_eq!(created.files[1].path, fmindex_partition_path(1));
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let r = index
