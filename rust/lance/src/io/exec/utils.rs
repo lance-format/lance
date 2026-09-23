@@ -71,19 +71,29 @@ pub enum PreFilterSource {
     None,
 }
 
+pub(crate) struct PreFilterMasks {
+    pub overlay_block: Option<RowAddrMask>,
+    pub external_mask: Option<Arc<RowAddrMask>>,
+}
+
 pub(crate) fn build_prefilter(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
-    overlay_block: Option<RowAddrMask>,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
-            Some(Box::new(FilteredRowIdsToPrefilter::new(stream)) as Box<dyn FilterLoader>)
+            // FTS materializes the same row-ID sets as ANN, so its execution
+            // summary must include the loader work on this node as well.
+            Some(
+                Box::new(FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition))
+                    as Box<dyn FilterLoader>,
+            )
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
             let stream = src_node.execute(partition, context)?;
@@ -95,14 +105,14 @@ pub(crate) fn build_prefilter(
     // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
     // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
     // applies separately to drop index entries staled by a data overlay.
-    let prefilter_loader = match external_mask {
+    let prefilter_loader = match masks.external_mask {
         Some(mask) => {
             Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
         }
         None => prefilter_loader,
     };
     let mut prefilter = DatasetPreFilter::new(ds, index_meta, prefilter_loader);
-    if let Some(overlay_block) = overlay_block {
+    if let Some(overlay_block) = masks.overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
@@ -132,6 +142,7 @@ impl FilteredRowIdsToPrefilter {
         }
     }
 
+    // Count physical loader executions; multi-vector ANN can load once per query node.
     pub(crate) fn with_metrics(
         mut self,
         metrics: &ExecutionPlanMetricsSet,
