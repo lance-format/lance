@@ -7596,3 +7596,27 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+def test_semantic_types_output_encodings(tmp_path: Path):
+    table = pa.table({"s": pa.array(["a", None], pa.large_string())})
+    ds = lance.write_dataset(table, tmp_path / "flagged", data_storage_version="2.3")
+
+    # A string column accepts every string layout, and reads return the
+    # layout it was created with.
+    lance.write_dataset(
+        pa.table({"s": pa.array(["b"], pa.string())}), ds, mode="append"
+    )
+    ds = lance.dataset(tmp_path / "flagged")
+    assert ds.to_table().schema.field("s").type == pa.large_string()
+    assert ds.to_table().column("s").to_pylist() == ["a", None, "b"]
+
+    viewed = ds.to_table(output_encodings={"s": "utf8_view"})
+    assert viewed.schema.field("s").type == pa.string_view()
+    scanned = ds.scanner(output_encodings={"s": "utf8"}).to_table()
+    assert scanned.schema.field("s").type == pa.string()
+
+    with pytest.raises(ValueError, match="decimal128"):
+        ds.to_table(output_encodings={"s": "decimal128"})
+    with pytest.raises(ValueError, match="no such field"):
+        ds.to_table(output_encodings={"missing": "utf8"})
