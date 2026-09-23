@@ -14,6 +14,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 
+use super::OUTPUT_ENCODING_META_KEY;
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
 use crate::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD, ROW_ID,
@@ -211,6 +212,115 @@ impl Schema {
                 .iter()
                 .map(Field::to_canonical_type)
                 .collect::<Result<_>>()?,
+            metadata: self.metadata.clone(),
+        })
+    }
+
+    /// Reject [`OUTPUT_ENCODING_META_KEY`] entries that this schema sets to a
+    /// value that is unknown or invalid for the field's semantic type.
+    ///
+    /// An entry that `previous` already holds with the same value, for the
+    /// field with the same ID, is not being set and passes: readers ignore
+    /// such entries, and a newer build may have written them.
+    pub fn check_output_encoding_entries(&self, previous: Option<&Self>) -> Result<()> {
+        for field in self.fields_pre_order() {
+            let Some(value) = field.metadata.get(OUTPUT_ENCODING_META_KEY) else {
+                continue;
+            };
+            if field.recorded_output_encoding().is_some() {
+                continue;
+            }
+            let unchanged = previous
+                .and_then(|previous| previous.field_by_id(field.id))
+                .and_then(|previous| previous.metadata.get(OUTPUT_ENCODING_META_KEY))
+                == Some(value);
+            if !unchanged {
+                return Err(Error::invalid_input(format!(
+                    "cannot set {OUTPUT_ENCODING_META_KEY} of field '{}' to '{value}': it is not an output encoding of type '{}'",
+                    field.name, field.logical_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// This schema as a data file schema records it. See
+    /// [`Field::to_data_file_field`].
+    pub fn to_data_file_schema(&self) -> Result<Self> {
+        Ok(Self {
+            fields: self
+                .fields
+                .iter()
+                .map(Field::to_data_file_field)
+                .collect::<Result<_>>()?,
+            metadata: self.metadata.clone(),
+        })
+    }
+
+    /// Record the view layouts of `input`, the Arrow schema of data written
+    /// with this schema. See [`Field::record_view_layouts`].
+    pub fn record_view_layouts(&mut self, input: &ArrowSchema) {
+        for input_field in input.fields() {
+            if let Some(field) = self
+                .fields
+                .iter_mut()
+                .find(|f| &f.name == input_field.name())
+            {
+                field.record_view_layouts(input_field);
+            }
+        }
+    }
+
+    /// This table schema with the Arrow layouts `file_schema` records. See
+    /// [`Field::with_file_layout`].
+    pub fn with_file_layouts(&self, file_schema: &Self) -> Self {
+        Self {
+            fields: self
+                .fields
+                .iter()
+                .map(|field| field.with_file_layout(file_schema))
+                .collect(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// This write schema with the Arrow layouts of `input`, the schema of the
+    /// data being written. Fields `input` does not hold keep their layout.
+    /// See [`Field::with_input_layout`].
+    pub fn with_input_layouts(&self, input: &Self) -> Result<Self> {
+        let fields = self
+            .fields
+            .iter()
+            .map(|field| match input.field(&field.name) {
+                Some(input_field) => field.with_input_layout(input_field),
+                None => Ok(field.clone()),
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            fields,
+            metadata: self.metadata.clone(),
+        })
+    }
+
+    /// The fields of this table schema that `input` writes, with `input`'s
+    /// Arrow layouts. See [`Field::with_input_layout`].
+    pub fn project_for_write(&self, input: &Self) -> Result<Self> {
+        let fields = input
+            .fields
+            .iter()
+            .map(|input_field| {
+                self.field(&input_field.name)
+                    .ok_or_else(|| {
+                        Error::schema(format!(
+                            "field '{}' does not exist in the table schema",
+                            input_field.name
+                        ))
+                    })?
+                    .with_input_layout(input_field)
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            fields,
             metadata: self.metadata.clone(),
         })
     }

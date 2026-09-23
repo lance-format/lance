@@ -34,7 +34,7 @@ use lance_file::{
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
-use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+use lance_table::feature_flags::{FLAG_MIXED_DATA_FILE_VERSIONS, creates_semantic_types};
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
@@ -49,7 +49,7 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
+use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
@@ -151,6 +151,17 @@ pub async fn write_fragments(
         }
         _ => normalized_schema,
     };
+    let semantic_types = dataset.map_or_else(
+        || creates_semantic_types(version),
+        |dataset| dataset.manifest.uses_semantic_types(),
+    );
+    if semantic_types && (dataset.is_none() || matches!(params.mode, WriteMode::Overwrite)) {
+        // This write defines the table schema, so reject inputs that have no
+        // semantic type or that set an invalid output encoding before any data
+        // file is written.
+        normalized_schema.check_output_encoding_entries(None)?;
+        normalized_schema.to_canonical_types()?;
+    }
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
         dataset,
@@ -158,6 +169,15 @@ pub async fn write_fragments(
         &params,
         schema_compare_options(version),
     )?;
+    // Under the semantic type contract, each data file records the layouts of
+    // the data written to it, which callers may pass in any accepted layout.
+    let schema = if semantic_types {
+        let mut input_schema = Schema::try_from(data.schema().as_ref())?;
+        input_schema.record_view_layouts(data.schema().as_ref());
+        schema.with_input_layouts(&input_schema)?
+    } else {
+        schema
+    };
     match version {
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::validate_legacy_blob_write_schema(&schema, &version_name)?;

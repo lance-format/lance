@@ -681,6 +681,13 @@ pub(super) async fn can_use_binary_copy_current(
         );
         return Ok(false);
     }
+    // Under the semantic type contract, data files of one column may hold
+    // different layouts, and copied pages keep theirs.
+    let data_file_schema = dataset
+        .manifest
+        .uses_semantic_types()
+        .then(|| dataset.schema().to_data_file_schema())
+        .transpose()?;
     for fragment in fragments {
         // Binary copy only reads base files; overlays must be materialized by the scanner.
         if !fragment.overlays.is_empty() {
@@ -731,6 +738,21 @@ pub(super) async fn can_use_binary_copy_current(
                     file_meta.file_buffers.len()
                 );
                 return Ok(false);
+            }
+            if let Some(data_file_schema) = &data_file_schema {
+                let differs = data_file_schema.fields_pre_order().any(|field| {
+                    file_meta
+                        .file_schema
+                        .field_by_id(field.id)
+                        .is_some_and(|file_field| file_field.logical_type != field.logical_type)
+                });
+                if differs {
+                    log::debug!(
+                        "Binary copy disabled: data file {} stores a column in another layout",
+                        data_file.path
+                    );
+                    return Ok(false);
+                }
             }
         }
     }

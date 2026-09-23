@@ -141,7 +141,9 @@ pub async fn rewrite_files_binary_copy(
     // - Writes a new footer (schema descriptor, column metadata, offset tables, version)
     // - Optionally carries forward stable row ids and persists them inline in fragment metadata
     // Merge small Lance files into larger ones by page-level binary copy.
-    let schema = dataset.schema().clone();
+    // The copied pages keep their layouts, which eligibility requires to be
+    // the ones the table schema's data file form records.
+    let schema = dataset.schema().to_data_file_schema()?;
     let column_count = schema
         .fields
         .iter()

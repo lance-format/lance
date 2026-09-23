@@ -164,12 +164,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let (writer, data_file) = create_writer(obj_writer, schema, filename)?;
+        let file_schema = schema.to_data_file_schema()?;
+        let (writer, data_file) = create_writer(obj_writer, file_schema.clone(), filename)?;
         fragment.files.push(data_file.clone());
 
         progress.begin(&fragment).await?;
 
-        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None);
+        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None, &file_schema);
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
         let mut broken_stream = break_stream(stream, break_limit);

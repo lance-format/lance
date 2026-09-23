@@ -25,7 +25,8 @@ use lance_arrow::{
 };
 
 use super::{
-    Dictionary, LogicalType, OUTPUT_ENCODING_META_KEY, OutputEncoding, Projection, TypeComparison,
+    Dictionary, LogicalType, OUTPUT_ENCODING_META_KEY, OutputEncoding, Projection, SemanticType,
+    SemanticTypeClass, TypeComparison,
     schema::{compare_fields, explain_fields_difference},
 };
 use crate::{
@@ -160,6 +161,16 @@ pub struct Field {
     /// None means the field is not part of the clustering key.
     /// Some(n) means this field is the nth column in the clustering key.
     pub unenforced_clustering_key_position: Option<u32>,
+
+    /// The Arrow layout of this field under the semantic type contract.
+    ///
+    /// Fields of a table that follows the contract always carry it when their
+    /// semantic type has output encodings: it is the table's output encoding,
+    /// or the layout of data being written to the table. Legacy table and data
+    /// file fields never carry it, because their `logical_type` names exactly
+    /// one Arrow type. A table records it as the [`OUTPUT_ENCODING_META_KEY`]
+    /// field metadata entry when it is not the type's default.
+    pub output_encoding: Option<OutputEncoding>,
 }
 
 impl Field {
@@ -171,6 +182,9 @@ impl Field {
 
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
+        if let Some(data_type) = self.output_encoding_data_type() {
+            return data_type;
+        }
         match &self.logical_type {
             lt if lt.is_list() => DataType::List(Arc::new(ArrowField::from(&self.children[0]))),
             lt if lt.is_large_list() => {
@@ -194,6 +208,44 @@ impl Field {
             }
             lt => DataType::try_from(lt).unwrap(),
         }
+    }
+
+    /// The Arrow layout [`Self::output_encoding`] selects, when it selects one.
+    ///
+    /// Output encodings of value-transforming types select a conversion rather
+    /// than a layout, so those fields keep the type `logical_type` names.
+    fn output_encoding_data_type(&self) -> Option<DataType> {
+        let encoding = self.output_encoding.as_ref()?;
+        let semantic = self.logical_type.semantic().ok()?;
+        let item = self.children.first().map(ArrowField::from);
+        semantic
+            .semantic_type
+            .layout_data_type(encoding, item.as_ref())
+            .ok()
+    }
+
+    /// The Arrow type of `other` that projections and intersections compare
+    /// with this field's.
+    ///
+    /// A field with an output encoding follows the semantic type contract,
+    /// where another layout of the same semantic type holds the same values,
+    /// so it compares as this field's own layout. Otherwise it is `other`'s.
+    fn layout_to_compare(&self, other: &Self) -> DataType {
+        if self.output_encoding.is_some() && self.type_matches(other, TypeComparison::Semantic) {
+            self.data_type()
+        } else {
+            other.data_type()
+        }
+    }
+
+    /// This field's semantic type and the output encoding of its Arrow layout.
+    fn semantic_layout(&self) -> Option<(SemanticType, Option<OutputEncoding>)> {
+        let semantic = self.logical_type.semantic().ok()?;
+        let encoding = self
+            .output_encoding
+            .clone()
+            .or_else(|| semantic.output_encoding());
+        Some((semantic.semantic_type, encoding))
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -445,18 +497,29 @@ impl Field {
     /// Whether this field's own type is compatible with `expected`'s under
     /// `comparison`. Children are not compared.
     pub fn type_matches(&self, expected: &Self, comparison: TypeComparison) -> bool {
-        comparison.logical_types_match(&self.logical_type, &expected.logical_type)
+        if self.output_encoding.is_none() && expected.output_encoding.is_none() {
+            return comparison.logical_types_match(&self.logical_type, &expected.logical_type);
+        }
+        // With an output encoding the string no longer names the layout, so an
+        // exact comparison compares the layouts it resolves to.
+        match (self.semantic_layout(), expected.semantic_layout()) {
+            (Some((actual_type, actual_layout)), Some((expected_type, expected_layout))) => {
+                actual_type == expected_type
+                    && (comparison == TypeComparison::Semantic || actual_layout == expected_layout)
+            }
+            _ => false,
+        }
     }
 
-    /// This field as a table that follows the semantic type contract records
-    /// it.
+    /// This field as a table that follows the semantic type contract holds it.
     ///
-    /// A legacy alias becomes its canonical semantic type, and the layout the
-    /// alias named becomes the field's [`OUTPUT_ENCODING_META_KEY`] entry when
-    /// it is not the type's default, so reads return the same Arrow type. An
-    /// existing entry takes precedence over the implied layout and is kept
-    /// unchanged, including values this build does not recognize. Children are
-    /// converted the same way; everything else is preserved.
+    /// A legacy alias becomes its canonical semantic type. The output encoding
+    /// comes from, in order, a valid [`OUTPUT_ENCODING_META_KEY`] entry, which
+    /// moves out of the metadata, the output encoding already set, the layout
+    /// the alias named, and the type's default, so reads return the same Arrow
+    /// type. An entry this build does not recognize, or that is not valid for
+    /// the type, stays in the metadata unchanged and has no effect. Children
+    /// are converted the same way, and everything else is preserved.
     pub fn to_canonical_type(&self) -> Result<Self> {
         let semantic = self.logical_type.semantic().map_err(|err| {
             Error::schema(format!(
@@ -465,19 +528,161 @@ impl Field {
             ))
         })?;
         let mut field = self.clone();
-        field.logical_type = semantic.semantic_type.logical_type();
-        if let Some(implied) = semantic.implied_encoding {
-            field
-                .metadata
-                .entry(OUTPUT_ENCODING_META_KEY.to_string())
-                .or_insert_with(|| implied.to_string());
+        let recorded = self.recorded_output_encoding();
+        if recorded.is_some() {
+            field.metadata.remove(OUTPUT_ENCODING_META_KEY);
         }
+        field.output_encoding = recorded
+            .or_else(|| self.output_encoding.clone())
+            .or_else(|| semantic.output_encoding());
+        field.logical_type = semantic.semantic_type.logical_type();
         field.children = self
             .children
             .iter()
             .map(Self::to_canonical_type)
             .collect::<Result<_>>()?;
         Ok(field)
+    }
+
+    /// This field as a data file schema records it: the Arrow-mapped
+    /// `logical_type` of its exact layout, without an output encoding.
+    ///
+    /// A view layout is recorded as the offset layout with 64-bit offsets,
+    /// which holds every value; writers convert view arrays to it. Fields
+    /// whose `logical_type` already names their layout are unchanged.
+    pub fn to_data_file_field(&self) -> Result<Self> {
+        let mut field = self.clone();
+        if self.is_representation_only() {
+            let data_type = match self.data_type() {
+                DataType::Utf8View => DataType::LargeUtf8,
+                DataType::BinaryView => DataType::LargeBinary,
+                data_type => data_type,
+            };
+            field.logical_type = LogicalType::try_from(&data_type)?;
+        }
+        field.output_encoding = None;
+        field.children = self
+            .children
+            .iter()
+            .map(Self::to_data_file_field)
+            .collect::<Result<_>>()?;
+        Ok(field)
+    }
+
+    /// Record the view layouts of `input`, the Arrow field of data written to
+    /// this field, as output encodings.
+    ///
+    /// Converting from Arrow reads a view as the offset layout of the same
+    /// width, which is how legacy tables store it. Under the semantic type
+    /// contract a view is its own output encoding, and writers store view data
+    /// in a layout that holds every value.
+    pub fn record_view_layouts(&mut self, input: &ArrowField) {
+        if matches!(input.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            self.output_encoding = OutputEncoding::of_data_type(input.data_type());
+        }
+        match input.data_type() {
+            DataType::Struct(input_children) => {
+                for input_child in input_children {
+                    if let Some(child) = self.child_mut(input_child.name()) {
+                        child.record_view_layouts(input_child);
+                    }
+                }
+            }
+            DataType::List(item)
+            | DataType::LargeList(item)
+            | DataType::FixedSizeList(item, _)
+            | DataType::Map(item, _) => {
+                if let Some(child) = self.children.first_mut() {
+                    child.record_view_layouts(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// This table field with the Arrow layouts a data file records for it.
+    ///
+    /// Representation-only fields that `file_schema` holds, matched by field
+    /// ID, take the file's layout; everything else is unchanged. Decoders only
+    /// produce the layout a file stores, so readers decode in it and convert to
+    /// the table's output encodings afterwards.
+    pub fn with_file_layout(&self, file_schema: &super::Schema) -> Self {
+        let mut field = self.clone();
+        if !self.is_blob()
+            && let Some(file_field) = file_schema.field_by_id(self.id)
+            && self.is_representation_only()
+            && file_field.type_matches(self, TypeComparison::Semantic)
+        {
+            field.logical_type = file_field.logical_type.clone();
+            field.output_encoding = None;
+        }
+        field.children = self
+            .children
+            .iter()
+            .map(|child| child.with_file_layout(file_schema))
+            .collect();
+        field
+    }
+
+    fn is_representation_only(&self) -> bool {
+        self.logical_type.semantic().is_ok_and(|semantic| {
+            semantic.semantic_type.class() == SemanticTypeClass::RepresentationOnly
+        })
+    }
+
+    /// This table field with the Arrow layouts of `input`, a field of data
+    /// being written to it.
+    ///
+    /// Representation-only fields take `input`'s layout, so each data file
+    /// records the layout it actually encodes. Everything else, including field
+    /// IDs and metadata, comes from this field. Struct children are matched by
+    /// name and the child of a list or map by position; children missing from
+    /// `input` are left out. The types must already be compatible under
+    /// [`TypeComparison::Semantic`].
+    pub fn with_input_layout(&self, input: &Self) -> Result<Self> {
+        let mut field = self.clone();
+        if self.is_blob() {
+            return Ok(field);
+        }
+        if self.is_representation_only() {
+            field.logical_type = input.logical_type.clone();
+            field.output_encoding = input.output_encoding.clone();
+        }
+        field.children = if self.logical_type.is_struct() {
+            input
+                .children
+                .iter()
+                .map(|input_child| {
+                    self.child(&input_child.name)
+                        .ok_or_else(|| {
+                            Error::schema(format!(
+                                "field '{}' has no child '{}'",
+                                self.name, input_child.name
+                            ))
+                        })?
+                        .with_input_layout(input_child)
+                })
+                .collect::<Result<_>>()?
+        } else {
+            self.children
+                .iter()
+                .zip(&input.children)
+                .map(|(child, input_child)| child.with_input_layout(input_child))
+                .collect::<Result<_>>()?
+        };
+        Ok(field)
+    }
+
+    /// The value a table records in this field's [`OUTPUT_ENCODING_META_KEY`]
+    /// entry: its output encoding, unless that is the type's default.
+    pub fn output_encoding_entry(&self) -> Option<String> {
+        let encoding = self.output_encoding.as_ref()?;
+        let default = self
+            .logical_type
+            .semantic()
+            .ok()
+            .and_then(|semantic| semantic.semantic_type.default_output_encoding());
+        (default.as_ref() != Some(encoding)).then(|| encoding.to_string())
     }
 
     /// The output encoding named by this field's [`OUTPUT_ENCODING_META_KEY`]
@@ -766,6 +971,7 @@ impl Field {
             dictionary: self.dictionary.clone(),
             unenforced_primary_key_position: self.unenforced_primary_key_position,
             unenforced_clustering_key_position: self.unenforced_clustering_key_position,
+            output_encoding: self.output_encoding.clone(),
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -856,7 +1062,7 @@ impl Field {
             return Ok(self.clone());
         }
 
-        match (self.data_type(), other.data_type()) {
+        match (self.data_type(), self.layout_to_compare(other)) {
             (DataType::Boolean, DataType::Boolean) => Ok(self.clone()),
             (dt, other_dt)
                 if (dt.is_primitive() && other_dt.is_primitive())
@@ -1000,7 +1206,7 @@ impl Field {
         }
 
         let self_type = self.data_type();
-        let other_type = other.data_type();
+        let other_type = self.layout_to_compare(other);
 
         if matches!(
             (&self_type, &other_type),
@@ -1039,6 +1245,7 @@ impl Field {
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
                 unenforced_clustering_key_position: self.unenforced_clustering_key_position,
+                output_encoding: self.output_encoding.clone(),
             };
             return Ok(f);
         }
@@ -1100,6 +1307,7 @@ impl Field {
                 dictionary: self.dictionary.clone(),
                 unenforced_primary_key_position: self.unenforced_primary_key_position,
                 unenforced_clustering_key_position: self.unenforced_clustering_key_position,
+                output_encoding: self.output_encoding.clone(),
             })
         }
     }
@@ -1371,6 +1579,7 @@ impl TryFrom<&ArrowField> for Field {
             dictionary: None,
             unenforced_primary_key_position,
             unenforced_clustering_key_position,
+            output_encoding: None,
         })
     }
 }
@@ -1688,9 +1897,10 @@ mod tests {
             ),
             true,
         );
-        let mut schema =
-            crate::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![arrow_field]))
-                .unwrap();
+        let mut schema = crate::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+            arrow_field.clone(),
+        ]))
+        .unwrap();
         schema.set_field_id(None);
         let canonical = schema.to_canonical_types().unwrap();
 
@@ -1700,7 +1910,7 @@ mod tests {
                 (
                     field.id,
                     field.logical_type.to_string(),
-                    field.metadata.get(OUTPUT_ENCODING_META_KEY).cloned(),
+                    field.output_encoding.as_ref().map(ToString::to_string),
                     field.nullable,
                 )
             })
@@ -1718,19 +1928,25 @@ mod tests {
                     encoding("dictionary:int8:utf8"),
                     true
                 ),
-                (4, "decimal:10:2".to_string(), None, true),
+                (4, "decimal:10:2".to_string(), encoding("decimal128"), true),
                 (5, "decimal:10:2".to_string(), encoding("decimal256"), true),
                 (6, "int64".to_string(), None, false),
             ]
         );
         let name = canonical.field("s.name").unwrap();
         assert_eq!(name.metadata.get("user").map(String::as_str), Some("kept"));
+        // Only encodings other than the default are recorded.
+        assert_eq!(name.output_encoding_entry().as_deref(), Some("large_utf8"));
         assert_eq!(
-            name.recorded_output_encoding(),
-            Some(OutputEncoding::LargeUtf8)
+            canonical.field("s.price").unwrap().output_encoding_entry(),
+            None
         );
+        // Every field reads back as the Arrow type it was created from.
+        assert_eq!(ArrowField::from(&canonical.fields[0]), arrow_field);
         // The transform is idempotent, so a canonical schema is its own form.
         assert_eq!(canonical.to_canonical_types().unwrap(), canonical);
+        // The data file form names the exact layouts again.
+        assert_eq!(canonical.to_data_file_schema().unwrap(), schema);
     }
 
     #[test]
@@ -1742,9 +1958,22 @@ mod tests {
         );
         let canonical = field.to_canonical_type().unwrap();
         assert_eq!(canonical.logical_type.to_string(), "string");
+        assert_eq!(canonical.output_encoding, Some(OutputEncoding::Utf8View));
+        assert!(!canonical.metadata.contains_key(OUTPUT_ENCODING_META_KEY));
+        assert_eq!(canonical.data_type(), DataType::Utf8View);
+
+        // An entry a reader cannot apply stays in the metadata, unused.
+        field
+            .metadata
+            .insert(OUTPUT_ENCODING_META_KEY.to_string(), "utf16".to_string());
+        let canonical = field.to_canonical_type().unwrap();
+        assert_eq!(canonical.output_encoding, Some(OutputEncoding::LargeUtf8));
         assert_eq!(
-            canonical.recorded_output_encoding(),
-            Some(OutputEncoding::Utf8View)
+            canonical
+                .metadata
+                .get(OUTPUT_ENCODING_META_KEY)
+                .map(String::as_str),
+            Some("utf16")
         );
 
         let dictionary_of_integers = Field::new_arrow(
@@ -1777,6 +2006,100 @@ mod tests {
             .metadata
             .insert(OUTPUT_ENCODING_META_KEY.to_string(), value.to_string());
         assert_eq!(field.recorded_output_encoding(), expected);
+    }
+
+    /// Views are stored as the offset layout that holds every value, and
+    /// canonical-only names become the layout they read as.
+    #[rstest::rstest]
+    #[case::utf8_view(DataType::Utf8View, "large_string")]
+    #[case::binary_view(DataType::BinaryView, "large_binary")]
+    #[case::large_utf8(DataType::LargeUtf8, "large_string")]
+    #[case::decimal(DataType::Decimal128(10, 2), "decimal:128:10:2")]
+    #[case::wide_decimal(DataType::Decimal256(40, 2), "decimal:256:40:2")]
+    fn test_to_data_file_field(#[case] layout: DataType, #[case] recorded: &str) {
+        let mut field = Field::new_arrow("a", layout.clone(), true)
+            .unwrap()
+            .to_canonical_type()
+            .unwrap();
+        field.record_view_layouts(&ArrowField::new("a", layout, true));
+        let data_file_field = field.to_data_file_field().unwrap();
+        assert_eq!(data_file_field.logical_type.to_string(), recorded);
+        assert_eq!(data_file_field.output_encoding, None);
+    }
+
+    /// A write takes field IDs and metadata from the table and layouts from
+    /// the input; a read takes layouts from the data file.
+    #[test]
+    fn test_input_and_file_layouts() {
+        let struct_of = |data_type: DataType| {
+            DataType::Struct(vec![ArrowField::new("b", data_type, true)].into())
+        };
+        let mut table = Field::new_arrow("a", struct_of(DataType::Utf8View), true).unwrap();
+        table.record_view_layouts(&ArrowField::new("a", struct_of(DataType::Utf8View), true));
+        let mut id = 0;
+        table.set_id(-1, &mut id);
+        table.children[0]
+            .metadata
+            .insert("lance-encoding:compression".to_string(), "zstd".to_string());
+        let table = table.to_canonical_type().unwrap();
+        assert_eq!(
+            table.children[0].output_encoding,
+            Some(OutputEncoding::Utf8View)
+        );
+
+        let input = Field::new_arrow("a", struct_of(DataType::LargeUtf8), true).unwrap();
+        assert!(!input.compare_with_options(&table, &SchemaCompareOptions::default()));
+        let write = table.with_input_layout(&input).unwrap();
+        assert_eq!(write.children[0].data_type(), DataType::LargeUtf8);
+        assert_eq!(write.children[0].id, 1);
+        assert_eq!(
+            write.children[0].metadata.get("lance-encoding:compression"),
+            Some(&"zstd".to_string())
+        );
+
+        let file_schema = crate::datatypes::Schema {
+            fields: vec![write.to_data_file_field().unwrap()],
+            metadata: HashMap::new(),
+        };
+        let read = table.with_file_layout(&file_schema);
+        assert_eq!(read.children[0].data_type(), DataType::LargeUtf8);
+        assert_eq!(table.children[0].data_type(), DataType::Utf8View);
+        // Exact comparisons of fields with output encodings compare layouts.
+        assert!(read.type_matches(&write, TypeComparison::Exact));
+        assert!(!read.children[0].type_matches(&table.children[0], TypeComparison::Exact));
+        assert!(read.children[0].type_matches(&table.children[0], TypeComparison::Semantic));
+    }
+
+    #[test]
+    fn test_check_output_encoding_entries() {
+        let schema_with = |value: &str| {
+            let mut field = Field::new_arrow("a", DataType::Utf8, true).unwrap();
+            field.id = 0;
+            field
+                .metadata
+                .insert(OUTPUT_ENCODING_META_KEY.to_string(), value.to_string());
+            crate::datatypes::Schema {
+                fields: vec![field],
+                metadata: HashMap::new(),
+            }
+        };
+        schema_with("large_utf8")
+            .check_output_encoding_entries(None)
+            .unwrap();
+        let err = schema_with("decimal128")
+            .check_output_encoding_entries(None)
+            .unwrap_err();
+        assert!(err.to_string().contains("decimal128"), "{err}");
+        // An entry carried unchanged was not set by this update.
+        let unknown = schema_with("utf16");
+        unknown
+            .check_output_encoding_entries(Some(&unknown))
+            .unwrap();
+        assert!(
+            schema_with("utf16")
+                .check_output_encoding_entries(Some(&schema_with("utf32")))
+                .is_err()
+        );
     }
 
     #[test]

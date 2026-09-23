@@ -11,8 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_SEMANTIC_TYPES, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    creates_semantic_types, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -41,7 +42,7 @@ use crate::transaction::{
 };
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
-    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION, OUTPUT_ENCODING_META_KEY,
 };
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
@@ -197,6 +198,11 @@ impl Transaction {
             )));
         }
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
+        if manifest.uses_semantic_types() {
+            // A version from before the table adopted the contract holds legacy
+            // aliases, which read as their canonical types and output encodings.
+            manifest.schema = manifest.schema.to_canonical_types()?;
+        }
         Ok((manifest, indices))
     }
 
@@ -1462,6 +1468,15 @@ impl Transaction {
 
         manifest.tag.clone_from(&self.tag);
 
+        // The contract is decided once, when the table is created; the flag is
+        // sticky, so apply_feature_flags and inheritance keep it from then on.
+        if current_manifest.is_none()
+            && creates_semantic_types(manifest.data_storage_format.lance_file_format())
+        {
+            manifest.reader_feature_flags |= FLAG_SEMANTIC_TYPES;
+            manifest.writer_feature_flags |= FLAG_SEMANTIC_TYPES;
+        }
+
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
@@ -1566,8 +1581,20 @@ impl Transaction {
                         .iter()
                         .any(|entry| entry.key == LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
                 });
+                let semantic_types = manifest.uses_semantic_types();
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
+                        if semantic_types {
+                            // Updates see the output encoding as the metadata
+                            // entry it is recorded as; the schema is converted
+                            // back to canonical form once all updates apply.
+                            if let Some(entry) = field.output_encoding_entry() {
+                                field
+                                    .metadata
+                                    .insert(OUTPUT_ENCODING_META_KEY.to_string(), entry);
+                            }
+                            field.output_encoding = None;
+                        }
                         apply_update_map(&mut field.metadata, field_metadata_update);
                         // Also set unenforced primary key based on updated field metadata.
                         field.unenforced_primary_key_position = field
@@ -1688,6 +1715,17 @@ impl Transaction {
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
+        }
+
+        if manifest.uses_semantic_types() {
+            // Output encodings are checked when set; entries carried over
+            // unchanged were written by other builds and are left alone.
+            manifest.schema.check_output_encoding_entries(
+                current_manifest
+                    .filter(|current| current.uses_semantic_types())
+                    .map(|current| &current.schema),
+            )?;
+            manifest.schema = manifest.schema.to_canonical_types()?;
         }
 
         Ok((manifest, final_indices))

@@ -1378,7 +1378,15 @@ async fn test_write_manifest(
         manifest.data_storage_format.version.to_manifest_string(),
         "stable" | "next"
     ));
-    assert_eq!(manifest.reader_feature_flags, 0);
+    // A new table follows the semantic type contract from data storage 2.3 on.
+    let creation_flags = if feature_flags::creates_semantic_types(
+        manifest.data_storage_format.lance_file_format(),
+    ) {
+        feature_flags::FLAG_SEMANTIC_TYPES
+    } else {
+        0
+    };
+    assert_eq!(manifest.reader_feature_flags, creation_flags);
 
     // Create one with deletions
     dataset.delete("i < 10").await.unwrap();
@@ -1399,11 +1407,11 @@ async fn test_write_manifest(
     .unwrap();
     assert_eq!(
         manifest.writer_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | creation_flags
     );
     assert_eq!(
         manifest.reader_feature_flags,
-        feature_flags::FLAG_DELETION_FILES
+        feature_flags::FLAG_DELETION_FILES | creation_flags
     );
 
     // Write with custom manifest
@@ -4169,4 +4177,566 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
         .await
         .expect("removing the offending rows must not be blocked under MemWAL");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+}
+
+fn string_array(data_type: &DataType, values: &[Option<&str>]) -> ArrayRef {
+    let utf8: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+    arrow_cast::cast(&utf8, data_type).unwrap()
+}
+
+/// Write one column `s` of `array` to `uri` and return the dataset.
+async fn write_single_column(
+    uri: &str,
+    array: ArrayRef,
+    mode: WriteMode,
+    version: Option<LanceFileVersion>,
+) -> Result<Dataset> {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        array.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode,
+            data_storage_version: version,
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// The Arrow type each fragment's data file records for `column`.
+async fn data_file_layouts(dataset: &Dataset, column: &str) -> Vec<DataType> {
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
+
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::default_for_testing(),
+    );
+    let mut layouts = Vec::new();
+    for fragment in dataset.manifest.fragments.iter() {
+        let data_file = &fragment.files[0];
+        let path = dataset
+            .data_file_dir(data_file)
+            .unwrap()
+            .join(data_file.path.as_str());
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let metadata = lance_file::reader::FileReader::read_all_metadata(&file)
+            .await
+            .unwrap();
+        layouts.push(metadata.file_schema.field(column).unwrap().data_type());
+    }
+    layouts
+}
+
+/// On a table under the semantic type contract, a `string` column accepts
+/// every string layout. Each data file keeps the layout it was written in, and
+/// reads return the layout the column was created with.
+#[rstest]
+#[case::utf8(DataType::Utf8, None)]
+#[case::large_utf8(DataType::LargeUtf8, Some("large_utf8"))]
+#[case::utf8_view(DataType::Utf8View, Some("utf8_view"))]
+#[case::dictionary(
+    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+    Some("dictionary:int16:utf8")
+)]
+#[tokio::test]
+async fn test_semantic_string_column_accepts_every_layout(
+    #[case] created: DataType,
+    #[case] output_encoding: Option<&str>,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let appended = [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+    ];
+    let mut expected = vec![Some("a"), None, Some("a")];
+    write_single_column(
+        uri,
+        string_array(&created, &expected),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    for (index, layout) in appended.iter().enumerate() {
+        let value = format!("v{index}");
+        let values = [Some(value.as_str()), None];
+        write_single_column(uri, string_array(layout, &values), WriteMode::Append, None)
+            .await
+            .unwrap();
+        expected.push(Some(Box::leak(value.into_boxed_str())));
+        expected.push(None);
+    }
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_SEMANTIC_TYPES,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & feature_flags::FLAG_SEMANTIC_TYPES,
+        0
+    );
+    let field = dataset.schema().field("s").unwrap();
+    assert_eq!(field.logical_type.to_string(), "string");
+    assert_eq!(field.output_encoding_entry().as_deref(), output_encoding);
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.column(0).data_type(), &created);
+    assert_eq!(
+        batch.column(0).as_ref(),
+        string_array(&created, &expected).as_ref()
+    );
+
+    // A view is stored as the offset layout that holds every value.
+    let stored = |layout: &DataType| match layout {
+        DataType::Utf8View => DataType::LargeUtf8,
+        layout => layout.clone(),
+    };
+    let mut expected_layouts = vec![stored(&created)];
+    expected_layouts.extend(appended.iter().map(stored));
+    assert_eq!(data_file_layouts(&dataset, "s").await, expected_layouts);
+}
+
+/// Compaction and scalar indices read a column whose data files hold different
+/// layouts, and see the same values in the table's output layout.
+#[rstest]
+#[case::reencode(crate::dataset::optimize::CompactionMode::Reencode)]
+#[case::try_binary_copy(crate::dataset::optimize::CompactionMode::TryBinaryCopy)]
+#[tokio::test]
+async fn test_semantic_mixed_layouts_compact_and_index(
+    #[case] compaction_mode: crate::dataset::optimize::CompactionMode,
+) {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let writes = [
+        (DataType::Utf8, [Some("a"), Some("b")]),
+        (DataType::LargeUtf8, [Some("c"), Some("a")]),
+        (DataType::Utf8View, [Some("a"), None]),
+        (
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            [Some("e"), Some("a")],
+        ),
+    ];
+    for (index, (layout, values)) in writes.iter().enumerate() {
+        let mode = if index == 0 {
+            WriteMode::Create
+        } else {
+            WriteMode::Append
+        };
+        write_single_column(
+            uri,
+            string_array(layout, values),
+            mode,
+            Some(LanceFileVersion::V2_3),
+        )
+        .await
+        .unwrap();
+    }
+    let expected = string_array(
+        &DataType::Utf8,
+        &writes
+            .iter()
+            .flat_map(|(_, values)| values.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    dataset
+        .create_index(
+            &["s"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    async fn count_indexed(dataset: &Dataset, predicate: &str) -> usize {
+        let mut scan = dataset.scan();
+        scan.filter(predicate).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        scan.try_into_batch().await.unwrap().num_rows()
+    }
+    assert_eq!(count_indexed(&dataset, "s = 'a'").await, 4);
+    assert_eq!(count_indexed(&dataset, "s = 'e'").await, 1);
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            compaction_mode: Some(compaction_mode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.column(0).as_ref(), expected.as_ref());
+    assert_eq!(count_indexed(&dataset, "s = 'a'").await, 4);
+    assert_eq!(count_indexed(&dataset, "s = 'c'").await, 1);
+}
+
+/// A decimal column accepts either width that holds its precision, and
+/// rejects another precision, which is a different value domain.
+#[tokio::test]
+async fn test_semantic_decimal_column_widths() {
+    use arrow_array::{Decimal128Array, Decimal256Array};
+    use arrow_buffer::i256;
+
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let decimal128 = |precision: u8, values: Vec<Option<i128>>| -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(precision, 2)
+                .unwrap(),
+        )
+    };
+    write_single_column(
+        uri,
+        decimal128(10, vec![Some(100), None]),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    let wider: ArrayRef = Arc::new(
+        Decimal256Array::from(vec![Some(i256::from(-250))])
+            .with_precision_and_scale(10, 2)
+            .unwrap(),
+    );
+    write_single_column(uri, wider, WriteMode::Append, None)
+        .await
+        .unwrap();
+    let err = write_single_column(uri, decimal128(12, vec![Some(1)]), WriteMode::Append, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("decimal:10:2") && err.to_string().contains("decimal:128:12:2"),
+        "{err}"
+    );
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    assert_eq!(
+        dataset
+            .schema()
+            .field("s")
+            .unwrap()
+            .logical_type
+            .to_string(),
+        "decimal:10:2"
+    );
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch.column(0).as_ref(),
+        decimal128(10, vec![Some(100), None, Some(-250)]).as_ref()
+    );
+    assert_eq!(
+        data_file_layouts(&dataset, "s").await,
+        vec![DataType::Decimal128(10, 2), DataType::Decimal256(10, 2)]
+    );
+}
+
+/// Tables on an earlier data storage version stay legacy tables: the schema
+/// keeps the Arrow-mapped strings, and appends compare exact types.
+#[tokio::test]
+async fn test_legacy_storage_version_keeps_exact_types() {
+    use arrow_array::Decimal256Array;
+    use arrow_buffer::i256;
+
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::LargeUtf8, true),
+        ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+        ),
+        ArrowField::new("n", DataType::Decimal256(10, 2), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            string_array(&DataType::LargeUtf8, &[Some("a")]),
+            string_array(schema.field(1).data_type(), &[Some("b")]),
+            Arc::new(
+                Decimal256Array::from(vec![Some(i256::from(1))])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_SEMANTIC_TYPES,
+        0
+    );
+    let fields = pb::Manifest::from(dataset.manifest.as_ref()).fields;
+    let recorded = fields
+        .iter()
+        .map(|field| (field.logical_type.as_str(), field.metadata.is_empty()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        vec![
+            ("large_string", true),
+            ("dict:string:int16:false", true),
+            ("decimal:256:10:2", true),
+        ]
+    );
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+
+    let err = write_single_column(
+        uri,
+        string_array(&DataType::Utf8, &[Some("c")]),
+        WriteMode::Append,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("should have type large_string but type was string"),
+        "{err}"
+    );
+}
+
+/// A 2.3 table created before the semantic type contract has no flag, keeps
+/// comparing exact types, and is never upgraded implicitly.
+#[tokio::test]
+async fn test_legacy_table_on_current_storage_version_is_not_upgraded() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let dataset = write_single_column(
+        uri,
+        string_array(&DataType::Utf8, &[Some("a")]),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    // `string` names `Utf8` in both vocabularies, so clearing the flag leaves
+    // the table exactly as an earlier build wrote it.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.reader_feature_flags &= !feature_flags::FLAG_SEMANTIC_TYPES;
+    manifest.writer_feature_flags &= !feature_flags::FLAG_SEMANTIC_TYPES;
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let err = write_single_column(
+        uri,
+        string_array(&DataType::LargeUtf8, &[Some("b")]),
+        WriteMode::Append,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("should have type string but type was large_string"),
+        "{err}"
+    );
+    let dataset = write_single_column(
+        uri,
+        string_array(&DataType::Utf8, &[Some("b")]),
+        WriteMode::Append,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_SEMANTIC_TYPES,
+        0
+    );
+    assert_eq!(
+        dataset.manifest.writer_feature_flags & feature_flags::FLAG_SEMANTIC_TYPES,
+        0
+    );
+}
+
+/// Changing a column's output encoding is a metadata-only schema update. A
+/// value that is not an output encoding of the column's type is rejected, and
+/// removing the entry restores the type's default.
+#[tokio::test]
+async fn test_semantic_output_encoding_update() {
+    use lance_core::datatypes::OUTPUT_ENCODING_META_KEY;
+
+    let dir = TempStrDir::default();
+    let mut dataset = write_single_column(
+        dir.as_str(),
+        string_array(&DataType::Utf8, &[Some("a")]),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    let read_type = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .column(0)
+                .data_type()
+                .clone()
+        }
+    };
+
+    dataset
+        .update_field_metadata()
+        .update("s", [(OUTPUT_ENCODING_META_KEY, "large_utf8")])
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(read_type(&dataset).await, DataType::LargeUtf8);
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(read_type(&reopened).await, DataType::LargeUtf8);
+
+    for invalid in ["large_binary", "utf16"] {
+        let err = dataset
+            .update_field_metadata()
+            .update("s", [(OUTPUT_ENCODING_META_KEY, invalid)])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(invalid), "{err}");
+    }
+
+    dataset
+        .update_field_metadata()
+        .update("s", [(OUTPUT_ENCODING_META_KEY, None::<&str>)])
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(read_type(&dataset).await, DataType::Utf8);
+
+    // Creating a column sets the entry too, and is rejected the same way.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Utf8, true).with_metadata(HashMap::from([(
+            OUTPUT_ENCODING_META_KEY.to_string(),
+            "large_binary".to_string(),
+        )])),
+    ]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![string_array(&DataType::Utf8, &[None])]).unwrap();
+    let other = TempStrDir::default();
+    let err = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        other.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("large_binary"), "{err}");
+}
+
+/// Merge insert matches a source column by semantic type, so a source in
+/// another layout of the column's type updates and inserts rows.
+#[tokio::test]
+async fn test_semantic_merge_insert_accepts_other_layout() {
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+    let dir = TempStrDir::default();
+    let batch = |ids: Vec<i32>, layout: &DataType, values: &[Option<&str>]| {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("s", layout.clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                string_array(layout, values),
+            ],
+        )
+        .unwrap()
+    };
+    let initial = batch(vec![1, 2], &DataType::Utf8, &[Some("a"), Some("b")]);
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let source = batch(vec![2, 3], &DataType::LargeUtf8, &[Some("B"), Some("c")]);
+    let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute(lance_datafusion::utils::reader_to_stream(Box::new(
+            RecordBatchIterator::new(vec![Ok(source.clone())], source.schema()),
+        )))
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.order_by(Some(vec![
+        crate::dataset::scanner::ColumnOrdering::asc_nulls_first("id".to_string()),
+    ]))
+    .unwrap();
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        result,
+        batch(
+            vec![1, 2, 3],
+            &DataType::Utf8,
+            &[Some("a"), Some("B"), Some("c")]
+        )
+    );
 }

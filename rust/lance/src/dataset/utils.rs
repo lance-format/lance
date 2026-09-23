@@ -196,6 +196,60 @@ fn downcast_view_columns(
     )
 }
 
+fn contains_view(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => contains_view(item.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| contains_view(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Cast columns holding view arrays to the layout `file_schema` records for
+/// them. Encoders do not write views; the file records the offset layout a
+/// view is stored as.
+fn cast_view_columns(
+    batch: RecordBatch,
+    file_schema: &ArrowSchema,
+) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|field| contains_view(field.data_type()))
+    {
+        return Ok(batch);
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let file_type = file_schema
+            .field_with_name(field.name())
+            .ok()
+            .map(|file_field| file_field.data_type())
+            .filter(|file_type| {
+                contains_view(field.data_type()) && *file_type != field.data_type()
+            });
+        if let Some(file_type) = file_type {
+            columns.push(arrow_cast::cast(column.as_ref(), file_type)?);
+            fields.push(field.as_ref().clone().with_data_type(file_type.clone()));
+        } else {
+            columns.push(column.clone());
+            fields.push(field.as_ref().clone());
+        }
+    }
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )),
+        columns,
+    )
+}
+
 /// Converts between the Arrow representations callers use and the ones Lance
 /// stores: Arrow JSON text ↔ Lance JSONB, and top-level view arrays → offset
 /// arrays.
@@ -228,13 +282,21 @@ impl SchemaAdapter {
         schema.fields().iter().any(|field| has_json_fields(field))
     }
 
-    pub fn to_physical_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        if self.requires_physical_conversion() {
-            let batch = convert_json_columns(&batch)?;
-            Ok(downcast_view_columns(&batch)?)
+    /// Convert a batch to the representation a data file with `file_schema`
+    /// stores: Arrow JSON text becomes Lance JSONB, and view arrays take the
+    /// offset layout the file records for them.
+    pub fn to_file_batch(batch: RecordBatch, file_schema: &ArrowSchema) -> Result<RecordBatch> {
+        let batch = if batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| has_arrow_json_fields(field))
+        {
+            convert_json_columns(&batch)?
         } else {
-            Ok(batch)
-        }
+            batch
+        };
+        Ok(cast_view_columns(batch, file_schema)?)
     }
 
     /// Build the physical Arrow schema for `logical_schema`: Arrow JSON fields
