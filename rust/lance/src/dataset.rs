@@ -18,7 +18,9 @@ use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
-use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection, TypeComparison};
+use lance_core::datatypes::{
+    OUTPUT_ENCODING_META_KEY, OnMissing, OnTypeMismatch, Projectable, Projection, TypeComparison,
+};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -26,6 +28,7 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
@@ -3265,6 +3268,93 @@ impl Dataset {
         Ok(())
     }
 
+    /// Migrate this table to the semantic type contract.
+    ///
+    /// Commits a metadata-only version that sets `FLAG_SEMANTIC_TYPES` and
+    /// rewrites each legacy `logical_type` alias to its canonical semantic type,
+    /// such as `large_string` to `string`, recording the output encoding that
+    /// keeps the Arrow type reads return. Data files are not rewritten, and
+    /// reads return the same Arrow types, values, and field IDs as before.
+    /// Afterwards appends accept any layout of a column's semantic type. Older
+    /// Lance versions can no longer read or write the table, there is no
+    /// downgrade, and restoring an earlier version keeps the flag.
+    ///
+    /// Nothing is committed when a column has no semantic type (a dictionary
+    /// whose values are not strings or byte strings), when a field already
+    /// carries a `lance-schema:output-encoding` entry (legacy tables ignore it,
+    /// so adopting it would change what reads return), or when the table uses
+    /// data file version 2.0 or earlier. Like [`Self::migrate_to_stable_row_ids`],
+    /// the commit is not retried if a concurrent write lands first; the caller
+    /// retries.
+    ///
+    /// This method is idempotent: a table that already follows the contract
+    /// returns `Ok(())` immediately.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.migrate_to_semantic_types().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn migrate_to_semantic_types(&mut self) -> Result<()> {
+        if self.manifest.uses_semantic_types() {
+            return Ok(());
+        }
+        let default_version = self.manifest.data_storage_format.lance_file_format();
+        if matches!(
+            default_version,
+            ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
+        ) {
+            return Err(Error::invalid_input(format!(
+                "Cannot migrate to semantic types: the table's data storage version is {default_version}, but the semantic type contract needs 2.1 or later"
+            )));
+        }
+        for fragment in self.manifest.fragments.iter() {
+            for data_file in fragment.referenced_lance_files() {
+                let file_version = data_file.file_version()?;
+                if matches!(
+                    file_version,
+                    ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
+                ) {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot migrate to semantic types: data file '{}' has version {file_version}, but the semantic type contract needs 2.1 or later",
+                        data_file.path
+                    )));
+                }
+            }
+        }
+        if let Some(field) = self
+            .schema()
+            .fields_pre_order()
+            .find(|field| field.metadata.contains_key(OUTPUT_ENCODING_META_KEY))
+        {
+            return Err(Error::invalid_input(format!(
+                "Cannot migrate to semantic types: field '{}' carries a {OUTPUT_ENCODING_META_KEY} entry, which this table does not interpret yet; remove it first",
+                field.name
+            )));
+        }
+        self.schema().to_canonical_types().map_err(|err| {
+            Error::invalid_input(format!("Cannot migrate to semantic types: {err}"))
+        })?;
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Project {
+                schema: self.schema().clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_semantic_type_migration()
+            .execute(transaction)
+            .await?;
+        *self = new_ds;
+        Ok(())
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -4120,6 +4210,9 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// Set by `migrate_to_semantic_types`: this commit adopts the semantic
+    /// type contract on an existing table.
+    adopt_semantic_types: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -4132,6 +4225,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            adopt_semantic_types: false,
         }
     }
 }
@@ -4160,6 +4254,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            adopt_semantic_types: self.adopt_semantic_types,
         }
     }
 }

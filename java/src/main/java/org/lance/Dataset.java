@@ -714,6 +714,30 @@ public class Dataset implements Closeable {
   private native void nativeMigrateManifestPathsV2();
 
   /**
+   * Migrate this table to the semantic type contract.
+   *
+   * <p>Commits a metadata-only version that rewrites each legacy logical type alias, such as {@code
+   * large_string}, to its semantic type, such as {@code string}, and records the output encoding
+   * that keeps the Arrow type reads return. Data files are not rewritten, and reads return the same
+   * types, values, and field IDs as before. Afterwards appends accept any Arrow layout of a
+   * column's type.
+   *
+   * <p>Older Lance versions can no longer read or write the table, there is no downgrade, and
+   * restoring an earlier version keeps the contract. The call is idempotent. It fails without
+   * committing when a column has no semantic type (a dictionary whose values are not strings or
+   * bytes), when a field already carries a {@code lance-schema:output-encoding} metadata entry, or
+   * when the table uses data file version 2.0 or earlier.
+   */
+  public void migrateToSemanticTypes() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateToSemanticTypes();
+    }
+  }
+
+  private native void nativeMigrateToSemanticTypes();
+
+  /**
    * Add columns to the dataset.
    *
    * @param sqlExpressions The SQL expressions to add columns

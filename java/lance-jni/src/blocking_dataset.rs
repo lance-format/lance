@@ -626,6 +626,24 @@ fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObjec
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeMigrateToSemanticTypes(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_native_migrate_to_semantic_types(&mut env, java_dataset)
+    )
+}
+
+fn inner_native_migrate_to_semantic_types(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    block_on(dataset_guard.inner.migrate_to_semantic_types())?;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     mut env: JNIEnv<'local>,

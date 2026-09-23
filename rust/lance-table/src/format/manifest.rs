@@ -771,6 +771,11 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
+    /// This commit migrates an existing table to the semantic type contract:
+    /// it sets [`crate::feature_flags::FLAG_SEMANTIC_TYPES`], and the table
+    /// schema is rewritten to canonical form with the output encodings that
+    /// keep every read type unchanged.
+    pub adopt_semantic_types: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

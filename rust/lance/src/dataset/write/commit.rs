@@ -54,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Set by `migrate_to_semantic_types`.
+    adopt_semantic_types: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -78,6 +80,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            adopt_semantic_types: false,
         }
     }
 
@@ -272,6 +275,12 @@ impl<'a> CommitBuilder<'a> {
     /// computed during the first migration commit. This bypasses the normal
     /// "cannot enable stable row IDs on an existing dataset" check so that the
     /// flag can be activated without creating the dataset from scratch.
+    /// Make this commit adopt the semantic type contract on an existing table.
+    pub(crate) fn with_semantic_type_migration(mut self) -> Self {
+        self.adopt_semantic_types = true;
+        self
+    }
+
     pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
         self.migration_next_row_id = Some(next_row_id);
         self
@@ -425,6 +434,7 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
+            adopt_semantic_types: self.adopt_semantic_types,
             ..Default::default()
         };
 

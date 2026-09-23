@@ -3266,6 +3266,19 @@ impl Dataset {
         Ok(())
     }
 
+    fn migrate_to_semantic_types(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.migrate_to_semantic_types())?
+            .map_err(|err: lance::Error| match err {
+                lance::Error::InvalidInput { source, .. } => {
+                    PyValueError::new_err(source.to_string())
+                }
+                err => PyIOError::new_err(err.to_string()),
+            })?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn drop_columns(&mut self, columns: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let columns: Vec<_> = columns.iter().map(|s| s.as_str()).collect();

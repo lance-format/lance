@@ -1470,8 +1470,9 @@ impl Transaction {
 
         // The contract is decided once, when the table is created; the flag is
         // sticky, so apply_feature_flags and inheritance keep it from then on.
-        if current_manifest.is_none()
-            && creates_semantic_types(manifest.data_storage_format.lance_file_format())
+        if config.adopt_semantic_types
+            || (current_manifest.is_none()
+                && creates_semantic_types(manifest.data_storage_format.lance_file_format()))
         {
             manifest.reader_feature_flags |= FLAG_SEMANTIC_TYPES;
             manifest.writer_feature_flags |= FLAG_SEMANTIC_TYPES;

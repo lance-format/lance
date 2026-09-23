@@ -1461,9 +1461,9 @@ public class ScannerTest {
     }
   }
 
-  /** Writes one string column `s` to a table on data storage version 2.3. */
-  private static Dataset writeSemanticTypesDataset(BufferAllocator allocator, String path)
-      throws IOException {
+  /** Writes one string column `s` to a table on the given data storage version. */
+  private static Dataset writeStringDataset(
+      BufferAllocator allocator, String path, String dataStorageVersion) throws IOException {
     Schema schema =
         new Schema(Collections.singletonList(Field.nullable("s", new ArrowType.Utf8())));
     try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
@@ -1484,7 +1484,7 @@ public class ScannerTest {
             .allocator(allocator)
             .reader(reader)
             .uri(path)
-            .dataStorageVersion("2.3")
+            .dataStorageVersion(dataStorageVersion)
             .execute();
       }
     }
@@ -1494,7 +1494,7 @@ public class ScannerTest {
   void testScanOutputEncodings(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("output_encodings").toString();
     try (BufferAllocator allocator = new RootAllocator();
-        Dataset dataset = writeSemanticTypesDataset(allocator, path)) {
+        Dataset dataset = writeStringDataset(allocator, path, "2.3")) {
       ScanOptions options =
           new ScanOptions.Builder()
               .outputEncodings(Collections.singletonMap("s", "large_utf8"))
@@ -1513,6 +1513,28 @@ public class ScannerTest {
               .outputEncodings(Collections.singletonMap("s", "decimal128"))
               .build();
       assertThrows(RuntimeException.class, () -> dataset.newScan(invalid).close());
+    }
+  }
+
+  @Test
+  void testMigrateToSemanticTypes(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("migrate_to_semantic_types").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeStringDataset(allocator, path, "2.2")) {
+      ScanOptions options =
+          new ScanOptions.Builder()
+              .outputEncodings(Collections.singletonMap("s", "large_utf8"))
+              .build();
+      assertThrows(RuntimeException.class, () -> dataset.newScan(options).close());
+
+      dataset.migrateToSemanticTypes();
+      try (LanceScanner scanner = dataset.newScan(options);
+          ArrowReader reader = scanner.scanBatches()) {
+        assertTrue(reader.loadNextBatch());
+        assertEquals(
+            new ArrowType.LargeUtf8(),
+            reader.getVectorSchemaRoot().getSchema().findField("s").getType());
+      }
     }
   }
 }
