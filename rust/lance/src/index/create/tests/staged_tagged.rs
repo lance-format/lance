@@ -468,3 +468,138 @@ async fn unlisted_segment_without_a_plan_is_an_error() {
         coverage[&s1.uuid]
     );
 }
+
+/// Two fragments of four rows: `i` 0..8 and a random 4-dim `vector`.
+async fn vector_fixture(uri: &str) -> Dataset {
+    lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap()
+}
+
+/// The plan and the sorted `i` of the `k` rows nearest to `query`, with or
+/// without the vector index.
+async fn nearest(
+    dataset: &Dataset,
+    query: &arrow_array::PrimitiveArray<arrow_array::types::Float32Type>,
+    k: usize,
+    use_index: bool,
+) -> (String, Vec<i32>) {
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, k).unwrap();
+    scan.use_index(use_index);
+    let plan = scan.explain_plan(false).await.unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids: Vec<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    (plan, ids)
+}
+
+/// Staged vector segments never open the dataset: the merge filters each by
+/// its stored bitmap in the raw address domain and the merged segment keeps
+/// the provenance union, so it claims no destination and translates at query
+/// time exactly like a committed vector merge. With one IVF partition the
+/// index answers every query the flat scan answers.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_vector_segments_merge_across_stable_partition_keep_provenance() {
+    let dir = TempStrDir::default();
+    let mut dataset = vector_fixture(dir.as_str()).await;
+    // Shards merge only when they share centroids: one fixed centroid, as a
+    // distributed build trains once and hands the centroids to every shard.
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    let mut segments = Vec::new();
+    for fragment in [0u32, 1] {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("staged".to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .clone();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+    let merged = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1]),
+        "a vector merge keeps the provenance union"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "vector", vec![merged.clone()])
+        .await
+        .unwrap();
+
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let stored = stored_segment(&dataset, "staged").await;
+    assert_eq!(stored.uuid, merged.uuid);
+    assert_eq!(
+        stored.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1]),
+        "the commit keeps the retired provenance that the lineage records"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([10u32, 11])),
+        "the committed segment translates to both destinations"
+    );
+    let (_, truth) = nearest(&dataset, &query, 1, false).await;
+    assert_eq!(truth, vec![6]);
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, truth);
+    let (_, flat) = nearest(&dataset, &query, 8, false).await;
+    let (_, indexed) = nearest(&dataset, &query, 8, true).await;
+    assert_eq!(flat.len(), 8);
+    assert_eq!(indexed, flat, "every row is reachable through the index");
+
+    // Trim keeps the transition the merged segment's provenance still names.
+    let mut dataset = dataset;
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert!(
+        dataset
+            .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, vec![6]);
+}

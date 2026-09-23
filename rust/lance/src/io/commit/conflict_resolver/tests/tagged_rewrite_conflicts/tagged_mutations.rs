@@ -1021,6 +1021,43 @@ async fn tagged_table_with_corrupt_history_refuses_the_commit() {
     assert_eq!(dataset.manifest.version, version, "nothing was committed");
 }
 
+/// A segment built after the rewrite names the destinations directly, so an
+/// in-place rewrite of its column is withdrawn from its bitmap as on an
+/// untagged table: the patched fragment leaves the `v` index and is
+/// scanned, the other destination is still served.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_prunes_in_place_rewrite_from_a_direct_index() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    create_v_index(&mut dataset).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_before = before.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert_eq!(
+        v_before.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11])
+    );
+
+    rewrite_in_place(dataset, "v", 333).await.unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_after = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert_eq!(v_after.uuid, v_before.uuid);
+    assert_eq!(
+        v_after.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32]),
+        "the patched destination (odd values, i = 3) left the v index"
+    );
+    assert_eq!(rows(&dataset, Some("v = 333"), true).await, vec![(3, 333)]);
+    assert_eq!(rows(&dataset, Some("v = 3"), true).await, vec![]);
+    assert_eq!(rows(&dataset, Some("v = 4"), true).await, vec![(4, 4)]);
+    assert_eq!(
+        rows(&dataset, None, true).await,
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| (i, if i == 3 { 333 } else { i }))
+    );
+    assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
 /// Sorted `i` values under a predicate, with or without the scalar index;
 /// for tables whose `v` is no longer Int32.
 async fn i_values(dataset: &Dataset, predicate: Option<&str>, use_index: bool) -> Vec<i32> {

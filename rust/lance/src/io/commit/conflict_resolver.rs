@@ -6577,6 +6577,7 @@ mod tests {
     /// shared in-memory cache: every decision has to come from transaction
     /// files and the manifests themselves.
     mod tagged_rewrite_conflicts {
+        mod index_over_committed_sp;
         mod tagged_mutations;
 
         use super::*;

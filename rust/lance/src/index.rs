@@ -388,6 +388,18 @@ async fn prune_stale_segment_coverage(
         .iter()
         .map(|fragment| (fragment.id as u32, fragment))
         .collect::<HashMap<_, _>>();
+    // Under a tagged fragment reuse history a segment's bitmap is provenance:
+    // a fragment it names that a recorded transition retired is not stale,
+    // its rows translate to the transition's destinations when the segment
+    // is opened. Such a fragment is on the entry's lineage (the sources and
+    // destinations of every transition); a retired fragment off the lineage
+    // (a bare rewrite of uncovered data, a whole-fragment delete) holds
+    // nothing the segment can reach and is pruned as before.
+    let lineage = load_all_indices(dataset)
+        .await?
+        .iter()
+        .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+        .and_then(|entry| entry.fragment_bitmap.clone());
     let historical_versions = segments
         .iter()
         .map(IndexSegment::dataset_version)
@@ -419,7 +431,9 @@ async fn prune_stale_segment_coverage(
                         return prune_historically_missing;
                     };
                     let Some(current_fragment) = current_fragments.get(fragment_id) else {
-                        return true;
+                        return !lineage
+                            .as_ref()
+                            .is_some_and(|lineage| lineage.contains(*fragment_id));
                     };
                     let historical_files =
                         fragment_field_files(&historical, historical_fragment, &indexed_field_ids);
