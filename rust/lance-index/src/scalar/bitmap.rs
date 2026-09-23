@@ -429,62 +429,28 @@ impl BitmapIndex {
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
+        let value_type = page_lookup_file.schema().fields[0].data_type();
 
         if total_rows == 0 {
-            let schema = page_lookup_file.schema();
-            let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
                 Arc::new(BTreeMap::new()),
                 Arc::new(RowAddrTreeMap::default()),
-                data_type,
+                value_type,
                 store,
                 WeakLanceCache::from(index_cache),
                 frag_reuse_index,
             )));
         }
 
-        let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
+        let (index_map, null_location) =
+            Self::load_key_map(page_lookup_file.as_ref(), total_rows).await?;
         let mut null_map = Arc::new(RowAddrTreeMap::default());
-        let mut null_location: Option<usize> = None;
-        let value_type = page_lookup_file.schema().fields[0].data_type();
-
-        // Stream keys in bounded batches to avoid loading the entire keys
-        // column into memory at once.
-        let mut keys_stream = page_lookup_file
-            .read_range_stream(0..total_rows, Some(&["keys"]), 4096, 2)
-            .await?;
-        let mut row_offset: usize = 0;
-        while let Some(keys_batch) = keys_stream.try_next().await? {
-            let dict_keys = keys_batch.column(0);
-            for idx in 0..keys_batch.num_rows() {
-                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
-                if key.0.is_null() {
-                    null_location = Some(row_offset);
-                } else {
-                    index_map.insert(key, row_offset);
-                }
-                row_offset += 1;
-            }
-        }
-
         if let Some(null_loc) = null_location {
-            let batch = page_lookup_file
-                .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
-                .await?;
-
-            let binary_bitmaps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
-            let bitmap_bytes = binary_bitmaps.value(0);
-            let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
-
+            let mut bitmap = Self::read_null_bitmap(page_lookup_file.as_ref(), null_loc).await?;
             // Apply fragment remapping if needed
             if let Some(fri) = &frag_reuse_index {
                 bitmap = fri.remap_row_addrs_tree_map(&bitmap);
             }
-
             null_map = Arc::new(bitmap);
         }
 
@@ -508,27 +474,52 @@ impl BitmapIndex {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
+        let value_type = page_lookup_file.schema().fields[0].data_type();
 
         if total_rows == 0 {
-            let schema = page_lookup_file.schema();
-            let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new_with_batch_remapping(
                 Arc::new(BTreeMap::new()),
                 Arc::new(RowAddrTreeMap::default()),
-                data_type,
+                value_type,
                 store,
                 WeakLanceCache::from(index_cache),
                 remapping,
             )));
         }
 
-        let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
+        let (index_map, null_location) =
+            Self::load_key_map(page_lookup_file.as_ref(), total_rows).await?;
         let mut null_map = Arc::new(RowAddrTreeMap::default());
-        let mut null_location: Option<usize> = None;
-        let value_type = page_lookup_file.schema().fields[0].data_type();
+        if let Some(null_loc) = null_location {
+            let mut bitmap = Self::read_null_bitmap(page_lookup_file.as_ref(), null_loc).await?;
+            // Apply fragment remapping if needed
+            if let Some(remapper) = &remapping {
+                bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
+            }
+            null_map = Arc::new(bitmap);
+        }
 
-        // Stream keys in bounded batches to avoid loading the entire keys
-        // column into memory at once.
+        Ok(Arc::new(Self::new_with_batch_remapping(
+            Arc::new(index_map),
+            null_map,
+            value_type,
+            store,
+            WeakLanceCache::from(index_cache),
+            remapping,
+        )))
+    }
+
+    /// Stream the page lookup file's keys column in bounded batches (never the
+    /// whole column at once) into the value -> row offset map, reporting the
+    /// row offset of the null entry when the index has one. Shared by
+    /// [`Self::load`] and [`Self::load_with_remapping`], which differ only in
+    /// how the null bitmap is remapped afterwards.
+    async fn load_key_map(
+        page_lookup_file: &dyn super::IndexReader,
+        total_rows: usize,
+    ) -> Result<(BTreeMap<OrderableScalarValue, usize>, Option<usize>)> {
+        let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
+        let mut null_location: Option<usize> = None;
         let mut keys_stream = page_lookup_file
             .read_range_stream(0..total_rows, Some(&["keys"]), 4096, 2)
             .await?;
@@ -545,36 +536,24 @@ impl BitmapIndex {
                 row_offset += 1;
             }
         }
+        Ok((index_map, null_location))
+    }
 
-        if let Some(null_loc) = null_location {
-            let batch = page_lookup_file
-                .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
-                .await?;
-
-            let binary_bitmaps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
-            let bitmap_bytes = binary_bitmaps.value(0);
-            let mut bitmap = deserialize_bitmap(bitmap_bytes, BITMAP_LOOKUP_NAME)?;
-
-            // Apply fragment remapping if needed
-            if let Some(remapper) = &remapping {
-                bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
-            }
-
-            null_map = Arc::new(bitmap);
-        }
-
-        Ok(Arc::new(Self::new_with_batch_remapping(
-            Arc::new(index_map),
-            null_map,
-            value_type,
-            store,
-            WeakLanceCache::from(index_cache),
-            remapping,
-        )))
+    /// Read the stored null-row bitmap at `null_loc`, before any remapping. A
+    /// bitmap that fails to deserialize is a corrupt index file, not a panic.
+    async fn read_null_bitmap(
+        page_lookup_file: &dyn super::IndexReader,
+        null_loc: usize,
+    ) -> Result<RowAddrTreeMap> {
+        let batch = page_lookup_file
+            .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
+            .await?;
+        let binary_bitmaps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
+        deserialize_bitmap(binary_bitmaps.value(0), BITMAP_LOOKUP_NAME)
     }
 
     async fn load_bitmap(
