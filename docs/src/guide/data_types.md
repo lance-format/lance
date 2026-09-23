@@ -30,6 +30,43 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `LargeBinary` | Large binary data (64-bit offsets) | Large blobs |
 | `FixedSizeBinary(n)` | Fixed-length binary data | UUIDs, hashes |
 
+### Semantic Types and Arrow Layouts
+
+Several Arrow layouts hold the same values: `Utf8`, `LargeUtf8`, `Utf8View`, and a dictionary of strings all hold strings, and `Decimal128(10, 2)` and `Decimal256(10, 2)` hold the same decimals.
+Tables created with `data_storage_version="2.3"` or later record a column's **semantic type** (such as `string` or `decimal:10:2`) instead of one Arrow layout:
+
+- Appends accept any layout of a column's type, and each data file stores the layout it was written in. Appending `Decimal128(12, 2)` to a `decimal(10, 2)` column still fails, because the precision is part of the type.
+- Reads return the layout the column was created with. A column created from `pa.large_string()` reads back as `large_string`.
+- A scan can ask for another layout of a column with `output_encodings`. It maps a column path to an output encoding such as `utf8`, `large_utf8`, `utf8_view`, `dictionary:int32:utf8`, `decimal128`, `decimal256`, or, for JSON columns, `arrow.json` (text) and `lance.json` (JSONB).
+- Setting the `lance-schema:output-encoding` field metadata entry changes the layout reads return by default. It is a metadata-only update.
+
+```python
+import lance
+import pyarrow as pa
+
+table = pa.table({"name": pa.array(["a", "b"], pa.large_string())})
+ds = lance.write_dataset(table, "./semantic.lance", data_storage_version="2.3")
+
+# Any string layout can be appended to the column.
+lance.write_dataset(pa.table({"name": pa.array(["c"])}), ds, mode="append")
+
+ds = lance.dataset("./semantic.lance")
+assert ds.to_table().schema.field("name").type == pa.large_string()
+views = ds.to_table(output_encodings={"name": "utf8_view"})
+assert views.schema.field("name").type == pa.string_view()
+```
+
+Tables created with an earlier data storage version keep one Arrow layout per column. `migrate_to_semantic_types()` moves such a table to semantic types in a metadata-only commit: data files are not rewritten, reads keep returning the same Arrow types, and appends then accept any layout.
+Lance versions without semantic types cannot read or write the table afterwards, and the migration cannot be undone.
+
+```python
+ds = lance.dataset("./existing.lance")
+ds.migrate_to_semantic_types()
+```
+
+Applications can define their own types as Arrow extension types over a core type, for example a bounding box stored as `FixedSizeList(Float32, 4)` with `ARROW:extension:name = "example.bbox"`.
+Lance stores and returns the values of the core type and keeps the extension name and metadata through appends, schema evolution, and compaction. Extension names starting with `lance.` are reserved.
+
 ### Blob Type for Large Binary Objects
 
 Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Blob columns support planned full-payload reads as well as lazy file-like access for streaming, seeking, and partial reads.

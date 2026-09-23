@@ -636,3 +636,132 @@ async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
     let result = ds.scan().try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), 4);
 }
+
+/// Extension semantic types annotate values without transforming them, so an
+/// extension Lance does not know keeps its name and metadata through schema
+/// evolution, appends in other layouts, compaction, and migration.
+#[rstest]
+#[case::semantic_types(LanceFileVersion::V2_3, false)]
+#[case::migrated(LanceFileVersion::V2_2, true)]
+#[case::legacy(LanceFileVersion::V2_2, false)]
+#[tokio::test]
+async fn test_unknown_extension_survives_rewrites(
+    #[case] version: LanceFileVersion,
+    #[case] migrate: bool,
+    #[values(
+        crate::dataset::optimize::CompactionMode::Reencode,
+        crate::dataset::optimize::CompactionMode::TryBinaryCopy
+    )]
+    compaction_mode: crate::dataset::optimize::CompactionMode,
+) {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::schema_evolution::ColumnAlteration;
+    use arrow_array::Float32Array;
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
+
+    let extension = |name: &str, metadata: &str| {
+        HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), name.to_string()),
+            (ARROW_EXT_META_KEY.to_string(), metadata.to_string()),
+        ])
+    };
+    let bbox_extension = extension("example.bbox", r#"{"crs":"EPSG:4326"}"#);
+    let tag_extension = extension("example.tag", "v1");
+    let bbox_type = DataType::FixedSizeList(
+        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+        4,
+    );
+    let batch_with = |tag_type: DataType| {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("bbox", bbox_type.clone(), true).with_metadata(bbox_extension.clone()),
+            ArrowField::new("tag", tag_type.clone(), true).with_metadata(tag_extension.clone()),
+            ArrowField::new("other", DataType::Int32, true),
+        ]));
+        let tags: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 8]), 4)
+                        .unwrap(),
+                ),
+                arrow_cast::cast(&tags, &tag_type).unwrap(),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap()
+    };
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let batch = batch_with(DataType::Utf8);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if migrate {
+        dataset.migrate_to_semantic_types().await.unwrap();
+    }
+    // Tables under the contract accept the extension over another layout.
+    let appended = if dataset.manifest.uses_semantic_types() {
+        batch_with(DataType::LargeUtf8)
+    } else {
+        batch.clone()
+    };
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+        dir.as_str(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("twice".into(), "other * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    dataset.drop_columns(&["other"]).await.unwrap();
+    dataset
+        .alter_columns(&[ColumnAlteration::new("bbox".into()).rename("box".into())])
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            compaction_mode: Some(compaction_mode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let scanned = dataset.scan().try_into_batch().await.unwrap();
+    for schema in [
+        Arc::new(ArrowSchema::from(dataset.schema())),
+        scanned.schema(),
+    ] {
+        let metadata = |name: &str| {
+            let metadata = schema.field_with_name(name).unwrap().metadata().clone();
+            metadata
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("ARROW:extension"))
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(metadata("box"), bbox_extension);
+        assert_eq!(metadata("tag"), tag_extension);
+    }
+    assert_eq!(scanned.num_rows(), 4);
+}
