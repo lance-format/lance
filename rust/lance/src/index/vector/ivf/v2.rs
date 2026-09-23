@@ -3067,8 +3067,10 @@ mod tests {
     const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
-    /// Partitions a fixture of `rows` supports when each centroid is fitted on
-    /// `sample_rate` vectors, capped by the count the build asked for.
+    /// The number of partitions we can create for a given number of `rows`
+    /// so that each partition has the required `sample_rate`.
+    ///
+    /// Returns at least 1 and no more than `requested`.
     fn supported_partitions(rows: usize, sample_rate: usize, requested: usize) -> usize {
         requested.min(rows / sample_rate).max(1)
     }

@@ -696,22 +696,17 @@ async fn rebuild_vector_segment(
         .await
 }
 
-/// True when a segment carries only its definition, so there is nothing to open
-/// and nothing to append to: training is the work it is waiting for.
+/// True when a segment carries only its definition.
 ///
-/// Both halves carry weight. Coverage alone is not enough: a segment
-/// initialized from another dataset's model holds centroids while covering no
-/// fragments, and retraining it from its parameters would discard them.
+/// This can happen when an index is trained against an empty table or the
+/// table doesn't have enough rows to justify the index.
 ///
-/// The file list is read as "no files recorded", absent included. The manifest
-/// stores it as a repeated field whose empty case means "sizes unknown", so a
-/// segment that recorded an empty list reads back as absent after any commit —
-/// treating absent as "has files" would stop recognising a definition the first
-/// time anything else commits to the table.
-///
-/// A segment whose rows were all deleted answers this the same way, and wants
-/// the same outcome: nothing can be served from it, and a rebuild is what makes
-/// it useful again.
+/// Both halves of the check carry weight. Coverage alone is not enough: a
+/// segment initialized from another dataset's model holds centroids while
+/// covering no fragments, and retraining it from its parameters would discard
+/// them. An absent file list counts as "no files recorded", because the
+/// manifest stores it as a repeated field whose empty case reads back as
+/// absent.
 fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
@@ -944,10 +939,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
             // A segment still awaiting training has no file to open and nothing
             // to append to, so the whole column is trained from the parameters
-            // its definition carries, superseding every old segment. One such
-            // segment is enough to force that: the logical index is opened by
-            // name, so it would be reached whichever segments the caller asks
-            // for, and there is no file behind it.
+            // its definition carries, superseding every old segment.
+            //
+            // Training removes every old segment, and every path that would add
+            // one routes here first, so such a segment should be the only one
+            // under its name. The check is written over all of them anyway: the
+            // logical index is opened by name and that open materialises every
+            // segment, so one with no file behind it would break the open
+            // whichever segments the caller asked for.
             let awaits_training = old_indices
                 .iter()
                 .any(|idx| is_definition_only_segment(idx));

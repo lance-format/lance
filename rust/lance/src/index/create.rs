@@ -287,9 +287,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 warn!(
                     column,
                     requested_num_partitions = requested,
-                    "Recording the index without training it: the partition count \
-                     will be derived from the data it trains on. Use \
-                     target_partition_size to state a shape that survives the wait."
+                    "You attempted to create an index with {requested} partitions. \
+                     However, there are not enough rows to train even a single \
+                     partition. An empty index will be created until more data is \
+                     added. Future index updates will use target_partition_size \
+                     (possibly a default value) instead of the num_partitions that \
+                     was supplied in this call."
                 );
             }
         }
