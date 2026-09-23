@@ -46,3 +46,9 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 * `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
   columns containing a payload, null, and empty bytes. These fixtures cover
   reading released files alongside newly appended Blob v2 files.
+* `v12.0.0/legacy_aliases`: A table on data storage version 2.2 whose schema
+  names Arrow layouts in `logical_type` (`large_string`, `dict:string:int32:false`,
+  `decimal:256:10:2`, `large_list`, `large_binary`). It predates the semantic
+  type contract, so it is a legacy table. Readers must keep returning these
+  exact Arrow types, and migrating it to the contract must keep the read types,
+  values, and field IDs.

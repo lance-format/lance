@@ -276,11 +276,13 @@ fn encode_json_text_array<O: OffsetSizeTrait>(
     array: &GenericStringArray<O>,
 ) -> Result<JsonArray, ArrowError> {
     let mut builder = LargeBinaryBuilder::with_capacity(array.len(), array.value_data().len());
-    for value in array {
+    for (row, value) in array.iter().enumerate() {
         match value {
             Some(json_str) => {
                 let encoded = encode_json(json_str).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
+                    ArrowError::InvalidArgumentError(format!(
+                        "Failed to encode JSON at row {row}: {e}"
+                    ))
                 })?;
                 builder.append_value(&encoded);
             }
@@ -464,12 +466,13 @@ fn field_with_extension(
 fn convert_json_array<F>(
     field: &ArrowField,
     array: &ArrayRef,
+    path: &str,
     convert_leaf: &F,
 ) -> Result<(ArrowField, ArrayRef, bool), ArrowError>
 where
-    F: Fn(&ArrowField, &ArrayRef) -> Result<Option<(ArrowField, ArrayRef)>, ArrowError>,
+    F: Fn(&str, &ArrowField, &ArrayRef) -> Result<Option<(ArrowField, ArrayRef)>, ArrowError>,
 {
-    if let Some((field, array)) = convert_leaf(field, array)? {
+    if let Some((field, array)) = convert_leaf(path, field, array)? {
         return Ok((field, array, true));
     }
 
@@ -481,8 +484,9 @@ where
             let mut changed = false;
 
             for (field, column) in fields.iter().zip(struct_array.columns()) {
+                let child_path = format!("{path}.{}", field.name());
                 let (new_field, new_column, field_changed) =
-                    convert_json_array(field, column, convert_leaf)?;
+                    convert_json_array(field, column, &child_path, convert_leaf)?;
                 changed |= field_changed;
                 new_fields.push(Arc::new(new_field));
                 new_columns.push(new_column);
@@ -501,7 +505,7 @@ where
         DataType::List(item) => {
             let list_array: &ListArray = array.as_list();
             let (new_item, new_values, changed) =
-                convert_json_array(item, list_array.values(), convert_leaf)?;
+                convert_json_array(item, list_array.values(), path, convert_leaf)?;
             if changed {
                 let new_field =
                     field_with_data_type(field, DataType::List(Arc::new(new_item.clone())));
@@ -519,7 +523,7 @@ where
         DataType::LargeList(item) => {
             let list_array: &LargeListArray = array.as_list();
             let (new_item, new_values, changed) =
-                convert_json_array(item, list_array.values(), convert_leaf)?;
+                convert_json_array(item, list_array.values(), path, convert_leaf)?;
             if changed {
                 let new_field =
                     field_with_data_type(field, DataType::LargeList(Arc::new(new_item.clone())));
@@ -537,7 +541,7 @@ where
         DataType::FixedSizeList(item, size) => {
             let list_array: &FixedSizeListArray = array.as_fixed_size_list();
             let (new_item, new_values, changed) =
-                convert_json_array(item, list_array.values(), convert_leaf)?;
+                convert_json_array(item, list_array.values(), path, convert_leaf)?;
             if changed {
                 let new_field = field_with_data_type(
                     field,
@@ -562,7 +566,7 @@ where
                 .expect("DataType::Map array must be MapArray");
             let entries_array = Arc::new(map_array.entries().clone()) as ArrayRef;
             let (new_entries, new_entries_array, changed) =
-                convert_json_array(entries, &entries_array, convert_leaf)?;
+                convert_json_array(entries, &entries_array, path, convert_leaf)?;
             if changed {
                 let entries_struct = new_entries_array
                     .as_any()
@@ -593,9 +597,17 @@ fn convert_arrow_json_array(
     field: &ArrowField,
     array: &ArrayRef,
 ) -> Result<(ArrowField, ArrayRef, bool), ArrowError> {
-    convert_json_array(field, array, &|field, array| {
+    convert_json_array(field, array, field.name(), &|path, field, array| {
         if is_arrow_json_field(field) {
-            let json_array = JsonArray::try_from(array.clone())?;
+            let json_array = JsonArray::try_from(array.clone()).map_err(|err| {
+                let detail = match err {
+                    ArrowError::InvalidArgumentError(detail) => detail,
+                    err => err.to_string(),
+                };
+                ArrowError::InvalidArgumentError(format!(
+                    "invalid JSON in field '{path}': {detail}"
+                ))
+            })?;
             Ok(Some((
                 arrow_json_to_lance_json(field),
                 Arc::new(json_array.into_inner()) as ArrayRef,
@@ -619,7 +631,7 @@ fn convert_lance_json_array(
     field: &ArrowField,
     array: &ArrayRef,
 ) -> Result<(ArrowField, ArrayRef, bool), ArrowError> {
-    convert_json_array(field, array, &|field, array| {
+    convert_json_array(field, array, field.name(), &|_, field, array| {
         if is_json_field(field) && !is_jsonb_output(field) {
             Ok(Some((
                 lance_json_to_arrow_json(field),
@@ -1490,6 +1502,35 @@ mod tests {
 
         let result = convert_json_columns(&batch);
         assert!(result.is_err());
+    }
+
+    /// Invalid JSON input names the field path and the row.
+    #[test]
+    fn test_invalid_json_names_field_and_row() {
+        let json = ArrowField::new("j", DataType::Utf8, true).with_metadata(
+            [(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]
+            .into(),
+        );
+        let values = StringArray::from(vec![Some("{}"), None, Some("{")]);
+        let nested = Fields::from(vec![json.clone()]);
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(nested.clone()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::new(nested, vec![Arc::new(values)], None)) as ArrayRef],
+        )
+        .unwrap();
+        let err = convert_json_columns(&batch).unwrap_err().to_string();
+        assert!(
+            err.contains("field 's.j'") && err.contains("row 2"),
+            "{err}"
+        );
     }
 
     #[test]
