@@ -666,7 +666,9 @@ pub fn pq_quantizer_minimum_rows(num_bits: usize) -> Option<usize> {
 /// `None` for an index type whose stages name no quantizer with a row floor.
 pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<usize> {
     stages.iter().find_map(|stage| match stage {
-        StageParams::PQ(pq) => pq_quantizer_minimum_rows(pq.num_bits),
+        // A supplied codebook is what training would have produced, so the
+        // build needs no vectors to fit one.
+        StageParams::PQ(pq) if pq.codebook.is_none() => pq_quantizer_minimum_rows(pq.num_bits),
         _ => None,
     })
 }
@@ -2385,6 +2387,40 @@ mod tests {
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
+
+    /// A build that was handed its codebook has nothing to fit, so the rows
+    /// that fitting would have needed are not required of it.
+    ///
+    /// Without this a caller who supplies both the centroids and the codebook
+    /// -- a fully specified index, needing no training data at all -- has the
+    /// build deferred and gets an empty index back.
+    #[test]
+    fn a_supplied_codebook_needs_no_rows_to_train_on() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_index::vector::pq::PQBuildParams;
+
+        let eight_bit = PQBuildParams {
+            num_bits: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(eight_bit.clone())]),
+            Some(256),
+            "fitting an 8-bit codebook needs a row per code"
+        );
+
+        let values = Float32Array::from(vec![0.0_f32; 2 * 256 * 4]);
+        let codebook = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let supplied = PQBuildParams {
+            codebook: Some(Arc::new(codebook)),
+            ..eight_bit
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(supplied)]),
+            None,
+            "a supplied codebook is the fit, so no rows are needed for it"
+        );
+    }
 
     /// A null vector inside a multivector row is not one to train on.
     ///
