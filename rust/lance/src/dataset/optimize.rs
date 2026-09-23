@@ -101,7 +101,7 @@ use super::{
 };
 use crate::Dataset;
 use crate::Result;
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::load_row_id_index_for_fragments;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
@@ -2432,11 +2432,16 @@ async fn rewrite_files(
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
     // Capturing row addresses is only useful if something will consume them:
-    // an index to remap now, or a deferred remap through the FRI.
+    // a deferred remap through the FRI, or an address-domain index to remap
+    // immediately. Stable row ids keep indices valid across the rewrite
+    // without an immediate remap (see `commit_compaction`'s `needs_remapping`),
+    // so an eager, non-deferred compaction on a stable-row-id dataset never
+    // uses the addresses and capturing them would be pure waste.
     let capture_row_addrs = options.defer_index_remap
-        || (load_indices_for_remapping(dataset.as_ref())
-            .await?
-            .is_some());
+        || (!dataset.manifest.uses_stable_row_ids()
+            && load_indices_for_remapping(dataset.as_ref())
+                .await?
+                .is_some());
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -2659,15 +2664,18 @@ async fn rewrite_files(
             .try_recv()
             .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
         // Stable row ids are captured as a sequence, and only the row-id index
-        // knows the address each one sat at before the rewrite.
+        // knows the address each one sat at before the rewrite. Every id that
+        // was captured was read from `fragments` (this task's own original
+        // fragments), so an index scoped to just those -- rather than
+        // `get_row_id_index`'s whole-dataset index -- has everything needed
+        // to look them up, without paying to index fragments this rewrite
+        // never touches.
         let row_id_index = if dataset.manifest.uses_stable_row_ids() {
-            get_row_id_index(dataset.as_ref()).await?
+            Some(load_row_id_index_for_fragments(dataset.as_ref(), &fragments).await?)
         } else {
             None
         };
-        let mut row_addrs = captured_ids
-            .row_addrs(row_id_index.as_deref())?
-            .into_owned();
+        let mut row_addrs = captured_ids.row_addrs(row_id_index.as_ref())?.into_owned();
         // Compaction reads whole fragments, so the captured addresses are
         // dense per-fragment ranges; run containers (standard roaring
         // format) shrink the persisted blob from O(rows) to O(runs) bytes.
@@ -4494,6 +4502,48 @@ mod tests {
             .unwrap();
             assert_eq!(dataset.get_fragments().len(), 1);
         }
+    }
+
+    /// Eager (non-deferred) compaction on a stable-row-id dataset never remaps
+    /// an index by address -- stable row ids keep an index's row ids valid
+    /// across the rewrite (see `commit_compaction`'s `needs_remapping`, which
+    /// is unconditionally false under stable row ids unless deferred) -- so it
+    /// must not pay to capture addresses that nothing will consume, even when
+    /// a remappable index is present.
+    #[tokio::test]
+    async fn test_stable_row_ids_eager_compaction_skips_row_addr_capture() {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        create_scalar_index(&mut dataset, "a", false).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+        assert!(
+            result.row_addrs.is_none(),
+            "eager stable-row-id compaction must not capture row addresses it will never use"
+        );
     }
 
     #[rstest::rstest]
