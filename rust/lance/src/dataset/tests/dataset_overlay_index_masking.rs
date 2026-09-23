@@ -2451,8 +2451,8 @@ async fn rtree_overlay_geometry(dataset: Dataset, field_id: i32, fragment_id: u6
     .await
 }
 
-/// The merged index must cover nothing, so the rows it would otherwise answer
-/// for are rescanned instead of served from entries an overlay has superseded.
+/// The merged index must cover nothing, so its rows are rescanned rather than
+/// answered from values an overlay has replaced.
 #[cfg(feature = "geo")]
 async fn assert_merge_covers_nothing(
     dataset: &Dataset,
@@ -2471,11 +2471,10 @@ async fn assert_merge_covers_nothing(
     );
 }
 
-/// A merged RTree index may cover the fragment a rewrite produced: the remap puts
-/// it there, and no source segment has it in its own history for the staleness
-/// pass to judge. An overlay over the indexed column is the separate question,
-/// and it takes that coverage away, because the segments hold entries those rows
-/// have moved past and need a rescan rather than an index answer.
+/// A merged RTree index may cover the fragment compaction produced: the remap
+/// puts it there, and no segment has it in its history for the staleness pass to
+/// judge. An overlay on the indexed column is a separate question and takes that
+/// coverage away, because the segments hold the old values for those rows.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() {
@@ -2498,9 +2497,9 @@ async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() 
     .await;
 }
 
-/// A rewrite folds an overlay on its inputs into the fragment it produces, so
-/// afterwards that fragment carries no overlay of its own. Segments built before
-/// the overlay hold the values it superseded.
+/// Compacting a fragment that has an overlay writes the overlay's values into the
+/// new fragment and drops the overlay, so the new fragment carries none of its
+/// own. Segments built before the overlay hold the old values.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_into() {
@@ -2518,9 +2517,9 @@ async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_into() {
     assert_merge_covers_nothing(&dataset, staged, "a rewrite folded an overlay into").await;
 }
 
-/// The same overlay across two rewrites. The fragment that absorbed it is itself
-/// rewritten, so it appears in neither the staged coverage nor the final one, and
-/// the superseded values reach the final fragment all the same.
+/// The same overlay across two compactions. The fragment that absorbed it is
+/// itself compacted away, so it appears in neither the staged coverage nor the
+/// final one, and the old values reach the final fragment all the same.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_fragment_two_rewrites_carried_a_folded_overlay_to() {
@@ -2540,10 +2539,10 @@ async fn test_rtree_merge_drops_a_fragment_two_rewrites_carried_a_folded_overlay
     assert_merge_covers_nothing(&dataset, staged, "two rewrites carried a folded overlay to").await;
 }
 
-/// An overlay that lands on a fragment a rewrite produced and is folded in by the
-/// next rewrite. The fragment it overlaid is named by neither the staged coverage
-/// nor the final one, so it is reached only by following what that coverage
-/// becomes at each rewrite.
+/// An overlay that lands on a fragment one compaction produced and is written in
+/// by the next. The fragment it overlaid is named by neither the staged coverage
+/// nor the final one, so it is found only by following what the covered fragments
+/// become at each compaction.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_on_its_own_output() {
@@ -2569,9 +2568,9 @@ async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_on_its_ow
     .await;
 }
 
-/// A compaction can rewrite several groups at once, and an overlay folded into
-/// one of them says nothing about the rows a segment covering a different group
-/// holds. Refusing those segments their coverage costs a flat scan for nothing.
+/// One compaction can rewrite several groups at once. An overlay written into one
+/// group says nothing about the rows a segment covering a different group holds,
+/// and refusing that segment its coverage costs a flat scan for nothing.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_keeps_coverage_when_a_folded_overlay_is_on_another_group() {

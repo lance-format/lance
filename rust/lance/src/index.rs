@@ -199,9 +199,9 @@ async fn remap_merged_segment_coverage(
         return Ok(None);
     };
 
-    // A rewrite folds an overlay on its inputs into the fragment it produces, so
-    // nothing remains there for a later check to find and no mapping can carry
-    // coverage onto it: these segments hold what that overlay superseded.
+    // Compaction writes overlay values into the fragment it produces and drops
+    // the overlay, leaving nothing to detect afterwards. Segments built before
+    // the overlay hold the old values, so no mapping can carry coverage there.
     if indexed_overlay_folded_into_rewrite(dataset, &frag_reuse_index, segments, &staged_coverage)
         .await?
     {
@@ -251,8 +251,8 @@ async fn remap_merged_segment_coverage(
         );
     }
 
-    // What the remap added: fragments the rewrite produced, so no segment here
-    // has them in its own history.
+    // Fragments the remap added. Compaction created them after these segments
+    // were built, so none of the segments has them in its history.
     let introduced = &merged_coverage - &staged_coverage;
 
     for segment in segments {
@@ -337,14 +337,8 @@ fn fragment_field_files<'a>(
         .collect()
 }
 
-/// Resolve the field ids a segment's staleness check must consider: the subtree of
-/// every field the segment declares, keyed and carried alike (see
-/// [`IndexSegment::fields`] and [`IndexSegment::covering_fields`]). A covered
-/// segment's carried columns can go stale independently of its keyed column, so
-/// checking only the keyed subtree would leave a fragment covered after a carried
-/// column was rewritten, and the segment would answer with the obsolete value.
-/// Whether `fragment` carries an overlay over `indexed` committed after
-/// `version`, holding values that supersede what an index built then recorded.
+/// Whether an overlay changed one of the `indexed` fields of `fragment` after
+/// `version`. An index built at `version` holds the old values for those rows.
 fn overlay_supersedes_index(fragment: &Fragment, version: u64, indexed: &HashSet<i32>) -> bool {
     fragment.overlays.iter().any(|overlay| {
         overlay.committed_version > version
@@ -356,12 +350,16 @@ fn overlay_supersedes_index(fragment: &Fragment, version: u64, indexed: &HashSet
     })
 }
 
-/// Whether a rewrite the coverage descends from folded in an overlay over the
-/// indexed fields committed after these segments were built. Folding leaves
-/// nothing behind on the fragment that absorbed it, and rewriting that fragment
-/// again carries the superseded values onward while putting the fragment that
-/// held them out of reach, so the chain is walked from the fragments the
-/// segments cover rather than from the fragments still standing.
+/// Whether a compaction wrote overlay values into the fragments these segments'
+/// rows now live in.
+///
+/// Compacting a fragment that has an overlay writes the overlay's values into the
+/// new fragment and drops the overlay, so afterwards nothing on that fragment
+/// shows one was ever there. A segment built before the overlay holds the old
+/// values and cannot cover those rows.
+///
+/// Every compaction is checked, and the set of fragments being followed advances
+/// to what each one produced, so a fragment compacted twice is still followed.
 async fn indexed_overlay_folded_into_rewrite(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
@@ -396,12 +394,11 @@ async fn indexed_overlay_folded_into_rewrite(
             continue;
         }
 
-        // An overlay committed no later than the oldest segment is one that
-        // segment already read, so only a rewrite after it can fold in a value
-        // the segment is missing.
+        // An overlay this old was already read by every segment, so only a later
+        // compaction can have written values they lack.
         if version.dataset_version > oldest_segment {
-            // A rewrite records the version it read, where its inputs are still
-            // present and still carry whatever overlays it was about to fold in.
+            // The reuse index records the version each compaction read. Its
+            // input fragments still exist there, with their overlays.
             let inputs = dataset
                 .checkout_version(version.dataset_version)
                 .await
@@ -427,8 +424,8 @@ async fn indexed_overlay_folded_into_rewrite(
             }
         }
 
-        // Carried forward at every version, so a rewrite of a rewrite is
-        // recognised as standing over these segments' rows.
+        // Follow the rows: what this compaction produced is what a later one
+        // will rewrite.
         for group in ours {
             for old in &group.old_frags {
                 descends_from.remove(old.id as u32);
@@ -441,6 +438,12 @@ async fn indexed_overlay_folded_into_rewrite(
     Ok(false)
 }
 
+/// Resolve the field ids a segment's staleness check must consider: the subtree of
+/// every field the segment declares, keyed and carried alike (see
+/// [`IndexSegment::fields`] and [`IndexSegment::covering_fields`]). A covered
+/// segment's carried columns can go stale independently of its keyed column, so
+/// checking only the keyed subtree would leave a fragment covered after a carried
+/// column was rewritten, and the segment would answer with the obsolete value.
 fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
     for field_id in fields {
@@ -454,10 +457,9 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
     Ok(indexed_field_ids)
 }
 
-/// `historically_missing_exempt` names fragments a rewrite produced after these
-/// segments were built, so their absence from a segment's own history is
-/// expected rather than stale. It exempts that one rule; every other check here
-/// applies to them.
+/// `historically_missing_exempt` names fragments compaction created after these
+/// segments were built. Missing them from a segment's history is expected, not
+/// stale, so that one rule is waived. Every other check below still applies.
 async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
@@ -506,9 +508,9 @@ async fn prune_stale_segment_coverage(
                     let Some(current_fragment) = current_fragments.get(fragment_id) else {
                         return true;
                     };
-                    // An exempt fragment has nothing in the segment's history
-                    // to compare files against. The overlay check below needs
-                    // none, and it decides whether the segment can serve it.
+                    // An exempt fragment has no counterpart in the segment's
+                    // history, so there are no files to compare. The overlay
+                    // check below needs none and still applies.
                     let changed_files = historical_fragment.is_some_and(|historical_fragment| {
                         let historical_files = fragment_field_files(
                             &historical,
@@ -2296,9 +2298,9 @@ impl DatasetIndexExt for Dataset {
 
         validate_segment_params_compatible(&[], &source_segments)?;
 
-        // Before the coverage work below, which checks out historical dataset
-        // versions: without `geo` these segments cannot be merged at all, so
-        // that work would be discarded.
+        // Checked before the coverage work below, which reads historical
+        // versions: without `geo` the merge cannot happen at all, so that work
+        // would be wasted.
         #[cfg(not(feature = "geo"))]
         if all_rtree {
             return Err(Error::not_supported(
@@ -2315,9 +2317,8 @@ impl DatasetIndexExt for Dataset {
         // to the distributed file merger with an object store and a directory,
         // reaching no dataset and so no reuse index.
         //
-        // This runs before the staleness pass below, which asks whether each
-        // covered fragment still exists and would drop the retired ones this
-        // remap carries forward.
+        // Runs first: the staleness pass below drops every covered fragment that
+        // no longer exists, which is exactly the ones this remap moves.
         let remapped_fragments = if !all_vector {
             let index_name = source_segments[0].name.clone();
             remap_merged_segment_coverage(self, &index_name, &mut source_segments).await?
@@ -2332,8 +2333,8 @@ impl DatasetIndexExt for Dataset {
                 .cloned()
                 .map(IntoIndexSegment::into_index_segment)
                 .collect::<Result<Vec<_>>>()?;
-            // Only what the remap added. Anything else missing from a
-            // segment's history is coverage it cannot serve.
+            // Only what the remap added. A fragment missing from a segment's
+            // history for any other reason is coverage it cannot serve.
             let exempt = remapped_fragments.unwrap_or_default();
             prune_stale_segment_coverage(self, &mut source_coverage, true, &exempt, true).await?;
             for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {

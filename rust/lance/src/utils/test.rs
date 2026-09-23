@@ -1001,8 +1001,8 @@ pub mod geo {
             uri,
             Some(WriteParams {
                 max_rows_per_file: rows_per_fragment as usize,
-                // A rewrite moves every row address, which is what leaves staged
-                // coverage needing the reuse index.
+                // Compaction moves every row address, which is what makes staged
+                // coverage need the reuse index.
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
