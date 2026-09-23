@@ -22,6 +22,7 @@ use datafusion_physical_expr::{
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
+use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion::exec::{
     LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
@@ -401,37 +402,29 @@ impl ScalarQueryParser for JsonQueryParser {
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                // Support multiple JSON extraction functions
-                let json_functions = [
-                    "json_extract",
-                    "json_get",
-                    "json_get_int",
-                    "json_get_float",
-                    "json_get_bool",
-                    "json_get_string",
-                ];
-                if !json_functions.contains(&udf.name()) {
-                    return None;
-                }
+                // Only the typed accessors are routable. `json_extract` evaluates to
+                // serialized JSON text (`"click"`, `2`) while index keys hold decoded
+                // native values (`click`, `2`), so an indexed `json_extract` predicate
+                // would answer a different question than the unindexed one. Quoting is
+                // also not order-preserving (`ab` < `ab!` but `"ab"` > `"ab!"`), so even
+                // a Utf8 index cannot serve `json_extract` ranges. Let these fall back
+                // to a full scan until literals are transcoded into the index's
+                // representation. See https://github.com/lance-format/lance/issues/8806.
+                let value_type = match udf.name() {
+                    "json_get_int" => DataType::Int64,
+                    "json_get_float" => DataType::Float64,
+                    "json_get_bool" => DataType::Boolean,
+                    "json_get_string" => DataType::Utf8,
+                    _ => return None,
+                };
                 if udf.args.len() != 2 {
                     return None;
                 }
                 // We already know index 0 is a column reference to the column so we just need to
                 // ensure that index 1 matches our path
                 match &udf.args[1] {
-                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
-                        if path == &self.path {
-                            // Return the appropriate type based on the function
-                            match udf.name() {
-                                "json_get_int" => Some(DataType::Int64),
-                                "json_get_float" => Some(DataType::Float64),
-                                "json_get_bool" => Some(DataType::Boolean),
-                                "json_get_string" | "json_extract" => Some(DataType::Utf8),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
+                    Expr::Literal(ScalarValue::Utf8(Some(path)), _) if path == &self.path => {
+                        Some(value_type)
                     }
                     _ => None,
                 }
@@ -495,12 +488,40 @@ impl JsonIndexPlugin {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
     }
 
+    /// Present the indexed JSON column as JSONB, the encoding the JSON path
+    /// functions read, whichever encoding it arrives in.
+    fn jsonb_values(data: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
+        let schema = data.schema();
+        let (value_idx, value_field) = schema.column_with_name(VALUE_COLUMN_NAME).expect_ok()?;
+        if JsonEncoding::of_field(value_field) != Some(JsonEncoding::Text) {
+            return Ok(data);
+        }
+        let value_field = value_field.clone();
+        let mut fields = schema.fields().to_vec();
+        fields[value_idx] = Arc::new(json_field(VALUE_COLUMN_NAME, value_field.is_nullable()));
+        let jsonb_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let output_schema = jsonb_schema.clone();
+        let stream = data.map(move |batch| {
+            let batch = batch?;
+            let values = JsonValues::try_new(&value_field, batch.column(value_idx))
+                .expect("the value field holds JSON text")
+                .to_jsonb()?;
+            let mut columns = batch.columns().to_vec();
+            columns[value_idx] = Arc::new(values);
+            Ok(RecordBatch::try_new(jsonb_schema.clone(), columns)?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+
     /// Extract a JSON path and its type tag while preserving all row-location columns.
     fn extract_json(
         data: SendableRecordBatchStream,
         path: String,
     ) -> Result<SendableRecordBatchStream> {
-        let input = Arc::new(OneShotExec::new(data));
+        let input = Arc::new(OneShotExec::new(Self::jsonb_values(data)?));
         let input_schema = input.schema();
         let value_column_idx = input_schema
             .column_with_name(VALUE_COLUMN_NAME)
@@ -877,9 +898,11 @@ impl BasicTrainer for JsonIndexPlugin {
         params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+        if JsonEncoding::of_field(field).is_none()
+            && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+        {
             return Err(Error::invalid_input_source(
-                "A JSON index can only be created on a Binary or LargeBinary field.".into(),
+                "A JSON index can only be created on a JSON, Binary or LargeBinary field.".into(),
             ));
         }
 
@@ -1407,6 +1430,61 @@ mod tests {
             result,
             SearchResult::exact(RowAddrTreeMap::from_iter(expected_row_ids))
         );
+    }
+
+    /// JSON text input is indexed from the same values as stored JSONB.
+    #[tokio::test]
+    async fn test_json_text_input_extracts_like_jsonb() {
+        use arrow_array::{Int64Array, StringArray};
+        use futures::{TryStreamExt, stream};
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+        let docs = [r#"{"v": 1}"#, r#"{"v": 2}"#];
+        let jsonb = json_update_batch(&docs, vec![0, 1]);
+        let text_field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let text_schema = Arc::new(Schema::new(vec![
+            text_field,
+            jsonb.schema().field(1).clone(),
+        ]));
+        let text = RecordBatch::try_new(
+            text_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(docs.to_vec())),
+                jsonb.column(1).clone(),
+            ],
+        )
+        .unwrap();
+
+        let mut extracted = Vec::new();
+        for batch in [jsonb, text] {
+            let schema = batch.schema();
+            let raw_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter([Ok(batch)]),
+            )) as SendableRecordBatchStream;
+            let converted = JsonIndexPlugin::convert_stream_by_type(
+                JsonIndexPlugin::extract_json(raw_stream, "v".to_string()).unwrap(),
+                DataType::Int64,
+                "v".to_string(),
+            )
+            .unwrap();
+            let batches = converted.try_collect::<Vec<_>>().await.unwrap();
+            extracted.push(
+                batches[0][VALUE_COLUMN_NAME]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        assert_eq!(extracted[0], Int64Array::from(vec![1, 2]));
+        assert_eq!(extracted[1], extracted[0]);
     }
 
     #[tokio::test]

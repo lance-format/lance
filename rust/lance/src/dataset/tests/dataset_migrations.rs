@@ -9,6 +9,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
@@ -185,10 +186,11 @@ async fn test_fix_v0_8_0_broken_migration() {
 }
 
 #[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::v1_v2_mixed_rejected(LanceFileVersion::Stable)]
 #[tokio::test]
 async fn test_v0_8_14_invalid_index_fragment_bitmap(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
+    #[case] data_storage_version: LanceFileVersion,
 ) {
     // Old versions of lance could create an index whose fragment bitmap was
     // invalid because it did not include fragments that were part of the index
@@ -233,7 +235,7 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
     let broken_version = dataset.version().version;
 
     // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
-    dataset
+    let append_result = dataset
         .append(
             data,
             Some(WriteParams {
@@ -241,8 +243,24 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+        .await;
+
+    if matches!(data_storage_version, LanceFileVersion::Stable) {
+        let error = append_result.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed"),
+            "{error}"
+        );
+        assert_eq!(
+            Dataset::open(test_uri).await.unwrap().version().version,
+            broken_version
+        );
+        return;
+    }
+    append_result.unwrap();
 
     for idx in dataset.load_indices().await.unwrap().iter() {
         // The corrupt fragment_bitmap does not contain 0 but the
@@ -279,6 +297,43 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
 
     let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
     assert_eq!(row_count, 1900);
+}
+
+/// The repair above is triggered by the writer version of the manifest being
+/// committed *from*, and a successful commit stamps the current one. So a
+/// commit that cannot open the index has exactly one chance at the corrupt
+/// bitmap, and carrying it through unverified would hand a later build a
+/// bitmap that looks migrated.
+#[tokio::test]
+async fn test_v0_8_14_invalid_index_fragment_bitmap_repair_is_not_lost() {
+    let test_dir = copy_test_data_to_tmp("v0.8.14/corrupt_index").unwrap();
+    let test_uri = test_dir.path_str();
+
+    let indices_dir = test_dir.std_path().join("_indices");
+    let stashed_dir = test_dir.std_path().join("_indices_stashed");
+    std::fs::rename(&indices_dir, &stashed_dir).unwrap();
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    dataset.delete("false").await.unwrap();
+
+    for idx in dataset.load_indices().await.unwrap().iter() {
+        assert_eq!(
+            idx.fragment_bitmap, None,
+            "a bitmap the migration could not verify must be recorded as unknown"
+        );
+    }
+
+    std::fs::rename(&stashed_dir, &indices_dir).unwrap();
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    dataset.delete("false").await.unwrap();
+
+    for idx in dataset.load_indices().await.unwrap().iter() {
+        assert!(
+            idx.fragment_bitmap.as_ref().unwrap().contains(0),
+            "the first build that can open the index must repair the coverage"
+        );
+    }
 }
 
 #[tokio::test]
@@ -352,6 +407,50 @@ async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
     }
     assert_eq!(get_bitmap(&indices[0]), vec![0]);
     assert_eq!(get_bitmap(&indices[1]), vec![1]);
+}
+
+/// Unlike the pre-0.8.15 trigger, an overlap is re-derived from the index
+/// metadata on every commit, so it asks to be recalculated again on its own. A
+/// commit that cannot open the index has nothing to preserve and must leave the
+/// coverage alone: `None` is a state modern indices are not built to recover
+/// from, since `calculate_included_frags` exists only for old manifests.
+#[tokio::test]
+async fn test_v0_21_0_corrupt_fragment_bitmap_kept_when_index_cannot_be_opened() {
+    let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+    let test_uri = test_dir.path_str();
+
+    std::fs::rename(
+        test_dir.std_path().join("_indices"),
+        test_dir.std_path().join("_indices_stashed"),
+    )
+    .unwrap();
+
+    fn coverage(indices: &[IndexMetadata]) -> Vec<(String, Option<Vec<u32>>)> {
+        let mut coverage = indices
+            .iter()
+            .map(|idx| {
+                (
+                    idx.uuid.to_string(),
+                    idx.fragment_bitmap
+                        .as_ref()
+                        .map(|bitmap| bitmap.iter().collect()),
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        coverage
+    }
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    let before = coverage(&dataset.load_indices().await.unwrap());
+
+    dataset.delete("false").await.unwrap();
+
+    assert_eq!(
+        coverage(&dataset.load_indices().await.unwrap()),
+        before,
+        "coverage the overlap check will ask about again must be left as it stands"
+    );
 }
 
 #[tokio::test]
@@ -713,6 +812,144 @@ async fn test_migrate_to_stable_row_ids_basic() {
     // next_row_id should have advanced by the 5 newly appended rows.
     assert_eq!(dataset_after_append.manifest.next_row_id, 25);
 
+    dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_ignores_system_indices() {
+    // Compaction with deferred index remap registers the fragment-reuse
+    // system index (`__lance_frag_reuse`) for rewritten, indexed fragments.
+    // It is internal bookkeeping, not a user index the migration would
+    // invalidate, and the user may have already dropped every user index —
+    // the migration must not be gated on it.
+    let uri = "memory://migrate_system_idx";
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "values",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    dataset
+        .create_index(
+            &["values"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Drop the user index; only the bookkeeping system index remains.
+    let user_index_name = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .find(|name| name != FRAG_REUSE_INDEX_NAME)
+        .expect("user index should exist after compaction");
+    dataset.drop_index(&user_index_name).await.unwrap();
+    let index_names: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    assert_eq!(
+        index_names,
+        vec![FRAG_REUSE_INDEX_NAME.to_string()],
+        "precondition: only the fragment-reuse system index remains"
+    );
+
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+    assert!(
+        dataset.manifest.uses_stable_row_ids(),
+        "migration must succeed with only the fragment-reuse index present"
+    );
+
+    // The migration must drop the fragment-reuse index rather than carry it
+    // forward. It maps old row addresses to new ones, and the read path
+    // attaches it to every index it opens, so a survivor would rewrite the
+    // freshly issued stable row ids as if they were addresses.
+    let remaining: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "migration must leave no indices behind, got {remaining:?}"
+    );
+
+    // An index built after the migration must return the row it covers. With
+    // the fragment-reuse index still attached this lookup finds nothing: the
+    // remapper rewrites row id 0 into the compacted fragment's address space,
+    // which no live row carries.
+    dataset
+        .create_index(
+            &["values"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let matched = dataset
+        .scan()
+        .filter("values = 0")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert_eq!(
+        matched, 1,
+        "an index built after the migration must find the row it covers"
+    );
+
+    // Deleting enough rows to materialize a compaction task (the default
+    // materialize-deletions threshold is 10%) exercises the commit path once
+    // more on the migrated dataset.
+    dataset.delete("values >= 7").await.unwrap();
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(
+        metrics.fragments_removed > 0,
+        "precondition: the compaction must do real work, got metrics {metrics:?}"
+    );
     dataset.validate().await.unwrap();
 }
 

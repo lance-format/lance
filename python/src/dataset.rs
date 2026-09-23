@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
@@ -71,6 +72,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_file::writer::FileWriterOptions;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -423,6 +425,15 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn data_storage_version<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        version: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.builder
+            .data_storage_version(version.parse().infer_error()?);
+        Ok(slf)
+    }
+
     pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
         slf.builder.use_index(use_index);
         Ok(slf)
@@ -586,6 +597,25 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    /// [`Self::analyze_plan`] for fully-materialized data.
+    ///
+    /// Routed to the same in-memory table `execute_batches` uses, so the reported
+    /// plan is the one such a source actually runs.
+    pub fn analyze_plan_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        rt().block_on(None, job.analyze_plan_batches(batches))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -846,6 +876,7 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         transaction_files_removed: stats.transaction_files_removed,
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
+        failed_deletes: stats.failed_deletes,
     }
 }
 
@@ -1198,7 +1229,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1234,6 +1265,7 @@ impl Dataset {
         substrait_aggregate: Option<Vec<u8>>,
         row_addr_allowlist: Option<Vec<u8>>,
         row_addr_blocklist: Option<Vec<u8>>,
+        minhash_query: Option<&Bound<PyDict>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1592,6 +1624,25 @@ impl Dataset {
         if let Some(aggregate_bytes) = substrait_aggregate {
             scanner
                 .aggregate(AggregateExpr::substrait(aggregate_bytes))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(minhash_query) = minhash_query {
+            let column: String = minhash_query
+                .get_item("column")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify a column"))?
+                .extract()?;
+            let text: String = minhash_query
+                .get_item("text")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify text"))?
+                .extract()?;
+            if limit.is_none() {
+                // Same default as the vector `nearest` path when no limit is given
+                scanner
+                    .limit(Some(10), offset)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            scanner
+                .minhash_search(MinHashQuery::new(text, column))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
@@ -1975,13 +2026,14 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None, data_storage_version=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1996,6 +2048,10 @@ impl Dataset {
 
         if let Some(timeout) = retry_timeout {
             builder = builder.retry_timeout(timeout);
+        }
+
+        if let Some(version) = data_storage_version {
+            builder = builder.data_storage_version(version.parse().infer_error()?);
         }
 
         for (key, value) in updates {
@@ -2153,6 +2209,38 @@ impl Dataset {
             .block_on(
                 Some(py),
                 new_self.shallow_clone(&target_path, reference, store_params),
+            )?
+            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
+    /// Deep clone the selected version into a new dataset.
+    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    fn deep_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        reference: Option<Bound<PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
+        let mut new_self = self.ds.as_ref().clone();
+        let reference = self.transform_ref(reference)?;
+        let ds = rt()
+            .block_on(
+                Some(py),
+                new_self.deep_clone(&target_path, reference, store_params),
             )?
             .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
 
@@ -4753,6 +4841,15 @@ pub fn get_write_params(
         }
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
+        }
+        let data_cache_bytes = get_dict_opt::<u64>(options, "data_cache_bytes")?;
+        let max_page_bytes = get_dict_opt::<u64>(options, "max_page_bytes")?;
+        if data_cache_bytes.is_some() || max_page_bytes.is_some() {
+            p.file_writer_options = Some(FileWriterOptions {
+                data_cache_bytes,
+                max_page_bytes,
+                ..Default::default()
+            });
         }
         if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
         {

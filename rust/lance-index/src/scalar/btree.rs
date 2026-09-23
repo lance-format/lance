@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -17,9 +18,12 @@ use super::{
     compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
+use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexType};
-use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
-use crate::{pbold, scalar::btree::flat::FlatIndex};
+use crate::{
+    pbold,
+    scalar::btree::flat::{FlatIndex, PageMatches},
+};
 use crate::{
     progress::{IndexBuildProgress, noop_progress},
     scalar::{
@@ -54,11 +58,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
-use futures::{
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
-    future::BoxFuture,
-    stream::{self},
-};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -68,7 +68,7 @@ use lance_core::{
     },
     error::LanceOptionExt,
     utils::{
-        tokio::get_num_compute_intensive_cpus,
+        tokio::{get_num_compute_intensive_cpus, spawn_cpu},
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
 };
@@ -76,6 +76,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
+use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
@@ -1301,6 +1302,42 @@ impl IndexReader for LazyRangedIndexReader {
         unimplemented!("Read range is not implemented for lazy page file reader.");
     }
 
+    /// Streams the partition page files one after another in global page order.
+    ///
+    /// Each partition file is streamed on its own so a short final page in one
+    /// partition stays a page of its own (exactly as `read_record_batch` would
+    /// return it) instead of being merged with the next partition's first page.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        // `RangeInclusiveMap` iterates in ascending key order, i.e. global page order.
+        let file_names = self
+            .ranges_to_files
+            .iter()
+            .map(|(_, (file_name, _))| file_name.clone())
+            .collect::<Vec<_>>();
+        let schema: Arc<Schema> = match file_names.first() {
+            Some(first) => Arc::new(self.get_reader(first).await?.schema().into()),
+            None => Arc::new(Schema::empty()),
+        };
+        let stream = stream::iter(file_names)
+            .then(move |file_name| {
+                let this = self.clone();
+                async move {
+                    this.get_reader(&file_name)
+                        .await?
+                        .read_record_batch_stream(batch_size, batch_readahead)
+                        .await
+                }
+            })
+            .try_flatten();
+        Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+            schema, stream,
+        )))
+    }
+
     async fn num_batches(&self, batch_size: u64) -> u32 {
         let mut total_batches = 0;
         for (_, (file_name, _)) in self.ranges_to_files.iter() {
@@ -1674,14 +1711,55 @@ impl BTreeIndex {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
-        let mut serialized_page = index_reader
+        let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
-        if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-            serialized_page =
-                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+        Self::decode_page(serialized_page, self.frag_reuse_index.as_deref())
+    }
+
+    /// Turn a serialized page into a searchable [`FlatIndex`], applying the
+    /// fragment-reuse row id remap first when there is one.
+    fn decode_page(
+        mut serialized_page: RecordBatch,
+        frag_reuse_index: Option<&dyn RowIdRemapper>,
+    ) -> Result<FlatIndex> {
+        if let Some(frag_reuse_index) = frag_reuse_index {
+            serialized_page = frag_reuse_index.remap_row_ids_record_batch(serialized_page, 1)?;
         }
         FlatIndex::try_new(serialized_page)
+    }
+
+    /// Stream every serialized page of `reader` in page order as
+    /// `(page_idx, page)`.
+    ///
+    /// Unlike [`Self::read_page`], which is the right tool for a single page
+    /// lookup, this issues one sequential read per page file (via
+    /// [`IndexReader::read_record_batch_stream`]) so that whole-index passes
+    /// (update / merge, remap, prewarm, `calculate_included_frags`) cost
+    /// O(files) IO scheduling passes instead of O(pages) random reads. Page
+    /// `i` of the stream is the same batch `read_record_batch(i, batch_size)`
+    /// would return.
+    async fn page_stream(
+        reader: Arc<dyn IndexReader>,
+        batch_size: u64,
+        batch_readahead: usize,
+    ) -> Result<impl Stream<Item = Result<(u32, RecordBatch)>> + Send + 'static> {
+        let batch_readahead = u32::try_from(batch_readahead.max(1)).unwrap_or(u32::MAX);
+        let batches = reader
+            .read_record_batch_stream(batch_size, batch_readahead)
+            .await?;
+        Ok(batches.enumerate().map(move |(page_idx, batch)| {
+            let batch = batch?;
+            if batch.num_rows() == 0 || batch.num_rows() as u64 > batch_size {
+                return Err(Error::internal(format!(
+                    "btree page stream yielded a batch of {} rows for page {} (page size {})",
+                    batch.num_rows(),
+                    page_idx,
+                    batch_size
+                )));
+            }
+            Ok((page_idx as u32, batch))
+        }))
     }
 
     /// Compile a sargable predicate into a physical expr against the per-page
@@ -1708,24 +1786,26 @@ impl BTreeIndex {
         prebuilt: Option<&Arc<dyn PhysicalExpr>>,
         track_nulls: bool,
         metrics: &dyn MetricsCollector,
-    ) -> Result<NullableRowAddrSet> {
+    ) -> Result<PageMatches> {
         let subindex = self
             .lookup_page(matches.page_id(), index_reader, metrics)
             .await?;
 
+        // Each page hands back plain id arrays; the caller assembles the
+        // final `RowAddrTreeMap` once across all pages (see `search_with_options`).
         match matches {
             // For a large IsIn the predicate is compiled once (see `search`) and
             // reused here, instead of rebuilding the whole IN-list per page.
             Matches::Some(_) => match prebuilt {
-                Some(expr) => subindex.search_prebuilt(expr, track_nulls, metrics),
-                None => subindex.search(query, track_nulls, metrics),
+                Some(expr) => subindex.search_prebuilt_matches(expr, track_nulls, metrics),
+                None => subindex.search_matches(query, track_nulls, metrics),
             },
-            Matches::All(_) => Ok(match query {
+            Matches::All(_) => match query {
                 // This means we hit an all-null page so just grab all row ids as true
-                SargableQuery::IsNull() => subindex.all_ignore_nulls(),
-                _ if track_nulls => subindex.all(),
-                _ => subindex.all_non_null(),
-            }),
+                SargableQuery::IsNull() => Ok(subindex.all_ignore_nulls_matches()),
+                _ if track_nulls => subindex.all_matches(),
+                _ => subindex.all_non_null_matches(),
+            },
         }
     }
 
@@ -1848,10 +1928,10 @@ impl BTreeIndex {
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
-        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
-        let batches = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(self.store.io_parallelism())
+        let batches = Self::page_stream(reader, self.batch_size, self.store.io_parallelism())
+            .await?
+            .map_ok(|(_, batch)| batch)
+            .map_err(DataFusionError::from)
             .map_ok(move |batch| {
                 RecordBatch::try_new(
                     new_schema.clone(),
@@ -2041,18 +2121,23 @@ impl Index for BTreeIndex {
     async fn prewarm(&self) -> Result<()> {
         let index_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = index_reader.get().await?;
-        let num_pages = reader.num_batches(self.batch_size).await;
-        let mut pages = stream::iter(0..num_pages)
-            .map(|page_idx| {
-                let index_reader = index_reader.clone();
+        // One sequential pass over the page file(s); pages are decoded
+        // concurrently on the compute pool as they arrive.
+        let mut pages = Self::page_stream(reader, self.batch_size, self.store.io_parallelism())
+            .await?
+            .map(|page| {
+                let frag_reuse_index = self.frag_reuse_index.clone();
                 async move {
-                    let page = self
-                        .read_page(page_idx, index_reader, &NoOpMetricsCollector)
-                        .await?;
+                    let (page_idx, serialized_page) = page?;
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_idx);
+                    let page = spawn_cpu(move || {
+                        Self::decode_page(serialized_page, frag_reuse_index.as_deref())
+                    })
+                    .await?;
                     Result::Ok((page_idx, page))
                 }
             })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+            .buffered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, page)) = pages.try_next().await? {
             let inserted = self
@@ -2110,10 +2195,13 @@ impl Index for BTreeIndex {
 
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let sub_index_reader = lazy_reader.get().await?;
-        let mut reader_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-            .await
-            .buffered(self.store.io_parallelism());
-        while let Some(serialized) = reader_stream.try_next().await? {
+        let mut pages = Self::page_stream(
+            sub_index_reader,
+            self.batch_size,
+            self.store.io_parallelism(),
+        )
+        .await?;
+        while let Some((_, serialized)) = pages.try_next().await? {
             let page = FlatIndex::try_new(serialized)?;
             frag_ids |= page.calculate_included_frags()?;
         }
@@ -2246,27 +2334,33 @@ impl ScalarIndex for BTreeIndex {
         debug!("Searching {} btree pages", page_tasks.len());
 
         // Collect both matching row IDs and null row IDs from all pages
-        let results: Vec<NullableRowAddrSet> = stream::iter(page_tasks)
+        let results: Vec<PageMatches> = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
             .try_collect()
             .await?;
 
-        let selection = if options.track_nulls() {
-            NullableRowAddrSet::union_all(&results)
+        // Assemble the result once. A page holds rows sorted by value, so its
+        // ids are scattered across fragments; a per-page `RowAddrTreeMap`
+        // would be `pages x fragments` tiny bitmaps to allocate and then
+        // union. Instead each page's sorted id array is bucketed by fragment
+        // and one bitmap is built per fragment.
+        //
+        // Every row lives on exactly one page, so a row that is TRUE on its
+        // page is never NULL on another; the union of the per-page null sets
+        // is therefore already the final null set and needs no subtraction
+        // (which is what `NullableRowAddrSet::union_all` would otherwise do).
+        let selected = RowAddrTreeMap::from_sorted_runs(results.iter().map(PageMatches::selected));
+        let nulls = if options.track_nulls() {
+            RowAddrTreeMap::from_sorted_runs(results.iter().map(PageMatches::nulls))
         } else {
-            let selected_rows = results
-                .iter()
-                .map(NullableRowAddrSet::selected_rows)
-                .collect::<Vec<_>>();
-            NullableRowAddrSet::new(
-                RowAddrTreeMap::union_all(&selected_rows),
-                Default::default(),
-            )
+            RowAddrTreeMap::new()
         };
 
-        Ok(SearchResult::Exact(selection))
+        Ok(SearchResult::Exact(NullableRowAddrSet::new(
+            selected, nulls,
+        )))
     }
 
     fn can_remap(&self) -> bool {
@@ -2308,20 +2402,24 @@ impl ScalarIndex for BTreeIndex {
             let train_schema_clone = train_schema.clone();
             let train_schema = train_schema.clone();
 
-            let remapped_stream = IndexReaderStream::new(sub_index_reader, self.batch_size)
-                .await
-                .buffered(self.store.io_parallelism())
-                .map_err(DataFusionError::from)
-                .and_then(move |batch| {
-                    // Remap the batch and then convert from the serialized schema to the training input schema
-                    let remapped =
-                        FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
-                    let with_train_schema = remapped.and_then(|batch| {
-                        RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
-                            .map_err(DataFusionError::from)
-                    });
-                    std::future::ready(with_train_schema)
+            let remapped_stream = Self::page_stream(
+                sub_index_reader,
+                self.batch_size,
+                self.store.io_parallelism(),
+            )
+            .await?
+            .map_ok(|(_, batch)| batch)
+            .map_err(DataFusionError::from)
+            .and_then(move |batch| {
+                // Remap the batch and then convert from the serialized schema to the training input schema
+                let remapped =
+                    FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
+                let with_train_schema = remapped.and_then(|batch| {
+                    RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
+                        .map_err(DataFusionError::from)
                 });
+                std::future::ready(with_train_schema)
+            });
 
             let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
                 train_schema_clone,
@@ -2816,10 +2914,14 @@ async fn merge_range_partitioned_lookups(
 
     for (idx, (part_id, part_lookup_file)) in sorted_part_lookup_files.into_iter().enumerate() {
         let lookup_reader = store.open_index_file(&part_lookup_file).await?;
-        let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
-        let mut stream = reader_stream.buffered(batch_readhead.unwrap_or(1)).boxed();
-        while let Some(batch) = stream.next().await {
-            let original_batch = batch?;
+        let mut stream = lookup_reader
+            .clone()
+            .read_record_batch_stream(
+                batch_size,
+                u32::try_from(batch_readhead.unwrap_or(1)).unwrap_or(u32::MAX),
+            )
+            .await?;
+        while let Some(original_batch) = stream.try_next().await? {
             let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
             lookup_file.write_record_batch(modified_batch).await?;
         }
@@ -2978,11 +3080,13 @@ async fn merge_pages(
 
         let reader = store.open_index_file(&page_file_name).await?;
 
-        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
-
-        let stream = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
-            .buffered(batch_readhead.unwrap_or(1))
+        let stream = reader
+            .read_record_batch_stream(
+                batch_size,
+                u32::try_from(batch_readhead.unwrap_or(1)).unwrap_or(u32::MAX),
+            )
+            .await?
+            .map_err(DataFusionError::from)
             .boxed();
 
         let sendable_stream =
@@ -3161,53 +3265,6 @@ pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
 }
 
-/// A stream that reads the original training data back out of the index
-///
-/// This is used for updating the index
-struct IndexReaderStream {
-    reader: Arc<dyn IndexReader>,
-    batch_size: u64,
-    num_batches: u32,
-    batch_idx: u32,
-}
-
-impl IndexReaderStream {
-    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
-        let num_batches = reader.num_batches(batch_size).await;
-        Self {
-            reader,
-            batch_size,
-            num_batches,
-            batch_idx: 0,
-        }
-    }
-}
-
-impl Stream for IndexReaderStream {
-    type Item = BoxFuture<'static, Result<RecordBatch>>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.batch_idx >= this.num_batches {
-            return std::task::Poll::Ready(None);
-        }
-        let batch_num = this.batch_idx;
-        this.batch_idx += 1;
-        let reader_copy = this.reader.clone();
-        let batch_size = this.batch_size;
-        let read_task = async move {
-            reader_copy
-                .read_record_batch(batch_num as u64, batch_size)
-                .await
-        }
-        .boxed();
-        std::task::Poll::Ready(Some(read_task))
-    }
-}
-
 /// Parameters for a btree index
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BTreeParameters {
@@ -3377,7 +3434,12 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )?))
     }
 
-    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
         let state = BTreeIndexState::from_index(index.as_ref())?;
         cache
             .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
@@ -3407,7 +3469,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, ops::Bound, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
@@ -3421,6 +3483,7 @@ mod tests {
     use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
@@ -3428,6 +3491,7 @@ mod tests {
     use lance_select::{RowAddrTreeMap, RowSetOps};
     use object_store::path::Path;
 
+    use crate::Index;
     use crate::metrics::LocalMetricsCollector;
     use crate::progress::{IndexBuildProgress, noop_progress};
     use crate::{
@@ -5660,6 +5724,177 @@ mod tests {
         assert_eq!(tracked.null_rows(), &RowAddrTreeMap::from_iter([0]));
     }
 
+    /// Row ids that span many fragments, interleaved so that every page holds
+    /// rows from (almost) every fragment. The search result is assembled once
+    /// from all pages' id arrays rather than per page, so this checks that the
+    /// bucketing by fragment reproduces exactly the expected TRUE and NULL
+    /// sets for range, IN, equality and IS NULL queries, with and without null
+    /// tracking.
+    #[tokio::test]
+    async fn test_search_assembles_rows_across_many_fragments() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        const NUM_FRAGMENTS: u64 = 200;
+        const ROWS_PER_FRAGMENT: u64 = 64;
+        const NUM_ROWS: u64 = NUM_FRAGMENTS * ROWS_PER_FRAGMENT;
+        // Larger than NUM_FRAGMENTS so each page spans every fragment.
+        const PAGE_SIZE: u64 = 256;
+        const NULL_EVERY: u64 = 50;
+
+        // Row `i` has value `i` (or NULL every 50th row) and lives at offset
+        // `i / NUM_FRAGMENTS` of fragment `i % NUM_FRAGMENTS`, so consecutive
+        // values sit in different fragments.
+        let addr_of = |i: u64| {
+            u64::from(RowAddress::new_from_parts(
+                (i % NUM_FRAGMENTS) as u32,
+                (i / NUM_FRAGMENTS) as u32,
+            ))
+        };
+        let is_null = |i: u64| i.is_multiple_of(NULL_EVERY);
+
+        let values: Int32Array = (0..NUM_ROWS)
+            .map(|i| if is_null(i) { None } else { Some(i as i32) })
+            .collect();
+        let row_ids = UInt64Array::from_iter_values((0..NUM_ROWS).map(addr_of));
+        let data = RecordBatch::try_from_iter(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+        // Training expects value-sorted, page-sized batches (nulls last, as
+        // DataFusion's default sort would produce them).
+        let data = lance_arrow::RecordBatchExt::sort_by_column(
+            &data,
+            0,
+            Some(arrow_schema::SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        )
+        .unwrap();
+        let schema = data.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::once(async { Ok(data) }),
+        )) as SendableRecordBatchStream;
+        let stream = break_stream(stream, PAGE_SIZE as usize).map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        train_btree_index(stream, test_store.as_ref(), PAGE_SIZE, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let num_pages = index.page_lookup.batch.num_rows();
+        assert!(num_pages > 40, "expected many pages, got {num_pages}");
+
+        let expected_rows = |pred: &dyn Fn(u64) -> bool| -> RowAddrTreeMap {
+            (0..NUM_ROWS)
+                .filter(|&i| !is_null(i) && pred(i))
+                .map(addr_of)
+                .collect()
+        };
+        let all_nulls: RowAddrTreeMap =
+            (0..NUM_ROWS).filter(|&i| is_null(i)).map(addr_of).collect();
+        assert_eq!(all_nulls.len(), Some(NUM_ROWS / NULL_EVERY));
+
+        // (query, expected TRUE rows, expected NULL rows when tracked)
+        let int = |i: u64| ScalarValue::Int32(Some(i as i32));
+        let cases: Vec<(SargableQuery, RowAddrTreeMap, RowAddrTreeMap)> = vec![
+            (
+                SargableQuery::Range(Bound::Included(int(3000)), Bound::Excluded(int(9000))),
+                expected_rows(&|i| (3000..9000).contains(&i)),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::Range(Bound::Unbounded, Bound::Included(int(1234))),
+                expected_rows(&|i| i <= 1234),
+                all_nulls.clone(),
+            ),
+            (
+                // 50 is a NULL slot and 99_999 is absent; both must be ignored.
+                SargableQuery::IsIn(
+                    [7_u64, 100, 4999, 12_000, 50, 99_999]
+                        .into_iter()
+                        .map(int)
+                        .collect(),
+                ),
+                expected_rows(&|i| [7, 100, 4999, 12_000].contains(&i)),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::Equals(int(4242)),
+                expected_rows(&|i| i == 4242),
+                all_nulls.clone(),
+            ),
+            (
+                // A value that only ever appears as NULL.
+                SargableQuery::Equals(int(50)),
+                RowAddrTreeMap::new(),
+                all_nulls.clone(),
+            ),
+            (
+                SargableQuery::IsNull(),
+                all_nulls.clone(),
+                RowAddrTreeMap::new(),
+            ),
+        ];
+
+        for (query, expected_true, expected_nulls) in cases {
+            for track_nulls in [true, false] {
+                let result = index
+                    .search_with_options(
+                        &query,
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                let SearchResult::Exact(rows) = result else {
+                    panic!("BTree search should be exact");
+                };
+                assert_eq!(
+                    rows.true_rows(),
+                    expected_true,
+                    "TRUE rows for {query:?} (track_nulls={track_nulls})"
+                );
+                let expected_nulls = if track_nulls {
+                    expected_nulls.clone()
+                } else {
+                    RowAddrTreeMap::new()
+                };
+                assert_eq!(
+                    rows.null_rows(),
+                    &expected_nulls,
+                    "NULL rows for {query:?} (track_nulls={track_nulls})"
+                );
+            }
+        }
+
+        // Sanity: the range result really did have to be stitched together
+        // across fragments and pages. Fragments whose id is a multiple of
+        // NULL_EVERY hold only NULL rows, so they carry no TRUE rows.
+        let fragments_with_true_rows = (NUM_FRAGMENTS - NUM_FRAGMENTS / NULL_EVERY) as usize;
+        let SearchResult::Exact(rows) = index
+            .search(
+                &SargableQuery::Range(Bound::Included(int(3000)), Bound::Excluded(int(9000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("BTree search should be exact");
+        };
+        assert_eq!(rows.true_rows().iter().count(), fragments_with_true_rows);
+    }
+
     fn sample_lookup_batch() -> RecordBatch {
         record_batch!(
             ("min", Int32, [Some(0), Some(10), Some(20)]),
@@ -6369,7 +6604,10 @@ mod tests {
         // The plugin's put/get hooks round-trip through a real cache + the codec.
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        plugin
+            .put_in_cache(test_store.clone(), &cache, index.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(test_store.clone(), None, &cache)
             .await
@@ -6574,7 +6812,10 @@ mod tests {
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        plugin
+            .put_in_cache(store.clone(), &cache, index.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(store.clone(), None, &cache)
             .await
@@ -6591,5 +6832,234 @@ mod tests {
                 .unwrap();
             assert_eq!(expected, actual, "value {value}");
         }
+    }
+
+    /// Train a two-partition (legacy range-partitioned) btree with `page_size` rows
+    /// per page. Partition 0 holds 2.5 pages and partition 1 holds 1.5 pages so
+    /// both partition files end in a short page, exercising the per-file page
+    /// boundaries of `LazyRangedIndexReader`.
+    async fn build_two_partition_btree(store: &LanceIndexStore, page_size: u64) {
+        let part0_rows = page_size * 5 / 2;
+        let part1_rows = page_size * 3 / 2;
+        for (part_id, start, rows) in [(0u32, 0u64, part0_rows), (1u32, part0_rows, part1_rows)] {
+            let data = gen_batch()
+                .col("value", array::step_custom::<Int32Type>(start as i32, 1))
+                .col("_rowid", array::step_custom::<UInt64Type>(start, 1))
+                .into_df_stream(RowCount::from(rows / 2), BatchCount::from(2));
+            let data = Box::pin(RecordBatchStreamAdapter::new(data.schema(), data));
+            train_btree_index(data, store, page_size, None, Some(part_id))
+                .await
+                .unwrap();
+        }
+        super::merge_metadata_files(
+            store,
+            &[
+                part_page_data_file_path(0),
+                part_page_data_file_path(1 << 32),
+            ],
+            &[part_lookup_file_path(0), part_lookup_file_path(1 << 32)],
+            Some(1),
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Train a plain (single page file) btree with `num_pages` pages of
+    /// `page_size` rows; the last page is short by half.
+    async fn build_plain_btree(store: &LanceIndexStore, page_size: u64, num_pages: u64) {
+        let rows = page_size * num_pages - page_size / 2;
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(rows), BatchCount::from(1));
+        let data = Box::pin(RecordBatchStreamAdapter::new(data.schema(), data));
+        train_btree_index(data, store, page_size, None, None)
+            .await
+            .unwrap();
+    }
+
+    /// Every page from the sequential page stream must be the exact batch the
+    /// per-page `read_record_batch` path returns, so page numbering is unchanged.
+    async fn assert_page_stream_matches_pages(
+        reader: Arc<dyn crate::scalar::IndexReader>,
+        page_size: u64,
+        expected_pages: u32,
+    ) {
+        let num_pages = reader.num_batches(page_size).await;
+        assert_eq!(num_pages, expected_pages);
+        let streamed: Vec<(u32, RecordBatch)> =
+            BTreeIndex::page_stream(reader.clone(), page_size, 3)
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+        assert_eq!(streamed.len() as u32, num_pages);
+        for (page_idx, (streamed_idx, streamed_page)) in streamed.iter().enumerate() {
+            assert_eq!(*streamed_idx, page_idx as u32);
+            let expected = reader
+                .read_record_batch(page_idx as u64, page_size)
+                .await
+                .unwrap();
+            assert_eq!(
+                streamed_page, &expected,
+                "page {} from the stream differs from read_record_batch",
+                page_idx
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_stream_matches_read_record_batch() {
+        let page_size = 64u64;
+
+        // Plain index: 8 pages, last one short.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        build_plain_btree(&store, page_size, 8).await;
+        let reader = store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        assert_page_stream_matches_pages(reader, page_size, 8).await;
+
+        // Range-partitioned index over two page files: 3 + 2 global pages, with
+        // the short pages in the middle (page 2) and at the end (page 4).
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        build_two_partition_btree(&store, page_size).await;
+        let index = BTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let ranges_to_files = index.ranges_to_files.clone();
+        assert!(ranges_to_files.is_some());
+        let reader = super::LazyIndexReader::new(store.clone(), ranges_to_files)
+            .get()
+            .await
+            .unwrap();
+        assert_page_stream_matches_pages(reader.clone(), page_size, 5).await;
+        assert_eq!(
+            reader
+                .read_record_batch(2, page_size)
+                .await
+                .unwrap()
+                .num_rows() as u64,
+            page_size / 2
+        );
+        assert_eq!(
+            reader
+                .read_record_batch(4, page_size)
+                .await
+                .unwrap()
+                .num_rows() as u64,
+            page_size / 2
+        );
+
+        // The whole-index passes built on the stream still see every page.
+        let frags = index.calculate_included_frags().await.unwrap();
+        assert_eq!(frags.len(), 1);
+        let rows: usize = index
+            .data_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows as u64, page_size * 4);
+    }
+
+    /// Whole-index passes (prewarm, calculate_included_frags, data_stream) must
+    /// read the page file sequentially: a handful of object store requests
+    /// regardless of the page count, instead of at least one request per page.
+    #[tokio::test]
+    async fn test_whole_index_reads_are_sequential() {
+        let page_size = 64u64;
+        let num_pages = 50u64;
+        let object_store = Arc::new(ObjectStore::local());
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        build_plain_btree(&store, page_size, num_pages).await;
+
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let index = BTreeIndex::load(store.clone(), None, &cache).await.unwrap();
+
+        // Baseline: the per-page path costs at least one request per page.
+        let reader = store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        object_store.io_stats_incremental();
+        for page_idx in 0..num_pages {
+            reader.read_record_batch(page_idx, page_size).await.unwrap();
+        }
+        let per_page_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            per_page_iops >= num_pages,
+            "expected >= {} requests for per-page reads, got {}",
+            num_pages,
+            per_page_iops
+        );
+
+        let budget = num_pages / 4;
+
+        object_store.io_stats_incremental();
+        index.prewarm().await.unwrap();
+        let prewarm_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            prewarm_iops < budget,
+            "prewarm issued {} requests for {} pages (per-page path: {})",
+            prewarm_iops,
+            num_pages,
+            per_page_iops
+        );
+        // Every page landed in the cache under its page number.
+        for page_idx in 0..num_pages as u32 {
+            let key = BTreePageKey {
+                page_number: page_idx,
+            };
+            assert!(
+                cache.get_with_key::<BTreePageKey>(&key).await.is_some(),
+                "page {} was not prewarmed",
+                page_idx
+            );
+        }
+
+        object_store.io_stats_incremental();
+        let frags = index.calculate_included_frags().await.unwrap();
+        assert_eq!(frags.len(), 1);
+        let frags_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            frags_iops < budget,
+            "calculate_included_frags issued {} requests for {} pages",
+            frags_iops,
+            num_pages
+        );
+
+        object_store.io_stats_incremental();
+        let batches: Vec<RecordBatch> = index
+            .data_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let data_stream_iops = object_store.io_stats_incremental().read_iops;
+        assert_eq!(batches.len() as u64, num_pages);
+        assert!(
+            data_stream_iops < budget,
+            "data_stream issued {} requests for {} pages",
+            data_stream_iops,
+            num_pages
+        );
     }
 }

@@ -4,13 +4,14 @@
 mod validate;
 
 use super::Dataset;
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
@@ -22,42 +23,30 @@ pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
+    let Some(row_id_meta) = &fragment.row_id_meta else {
+        return Err(Error::internal("Missing row id meta"));
+    };
+    let key = RowIdSequenceKey {
+        fragment_id: fragment.id,
+        row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
+    };
+    dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || read_row_id_sequence(fragment))
+        .await
+}
+
+/// Decode the row id sequence of `fragment`, bypassing every cache.
+async fn read_row_id_sequence(fragment: &Fragment) -> Result<RowIdSequence> {
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(row_id_meta @ RowIdMeta::Inline(data)) => {
-            let data = data.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-                row_id_meta,
-            };
-            dataset
-                .metadata_cache
-                .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
-                .await
-        }
-        Some(row_id_meta @ RowIdMeta::External(file_slice)) => {
-            let file_slice = file_slice.clone();
-            let dataset_clone = dataset.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-                row_id_meta,
-            };
-            dataset
-                .metadata_cache
-                .get_or_insert_with_key(key, || async move {
-                    let path = dataset_clone.base.clone().join(file_slice.path.as_str());
-                    let range = file_slice.offset as usize
-                        ..(file_slice.offset as usize + file_slice.size as usize);
-                    let data = dataset_clone
-                        .object_store
-                        .open(&path)
-                        .await?
-                        .get_range(range)
-                        .await?;
-                    read_row_ids(&data)
-                })
-                .await
-        }
+        Some(RowIdMeta::Inline(data)) => read_row_ids(data),
+        Some(RowIdMeta::Column) => Err(Error::not_supported(format!(
+            "row ids of fragment {} are spilled to a data file column, which this build \
+             cannot read",
+            fragment.id
+        ))),
     }
 }
 
@@ -76,21 +65,26 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
-pub async fn get_row_id_index(
-    dataset: &Dataset,
-) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_stable_row_ids() {
-        let key = RowIdIndexKey {
-            version: dataset.manifest.version,
-        };
-        let index = dataset
-            .metadata_cache
-            .get_or_insert_with_key(key, || load_row_id_index(dataset))
-            .await?;
-        Ok(Some(index))
-    } else {
-        Ok(None)
+pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
     }
+    // The cache is shared by every dataset opened at this URI, and one dropped
+    // and recreated there restarts at version 1. Without a token for this
+    // manifest generation a cached index could be the old generation's, so
+    // build a private one instead of sharing.
+    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+        return Ok(Some(Arc::new(load_row_id_index(dataset).await?)));
+    };
+    let key = RowIdIndexKey {
+        version: dataset.manifest.version,
+        e_tag: Some(e_tag),
+    };
+    let index = dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || load_row_id_index(dataset))
+        .await?;
+    Ok(Some(index))
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -233,50 +227,43 @@ async fn row_addrs_to_row_ids_impl(
     Ok(ids)
 }
 
-async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
-    let sequences = load_row_id_sequences(dataset, &dataset.manifest.fragments)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let fragments = dataset.get_fragments();
-    let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
-        fragments.iter().map(|f| (f.id() as u32, f)).collect();
-
-    let fragment_indices: Vec<_> =
-        futures::stream::iter(sequences.into_iter().map(|(fragment_id, sequence)| {
-            let fragment = fragment_map
-                .get(&fragment_id)
-                .expect("Fragment should exist");
-            let has_deletion_file = fragment.metadata().deletion_file.is_some();
-            let fragment_clone = (*fragment).clone();
-            async move {
-                let deletion_vector = if has_deletion_file {
-                    fragment_clone
-                        .get_deletion_vector()
-                        .await?
-                        .ok_or_else(|| {
-                            Error::internal(format!(
-                                "fragment_id={fragment_id} has deletion-file metadata but no deletion vector"
-                            ))
-                        })?
-                } else {
-                    Arc::new(DeletionVector::default())
-                };
-
-                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
-                    fragment_id,
-                    row_id_sequence: sequence,
-                    deletion_vector,
-                })
-            }
-        }))
+/// Build the index from freshly decoded sequences. The index then owns their
+/// memory alone, so its cache charge is exact and it stays cached whenever it
+/// fits; reading them through the sequence cache instead would charge each
+/// sequence twice and leave a large table's index too heavy to keep. A scan
+/// that needs a sequence still caches its own copy under `RowIdSequenceKey`,
+/// keyed by the fragment's content; the index is keyed by manifest generation
+/// and cannot stand in for it.
+async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
+    // A `for` loop rather than `map`: a closure returning a future that borrows
+    // its argument trips the higher-ranked lifetime check on the outer future.
+    let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
+    for fragment in dataset.manifest.fragments.iter() {
+        loads.push(read_fragment_row_id_index(dataset, fragment));
+    }
+    let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
         .buffer_unordered(dataset.object_store.io_parallelism())
         .try_collect()
         .await?;
+    RowIdIndex::new(&fragment_indices)
+}
 
-    let index = RowIdIndex::new(&fragment_indices)?;
-
-    Ok(index)
+async fn read_fragment_row_id_index(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<FragmentRowIdIndex> {
+    let row_id_sequence = Arc::new(read_row_id_sequence(fragment).await?);
+    let deletion_vector = match &fragment.deletion_file {
+        None => Arc::new(DeletionVector::default()),
+        Some(deletion_file) => {
+            read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
+        }
+    };
+    Ok(FragmentRowIdIndex {
+        fragment_id: fragment.id as u32,
+        row_id_sequence,
+        deletion_vector,
+    })
 }
 
 #[cfg(test)]
@@ -284,7 +271,8 @@ mod test {
     use std::ops::Range;
 
     use crate::dataset::{
-        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+        ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+        builder::DatasetBuilder,
     };
 
     use super::*;
@@ -303,6 +291,7 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -395,6 +384,73 @@ mod test {
         assert_eq!(found_addresses, expected_addresses);
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_owns_the_sequences_it_caches() {
+        let batch = sequence_batch(0..30);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let session = dataset.session();
+
+        // Building the index adds one cache entry: the index, which holds its
+        // sequences itself rather than reading them through their own entries.
+        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before + 1
+        );
+        let again = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&index, &again));
+
+        // A sequence lookup keeps its own content-keyed entry.
+        let fragment = &dataset.manifest.fragments[1];
+        let sequence = load_row_id_sequence(&dataset, fragment).await.unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (10..20).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_is_not_shared_without_a_generation_token() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        // Without an e-tag the version-only key could alias a dataset recreated
+        // at the same URI, so the index must be built privately, never cached.
+        dataset.manifest_location.e_tag = None;
+        let session = dataset.session();
+        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let first = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let second = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before
+        );
+        assert_eq!(
+            second.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(0, 9))
+        );
     }
 
     #[tokio::test]
@@ -565,6 +621,10 @@ mod test {
             .await
             .unwrap();
         assert_eq!(sequence.len(), 100);
+        // Leave this generation's index in the session cache: `RowIdIndexKey`
+        // is scoped by version alone, so the recreated dataset below reaches
+        // the same key, and no sequence load may be answered from it.
+        get_row_id_index(&dataset).await.unwrap().unwrap();
 
         // Reloading the unchanged fragment must still hit: keying on contents has
         // to leave the sequence cacheable, not just make it distinguishable.
@@ -588,6 +648,15 @@ mod test {
         assert_eq!(
             sequence.iter().collect::<Vec<_>>(),
             (0..60).collect::<Vec<_>>()
+        );
+
+        // The same goes for the index: row id 60 exists only in the dropped
+        // generation, whose index is still in the session cache.
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(60).unwrap().is_none());
+        assert_eq!(
+            index.get(59).unwrap(),
+            Some(RowAddress::new_from_parts(0, 59))
         );
     }
 
@@ -919,6 +988,117 @@ mod test {
 
     pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_range_segments_are_opt_in() {
+        use lance_table::format::pb;
+        use lance_table::transaction::RANGE_SEGMENTS_CONFIG_KEY;
+        use prost::Message;
+
+        /// Wire-level segment kinds of every fragment, and whether the decoded
+        /// form folded any of them into a compact `Ranges` segment.
+        fn segment_shapes(dataset: &Dataset) -> (Vec<&'static str>, bool) {
+            let mut kinds = Vec::new();
+            let mut folded = false;
+            for fragment in dataset.manifest.fragments.iter() {
+                let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+                    panic!("expected inline row ids, got {:?}", fragment.row_id_meta);
+                };
+                let wire = pb::RowIdSequence::decode(&data[..]).unwrap();
+                kinds.extend(wire.segments.iter().map(|segment| match segment.segment {
+                    Some(pb::u64_segment::Segment::Range(_)) => "range",
+                    Some(pb::u64_segment::Segment::RangeWithBitmap(_)) => "bitmap",
+                    _ => "other",
+                }));
+                folded |= read_row_ids(&data[..])
+                    .unwrap()
+                    .segments()
+                    .iter()
+                    .any(|segment| matches!(segment, U64Segment::Ranges { .. }));
+            }
+            (kinds, folded)
+        }
+
+        // Deleting a contiguous block inside every fragment leaves each row id
+        // sequence as a range with one long run of holes, which `delete`
+        // encodes as a bitmap segment; compaction carries those segments over.
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(500),
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        delete(&mut dataset, "i % 500 >= 100 and i % 500 < 400").await;
+        compact(&mut dataset, 5000).await;
+        let map_before = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before.len(), 800);
+
+        // Without the opt-in the bitmaps stay.
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.contains(&"bitmap") && !folded, "{kinds:?}");
+
+        // Opting in re-encodes every eligible fragment in the same commit: on
+        // the wire only plain `Range` segments, folded back when decoded.
+        dataset
+            .update_config([(RANGE_SEGMENTS_CONFIG_KEY, "true")])
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.iter().all(|kind| *kind == "range"), "{kinds:?}");
+        assert!(
+            folded,
+            "fragments with 300 contiguous holes each should fold into Ranges"
+        );
+        assert_eq!(
+            dataset.manifest().reader_feature_flags,
+            lance_table::feature_flags::FLAG_STABLE_ROW_IDS,
+            "the wire format did not change, so no new reader flag"
+        );
+
+        // Reads see the same row ids; a take by row id resolves through the
+        // compact segments.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
+        let mut sample: Vec<u64> = map_before.keys().copied().collect();
+        sample.sort_unstable();
+        let sample: Vec<u64> = sample.into_iter().step_by(97).collect();
+        let taken = dataset
+            .take_rows(
+                &sample,
+                ProjectionRequest::from_columns(["i"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), sample.len());
+        let index = get_row_id_index(&Arc::new(dataset.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        for row_id in &sample {
+            assert!(index.get(*row_id).unwrap().is_some(), "row id {row_id}");
+        }
+
+        // Later commits keep re-encoding only what changed, and the manifest
+        // re-read from storage folds the same way.
+        delete(&mut dataset, "i = 10").await;
+        let reopened = dataset
+            .checkout_version(dataset.manifest().version)
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&reopened);
+        assert!(
+            kinds.iter().all(|kind| *kind == "range") && folded,
+            "{kinds:?}"
+        );
+        assert_eq!(scan_rowid_map(&reopened).await.len(), 799);
     }
 
     #[tokio::test]

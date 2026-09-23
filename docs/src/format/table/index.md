@@ -119,6 +119,17 @@ Field ids might be replaced with `-2`, a tombstone value.
 In this case that column should be ignored. This used, for example, when rewriting a column: 
 The old data file replaces the field id with `-2` to ignore the old data, and a new data file is appended to the fragment.
 
+Every negative field id is reserved for system use and never names a field of the
+dataset schema. A reader MUST skip any negative id when it projects the dataset schema
+onto a data file, rather than treat it as a schema field or reject the file. Besides
+`-1` (not yet assigned; only ever exists in memory and must not be written) and the
+`-2` tombstone above, `-3`, `-4` and `-5` are the hidden `_rowid`,
+`_row_created_at_version` and `_row_last_updated_at_version` columns that hold a
+fragment's row lineage sequences when they are not stored in the manifest; see
+[Row ID and Lineage](row_id_lineage.md). Such a column always lives in one of the
+fragment's `files`, next to user columns or in a file holding nothing else, and at
+most one file of a fragment may carry each of these ids.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.

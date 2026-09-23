@@ -41,6 +41,51 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+@pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
+def test_compact_files_exact_data_storage_version(tmp_path: Path, mode):
+    data = pa.table({"id": range(4)})
+    dataset = lance.write_dataset(
+        data, tmp_path / "dataset", max_rows_per_file=2, data_storage_version="2.1"
+    )
+    options = dict(
+        target_rows_per_fragment=4, data_storage_version="2.2", compaction_mode=mode
+    )
+    if mode == "force_binary_copy":
+        with pytest.raises(OSError, match="target is 2.2.*uses 2.1"):
+            dataset.optimize.compact_files(**options)
+        assert dataset.version == 1
+    else:
+        dataset.optimize.compact_files(**options)
+        assert {
+            (file.file_major_version, file.file_minor_version)
+            for fragment in dataset.get_fragments()
+            for file in fragment.metadata.files
+        } == {(2, 2)}
+    assert dataset.to_table() == data
+    assert dataset.data_storage_version == "2.1"
+
+
+@pytest.mark.parametrize("version,expected", [(None, "2.2"), ("2.0", "2.0")])
+def test_compaction_version_config_precedence(tmp_path: Path, version, expected):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "dataset",
+        max_rows_per_file=2,
+        data_storage_version="2.1",
+    )
+    dataset.update_config({"lance.compaction.data_storage_version": "2.2"})
+    options = dict(data_storage_version=version)
+    plan = Compaction.plan(dataset, options)
+    assert json.loads(plan.json())["options"]["data_storage_version"] == expected
+    dataset.optimize.compact_files(**options)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == {expected}
+    assert dataset.data_storage_version == "2.1"
+
+
 def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
     dataset = lance.write_dataset(
         pa.table({"a": range(800)}),
@@ -132,7 +177,7 @@ def test_blob_compaction(tmp_path: Path):
         base_dir,
         schema=schema,
         max_rows_per_file=1,
-        data_storage_version="stable",
+        data_storage_version="2.1",
     )
     assert len(dataset.get_fragments()) == 2
 
@@ -588,16 +633,29 @@ def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
     )
 
 
-def test_dataset_distributed_optimize(tmp_path: Path):
+@pytest.mark.parametrize(
+    "version", [None, "2.0", "2.1", "2.2", "2.3", "stable", "next"]
+)
+def test_dataset_distributed_optimize(tmp_path: Path, version):
     base_dir = tmp_path / "dataset"
-    data = pa.table({"a": range(800), "b": range(800)})
+    data = pa.table({"a": range(8), "b": range(8)})
 
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=200)
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=2,
+        data_storage_version="2.1",
+    )
     fragments = dataset.get_fragments()
     assert len(fragments) == 4
 
     plan = Compaction.plan(
-        dataset, options=dict(target_rows_per_fragment=400, num_threads=1)
+        dataset,
+        options=dict(
+            target_rows_per_fragment=4,
+            num_threads=1,
+            data_storage_version=version,
+        ),
     )
     assert plan.read_version == 1
     assert plan.num_tasks() == 2
@@ -608,7 +666,7 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     excluded_plan = Compaction.plan(
         dataset,
         options=dict(
-            target_rows_per_fragment=400,
+            target_rows_per_fragment=4,
             excluded_fragment_ids=[1, 1, 999],
             num_threads=1,
         ),
@@ -622,9 +680,10 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     none_plan = Compaction.plan(
         dataset,
         options=dict(
-            target_rows_per_fragment=400,
+            target_rows_per_fragment=4,
             excluded_fragment_ids=None,
             num_threads=1,
+            data_storage_version=version,
         ),
     )
     assert none_plan == plan
@@ -636,24 +695,32 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     task = pickle.loads(pickled_task)
     assert task == plan.tasks[0]
 
-    result1 = plan.tasks[0].execute(dataset)
-    result1.metrics.fragments_removed == 2
-    result1.metrics.fragments_added == 1
+    result1 = task.execute(dataset)
+    assert result1.metrics.fragments_removed == 2
+    assert result1.metrics.fragments_added == 1
 
     pickled_result = pickle.dumps(result1)
     result = pickle.loads(pickled_result)
     assert isinstance(result, RewriteResult)
     assert result == result1
+    exact = {None: "2.1", "stable": "2.2", "next": "2.3"}.get(version, version)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in result.new_fragments
+        for file in fragment.files
+    } == {exact}
     assert re.match(
         r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
         repr(result),
     )
 
-    metrics = Compaction.commit(dataset, [result1])
+    metrics = Compaction.commit(dataset, [result])
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added == 1
     # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
+    assert dataset.data_storage_version == "2.1"
+    assert dataset.to_table().sort_by("a") == data
 
 
 def test_migration_via_fragment_apis(tmp_path):

@@ -23,6 +23,8 @@ pub struct IndexCriteria<'a> {
     pub fts_document_granularity: Option<DocumentGranularity>,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
+    /// If true, only consider indices that support MinHash similarity search
+    pub must_support_minhash: bool,
 }
 
 impl<'a> IndexCriteria<'a> {
@@ -60,6 +62,12 @@ impl<'a> IndexCriteria<'a> {
     /// or an index like a bloom filter
     pub fn supports_exact_equality(mut self) -> Self {
         self.must_support_exact_equality = true;
+        self
+    }
+
+    /// Only consider MinHash LSH indices
+    pub fn supports_minhash(mut self) -> Self {
+        self.must_support_minhash = true;
         self
     }
 }
@@ -188,6 +196,8 @@ impl Display for FtsPrewarmDiagnostics {
 pub struct FtsPrewarmSegmentStatus {
     pub segment_id: String,
     pub scalar_index_container_resident: bool,
+    /// Whether the cached container shares the opened segment's prewarm state,
+    /// including when its storage readers have been rebound to another request.
     pub scalar_index_container_matches_prewarmed: bool,
 }
 
@@ -204,7 +214,7 @@ impl Display for FtsPrewarmSegmentStatus {
             missing.push("resident scalar index container");
         }
         if !self.scalar_index_container_matches_prewarmed {
-            missing.push("stable scalar index container identity");
+            missing.push("shared scalar index prewarm state");
         }
         write!(
             f,

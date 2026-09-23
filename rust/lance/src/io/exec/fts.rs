@@ -790,6 +790,32 @@ impl CompoundQueryExec {
         self.base_scorer.as_ref()
     }
 
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
+            segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
@@ -965,7 +991,7 @@ fn residual_bm25_scorer(
 /// flat-search approximation without rescanning the residual input or rebuilding
 /// exact corpus statistics.
 #[derive(Debug)]
-pub(crate) struct HybridCompoundQueryExec {
+pub struct HybridCompoundQueryExec {
     dataset: Arc<Dataset>,
     query: FtsQuery,
     params: FtsSearchParams,
@@ -977,7 +1003,7 @@ pub(crate) struct HybridCompoundQueryExec {
 }
 
 impl HybridCompoundQueryExec {
-    pub(crate) fn new(
+    pub fn new(
         dataset: Arc<Dataset>,
         query: FtsQuery,
         params: FtsSearchParams,
@@ -1000,6 +1026,35 @@ impl HybridCompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// The indexed segments this scorer reads. Paired with
+    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
+    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// fetch node, so changing it means reconstruction.
+    pub fn segments(&self) -> &[IndexMetadata] {
+        &self.segments
+    }
+
+    /// The scan over the fragments no segment covers.
+    pub fn residual_input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.residual_input
     }
 }
 
@@ -1061,6 +1116,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
@@ -1131,6 +1187,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     overlay_block: None,
                     external_mask: None,
                 },
+                &metrics_set,
             )?;
             let indexed_search = compound_search_with_base_scorer(
                 &indices,
@@ -1355,6 +1412,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1410,6 +1468,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -1799,6 +1858,30 @@ impl CrossColumnCompoundQueryExec {
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
     }
+
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl DisplayAs for CrossColumnCompoundQueryExec {
@@ -1883,6 +1966,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1916,6 +2000,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2868,6 +2953,7 @@ impl ExecutionPlan for MatchQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -2906,6 +2992,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -4177,6 +4264,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -4205,6 +4293,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices

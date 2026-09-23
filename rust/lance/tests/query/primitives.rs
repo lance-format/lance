@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::*;
 use arrow_array::{
-    ArrayRef, BinaryArray, BinaryViewArray, Float32Array, Float64Array, Int32Array,
+    ArrayRef, BinaryArray, BinaryViewArray, Float16Array, Float32Array, Float64Array, Int32Array,
     LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
     StringViewArray,
 };
 use arrow_schema::DataType;
+use half::f16;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
@@ -140,6 +141,7 @@ async fn test_btree_nullable_or_with_absent_value() {
 
 #[tokio::test]
 #[rstest::rstest]
+#[case::float16(DataType::Float16)]
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float(#[case] data_type: DataType) {
@@ -148,17 +150,20 @@ async fn test_query_float(#[case] data_type: DataType) {
         .col("value", array::rand_type(&data_type).with_random_nulls(0.1))
         .into_batch_rows(RowCount::from(60))
         .unwrap();
+    // BloomFilter is left out for Float16 because that index rejects the type
+    // outright. `test_bloom_filter_rejects_float16` pins the rejection so this
+    // skip cannot outlive it.
+    let mut index_types = vec![
+        None,
+        Some(IndexType::BTree),
+        Some(IndexType::Bitmap),
+        Some(IndexType::ZoneMap),
+    ];
+    if data_type != DataType::Float16 {
+        index_types.push(Some(IndexType::BloomFilter));
+    }
     DatasetTestCases::from_data(batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::BTree),
-                Some(IndexType::Bitmap),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
+        .with_index_types("value", index_types)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
@@ -172,15 +177,63 @@ async fn test_query_float(#[case] data_type: DataType) {
         .await
 }
 
+/// `test_query_float` runs its Float16 case without `IndexType::BloomFilter`
+/// because that index refuses the type. Pin the refusal here so the skip cannot
+/// outlive it: once bloom filters accept Float16 this test fails, and whoever
+/// makes it pass should drop the skip too.
+#[tokio::test]
+async fn test_bloom_filter_rejects_float16() {
+    let batch = gen_batch()
+        .col("value", array::rand_type(&DataType::Float16))
+        .into_batch_rows(RowCount::from(16))
+        .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://bloom_f16",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let err = ds
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .expect_err("bloom filter should still refuse Float16");
+    assert!(
+        matches!(err, lance::Error::InvalidInput { .. }),
+        "unexpected error variant: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("Float16"),
+        "error should name the rejected type: {err}"
+    );
+}
+
 #[tokio::test]
 #[rstest::rstest]
-// Float16 is missing on purpose: `safe_coerce_scalar` has no Float16 arm, so
-// `value < 0.0` against a Float16 column fails to resolve the literal long before
-// any of this matters. See rust/lance-datafusion/src/expr.rs.
+#[case::float16(DataType::Float16)]
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float_special_values(#[case] data_type: DataType) {
     let value_array: Arc<dyn arrow_array::Array> = match data_type {
+        DataType::Float16 => Arc::new(Float16Array::from(vec![
+            Some(f16::ZERO),
+            Some(f16::NEG_ZERO),
+            Some(f16::INFINITY),
+            Some(f16::NEG_INFINITY),
+            Some(f16::NAN),
+            Some(f16::ONE),
+            Some(f16::NEG_ONE),
+            Some(f16::MIN),
+            Some(f16::MAX),
+            None,
+        ])),
         DataType::Float32 => Arc::new(Float32Array::from(vec![
             Some(0.0_f32),
             Some(-0.0_f32),
@@ -214,17 +267,20 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         RecordBatch::try_from_iter(vec![("id", id_array as ArrayRef), ("value", value_array)])
             .unwrap();
 
+    // BloomFilter is left out for Float16 for the reason
+    // `test_bloom_filter_rejects_float16` pins: that index refuses the type.
+    let mut index_types = vec![
+        None,
+        Some(IndexType::BTree),
+        Some(IndexType::Bitmap),
+        Some(IndexType::ZoneMap),
+    ];
+    if data_type != DataType::Float16 {
+        index_types.push(Some(IndexType::BloomFilter));
+    }
+
     DatasetTestCases::from_data(batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::BTree),
-                Some(IndexType::Bitmap),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
+        .with_index_types("value", index_types)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;

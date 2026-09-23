@@ -3,7 +3,7 @@
 
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
@@ -12,20 +12,19 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_file::version::stable_file_version;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
-use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::utils::SchemaAdapter;
-use crate::dataset::write::validate_and_resolve_target_bases_with_primary;
+use crate::dataset::write::{
+    GenericWriter, V2WriterAdapter, validate_and_resolve_target_bases_with_primary,
+};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -103,6 +102,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         self
     }
 
+    pub(crate) fn file_writer_options(&self) -> FileWriterOptions {
+        self.write_params
+            .and_then(|params| params.file_writer_options.clone())
+            .unwrap_or_default()
+    }
+
     /// Write a fragment.
     pub async fn write(
         &self,
@@ -110,13 +115,6 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
-        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
-        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through
-        // `versions::write_fragments_direct`;
-        // the single-fragment create path must do the same or the raw UTF-8 string bytes
-        // would be written into a column whose schema declares JSONB, corrupting reads.
-        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         let version = self
             .write_params
             .map(|params| params.storage_version_or_default())
@@ -166,44 +164,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let (mut writer, data_file) = create_writer(obj_writer, schema, filename)?;
-        fragment.files.push(data_file);
+        let (writer, data_file) = create_writer(obj_writer, schema, filename)?;
+        fragment.files.push(data_file.clone());
 
         progress.begin(&fragment).await?;
 
+        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None);
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
-        let mut broken_stream = break_stream(stream, break_limit)
-            .map_ok(|batch| vec![batch])
-            .boxed();
-        while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
-            writer.write_batches(batch_chunk.iter()).await?;
+        let mut broken_stream = break_stream(stream, break_limit);
+        while let Some(batch) = broken_stream.next().await {
+            writer.write_batch(&batch?).await?;
         }
 
-        let write_summary = writer.finish().await?;
-        fragment.physical_rows = Some(write_summary.num_rows as usize);
+        let (num_rows, data_file) = writer.finish().await?;
+        fragment.physical_rows = Some(num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>()
-            .into();
-        let column_indices: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>()
-            .into();
-
-        fragment.files[0].fields = field_ids;
-        fragment.files[0].column_indices = column_indices;
-        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
+        fragment.files[0] = data_file;
 
         progress.complete(&fragment).await?;
 

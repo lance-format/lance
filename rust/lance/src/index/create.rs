@@ -50,18 +50,16 @@ fn default_index_name(fields: &[&str]) -> String {
 }
 
 fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexParams> {
-    let mut merged = serde_json::to_value(InvertedIndexParams::default())?;
-    if let Some(raw_params) = params.params.as_deref() {
-        let provided = serde_json::from_str::<serde_json::Value>(raw_params)?;
-        let merged = merged.as_object_mut().ok_or_else(|| {
-            Error::internal("default inverted index parameters are not a JSON object".to_string())
-        })?;
-        let provided = provided.as_object().ok_or_else(|| {
-            Error::invalid_input("inverted index parameters must be a JSON object".to_string())
-        })?;
-        merged.extend(provided.clone());
-    }
-    Ok(serde_json::from_value(merged)?)
+    let provided = params
+        .params
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    provided.as_object().ok_or_else(|| {
+        Error::invalid_input("inverted index parameters must be a JSON object".to_string())
+    })?;
+    Ok(serde_json::from_value(provided)?)
 }
 
 fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
@@ -269,8 +267,10 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = if let Some(name) = self.name.take() {
-            name
+        // Read without consuming: a failed build must leave the requested name in
+        // place so a retry commits under it instead of an auto-generated one.
+        let index_name = if let Some(name) = self.name.as_deref() {
+            name.to_string()
         } else {
             // Generate default name with collision handling.
             // A name is available when there is no existing index with:
@@ -342,7 +342,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
-                | IndexType::RTree,
+                | IndexType::RTree
+                | IndexType::MinHashLsh,
                 LANCE_SCALAR_INDEX,
             ) => {
                 assert!(
@@ -711,8 +712,10 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         let indices = load_all_indices(self.dataset).await?;
-        let index_name = if let Some(name) = self.name.take() {
-            name
+        // Matches execute_uncommitted. Unobservable here, since the only caller
+        // consumes the builder.
+        let index_name = if let Some(name) = self.name.as_deref() {
+            name.to_string()
         } else {
             let column_path = default_index_name(&names);
             let base_name = format!("{column_path}_idx");
@@ -1045,6 +1048,7 @@ mod tests {
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
@@ -1064,6 +1068,24 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(7)));
+    }
+
+    #[rstest]
+    #[case::omitted(r#"{"base_tokenizer":"ngram"}"#, false)]
+    #[case::explicit(
+        r#"{"base_tokenizer":"ngram","stem":true,"remove_stop_words":true}"#,
+        true
+    )]
+    fn test_generic_inverted_params_preserve_ngram_defaults(
+        #[case] raw_params: &str,
+        #[case] expected_word_filters: bool,
+    ) {
+        let provided: serde_json::Value = serde_json::from_str(raw_params).unwrap();
+        let params = ScalarIndexParams::new("inverted".to_string()).with_params(&provided);
+        let resolved = serde_json::to_value(resolved_inverted_params(&params).unwrap()).unwrap();
+        assert_eq!(resolved["base_tokenizer"], "ngram");
+        assert_eq!(resolved["stem"], expected_word_filters);
+        assert_eq!(resolved["remove_stop_words"], expected_word_filters);
     }
 
     #[test]
@@ -1480,6 +1502,52 @@ mod tests {
         assert_eq!(resolved[1].as_ref().unwrap().id() as u32, first);
         assert_eq!(resolved[2].as_ref().unwrap().id() as u32, second);
         assert!(resolved[3].is_none());
+    }
+
+    /// A failed `execute_uncommitted` must not consume the requested index
+    /// name: the method takes `&mut self`, so a caller can hold the builder and
+    /// retry, and a retry that lost the name commits under `<column>_idx`.
+    #[tokio::test]
+    async fn test_failed_execute_uncommitted_preserves_name() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("retry_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        // replace defaults to false, so the duplicate name is rejected. That
+        // rejection happens after the name is read, which is the point.
+        let mut builder = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("retry_idx".to_string());
+        let error = builder.execute_uncommitted().await.unwrap_err();
+        assert!(
+            error.to_string().contains("already exists"),
+            "the build must fail on the duplicate name, which is downstream of \
+             the name read; got {error}"
+        );
+
+        assert_eq!(builder.name.as_deref(), Some("retry_idx"));
+
+        // The retry a caller would make. Losing the name here would commit a
+        // second index called text_idx instead of replacing retry_idx.
+        builder.replace(true).execute().await.unwrap();
+        let names = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["retry_idx"], "the retry must reuse the name");
     }
 
     #[tokio::test]

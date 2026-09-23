@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Result;
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -196,7 +196,14 @@ fn downcast_view_columns(
     )
 }
 
-/// Adapter around the existing JSON and view-type conversion utilities.
+/// Converts between the Arrow representations callers use and the ones Lance
+/// stores: Arrow JSON text ↔ Lance JSONB, and top-level view arrays → offset
+/// arrays.
+///
+/// Dataset writes convert once, in the data file writer
+/// ([`V2WriterAdapter`](super::write::V2WriterAdapter)). The physical methods
+/// are otherwise only for combining caller data with values read back from
+/// storage before that point.
 #[derive(Debug, Clone)]
 pub struct SchemaAdapter {
     logical_schema: ArrowSchemaRef,
@@ -230,18 +237,12 @@ impl SchemaAdapter {
         }
     }
 
-    /// Convert a logical stream into a physical stream.
-    pub fn to_physical_stream(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> SendableRecordBatchStream {
-        if !self.requires_physical_conversion() {
-            return stream;
-        }
-
-        let arrow_schema = stream.schema();
-        let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
-        for field in arrow_schema.fields() {
+    /// Build the physical Arrow schema for `logical_schema`: Arrow JSON fields
+    /// become Lance JSON fields and view types are downcast to their classic
+    /// offset equivalents. Fields needing no conversion are left unchanged.
+    fn physical_schema(logical_schema: &ArrowSchemaRef) -> ArrowSchemaRef {
+        let mut new_fields = Vec::with_capacity(logical_schema.fields().len());
+        for field in logical_schema.fields() {
             if has_arrow_json_fields(field) {
                 new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
             } else if let Some(phys) = physical_field(field) {
@@ -250,25 +251,30 @@ impl SchemaAdapter {
                 new_fields.push(Arc::clone(field));
             }
         }
-        let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+        Arc::new(ArrowSchema::new_with_metadata(
             new_fields,
-            arrow_schema.metadata().clone(),
-        ));
-
-        let converted_stream = stream.map(move |batch_result| {
-            batch_result.and_then(|batch| {
-                let batch = convert_json_columns(&batch).map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                })?;
-                downcast_view_columns(&batch)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
-            })
-        });
-
-        Box::pin(RecordBatchStreamAdapter::new(
-            converted_schema,
-            converted_stream,
+            logical_schema.metadata().clone(),
         ))
+    }
+
+    /// Wrap a synchronous [`RecordBatchReader`] so each batch is converted from
+    /// its logical form to the physical form Lance stores on disk (Arrow JSON →
+    /// Lance JSON, view types → offset types). Returns the reader unchanged when
+    /// no field needs conversion.
+    pub fn to_physical_reader(
+        &self,
+        reader: Box<dyn RecordBatchReader + Send>,
+    ) -> Box<dyn RecordBatchReader + Send> {
+        if !self.requires_physical_conversion() {
+            return reader;
+        }
+        let schema = Self::physical_schema(&reader.schema());
+        let converted = reader.map(|batch| {
+            let batch = batch?;
+            let batch = convert_json_columns(&batch)?;
+            downcast_view_columns(&batch)
+        });
+        Box::new(RecordBatchIterator::new(converted, schema))
     }
 
     /// Convert a physical stream into a logical stream.

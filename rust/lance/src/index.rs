@@ -4,6 +4,7 @@
 //! Secondary Index
 //!
 
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -545,7 +546,7 @@ async fn aggregate_fts_prewarm_results(
             .and_then(|index| index.as_any().downcast_ref::<InvertedIndex>());
         let container_resident = cached_inverted.is_some();
         let container_matches_prewarmed = match (prewarmed_inverted, cached_inverted) {
-            (Some(prewarmed), Some(cached)) => std::ptr::addr_eq(prewarmed, cached),
+            (Some(prewarmed), Some(cached)) => prewarmed.shares_prewarm_state(cached),
             _ => false,
         };
 
@@ -809,6 +810,41 @@ fn filter_index_segments_by_ids(
     Ok(filtered)
 }
 
+/// Ask the scalar index plugin whether the parameters of `incoming` segments
+/// let them join `existing` ones (for example, MinHash signatures are only
+/// comparable across segments built with the same hashing parameters).
+/// Complements [`validate_segment_index_details`], which only checks that
+/// segments share a details type. Vector indices and details without a plugin
+/// are not checked.
+pub(crate) fn validate_segment_params_compatible(
+    existing: &[IndexMetadata],
+    incoming: &[IndexMetadata],
+) -> Result<()> {
+    let Some(reference) = incoming
+        .iter()
+        .chain(existing.iter())
+        .find_map(|segment| segment.index_details.as_ref())
+    else {
+        return Ok(());
+    };
+    let details = IndexDetails(reference.clone());
+    let Ok(plugin) = details.get_plugin() else {
+        return Ok(());
+    };
+    let existing_details: Vec<&prost_types::Any> = existing
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    let incoming_details: Vec<&prost_types::Any> = incoming
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    plugin.validate_new_segments_against_existing(&existing_details, &incoming_details)
+}
+
+/// Every segment of one commit must carry index details of the same type;
+/// whether their parameters are compatible is the plugin's call, see
+/// [`validate_segment_params_compatible`].
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     let mut type_url = None::<&str>;
     for segment in segments {
@@ -925,6 +961,13 @@ fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
         .index_details
         .as_ref()
         .is_some_and(|details| details.type_url.ends_with("RTreeIndexDetails"))
+}
+
+fn segment_has_minhashlsh_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("MinHashLshIndexDetails"))
 }
 
 fn segment_has_ngram_details(segment: &IndexMetadata) -> bool {
@@ -1138,6 +1181,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
         "FMIndex" | "FM" => IndexType::Fm.to_string(),
+        "MinHashLsh" => IndexType::MinHashLsh.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -1151,6 +1195,30 @@ pub trait IndexBuilder {
     fn index_type() -> IndexType;
 
     async fn build(&self) -> Result<()>;
+}
+
+fn remap_deletes_all_indexed_rows(
+    dataset: &Dataset,
+    indexed_fragments: &RoaringBitmap,
+    row_id_map: &RowAddrRemap,
+) -> bool {
+    indexed_fragments.iter().all(|fragment_id| {
+        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            return false;
+        };
+        let Some(physical_rows) = fragment.metadata().physical_rows else {
+            // Legacy fragments may not record their physical row count, so the
+            // remap cannot prove that every possible address was deleted.
+            return false;
+        };
+        (0..physical_rows).all(|offset| {
+            let Ok(offset) = u32::try_from(offset) else {
+                return false;
+            };
+            let row_addr = u64::from(RowAddress::new_from_parts(fragment_id, offset));
+            row_id_map.get(row_addr) == Some(None)
+        })
+    })
 }
 
 pub(crate) async fn remap_index(
@@ -1201,8 +1269,10 @@ pub(crate) async fn remap_index(
         )));
     }
 
-    if let Some(deleted_bitmap) = row_id_map.fully_deleted_fragments()
-        && Some(deleted_bitmap) == matched.fragment_bitmap
+    if matched
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(|fragments| remap_deletes_all_indexed_rows(dataset, fragments, row_id_map))
     {
         // If remap deleted all rows, we can just return the same index ID.
         // This can happen if there is a bug where the index is covering empty
@@ -1942,6 +2012,7 @@ impl DatasetIndexExt for Dataset {
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
         let all_rtree = source_segments.iter().all(segment_has_rtree_details);
         let all_ngram = source_segments.iter().all(segment_has_ngram_details);
+        let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
         if !all_vector
             && !all_inverted
             && !all_bitmap
@@ -1952,12 +2023,15 @@ impl DatasetIndexExt for Dataset {
             && !all_label_list
             && !all_rtree
             && !all_ngram
+            && !all_minhashlsh
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
             ));
         }
+
+        validate_segment_params_compatible(&[], &source_segments)?;
 
         let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
@@ -1990,6 +2064,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else if all_ngram {
             crate::index::scalar::ngram::merge_segments(self, source_segments).await?
+        } else if all_minhashlsh {
+            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments).await?
         } else if all_rtree {
             #[cfg(feature = "geo")]
             {
@@ -2115,6 +2191,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
+        let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
         // already carries the same pair: `build_index_metadata_from_segments`
         // compares them against each other before this point.
@@ -2189,6 +2266,18 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        // Segments that stay together must be compatible under the plugin's
+        // rules (for example identical hash parameters). Segments this commit
+        // removes are not consulted, so a full rebuild may change parameters.
+        let retained_indices: Vec<IndexMetadata> = existing_snapshot
+            .into_iter()
+            .filter(|idx| {
+                !removed_indices
+                    .iter()
+                    .any(|removed| removed.uuid == idx.uuid)
+            })
+            .collect();
+        validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -3751,17 +3840,20 @@ mod tests {
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use futures::stream::TryStreamExt;
+    use futures::{future::try_join_all, stream::TryStreamExt};
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::metrics::LocalMetricsCollector;
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
     use lance_index::scalar::inverted::{
         INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
     };
+    use lance_index::scalar::registry::ScalarIndexCacheKey;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -3771,12 +3863,24 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
+    use lance_io::{
+        assert_io_eq, assert_io_lt,
+        object_store::{
+            ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+        },
+        utils::tracking_store::IoStats,
+    };
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     async fn write_vector_segment_metadata(
         dataset: &Dataset,
@@ -3811,6 +3915,370 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+        }
+    }
+
+    #[derive(Debug)]
+    struct RequestIndexStoreWrapper {
+        policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        revoked: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestIndexStoreWrapper {
+        fn new(index_path: String) -> Self {
+            let revoked = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut policy = ProxyObjectStorePolicy::new();
+            let policy_revoked = revoked.clone();
+            let policy_requests = requests.clone();
+            policy.set_before_policy(
+                "observe_index_reads",
+                Arc::new(move |method, path| {
+                    if path.as_ref().contains(&index_path) {
+                        policy_requests.lock().unwrap().push(method.to_owned());
+                        if policy_revoked.load(Ordering::Relaxed) {
+                            return Err(object_store::Error::Generic {
+                                store: "RequestIndexStoreWrapper",
+                                source: "request credentials have been revoked".into(),
+                            }
+                            .into());
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+            Self {
+                policy: Arc::new(Mutex::new(policy)),
+                revoked,
+                requests,
+            }
+        }
+    }
+
+    impl WrappingObjectStore for RequestIndexStoreWrapper {
+        fn wrap(
+            &self,
+            _storage_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
+        }
+    }
+
+    #[rstest]
+    #[case::credential_stores(false)]
+    #[case::request_wrappers(true)]
+    #[tokio::test]
+    async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: bool) {
+        async fn search_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        // Rotated credentials require distinct ObjectStore instances to read the same data.
+        // `memory://` creates an isolated in-memory backend for each instance, so this test needs
+        // a filesystem-backed URI.
+        let test_dir = TempStrDir::default();
+        let batches = vec![
+            arrow_array::record_batch!(
+                ("id", Int32, [0, 1, 2, 3]),
+                (
+                    "text",
+                    Utf8,
+                    [
+                        "alpha common",
+                        "beta common",
+                        "gamma common",
+                        "alpha common"
+                    ]
+                )
+            )
+            .unwrap(),
+            arrow_array::record_batch!(
+                ("id", Int32, [4, 5, 6, 7]),
+                (
+                    "text",
+                    Utf8,
+                    ["beta common", "gamma common", "alpha common", "beta common"]
+                )
+            )
+            .unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_group: 4,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("credential_rotation_fts".to_owned()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let index_meta = dataset
+            .load_indices_by_name("credential_rotation_fts")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let session = Arc::new(Session::default());
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let index_path_fragment = format!("_indices/{}", index_meta.uuid);
+        let wrapper_a = Arc::new(RequestIndexStoreWrapper::new(index_path_fragment.clone()));
+        let wrapper_b = Arc::new(RequestIndexStoreWrapper::new(index_path_fragment));
+        let mut requests = Vec::with_capacity(2);
+        for (generation, wrapper) in [("a", &wrapper_a), ("b", &wrapper_b)] {
+            let request = if request_wrappers {
+                dataset
+                    .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>])
+            } else {
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(HashMap::from([(
+                            "credential_generation".to_owned(),
+                            format!("secret-generation-{generation}"),
+                        )])),
+                    )),
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                };
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    dataset.session().store_registry(),
+                    dataset.uri(),
+                    &store_params,
+                )
+                .await
+                .unwrap();
+                dataset.with_object_store(store, Some(store_params))
+            };
+            requests.push(request);
+        }
+        let dataset_a = &requests[0];
+        let dataset_b = &requests[1];
+        assert!(!Arc::ptr_eq(
+            &dataset_a.object_store,
+            &dataset_b.object_store
+        ));
+        assert!(!Arc::ptr_eq(
+            &dataset_a.object_store.inner,
+            &dataset_b.object_store.inner
+        ));
+
+        let initial_metrics = LocalMetricsCollector::default();
+        let initial = dataset_a
+            .open_scalar_index("text", &index_meta.uuid, &initial_metrics)
+            .await
+            .unwrap();
+        assert_eq!(initial_metrics.index_loads.load(Ordering::Relaxed), 1);
+        initial.prewarm().await.unwrap();
+        assert_eq!(search_ids(dataset_a, "alpha").await, vec![0, 3, 6]);
+        assert!(
+            !wrapper_a.requests.lock().unwrap().is_empty(),
+            "the first request must read the FTS index through store A"
+        );
+        wrapper_a.requests.lock().unwrap().clear();
+        wrapper_b.requests.lock().unwrap().clear();
+
+        let same_binding_metrics = LocalMetricsCollector::default();
+        let same_binding = dataset_a
+            .open_scalar_index("text", &index_meta.uuid, &same_binding_metrics)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial, &same_binding));
+        assert_eq!(same_binding_metrics.index_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(search_ids(dataset_a, "alpha").await, vec![0, 3, 6]);
+        assert!(
+            wrapper_a.requests.lock().unwrap().is_empty(),
+            "the same store binding should reuse the prewarmed scalar index"
+        );
+
+        wrapper_a.revoked.store(true, Ordering::Relaxed);
+        let rotation_metrics = LocalMetricsCollector::default();
+        let opened = try_join_all(
+            (0..8)
+                .map(|_| dataset_b.open_scalar_index("text", &index_meta.uuid, &rotation_metrics)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.len(), 8);
+        assert!(opened.iter().all(|index| Arc::ptr_eq(index, &opened[0])));
+        assert!(!Arc::ptr_eq(&initial, &opened[0]));
+        assert_eq!(
+            rotation_metrics.index_loads.load(Ordering::Relaxed),
+            0,
+            "concurrent opens after rotation should reuse metadata without a full index load"
+        );
+        assert!(
+            opened[0]
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .unwrap()
+                .prewarm_residency_result(false)
+                .await
+                .fully_resident,
+            "request B must retain the prewarmed query state before another prewarm"
+        );
+        // A request can rebind the cached shell between prewarming and the
+        // final residency check. B still owns the runtime state prepared by A.
+        let result = aggregate_fts_prewarm_results(
+            dataset_a,
+            vec![OpenedSegmentPrewarmResult {
+                index_uuid: index_meta.uuid,
+                partition_count: initial
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .partition_count(),
+                index: initial.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.fully_resident);
+        assert_eq!(search_ids(dataset_b, "beta").await, vec![1, 4, 7]);
+        assert!(wrapper_a.requests.lock().unwrap().is_empty());
+        assert!(
+            wrapper_b.requests.lock().unwrap().is_empty(),
+            "a new request must serve the prewarmed index without opening partition files"
+        );
+
+        let scalar_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+        let cached = scalar_cache
+            .get_unsized_with_key(&ScalarIndexCacheKey)
+            .await
+            .expect("the live scalar index should be cached with store B's binding");
+        assert!(Arc::ptr_eq(&cached.index(), &opened[0]));
+
+        // Evict decoded values while retaining the live shell. A fully warm query
+        // cannot prove that cache misses use the current request's credentials.
+        scalar_cache.clear().await;
+        scalar_cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, cached.clone())
+            .await;
+        wrapper_b.requests.lock().unwrap().clear();
+        assert_eq!(search_ids(dataset_b, "beta").await, vec![1, 4, 7]);
+        assert!(
+            wrapper_a.requests.lock().unwrap().is_empty(),
+            "request B must not issue index I/O through revoked store A"
+        );
+        assert!(
+            wrapper_b
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| matches!(method.as_str(), "get_opts" | "get_ranges")),
+            "request B must read uncached index data through store B"
+        );
+
+        scalar_cache.clear().await;
+        scalar_cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, cached)
+            .await;
+        wrapper_a.revoked.store(false, Ordering::Relaxed);
+        wrapper_b.revoked.store(true, Ordering::Relaxed);
+        wrapper_a.requests.lock().unwrap().clear();
+        wrapper_b.requests.lock().unwrap().clear();
+        assert_eq!(search_ids(dataset_a, "gamma").await, vec![2, 5]);
+        assert!(
+            wrapper_a
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| matches!(method.as_str(), "get_opts" | "get_ranges")),
+            "re-querying dataset A must read uncached index data through store A"
+        );
+        assert!(
+            wrapper_b.requests.lock().unwrap().is_empty(),
+            "re-querying dataset A must not issue index I/O through revoked store B"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_wrappers_reload_legacy_fts_fixture() {
+        let test_dir = copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let uuid = indices[0].uuid;
+
+        for _ in 0..2 {
+            let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!("_indices/{uuid}")));
+            let request = dataset
+                .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+            let metrics = LocalMetricsCollector::default();
+            let index = request
+                .open_scalar_index("text", &uuid, &metrics)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .is_legacy()
+            );
+            assert_eq!(
+                metrics.index_loads.load(Ordering::Relaxed),
+                1,
+                "legacy readers must still be reloaded through each request's store"
+            );
+            let result = request
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("happy".to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), 1);
+            assert_eq!(
+                result["text"].as_string::<i32>().value(0),
+                "frodo was a happy puppy"
+            );
+            assert!(!wrapper.requests.lock().unwrap().is_empty());
+            wrapper.revoked.store(true, Ordering::Relaxed);
         }
     }
 
@@ -3892,7 +4360,11 @@ mod tests {
         ]));
         let first_fragment_rows = 20_000;
         let second_fragment_rows = 100;
-        let first_values = vec![0.0f32; first_fragment_rows * dimension as usize];
+        // A tiny per-row perturbation keeps the rows distinct, so the oversized
+        // partition can actually be split by k-means.
+        let first_values = (0..first_fragment_rows * dimension as usize)
+            .map(|i| (i / dimension as usize) as f32 * 0.0001)
+            .collect::<Vec<f32>>();
         let second_values = vec![100.0f32; second_fragment_rows * dimension as usize];
         let first_vectors =
             FixedSizeListArray::try_new_from_values(Float32Array::from(first_values), dimension)
@@ -4551,7 +5023,12 @@ mod tests {
             .num_partitions_per_segment()
             .into_iter()
             .collect::<HashMap<_, _>>();
-        assert_eq!(partitions_per_segment[&after_by_fragment[&vec![0]]], 3);
+        // The 20_000-row partition is split straight to the target size:
+        // ceil(20_000 / 4096) = 5 pieces, so 2 + 4 partitions.
+        assert_eq!(
+            partitions_per_segment[&after_by_fragment[&vec![0]]],
+            2 + 20_000_usize.div_ceil(IndexType::IvfFlat.target_partition_size()) - 1
+        );
         assert_eq!(partitions_per_segment[&after_by_fragment[&vec![1]]], 2);
     }
 
@@ -5239,6 +5716,34 @@ mod tests {
         )
         .await;
         assert_eq!(phrase_ids, (0..300).step_by(3).collect::<Vec<_>>());
+
+        for _ in 0..2 {
+            let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!(
+                "_indices/{}",
+                indices[0].uuid
+            )));
+            let request = dataset
+                .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+            assert_eq!(
+                search_ids(
+                    &request,
+                    FullTextSearchQuery::new("compatibility".to_owned())
+                )
+                .await,
+                match_ids
+            );
+            let phrase =
+                PhraseQuery::new("lance database".to_owned()).with_column(Some("text".to_owned()));
+            assert_eq!(
+                search_ids(
+                    &request,
+                    FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase))
+                )
+                .await,
+                phrase_ids
+            );
+            wrapper.revoked.store(true, Ordering::Relaxed);
+        }
     }
 
     #[rstest]
@@ -5930,6 +6435,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    #[tokio::test]
+    async fn test_remap_partial_map_does_not_keep_index() {
+        let data = gen_batch()
+            .col("int", array::step::<Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(16)),
+            )
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+        assert_eq!(dataset.count_all_rows().await.unwrap(), 256);
+        assert_eq!(
+            index_meta.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([0u32]))
+        );
+
+        let remap = RowAddrRemap::direct(HashMap::from([(0u64, None)]));
+        assert_eq!(remap.get(1), None);
+
+        let result = remap_index(&dataset, &index_meta.uuid, &remap)
+            .await
+            .unwrap();
+        assert_ne!(result, RemapResult::Keep(index_meta.uuid));
+
+        let complete_remap =
+            RowAddrRemap::direct((0u64..256).map(|offset| (offset, None)).collect());
+        let mut legacy_dataset = dataset.clone();
+        let manifest = Arc::make_mut(&mut legacy_dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[0].physical_rows = None;
+        assert!(!remap_deletes_all_indexed_rows(
+            &legacy_dataset,
+            index_meta.fragment_bitmap.as_ref().unwrap(),
+            &complete_remap,
+        ));
     }
 
     /// The `fields.len() > 1` rejection in `remap_index`, which had no dedicated

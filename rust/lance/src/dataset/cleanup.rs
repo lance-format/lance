@@ -50,6 +50,7 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
+use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{IndexMetadata, Manifest},
     io::{
@@ -87,6 +88,9 @@ pub struct RemovalStats {
     pub transaction_files_removed: u64,
     pub index_files_removed: u64,
     pub deletion_files_removed: u64,
+    /// Files that could not be deleted. They are not counted as removed; the next
+    /// cleanup finds them again by listing.
+    pub failed_deletes: u64,
 }
 
 /// A read-only explanation of what a cleanup operation would remove.
@@ -208,6 +212,7 @@ impl RemovalStats {
         self.transaction_files_removed += other.transaction_files_removed;
         self.index_files_removed += other.index_files_removed;
         self.deletion_files_removed += other.deletion_files_removed;
+        self.failed_deletes += other.failed_deletes;
     }
 }
 
@@ -298,10 +303,22 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
+/// A manifest that has aged out and is queued for deletion.
+#[derive(Clone, Debug)]
+struct ExpiredManifest {
+    version: u64,
+    /// Size from the manifest listing. `None` means it must be fetched before it can
+    /// be counted in `RemovalStats::bytes_removed`.
+    size_bytes: Option<u64>,
+}
+
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
-    old_manifests: HashMap<Path, u64>,
+    old_manifests: HashMap<Path, ExpiredManifest>,
+    /// Store records to retire once their manifests are gone, by version;
+    /// see `CommitHandler::forget_version`.
+    retired_records: HashMap<u64, String>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -343,8 +360,6 @@ impl CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
-const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
-const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 
 /// Builder-style cleanup operation.
@@ -568,6 +583,14 @@ impl<'a> CleanupTask<'a> {
                     manifest_path = %location.path,
                     "Skipping old manifest removed by concurrent cleanup"
                 );
+                // Its record may still be there if that cleanup stopped early.
+                if let Some(identity) = location.identity {
+                    inspection
+                        .lock()
+                        .unwrap()
+                        .retired_records
+                        .insert(location.version, identity);
+                }
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -589,9 +612,20 @@ impl<'a> CleanupTask<'a> {
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         let commit_ts = manifest.timestamp();
         if !in_working_set {
-            inspection
-                .old_manifests
-                .insert(location.path.clone(), manifest.version);
+            inspection.old_manifests.insert(
+                location.path.clone(),
+                ExpiredManifest {
+                    version: manifest.version,
+                    // Carried from the listing so the delete phase need not HEAD
+                    // every manifest just to report bytes removed.
+                    size_bytes: location.size,
+                },
+            );
+            if let Some(identity) = location.identity.clone() {
+                inspection
+                    .retired_records
+                    .insert(manifest.version, identity);
+            }
             match inspection.latest_deleted_manifest_time {
                 Some(ts) if commit_ts <= ts => {}
                 _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
@@ -678,6 +712,10 @@ impl<'a> CleanupTask<'a> {
             .map(|uuid| indices_dir.clone().join(uuid.as_str()))
             .collect::<HashSet<_>>();
         let index_dirs_to_remove = Mutex::new(HashSet::new());
+        // Versions whose manifest could not be deleted. Their store records must
+        // survive with them: a record outliving its manifest is retired by the next
+        // cleanup, but a manifest outliving its record is a lost version.
+        let undeleted_manifest_versions = Mutex::new(HashSet::new());
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
@@ -719,10 +757,19 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
+        // Data files owned by no manifest can be newer than the retained
+        // manifest floor. List through the moving verification threshold so
+        // they become candidates once old enough, or list all data files when
+        // the caller explicitly permits deleting unverified files.
+        let data_unmodified_since = if self.policy.delete_unverified {
+            None
+        } else {
+            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+        };
         let streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -734,8 +781,10 @@ impl<'a> CleanupTask<'a> {
 
         let old_manifests = inspection.old_manifests.clone();
         let manifest_files = stream::iter(old_manifests)
-            .map(|(path, _version)| async move {
-                let size_bytes = self.dataset.object_store.size(&path).await?;
+            .map(|(path, expired)| async move {
+                let size_bytes =
+                    expired_manifest_size(&self.dataset.object_store, &path, expired.size_bytes)
+                        .await?;
                 Ok::<CleanupFile, Error>(CleanupFile {
                     path,
                     kind: CleanupFileKind::Manifest,
@@ -747,7 +796,7 @@ impl<'a> CleanupTask<'a> {
             .boxed();
 
         let all_files = stream::iter(vec![unreferenced_files, manifest_files]).flatten();
-        let all_paths_to_remove = all_files.map(|file| {
+        let all_files_to_remove = all_files.map(|file| {
             let file = file?;
             if deletes_files {
                 let mode = if file.unverified {
@@ -772,10 +821,6 @@ impl<'a> CleanupTask<'a> {
                     CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
                 }
             }
-            cleanup_result
-                .lock()
-                .unwrap()
-                .record_file(&file, candidate_file_limit, self.track_removed_manifests);
             if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
                 let mut parent = file.path.parent();
                 let mut index_dirs = index_dirs_to_remove.lock().unwrap();
@@ -787,29 +832,89 @@ impl<'a> CleanupTask<'a> {
                     parent = dir_path.parent();
                 }
             }
-            Ok(file.path)
+            Ok(file)
         });
 
         if deletes_files {
-            let paths_to_delete: BoxStream<Result<Path>> =
+            let files_to_delete: BoxStream<Result<CleanupFile>> =
                 if let Some(rate) = self.policy.delete_rate_limit {
-                    let duration =
-                        calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
+                    let duration = calculate_duration(rate);
                     let mut ticker = interval(duration);
                     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     IntervalStream::new(ticker)
-                        .zip(all_paths_to_remove)
-                        .map(|(_, path)| path)
+                        .zip(all_files_to_remove)
+                        .map(|(_, file)| file)
                         .boxed()
                 } else {
-                    all_paths_to_remove.boxed()
+                    all_files_to_remove.boxed()
                 };
 
-            self.dataset
-                .object_store
-                .remove_stream(paths_to_delete)
-                .try_for_each(|_| future::ready(Ok(())))
+            // Deleting here rather than through `remove_stream` keeps each outcome
+            // attached to its file, which is what lets the stats below count what was
+            // actually removed instead of what was merely attempted.
+            let store = &self.dataset.object_store;
+            files_to_delete
+                .map(|file| async move {
+                    let file = file?;
+                    let outcome = match store.delete(&file.path).await {
+                        Ok(()) => Ok(()),
+                        // Cleanup lists first and deletes after, so a concurrent
+                        // writer or a second cleanup can remove a path in between.
+                        // Already gone is the outcome we wanted.
+                        Err(error) if is_not_found_err(&error) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    Ok::<_, Error>((file, outcome))
+                })
+                .buffer_unordered(self.dataset.object_store.io_parallelism())
+                .try_for_each(|(file, outcome)| {
+                    let mut result = cleanup_result.lock().unwrap();
+                    match outcome {
+                        Ok(()) => result.record_file(
+                            &file,
+                            candidate_file_limit,
+                            self.track_removed_manifests,
+                        ),
+                        // One transient failure must not discard a sweep over
+                        // millions of objects. The file stays, is not counted as
+                        // removed, and the next run finds it again by listing.
+                        Err(error) => {
+                            // Only the first is warned; a failing backend would
+                            // otherwise emit a line per object.
+                            if result.stats.failed_deletes == 0 {
+                                warn!(path = %file.path, error = %error,
+                                      "failed to delete file; continuing and counting it");
+                            } else {
+                                debug!(path = %file.path, error = %error, "failed to delete file");
+                            }
+                            result.stats.failed_deletes += 1;
+                            if matches!(file.kind, CleanupFileKind::Manifest)
+                                && let Some(expired) = inspection.old_manifests.get(&file.path)
+                            {
+                                undeleted_manifest_versions
+                                    .lock()
+                                    .unwrap()
+                                    .insert(expired.version);
+                            }
+                        }
+                    }
+                    future::ready(Ok(()))
+                })
                 .await?;
+
+            // Only after the objects are gone: a record that outlives its
+            // manifest is retired by the next cleanup, the reverse is a lost
+            // version.
+            let undeleted = undeleted_manifest_versions.into_inner().unwrap();
+            for (version, identity) in &inspection.retired_records {
+                if undeleted.contains(version) {
+                    continue;
+                }
+                self.dataset
+                    .commit_handler
+                    .forget_version(&self.dataset.base, *version, identity)
+                    .await?;
+            }
 
             if removes_empty_dirs
                 && let Err(error) = self
@@ -830,9 +935,16 @@ impl<'a> CleanupTask<'a> {
                 );
             }
         } else {
-            // Drain the stream to populate stats, but do not call remove_stream.
-            all_paths_to_remove
-                .try_for_each(|_| future::ready(Ok(())))
+            // Nothing is deleted, so the stats describe what would be removed.
+            all_files_to_remove
+                .try_for_each(|file| {
+                    cleanup_result.lock().unwrap().record_file(
+                        &file,
+                        candidate_file_limit,
+                        self.track_removed_manifests,
+                    );
+                    future::ready(Ok(()))
+                })
                 .await?;
         }
 
@@ -1287,30 +1399,52 @@ impl<'a> CleanupTask<'a> {
         if is_referenced {
             inspection
                 .old_manifests
-                .retain(|_path, version_number| *version_number != referenced_version);
+                .retain(|_path, expired| expired.version != referenced_version);
+            // Kept on disk, so its record stays too.
+            inspection.retired_records.remove(&referenced_version);
         }
 
         Ok(())
     }
 }
 
-fn calculate_duration(scheme: String, rate: u64) -> Duration {
-    let batch_size = if scheme.to_lowercase().contains("s3") {
-        S3_DELETE_STREAM_BATCH_SIZE
-    } else if scheme.to_lowercase().contains("az") {
-        AZURE_DELETE_STREAM_BATCH_SIZE
-    } else {
-        1
-    };
+/// Size of an expired manifest, for `bytes_removed`.
+///
+/// `known` is what the listing reported. The HEAD fallback only runs when the listing did
+/// not say, because issuing it unconditionally costs a request per expired manifest.
+///
+/// A manifest that has already vanished counts as zero rather than failing. Cleanup lists
+/// first and acts after, so a concurrent cleanup can remove one in between — and that is
+/// the outcome this sweep wanted. Propagating `NotFound` here would abandon an entire
+/// sweep over a single file that is already in the desired state.
+async fn expired_manifest_size(
+    object_store: &ObjectStore,
+    path: &Path,
+    known: Option<u64>,
+) -> Result<u64> {
+    match known {
+        Some(size_bytes) => Ok(size_bytes),
+        None => match object_store.size(path).await {
+            Ok(size_bytes) => Ok(size_bytes),
+            Err(Error::NotFound { .. }) => Ok(0),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// The interval between delete permits for a `delete_rate_limit` of `rate` requests/s.
+///
+/// One permit issues exactly one `delete`, so the interval is the reciprocal of the
+/// rate. Scaling it by a bulk-delete batch size would only be correct if a permit
+/// covered a whole batch; nothing coalesces paths into a single request, so doing so
+/// lets the limiter issue `batch_size` times the configured rate.
+fn calculate_duration(rate: u64) -> Duration {
     let effective_rate = rate.max(1);
-    let path_rate = effective_rate * batch_size;
     info!(
         "delete_rate_limit enabled: limit {} delete requests/sec",
         effective_rate
     );
-    // convert user given op/s to the rate of issuing paths
-    let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
-    Duration::from_nanos(duration_ns)
+    Duration::from_nanos(1_000_000_000u64.div_ceil(effective_rate).max(1))
 }
 
 #[derive(Clone, Debug)]
@@ -1329,9 +1463,10 @@ pub struct CleanupPolicy {
     pub clean_referenced_branches: bool,
     /// Maximum number of delete requests per second. If None, no rate limiting is applied.
     ///
-    /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
-    /// On stores with bulk delete, each request can include multiple paths.
-    /// For example, `Some(100)` limits deletions to 100 delete requests per second.
+    /// Use this to avoid hitting S3 (or other object store) request rate limits during
+    /// cleanup. Cleanup deletes one path per request, so this is also the number of
+    /// paths removed per second. For example, `Some(100)` limits deletions to 100
+    /// delete requests per second.
     pub delete_rate_limit: Option<u64>,
 }
 
@@ -1412,7 +1547,7 @@ impl CleanupPolicyBuilder {
                 "retain_versions must be greater than 0, got {n}"
             )));
         }
-        let versions = dataset.versions().await?;
+        let versions = dataset.version_refs().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
         } else {
@@ -2260,6 +2395,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_removed_file_kind_contributes_its_bytes() {
+        // Each kind must contribute its size to `bytes_removed`, not merely increment its
+        // per-kind counter. Index files dominate some tables, so an undercount there makes
+        // cleanup look far less effective than it is; deletion and transaction files are
+        // individually small but numerous.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.create_some_index().await.unwrap();
+        // Produces a deletion file that the overwrite below then orphans. The only data
+        // column here is a vector, so delete on the row id instead.
+        fixture.delete_data("_rowid < 20").await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        // Overwrite drops the index and the old fragments, leaving all of it unreferenced.
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before = fixture.count_files().await.unwrap();
+        let removed = fixture.run_cleanup(utc_now()).await.unwrap();
+        let after = fixture.count_files().await.unwrap();
+
+        assert_gt!(removed.index_files_removed, 0);
+        assert_gt!(removed.deletion_files_removed, 0);
+        assert_gt!(removed.transaction_files_removed, 0);
+        assert_gt!(removed.data_files_removed, 0);
+        assert_gt!(removed.old_versions, 0);
+        // The whole point: reported bytes match the storage delta exactly with every kind
+        // in the mix, so no kind is silently contributing zero.
+        assert_eq!(removed.bytes_removed, before.num_bytes - after.num_bytes);
+    }
+
+    #[tokio::test]
     async fn cleanup_blob_v2_sidecar_files() {
         let fixture = MockDatasetFixture::try_new().unwrap();
 
@@ -2913,6 +3078,7 @@ mod tests {
             .await
             .unwrap();
 
+        let root_version = dataset.manifest.version;
         let branch = fixture
             .create_branch_and_load(&mut dataset, "child", (None, None))
             .await
@@ -2934,6 +3100,40 @@ mod tests {
             CleanupAction::Execute,
         );
         let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        // Queue the branch root for removal on both sides; rescuing the
+        // manifest must rescue its store record with it.
+        let inspection = Mutex::new(inspection);
+        {
+            let mut queued = inspection.lock().unwrap();
+            queued.old_manifests.insert(
+                Path::from("_versions/root.manifest"),
+                ExpiredManifest {
+                    version: root_version,
+                    size_bytes: None,
+                },
+            );
+            queued
+                .retired_records
+                .insert(root_version, "root-identity".to_string());
+        }
+        task.process_branch_referenced_manifests(
+            branch.manifest_location.clone(),
+            root_version,
+            &inspection,
+        )
+        .await
+        .unwrap();
+        let inspection = inspection.into_inner().unwrap();
+        assert!(
+            !inspection
+                .old_manifests
+                .values()
+                .any(|expired| expired.version == root_version)
+        );
+        assert!(
+            !inspection.retired_records.contains_key(&root_version),
+            "a retained branch root must not be retired from authoritative history"
+        );
         let referenced_branches = task.find_referenced_branches().await.unwrap();
         let inspection = task
             .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
@@ -3392,29 +3592,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::aged(false, 10)]
+    #[case::delete_unverified(true, 1)]
     #[tokio::test]
-    async fn cleanup_failed_commit_data_file() {
+    async fn cleanup_failed_commit_data_file(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+    ) {
         // We should clean up data files that are written but the commit failed
         // for whatever reason
 
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
         let mut fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
+
+        // The failed write is newer than every manifest, so a retained-manifest
+        // listing cutoff must not hide it from the age and policy checks.
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
-        // This append will fail since the commit is blocked but it should have
-        // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
         // Only 1 txn file: the failed commit's txn file was already cleaned up.
         assert_eq!(before_count.num_tx_files, 1);
 
-        // All of our manifests are newer than the threshold but temp files
-        // should still be deleted.
         let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
             .await
             .unwrap();
 
@@ -3478,18 +3689,20 @@ mod tests {
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 2);
 
-        assert!(
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-                .await
-                .is_err()
+        // A file that cannot be deleted is counted and skipped, not fatal: one
+        // transient failure must not discard a sweep over millions of objects.
+        let interrupted = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(interrupted.failed_deletes, 1);
+        assert_eq!(
+            interrupted.old_versions, 0,
+            "a manifest that failed to delete is not a removed version"
         );
 
-        // This test currently relies on us sending in manifest files after
-        // data files.  Also, the delete process is run in parallel.  However,
-        // it seems stable to stably delete the data file even though the manifest delete fails.
-        // My guess is that it is not possible to interrupt a task in flight and so it still
-        // has to finish the buffered tasks even if they are ignored.
+        // Every candidate is attempted, so the data file goes even though the
+        // manifest delete fails. This no longer depends on buffering order.
         let mid_count = fixture.count_files().await.unwrap();
         assert_eq!(mid_count.num_data_files, 1);
         assert_eq!(mid_count.num_manifest_files, 2);
@@ -3530,6 +3743,26 @@ mod tests {
                 .contains("retain_versions must be greater than 0, got 0"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn retain_n_versions_does_not_read_manifests() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, 2)
+            .await
+            .unwrap()
+            .build();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+
+        assert_eq!(policy.before_version, Some(2));
+        assert_eq!(io_stats.read_bytes, 0);
     }
 
     #[tokio::test]
@@ -4907,27 +5140,44 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_index_files, 7);
     }
 
+    #[tokio::test]
+    async fn expired_manifest_size_tolerates_a_vanished_manifest() {
+        let store = ObjectStore::memory();
+        let path = Path::from("_versions/1.manifest");
+
+        // A size the listing already reported costs no request at all.
+        assert_eq!(
+            expired_manifest_size(&store, &path, Some(42))
+                .await
+                .unwrap(),
+            42
+        );
+
+        // Unknown size and the object is gone: zero, not an error. A concurrent cleanup
+        // can remove a manifest between listing and here, and propagating NotFound would
+        // abandon the whole sweep over one file already in the state we wanted.
+        assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 0);
+
+        // A present object still reports its real size through the fallback.
+        store.put(&path, b"1234".as_slice()).await.unwrap();
+        assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
+    }
+
     #[test]
-    fn test_calculate_duration_s3() {
-        // Normal case: duration is computed from S3 batch size and configured rate.
-        let normal_rate = 100;
-        let expected_duration_ns =
-            1_000_000_000u64.div_ceil(normal_rate * S3_DELETE_STREAM_BATCH_SIZE);
-        assert_eq!(
-            calculate_duration("s3".to_string(), normal_rate),
-            Duration::from_nanos(expected_duration_ns)
-        );
+    fn test_calculate_duration() {
+        // One permit is one delete request, so the interval is the reciprocal of the
+        // configured rate. Scaling by a bulk-delete batch size here would let the
+        // limiter issue batch_size times the rate the caller asked for: at 100
+        // requests/s an S3 multiplier of 1,000 would give 10us instead of 10ms.
+        assert_eq!(calculate_duration(100), Duration::from_millis(10));
+        assert_eq!(calculate_duration(1_000), Duration::from_millis(1));
+        assert_eq!(calculate_duration(1), Duration::from_secs(1));
 
-        // Edge case: rate too small should be clamped to 1.
-        let min_rate_duration = calculate_duration("s3".to_string(), 1);
-        assert_eq!(calculate_duration("s3".to_string(), 0), min_rate_duration);
+        // Edge case: rate too small is clamped to 1.
+        assert_eq!(calculate_duration(0), calculate_duration(1));
 
-        // Edge case: computed duration_ns too small should be clamped to at least 1ns.
-        let very_large_rate = 2_000_000;
-        assert_eq!(
-            calculate_duration("s3".to_string(), very_large_rate),
-            Duration::from_nanos(1)
-        );
+        // Edge case: a rate finer than 1ns is clamped to 1ns.
+        assert_eq!(calculate_duration(2_000_000_000), Duration::from_nanos(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4966,5 +5216,284 @@ mod tests {
             "expected cleanup to be rate-limited (elapsed: {:?})",
             elapsed
         );
+    }
+
+    use lance_table::io::commit::external_manifest::ExternalManifestStore;
+    use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+
+    /// `(path, size, identity)` per version.
+    #[derive(Debug, Default)]
+    struct IdentifiedStore {
+        rows: Mutex<HashMap<u64, (String, u64, String)>>,
+        next_identity: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalManifestStore for IdentifiedStore {
+        async fn get(&self, _base_uri: &str, version: u64) -> Result<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.0.clone())
+                .ok_or_else(|| Error::not_found(format!("@{version}")))
+        }
+
+        async fn get_manifest_location(
+            &self,
+            _base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            let row = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .cloned()
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            Ok(ManifestLocation {
+                version,
+                path: Path::parse(&row.0).unwrap(),
+                size: Some(row.1),
+                naming_scheme: ManifestNamingScheme::V2,
+                e_tag: None,
+                identity: Some(row.2),
+            })
+        }
+
+        async fn get_latest_version(&self, _base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .max_by_key(|(version, _)| **version)
+                .map(|(version, row)| (*version, row.0.clone())))
+        }
+
+        async fn get_latest_manifest_location(
+            &self,
+            base_uri: &str,
+        ) -> Result<Option<ManifestLocation>> {
+            match self.get_latest_version(base_uri).await? {
+                Some((version, _)) => self
+                    .get_manifest_location(base_uri, version)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let identity = format!(
+                "identity-{}",
+                self.next_identity
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            let mut rows = self.rows.lock().unwrap();
+            if rows.contains_key(&version) {
+                return Err(Error::commit_conflict_source(version, "exists".into()));
+            }
+            rows.insert(version, (path.to_string(), size, identity));
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&version)
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            row.0 = path.to_string();
+            row.1 = size;
+            Ok(())
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn get_identity(&self, _base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.2.clone()))
+        }
+
+        async fn list_versions(
+            &self,
+            base_uri: &str,
+            since: Option<u64>,
+        ) -> Result<Option<Vec<ManifestLocation>>> {
+            let versions: Vec<u64> = self.rows.lock().unwrap().keys().copied().collect();
+            let mut locations = Vec::new();
+            for version in versions {
+                if since.is_none_or(|since| version > since) {
+                    locations.push(self.get_manifest_location(base_uri, version).await?);
+                }
+            }
+            Ok(Some(locations))
+        }
+
+        async fn forget_version(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            identity: &str,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(&version).is_some_and(|row| row.2 == identity) {
+                rows.remove(&version);
+            }
+            Ok(())
+        }
+    }
+
+    /// Cleanup retires the store record of every manifest it removes, one
+    /// whose object was already gone included, so store-backed history
+    /// matches what is on disk.
+    #[tokio::test]
+    async fn test_cleanup_forgets_removed_versions_in_the_external_store() {
+        use crate::dataset::{InsertBuilder, WriteDestination};
+        use lance_table::io::commit::CommitHandler;
+        use lance_table::io::commit::external_manifest::{
+            ExternalManifestCommitHandler, ExternalManifestStore,
+        };
+
+        let store = Arc::new(IdentifiedStore::default());
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: store.clone(),
+        });
+        let uri = TempStrDir::default();
+        let batch = || arrow_array::record_batch!(("i", Int32, [1, 2, 3])).unwrap();
+        let mut dataset = InsertBuilder::new(uri.as_str())
+            .with_params(&WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            })
+            .execute(vec![batch()])
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                })
+                .execute(vec![batch()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.count_versions().await.unwrap(), 3);
+
+        // Version 1's object is already gone, as after a cleanup that stopped
+        // before retiring records.
+        let v1 = Path::parse(store.get("", 1).await.unwrap()).unwrap();
+        dataset.object_store.delete(&v1).await.unwrap();
+
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
+        remaining.sort();
+        assert_eq!(remaining, vec![3]);
+        assert_eq!(dataset.count_versions().await.unwrap(), 1);
+        assert_eq!(dataset.versions().await.unwrap().len(), 1);
+    }
+
+    /// A manifest whose delete fails keeps its store record. A record outliving its
+    /// manifest is retired by the next cleanup; a manifest outliving its record is a
+    /// version nothing can find again.
+    #[tokio::test]
+    async fn test_a_manifest_that_fails_to_delete_keeps_its_record() {
+        use crate::dataset::{InsertBuilder, WriteDestination};
+        use lance_table::io::commit::CommitHandler;
+        use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+
+        let store = Arc::new(IdentifiedStore::default());
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: store.clone(),
+        });
+        let mock_store = Arc::new(MockObjectStore::new());
+        let os_params = ObjectStoreParams {
+            object_store_wrapper: Some(mock_store.clone()),
+            ..Default::default()
+        };
+        let uri = TempStrDir::default();
+        let batch = || arrow_array::record_batch!(("i", Int32, [1, 2, 3])).unwrap();
+        let params = |mode| WriteParams {
+            mode,
+            commit_handler: Some(handler.clone()),
+            store_params: Some(os_params.clone()),
+            ..Default::default()
+        };
+        let mut dataset = InsertBuilder::new(uri.as_str())
+            .with_params(&params(WriteMode::Create))
+            .execute(vec![batch()])
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_params(&params(WriteMode::Append))
+                .execute(vec![batch()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.count_versions().await.unwrap(), 3);
+
+        mock_store.policy.lock().unwrap().set_before_policy(
+            "block_delete_manifest",
+            Arc::new(|op: &str, path: &Path| -> Result<()> {
+                if op.contains("delete") && path.extension() == Some("manifest") {
+                    Err(Error::internal("Delete manifest blocked".to_string()))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+
+        let stats = cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .build(),
+        )
+        .await
+        .expect("a blocked manifest delete must not fail the sweep");
+
+        assert!(
+            stats.failed_deletes > 0,
+            "the blocked manifests are counted"
+        );
+        assert_eq!(
+            stats.old_versions, 0,
+            "a manifest still on disk is not a removed version"
+        );
+        // Every record survives, because every manifest survives.
+        let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
+        remaining.sort();
+        assert_eq!(remaining, vec![1, 2, 3]);
     }
 }
