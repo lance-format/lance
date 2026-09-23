@@ -3357,6 +3357,55 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
+    fn find_duplicate_pairs(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        distance_threshold: f32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs(
+                    self.ds.clone(),
+                    column,
+                    distance_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
+    fn find_duplicate_pairs_in_partition(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        segment_id: &str,
+        partition_id: usize,
+        distance_threshold: f32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let segment_id = uuid::Uuid::parse_str(segment_id).map_err(|err| {
+            PyValueError::new_err(format!("invalid segment_id '{segment_id}': {err}"))
+        })?;
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_in_partition(
+                    self.ds.clone(),
+                    column,
+                    segment_id,
+                    partition_id,
+                    distance_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
     #[pyo3(signature = (*, min_version=None, progress=None))]
     fn tracked_files(
         &self,

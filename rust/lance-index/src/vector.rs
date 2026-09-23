@@ -31,6 +31,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
+pub mod pairwise;
 pub mod pq;
 pub mod quantizer;
 pub mod residual;
@@ -440,6 +441,23 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
+    }
+
+    /// Whether bounded index-vector reconstruction is available (current format).
+    fn supports_pairwise_vectors(&self) -> bool {
+        false
+    }
+
+    /// Read a bounded range in a physical partition's stable storage order.
+    /// Quantized vectors are reconstructed from index data, not source rows.
+    async fn read_pairwise_vectors(
+        &self,
+        _partition_id: usize,
+        _range: std::ops::Range<usize>,
+    ) -> Result<pairwise::PairwiseVectorBatch> {
+        Err(lance_core::Error::not_supported(
+            "pair enumeration requires a current-format vector index; rebuild this index",
+        ))
     }
 
     // for SubIndex only

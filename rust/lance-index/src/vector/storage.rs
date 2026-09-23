@@ -5,10 +5,14 @@
 
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
+    cast::AsArray,
+    types::{UInt8Type, UInt64Type},
+};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
@@ -736,6 +740,124 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             self.distance_type,
             self.frag_reuse_index.clone(),
         )
+    }
+
+    async fn read_vector_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+        let batches = self
+            .reader
+            .read_stream(
+                ReadBatchParams::Range(range),
+                u32::MAX,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let schema = Arc::new(self.reader.schema().as_ref().into());
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+
+    /// Read and reconstruct a bounded batch without populating the partition cache.
+    pub async fn read_pairwise_vectors(
+        &self,
+        partition_id: usize,
+        range: std::ops::Range<usize>,
+        centroid: ArrayRef,
+    ) -> Result<super::pairwise::PairwiseVectorBatch> {
+        if partition_id >= self.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        let partition = self.ivf.row_range(partition_id);
+        if range.start > range.end || range.end > partition.len() || range.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "vector range {range:?} outside partition {partition_id} of size {}",
+                partition.len()
+            )));
+        }
+        let quantizer = self.quantizer()?;
+        // RQ FastScan sign codes are packed in groups of 32 vectors, including
+        // a separately transposed tail. Decode complete groups before slicing.
+        let packed = matches!(&quantizer, Quantizer::Rabit(rq) if rq.metadata_ref().packed);
+        let start = if packed {
+            range.start / 32 * 32
+        } else {
+            range.start
+        };
+        let end = if packed {
+            range.end.next_multiple_of(32).min(partition.len())
+        } else {
+            range.end
+        };
+        let mut batch = self
+            .read_vector_range(partition.start + start..partition.start + end)
+            .await?;
+        if self.metadata.is_transposed() {
+            let column = quantizer.column();
+            let code_dim = batch
+                .column_by_name(column)
+                .ok_or_else(|| Error::invalid_input(format!("missing {column}")))?
+                .as_fixed_size_list()
+                .value_length() as usize;
+            let mut codes = vec![0u8; (end - start) * code_dim];
+            // PQ's Arrow rows contain a flattened column-major code matrix.
+            // Fetch only the byte spans for this vector range in each column.
+            for code in 0..code_dim {
+                let byte_start = code * partition.len() + start;
+                let byte_end = code * partition.len() + end;
+                let first = byte_start / code_dim;
+                let last = byte_end.div_ceil(code_dim);
+                let encoded = self
+                    .read_vector_range(partition.start + first..partition.start + last)
+                    .await?;
+                let values = encoded
+                    .column_by_name(column)
+                    .ok_or_else(|| Error::invalid_input(format!("missing {column}")))?
+                    .as_fixed_size_list()
+                    .values()
+                    .as_primitive::<UInt8Type>();
+                let offset = byte_start - first * code_dim;
+                for row in 0..end - start {
+                    codes[row * code_dim + code] = values.value(offset + row);
+                }
+            }
+            let codes =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), code_dim as i32)?;
+            batch = batch.replace_column_by_name(column, Arc::new(codes))?;
+        }
+        let metric = self.distance_type;
+        let remapper = self.frag_reuse_index.clone();
+        spawn_cpu(move || {
+            let vectors = super::pairwise::reconstruct(&quantizer, &batch, centroid, metric)?;
+            let vectors = vectors.slice(range.start - start, range.len());
+            let ids = batch
+                .column_by_name(ROW_ID)
+                .ok_or_else(|| Error::invalid_input("index batch missing row IDs"))?
+                .as_primitive::<UInt64Type>()
+                .slice(range.start - start, range.len());
+            if let Some(remapper) = remapper {
+                let mapped = ids
+                    .values()
+                    .iter()
+                    .map(|&id| remapper.remap_row_id(id))
+                    .collect::<Vec<_>>();
+                // Keep physical positions so the outer/inner traversal has the
+                // same order even when compaction discarded a row.
+                Ok(super::pairwise::PairwiseVectorBatch {
+                    row_ids: UInt64Array::from(mapped),
+                    vectors,
+                })
+            } else {
+                Ok(super::pairwise::PairwiseVectorBatch {
+                    row_ids: ids,
+                    vectors,
+                })
+            }
+        })
+        .await
     }
 
     /// Materialize a compact partition for the parallel prewarm path.

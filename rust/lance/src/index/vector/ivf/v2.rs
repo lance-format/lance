@@ -2812,6 +2812,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(Box::pin(stream))
     }
 
+    fn supports_pairwise_vectors(&self) -> bool {
+        true
+    }
+
+    async fn read_pairwise_vectors(
+        &self,
+        partition_id: usize,
+        range: std::ops::Range<usize>,
+    ) -> Result<lance_index::vector::pairwise::PairwiseVectorBatch> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::invalid_input(format!("partition_id={partition_id} has no centroid"))
+        })?;
+        self.storage
+            .read_pairwise_vectors(partition_id, range, centroid)
+            .await
+    }
+
     async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
         unimplemented!("this method is for only sub index");
     }
