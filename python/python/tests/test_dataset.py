@@ -4307,7 +4307,9 @@ def _assert_mixed_version_reads(dataset, expected):
         ("2.0", "2.1", "2.2", "2.3"),
         ("2.1", "2.2", "2.3", "2.0"),
         ("2.2", "2.3", "2.0", "2.1"),
-        ("2.3", "2.0", "2.1", "2.2"),
+        # A table created on 2.3 follows the semantic type contract and only
+        # takes data files of version 2.1 or later.
+        ("2.3", "2.1", "2.2", "2.1"),
     ],
 )
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy"])
