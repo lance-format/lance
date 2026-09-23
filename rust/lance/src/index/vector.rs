@@ -10,6 +10,7 @@ use std::{any::Any, collections::HashMap};
 
 mod bounded_partition_stream;
 pub mod builder;
+pub mod dedup;
 pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;

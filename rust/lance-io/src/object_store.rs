@@ -1601,19 +1601,38 @@ impl ObjectStore {
         result
     }
 
+    /// Delete every location in the stream, up to `io_parallelism` at a time.
+    ///
+    /// Deleting serially costs a round trip per object — ~30/s against a cloud store,
+    /// which is days for a table with millions of unreferenced files.
+    ///
+    /// `ObjectStore::delete_stream` would also batch (S3: 1000 keys per request) but
+    /// needs a `'static` stream of `object_store::Result`; callers pass a borrowed
+    /// stream of `lance_core::Result`. Using it means changing this signature.
+    ///
+    /// Order is not preserved; no caller may depend on it.
+    ///
+    /// A location that is already gone counts as removed. Callers list first and
+    /// delete after, so a concurrent writer or a second cleanup can remove a path in
+    /// between; failing there would abandon an entire sweep over one absent object.
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
     ) -> BoxStream<'a, Result<Path>> {
         let store = Arc::clone(&self.inner);
         locations
-            .and_then(move |location| {
+            .map(move |location| {
                 let store = Arc::clone(&store);
                 async move {
-                    store.delete(&location).await?;
-                    Ok(location)
+                    let location = location?;
+                    match store.delete(&location).await {
+                        Ok(()) => Ok(location),
+                        Err(object_store::Error::NotFound { .. }) => Ok(location),
+                        Err(error) => Err(error.into()),
+                    }
                 }
             })
+            .buffer_unordered(self.io_parallelism())
             .boxed()
     }
 
@@ -2750,6 +2769,19 @@ mod tests {
         part_count: AtomicUsize,
         abort_count: AtomicUsize,
         native_copy_count: AtomicUsize,
+        delete_stream_count: AtomicUsize,
+        delete_in_flight: AtomicUsize,
+        /// High-water mark of concurrent deletions; 1 means serial.
+        delete_max_in_flight: AtomicUsize,
+    }
+
+    /// Decrements the in-flight count when its stream is dropped.
+    struct InFlightGuard(Arc<MultipartObservations>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.delete_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[derive(Debug)]
@@ -2843,7 +2875,28 @@ mod tests {
             &self,
             locations: BoxStream<'static, OSResult<Path>>,
         ) -> BoxStream<'static, OSResult<Path>> {
-            self.inner.delete_stream(locations)
+            let observations = self.observations.clone();
+            observations
+                .delete_stream_count
+                .fetch_add(1, Ordering::SeqCst);
+            let in_flight = observations.delete_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            observations
+                .delete_max_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            let guard = InFlightGuard(observations);
+            let inner = self.inner.delete_stream(locations);
+            // An in-memory delete resolves on first poll, so overlap is only
+            // observable if the deletion yields.
+            async move {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                inner.map(move |result| {
+                    let _ = &guard;
+                    result
+                })
+            }
+            .flatten_stream()
+            .boxed()
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -2976,6 +3029,87 @@ mod tests {
         assert_eq!(
             store.read_one_all(&destination).await.unwrap().as_ref(),
             contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Concurrent deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_tolerates_already_deleted() {
+        // Callers list first and delete after, so a path can disappear in between.
+        // Failing there abandons the whole sweep over one absent object.
+        let store = ObjectStore::memory();
+        let present = Path::from("present");
+        let absent = Path::from("never-written");
+        store.put(&present, b"x").await.unwrap();
+
+        let to_remove =
+            futures::stream::iter(vec![Ok(absent.clone()), Ok(present.clone())]).boxed();
+        let mut removed = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("an already-absent path must not fail the stream");
+
+        removed.sort_unstable();
+        let mut expected = vec![absent, present.clone()];
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
+        assert!(!store.exists(&present).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_deletes_concurrently() {
+        // Serial deletion is a round trip per object; the high-water mark is 1
+        // exactly when that regression happens.
+        let observations = Arc::new(MultipartObservations::default());
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let removed = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(removed.len(), paths.len());
+        assert!(
+            observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
+            "deletions ran one at a time; remove_stream must overlap them"
         );
     }
 

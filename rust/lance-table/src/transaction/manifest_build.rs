@@ -544,7 +544,7 @@ impl Transaction {
         }
 
         // Get the schema and the final fragment list
-        let schema = match self.operation {
+        let mut schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
@@ -1391,6 +1391,46 @@ impl Transaction {
                 read_version_state,
                 new_version,
             )?;
+        }
+
+        // Blob is one logical column across file versions. Publishing its first
+        // 2.2+ file also publishes the logical v2 view, without replacing older files.
+        // Blob children are not independent physical columns; retain the root ID
+        // and allocate logical child IDs against the current manifest on commit.
+        let legacy_blob_ids = schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            let mut blob_v2_fields = std::collections::BTreeSet::new();
+            for file in final_fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+            {
+                if matches!(
+                    file.file_version()?,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ) {
+                    blob_v2_fields.extend(
+                        file.fields
+                            .iter()
+                            .copied()
+                            .filter(|id| legacy_blob_ids.contains(id)),
+                    );
+                }
+            }
+            let mut next_field_id = current_manifest
+                .map(|manifest| manifest.max_field_id())
+                .unwrap_or(-1)
+                .max(schema.max_field_id().unwrap_or(-1))
+                + 1;
+            for id in blob_v2_fields {
+                if let Some(field) = schema.mut_field_by_id(id) {
+                    field.promote_blob_v2()?;
+                    field.set_id(field.parent_id, &mut next_field_id);
+                }
+            }
         }
 
         let mut manifest = if let Some(current_manifest) = current_manifest {

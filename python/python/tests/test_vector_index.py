@@ -31,6 +31,57 @@ from lance.util import (  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
+@pytest.mark.parametrize("query_scale", [0.25, 4.0])
+def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
+    centroids = np.eye(16, dtype=np.float32)
+    vectors = np.repeat(centroids, 16, axis=0)
+    vectors *= np.tile(np.linspace(1, 2, 16, dtype=np.float32), 16)[:, None]
+    vectors += (
+        np.random.default_rng(2249).normal(0, 0.001, vectors.shape).astype(np.float32)
+    )
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    dataset = lance.write_dataset(table, tmp_path / "dot.lance", max_rows_per_file=32)
+    dataset.create_index(
+        "vector", "IVF_FLAT", metric="dot", num_partitions=16, ivf_centroids=centroids
+    )
+    query = centroids[0] * query_scale
+    nearest = {"column": "vector", "q": query, "k": 10, "metric": "dot"}
+    expected = set(np.argsort(-(vectors @ query))[:10].tolist())
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "2")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "2")
+    captured = []
+    result = dataset.scanner(
+        columns=["id"], nearest=nearest, scan_stats_callback=captured.append
+    ).to_table()
+    assert set(result["id"].to_pylist()) == expected
+    assert captured[0].all_counts["partitions_searched"] == 2
+
+    # An initial cap must not prevent later probing when filters exhaust it.
+    captured.clear()
+    filtered = dataset.scanner(
+        columns=["id"],
+        nearest=nearest,
+        filter="id >= 224",
+        prefilter=True,
+        scan_stats_callback=captured.append,
+    ).to_table()
+    assert len(filtered) == 10
+    assert min(filtered["id"].to_pylist()) >= 224
+    assert captured[0].all_counts["partitions_searched"] > 2
+
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        dataset.to_table(columns=["id"], nearest=nearest)
+    # Fixed budgets and explicitly bounded Auto retain their existing semantics.
+    fixed = dataset.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
+    assert set(fixed["id"].to_pylist()) == expected
+    bounded = dataset.to_table(
+        columns=["id"], nearest={**nearest, "maximum_nprobes": 4}
+    )
+    assert set(bounded["id"].to_pylist()) == expected
+
+
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
@@ -1012,6 +1063,56 @@ def test_index_type(tmp_path):
         assert actual.num_rows == 10
         assert len(actual_ids) == 10
         assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
+
+
+@pytest.mark.parametrize("approx_mode", ["normal", "accurate"])
+def test_ivf_rq_dot_query_scale_invariance(tmp_path, approx_mode):
+    rng = np.random.default_rng(20260921)
+    vectors = rng.normal(size=(128, 64)).astype(np.float32)
+    center = rng.normal(size=64).astype(np.float32)
+    vectors[:64] += 2 * center
+    vectors[64:] -= 2 * center
+    centroids = np.stack([2 * center, -2 * center])
+    table = vec_to_table(data=vectors).append_column("id", pa.array(range(128)))
+    ds = lance.write_dataset(table, tmp_path / "scale.lance", max_rows_per_file=64)
+    ds = ds.create_index(
+        "vector",
+        "IVF_RQ",
+        metric="dot",
+        num_bits=5,
+        num_partitions=2,
+        ivf_centroids=centroids,
+    )
+    assert len(ds.get_fragments()) == 2
+    for q in vectors[[3, 97]]:
+        truth = set(np.argsort(-(vectors.astype(np.float64) @ q))[:10])
+        for k in [10, len(vectors)]:
+            reference = None
+            for scale in [1.0, 0.125, 8.0]:
+                result = ds.to_table(
+                    columns=["id", "_distance"],
+                    nearest={
+                        "column": "vector",
+                        "q": q * scale,
+                        "k": k,
+                        "metric": "dot",
+                        "nprobes": 2,
+                        "approx_mode": approx_mode,
+                    },
+                )
+                ids = result["id"].to_numpy()
+                distances = result["_distance"].to_numpy()
+                assert len(set(ids[:10]) & truth) / 10 >= 0.5
+                if reference is None:
+                    reference = (ids, distances)
+                else:
+                    np.testing.assert_array_equal(ids, reference[0])
+                    np.testing.assert_allclose(
+                        distances,
+                        1 + scale * (reference[1] - 1),
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
 
 
 def test_create_dot_index(tmp_path):

@@ -13,7 +13,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
-use super::row_ids::{ExternalFile, RowIdMeta};
+use super::row_ids::RowIdMeta;
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -318,13 +318,9 @@ impl DataFileFieldInterner {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                file,
-            ) => Ok(RowDatasetVersionMeta::External(ExternalFile {
-                path: file.path,
-                offset: file.offset,
-                size: file.size,
-            })),
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
+            }
         }
     }
 
@@ -337,12 +333,8 @@ impl DataFileFieldInterner {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                Ok(RowDatasetVersionMeta::External(ExternalFile {
-                    path: file.path,
-                    offset: file.offset,
-                    size: file.size,
-                }))
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
             }
         }
     }
@@ -571,6 +563,43 @@ impl Fragment {
             .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
     }
 
+    /// Whether any of this fragment's row lineage sequences lives in a data
+    /// file column rather than inline.
+    pub fn has_spilled_row_lineage(&self) -> bool {
+        matches!(self.row_id_meta, Some(RowIdMeta::Column))
+            || matches!(
+                self.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+            || matches!(
+                self.last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+    }
+
+    /// The data file holding the row lineage column with the reserved
+    /// `field_id`, which is the one entry of [`Self::files`] whose fields carry
+    /// it. `None` when no file does, which for a sequence whose metadata says
+    /// it is spilled is corruption; so is more than one file carrying the id,
+    /// which this reports as an error.
+    pub fn row_lineage_file(&self, field_id: i32) -> Result<Option<&DataFile>> {
+        let mut carriers = self
+            .files
+            .iter()
+            .filter(|file| file.fields.contains(&field_id));
+        let file = carriers.next();
+        if let Some(extra) = carriers.next() {
+            return Err(Error::corrupt_file_named(
+                &extra.path,
+                format!(
+                    "fragment {} has more than one data file carrying row lineage field {}",
+                    self.id, field_id
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
@@ -735,12 +764,8 @@ impl From<&Fragment> for pb::DataFragment {
             RowIdMeta::Inline(data) => {
                 pb::data_fragment::RowIdSequence::InlineRowIds(data.bytes().clone())
             }
-            RowIdMeta::External(file) => {
-                pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                })
+            RowIdMeta::Column => {
+                pb::data_fragment::RowIdSequence::ColumnRowIds(pb::RowLineageColumn {})
             }
         });
         let last_updated_at_version_sequence =

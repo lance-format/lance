@@ -12,7 +12,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::pb;
 
-/// A reference to a part of a file.
+/// Field id of the hidden `_rowid` column that a spilled row id sequence lives in.
+///
+/// Field ids are `i32` and every negative value is reserved for system use:
+/// `-1` is the unassigned sentinel, `-2` is
+/// [`TOMBSTONE_FIELD_ID`](crate::format::overlay::TOMBSTONE_FIELD_ID), and
+/// `-3..=-5` are the three row lineage columns.
+pub const ROW_ID_FIELD_ID: i32 = -3;
+/// Field id of the hidden `_row_created_at_version` column that a spilled
+/// created-at version sequence lives in.
+pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = -4;
+/// Field id of the hidden `_row_last_updated_at_version` column that a spilled
+/// last-updated-at version sequence lives in.
+pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = -5;
+
+/// A reference to a part of a file, used by the fragment reuse index details.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct ExternalFile {
     pub path: String,
@@ -138,7 +152,16 @@ impl DeepSizeOf for InlineRowIdsInner {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub enum RowIdMeta {
     Inline(InlineRowIds),
-    External(ExternalFile),
+    /// The sequence is spilled to a hidden [`ROW_ID_FIELD_ID`] column of one of
+    /// the fragment's data files, one row id per physical row, in offset order.
+    /// The file is the entry of [`Fragment::files`](super::Fragment::files)
+    /// whose fields carry that id; see
+    /// [`Fragment::row_lineage_file`](super::Fragment::row_lineage_file).
+    ///
+    /// An ordinary column rather than an opaque byte range: it carries the
+    /// file's encodings and page layout, so it can be read back a page at a
+    /// time instead of whole.
+    Column,
 }
 
 impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
@@ -147,13 +170,7 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
         match value {
             pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data.into())),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
+            pb::data_fragment::RowIdSequence::ColumnRowIds(_) => Ok(Self::Column),
         }
     }
 }

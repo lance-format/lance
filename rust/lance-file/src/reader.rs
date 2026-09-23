@@ -2432,6 +2432,7 @@ mod tests {
     use arrow_array::{
         DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
         StringArray, UInt32Array,
+        cast::AsArray,
         types::{Float64Type, Int8Type, Int32Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -4098,6 +4099,75 @@ mod tests {
             stats.read_iops, 1,
             "{num_pages} adjacent pages must be read together, not one request each"
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_batches_column_reads_into_one_request(
+        #[values(ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_1)]
+        version: ConcreteFileVersion,
+    ) {
+        let fs = FsFixture::default();
+        // 16 int32 columns of 256 rows: one 1 KiB page each, written back to
+        // back, so one row's reads sit within the local 4 KiB block size.
+        let mut generator = gen_batch();
+        for i in 0..16 {
+            generator = generator.col(format!("c{i}"), array::step::<Int32Type>());
+        }
+        write_lance_file(
+            generator.into_reader_rows(RowCount::from(256), BatchCount::from(1)),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let take = |row: u32| {
+            let file_reader = &file_reader;
+            async move {
+                file_reader
+                    .read_stream(
+                        lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![row])),
+                        1,
+                        1,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+        // The first take also initializes the page metadata; the cache keeps
+        // it, so the second take is data I/O only.
+        take(3).await;
+        fs.object_store.io_stats_incremental();
+        let batches = take(200).await;
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 1,
+            "one row across 16 adjacent column pages must be one request, not one per column"
+        );
+        assert_eq!(batches[0].num_columns(), 16);
+        for column in batches[0].columns() {
+            assert_eq!(column.as_primitive::<Int32Type>().value(0), 200);
+        }
     }
 
     #[rstest]

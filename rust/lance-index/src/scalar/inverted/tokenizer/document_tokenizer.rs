@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::json::JsonEncoding;
 use lance_tokenizer::{BoxTokenStream, TextAnalyzer, Token, TokenStream};
 use serde_json::Value;
 
@@ -27,6 +26,10 @@ impl TryFrom<&Field> for DocType {
     type Error = lance_core::Error;
 
     fn try_from(field: &Field) -> Result<Self, Self::Error> {
+        // JSON text is also `Utf8`, so it must be recognized before plain text.
+        if JsonEncoding::of_field(field).is_some() {
+            return Ok(Self::Json);
+        }
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
             DataType::List(field) | DataType::LargeList(field)
@@ -34,12 +37,6 @@ impl TryFrom<&Field> for DocType {
             {
                 Ok(Self::Text)
             }
-            DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
-                Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
-                _ => Err(lance_core::Error::invalid_input_source(
-                    format!("field {} is not json", field.name()).into(),
-                )),
-            },
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("field {} is not json", field.name()).into(),
             )),
@@ -304,10 +301,31 @@ impl TokenStream for TTStream {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
-        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
+        DocType, JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use arrow_schema::{DataType, Field};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, json_field};
     use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use rstest::rstest;
     use serde_json::Value;
+    use std::collections::HashMap;
+
+    /// A JSON column is tokenized as JSON whether it holds stored JSONB or
+    /// Arrow JSON text; plain strings stay text.
+    #[rstest]
+    #[case::jsonb(json_field("doc", true), "json")]
+    #[case::arrow_json_text(
+        Field::new("doc", DataType::Utf8, true).with_metadata(HashMap::from([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        )])),
+        "json"
+    )]
+    #[case::plain_text(Field::new("doc", DataType::Utf8, true), "text")]
+    fn test_doc_type_of_field(#[case] field: Field, #[case] expected: &str) {
+        assert_eq!(DocType::try_from(&field).unwrap().as_ref(), expected);
+    }
 
     #[test]
     fn test_json_tokenizer() {

@@ -148,7 +148,9 @@ impl BloomFilterIndex {
         let mut zones = Vec::with_capacity(index_file.num_rows());
         for start in (0..index_file.num_rows()).step_by(read_batch_size) {
             let end = (start + read_batch_size).min(index_file.num_rows());
-            let mut bloom_data = index_file.read_range_stream(start..end, None).await?;
+            let mut bloom_data = index_file
+                .read_range_stream(start..end, None, 4096, 2)
+                .await?;
             while let Some(batch) = bloom_data.try_next().await? {
                 zones.extend(Self::try_from_serialized(batch, max_array_length)?);
             }
