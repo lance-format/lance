@@ -178,8 +178,7 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
-     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
-     * the same value.
+     * <p>This sets both the minimum and maximum number of probes to the same value.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.

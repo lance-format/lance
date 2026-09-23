@@ -2627,6 +2627,19 @@ def test_vector_index_with_nprobes(indexed_dataset):
             "column": "vector",
             "q": np.random.randn(128),
             "k": 10,
+            "nprobes": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
             "minimum_nprobes": 7,
         }
     ).explain_plan()

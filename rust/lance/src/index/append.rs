@@ -1502,7 +1502,8 @@ mod tests {
             .unwrap()
             .nearest("vector", query, 1)
             .unwrap()
-            .nprobes(num_probes)
+            .minimum_nprobes(num_probes)
+            .maximum_nprobes(num_probes)
             .refine(1)
             .try_into_batch()
             .await
@@ -2541,7 +2542,8 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
-            .nprobes(2)
+            .minimum_nprobes(2)
+            .maximum_nprobes(2)
             .refine(1);
         let fanout_plan = fanout_scanner.explain_plan(true).await.unwrap();
         assert!(
@@ -2563,7 +2565,8 @@ mod tests {
                 .unwrap()
                 .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 1)
                 .unwrap()
-                .nprobes(2)
+                .minimum_nprobes(2)
+                .maximum_nprobes(2)
                 .refine(1)
                 .with_index_segments(vec![segment.uuid])
                 .unwrap();
@@ -2867,7 +2870,8 @@ mod tests {
             .unwrap()
             .nearest("vector", &query, 5)
             .unwrap()
-            .nprobes(1)
+            .minimum_nprobes(1)
+            .maximum_nprobes(1)
             .try_into_batch()
             .await
             .unwrap();
