@@ -723,8 +723,8 @@ impl JsonIndexPlugin {
                     if is_null(i) {
                         builder.append_null();
                     } else {
-                        let raw_jsonb = jsonb::RawJsonb::new(binary_array.value(i));
-                        let value = jsonb::from_raw_jsonb::<bool>(&raw_jsonb).map_err(|error| {
+                        let raw_jsonb = lance_jsonb::RawJsonb::new(binary_array.value(i));
+                        let value = lance_jsonb::from_raw_jsonb::<bool>(&raw_jsonb).map_err(|error| {
                             Error::invalid_input_source(
                                 format!(
                                     "Failed to convert JSON path '{path}' at batch row {i} to Boolean: {error}"
@@ -744,8 +744,8 @@ impl JsonIndexPlugin {
                     if is_null(i) {
                         builder.append_null();
                     } else {
-                        let raw_jsonb = jsonb::RawJsonb::new(binary_array.value(i));
-                        let value = jsonb::from_raw_jsonb::<i64>(&raw_jsonb).map_err(|error| {
+                        let raw_jsonb = lance_jsonb::RawJsonb::new(binary_array.value(i));
+                        let value = lance_jsonb::from_raw_jsonb::<i64>(&raw_jsonb).map_err(|error| {
                             Error::invalid_input_source(
                                 format!(
                                     "Failed to convert JSON path '{path}' at batch row {i} to Int64: {error}"
@@ -765,8 +765,8 @@ impl JsonIndexPlugin {
                     if is_null(i) {
                         builder.append_null();
                     } else {
-                        let raw_jsonb = jsonb::RawJsonb::new(binary_array.value(i));
-                        let value = jsonb::from_raw_jsonb::<f64>(&raw_jsonb).map_err(|error| {
+                        let raw_jsonb = lance_jsonb::RawJsonb::new(binary_array.value(i));
+                        let value = lance_jsonb::from_raw_jsonb::<f64>(&raw_jsonb).map_err(|error| {
                             Error::invalid_input_source(
                                 format!(
                                     "Failed to convert JSON path '{path}' at batch row {i} to Float64: {error}"
@@ -786,9 +786,9 @@ impl JsonIndexPlugin {
                     if is_null(i) {
                         builder.append_null();
                     } else {
-                        let raw_jsonb = jsonb::RawJsonb::new(binary_array.value(i));
+                        let raw_jsonb = lance_jsonb::RawJsonb::new(binary_array.value(i));
                         let value =
-                            jsonb::from_raw_jsonb::<String>(&raw_jsonb).map_err(|error| {
+                            lance_jsonb::from_raw_jsonb::<String>(&raw_jsonb).map_err(|error| {
                                 Error::invalid_input_source(
                                     format!(
                                         "Failed to convert JSON path '{path}' at batch row {i} to Utf8: {error}"
@@ -1113,7 +1113,7 @@ mod tests {
         // Convert JSON strings to JSONB binary format
         let mut jsonb_values = Vec::new();
         for json_str in &json_data {
-            let owned_jsonb: jsonb::OwnedJsonb = json_str.parse().unwrap();
+            let owned_jsonb: lance_jsonb::OwnedJsonb = json_str.parse().unwrap();
             jsonb_values.push(Some(owned_jsonb.to_vec()));
         }
 
@@ -1159,17 +1159,17 @@ mod tests {
             vec![
                 Arc::new(LargeBinaryArray::from(vec![
                     json_data[0]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
                     json_data[1]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
                     json_data[2]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
@@ -1198,17 +1198,17 @@ mod tests {
             vec![
                 Arc::new(LargeBinaryArray::from(vec![
                     json_data[0]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
                     json_data[1]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
                     json_data[2]
-                        .parse::<jsonb::OwnedJsonb>()
+                        .parse::<lance_jsonb::OwnedJsonb>()
                         .ok()
                         .map(|j| j.to_vec())
                         .as_deref(),
@@ -1262,7 +1262,7 @@ mod tests {
 
         let jsonb: Vec<Vec<u8>> = json_docs
             .iter()
-            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .map(|s| s.parse::<lance_jsonb::OwnedJsonb>().unwrap().to_vec())
             .collect();
 
         let mut fields = Vec::with_capacity(3);
@@ -1325,7 +1325,7 @@ mod tests {
 
         let jsonb = json_docs
             .iter()
-            .map(|json| json.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .map(|json| json.parse::<lance_jsonb::OwnedJsonb>().unwrap().to_vec())
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),

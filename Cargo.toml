@@ -11,6 +11,7 @@ members = [
     "rust/lance-index",
     "rust/lance-index-core",
     "rust/lance-io",
+    "rust/lance-jsonb",
     "rust/lance-linalg",
     "rust/lance-namespace",
     "rust/lance-namespace-impls",
@@ -70,6 +71,7 @@ lance-geo = { version = "=13.0.0-beta.12", path = "./rust/lance-geo" }
 lance-index = { version = "=13.0.0-beta.12", path = "./rust/lance-index" }
 lance-index-core = { version = "=13.0.0-beta.12", path = "./rust/lance-index-core" }
 lance-io = { version = "=13.0.0-beta.12", path = "./rust/lance-io", default-features = false }
+lance-jsonb = { version = "=13.0.0-beta.12", path = "./rust/lance-jsonb" }
 lance-linalg = { version = "=13.0.0-beta.12", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=13.0.0-beta.12", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=13.0.0-beta.12", path = "./rust/lance-namespace-impls" }
@@ -166,7 +168,6 @@ icu_segmenter = { version = "2.2", default-features = false, features = ["compil
 io-uring = "0.7"
 itertools = "0.14"
 jieba-rs = { version = "0.10.0", default-features = false }
-jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
 metrics = { version = "0.24" }

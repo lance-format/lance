@@ -3488,6 +3488,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "goldenfile"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "206600f27ef687e85a572315eb297c79f66620b2b3eeb3a6cde17f25e049ae5b"
+dependencies = [
+ "scopeguard",
+ "similar-asserts",
+ "static_assertions",
+ "tempfile",
+ "yansi",
+]
+
+[[package]]
 name = "goosefs-sdk"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4412,23 +4425,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonb"
-version = "0.5.6"
+name = "json-five"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb98fb29636087c40ad0d1274d9a30c0c1e83e03ae93f6e7e89247b37fcc6953"
+checksum = "865f2d01a4549c1fd8c60640c03ae5249eb374cd8cde8b905628d4b1af95c87c"
 dependencies = [
- "byteorder",
- "ethnum",
- "fast-float2",
- "itoa",
- "jiff",
- "nom 8.0.0",
- "num-traits",
- "ordered-float 5.3.0",
- "rand 0.9.5",
  "serde",
- "serde_json",
- "zmij",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -4576,7 +4579,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "half",
- "jsonb",
+ "lance-jsonb",
  "num-traits",
  "rand 0.9.5",
 ]
@@ -4680,11 +4683,11 @@ dependencies = [
  "datafusion-substrait",
  "futures",
  "half",
- "jsonb",
  "lance-arrow",
  "lance-core",
  "lance-datagen",
  "lance-geo",
+ "lance-jsonb",
  "log",
  "pin-project",
  "prost",
@@ -4887,7 +4890,6 @@ dependencies = [
  "hex",
  "itertools 0.14.0",
  "jieba-rs",
- "jsonb",
  "lance-arrow",
  "lance-arrow-stats",
  "lance-bitpacking",
@@ -4899,6 +4901,7 @@ dependencies = [
  "lance-geo",
  "lance-index-core",
  "lance-io",
+ "lance-jsonb",
  "lance-linalg",
  "lance-select",
  "lance-table",
@@ -5005,6 +5008,26 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "lance-jsonb"
+version = "13.0.0-beta.12"
+dependencies = [
+ "byteorder",
+ "ethnum",
+ "fast-float2",
+ "goldenfile",
+ "itoa",
+ "jiff",
+ "json-five",
+ "nom 8.0.0",
+ "num-traits",
+ "ordered-float 5.3.0",
+ "proptest",
+ "serde",
+ "serde_json",
+ "zmij",
 ]
 
 [[package]]
@@ -8530,6 +8553,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+dependencies = [
+ "bstr",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "similar-asserts"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5b441962c817e33508847a22bd82f03a30cff43642dc2fae8b050566121eb9a"
+dependencies = [
+ "console",
+ "similar",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9593,6 +9636,12 @@ name = "unicode-blocks"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b12e05d9e06373163a9bb6bb8c263c261b396643a99445fe6b9811fd376581b"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"
