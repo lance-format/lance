@@ -377,7 +377,7 @@ impl TryFrom<pb::AddIndexSegment> for AddIndexSegment {
 mod tests {
     use super::*;
     use crate::transaction::action::test_support::{
-        added_field, apply_with_indices, backed_manifest,
+        added_field, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
         Action, AddField, AddFragment, AlterField, CompositeOperation, DropField, Footprint,
@@ -755,14 +755,11 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let rewrite = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step",
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(0)],
-                data_change: true,
-            })],
-        )]));
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![Ref::Committed(0)],
+            data_change: true,
+        })]);
 
         assert!(
             build.conflicts_with(&rewrite),
@@ -784,14 +781,11 @@ mod tests {
         segment.covering_fields = vec![Ref::Committed(1)];
         let build = index_footprint(segment);
 
-        let rewrite = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step",
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(1)],
-                data_change: true,
-            })],
-        )]));
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![Ref::Committed(1)],
+            data_change: true,
+        })]);
 
         assert!(build.conflicts_with(&rewrite));
     }
@@ -804,15 +798,12 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_cast_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let cast = Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step",
-            vec![Action::AlterField(AlterField {
-                field: Ref::Committed(0),
-                name: None,
-                logical_type: Some("int64".into()),
-                nullable: None,
-            })],
-        )]));
+        let cast = footprint(vec![Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: None,
+            logical_type: Some("int64".into()),
+            nullable: None,
+        })]);
 
         assert!(build.conflicts_with(&cast));
         assert!(!cast.conflicts_with(&build));
@@ -830,13 +821,10 @@ mod tests {
     fn test_a_build_loses_to_a_committed_removal_of_a_covered_fragment() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let removal = |fragment: u64| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-                "step",
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(fragment),
-                    data_change: false,
-                })],
-            )]))
+            footprint(vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(fragment),
+                data_change: false,
+            })])
         };
 
         assert!(build.conflicts_with(&removal(0)));
@@ -845,10 +833,7 @@ mod tests {
     }
 
     fn index_footprint(action: AddIndexSegment) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step",
-            vec![Action::AddIndexSegment(action)],
-        )]))
+        footprint(vec![Action::AddIndexSegment(action)])
     }
 
     fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegment {

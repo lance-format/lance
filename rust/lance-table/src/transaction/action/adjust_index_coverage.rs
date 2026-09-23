@@ -176,11 +176,10 @@ impl TryFrom<pb::AdjustIndexCoverage> for AdjustIndexCoverage {
 mod tests {
     use super::*;
     use crate::format::IndexMetadata;
-    use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
-    use crate::transaction::action::{
-        Action, AddFragment, AddIndexSegment, CompositeOperation, Footprint, RemoveFragment,
-        UserAction,
+    use crate::transaction::action::test_support::{
+        apply_with_indices, backed_manifest, footprint,
     };
+    use crate::transaction::action::{Action, AddFragment, AddIndexSegment, RemoveFragment};
     use crate::transaction::test_support::sample_index_metadata;
 
     fn covering(name: &str, fragments: impl IntoIterator<Item = u32>) -> IndexMetadata {
@@ -311,12 +310,6 @@ mod tests {
             error.to_string().contains("records no fragment coverage"),
             "unexpected error: {error}"
         );
-    }
-
-    fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step", actions,
-        )]))
     }
 
     fn build(name: &str, fragment: u64) -> Action {
