@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
 use std::{
     any::Any,
@@ -2423,7 +2424,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // (part_id, path)
@@ -2443,7 +2444,7 @@ impl ScalarIndex for BTreeIndex {
                 vec![(None, BTREE_PAGES_NAME)]
             };
 
-        let mapping = Arc::new(mapping.clone());
+        let mapping = mapping.clone();
         let train_schema = Arc::new(self.train_schema());
         let mut remapped_files = Vec::new();
 
@@ -2465,14 +2466,17 @@ impl ScalarIndex for BTreeIndex {
             .map_ok(|(_, batch)| batch)
             .map_err(DataFusionError::from)
             .and_then(move |batch| {
-                // Remap the batch and then convert from the serialized schema to the training input schema
-                let remapped =
-                    FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
-                let with_train_schema = remapped.and_then(|batch| {
-                    RecordBatch::try_new(train_schema.clone(), batch.columns().to_vec())
+                let mapping = mapping.clone();
+                let train_schema = train_schema.clone();
+                async move {
+                    // Translate one page's addresses, then convert from the
+                    // serialized schema to the training input schema.
+                    let remapped = FlatIndex::remap_batch_with(batch, &mapping)
+                        .await
+                        .map_err(DataFusionError::from)?;
+                    RecordBatch::try_new(train_schema, remapped.columns().to_vec())
                         .map_err(DataFusionError::from)
-                });
-                std::future::ready(with_train_schema)
+                }
             });
 
             let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -3536,6 +3540,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_index_core::remapping::RowAddrTranslator;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, ops::Bound, sync::Arc};
 
@@ -3687,7 +3692,10 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         index
-            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
+            .remap(
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                remap_store.as_ref(),
+            )
             .await
             .unwrap();
 
@@ -5245,7 +5253,10 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         ranged_index
-            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
+            .remap(
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                remap_store.as_ref(),
+            )
             .await
             .unwrap();
 
@@ -5574,7 +5585,10 @@ mod tests {
 
         // Remap the index with our deletion mapping
         index
-            .remap(&RowAddrRemap::direct(mapping), remap_store.as_ref())
+            .remap(
+                &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
+                remap_store.as_ref(),
+            )
             .await
             .unwrap();
 

@@ -49,7 +49,6 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
@@ -68,6 +67,7 @@ use lance_file::{
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
+use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
@@ -1545,7 +1545,7 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrTranslator) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -2020,7 +2020,7 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
@@ -2099,7 +2099,7 @@ pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
     new_uuid: &Uuid,
     index: Arc<dyn VectorIndex>,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     column: String,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
@@ -2222,7 +2222,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &Uuid,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -5045,6 +5045,7 @@ async fn train_ivf_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
 
     use std::collections::HashSet;
     use std::iter::repeat_n;
@@ -5842,7 +5843,7 @@ mod tests {
             &new_uuid,
             dataset_mut.version().version,
             ivf_index,
-            &RowAddrRemap::direct(mapping),
+            &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],

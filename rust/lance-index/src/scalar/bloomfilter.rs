@@ -21,7 +21,7 @@ use futures::TryStreamExt;
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
@@ -552,7 +552,7 @@ impl ScalarIndex for BloomFilterIndex {
 
     async fn remap(
         &self,
-        _mapping: &RowAddrRemap,
+        _mapping: &RowAddrTranslator,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(

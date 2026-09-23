@@ -10,12 +10,14 @@ use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
     decode_frag_reuse_ledger, load_frag_reuse_index_details, open_frag_reuse_index,
 };
+use crate::index::frag_reuse_reader::{CachedMapping, open_mapping};
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
+use lance_index::scalar::{BatchRowIdRemapper, RowAddrTranslator};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
@@ -309,8 +311,12 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result =
-        index::remap_index(dataset, index_id, frag_reuse_index.row_addr_remap()).await?;
+    let remap_result = index::remap_index(
+        dataset,
+        index_id,
+        &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
+    )
+    .await?;
 
     // Remapping advances the index watermark for fragment-reuse cleanup, but it
     // does not incorporate overlays committed after the source index was built.
@@ -402,11 +408,9 @@ enum PlannedHop {
     /// `enter_fragments` is the subset of that transition's SOURCE fragments
     /// the segment's addresses actually occupy when they reach this hop
     /// (its provenance pushed forward through the preceding hops, intersected
-    /// with the transition's sources). Materializing the row map over only
-    /// these fragments -- rather than every source of the transition -- keeps
-    /// the map O(segment rows), not O(table rows): a segment covering a
-    /// quarter of a full-table partition builds a quarter-size map, and the
-    /// reader only ever looks up the addresses this segment stores anyway.
+    /// with the transition's sources). It is the hop's source filter when
+    /// batches are translated: only addresses in these fragments enter the
+    /// row map, everything else passes through.
     StablePartition {
         position: usize,
         enter_fragments: RoaringBitmap,
@@ -542,111 +546,122 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
     }
 }
 
-/// Compose the planned hops into one queryable remap, in chain order.
-/// Compaction hops are ready-made; each stable-partition hop is materialized
-/// by translating every source address through the transition's row map.
-/// Memory is O(source rows) per stable-partition hop (~16 bytes a row);
-/// streaming the composition instead is future work if this path graduates
-/// from exploration.
+/// One hop of a planned tagged remap, applied to a batch of addresses.
+enum HopStep {
+    /// A compaction's compact remap: an address it does not cover passes
+    /// through unchanged.
+    Compaction(Arc<RowAddrRemap>),
+    /// A stable-partition hop. Only addresses in `sources` (the fragments
+    /// the segment's rows occupy when they reach this hop) enter the row
+    /// map, which is opened through the reader's chunk cache; every other
+    /// address passes through unchanged.
+    StablePartition {
+        sources: RoaringBitmap,
+        mapping: Arc<CachedMapping>,
+    },
+}
+
+/// The planned hops of one segment, applied to each batch of addresses in
+/// ledger order. Nothing is materialized up front: a batch is pushed through
+/// the hops one hop at a time, so memory is the batch itself plus what the
+/// stable-partition reader holds (one decoded block per request and the
+/// shared chunk cache), never a map sized to the source rows.
+///
+/// Per batch and per hop: an address whose fragment the hop does not consume
+/// passes through unchanged; a row a hop deletes becomes `None` and stays
+/// `None`; input order and duplicates are preserved one to one. Hops are
+/// applied strictly in ledger order, so a compaction after a stable
+/// partition sees the partition's output and is never hoisted ahead of it.
+///
+/// The per-hop source filter is also what makes a second translation of an
+/// already-translated address impossible: a destination address is never a
+/// source of the hop that produced it, so a bitmap-family segment whose rows
+/// were already translated at load (`V1Translate`) passes through every hop
+/// unchanged.
+struct PlannedHopRemapper {
+    steps: Vec<HopStep>,
+}
+
+impl std::fmt::Debug for PlannedHopRemapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedHopRemapper")
+            .field("hops", &self.steps.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl BatchRowIdRemapper for PlannedHopRemapper {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        let mut current: Vec<Option<u64>> = row_ids.iter().copied().map(Some).collect();
+        for step in &self.steps {
+            match step {
+                HopStep::Compaction(remap) => {
+                    for slot in current.iter_mut() {
+                        if let Some(addr) = *slot {
+                            *slot = remap.get(addr).unwrap_or(Some(addr));
+                        }
+                    }
+                }
+                HopStep::StablePartition { sources, mapping } => {
+                    let positions: Vec<usize> = current
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, slot)| {
+                            slot.is_some_and(|addr| {
+                                sources.contains(RowAddress::from(addr).fragment_id())
+                            })
+                        })
+                        .map(|(position, _)| position)
+                        .collect();
+                    if positions.is_empty() {
+                        continue;
+                    }
+                    let addrs: Vec<u64> = positions
+                        .iter()
+                        .map(|&position| current[position].expect("filtered to Some"))
+                        .collect();
+                    let translated = mapping.remap_row_ids(&addrs).await?;
+                    if translated.len() != addrs.len() {
+                        return Err(Error::internal(
+                            "stable-partition mapping changed the translation batch length",
+                        ));
+                    }
+                    for (position, address) in positions.into_iter().zip(translated) {
+                        current[position] = address;
+                    }
+                }
+            }
+        }
+        Ok(current)
+    }
+}
+
+/// Bind the planned hops to their readers: a compaction hop carries its
+/// compact remap, a stable-partition hop opens the transition's row map
+/// through the reader's chunk cache. Nothing is translated here; the index
+/// rewrite pulls batches through the returned translator.
 async fn materialize_hops(
     dataset: &Dataset,
     ledger: &FragReuseLedger,
     hops: Vec<PlannedHop>,
-) -> Result<RowAddrRemap> {
-    let mut remaps = Vec::with_capacity(hops.len());
+) -> Result<RowAddrTranslator> {
+    let mut steps = Vec::with_capacity(hops.len());
     for hop in hops {
-        remaps.push(match hop {
-            PlannedHop::Compaction(remap) => remap,
+        steps.push(match hop {
+            PlannedHop::Compaction(remap) => HopStep::Compaction(Arc::new(remap)),
             PlannedHop::StablePartition {
                 position,
                 enter_fragments,
-            } => {
-                materialize_stable_partition(
-                    dataset,
-                    &ledger.transitions()[position],
-                    &enter_fragments,
-                )
-                .await?
-            }
+            } => HopStep::StablePartition {
+                sources: enter_fragments,
+                mapping: open_mapping(dataset, &ledger.transitions()[position]).await?,
+            },
         });
     }
-    Ok(RowAddrRemap::chained(remaps))
-}
-
-/// Materialize one stable-partition transition as a materialized
-/// source-address → destination-address map by sweeping the source addresses
-/// (fragment id + `0..physical_rows`) the remapped segment actually stores
-/// through the transition's row map.
-///
-/// `enter_fragments` bounds the enumeration to the SOURCE fragments the
-/// segment's addresses occupy when they reach this hop, so the resulting map
-/// is O(segment rows), not O(table rows). This is exactly the set the reader
-/// would ever look up: `index::remap_index` streams only the segment's own
-/// stored addresses through the returned map, and any address outside these
-/// fragments is not one the segment stores. (A fragment listed in
-/// `enter_fragments` that is not a source of this transition contributes
-/// nothing: its addresses would remain unaffected by the map, matching the
-/// tri-state `None` a full-table map returns for them.)
-async fn materialize_stable_partition(
-    dataset: &Dataset,
-    transition: &lance_table::system_index::frag_reuse::ledger::Transition,
-    enter_fragments: &RoaringBitmap,
-) -> Result<RowAddrRemap> {
-    use lance_core::utils::fragment_reuse::MappingReader;
-    use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
-    use lance_index::scalar::lance_format::LanceIndexStore;
-
-    let Mapping::StablePartition(reference) = transition.mapping() else {
-        return Err(Error::internal(
-            "a planned stable-partition hop does not reference a stable partition".to_string(),
-        ));
-    };
-    // Open the row map exactly as the reader does (base-aware); the same
-    // construction as `validate_folded_deletions`.
-    let base = match reference.base_id {
-        None => dataset.base.clone(),
-        Some(id) => dataset
-            .manifest
-            .base_paths
-            .get(&id)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "mapping {} references missing base {id}",
-                    reference.map_id
-                ))
-            })?
-            .extract_path(dataset.session.store_registry())?,
-    };
-    let directory = base.join("_fri").join(reference.map_id.as_str());
-    let store = dataset.object_store(reference.base_id).await?;
-    let metadata_cache = dataset.metadata_cache.file_metadata_cache(&directory);
-    let store = LanceIndexStore::new(store, directory, Arc::new(metadata_cache)).with_file_sizes(
-        HashMap::from([(MAPPING_FILE.to_string(), reference.map_size_bytes)]),
-    );
-    let mapping = StablePartitionMapping::try_new(
-        Arc::new(store),
-        transition.sources().to_vec(),
-        transition.destinations().to_vec(),
-    )?;
-    /// Addresses translated per request, bounding the row-map label blocks
-    /// in flight (the result map is O(source rows) regardless).
-    const BATCH_ROWS: usize = 64 * 1024;
-    let addrs: Vec<u64> = transition
-        .sources()
-        .iter()
-        .filter(|digest| enter_fragments.contains(digest.id as u32))
-        .flat_map(|digest| {
-            let fragment = digest.id as u32;
-            (0..digest.physical_rows as u32)
-                .map(move |offset| RowAddress::new_from_parts(fragment, offset).into())
-        })
-        .collect();
-    let mut map = HashMap::with_capacity(addrs.len());
-    for chunk in addrs.chunks(BATCH_ROWS) {
-        let translated = mapping.remap_row_ids(chunk).await?;
-        map.extend(chunk.iter().copied().zip(translated));
-    }
-    Ok(RowAddrRemap::direct(map))
+    Ok(RowAddrTranslator::Batch(Arc::new(PlannedHopRemapper {
+        steps,
+    })))
 }
 
 /// Remap one segment of a user index through a tagged history's
@@ -709,7 +724,12 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             return Ok(());
         }
         TaggedRemapPlan::Remap { hops, coverage } => {
-            (materialize_hops(dataset, &ledger, hops).await?, coverage)
+            let translator = if hops.is_empty() {
+                None
+            } else {
+                Some(materialize_hops(dataset, &ledger, hops).await?)
+            };
+            (translator, coverage)
         }
     };
 
@@ -717,9 +737,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     // the index files stay as they are and only the swapped bitmap (plus the
     // advanced dataset_version) is committed. This also avoids opening the
     // index, which the query planner may refuse for a straddled segment.
-    let remap_result = if remap.is_empty() {
-        RemapResult::Keep(*index_id)
-    } else {
+    let remap_result = if let Some(translator) = remap {
         // The rewrite streams the segment through the reader's loading path,
         // and for index types that materialize their state at load (e.g.
         // bitmap) that path applies direct-coverage-wins: rows whose
@@ -741,7 +759,9 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         {
             coverage &= servable;
         }
-        index::remap_index(dataset, index_id, &remap).await?
+        index::remap_index(dataset, index_id, &translator).await?
+    } else {
+        RemapResult::Keep(*index_id)
     };
 
     // Overlays committed after the source index was built are not
@@ -762,7 +782,20 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     }
 
     let new_index_meta = match remap_result {
-        RemapResult::Drop => return Ok(()),
+        // The index type cannot be remapped (or the segment is otherwise
+        // withdrawn by `remap_index`). On a tagged table that is not a drop:
+        // the segment is kept as it is and queries keep translating through
+        // the reuse index, exactly like a blocked hop.
+        RemapResult::Drop => {
+            log::info!(
+                "Skipping remap of index {} ({}): its index type cannot be remapped. \
+                 Queries keep translating through the reuse index; rebuild the index \
+                 to catch it up",
+                curr_index_meta.name,
+                curr_index_meta.uuid
+            );
+            return Ok(());
+        }
         RemapResult::Keep(new_id) => IndexMetadata {
             uuid: new_id,
             name: curr_index_meta.name.clone(),
@@ -1210,6 +1243,136 @@ mod tests {
 
     /// A/C-rows end to end: eligibility, clean skips, and the remap-then-trim
     /// pipeline on a real tagged table.
+    mod planned_hop_remapper {
+        use super::*;
+        use crate::index::frag_reuse_reader::CachedMapping;
+        use lance_core::deepsize::{Context, DeepSizeOf};
+        use lance_core::utils::fragment_reuse::MappingReader;
+        use lance_index::scalar::{BatchRowIdRemapper, RowAddrTranslator};
+        use std::sync::Mutex;
+
+        /// A row map over an explicit table; an address outside it is an
+        /// error, exactly like the real stable-partition reader.
+        #[derive(Debug)]
+        struct TableMapping {
+            table: HashMap<u64, Option<u64>>,
+            batches: Mutex<Vec<usize>>,
+        }
+
+        impl DeepSizeOf for TableMapping {
+            fn deep_size_of_children(&self, _: &mut Context) -> usize {
+                0
+            }
+        }
+
+        #[async_trait]
+        impl MappingReader for TableMapping {
+            async fn remap_row_id(&self, row_id: u64) -> Result<Option<u64>> {
+                self.table.get(&row_id).copied().ok_or_else(|| {
+                    Error::invalid_input(format!("address {row_id} is outside the mapping"))
+                })
+            }
+
+            async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+                self.batches.lock().unwrap().push(row_ids.len());
+                let mut mapped = Vec::with_capacity(row_ids.len());
+                for &row_id in row_ids {
+                    mapped.push(self.remap_row_id(row_id).await?);
+                }
+                Ok(mapped)
+            }
+        }
+
+        fn addr(fragment: u32, offset: u32) -> u64 {
+            RowAddress::new_from_parts(fragment, offset).into()
+        }
+
+        fn table(entries: impl IntoIterator<Item = (u64, Option<u64>)>) -> Arc<TableMapping> {
+            Arc::new(TableMapping {
+                table: entries.into_iter().collect(),
+                batches: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn partition_hop(sources: &[u32], mapping: &Arc<TableMapping>) -> HopStep {
+            HopStep::StablePartition {
+                sources: sources.iter().copied().collect(),
+                mapping: CachedMapping::uncached(mapping.clone()),
+            }
+        }
+
+        /// C -> SP -> C -> SP: hops apply in ledger order per batch (a
+        /// compaction after the partition sees the partition's output),
+        /// addresses outside a hop's sources pass through, deleted rows stay
+        /// deleted, and input order and duplicates survive one to one.
+        #[tokio::test]
+        async fn hops_apply_in_ledger_order_per_batch() {
+            // C1: F0 -> F2, row order kept.
+            let c1 = RowAddrRemap::direct((0..4).map(|i| (addr(0, i), Some(addr(2, i)))).collect());
+            // SP1 over F2: even rows compact into F4, odd rows are deleted.
+            let sp1 = table((0..4).map(|i| (addr(2, i), (i % 2 == 0).then(|| addr(4, i / 2)))));
+            // C2: F4 -> F6, meaningful only on SP1's output.
+            let c2 = RowAddrRemap::direct((0..2).map(|j| (addr(4, j), Some(addr(6, j)))).collect());
+            // SP2 over F6: shifts every row by one into F8.
+            let sp2 = table((0..2).map(|j| (addr(6, j), Some(addr(8, j + 1)))));
+            let remapper = PlannedHopRemapper {
+                steps: vec![
+                    HopStep::Compaction(Arc::new(c1)),
+                    partition_hop(&[2], &sp1),
+                    HopStep::Compaction(Arc::new(c2)),
+                    partition_hop(&[6], &sp2),
+                ],
+            };
+            let input = vec![addr(0, 0), addr(0, 1), addr(9, 5), addr(0, 0), addr(0, 2)];
+            let output = remapper.remap_row_ids(&input).await.unwrap();
+            assert_eq!(
+                output,
+                vec![
+                    Some(addr(8, 1)),
+                    None,
+                    Some(addr(9, 5)),
+                    Some(addr(8, 1)),
+                    Some(addr(8, 2)),
+                ]
+            );
+            // Each partition hop saw exactly the addresses in its sources (the
+            // untouched F9 address never reached either), in one batch.
+            assert_eq!(sp1.batches.lock().unwrap().as_slice(), &[4]);
+            assert_eq!(sp2.batches.lock().unwrap().as_slice(), &[3]);
+        }
+
+        /// Driven through the translator, a large request reaches the hops in
+        /// batches of at most 64K addresses, and `resolve` builds a map of
+        /// exactly one unit of work: nothing sized to the source rows exists.
+        #[tokio::test]
+        async fn translator_bounds_batches_and_resolves_one_unit() {
+            const ROWS: u32 = 150_000;
+            let sp = table((0..ROWS).map(|i| (addr(1, i), Some(addr(3, i)))));
+            let translator = RowAddrTranslator::Batch(Arc::new(PlannedHopRemapper {
+                steps: vec![partition_hop(&[1], &sp)],
+            }));
+            assert!(!translator.is_empty());
+            let input: Vec<u64> = (0..ROWS).map(|i| addr(1, i)).collect();
+            let output = translator.remap_row_addrs(&input).await.unwrap();
+            assert_eq!(output.len(), ROWS as usize);
+            assert!(
+                output
+                    .iter()
+                    .enumerate()
+                    .all(|(i, out)| *out == Some(addr(3, i as u32)))
+            );
+            let batches = sp.batches.lock().unwrap().clone();
+            assert_eq!(batches.iter().sum::<usize>(), ROWS as usize);
+            assert!(batches.iter().all(|&len| len <= 64 * 1024), "{batches:?}");
+            assert!(batches.len() >= 3, "{batches:?}");
+
+            let page: Vec<u64> = (10..20).map(|i| addr(1, i)).collect();
+            let resolved = translator.resolve(page.iter().copied()).await.unwrap();
+            assert_eq!(resolved.get(addr(1, 15)), Some(Some(addr(3, 15))));
+            assert_eq!(resolved.get(addr(1, 25)), None, "not part of the unit");
+        }
+    }
+
     mod tagged_remap_integration {
         use super::*;
         use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
@@ -1591,6 +1754,73 @@ mod tests {
             assert_eq!(
                 sorted_values(&dataset, Some("i < 4")).await,
                 (0..4).collect::<Vec<_>>()
+            );
+        }
+
+        /// The bitmap family translates its rows at load and again through
+        /// the write-side hops; the per-hop source filter makes the second
+        /// pass a no-op, so the streamed remap over a stable partition ends
+        /// with exactly the rows a scan sees.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn fully_covered_stable_partition_remaps_bitmap_index() {
+            let dataset = reader_tests::fixture_with_index(IndexType::Bitmap).await;
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+            let before = stored_index(&dataset, "i_idx").await;
+            let all_values: Vec<i32> = (0..16).collect();
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after.uuid, before.uuid);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10u32, 11])
+            );
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            for value in 0..8 {
+                assert_eq!(
+                    sorted_values(&dataset, Some(&format!("i = {value}"))).await,
+                    vec![value]
+                );
+            }
+            let plan = dataset
+                .scan()
+                .filter("i = 5")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        }
+
+        /// A segment whose index type cannot be remapped is kept as it is on
+        /// a tagged table (queries keep translating through the reuse index),
+        /// never dropped the way the compaction path withdraws it.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn non_remappable_segment_is_kept_on_tagged_table() {
+            let dataset = reader_tests::fixture_with_index(IndexType::ZoneMap).await;
+            let mut dataset = append_two_fragments(dataset).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+            let before = stored_index(&dataset, "i_idx").await;
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version, "nothing to commit");
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(after.uuid, before.uuid);
+            assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+            assert_eq!(sorted_values(&dataset, Some("i = 5")).await, vec![5]);
+            assert_eq!(
+                sorted_values(&dataset, None).await,
+                (0..16).collect::<Vec<_>>()
             );
         }
 

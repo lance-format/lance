@@ -1250,7 +1250,7 @@ impl ScalarIndex for MinHashLshIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let files = MinHashLshIndexBuilder::try_new(self.params.clone())?

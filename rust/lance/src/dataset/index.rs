@@ -4,6 +4,7 @@
 pub mod frag_reuse;
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -70,7 +71,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &IndexMetadata,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
     }
@@ -84,6 +85,9 @@ impl IndexRemapper for DatasetIndexRemapper {
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
+        // The compaction remap is fully materialized: one shared synchronous
+        // translator serves every index.
+        let mapping = RowAddrTranslator::sync(mapping);
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)

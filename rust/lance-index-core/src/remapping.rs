@@ -8,10 +8,13 @@
 //! entry points that load indices under a mapping whose payload may require
 //! asynchronous reads, awaiting translation once per batch, never once per row.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use async_trait::async_trait;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use roaring::RoaringTreemap;
@@ -47,6 +50,73 @@ pub fn check_batch_remapping_entry() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The address translation an index rewrite applies.
+///
+/// `Sync` is a fully materialized map (a compaction's compact remap, or a
+/// direct map): every lookup is immediate. `Batch` is a translator whose
+/// payload may need reads (a tagged history whose path holds stable-partition
+/// hops). Index rewrites translate the addresses of one unit of work at a
+/// time (a page, a partition, a spill batch) through [`Self::resolve`] or
+/// [`Self::remap_row_addrs`], so a batch translator never has a map sized to
+/// the source rows built for it.
+#[derive(Clone, Debug)]
+pub enum RowAddrTranslator {
+    Sync(Arc<RowAddrRemap>),
+    Batch(Arc<dyn BatchRowIdRemapper>),
+}
+
+impl RowAddrTranslator {
+    /// A synchronous translator over an owned map.
+    pub fn sync(remap: RowAddrRemap) -> Self {
+        Self::Sync(Arc::new(remap))
+    }
+
+    /// Whether the translator is known to move no address at all. A batch
+    /// translator is never known to be empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Sync(remap) => remap.is_empty(),
+            Self::Batch(_) => false,
+        }
+    }
+
+    /// Translate `addrs` in order, one result per input: `None` for a
+    /// deleted row, otherwise the current address (unchanged when the
+    /// translator does not touch it). At most `BATCH_SIZE` addresses are
+    /// handed to a batch translator at a time.
+    pub async fn remap_row_addrs(&self, addrs: &[u64]) -> Result<Vec<Option<u64>>> {
+        match self {
+            Self::Sync(remap) => Ok(addrs
+                .iter()
+                .map(|&addr| remap.get(addr).unwrap_or(Some(addr)))
+                .collect()),
+            Self::Batch(remapper) => remap_row_ids_async(remapper.as_ref(), addrs).await,
+        }
+    }
+
+    /// A synchronous map covering exactly `addrs`, so an existing synchronous
+    /// remap step runs unchanged over one unit of work. `Sync` borrows its
+    /// map; `Batch` translates `addrs` (deduplicated) and builds a map of
+    /// that size, released with the returned value: memory is O(one unit),
+    /// never O(source rows).
+    pub async fn resolve(
+        &self,
+        addrs: impl IntoIterator<Item = u64>,
+    ) -> Result<Cow<'_, RowAddrRemap>> {
+        match self {
+            Self::Sync(remap) => Ok(Cow::Borrowed(remap.as_ref())),
+            Self::Batch(remapper) => {
+                let mut addrs: Vec<u64> = addrs.into_iter().collect();
+                addrs.sort_unstable();
+                addrs.dedup();
+                let translated = remap_row_ids_async(remapper.as_ref(), &addrs).await?;
+                let map: HashMap<u64, Option<u64>> = addrs.into_iter().zip(translated).collect();
+                Ok(Cow::Owned(RowAddrRemap::direct(map)))
+            }
+        }
+    }
 }
 
 /// Translate row IDs in input order, preserving duplicates and deleted positions.

@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use arrow_array::StringArray;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;
@@ -676,7 +677,10 @@ async fn test_remap_rewrites_and_drops_row_ids() {
         (3u64, Some(9u64)),
     ]));
     let (_dest_dir, dest_store) = test_store();
-    let created = index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+    let created = index
+        .remap(&RowAddrTranslator::sync(mapping), dest_store.as_ref())
+        .await
+        .unwrap();
     let remapped = load(&dest_store, &created.index_details, &LanceCache::no_cache()).await;
     assert_eq!(remapped.num_docs(), 3);
     assert_eq!(row_ids(&remapped, &bases[0], 1).await, vec![7]);

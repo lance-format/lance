@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod test {
-    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_index::scalar::RowAddrTranslator;
     use std::{
         any::Any,
         cell::OnceCell,
@@ -149,7 +149,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrTranslator) -> Result<()> {
             Ok(())
         }
 

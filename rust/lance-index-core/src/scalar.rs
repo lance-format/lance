@@ -3,6 +3,7 @@
 
 //! Abstract scalar index traits and types for Lance index plugins
 
+use crate::remapping::RowAddrTranslator;
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -12,7 +13,6 @@ use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -640,10 +640,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    /// Remap the row ids, creating a new remapped version of this index in `dest_store`.
+    ///
+    /// Implementations translate one unit of work at a time (a page, a
+    /// partition, a spill batch) through the translator; they must not
+    /// resolve the whole index into one map.
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
 

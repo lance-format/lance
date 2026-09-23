@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
@@ -920,7 +921,7 @@ impl ScalarIndex for BitmapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let mut writer =
@@ -1750,25 +1751,47 @@ pub(crate) async fn build_index_map(
 /// row per source key.
 pub(crate) async fn remap_index_map(
     index: &BitmapIndex,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     writer: &mut BitmapBatchWriter,
 ) -> Result<()> {
     if !index.null_map.is_empty() {
         let null_key = new_null_array(index.value_type(), 1);
         let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
         writer
-            .emit(null_key, &remap_row_addrs(&index.null_map, mapping)?)
+            .emit(
+                null_key,
+                &remap_row_addrs_with(&index.null_map, mapping).await?,
+            )
             .await?;
     }
 
     for key in index.index_map.keys() {
         let bitmap = index.load_bitmap(key, None).await?;
         writer
-            .emit(key.0.clone(), &remap_row_addrs(&bitmap, mapping)?)
+            .emit(
+                key.0.clone(),
+                &remap_row_addrs_with(&bitmap, mapping).await?,
+            )
             .await?;
     }
 
     Ok(())
+}
+
+/// [`remap_row_addrs`] through a [`RowAddrTranslator`]: a synchronous map
+/// remaps directly; a batch translator translates the posting in bounded
+/// batches (`remap_row_addrs_tree_map_async`) and never resolves it into a
+/// map, so one posting list is the unit of work here.
+pub(crate) async fn remap_row_addrs_with(
+    bitmap: &RowAddrTreeMap,
+    translator: &RowAddrTranslator,
+) -> Result<RowAddrTreeMap> {
+    match translator {
+        RowAddrTranslator::Sync(mapping) => remap_row_addrs(bitmap, mapping),
+        RowAddrTranslator::Batch(remapper) => {
+            remap_row_addrs_tree_map_async(remapper.as_ref(), bitmap).await
+        }
+    }
 }
 
 pub(crate) fn remap_row_addrs(
@@ -3039,7 +3062,10 @@ mod tests {
         assert!(!index.null_map.is_empty()); // Should have null values
 
         // Perform remap
-        index.remap(&remap, test_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrTranslator::sync(remap.clone()), test_store.as_ref())
+            .await
+            .unwrap();
 
         // Reload and check
         let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
@@ -3166,7 +3192,13 @@ mod tests {
         ]));
 
         let (_dest_dir, dest_store) = test_util::index_store();
-        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+        index
+            .remap(
+                &RowAddrTranslator::sync(mapping.clone()),
+                dest_store.as_ref(),
+            )
+            .await
+            .unwrap();
 
         // Read in file order, so this pins the emitted order as well as the
         // contents: the null key first, then keys ascending. The old path wrote

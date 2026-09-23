@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 #[cfg(test)]
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -183,7 +183,7 @@ mod test {
             unimplemented!()
         }
 
-        async fn remap(&mut self, _: &RowAddrRemap) -> Result<()> {
+        async fn remap(&mut self, _: &RowAddrTranslator) -> Result<()> {
             Ok(())
         }
 

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_index_core::remapping::RowAddrTranslator;
 
 #[derive(Debug, Default)]
 pub(in super::super) struct InvertedPrewarmState {
@@ -946,7 +947,7 @@ impl ScalarIndex for InvertedIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let files = self

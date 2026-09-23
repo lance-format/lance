@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -466,8 +466,12 @@ impl VectorIndex for PQIndex {
         }
     }
 
-    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
+    async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
+        // One page's addresses are the unit of translation.
+        let mapping = mapping
+            .resolve(self.row_ids.as_ref().unwrap().values().iter().copied())
+            .await?;
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids

@@ -27,6 +27,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowSetOps;
 use object_store::path::Path;
@@ -546,7 +547,7 @@ impl InvertedIndexBuilder {
 
     pub async fn remap(
         &mut self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
@@ -965,10 +966,12 @@ impl InnerBuilder {
         self.posting_lists = posting_lists;
     }
 
-    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
+        // One partition's documents are the unit of translation.
+        let mapping = mapping.resolve(self.docs.row_ids().iter().copied()).await?;
         // for the docs, we need to remove the rows that are removed from the doc set,
         // and update the row ids of the rows that are updated
-        let removed = self.docs.remap(mapping);
+        let removed = self.docs.remap(&mapping);
 
         // for the posting lists, we need to remap the doc ids:
         // - if the a row is removed, we need to shift the doc ids of the following rows
@@ -1004,7 +1007,8 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
-        self.remap(&RowAddrRemap::direct(mapping)).await
+        self.remap(&RowAddrTranslator::sync(RowAddrRemap::direct(mapping)))
+            .await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -5076,7 +5080,10 @@ mod tests {
         use crate::scalar::ScalarIndex;
         let mapping = HashMap::from([(0u64, Some(50 << 32))]);
         index
-            .remap(&RowAddrRemap::direct(mapping), dest_store.as_ref())
+            .remap(
+                &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
+                dest_store.as_ref(),
+            )
             .await
             .unwrap();
 

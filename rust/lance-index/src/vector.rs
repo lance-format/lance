@@ -4,7 +4,7 @@
 //! Vector Index
 //!
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use crate::scalar::RowAddrTranslator;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -480,7 +480,10 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
+    ///
+    /// Implementations translate their own row ids as one unit of work (a
+    /// page or a partition) through the translator.
+    async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()>;
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

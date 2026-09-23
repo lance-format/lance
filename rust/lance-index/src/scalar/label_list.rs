@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
@@ -46,7 +46,7 @@ use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
     BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
-    new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
+    new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -238,10 +238,10 @@ impl ScalarIndex for LabelListIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs(&self.list_nulls, mapping)?;
+        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
         let mut writer = new_bitmap_batch_writer(
             dest_store,
             BITMAP_LOOKUP_NAME,
@@ -1100,6 +1100,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
     use datafusion_common::ScalarValue;
@@ -1558,7 +1559,13 @@ mod tests {
         );
 
         let (_dest_dir, dest_store) = test_util::index_store();
-        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+        index
+            .remap(
+                &RowAddrTranslator::sync(mapping.clone()),
+                dest_store.as_ref(),
+            )
+            .await
+            .unwrap();
         let after = read_index_contents(dest_store.as_ref()).await;
 
         let remapped = |addrs: &[u64]| -> Vec<u64> {
@@ -2036,7 +2043,13 @@ mod tests {
                 let (_dest_dir, dest_store) = test_util::index_store();
                 let mapping =
                     RowAddrRemap::direct((0..4u64).map(|addr| (addr, Some(addr))).collect());
-                index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+                index
+                    .remap(
+                        &RowAddrTranslator::sync(mapping.clone()),
+                        dest_store.as_ref(),
+                    )
+                    .await
+                    .unwrap();
                 read_index_contents(dest_store.as_ref()).await
             }
             other => panic!("unknown path {other}"),

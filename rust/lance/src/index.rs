@@ -5,7 +5,7 @@
 //!
 
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -1479,34 +1479,51 @@ pub trait IndexBuilder {
     async fn build(&self) -> Result<()>;
 }
 
-fn remap_deletes_all_indexed_rows(
+/// Addresses checked per translation while deciding whether a remap deletes
+/// every indexed row; the check stops at the first surviving row.
+const REMAP_DELETE_CHECK_BATCH: u32 = 64 * 1024;
+
+async fn remap_deletes_all_indexed_rows(
     dataset: &Dataset,
     indexed_fragments: &RoaringBitmap,
-    row_id_map: &RowAddrRemap,
-) -> bool {
-    indexed_fragments.iter().all(|fragment_id| {
+    row_id_map: &RowAddrTranslator,
+) -> Result<bool> {
+    for fragment_id in indexed_fragments.iter() {
         let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
-            return false;
+            return Ok(false);
         };
         let Some(physical_rows) = fragment.metadata().physical_rows else {
             // Legacy fragments may not record their physical row count, so the
             // remap cannot prove that every possible address was deleted.
-            return false;
+            return Ok(false);
         };
-        (0..physical_rows).all(|offset| {
-            let Ok(offset) = u32::try_from(offset) else {
-                return false;
-            };
-            let row_addr = u64::from(RowAddress::new_from_parts(fragment_id, offset));
-            row_id_map.get(row_addr) == Some(None)
-        })
-    })
+        let Ok(physical_rows) = u32::try_from(physical_rows) else {
+            return Ok(false);
+        };
+        for start in (0..physical_rows).step_by(REMAP_DELETE_CHECK_BATCH as usize) {
+            let end = start
+                .saturating_add(REMAP_DELETE_CHECK_BATCH)
+                .min(physical_rows);
+            let addrs: Vec<u64> = (start..end)
+                .map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+                .collect();
+            if row_id_map
+                .remap_row_addrs(&addrs)
+                .await?
+                .iter()
+                .any(|row| row.is_some())
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &RowAddrRemap,
+    row_id_map: &RowAddrTranslator,
 ) -> Result<RemapResult> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
@@ -1551,10 +1568,8 @@ pub(crate) async fn remap_index(
         )));
     }
 
-    if matched
-        .fragment_bitmap
-        .as_ref()
-        .is_some_and(|fragments| remap_deletes_all_indexed_rows(dataset, fragments, row_id_map))
+    if let Some(fragments) = matched.fragment_bitmap.as_ref()
+        && remap_deletes_all_indexed_rows(dataset, fragments, row_id_map).await?
     {
         // If remap deleted all rows, we can just return the same index ID.
         // This can happen if there is a bug where the index is covering empty
@@ -4559,6 +4574,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{future::try_join_all, stream::TryStreamExt};
     use lance_arrow::*;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_datagen::gen_batch;
@@ -7957,9 +7973,13 @@ mod tests {
             RowAddrRemap::direct(first_half),
             RowAddrRemap::direct(second_half),
         ]);
-        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
-            .await
-            .unwrap();
+        let new_uuid = remap_index(
+            &dataset,
+            &index_uuid,
+            &RowAddrTranslator::sync(remap_to_empty.clone()),
+        )
+        .await
+        .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
     }
 
@@ -7990,9 +8010,13 @@ mod tests {
         let remap = RowAddrRemap::direct(HashMap::from([(0u64, None)]));
         assert_eq!(remap.get(1), None);
 
-        let result = remap_index(&dataset, &index_meta.uuid, &remap)
-            .await
-            .unwrap();
+        let result = remap_index(
+            &dataset,
+            &index_meta.uuid,
+            &RowAddrTranslator::sync(remap.clone()),
+        )
+        .await
+        .unwrap();
         assert_ne!(result, RemapResult::Keep(index_meta.uuid));
 
         let complete_remap =
@@ -8000,11 +8024,15 @@ mod tests {
         let mut legacy_dataset = dataset.clone();
         let manifest = Arc::make_mut(&mut legacy_dataset.manifest);
         Arc::make_mut(&mut manifest.fragments)[0].physical_rows = None;
-        assert!(!remap_deletes_all_indexed_rows(
-            &legacy_dataset,
-            index_meta.fragment_bitmap.as_ref().unwrap(),
-            &complete_remap,
-        ));
+        assert!(
+            !remap_deletes_all_indexed_rows(
+                &legacy_dataset,
+                index_meta.fragment_bitmap.as_ref().unwrap(),
+                &RowAddrTranslator::sync(complete_remap.clone()),
+            )
+            .await
+            .unwrap()
+        );
     }
 
     /// The `fields.len() > 1` rejection in `remap_index`, which had no dedicated
@@ -8057,9 +8085,13 @@ mod tests {
             .unwrap();
 
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let error = remap_index(&dataset, &index_uuid, &RowAddrRemap::empty())
-            .await
-            .unwrap_err();
+        let error = remap_index(
+            &dataset,
+            &index_uuid,
+            &RowAddrTranslator::sync(RowAddrRemap::empty()),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -8130,9 +8162,13 @@ mod tests {
 
         // The validation runs first in `remap_index`, ahead of the withdrawal and
         // of every row-map-dependent branch, so an empty remap reaches it.
-        let error = remap_index(&dataset, &index_uuid, &RowAddrRemap::empty())
-            .await
-            .expect_err("malformed covering metadata must not be silently accepted");
+        let error = remap_index(
+            &dataset,
+            &index_uuid,
+            &RowAddrTranslator::sync(RowAddrRemap::empty()),
+        )
+        .await
+        .expect_err("malformed covering metadata must not be silently accepted");
         assert!(
             error.to_string().contains("are not among its fields"),
             "expected the validator's message, got: {error}"
