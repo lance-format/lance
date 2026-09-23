@@ -1149,3 +1149,244 @@ fn test_migration_allocates_from_the_given_mark(
     let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
     assert_eq!(sequences, expected);
 }
+
+/// Columns in legacy aliases, written to a table on data storage version 2.2.
+fn legacy_alias_batch() -> RecordBatch {
+    use arrow_array::{
+        ArrayRef, Decimal256Array, Int16DictionaryArray, LargeBinaryArray, LargeListArray,
+        LargeStringArray, StructArray, types::Int32Type,
+    };
+    use arrow_buffer::i256;
+
+    let st_fields = vec![ArrowField::new("x", DataType::LargeBinary, true)];
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("s", DataType::LargeUtf8, true),
+        ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+        ),
+        ArrowField::new("n", DataType::Decimal256(10, 2), true),
+        ArrowField::new(
+            "l",
+            DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            true,
+        ),
+        ArrowField::new("st", DataType::Struct(st_fields.clone().into()), true),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1, 2])),
+        Arc::new(LargeStringArray::from(vec![Some("a"), None])),
+        Arc::new(Int16DictionaryArray::from_iter([Some("x"), Some("x")])),
+        Arc::new(
+            Decimal256Array::from(vec![Some(i256::from(125)), None])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ),
+        Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+            vec![Some(vec![Some(1)]), None],
+        )),
+        Arc::new(StructArray::new(
+            st_fields.into(),
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                Some(b"b".as_ref()),
+                None,
+            ]))],
+            None,
+        )),
+    ];
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+async fn write_batch(uri: &str, batch: RecordBatch, version: LanceFileVersion) -> Dataset {
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Migrating a legacy table rewrites its schema to canonical names and output
+/// encodings in one metadata-only commit, and reads return exactly what they
+/// returned before.
+#[tokio::test]
+async fn test_migrate_to_semantic_types() {
+    use lance_table::feature_flags::FLAG_SEMANTIC_TYPES;
+    use lance_table::format::pb;
+
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let uri = dir.as_str();
+    let batch = legacy_alias_batch();
+    let mut dataset = write_batch(uri, batch.clone(), LanceFileVersion::V2_2).await;
+    let field_ids = dataset
+        .schema()
+        .fields_pre_order()
+        .map(|field| (field.name.clone(), field.id))
+        .collect::<Vec<_>>();
+    let data_files = dataset.manifest.fragments[0].files.clone();
+
+    dataset.migrate_to_semantic_types().await.unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_SEMANTIC_TYPES,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_SEMANTIC_TYPES,
+        0
+    );
+    // No data file was rewritten.
+    assert_eq!(dataset.manifest.fragments[0].files, data_files);
+    let recorded = pb::Manifest::from(dataset.manifest.as_ref())
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.clone(),
+                field.logical_type.clone(),
+                field
+                    .metadata
+                    .get("lance-schema:output-encoding")
+                    .map(|value| String::from_utf8(value.clone()).unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let entry = |value: &str| Some(value.to_string());
+    assert_eq!(
+        recorded,
+        vec![
+            ("id".to_string(), "int64".to_string(), None),
+            ("s".to_string(), "string".to_string(), entry("large_utf8")),
+            (
+                "d".to_string(),
+                "string".to_string(),
+                entry("dictionary:int16:utf8")
+            ),
+            (
+                "n".to_string(),
+                "decimal:10:2".to_string(),
+                entry("decimal256")
+            ),
+            ("l".to_string(), "list".to_string(), entry("large_list")),
+            ("item".to_string(), "int32".to_string(), None),
+            ("st".to_string(), "struct".to_string(), None),
+            ("x".to_string(), "binary".to_string(), entry("large_binary")),
+        ]
+    );
+
+    let reopened = Dataset::open(uri).await.unwrap();
+    for dataset in [&dataset, &reopened] {
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+        let ids = dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| (field.name.clone(), field.id))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, field_ids);
+    }
+
+    // Appends now accept other layouts of each column's semantic type.
+    let appended = arrow_cast::cast(
+        &arrow_array::StructArray::from(batch.clone()),
+        &DataType::Struct(
+            vec![
+                ArrowField::new("id", DataType::Int64, false),
+                ArrowField::new("s", DataType::Utf8View, true),
+                ArrowField::new("d", DataType::Utf8, true),
+                ArrowField::new("n", DataType::Decimal128(10, 2), true),
+                ArrowField::new(
+                    "l",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+                ArrowField::new(
+                    "st",
+                    DataType::Struct(vec![ArrowField::new("x", DataType::Binary, true)].into()),
+                    true,
+                ),
+            ]
+            .into(),
+        ),
+    )
+    .unwrap();
+    let appended = RecordBatch::from(arrow_array::cast::AsArray::as_struct(&appended));
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+    let scanned = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        scanned,
+        concat_batches(&batch.schema(), &[batch.clone(), batch.clone()]).unwrap()
+    );
+
+    // Migrating again is a no-op, and restoring a version from before the
+    // migration keeps the contract and the read types.
+    let version = dataset.version().version;
+    dataset.migrate_to_semantic_types().await.unwrap();
+    assert_eq!(dataset.version().version, version);
+    let mut first = dataset.checkout_version(1).await.unwrap();
+    first.restore().await.unwrap();
+    assert!(first.manifest.uses_semantic_types());
+    assert_eq!(first.scan().try_into_batch().await.unwrap(), batch);
+}
+
+#[rstest]
+#[case::dictionary_of_integers("dictionary")]
+#[case::output_encoding_entry("lance-schema:output-encoding")]
+#[case::data_file_version_2_0("2.1 or later")]
+#[tokio::test]
+async fn test_migrate_to_semantic_types_rejected(#[case] message: &str) {
+    use arrow_array::{Int8DictionaryArray, StringArray};
+
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let (field, column, version): (ArrowField, Arc<dyn Array>, LanceFileVersion) = match message {
+        "dictionary" => (
+            ArrowField::new(
+                "c",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+                true,
+            ),
+            Arc::new(
+                arrow_cast::cast(
+                    &arrow_array::Int32Array::from(vec![1, 1]),
+                    &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+                )
+                .unwrap(),
+            ),
+            LanceFileVersion::V2_2,
+        ),
+        "lance-schema:output-encoding" => (
+            ArrowField::new("c", DataType::Utf8, true).with_metadata(
+                [(
+                    "lance-schema:output-encoding".to_string(),
+                    "large_utf8".to_string(),
+                )]
+                .into(),
+            ),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            LanceFileVersion::V2_2,
+        ),
+        _ => (
+            ArrowField::new("c", DataType::Utf8, true),
+            Arc::new(Int8DictionaryArray::from_iter(["a", "b"]).values().clone()),
+            LanceFileVersion::V2_0,
+        ),
+    };
+    let batch =
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![column]).unwrap();
+    let mut dataset = write_batch(dir.as_str(), batch, version).await;
+    let err = dataset.migrate_to_semantic_types().await.unwrap_err();
+    assert!(err.to_string().contains(message), "{err}");
+    assert!(!dataset.manifest.uses_semantic_types());
+    assert_eq!(dataset.version().version, 1);
+}

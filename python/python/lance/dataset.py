@@ -5312,6 +5312,31 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def migrate_to_semantic_types(self) -> None:
+        """Migrate this table to the semantic type contract.
+
+        Commits a metadata-only version that rewrites each legacy logical type
+        alias, such as ``large_string``, to its semantic type, such as
+        ``string``, and records the output encoding that keeps the Arrow type
+        reads return. Data files are not rewritten, and reads return the same
+        types, values, and field IDs as before. Afterwards appends accept any
+        Arrow layout of a column's type, for example ``pa.string()``,
+        ``pa.large_string()``, or ``pa.string_view()`` for a string column.
+
+        Older Lance versions can no longer read or write the table, there is no
+        downgrade, and restoring an earlier version keeps the contract. The
+        call is idempotent.
+
+        Raises
+        ------
+        ValueError
+            If a column has no semantic type (a dictionary whose values are not
+            strings or bytes), a field already carries a
+            ``lance-schema:output-encoding`` metadata entry, or the table uses
+            data file version 2.0 or earlier.
+        """
+        self._ds.migrate_to_semantic_types()
+
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
 

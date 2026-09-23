@@ -7620,3 +7620,32 @@ def test_semantic_types_output_encodings(tmp_path: Path):
         ds.to_table(output_encodings={"s": "decimal128"})
     with pytest.raises(ValueError, match="no such field"):
         ds.to_table(output_encodings={"missing": "utf8"})
+
+
+def test_migrate_to_semantic_types(tmp_path: Path):
+    table = pa.table(
+        {
+            "s": pa.array(["a", None], pa.large_string()),
+            "d": pa.array(["x", "x"]).dictionary_encode(),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path / "legacy", data_storage_version="2.2")
+    with pytest.raises(ValueError, match="semantic type contract"):
+        ds.to_table(output_encodings={"s": "utf8"})
+    with pytest.raises(OSError, match="should have type large_string"):
+        lance.write_dataset(
+            pa.table({"s": pa.array(["b"]), "d": pa.array(["y"]).dictionary_encode()}),
+            ds,
+            mode="append",
+        )
+
+    ds.migrate_to_semantic_types()
+    ds.migrate_to_semantic_types()
+    assert ds.to_table() == table
+
+    lance.write_dataset(
+        pa.table({"s": pa.array(["b"]), "d": pa.array(["y"])}), ds, mode="append"
+    )
+    ds = lance.dataset(tmp_path / "legacy")
+    assert ds.to_table().schema == table.schema
+    assert ds.to_table().column("d").to_pylist() == ["x", "x", "y"]
