@@ -1789,18 +1789,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             OrderedNode<(usize, u32, u64, lance_index::vector::graph::OrderedFloat)>,
         > = BinaryHeap::with_capacity(limit);
         let mut distances = HashMap::new();
-        for index in start..end {
-            let part_id = partitions.value(index) as usize;
-            let mut local_query = query.clone();
-            local_query.dist_q_c = centroid_dists.value(index);
+        let load_parallelism = self
+            .io_parallelism
+            .max(1)
+            .min(get_num_compute_intensive_cpus().max(1));
+        // Keep the probe order for heap ties while overlapping independent
+        // partition reads. The window bounds how many loaded stores stay pinned.
+        let mut prepared = stream::iter(start..end)
+            .map(|index| async move {
+                let part_id = partitions.value(index) as usize;
+                let mut local_query = query.clone();
+                local_query.dist_q_c = centroid_dists.value(index);
+                let entry = self
+                    .load_initial_partition(part_id, &local_query, metrics)
+                    .await?;
+                Result::Ok((part_id, local_query, entry))
+            })
+            .buffered(load_parallelism);
+        let mut pending = prepared.try_next().await?;
+        while let Some((part_id, local_query, entry)) = pending {
             distances.insert(part_id, local_query.dist_q_c);
-            let entry = self
-                .load_initial_partition(part_id, &local_query, metrics)
-                .await?;
             let filter = pre_filter.clone();
             let raw_query = raw_query.clone();
             let cache = self.rq_search_cache.clone();
-            coarse_heap = spawn_cpu(move || -> Result<_> {
+            let scoring = spawn_cpu(move || -> Result<_> {
                 let mut scratch = Vec::new();
                 let context = QueryResidual::RabitRawQuery {
                     rotated_centroid: rotated_partition_centroid_slice(cache.as_deref(), part_id),
@@ -1844,8 +1856,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     }
                 }
                 Ok(coarse_heap)
-            })
-            .await?;
+            });
+            let (scored, next) = tokio::join!(scoring, prepared.try_next());
+            coarse_heap = scored?;
+            pending = next?;
         }
         Ok(coarse_heap
             .into_sorted_vec()
@@ -1900,19 +1914,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .push(candidate);
         }
         let mut full_heap: BinaryHeap<OrderedNode<u64>> = BinaryHeap::with_capacity(k);
-        for (part_id, mut rows) in candidates {
-            rows.sort_unstable_by_key(|row| row.row_offset);
-            if rows
-                .windows(2)
-                .any(|pair| pair[0].row_offset == pair[1].row_offset)
-            {
-                return Err(Error::invalid_input("duplicate quantized candidate offset"));
-            }
-            let offsets = rows.iter().map(|row| row.row_offset).collect();
-            let storage = self
-                .storage
-                .load_candidates(part_id, offsets, &self.index_cache, metrics.io_stats())
-                .await?;
+        let load_parallelism = self
+            .io_parallelism
+            .max(1)
+            .min(get_num_compute_intensive_cpus().max(1));
+        // Preserve sorted partition order for deterministic ties. Fetching each
+        // partition serially otherwise multiplies origin latency by nprobes.
+        let mut prepared = stream::iter(candidates)
+            .map(|(part_id, mut rows)| async move {
+                rows.sort_unstable_by_key(|row| row.row_offset);
+                if rows
+                    .windows(2)
+                    .any(|pair| pair[0].row_offset == pair[1].row_offset)
+                {
+                    return Err(Error::invalid_input("duplicate quantized candidate offset"));
+                }
+                let offsets = rows.iter().map(|row| row.row_offset).collect();
+                let storage = self
+                    .storage
+                    .load_candidates(part_id, offsets, &self.index_cache, metrics.io_stats())
+                    .await?;
+                Result::Ok((part_id, rows, storage))
+            })
+            .buffered(load_parallelism);
+        let mut pending = prepared.try_next().await?;
+        while let Some((part_id, rows, storage)) = pending {
             let dist_q_c = distances[&part_id];
             let key = query.key.clone();
             let cache = self.rq_search_cache.clone();
@@ -1920,7 +1946,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             let approx_mode = query.approx_mode;
             let lower_bound = query.lower_bound;
             let upper_bound = query.upper_bound;
-            full_heap = spawn_cpu(move || -> Result<_> {
+            let scoring = spawn_cpu(move || -> Result<_> {
                 let mut scratch = Vec::new();
                 let context = QueryResidual::RabitRawQuery {
                     rotated_centroid: rotated_partition_centroid_slice(cache.as_deref(), part_id),
@@ -1964,8 +1990,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     }
                 }
                 Ok(full_heap)
-            })
-            .await?;
+            });
+            let (scored, next) = tokio::join!(scoring, prepared.try_next());
+            full_heap = scored?;
+            pending = next?;
         }
         spawn_cpu(move || Self::global_heap_to_batch(full_heap)).await
     }
