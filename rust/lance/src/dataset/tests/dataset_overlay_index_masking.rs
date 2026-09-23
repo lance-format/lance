@@ -2599,3 +2599,78 @@ async fn test_rtree_merge_keeps_coverage_when_a_folded_overlay_is_on_another_gro
          group its segments never covered, costing a flat scan for nothing"
     );
 }
+
+/// The folded-overlay rule is not RTree's: every scalar family resolves staged
+/// coverage through the same remap. A BTree index built before the overlay holds
+/// the value it replaced, so the merge must give up the fragment the compaction
+/// folded it into and let those rows be scanned.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_a_compaction_folded_an_overlay_into() {
+    let mut dataset = create_base_dataset_with(false).await;
+    // On `id`, not `age`: the compaction below needs an index to defer so it
+    // writes a reuse mapping, and this leaves `age` answered only by the merged
+    // index under test.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let mut staged = Vec::new();
+    for fragment in dataset.get_fragments() {
+        staged.push(
+            dataset
+                .create_index_builder(&["age"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("age_staged".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dataset.get_fragments()[0].metadata().overlays.is_empty(),
+        "the compaction writes the overlay in, leaving none on the fragment"
+    );
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![0],
+        "the row the overlay set to 999 is missing: the merged index claimed the \
+         fragment the compaction wrote that overlay into, while holding the value \
+         it replaced"
+    );
+}
