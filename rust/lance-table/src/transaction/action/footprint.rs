@@ -329,20 +329,15 @@ impl From<&CompositeOperation> for Footprint {
 mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
+    use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData, UserAction,
+        SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::{Field, LogicalType};
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
-
-    fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step", actions,
-        )]))
-    }
 
     fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {
@@ -497,6 +492,13 @@ mod tests {
         vec![remove_fragment(0)],
         vec![tombstone(1, &[1])],
         false,
+    )]
+    // Two compactions of one fragment: the second would remove something the
+    // first already took away.
+    #[case::removing_the_same_fragment_twice(
+        vec![remove_fragment(0)],
+        vec![remove_fragment(0)],
+        true,
     )]
     // A new column's cells in a committed fragment are not a coordinate -- the
     // field is minted -- but they are gone if the fragment is, whichever order

@@ -271,8 +271,10 @@ impl TryFrom<pb_transaction::ConfigUpdate> for ConfigUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
-    use crate::transaction::action::{Action, AddField, CompositeOperation, Footprint, UserAction};
+    use crate::transaction::action::test_support::{
+        added_field, apply, backed_manifest, footprint,
+    };
+    use crate::transaction::action::{Action, AddField};
     use crate::transaction::update_map::UpdateMapEntry;
 
     fn merge(entries: &[(&str, Option<&str>)]) -> UpdateMap {
@@ -293,12 +295,6 @@ mod tests {
                 .collect(),
             replace: true,
         }
-    }
-
-    fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-            "step", actions,
-        )]))
     }
 
     #[test]
