@@ -31,7 +31,7 @@ use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::ScalarValue;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::scalar::btree::OrderableScalarValue;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME};
@@ -1121,6 +1121,8 @@ impl BTreeMemIndex {
 
     /// Export the index data as sorted RecordBatches for BTree index training.
     pub fn to_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
+        use lance_core::ROW_ADDR;
+
         let snapshot = self.snapshot();
         if snapshot.is_empty() {
             return Ok(vec![]);
@@ -1129,7 +1131,7 @@ impl BTreeMemIndex {
         let data_type = snapshot[0].0.0.data_type();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, data_type, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let mut batches = Vec::new();
@@ -1600,7 +1602,7 @@ mod tests {
 
     #[test]
     fn test_btree_index_to_training_batches() {
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
         let schema = create_test_schema();
@@ -1613,7 +1615,7 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 6);
         assert_eq!(batch.schema().field(0).name(), VALUE_COLUMN_NAME);
-        assert_eq!(batch.schema().field(1).name(), ROW_ID);
+        assert_eq!(batch.schema().field(1).name(), ROW_ADDR);
 
         let values = batch
             .column_by_name(VALUE_COLUMN_NAME)
@@ -1626,7 +1628,7 @@ mod tests {
             vec![0, 1, 2, 10, 11, 12]
         );
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
