@@ -64,11 +64,6 @@ pub struct TransactionRebase<'a> {
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
     reuse: RewriteReuseState,
-    /// Whether the dataset uses stable row ids, at the transaction's read version.
-    ///
-    /// Only needed to spot an SRID/FRI/row-id-domain-index conflict below;
-    /// the feature cannot be turned on or off by a concurrent commit.
-    uses_stable_row_ids: bool,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -159,7 +154,6 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -189,7 +183,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments,
                     read_schema,
                     reuse: Default::default(),
-                    uses_stable_row_ids,
                 })
             }
             Operation::Delete {
@@ -225,7 +218,6 @@ impl<'a> TransactionRebase<'a> {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
-                        uses_stable_row_ids,
                     });
                 }
 
@@ -245,7 +237,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
-                    uses_stable_row_ids,
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -271,7 +262,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse,
-                    uses_stable_row_ids,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -293,7 +283,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
-                    uses_stable_row_ids,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -315,7 +304,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
-                    uses_stable_row_ids,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -336,7 +324,6 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
-                    uses_stable_row_ids,
                 })
             }
         }
@@ -1490,7 +1477,20 @@ impl<'a> TransactionRebase<'a> {
                             //
                             // This should be relatively rare as we are moving indexes
                             // away from row ids
-                            if self.uses_stable_row_ids
+                            //
+                            // `old_fragments` come from the dataset's manifest at the
+                            // rewrite's read version (never freshly constructed, where
+                            // `row_id_meta` would default to `None` regardless of the
+                            // feature flag), so `row_id_meta.is_some()` is equivalent to
+                            // the manifest's stable-row-ids flag being set. This is an
+                            // inference from fragment metadata rather than reading the
+                            // flag directly, and would silently stop detecting the
+                            // conflict below if that equivalence ever broke.
+                            let uses_stable_row_ids = groups
+                                .iter()
+                                .flat_map(|g| &g.old_fragments)
+                                .any(|f| f.row_id_meta.is_some());
+                            if uses_stable_row_ids
                                 && new_indices.iter().any(corrupted_by_frag_reuse)
                             {
                                 return Err(
@@ -2969,6 +2969,7 @@ mod tests {
     use uuid::Uuid;
 
     use lance_table::format::IndexMetadata;
+    use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -4193,7 +4194,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -4404,7 +4404,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4470,7 +4469,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4618,7 +4616,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4667,7 +4664,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -4689,7 +4685,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4776,7 +4771,6 @@ mod tests {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
-                        uses_stable_row_ids: false,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4833,7 +4827,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -4971,7 +4964,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
         let update = Transaction::new(
             1,
@@ -5038,7 +5030,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5099,7 +5090,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5127,7 +5117,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5178,7 +5167,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let same_name = Transaction::new(
@@ -5240,7 +5228,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5305,7 +5292,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5353,7 +5339,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5402,7 +5387,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5478,7 +5462,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -5490,6 +5473,93 @@ mod tests {
                 assert!(
                     result.is_ok(),
                     "disjoint staged NGram index should remain compatible, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
+        let row_id_domain_index = |fragment_id| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_ivf".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "lance.index.IvfPqIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let frag_reuse_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 2,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        // The rewrite's own `old_fragments` are what the SRID inference reads:
+        // `row_id_meta` set means stable row ids were on at the read version.
+        for (row_id_meta, expect_conflict) in [
+            (Some(RowIdMeta::Inline(InlineRowIds::from(vec![7]))), true),
+            (None, false),
+        ] {
+            let mut old_fragment = Fragment::new(1);
+            old_fragment.row_id_meta = row_id_meta;
+
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(
+                    1,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments: vec![old_fragment],
+                            new_fragments: vec![Fragment::new(2)],
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: Some(frag_reuse_index.clone()),
+                    },
+                    None,
+                ),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            // Disjoint from the rewritten fragment, so this only exercises the
+            // stable-row-ids check and not the group-straddling check below it.
+            let create_index = Transaction::new(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![row_id_domain_index(5u32)],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let result = rebase.check_txn(&create_index, 2);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "stable row ids should conflict with a row-id-domain index built \
+                     during a deferred rewrite, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "fragments without row ids should not trip the stable-row-ids \
+                     inference, got {result:?}"
                 );
             }
         }
@@ -6166,7 +6236,6 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
-                uses_stable_row_ids: false,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6236,7 +6305,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6281,7 +6349,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6327,7 +6394,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6373,7 +6439,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6430,7 +6495,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6462,7 +6526,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -6515,7 +6578,6 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
-            uses_stable_row_ids: false,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
