@@ -2033,25 +2033,24 @@ async fn tagged_append_preserves_stored_segment_provenance() {
 async fn dropped_unknown_transition_forces_scalar_query_to_scan(#[case] external: bool) {
     let mut dataset = fixture_with_index(IndexType::BTree).await;
 
-    // Ground truth from a direct scan before any FRI is installed.
-    let truth: Vec<usize> = {
-        let mut counts = Vec::new();
-        for value in 0..8 {
-            counts.push(
-                dataset
-                    .count_rows(Some(format!("i = {value}")))
-                    .await
-                    .unwrap(),
-            );
-        }
-        counts
-    };
-
     let (mut transition, destinations) = prepare(&dataset).await;
     transition.mapping = None;
     let mut raw = transition.encode_to_vec();
     raw.extend(field(17, b"future mapping"));
     let fri = install(&mut dataset, field(2, &raw), destinations, external).await;
+
+    // Ground truth from an explicitly index-DISABLED scan of the reclustered
+    // snapshot, so the comparison is against a real scan and not the index path.
+    let truth: Vec<usize> = {
+        let mut counts = Vec::new();
+        for value in 0..8 {
+            let mut scan = dataset.scan();
+            scan.filter(&format!("i = {value}")).unwrap();
+            scan.use_scalar_index(false);
+            counts.push(scan.try_into_batch().await.unwrap().num_rows());
+        }
+        counts
+    };
     let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
     assert!(mapping.ledger.has_unsupported_transitions());
     assert!(mapping.ledger.transitions().is_empty());
@@ -2240,5 +2239,71 @@ async fn fragment_scope_cache_hit_is_scope_independent() {
             1,
             "value {value}"
         );
+    }
+}
+
+// P1 guard witness: index coverage PROJECTED onto live destinations {10,11}
+// while the segment's STORED addresses are the retired sources F0/F1, and the
+// transition that would map F0/F1 -> F10/F11 is DROPPED (unknown field). Direct
+// coverage of the live destinations would be granted, but the translator cannot
+// map the pre-transition addresses, so those rows would be dropped and the scan
+// fallback suppressed. The third-state guard must instead grant NO coverage, so
+// the query scans and matches an index-disabled scan. Verified cold and warm,
+// and this fails without the guard.
+#[tokio::test]
+async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
+    let mut dataset = fixture_with_index(IndexType::BTree).await;
+
+    let (mut transition, destinations) = prepare(&dataset).await;
+    transition.mapping = None;
+    let mut raw = transition.encode_to_vec();
+    raw.extend(field(17, b"future mapping"));
+    install(&mut dataset, field(2, &raw), destinations, false).await;
+
+    // Project the index coverage onto the live destination fragments while its
+    // stored addresses remain the retired sources. This is the identity-eligible
+    // "direct coverage of live fragments" shape the guard must reject.
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let index = indices
+        .iter_mut()
+        .find(|index| index.name == "i_idx")
+        .unwrap();
+    index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    let key = IndexMetadataKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&key, Arc::new(indices))
+        .await;
+
+    // Truth: an index-disabled scan of the reclustered snapshot.
+    let mut truth = Vec::new();
+    for value in 0..8 {
+        let mut scan = dataset.scan();
+        scan.filter(&format!("i = {value}")).unwrap();
+        scan.use_scalar_index(false);
+        truth.push(scan.try_into_batch().await.unwrap().num_rows());
+    }
+
+    // Index-using queries must match the truth, both cold (first derive) and warm
+    // (cache hit). Without the guard, coverage is granted, the translator drops
+    // the F0/F1 addresses, and these counts come up short.
+    for _pass in 0..2 {
+        for (value, &expected) in truth.iter().enumerate() {
+            let mut scan = dataset.scan();
+            scan.filter(&format!("i = {value}")).unwrap();
+            assert_eq!(
+                scan.try_into_batch().await.unwrap().num_rows(),
+                expected,
+                "value {value}"
+            );
+        }
     }
 }

@@ -66,6 +66,17 @@ pub(super) async fn load_indices(
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
             if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
+                // A dropped unknown transition loses the record of which
+                // fragments it touched, so we cannot prove any segment's stored
+                // addresses are translatable: supporting the remap plugin is
+                // necessary but not sufficient when the mapping itself is gone.
+                // Exclude every such segment (no coverage, scan fallback) rather
+                // than grant coverage a translator cannot honor, which would drop
+                // rows silently. This is the third state: cannot prove
+                // translation, so no coverage.
+                if mapping.ledger.has_unsupported_transitions() {
+                    continue;
+                }
                 let can_remap = if super::segment_has_vector_details(index) {
                     super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index)
                         .await?
