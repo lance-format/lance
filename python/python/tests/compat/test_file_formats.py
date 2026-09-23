@@ -11,6 +11,7 @@ covering various data types and file format versions.
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -151,3 +152,56 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
         lance.write_dataset(
             build_basic_types(), self.path, data_storage_version="0.1", mode="append"
         )
+
+
+def _supports_semantic_types() -> bool:
+    return hasattr(lance.LanceDataset, "migrate_to_semantic_types")
+
+
+# 2.2 datasets are readable from the first release that wrote them.
+@compat_test(min_version="4.0.0b1")
+class SemanticTypes(UpgradeDowngradeTest):
+    """Tables under the semantic type contract are fenced from older readers and
+    writers, and a current writer never moves a legacy table under it."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    @property
+    def _created_under_contract(self) -> Path:
+        return self.path.with_name("created_under_contract")
+
+    def create(self):
+        table = pa.table({"s": pa.array(["a", None], pa.large_string())})
+        if _supports_semantic_types():
+            lance.write_dataset(table, self.path, data_storage_version="2.3")
+            self._created_under_contract.touch()
+        else:
+            lance.write_dataset(table, self.path, data_storage_version="2.2")
+
+    # Released versions refuse unknown feature flags with ValueError (read) or
+    # OSError (write); later ones map "not supported" to NotImplementedError.
+    def _fenced(self) -> bool:
+        return self._created_under_contract.exists() and not _supports_semantic_types()
+
+    def check_read(self):
+        if self._fenced():
+            with pytest.raises(
+                (OSError, NotImplementedError, ValueError),
+                match="cannot be read by this version",
+            ):
+                lance.dataset(self.path).to_table()
+            return
+        table = lance.dataset(self.path).to_table()
+        assert table.schema.field("s").type == pa.large_string()
+
+    def check_write(self):
+        batch = pa.table({"s": pa.array(["b"], pa.large_string())})
+        if self._fenced():
+            with pytest.raises(
+                (OSError, NotImplementedError, ValueError),
+                match="cannot be (read|written)",
+            ):
+                lance.write_dataset(batch, self.path, mode="append")
+            return
+        lance.write_dataset(batch, self.path, mode="append")

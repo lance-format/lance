@@ -1390,3 +1390,110 @@ async fn test_migrate_to_semantic_types_rejected(#[case] message: &str) {
     assert!(!dataset.manifest.uses_semantic_types());
     assert_eq!(dataset.version().version, 1);
 }
+
+/// A table written by Lance 12.0.0 names Arrow layouts in `logical_type`. It
+/// stays a legacy table with exact types until migrated, and migrating it keeps
+/// the Arrow types, values, and field IDs reads return.
+#[tokio::test]
+async fn test_v12_legacy_aliases_migrate_to_semantic_types() {
+    use lance_table::format::pb;
+
+    let test_dir = copy_test_data_to_tmp("v12.0.0/legacy_aliases").unwrap();
+    let uri = test_dir.path_str();
+    let mut dataset = Dataset::open(&uri).await.unwrap();
+    assert!(!dataset.manifest.uses_semantic_types());
+    let logical_types = |dataset: &Dataset| {
+        pb::Manifest::from(dataset.manifest.as_ref())
+            .fields
+            .into_iter()
+            .map(|field| field.logical_type)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        logical_types(&dataset),
+        vec![
+            "int64",
+            "large_string",
+            "dict:string:int32:false",
+            "decimal:256:10:2",
+            "large_list",
+            "int32",
+            "large_binary",
+            "struct",
+            "string",
+        ]
+    );
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let field_ids = dataset
+        .schema()
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+
+    // Legacy tables compare exact types.
+    let other_layout = arrow_cast::cast(
+        &arrow_array::StructArray::from(before.clone()),
+        &DataType::Struct(
+            before
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| match field.name().as_str() {
+                    "s" => Arc::new(ArrowField::new("s", DataType::Utf8, true)),
+                    _ => field.clone(),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+    let other_layout = RecordBatch::from(arrow_array::cast::AsArray::as_struct(&other_layout));
+    let append = |dataset: Dataset, batch: RecordBatch| async move {
+        InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+    };
+    let err = append(dataset.clone(), other_layout.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("should have type large_string but type was string"),
+        "{err}"
+    );
+
+    dataset.migrate_to_semantic_types().await.unwrap();
+    assert_eq!(
+        logical_types(&dataset),
+        vec![
+            "int64",
+            "string",
+            "string",
+            "decimal:10:2",
+            "list",
+            "int32",
+            "binary",
+            "struct",
+            "string",
+        ]
+    );
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), before);
+    assert_eq!(
+        reopened
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<Vec<_>>(),
+        field_ids
+    );
+
+    let dataset = append(reopened, other_layout).await.unwrap();
+    assert_eq!(
+        dataset.scan().try_into_batch().await.unwrap(),
+        concat_batches(&before.schema(), &[before.clone(), before.clone()]).unwrap()
+    );
+}

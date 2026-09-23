@@ -4768,3 +4768,159 @@ async fn test_semantic_table_rejects_v2_0_data_files() {
     let err = crate::dataset::versions::check_manifest_storage_version(&mut manifest).unwrap_err();
     assert!(err.to_string().contains("2.1 or later"), "{err}");
 }
+
+/// The files under a dataset's data directory.
+async fn data_file_count(uri: &str) -> usize {
+    std::fs::read_dir(std::path::Path::new(uri).join("data"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// Failure semantics: an input that is not an accepted input of the column's
+/// semantic type fails the write before any data file is written, naming the
+/// field, the semantic type, and the input type.
+#[tokio::test]
+async fn test_semantic_rejects_unaccepted_input_before_writing() {
+    use arrow_array::Decimal128Array;
+
+    let dir = TempStrDir::default();
+    let decimals = |precision: u8| -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(vec![Some(1)])
+                .with_precision_and_scale(precision, 2)
+                .unwrap(),
+        )
+    };
+    write_single_column(
+        dir.as_str(),
+        decimals(10),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    let files = data_file_count(dir.as_str()).await;
+    let err = write_single_column(dir.as_str(), decimals(12), WriteMode::Append, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("`s`") && err.contains("decimal:10:2") && err.contains("decimal:128:12:2"),
+        "{err}"
+    );
+    assert_eq!(data_file_count(dir.as_str()).await, files);
+
+    // A dictionary of integers is no layout of any semantic type.
+    let other = TempStrDir::default();
+    let integers: ArrayRef = Arc::new(
+        arrow_array::DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(Int32Array::from(vec![7])),
+        )
+        .unwrap(),
+    );
+    let err = write_single_column(
+        other.as_str(),
+        integers,
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'s'") && err.contains("dict:int32:int8:false"),
+        "{err}"
+    );
+    assert_eq!(data_file_count(other.as_str()).await, 0);
+}
+
+/// Failure semantics: invalid JSON input fails the write, naming the field
+/// path and the row.
+#[tokio::test]
+async fn test_semantic_rejects_invalid_json_with_field_and_row() {
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("j", DataType::Utf8, true).with_metadata(
+            [(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]
+            .into(),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some("{}"), Some("{")]))],
+    )
+    .unwrap();
+    let dir = TempStrDir::default();
+    let err = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("field 'j'") && err.contains("row 1"), "{err}");
+}
+
+/// Failure semantics: a reader ignores an output encoding entry it does not
+/// recognize, such as one a newer writer recorded, and writers keep it.
+#[tokio::test]
+async fn test_semantic_ignores_unknown_output_encoding_entry() {
+    use lance_core::datatypes::OUTPUT_ENCODING_META_KEY;
+
+    let dir = TempStrDir::default();
+    let dataset = write_single_column(
+        dir.as_str(),
+        string_array(&DataType::Utf8, &[Some("a")]),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.schema.fields[0]
+        .metadata
+        .insert(OUTPUT_ENCODING_META_KEY.to_string(), "utf32".to_string());
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig::default(),
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let dataset = write_single_column(
+        dir.as_str(),
+        string_array(&DataType::LargeUtf8, &[Some("b")]),
+        WriteMode::Append,
+        None,
+    )
+    .await
+    .unwrap();
+    let field = dataset.schema().field("s").unwrap();
+    assert_eq!(
+        field
+            .metadata
+            .get(OUTPUT_ENCODING_META_KEY)
+            .map(String::as_str),
+        Some("utf32")
+    );
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.column(0).data_type(), &DataType::Utf8);
+    assert_eq!(batch.num_rows(), 2);
+}
