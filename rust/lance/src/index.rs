@@ -141,6 +141,7 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 
     Ok(())
 }
+
 /// Move a caller-defined segment group's coverage into the current fragment space.
 ///
 /// A deferred compaction can combine several independently built segments into one
@@ -199,18 +200,23 @@ async fn remap_merged_segment_coverage(
         return Ok(None);
     };
 
-    // Compaction writes overlay values into the fragment it produces and drops
+    // Compaction materializes an overlay into the fragment it produces and drops
     // the overlay, leaving nothing to detect afterwards. Segments built before
     // the overlay hold the old values, so no mapping can carry coverage there.
-    if indexed_overlay_folded_into_rewrite(dataset, &frag_reuse_index, segments, &staged_coverage)
-        .await?
+    if compaction_materialized_a_newer_overlay(
+        dataset,
+        &frag_reuse_index,
+        segments,
+        &staged_coverage,
+    )
+    .await?
     {
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
-            "Merging index segments across a rewrite that folded in an overlay committed \
-             after they were built: the merged index will not cover those rows, which fall \
-             back to a flat scan. Rebuild the index to cover them."
+            "Merging index segments across a compaction that materialized an overlay \
+             committed after they were built: the merged index will not cover those rows, \
+             which fall back to a flat scan. Rebuild the index to cover them."
         );
         return Ok(None);
     }
@@ -337,9 +343,10 @@ fn fragment_field_files<'a>(
         .collect()
 }
 
-/// Whether an overlay changed one of the `indexed` fields of `fragment` after
-/// `version`. An index built at `version` holds the old values for those rows.
-fn overlay_supersedes_index(fragment: &Fragment, version: u64, indexed: &HashSet<i32>) -> bool {
+/// Whether `fragment` carries an overlay over one of the `indexed` fields
+/// committed after `version`. An index built at `version` holds the old values
+/// for those rows.
+fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i32>) -> bool {
     fragment.overlays.iter().any(|overlay| {
         overlay.committed_version > version
             && overlay
@@ -350,17 +357,17 @@ fn overlay_supersedes_index(fragment: &Fragment, version: u64, indexed: &HashSet
     })
 }
 
-/// Whether a compaction wrote overlay values into the fragments these segments'
-/// rows now live in.
+/// Whether a compaction materialized an overlay into the fragments these
+/// segments' rows now live in.
 ///
-/// Compacting a fragment that has an overlay writes the overlay's values into the
-/// new fragment and drops the overlay, so afterwards nothing on that fragment
-/// shows one was ever there. A segment built before the overlay holds the old
-/// values and cannot cover those rows.
+/// Compacting a fragment that has an overlay materializes the overlay's values
+/// into the new fragment and drops the overlay, so afterwards nothing on that
+/// fragment shows one was ever there. A segment built before the overlay holds
+/// the old values and cannot cover those rows.
 ///
 /// Every compaction is checked, and the set of fragments being followed advances
 /// to what each one produced, so a fragment compacted twice is still followed.
-async fn indexed_overlay_folded_into_rewrite(
+async fn compaction_materialized_a_newer_overlay(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
@@ -395,7 +402,7 @@ async fn indexed_overlay_folded_into_rewrite(
         }
 
         // An overlay this old was already read by every segment, so only a later
-        // compaction can have written values they lack.
+        // compaction can have materialized values they lack.
         if version.dataset_version > oldest_segment {
             // The reuse index records the version each compaction read. Its
             // input fragments still exist there, with their overlays.
@@ -416,7 +423,7 @@ async fn indexed_overlay_folded_into_rewrite(
             if ours.iter().any(|group| {
                 group.old_frags.iter().any(|old| {
                     inputs.get(&old.id).is_some_and(|input| {
-                        overlay_supersedes_index(input, oldest_segment, &indexed)
+                        has_overlay_newer_than(input, oldest_segment, &indexed)
                     })
                 })
             }) {
@@ -522,7 +529,7 @@ async fn prune_stale_segment_coverage(
                         historical_files.is_none() || historical_files != current_files
                     });
                     let changed_overlays = prune_newer_overlays
-                        && overlay_supersedes_index(current_fragment, version, &indexed_field_ids);
+                        && has_overlay_newer_than(current_fragment, version, &indexed_field_ids);
                     changed_files || changed_overlays
                 })
                 .collect::<Vec<_>>();

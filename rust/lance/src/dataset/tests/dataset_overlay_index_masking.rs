@@ -2497,12 +2497,12 @@ async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() 
     .await;
 }
 
-/// Compacting a fragment that has an overlay writes the overlay's values into the
-/// new fragment and drops the overlay, so the new fragment carries none of its
-/// own. Segments built before the overlay hold the old values.
+/// Compacting a fragment that has an overlay materializes the overlay's values
+/// into the new fragment and drops the overlay, so the new fragment carries none
+/// of its own. Segments built before the overlay hold the old values.
 #[cfg(feature = "geo")]
 #[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_into() {
+async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
     let dir = TempStrDir::default();
     let (mut dataset, params) =
         geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
@@ -2514,15 +2514,20 @@ async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_into() {
     let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
     rtree_compact(&mut dataset, 3).await;
 
-    assert_merge_covers_nothing(&dataset, staged, "a rewrite folded an overlay into").await;
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "a compaction materialized an overlay into",
+    )
+    .await;
 }
 
-/// The same overlay across two compactions. The fragment that absorbed it is
+/// The same overlay across two compactions. The fragment that materialized it is
 /// itself compacted away, so it appears in neither the staged coverage nor the
 /// final one, and the old values reach the final fragment all the same.
 #[cfg(feature = "geo")]
 #[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_two_rewrites_carried_a_folded_overlay_to() {
+async fn test_rtree_merge_drops_a_fragment_two_compactions_carried_a_materialized_overlay_to() {
     let dir = TempStrDir::default();
     let (mut dataset, params) =
         geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
@@ -2536,16 +2541,22 @@ async fn test_rtree_merge_drops_a_fragment_two_rewrites_carried_a_folded_overlay
     rtree_compact(&mut dataset, 4).await;
     assert_eq!(dataset.get_fragments().len(), 1);
 
-    assert_merge_covers_nothing(&dataset, staged, "two rewrites carried a folded overlay to").await;
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "two compactions carried a materialized overlay to",
+    )
+    .await;
 }
 
-/// An overlay that lands on a fragment one compaction produced and is written in
-/// by the next. The fragment it overlaid is named by neither the staged coverage
-/// nor the final one, so it is found only by following what the covered fragments
-/// become at each compaction.
+/// An overlay that lands on a fragment one compaction produced and is
+/// materialized by the next. The fragment it overlaid is named by neither the
+/// staged coverage nor the final one, so it is found only by following what the
+/// covered fragments become at each compaction.
 #[cfg(feature = "geo")]
 #[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_on_its_own_output() {
+async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_on_its_own_output()
+{
     let dir = TempStrDir::default();
     let (mut dataset, params) =
         geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
@@ -2563,17 +2574,18 @@ async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_on_its_ow
     assert_merge_covers_nothing(
         &dataset,
         staged,
-        "a rewrite folded an overlay on its own output",
+        "a compaction materialized an overlay on its own output",
     )
     .await;
 }
 
-/// One compaction can rewrite several groups at once. An overlay written into one
-/// group says nothing about the rows a segment covering a different group holds,
-/// and refusing that segment its coverage costs a flat scan for nothing.
+/// One compaction can rewrite several groups at once. An overlay materialized
+/// into one group says nothing about the rows a segment covering a different
+/// group holds, and refusing that segment its coverage costs a flat scan for
+/// nothing.
 #[cfg(feature = "geo")]
 #[tokio::test]
-async fn test_rtree_merge_keeps_coverage_when_a_folded_overlay_is_on_another_group() {
+async fn test_rtree_merge_keeps_coverage_when_a_materialized_overlay_is_on_another_group() {
     let dir = TempStrDir::default();
     let (mut dataset, params) =
         geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
@@ -2595,17 +2607,17 @@ async fn test_rtree_merge_keeps_coverage_when_a_folded_overlay_is_on_another_gro
     assert_eq!(
         coverage.len(),
         1,
-        "the merged index gave up coverage over an overlay folded into a rewrite \
-         group its segments never covered, costing a flat scan for nothing"
+        "the merged index gave up coverage over an overlay materialized into a \
+         rewrite group its segments never covered, costing a flat scan for nothing"
     );
 }
 
-/// The folded-overlay rule is not RTree's: every scalar family resolves staged
-/// coverage through the same remap. A BTree index built before the overlay holds
-/// the value it replaced, so the merge must give up the fragment the compaction
-/// folded it into and let those rows be scanned.
+/// The rule is not RTree's: every scalar family resolves staged coverage through
+/// the same remap. A BTree index built before the overlay holds the value it
+/// replaced, so the merge must give up the fragment the compaction materialized
+/// it into and let those rows be scanned.
 #[tokio::test]
-async fn test_btree_merge_drops_a_fragment_a_compaction_folded_an_overlay_into() {
+async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
     let mut dataset = create_base_dataset_with(false).await;
     // On `id`, not `age`: the compaction below needs an index to defer so it
     // writes a reuse mapping, and this leaves `age` answered only by the merged
@@ -2622,18 +2634,20 @@ async fn test_btree_merge_drops_a_fragment_a_compaction_folded_an_overlay_into()
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
 
-    let mut staged = Vec::new();
-    for fragment in dataset.get_fragments() {
-        staged.push(
-            dataset
-                .create_index_builder(&["age"], IndexType::BTree, &ScalarIndexParams::default())
-                .name("age_staged".to_string())
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-        );
-    }
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
 
     let mut dataset = commit_overlay(
         dataset,
@@ -2657,7 +2671,7 @@ async fn test_btree_merge_drops_a_fragment_a_compaction_folded_an_overlay_into()
     .unwrap();
     assert!(
         dataset.get_fragments()[0].metadata().overlays.is_empty(),
-        "the compaction writes the overlay in, leaving none on the fragment"
+        "the compaction materializes the overlay, leaving none on the fragment"
     );
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
@@ -2670,7 +2684,7 @@ async fn test_btree_merge_drops_a_fragment_a_compaction_folded_an_overlay_into()
         ids_matching(&dataset, "age = 999").await,
         vec![0],
         "the row the overlay set to 999 is missing: the merged index claimed the \
-         fragment the compaction wrote that overlay into, while holding the value \
-         it replaced"
+         fragment the compaction materialized that overlay into, while holding the \
+         value it replaced"
     );
 }

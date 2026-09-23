@@ -928,6 +928,34 @@ impl CommitHandler for AmbiguousCommitHandler {
     }
 }
 
+/// One uncommitted scalar index segment per named fragment, each covering only
+/// that fragment, ready to be merged once a compaction has rewritten them.
+#[cfg(test)]
+pub async fn stage_index_segments(
+    dataset: &mut Dataset,
+    column: &str,
+    index_type: lance_index::IndexType,
+    params: &lance_index::scalar::ScalarIndexParams,
+    name: &str,
+    fragment_ids: Vec<u32>,
+) -> Vec<lance_table::format::IndexMetadata> {
+    use crate::index::DatasetIndexExt;
+
+    let mut staged = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        staged.push(
+            dataset
+                .create_index_builder(&[column], index_type, params)
+                .name(name.to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    staged
+}
+
 /// Geometry fixtures shared by the RTree tests.
 #[cfg(feature = "geo")]
 pub mod geo {
@@ -1025,26 +1053,21 @@ pub mod geo {
         (dataset, params)
     }
 
-    /// One uncommitted RTree segment per named fragment, each holding that
-    /// fragment's share of what a compaction then rewrites.
+    /// One uncommitted RTree segment per named fragment over `geometry`.
     pub async fn stage_rtree_segments(
         dataset: &mut Dataset,
         params: &ScalarIndexParams,
         fragment_ids: Vec<u32>,
     ) -> Vec<IndexMetadata> {
-        let mut staged = Vec::with_capacity(fragment_ids.len());
-        for fragment_id in fragment_ids {
-            staged.push(
-                dataset
-                    .create_index_builder(&["geometry"], IndexType::RTree, params)
-                    .name("geometry_idx".to_string())
-                    .fragments(vec![fragment_id])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
-        }
-        staged
+        super::stage_index_segments(
+            dataset,
+            "geometry",
+            IndexType::RTree,
+            params,
+            "geometry_idx",
+            fragment_ids,
+        )
+        .await
     }
 
     /// A compaction that leaves its index remap to the reuse index.
