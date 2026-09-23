@@ -1018,6 +1018,16 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         if num_rows == 0 {
             return Ok(0);
         }
+        if let Some(dictionary) = &self.dictionary {
+            // Dictionary-encoded pages decode to fixed-width indices which `drain`
+            // then wraps with the shared dictionary values block; `DataBlock::data_size`
+            // on the result charges both. The indices' bit width isn't known here (and
+            // common fixed-width index decompressors don't report a chunk size), so
+            // charge a conservative 8 bytes/row (indices are never wider than 64 bits)
+            // plus the dictionary once -- it is not re-decoded per chunk, so it must
+            // only be counted once per page per batch, not once per chunk walked below.
+            return Ok(dictionary.data_size() + num_rows * 8);
+        }
 
         let max_rep = self.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
         let max_visible_level = max_visible_level(&self.def_meaning);
@@ -13082,6 +13092,55 @@ mod tests {
         let task = decoder.drain(3).unwrap();
         let decoded = task.decode().unwrap();
         assert_eq!(decoded.data.data_size(), expected_first_3);
+    }
+
+    #[test]
+    fn test_miniblock_decoded_bytes_includes_dictionary() {
+        use super::MiniBlockDecoder;
+        use crate::decoder::StructuralPageDecoder;
+        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+        use std::collections::VecDeque;
+
+        // A 64-byte shared dictionary values block. `drain` wraps the decoded
+        // indices with this block (see `DecodeMiniBlockTask::decode`'s
+        // `dictionary_data` handling) and `DataBlock::data_size` on the result
+        // charges both the indices and the dictionary -- so `decoded_bytes` must
+        // account for the dictionary too, not just the indices it would compute by
+        // walking chunks.
+        let dictionary = Arc::new(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0u8; 64]),
+            bits_per_value: 8,
+            num_values: 64,
+            block_info: BlockInfo::new(),
+        }));
+
+        // `loaded_chunks`/`instructions` are left empty: the dictionary case must be
+        // handled before any chunk walk (real fixed-width index decompressors
+        // typically can't report a per-chunk size at all, so falling through to the
+        // chunk walk here would itself fail).
+        let decoder = MiniBlockDecoder {
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32)),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::new(),
+            instructions: VecDeque::new(),
+            offset_in_current_chunk: 0,
+            num_rows: 3,
+            num_buffers: 1,
+            dictionary: Some(dictionary.clone()),
+            has_large_chunk: false,
+        };
+
+        // The dictionary is fully materialized and shared, so it must be charged
+        // once per call (not per row, not per chunk) plus a conservative per-row
+        // index width -- never the indices alone.
+        let expected_3 = dictionary.data_size() + 3 * 8;
+        assert_eq!(decoder.decoded_bytes(3).unwrap(), expected_3);
+
+        // A different row count only scales the index estimate.
+        let expected_1 = dictionary.data_size() + 8;
+        assert_eq!(decoder.decoded_bytes(1).unwrap(), expected_1);
     }
 
     #[test]
