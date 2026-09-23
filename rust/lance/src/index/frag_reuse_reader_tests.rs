@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::tests::{fixture, fixture_with_index, install, persist_fixture, prepare};
+use super::tests::{field, fixture, fixture_with_index, install, persist_fixture, prepare};
 use super::*;
 use crate::dataset::WriteParams;
 use crate::index::create::CreateIndexBuilder;
@@ -2016,4 +2016,67 @@ async fn tagged_append_preserves_stored_segment_provenance() {
         assert_eq!(&serialize(&stored.fragment_bitmap), bitmap, "{uuid}");
     }
     assert_eq!(dataset.count_rows(Some("i = 100".into())).await.unwrap(), 1);
+}
+
+// End-to-end composition: a v1 FRI whose only transition is DROPPED (unknown
+// field) over an indexed dataset. The scalar consumer must fall back to scanning
+// (the segment cannot claim coverage through a dropped mapping) and every value
+// count must match the pre-FRI direct-scan truth, so no rows are lost and no
+// stale pre-transition rows are returned. This exercises the full query path
+// (planner + scalar consumer + FRI reader) end to end; the guard's own
+// fail-without-fix witness is the unit test
+// `dropped_unknown_transition_denies_identity_to_live_segment`.
+#[rstest::rstest]
+#[case::inline(false)]
+#[case::external(true)]
+#[tokio::test]
+async fn dropped_unknown_transition_forces_scalar_query_to_scan(#[case] external: bool) {
+    let mut dataset = fixture_with_index(IndexType::BTree).await;
+
+    // Ground truth from a direct scan before any FRI is installed.
+    let truth: Vec<usize> = {
+        let mut counts = Vec::new();
+        for value in 0..8 {
+            counts.push(
+                dataset
+                    .count_rows(Some(format!("i = {value}")))
+                    .await
+                    .unwrap(),
+            );
+        }
+        counts
+    };
+
+    let (mut transition, destinations) = prepare(&dataset).await;
+    transition.mapping = None;
+    let mut raw = transition.encode_to_vec();
+    raw.extend(field(17, b"future mapping"));
+    let fri = install(&mut dataset, field(2, &raw), destinations, external).await;
+    let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+    assert!(mapping.ledger.has_unsupported_transitions());
+    assert!(mapping.ledger.transitions().is_empty());
+
+    // The scalar index must not be used: the dropped unknown transition forbids
+    // identity, so the segment cannot claim coverage and the query scans.
+    let plan = dataset
+        .scan()
+        .filter("i = 2")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(!plan.contains("ScalarIndexQuery"), "{plan}");
+
+    // Every value count still matches the direct-scan truth: no rows lost and no
+    // stale pre-transition rows returned.
+    for (value, &expected) in truth.iter().enumerate() {
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("i = {value}")))
+                .await
+                .unwrap(),
+            expected,
+            "value {value}"
+        );
+    }
 }
