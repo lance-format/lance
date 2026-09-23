@@ -140,13 +140,8 @@ mod tests {
 
     #[test]
     fn test_reset_conflicts_with_everything() {
-        use crate::transaction::action::{CompositeOperation, Footprint, UserAction};
-
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-                "step", actions,
-            )]))
-        };
+        use crate::transaction::action::ReserveFragmentIds;
+        use crate::transaction::action::test_support::footprint;
 
         let reset = footprint(vec![reset()]);
         // Even a pure append, which writes no committed coordinate at all, is
@@ -165,5 +160,33 @@ mod tests {
         assert!(append.conflicts_with(&reset));
         assert!(reset.conflicts_with(&reset.clone()));
         assert!(!append.conflicts_with(&append.clone()));
+
+        // Nor does a set have to write anything: one that only requires a
+        // coordinate (a compaction-shaped set, which is not even an insert),
+        // or records nothing at all, still cannot land on either side of a
+        // reset.
+        let requires_only = footprint(vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: DataFile::new_unstarted("data/compacted.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: false,
+            }),
+        ]);
+        let records_nothing = footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds {
+            count: 3,
+        })]);
+        for other in [requires_only, records_nothing] {
+            assert!(reset.conflicts_with(&other));
+            assert!(other.conflicts_with(&reset));
+        }
     }
 }

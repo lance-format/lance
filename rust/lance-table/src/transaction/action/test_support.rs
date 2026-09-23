@@ -3,7 +3,7 @@
 
 //! Fixtures shared by the per-action test modules.
 
-use super::{Action, CompositeOperation, UserAction};
+use super::{Action, CompositeOperation, Footprint, UserAction};
 use crate::format::{DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, Transaction};
@@ -30,6 +30,15 @@ pub(super) fn apply_with_indices(
         None,
     );
     transaction.build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
+}
+
+/// The footprint of one action set, for pair tests. Every conflict test in the
+/// action modules builds its two sides with this, so a pair reads as two lists
+/// of actions and an expected answer.
+pub(super) fn footprint(actions: Vec<Action>) -> Footprint {
+    Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+        "step", actions,
+    )]))
 }
 
 pub(super) fn added_field(name: &str) -> Field {
