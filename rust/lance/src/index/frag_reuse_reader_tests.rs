@@ -2118,7 +2118,8 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
         .await
         .unwrap();
 
-    // Recluster F0,F1 -> destinations {10,11}, rows interleaved by parity.
+    // Recluster F0,F1 -> destinations {10,11}, rows interleaved by parity
+    // (F10 = even i {0,2,4,6}, F11 = odd i {1,3,5,7}).
     let (transition, destinations) = prepare(&dataset).await;
     let destination_ids: Vec<u32> = destinations.iter().map(|f| f.id as u32).collect();
     assert_eq!(destination_ids, vec![10, 11]);
@@ -2129,63 +2130,104 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    // Effective coverage of the segmented index is now the destinations, not the
-    // dead source fragments. Pruning consumes THIS, not the raw manifest bitmap.
+    // Add an UNRELATED third segment S3 over a fresh fragment the recluster never
+    // touched (values 8..12), extending the same logical index. Its coverage does
+    // not intersect the {10,11} destinations, so a destination-scoped query must
+    // prune it.
+    let appended = arrow_array::record_batch!(("i", Int32, [8, 9, 10, 11])).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let s3_fragment = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .max()
+        .unwrap();
+    let s3 = CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+        .name("i_idx".into())
+        .replace(true)
+        .fragments(vec![s3_fragment])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices.push(s3);
+    persist_fixture(&mut dataset, indices).await;
+
+    // Effective coverage of the reclustered pair is the destinations; S3 stays on
+    // its own fragment. Pruning consumes the EFFECTIVE bitmaps.
     let effective = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(effective, RoaringBitmap::from_iter([10, 11]));
+    assert!(effective.contains(10) && effective.contains(11));
 
-    // The pruning consumes each segment's EFFECTIVE bitmap. Scope to a single
-    // destination fragment: both source segments were reclustered into it (rows
-    // interleaved), so both effective bitmaps intersect {10} and both survive.
-    // This mirrors open_scalar_index_segments' own retain against the effective
-    // listing, and proves "querying one reclustered fragment can still need
-    // multiple old segments".
-    let named = crate::index::scalar_logical::load_named_scalar_segments(&dataset, "i", "i_idx")
+    // Open the index scoped to destination F10 and COUNT segment loads: both
+    // reclustered contributors (S1, S2) must load, S3 must not (its coverage does
+    // not intersect {10}).
+    let scope_f10 = RoaringBitmap::from_iter([10]);
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    let scoped = open_scalar_index_segments(&dataset, "i", "i_idx", Some(&scope_f10), &metrics)
         .await
         .unwrap();
-    assert_eq!(named.len(), 2, "index has two segments");
-    let scope_f10 = RoaringBitmap::from_iter([10]);
-    let kept: Vec<_> = named
-        .iter()
-        .filter(|index| {
-            index
-                .fragment_bitmap
-                .as_ref()
-                .is_none_or(|coverage| coverage.intersection_len(&scope_f10) > 0)
-        })
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "exactly the two reclustered contributors load under an F10 scope; S3 is pruned"
+    );
+
+    // Run a real search under that scope and confirm rows from BOTH contributors
+    // (the even source values that landed in F10: 0 and 2 from S1's F0, 4 and 6
+    // from S2's F1) are returned, while F11-only rows (odd values) are not.
+    use lance_index::scalar::{SargableQuery, SearchResult};
+    use std::ops::Bound;
+    let result = scoped
+        .search(
+            &SargableQuery::Range(
+                Bound::Included(datafusion::scalar::ScalarValue::Int32(Some(0))),
+                Bound::Included(datafusion::scalar::ScalarValue::Int32(Some(7))),
+            ),
+            &metrics,
+        )
+        .await
+        .unwrap();
+    let SearchResult::Exact(row_addrs) = result else {
+        panic!("expected exact scalar search result");
+    };
+    let fragments: std::collections::BTreeSet<u32> = row_addrs
+        .true_rows()
+        .row_addrs()
+        .unwrap()
+        .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
         .collect();
     assert_eq!(
-        kept.len(),
-        2,
-        "both reclustered segments must survive a destination-F10-scoped prune"
+        fragments,
+        std::collections::BTreeSet::from([10]),
+        "an F10-scoped search must return only F10 rows, from both contributors, and no F11 rows"
     );
-    // And opening under that scope succeeds (both segments open + remap).
-    open_scalar_index_segments(
-        &dataset,
-        "i",
-        "i_idx",
-        Some(&scope_f10),
-        &lance_index::metrics::NoOpMetricsCollector,
-    )
-    .await
-    .unwrap();
 
-    // A scope disjoint from the effective coverage prunes every segment, so no
-    // usable index remains. This proves the prune actually fires (an "open all"
-    // implementation would instead open the segments regardless).
-    let pruned = open_scalar_index_segments(
-        &dataset,
-        "i",
-        "i_idx",
-        Some(&RoaringBitmap::from_iter([999])),
-        &lance_index::metrics::NoOpMetricsCollector,
-    )
-    .await;
+    // A scope disjoint from the effective coverage prunes every segment.
     assert!(
-        pruned.is_err(),
+        open_scalar_index_segments(
+            &dataset,
+            "i",
+            "i_idx",
+            Some(&RoaringBitmap::from_iter([999])),
+            &lance_index::metrics::NoOpMetricsCollector,
+        )
+        .await
+        .is_err(),
         "a scope disjoint from effective coverage must prune every segment"
     );
 }
@@ -2197,8 +2239,6 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
 // served a listing trimmed to the first scope.
 #[tokio::test]
 async fn fragment_scope_cache_hit_is_scope_independent() {
-    use crate::index::scalar_logical::scalar_index_fragment_bitmap;
-
     let mut dataset = fixture_with_index(IndexType::BTree).await;
     let (transition, destinations) = prepare(&dataset).await;
     let content = InlineContent {
@@ -2208,38 +2248,59 @@ async fn fragment_scope_cache_hit_is_scope_independent() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    // Cold: first read derives and caches the full effective listing {10,11}.
-    let cold = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(cold, RoaringBitmap::from_iter([10, 11]));
+    // After the parity recluster the destinations both hold predicate-satisfying
+    // rows: F10 = even values {0,2,4,6}, F11 = odd values {1,3,5,7}.
+    let fragment = |id: u32| {
+        dataset
+            .fragments()
+            .iter()
+            .find(|f| f.id as u32 == id)
+            .unwrap()
+            .clone()
+    };
 
-    // Warm: a second read on the same snapshot hits the cache and must return
-    // the SAME full listing, not a scope-trimmed one.
-    let warm = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(warm, RoaringBitmap::from_iter([10, 11]));
+    // Collect the sorted `i` values a scan returns for one destination fragment,
+    // with the scalar index either used or disabled. Every query runs on the SAME
+    // dataset, so the first (F10) query populates the derived-listing cache and
+    // the second (F11) query hits it.
+    let values_for = |frag_id: u32, use_scalar: bool| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.with_fragments(vec![fragment(frag_id)]);
+            scan.filter("i >= 0").unwrap();
+            scan.use_scalar_index(use_scalar);
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            values
+        }
+    };
 
-    // The derived listing is served from cache (identical Arc) across calls.
+    // F10 first (cold cache), then F11 (warm cache). Each scoped, index-using
+    // result must equal the same fragment scanned with the index disabled, by
+    // value (row identity + multiplicity). A cache poisoned by the F10 scope would
+    // make the F11 result wrong.
+    let f10_index = values_for(10, true).await;
+    let f10_scan = values_for(10, false).await;
+    let f11_index = values_for(11, true).await;
+    let f11_scan = values_for(11, false).await;
+
+    assert_eq!(f10_index, f10_scan, "F10 scoped result must match a scan");
+    assert_eq!(
+        f11_index, f11_scan,
+        "F11 scoped result must match a scan after the F10 query populated the cache"
+    );
+    assert_eq!(f10_index, vec![0, 2, 4, 6], "{f10_index:?}");
+    assert_eq!(f11_index, vec![1, 3, 5, 7], "{f11_index:?}");
+    // No cross-scope leak: F10's rows never appear in F11's result and vice versa.
+    assert!(f10_index.iter().all(|v| v % 2 == 0));
+    assert!(f11_index.iter().all(|v| v % 2 == 1));
+
+    // The derived listing is still served from the cache (same Arc) across calls.
     let first = dataset.load_indices().await.unwrap();
     let second = dataset.load_indices().await.unwrap();
     assert!(Arc::ptr_eq(&first, &second));
-
-    // Every value is still found correctly on the reclustered snapshot, so the
-    // cache did not drop or stale any destination's rows.
-    for value in 0..8 {
-        assert_eq!(
-            dataset
-                .count_rows(Some(format!("i = {value}")))
-                .await
-                .unwrap(),
-            1,
-            "value {value}"
-        );
-    }
 }
 
 // P1 guard witness: index coverage PROJECTED onto live destinations {10,11}
@@ -2306,4 +2367,114 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
             );
         }
     }
+}
+
+// Combination: vector search with a SCALAR prefilter over an FRI-reclustered
+// dataset. With no explicit .with_fragments(), the prefilter's ScalarIndexExec
+// gets its fragment_scope from partition_frags_by_coverage (FRI effective
+// coverage), and each opened scalar segment is remapped through the FRI seam.
+// The prefiltered result must match a scan that does not use the scalar index,
+// proving the fragment-scope pruning and FRI translation compose without
+// dropping rows.
+#[tokio::test]
+async fn vector_prefilter_composes_scope_pruning_with_fri_translation() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+
+    // Per-fragment vector segments (so a fragment-scoped ANN needs each
+    // contributor) plus a scalar BTree index on `i` for the prefilter.
+    let vparams = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    let frag_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let mut vsegments = Vec::new();
+    for fragment in &frag_ids {
+        vsegments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &vparams)
+                .name("vector_idx".into())
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("vector_idx", "vector", vsegments)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Recluster the sources, then run a vector search with a scalar prefilter and
+    // NO explicit fragment selection, so the prefilter scope comes from FRI
+    // coverage (scanner partition_frags_by_coverage -> with_fragment_scope).
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .clone();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let run = |use_scalar: bool| {
+        let query = query.clone();
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 8).unwrap();
+            scan.filter("i >= 4").unwrap();
+            scan.prefilter(true);
+            scan.use_scalar_index(use_scalar);
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            values
+        }
+    };
+
+    // Confirm the query actually reaches the scoped scalar prefilter
+    // (ScalarIndexQuery feeding the ANN prefilter), not a filtered-read fallback.
+    let plan = {
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 8).unwrap();
+        scan.filter("i >= 4").unwrap();
+        scan.prefilter(true);
+        scan.explain_plan(false).await.unwrap()
+    };
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert!(plan.contains("ANN"), "{plan}");
+
+    // The prefiltered result (scalar index + fragment-scope + FRI translation)
+    // must equal the same query with the scalar index disabled.
+    let with_index = run(true).await;
+    let without_index = run(false).await;
+    assert_eq!(with_index, without_index);
+    assert_eq!(without_index, vec![4, 5, 6, 7], "{without_index:?}");
 }
