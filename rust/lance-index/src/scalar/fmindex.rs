@@ -32,6 +32,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
@@ -101,12 +102,7 @@ static LANCE_FMINDEX_WRITE_QUEUE_SIZE: std::sync::LazyLock<usize> =
 static LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         std::env::var("LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS")
-            .map(|value| {
-                matches!(
-                    value.as_str(),
-                    "1" | "true" | "TRUE" | "True" | "yes" | "YES"
-                )
-            })
+            .map(|value| str_is_truthy(&value))
             .unwrap_or(false)
     });
 static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
@@ -1646,6 +1642,11 @@ impl ScalarIndex for FMIndexScalarIndex {
             )),
         }
     }
+
+    fn results_are_row_addresses(&self) -> bool {
+        true
+    }
+
     fn can_remap(&self) -> bool {
         false
     }

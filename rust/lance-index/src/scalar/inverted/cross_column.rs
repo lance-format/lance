@@ -1310,7 +1310,7 @@ fn score_cross_column_sources(
         debug_assert!(slot.is_none());
         *slot = Some(Box::new(MaterializedScorer::try_new(rows)?));
     }
-    let mut scorer = plan.build(&mut leaf_scorers, metrics.as_ref())?;
+    let mut scorer = plan.build(&mut leaf_scorers)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "cross-column compound FTS scorer did not consume every prepared leaf",
@@ -1501,7 +1501,6 @@ pub async fn cross_column_compound_search(
     let staged_candidates = if let Some((generator_leaf_ordinals, candidate_budget)) =
         staged_generator
     {
-        metrics.record_cross_column_staged_attempts(1);
         let generator_leaf_set = generator_leaf_ordinals
             .iter()
             .copied()
@@ -1557,7 +1556,7 @@ pub async fn cross_column_compound_search(
             )
         })
         .await?;
-        let staged = if let Some(local_candidates) = local_candidates {
+        if let Some(local_candidates) = local_candidates {
             let resolved = stream::iter(
                 local_candidates
                     .into_iter()
@@ -1578,17 +1577,6 @@ pub async fn cross_column_compound_search(
             .await?
         } else {
             None
-        };
-        match staged {
-            Some(candidates) => {
-                metrics.record_cross_column_staged_successes(1);
-                metrics.record_cross_column_staged_candidates(candidates.addresses.len());
-                Some(candidates)
-            }
-            None => {
-                metrics.record_cross_column_staged_fallbacks(1);
-                None
-            }
         }
     } else {
         None

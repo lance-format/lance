@@ -933,6 +933,14 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn requires_payload(&self) -> bool {
         true
     }
+
+    /// Inspect a block for an exact payload-derived value count when supported.
+    ///
+    /// This must not materialize the decoded values. `None` means the encoding requires an
+    /// external count or cannot safely prove one from this payload.
+    fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {
@@ -1022,7 +1030,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)?))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
                 rle,
@@ -1077,7 +1085,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
-            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1173,7 +1181,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
             Compression::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
             Compression::OutOfLineBitpacking(out_of_line) => {
                 // Extract the compressed bit width from the values encoding

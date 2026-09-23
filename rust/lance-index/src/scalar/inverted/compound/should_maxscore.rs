@@ -22,14 +22,6 @@ struct ReportedBounds {
     bounds: ScoreBounds,
 }
 
-#[derive(Default)]
-struct MaxScoreWork {
-    skipped_windows: usize,
-    bound_recomputations: usize,
-    essential_evaluations: usize,
-    non_essential_evaluations: usize,
-}
-
 /// Exact windowed MAXSCORE scorer for same-column Boolean SHOULD sums.
 ///
 /// List-wide maxima split clauses into a non-essential prefix whose total
@@ -53,8 +45,6 @@ pub(super) struct ShouldMaxScoreScorer<'a> {
     essential: Vec<bool>,
     bound_order: Vec<usize>,
     child_scores: Vec<Option<f32>>,
-    metrics: Option<&'a dyn MetricsCollector>,
-    work: MaxScoreWork,
 }
 
 impl<'a> ShouldMaxScoreScorer<'a> {
@@ -78,11 +68,7 @@ impl<'a> ShouldMaxScoreScorer<'a> {
             .then_some(bounds)
     }
 
-    pub(super) fn new(
-        children: Vec<BoxScorer<'a>>,
-        global_upper_bounds: Vec<f32>,
-        metrics: Option<&'a dyn MetricsCollector>,
-    ) -> Self {
+    pub(super) fn new(children: Vec<BoxScorer<'a>>, global_upper_bounds: Vec<f32>) -> Self {
         debug_assert_eq!(children.len(), global_upper_bounds.len());
         let num_children = children.len();
         let global_score_upper_bound = Self::sum_uppers(global_upper_bounds.iter());
@@ -109,8 +95,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
             essential: vec![true; num_children],
             bound_order,
             child_scores: vec![None; num_children],
-            metrics,
-            work: MaxScoreWork::default(),
         }
     }
 
@@ -228,9 +212,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
 
         self.select_essential_children();
         if !self.essential.iter().any(|is_essential| *is_essential) {
-            if self.children.iter().any(|child| child.doc().is_some()) {
-                self.work.skipped_windows = self.work.skipped_windows.saturating_add(1);
-            }
             self.exhaust();
             return Ok(());
         }
@@ -259,9 +240,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
             }
         }
         if !has_active_child {
-            if self.children.iter().any(|child| child.doc().is_some()) {
-                self.work.skipped_windows = self.work.skipped_windows.saturating_add(1);
-            }
             self.exhaust();
             return Ok(());
         }
@@ -274,7 +252,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
         for (index, child) in self.children.iter_mut().enumerate() {
             if self.essential[index] && child.doc().is_some_and(|doc| doc <= up_to) {
                 let bounds = child.score_bounds(up_to)?;
-                self.work.bound_recomputations = self.work.bound_recomputations.saturating_add(1);
                 if Self::usable_bounds(bounds) {
                     self.child_upper_bounds[index] =
                         bounds.upper.max(0.0).min(self.global_upper_bounds[index]);
@@ -318,7 +295,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
                 .ok_or_else(|| Error::internal("FTS SHOULD scorer did not prepare a window"))?;
 
             if window.combined_upper < self.min_competitive_score {
-                self.work.skipped_windows = self.work.skipped_windows.saturating_add(1);
                 if window.up_to == u64::MAX {
                     return Ok(self.exhaust());
                 }
@@ -344,14 +320,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
             }
 
             if window.up_to == u64::MAX {
-                if self
-                    .children
-                    .iter()
-                    .zip(&self.essential)
-                    .any(|(child, is_essential)| !*is_essential && child.doc().is_some())
-                {
-                    self.work.skipped_windows = self.work.skipped_windows.saturating_add(1);
-                }
                 return Ok(self.exhaust());
             }
             target = window.up_to + 1;
@@ -387,7 +355,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
             if !self.essential[index] || self.children[index].doc() != Some(current) {
                 continue;
             }
-            self.work.essential_evaluations = self.work.essential_evaluations.saturating_add(1);
             if self.children[index].matches()? {
                 self.child_scores[index] = Some(self.children[index].score()?);
             }
@@ -398,8 +365,6 @@ impl<'a> ShouldMaxScoreScorer<'a> {
                 if self.essential[index] || self.child_upper_bounds[index] == 0.0 {
                     continue;
                 }
-                self.work.non_essential_evaluations =
-                    self.work.non_essential_evaluations.saturating_add(1);
                 if self.children[index].doc().is_some_and(|doc| doc < current) {
                     self.children[index].advance(current)?;
                 }
@@ -614,17 +579,6 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
             .any(|child| child.supports_doc_local_confirmation_pruning())
     }
 
-    fn record_confirmation_avoided(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        for child in &mut self.children {
-            if child.doc() == Some(current) {
-                child.record_confirmation_avoided();
-            }
-        }
-    }
-
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }
@@ -638,18 +592,5 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
 
     fn scores_non_negative(&self) -> bool {
         true
-    }
-}
-
-impl Drop for ShouldMaxScoreScorer<'_> {
-    fn drop(&mut self) {
-        let Some(metrics) = self.metrics else {
-            return;
-        };
-        metrics.record_compound_should_skipped_windows(self.work.skipped_windows);
-        metrics.record_compound_should_bound_recomputations(self.work.bound_recomputations);
-        metrics.record_compound_should_essential_evaluations(self.work.essential_evaluations);
-        metrics
-            .record_compound_should_non_essential_evaluations(self.work.non_essential_evaluations);
     }
 }

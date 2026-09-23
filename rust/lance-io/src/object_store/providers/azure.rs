@@ -23,9 +23,10 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
+    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
 };
 use lance_core::error::{Error, Result};
+use lance_core::utils::parse::str_is_truthy;
 
 #[derive(Default, Debug)]
 pub struct AzureBlobStoreProvider;
@@ -191,7 +192,10 @@ impl AzureBlobStoreProvider {
 
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::object_store::metrics_base(&store_prefix, base_path),
+        ));
 
         Ok(Arc::new(builder.build()?))
     }
@@ -253,17 +257,15 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v.as_str() == "true")
+            .map(|v| str_is_truthy(v.as_str()))
             .unwrap_or(false);
 
         let accessor = params.get_accessor();
 
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let throttle_state = if throttle_config.is_disabled() {
-            None
-        } else {
-            Some(AimdThrottleState::new(throttle_config)?)
-        };
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.

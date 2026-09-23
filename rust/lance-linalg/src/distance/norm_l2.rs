@@ -12,6 +12,10 @@ use half::{bf16, f16};
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Float, Num};
 
+#[cfg(feature = "fp16kernels")]
+use super::HalfBackend;
+use super::{HALF_KERNELS_COMPILED, HalfType, half_backend, x86_half_features};
+
 /// L2 normalization
 pub trait Normalize: Num {
     /// L2 Normalization over a Vector.
@@ -48,9 +52,15 @@ impl Normalize for u8 {
 impl Normalize for f16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::F16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 kernel::norm_l2_f16_neon(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(
@@ -58,24 +68,24 @@ impl Normalize for f16 {
                 kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 kernel::norm_l2_f16_avx512(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 kernel::norm_l2_f16_lasx(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 kernel::norm_l2_f16_lsx(vector.as_ptr(), vector.len() as u32)
             },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the f16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
+            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+            // route; this fallback only extends the tiers the C kernel already
+            // served to Avx512FP16 after checking F16C and FMA.
             _ => norm_l2_impl::<Self, f32, 32>(vector),
         }
     }
@@ -102,9 +112,15 @@ mod bf16_kernel {
 impl Normalize for bf16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::Bf16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 bf16_kernel::norm_l2_bf16_neon(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(
@@ -112,19 +128,19 @@ impl Normalize for bf16 {
                 kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 bf16_kernel::norm_l2_bf16_avx512(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 bf16_kernel::norm_l2_bf16_avx2(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 bf16_kernel::norm_l2_bf16_lasx(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 bf16_kernel::norm_l2_bf16_lsx(vector.as_ptr(), vector.len() as u32)
             },
             // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
@@ -439,6 +455,11 @@ pub fn norm_l2_fsl(fsl: &FixedSizeListArray) -> crate::Result<Float32Array> {
     })
 }
 
+/// Squared L2 norm of every vector in a [FixedSizeListArray].
+///
+/// Each square is accumulated in `f32` (or wider) rather than in the element
+/// type: squaring an `f16` saturates to `inf` at `|x| >= 256` and to zero at
+/// `|x| <= 1.726e-4`.
 pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
     let dim = fsl.value_length() as usize;
     match fsl.value_type() {
@@ -447,7 +468,14 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
             .as_primitive::<Float16Type>()
             .values()
             .chunks_exact(dim)
-            .map(|v| v.iter().map(|v| v * v).sum::<f16>().to_f32())
+            .map(|v| {
+                v.iter()
+                    .map(|v| {
+                        let v = v.to_f32();
+                        v * v
+                    })
+                    .sum::<f32>()
+            })
             .collect::<Vec<_>>(),
         DataType::Float32 => fsl
             .values()
@@ -712,5 +740,42 @@ mod tests {
             .unwrap();
         let err = norm_l2_fsl(&fsl).unwrap_err().to_string();
         assert!(err.contains("float16/float32/float64"), "got: {err}");
+    }
+
+    /// `norm_squared_fsl` must accumulate in a type wider than the element type.
+    /// `f16 * f16` rounds each square back to `f16`, which saturates to `inf` at
+    /// `|x| >= 256` and to zero at `|x| <= 1.726e-4`.
+    #[test]
+    fn test_norm_squared_fsl_f16_accumulates_wide() {
+        use arrow_array::Float16Array;
+        use arrow_schema::Field;
+        use std::sync::Arc;
+
+        // dim 2: row 0 overflows at the square, row 1 underflows at the square.
+        let raw = [256.0f32, 0.0, 1e-4, 1e-4];
+        let values = Float16Array::from_iter_values(raw.map(f16::from_f32));
+        let field = Arc::new(Field::new("item", DataType::Float16, true));
+        let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        let got = norm_squared_fsl(&fsl);
+        // Independent reference: square and sum the same f16 inputs in f64.
+        let expected = raw
+            .chunks(2)
+            .map(|c| {
+                c.iter()
+                    .map(|&x| {
+                        let x = f16::from_f32(x).to_f64();
+                        x * x
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+
+        for (row, (&got, &want)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                approx::relative_eq!(got as f64, want, max_relative = 1e-3),
+                "row {row}: got {got}, want {want}"
+            );
+        }
     }
 }

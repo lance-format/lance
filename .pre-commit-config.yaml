@@ -28,3 +28,9 @@ repos:
         language: system
         files: '(^|/)Cargo\.(toml|lock)$'
         pass_filenames: false
+
+      - id: proto-comment-style
+        name: Multi-line .proto comments use /* ... */
+        entry: python3 ci/check_proto_comments.py --fix
+        language: system
+        files: '\.proto$'

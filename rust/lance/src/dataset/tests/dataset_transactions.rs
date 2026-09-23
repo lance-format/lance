@@ -225,6 +225,35 @@ async fn test_session_store_registry() {
     assert_eq!(registry.active_stores().len(), 0);
 }
 
+#[test]
+fn test_decode_inline_transaction_tolerates_unknown_operations() {
+    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // A transaction written by a newer version of Lance may carry an operation
+    // this version cannot decode; prost surfaces it as a missing oneof. This
+    // must not fail (it would prevent opening the dataset), only skip caching.
+    let unknown_operation = pb::Transaction {
+        read_version: 1,
+        uuid: "test".to_string(),
+        ..Default::default()
+    };
+    assert!(decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).is_none());
+
+    // Corrupt bytes are likewise tolerated.
+    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
+
+    // A decodable transaction is returned.
+    let known = pb::Transaction::from(&Transaction::new(
+        1,
+        Operation::Append { fragments: vec![] },
+        None,
+    ));
+    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Append { .. }));
+}
+
 #[tokio::test]
 async fn test_migrate_v2_manifest_paths() {
     let test_uri = TempStrDir::default();
@@ -427,6 +456,8 @@ async fn test_inline_transaction() {
         &ManifestWriteConfig::default(),
         ds.manifest_location.naming_scheme,
         None,
+        // Previously classified from a None inline copy, which validated.
+        true,
     )
     .await
     .unwrap();

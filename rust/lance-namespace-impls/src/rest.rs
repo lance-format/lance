@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::OpsMetrics;
+use crate::merge_insert_on_columns;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -50,6 +51,7 @@ use lance_namespace::models::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
@@ -290,13 +292,13 @@ impl RestNamespaceBuilder {
         let ssl_ca_cert = properties.get("tls.ssl_ca_cert").cloned();
         let assert_hostname = properties
             .get("tls.assert_hostname")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {
@@ -1010,14 +1012,13 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
 
-        let on = request.on.as_deref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge insert".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let path = format!("/v1/table/{}/merge_insert", encoded_id);
-        let mut query = vec![("delimiter", self.delimiter.as_str()), ("on", on)];
+        // The `on` query parameter uses `style: form, explode: true`, so a composite key
+        // repeats the parameter once per column.
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        query.extend(on.iter().map(|column| ("on", column.as_str())));
 
         let when_matched_update_all_str;
         if let Some(v) = request.when_matched_update_all {

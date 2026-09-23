@@ -4,6 +4,8 @@
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
+
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -46,7 +48,9 @@ pub struct InlineRowIds {
 }
 
 struct InlineRowIdsInner {
-    data: Vec<u8>,
+    /// `Bytes` rather than `Vec<u8>`: when the manifest is decoded from the
+    /// fetched buffer this is a slice of that buffer, not a copy of it.
+    data: Bytes,
     digest: OnceLock<[u8; 32]>,
 }
 
@@ -57,16 +61,27 @@ impl InlineRowIds {
             .digest
             .get_or_init(|| blake3::hash(&self.inner.data).into())
     }
+
+    /// The encoded bytes, sharing the underlying allocation.
+    pub fn bytes(&self) -> &Bytes {
+        &self.inner.data
+    }
 }
 
-impl From<Vec<u8>> for InlineRowIds {
-    fn from(data: Vec<u8>) -> Self {
+impl From<Bytes> for InlineRowIds {
+    fn from(data: Bytes) -> Self {
         Self {
             inner: Arc::new(InlineRowIdsInner {
                 data,
                 digest: OnceLock::new(),
             }),
         }
+    }
+}
+
+impl From<Vec<u8>> for InlineRowIds {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from(Bytes::from(data))
     }
 }
 
@@ -189,6 +204,18 @@ mod tests {
         let fresh_clone = fresh.clone();
         let via_clone = *fresh_clone.digest();
         assert_eq!(fresh.digest(), &via_clone);
+    }
+
+    #[test]
+    fn inline_row_ids_from_bytes_shares_the_allocation() {
+        let buffer = Bytes::from((0..64u8).collect::<Vec<u8>>());
+        let slice = buffer.slice(16..48);
+        let inline = InlineRowIds::from(slice.clone());
+        assert_eq!(&*inline, &buffer[16..48]);
+        assert_eq!(inline.bytes().as_ptr(), slice.as_ptr());
+        // The bytes are charged by length, whatever buffer they slice.
+        let shorter = InlineRowIds::from(buffer.slice(0..8));
+        assert_eq!(inline.deep_size_of() - shorter.deep_size_of(), 32 - 8);
     }
 
     #[test]

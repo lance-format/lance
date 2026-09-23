@@ -3,7 +3,8 @@
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes};
+use futures::TryStreamExt;
 use lance_file::{
     version::ConcreteFileVersion,
     versions::v1::{
@@ -21,7 +22,7 @@ use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
-    utils::read_message,
+    utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
 use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
@@ -75,38 +76,55 @@ pub async fn read_manifest(
         // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
-        // The prefetch only captured part of the manifest. We need to make an
-        // additional range request to read the remainder.
-        let mut buf2: BytesMut = object_store
-            .inner
-            .get_range(
-                path,
-                Range {
-                    start: manifest_pos as u64,
-                    end: file_size - PREFETCH_SIZE,
-                },
-            )
-            .await?
-            .into_iter()
-            .collect();
-        buf2.extend_from_slice(&buf);
-        buf2.freeze()
+        // The prefetch only captured part of the manifest. Fetch the remainder
+        // as concurrent chunked range requests: a single GET is limited to one
+        // connection's throughput, which dominates load time for manifests of
+        // datasets with many fragments.
+        let reader = object_store
+            .open_with_size(path, file_size as usize)
+            .await?;
+        let mut chunks = read_range_in_chunks(
+            reader.as_ref(),
+            manifest_pos..(file_size - PREFETCH_SIZE) as usize,
+            METADATA_READ_CHUNK_SIZE,
+        );
+        // Decode straight from the chunks rather than re-copying ~all of the
+        // file into one buffer; see `ChunkedBuf`.
+        let mut chunked = ChunkedBuf::default();
+        while let Some(chunk) = chunks.try_next().await? {
+            chunked.push(chunk);
+        }
+        chunked.push(buf);
+        // A u32 length prefix in front, the 16 byte footer behind.
+        if chunked.remaining() < 20 {
+            return Err(Error::corrupt_file(
+                path.clone(),
+                "Invalid format: manifest shorter than its length prefix and footer".to_string(),
+            ));
+        }
+        let recorded_length = chunked.get_u32_le() as usize;
+        chunked.truncate(chunked.remaining() - 16);
+        return decode_manifest(chunked, recorded_length);
     };
 
     let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
     // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
+    decode_manifest(buf, recorded_length)
+}
 
-    if buf.len() != recorded_length {
+fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
+    if buf.remaining() != recorded_length {
         return Err(Error::invalid_input(format!(
             "Invalid format: manifest length does not match. Expected {}, got {}",
             recorded_length,
-            buf.len()
+            buf.remaining()
         )));
     }
-
     let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let mut manifest = Manifest::try_from(proto)?;
+    manifest.detach_sparse_inline_row_ids(recorded_length);
+    Ok(manifest)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -261,11 +279,8 @@ mod test {
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(manifest_min_size)
-            .map(char::from)
-            .collect();
+        // A cheap deterministic filler; only the size matters for these tests.
+        let long_name: String = "a".repeat(manifest_min_size);
 
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
@@ -301,6 +316,13 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_larger_than_read_chunk() {
+        // Crosses METADATA_READ_CHUNK_SIZE so the manifest body is fetched as
+        // multiple concurrent chunks and reassembled with the prefetched tail.
+        test_roundtrip_manifest(1000, METADATA_READ_CHUNK_SIZE + 4 * 1024 * 1024).await;
     }
 
     #[tokio::test]

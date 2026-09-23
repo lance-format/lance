@@ -285,9 +285,6 @@ pub(super) trait ComposableScorer: Send {
         false
     }
 
-    /// Report pending two-phase confirmations skipped by a doc-local bound.
-    fn record_confirmation_avoided(&mut self) {}
-
     fn matches(&mut self) -> Result<bool> {
         Ok(true)
     }
@@ -693,11 +690,7 @@ impl CompoundScorerPlan {
         }
     }
 
-    pub(super) fn build<'a>(
-        &self,
-        leaves: &mut [Option<BoxScorer<'a>>],
-        metrics: &'a dyn MetricsCollector,
-    ) -> Result<BoxScorer<'a>> {
+    pub(super) fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -715,14 +708,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves, metrics)?,
-                negative.build(leaves, metrics)?,
+                positive.build(leaves)?,
+                negative.build(leaves)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -730,19 +723,18 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new_with_metrics(
+            } => Ok(Box::new(BooleanScorer::try_new(
                 should
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 must.iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 must_not
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
-                Some(metrics),
             )?)),
         }
     }
@@ -798,10 +790,6 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.match_cost().is_some()
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        WandCursor::record_confirmation_avoided(self)
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -1283,10 +1271,6 @@ impl ComposableScorer for RowAddressScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.source.supports_doc_local_confirmation_pruning()
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        self.source.record_confirmation_avoided()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -1842,12 +1826,6 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
             .any(|source| source.supports_doc_local_confirmation_pruning())
     }
 
-    fn record_confirmation_avoided(&mut self) {
-        if let Ok(source) = self.current_source_mut() {
-            source.record_confirmation_avoided();
-        }
-    }
-
     fn matches(&mut self) -> Result<bool> {
         self.current_source_mut()?.matches()
     }
@@ -1965,7 +1943,6 @@ pub(super) struct TopKCollector<K = u64> {
     heap: BinaryHeap<HeapRow<K>>,
     competitive_score: Arc<CompetitiveScore>,
     tie_handling: TieHandling,
-    peak_buffered: usize,
 }
 
 impl<K: Copy + Ord> TopKCollector<K> {
@@ -2003,7 +1980,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
             heap: BinaryHeap::with_capacity(limit.min(DEFAULT_BLOCK_SIZE)),
             competitive_score,
             tie_handling,
-            peak_buffered: 0,
         }
     }
 
@@ -2054,7 +2030,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 }
             }
         }
-        self.peak_buffered = self.peak_buffered.max(self.heap.len());
         self.raise_competitive_score();
         CollectionStatus::Complete
     }
@@ -2131,7 +2106,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
                     .current_score_upper_bound()?
                     .is_some_and(|upper| upper < min_score)
             {
-                scorer.record_confirmation_avoided();
                 doc = scorer.next()?;
                 continue;
             }
@@ -2187,6 +2161,40 @@ impl TopKCollector<u64> {
         self.collect_mapped(scorer, Ok)?;
         Ok(self.into_rows())
     }
+}
+
+/// Evaluate a compound query over exact, materialized leaf result sets.
+///
+/// This is the bridge used by query-local residual postings: it keeps Boolean,
+/// Boost, and MultiMatch semantics in the same scorer tree as the on-disk
+/// compound path while allowing a different posting source.
+#[doc(hidden)]
+pub fn materialized_compound_top_k(
+    query: &FtsQuery,
+    leaves: Vec<Vec<(u64, f32)>>,
+    limit: usize,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let mut leaf_count = 0;
+    let plan = CompoundScorerPlan::from_query(query, &mut leaf_count)?;
+    if leaf_count != leaves.len() {
+        return Err(Error::internal(format!(
+            "compound FTS planned {leaf_count} leaves but received {} materialized leaves",
+            leaves.len()
+        )));
+    }
+    let mut scorers = leaves
+        .into_iter()
+        .map(|rows| {
+            let rows = rows
+                .into_iter()
+                .map(|(row_id, score)| ScoredRow { row_id, score })
+                .collect();
+            MaterializedScorer::try_new(rows).map(|scorer| Some(Box::new(scorer) as BoxScorer<'_>))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut scorer = plan.build(&mut scorers)?;
+    let rows = TopKCollector::new(limit).collect(scorer.as_mut())?;
+    Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2347,10 +2355,6 @@ impl ComposableScorer for ScaleScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.child.supports_doc_local_confirmation_pruning()
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        self.child.record_confirmation_avoided()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -2596,17 +2600,6 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         self.children
             .iter()
             .any(|child| child.supports_doc_local_confirmation_pruning())
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        for child in &mut self.children {
-            if child.doc() == Some(current) {
-                child.record_confirmation_avoided();
-            }
-        }
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -2882,17 +2875,6 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
             .any(|child| child.supports_doc_local_confirmation_pruning())
     }
 
-    fn record_confirmation_avoided(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        for child in &mut self.children {
-            if child.doc() == Some(current) {
-                child.record_confirmation_avoided();
-            }
-        }
-    }
-
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }
@@ -3032,10 +3014,6 @@ impl ComposableScorer for BoostScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.positive.supports_doc_local_confirmation_pruning()
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        self.positive.record_confirmation_avoided()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -3408,16 +3386,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
             || self.optional.supports_doc_local_confirmation_pruning()
     }
 
-    fn record_confirmation_avoided(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        self.required.record_confirmation_avoided();
-        if self.optional.doc() == Some(current) {
-            self.optional.record_confirmation_avoided();
-        }
-    }
-
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }
@@ -3448,20 +3416,10 @@ pub(super) struct BooleanScorer<'a> {
 }
 
 impl<'a> BooleanScorer<'a> {
-    #[cfg(test)]
     pub(super) fn try_new(
         should: Vec<BoxScorer<'a>>,
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
-    ) -> Result<Self> {
-        Self::try_new_with_metrics(should, must, must_not, None)
-    }
-
-    fn try_new_with_metrics(
-        should: Vec<BoxScorer<'a>>,
-        must: Vec<BoxScorer<'a>>,
-        must_not: Vec<BoxScorer<'a>>,
-        metrics: Option<&'a dyn MetricsCollector>,
     ) -> Result<Self> {
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
@@ -3470,7 +3428,7 @@ impl<'a> BooleanScorer<'a> {
                 ));
             }
             let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
-                Box::new(ShouldMaxScoreScorer::new(should, global_bounds, metrics)) as BoxScorer<'a>
+                Box::new(ShouldMaxScoreScorer::new(should, global_bounds)) as BoxScorer<'a>
             } else {
                 Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
                     as BoxScorer<'a>
@@ -3721,23 +3679,6 @@ impl ComposableScorer for BooleanScorer<'_> {
 
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.defer_confirmation
-    }
-
-    fn record_confirmation_avoided(&mut self) {
-        let Some(current) = self.current else {
-            return;
-        };
-        self.driver.record_confirmation_avoided();
-        if let Some(optional) = &mut self.optional
-            && optional.doc() == Some(current)
-        {
-            optional.record_confirmation_avoided();
-        }
-        if let Some(prohibited) = &mut self.prohibited
-            && prohibited.doc() == Some(current)
-        {
-            prohibited.record_confirmation_avoided();
-        }
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -4081,7 +4022,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
+    let mut scorer = plan.build(&mut leaf_scorers)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -4127,7 +4068,6 @@ fn collect_loaded_partitions(
             } => {
                 let documents = ModernWandDocuments::filtered(lengths.as_ref(), &visibility);
                 if let Some(projection) = projection {
-                    let mut addresses_resolved = 0;
                     let status = collect_partition_with_documents(
                         &documents,
                         leaves,
@@ -4146,12 +4086,10 @@ fn collect_loaded_partitions(
                                     doc_id.get()
                                 ))
                             })?;
-                            addresses_resolved += 1;
                             Ok(row_id)
                         },
                     )?;
                     debug_assert_eq!(status, CollectionStatus::Complete);
-                    metrics.record_compound_addresses_resolved(addresses_resolved);
                 } else {
                     let max_buffered = collector
                         .limit
@@ -4175,7 +4113,6 @@ fn collect_loaded_partitions(
                             })?))
                         },
                     )?;
-                    metrics.record_compound_peak_buffered_candidates(local_collector.peak_buffered);
                     let boundary = match status {
                         CollectionStatus::Complete => {
                             PartitionCollectionBoundary::Deferred(DeferredCompoundRows {
@@ -4184,7 +4121,6 @@ fn collect_loaded_partitions(
                             })
                         }
                         CollectionStatus::ScoreFloorOverflow => {
-                            metrics.record_compound_score_floor_overflows(1);
                             PartitionCollectionBoundary::Overflow(OverflowedCompoundPartition {
                                 segment_ordinal,
                                 partition_ordinal,
@@ -4193,7 +4129,6 @@ fn collect_loaded_partitions(
                             })
                         }
                     };
-                    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
                     return Ok(CollectedPartitions {
                         collector,
                         remaining: partitions.collect(),
@@ -4203,7 +4138,6 @@ fn collect_loaded_partitions(
             }
         }
     }
-    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
     Ok(CollectedPartitions {
         collector,
         remaining: Vec::new(),
@@ -4214,7 +4148,6 @@ fn collect_loaded_partitions(
 async fn merge_resolved_compound_rows(
     collector: &mut TopKCollector<u64>,
     deferred: DeferredCompoundRows,
-    metrics: &dyn MetricsCollector,
 ) -> Result<()> {
     for rows in deferred.rows.chunks(SCORE_FLOOR_RESOLUTION_BATCH_SIZE) {
         let doc_ids = rows.iter().map(|row| row.row_id).collect::<Vec<_>>();
@@ -4226,9 +4159,6 @@ async fn merge_resolved_compound_rows(
                 rows.len()
             )));
         }
-        metrics.record_compound_address_resolution_batches(1);
-        metrics.record_compound_peak_address_resolution_batch_size(rows.len());
-        metrics.record_compound_addresses_resolved(addresses.len());
         for (row, row_id) in rows.iter().zip(addresses) {
             let status = collector.insert(ScoredRow {
                 row_id,
@@ -4237,7 +4167,6 @@ async fn merge_resolved_compound_rows(
             debug_assert_eq!(status, CollectionStatus::Complete);
         }
     }
-    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
     Ok(())
 }
 
@@ -4484,8 +4413,7 @@ async fn compound_search_impl(
             partitions = collected.remaining;
             match collected.boundary {
                 Some(PartitionCollectionBoundary::Deferred(deferred)) => {
-                    merge_resolved_compound_rows(&mut collector, deferred, metrics.as_ref())
-                        .await?;
+                    merge_resolved_compound_rows(&mut collector, deferred).await?;
                 }
                 Some(PartitionCollectionBoundary::Overflow(overflow)) => {
                     let retry = reload_compound_partition_with_projection(
@@ -4521,6 +4449,7 @@ mod tests {
     use super::super::scorer::Scorer;
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::inverted::query::MultiMatchQuery;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -4531,6 +4460,25 @@ mod tests {
 
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    #[test]
+    fn materialized_compound_top_k_preserves_multimatch_and_tie_order() {
+        let query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+            ],
+        });
+        let (row_ids, scores) = materialized_compound_top_k(
+            &query,
+            vec![vec![(7, 1.0), (3, 2.0)], vec![(7, 3.0), (5, 3.0)]],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(row_ids, vec![5, 7]);
+        assert_eq!(scores, vec![3.0, 3.0]);
     }
 
     fn zero_weight_wand<'a>(
@@ -4571,101 +4519,9 @@ mod tests {
         }
     }
 
-    fn should_maxscore<'a>(
-        children: Vec<BoxScorer<'a>>,
-        metrics: Option<&'a dyn MetricsCollector>,
-    ) -> ShouldMaxScoreScorer<'a> {
+    fn should_maxscore<'a>(children: Vec<BoxScorer<'a>>) -> ShouldMaxScoreScorer<'a> {
         let global_bounds = ShouldMaxScoreScorer::global_bounds(&children).unwrap();
-        ShouldMaxScoreScorer::new(children, global_bounds, metrics)
-    }
-
-    #[derive(Default)]
-    struct ShouldMetrics {
-        reports: AtomicUsize,
-        skipped_windows: AtomicUsize,
-        bound_recomputations: AtomicUsize,
-        essential_evaluations: AtomicUsize,
-        non_essential_evaluations: AtomicUsize,
-    }
-
-    #[derive(Default)]
-    struct PhraseMetrics {
-        exact_approximations: AtomicUsize,
-        sloppy_approximations: AtomicUsize,
-        exact_confirmations: AtomicUsize,
-        sloppy_confirmations: AtomicUsize,
-        exact_confirmations_avoided: AtomicUsize,
-        sloppy_confirmations_avoided: AtomicUsize,
-    }
-
-    impl MetricsCollector for PhraseMetrics {
-        fn record_parts_loaded(&self, _num_parts: usize) {}
-
-        fn record_index_loads(&self, _num_loads: usize) {}
-
-        fn record_comparisons(&self, _num_comparisons: usize) {}
-
-        fn record_compound_phrase_exact_approximations(&self, num_approximations: usize) {
-            self.exact_approximations
-                .fetch_add(num_approximations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_phrase_sloppy_approximations(&self, num_approximations: usize) {
-            self.sloppy_approximations
-                .fetch_add(num_approximations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_phrase_exact_confirmations(&self, num_confirmations: usize) {
-            self.exact_confirmations
-                .fetch_add(num_confirmations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_phrase_sloppy_confirmations(&self, num_confirmations: usize) {
-            self.sloppy_confirmations
-                .fetch_add(num_confirmations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_phrase_exact_confirmations_avoided(&self, num_confirmations: usize) {
-            self.exact_confirmations_avoided
-                .fetch_add(num_confirmations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_phrase_sloppy_confirmations_avoided(&self, num_confirmations: usize) {
-            self.sloppy_confirmations_avoided
-                .fetch_add(num_confirmations, AtomicOrdering::Relaxed);
-        }
-    }
-
-    impl MetricsCollector for ShouldMetrics {
-        fn record_parts_loaded(&self, _num_parts: usize) {}
-
-        fn record_index_loads(&self, _num_loads: usize) {}
-
-        fn record_comparisons(&self, _num_comparisons: usize) {}
-
-        fn record_compound_should_skipped_windows(&self, num_windows: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.skipped_windows
-                .fetch_add(num_windows, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.bound_recomputations
-                .fetch_add(num_recomputations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.essential_evaluations
-                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.non_essential_evaluations
-                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
-        }
+        ShouldMaxScoreScorer::new(children, global_bounds)
     }
 
     #[test]
@@ -4906,7 +4762,6 @@ mod tests {
         has_doc_upper: bool,
         approximations: Arc<AtomicUsize>,
         confirmations: Arc<AtomicUsize>,
-        confirmations_avoided: Arc<AtomicUsize>,
     }
 
     impl ComposableScorer for TwoPhaseScorer {
@@ -4966,11 +4821,6 @@ mod tests {
             true
         }
 
-        fn record_confirmation_avoided(&mut self) {
-            self.confirmations_avoided
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
-
         fn matches(&mut self) -> Result<bool> {
             self.confirmations.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(self
@@ -4996,24 +4846,8 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
-        let (scorer, approximations, confirmations, _) =
-            two_phase_with_avoided(values, accepted, match_cost);
-        (scorer, approximations, confirmations)
-    }
-
-    fn two_phase_with_avoided(
-        values: &[(u64, f32)],
-        accepted: Vec<u64>,
-        match_cost: Option<f32>,
-    ) -> (
-        Box<dyn ComposableScorer>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    ) {
         let approximations = Arc::new(AtomicUsize::new(0));
         let confirmations = Arc::new(AtomicUsize::new(0));
-        let confirmations_avoided = Arc::new(AtomicUsize::new(0));
         let scorer = TwoPhaseScorer {
             inner: MaterializedScorer::try_new(rows(values)).unwrap(),
             accepted,
@@ -5021,14 +4855,8 @@ mod tests {
             has_doc_upper: true,
             approximations: approximations.clone(),
             confirmations: confirmations.clone(),
-            confirmations_avoided: confirmations_avoided.clone(),
         };
-        (
-            Box::new(scorer),
-            approximations,
-            confirmations,
-            confirmations_avoided,
-        )
+        (Box::new(scorer), approximations, confirmations)
     }
 
     fn two_phase_without_doc_upper(
@@ -5038,11 +4866,9 @@ mod tests {
         Box<dyn ComposableScorer>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
     ) {
         let approximations = Arc::new(AtomicUsize::new(0));
         let confirmations = Arc::new(AtomicUsize::new(0));
-        let confirmations_avoided = Arc::new(AtomicUsize::new(0));
         let scorer = TwoPhaseScorer {
             inner: MaterializedScorer::try_new(rows(values)).unwrap(),
             accepted,
@@ -5050,14 +4876,8 @@ mod tests {
             has_doc_upper: false,
             approximations: approximations.clone(),
             confirmations: confirmations.clone(),
-            confirmations_avoided: confirmations_avoided.clone(),
         };
-        (
-            Box::new(scorer),
-            approximations,
-            confirmations,
-            confirmations_avoided,
-        )
+        (Box::new(scorer), approximations, confirmations)
     }
 
     #[derive(Default)]
@@ -5134,10 +4954,6 @@ mod tests {
 
         fn supports_doc_local_confirmation_pruning(&self) -> bool {
             self.inner.supports_doc_local_confirmation_pruning()
-        }
-
-        fn record_confirmation_avoided(&mut self) {
-            self.inner.record_confirmation_avoided()
         }
 
         fn matches(&mut self) -> Result<bool> {
@@ -5932,7 +5748,7 @@ mod tests {
 
         for slop in [0, 2] {
             let params = FtsSearchParams::default().with_phrase_slop(Some(slop));
-            let metrics = PhraseMetrics::default();
+            let metrics = NoOpMetricsCollector;
             let phrase = zero_weight_wand(&documents, scorer.clone(), &params, &metrics);
             // The high-scoring sibling keeps the shared block competitive, while
             // doc 0 still has a combined doc-local upper below the score floor.
@@ -5950,42 +5766,12 @@ mod tests {
                     .unwrap(),
                 rows(&[(1, 2.0)])
             );
-
-            if slop == 0 {
-                assert_eq!(
-                    metrics.exact_approximations.load(AtomicOrdering::Relaxed),
-                    1
-                );
-                assert_eq!(metrics.exact_confirmations.load(AtomicOrdering::Relaxed), 0);
-                assert_eq!(
-                    metrics
-                        .exact_confirmations_avoided
-                        .load(AtomicOrdering::Relaxed),
-                    1
-                );
-            } else {
-                assert_eq!(
-                    metrics.sloppy_approximations.load(AtomicOrdering::Relaxed),
-                    1
-                );
-                assert_eq!(
-                    metrics.sloppy_confirmations.load(AtomicOrdering::Relaxed),
-                    0
-                );
-                assert_eq!(
-                    metrics
-                        .sloppy_confirmations_avoided
-                        .load(AtomicOrdering::Relaxed),
-                    1
-                );
-            }
         }
     }
 
     #[test]
     fn phrase_positive_boost_uses_positive_upper_before_confirmation() {
-        let (phrase, _, confirmations, confirmations_avoided) =
-            two_phase_with_avoided(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
+        let (phrase, _, confirmations) = two_phase(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
         let mut scorer = BoostScorer::try_new(phrase, materialized(&[(1, 1.0)]), 0.5).unwrap();
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(9.5);
@@ -5997,13 +5783,12 @@ mod tests {
             rows(&[(1, 9.5)])
         );
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
     fn phrase_must_not_never_contributes_to_score_upper_bound() {
-        let (prohibited, approximations, confirmations, confirmations_avoided) =
-            two_phase_with_avoided(&[(0, 100.0)], Vec::new(), Some(1.0));
+        let (prohibited, approximations, confirmations) =
+            two_phase(&[(0, 100.0)], Vec::new(), Some(1.0));
         let mut scorer = BooleanScorer::try_new(
             Vec::new(),
             vec![materialized(&[(0, 1.0), (1, 10.0)])],
@@ -6023,13 +5808,11 @@ mod tests {
         // phrase is never advanced, so it cannot inflate that upper bound.
         assert_eq!(approximations.load(AtomicOrdering::Relaxed), 0);
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 0);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]
     fn signed_and_unknown_doc_bounds_use_exact_confirmation_fallback() {
-        let (signed_phrase, _, signed_confirmations, signed_avoided) =
-            two_phase_with_avoided(&[(0, 2.0)], vec![0], Some(1.0));
+        let (signed_phrase, _, signed_confirmations) = two_phase(&[(0, 2.0)], vec![0], Some(1.0));
         let signed_optional =
             Box::new(BoostScorer::try_new(signed_phrase, materialized(&[(0, 2.0)]), 2.0).unwrap());
         let mut signed = BooleanScorer::try_new(
@@ -6048,9 +5831,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(signed_confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(signed_avoided.load(AtomicOrdering::Relaxed), 0);
-
-        let (unknown_phrase, approximations, confirmations, confirmations_avoided) =
+        let (unknown_phrase, approximations, confirmations) =
             two_phase_without_doc_upper(&[(0, 1.0), (1, 100.0)], vec![1]);
         let mut unknown = BooleanScorer::try_new(
             vec![unknown_phrase, materialized(&[(0, 0.0), (1, 0.0)])],
@@ -6069,15 +5850,14 @@ mod tests {
         );
         assert_eq!(approximations.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 2);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]
     fn row_address_merge_forwards_phrase_doc_bound_and_avoidance() {
         // Cross-column eager execution maps each leaf into row-address space
         // and merges disjoint sources through this same wrapper stack.
-        let (phrase, approximations, confirmations, confirmations_avoided) =
-            two_phase_with_avoided(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
+        let (phrase, approximations, confirmations) =
+            two_phase(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
         let mapped_phrase = Box::new(RowAddressScorer::new(
             phrase,
             ordered_row_address_projection_for_test(vec![100, 200]),
@@ -6098,7 +5878,6 @@ mod tests {
         );
         assert_eq!(approximations.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
@@ -6111,8 +5890,7 @@ mod tests {
                 .upper(),
             floor
         );
-        let (phrase, _, confirmations, confirmations_avoided) =
-            two_phase_with_avoided(&[(7, exact_score)], vec![7], Some(1.0));
+        let (phrase, _, confirmations) = two_phase(&[(7, exact_score)], vec![7], Some(1.0));
         let mut phrase = DisjunctionScorer::try_new(vec![phrase], DisjunctionScore::Sum).unwrap();
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(floor);
@@ -6124,13 +5902,11 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]
     fn surviving_nested_phrase_is_confirmed_exactly_once() {
-        let (phrase, _, confirmations, confirmations_avoided) =
-            two_phase_with_avoided(&[(3, 5.0)], vec![3], Some(1.0));
+        let (phrase, _, confirmations) = two_phase(&[(3, 5.0)], vec![3], Some(1.0));
         let nested = Box::new(
             DisjunctionScorer::try_new(
                 vec![phrase, materialized(&[(3, 0.0)])],
@@ -6145,7 +5921,6 @@ mod tests {
             rows(&[(3, 5.0)])
         );
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(confirmations_avoided.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]
@@ -6577,10 +6352,10 @@ mod tests {
             ("must_should", must_should, 11.0),
             ("nested", nested, 11.0),
         ] {
-            let (exact, _, exact_confirmations, exact_avoided) =
-                two_phase_with_avoided(&exact_approximations, vec![1, 3], Some(1.0));
-            let (sloppy, _, sloppy_confirmations, sloppy_avoided) =
-                two_phase_with_avoided(&sloppy_approximations, vec![1, 2, 3], Some(2.0));
+            let (exact, _, exact_confirmations) =
+                two_phase(&exact_approximations, vec![1, 3], Some(1.0));
+            let (sloppy, _, sloppy_confirmations) =
+                two_phase(&sloppy_approximations, vec![1, 2, 3], Some(2.0));
             let mut leaves = vec![
                 Some(exact),
                 Some(sloppy),
@@ -6598,7 +6373,7 @@ mod tests {
                     (4, 1.0),
                 ])),
             ];
-            let mut scorer = plan.build(&mut leaves, &NoOpMetricsCollector).unwrap();
+            let mut scorer = plan.build(&mut leaves).unwrap();
             let competitive_score = Arc::new(CompetitiveScore::default());
             competitive_score.raise(floor);
             let actual = TopKCollector::with_competitive_score(2, competitive_score)
@@ -6608,12 +6383,6 @@ mod tests {
 
             assert_eq!(actual, expected, "shape={shape}");
             assert_eq!(actual, rows(&[(1, floor), (3, floor)]), "shape={shape}");
-            assert!(
-                exact_avoided.load(AtomicOrdering::Relaxed)
-                    + sloppy_avoided.load(AtomicOrdering::Relaxed)
-                    > 0,
-                "shape={shape} should avoid at least one position confirmation"
-            );
             assert!(
                 exact_confirmations.load(AtomicOrdering::Relaxed) > 0
                     && sloppy_confirmations.load(AtomicOrdering::Relaxed) > 0,
@@ -6983,7 +6752,6 @@ mod tests {
             for (shape, plan) in &plans {
                 for limit in [1, 3, 7] {
                     let expected = exhaustive_compound_top_k(plan, &leaves, limit);
-                    let metrics = ShouldMetrics::default();
                     let mut mapped_leaves = leaves
                         .iter()
                         .map(|leaf| {
@@ -6994,7 +6762,7 @@ mod tests {
                             ))
                         })
                         .collect::<Vec<_>>();
-                    let mut scorer = plan.build(&mut mapped_leaves, &metrics).unwrap();
+                    let mut scorer = plan.build(&mut mapped_leaves).unwrap();
                     assert!(mapped_leaves.iter().all(Option::is_none));
                     let actual = TopKCollector::new(limit).collect(scorer.as_mut()).unwrap();
                     assert_eq!(actual, expected, "seed={seed} shape={shape} limit={limit}");
@@ -7010,10 +6778,9 @@ mod tests {
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
         let eager_comparisons = scorer_advances(&eager_work);
 
-        let metrics = ShouldMetrics::default();
         let (children, optimized_work) = pure_should_canary_children();
         let optimized_results = {
-            let mut optimized = should_maxscore(children, Some(&metrics));
+            let mut optimized = should_maxscore(children);
             TopKCollector::new(1).collect(&mut optimized).unwrap()
         };
         let optimized_comparisons = scorer_advances(&optimized_work);
@@ -7025,16 +6792,6 @@ mod tests {
             optimized_comparisons * 5 <= eager_comparisons * 4,
             "pure-SHOULD MAXSCORE should reduce posting candidate probes by at least 20%: \
              optimized={optimized_comparisons} eager={eager_comparisons}"
-        );
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
-        assert!(metrics.skipped_windows.load(AtomicOrdering::Relaxed) > 0);
-        assert!(metrics.bound_recomputations.load(AtomicOrdering::Relaxed) > 0);
-        assert!(metrics.essential_evaluations.load(AtomicOrdering::Relaxed) > 0);
-        assert!(
-            metrics
-                .non_essential_evaluations
-                .load(AtomicOrdering::Relaxed)
-                > 0
         );
     }
 
@@ -7060,10 +6817,8 @@ mod tests {
             for limit in [1, 7, 31, 512] {
                 let expected = exhaustive_should_top_k(&children, limit);
 
-                let mut optimized = should_maxscore(
-                    children.iter().map(|values| materialized(values)).collect(),
-                    None,
-                );
+                let mut optimized =
+                    should_maxscore(children.iter().map(|values| materialized(values)).collect());
                 let actual = TopKCollector::new(limit).collect(&mut optimized).unwrap();
                 assert_eq!(actual, expected, "seed={seed} limit={limit}");
             }
@@ -7073,19 +6828,15 @@ mod tests {
     #[test]
     fn pure_should_maxscore_confirms_two_phase_children_before_scoring() {
         let (phrase, _, confirmations) = two_phase(&[(1, 100.0)], Vec::new(), Some(10.0));
-        let metrics = ShouldMetrics::default();
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(10.0);
         let results = {
-            let mut scorer = should_maxscore(
-                vec![
-                    materialized(&[(0, 10.0)]),
-                    phrase,
-                    materialized(&[(1, 6.0)]),
-                    materialized(&[(1, 5.0)]),
-                ],
-                Some(&metrics),
-            );
+            let mut scorer = should_maxscore(vec![
+                materialized(&[(0, 10.0)]),
+                phrase,
+                materialized(&[(1, 6.0)]),
+                materialized(&[(1, 5.0)]),
+            ]);
             TopKCollector::with_competitive_score(1, competitive_score)
                 .collect(&mut scorer)
                 .unwrap()
@@ -7093,25 +6844,16 @@ mod tests {
 
         assert_eq!(results, rows(&[(1, 11.0)]));
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert!(
-            metrics
-                .non_essential_evaluations
-                .load(AtomicOrdering::Relaxed)
-                > 0
-        );
     }
 
     #[test]
     fn pure_should_maxscore_preserves_query_score_order_and_terminal_doc() {
-        let mut scorer = should_maxscore(
-            vec![
-                materialized(&[(u64::MAX, 16_777_216.0)]),
-                materialized(&[(u64::MAX, 1.0)]),
-                materialized(&[(u64::MAX, 1.0)]),
-                materialized(&[]),
-            ],
-            None,
-        );
+        let mut scorer = should_maxscore(vec![
+            materialized(&[(u64::MAX, 16_777_216.0)]),
+            materialized(&[(u64::MAX, 1.0)]),
+            materialized(&[(u64::MAX, 1.0)]),
+            materialized(&[]),
+        ]);
 
         assert_eq!(
             TopKCollector::new(1).collect(&mut scorer).unwrap(),
@@ -7138,7 +6880,6 @@ mod tests {
                 .into_iter()
                 .map(|score| materialized(&[(7, score)]))
                 .collect(),
-            None,
         );
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(exact_score);
@@ -7171,9 +6912,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     nested_dismax,
                     nested_boolean,
@@ -7181,21 +6921,18 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 6.5)]));
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_maxscore_applies_must_not_before_raising_the_floor() {
-        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     materialized(&[(0, 10.0), (1, 5.0)]),
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -7203,19 +6940,16 @@ mod tests {
                 ],
                 Vec::new(),
                 vec![materialized(&[(0, 1.0)])],
-                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 8.0)]));
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_uses_exact_fallback_for_unsupported_shapes() {
-        let signed_metrics = ShouldMetrics::default();
         let signed_results = {
             let signed = Box::new(
                 BoostScorer::try_new(
@@ -7225,7 +6959,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     signed,
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -7233,20 +6967,17 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&signed_metrics),
             )
             .unwrap();
             TopKCollector::new(2).collect(&mut scorer).unwrap()
         };
         assert_eq!(signed_results, rows(&[(0, 4.0), (1, 3.0)]));
-        assert_eq!(signed_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let unbounded_metrics = ShouldMetrics::default();
         let unbounded_results = {
             let unbounded = Box::new(UnboundedScorer {
                 inner: MaterializedScorer::try_new(rows(&[(0, 1.0), (2, 3.0)])).unwrap(),
             });
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     unbounded,
                     materialized(&[(0, 2.0), (1, 2.0)]),
@@ -7254,21 +6985,17 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&unbounded_metrics),
             )
             .unwrap();
             TopKCollector::new(3).collect(&mut scorer).unwrap()
         };
         assert_eq!(unbounded_results, rows(&[(1, 6.0), (0, 3.0), (2, 3.0)]));
-        assert_eq!(unbounded_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let low_count_metrics = ShouldMetrics::default();
         {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![materialized(&[(0, 1.0)]), materialized(&[(1, 2.0)])],
                 Vec::new(),
                 Vec::new(),
-                Some(&low_count_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -7276,12 +7003,10 @@ mod tests {
                 rows(&[(1, 2.0), (0, 1.0)])
             );
         }
-        assert_eq!(low_count_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let overflow_metrics = ShouldMetrics::default();
         let large_score = f32::MAX / 2.0;
         {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     materialized(&[(0, large_score)]),
                     materialized(&[(1, large_score)]),
@@ -7289,7 +7014,6 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&overflow_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -7297,6 +7021,5 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
-        assert_eq!(overflow_metrics.reports.load(AtomicOrdering::Relaxed), 0);
     }
 }

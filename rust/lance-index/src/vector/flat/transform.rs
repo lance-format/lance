@@ -52,9 +52,11 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow::buffer::NullBuffer;
     use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
+    use rstest::rstest;
 
     const DIM: i32 = 4;
     const ROWS: usize = 8;
@@ -96,32 +98,48 @@ mod tests {
         assert_eq!(flat.as_ref(), input.column_by_name("vec").unwrap().as_ref());
     }
 
-    #[test]
-    fn test_flat_transform_preserves_nullability() {
-        // The renamed field copies the source column's nullability rather than
-        // hardcoding it, so a non-nullable vector column stays non-nullable.
-        let values = Float32Array::from_iter((0..(DIM as usize * ROWS)).map(|v| v as f32));
-        let vectors = Arc::new(FixedSizeListArray::try_new_from_values(values, DIM).unwrap());
+    /// Builds a batch whose vector column holds `nulls`, one entry per row.
+    fn batch_with_nulls(nulls: &[bool]) -> RecordBatch {
+        let rows = nulls.len();
+        let values = Float32Array::from_iter((0..(DIM as usize * rows)).map(|v| v as f32));
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let validity = NullBuffer::from(nulls.iter().map(|n| !n).collect::<Vec<bool>>());
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new(item, DIM, Arc::new(values), Some(validity)).unwrap(),
+        );
         let schema = Schema::new(vec![
-            Field::new("vec", vectors.data_type().clone(), false),
+            Field::new("vec", vectors.data_type().clone(), true),
             Field::new("other", DataType::Int32, false),
         ]);
-        let input = RecordBatch::try_new(
+        RecordBatch::try_new(
             Arc::new(schema),
             vec![
                 vectors,
-                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(Int32Array::from_iter_values(0..rows as i32)),
             ],
         )
-        .unwrap();
+        .unwrap()
+    }
 
+    /// The renamed field takes its nullability from `Array::is_nullable`, which
+    /// reports whether the column *currently holds* nulls rather than what the
+    /// source schema declared. Both directions are pinned so the flag cannot be
+    /// hardcoded either way.
+    #[rstest]
+    #[case::no_nulls(&[false, false], false)]
+    #[case::some_nulls(&[false, true], true)]
+    fn test_flat_transform_nullability_follows_the_data(
+        #[case] nulls: &[bool],
+        #[case] expected: bool,
+    ) {
+        let input = batch_with_nulls(nulls);
         let output = FlatTransformer::new("vec").transform(&input).unwrap();
         let field = output
             .schema()
             .field_with_name(FLAT_COLUMN)
             .unwrap()
             .clone();
-        assert!(!field.is_nullable());
+        assert_eq!(field.is_nullable(), expected);
     }
 
     #[test]

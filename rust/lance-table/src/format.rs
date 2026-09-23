@@ -24,7 +24,7 @@ pub use manifest::{
     populate_manifest_schema_dictionaries,
 };
 pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
-pub use transaction::Transaction;
+pub use transaction::{Transaction, operation_may_change_schema};
 
 use lance_core::{Error, Result};
 
