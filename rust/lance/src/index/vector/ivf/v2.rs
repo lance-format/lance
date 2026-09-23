@@ -2816,11 +2816,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         true
     }
 
-    async fn read_pairwise_vectors(
+    async fn prepare_pairwise_partition(
         &self,
         partition_id: usize,
-        range: std::ops::Range<usize>,
-    ) -> Result<lance_index::vector::pairwise::PairwiseVectorBatch> {
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<lance_index::vector::pairwise::PairwisePartition> {
         if partition_id >= self.ivf.num_partitions() {
             return Err(Error::invalid_input(format!(
                 "partition_id={partition_id} out of range 0..{}",
@@ -2831,7 +2833,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             Error::invalid_input(format!("partition_id={partition_id} has no centroid"))
         })?;
         self.storage
-            .read_pairwise_vectors(partition_id, range, centroid)
+            .prepare_pairwise_partition(
+                partition_id,
+                batch_size,
+                memory_limit,
+                centroid,
+                spill_store,
+            )
             .await
     }
 
@@ -3823,6 +3831,107 @@ mod tests {
             .unwrap();
         let schema = batch.schema();
         (batch, schema)
+    }
+
+    #[rstest]
+    #[case::flat(None)]
+    #[case::pq4(Some(4))]
+    #[case::pq8(Some(8))]
+    #[case::rq5(Some(5))]
+    #[tokio::test]
+    async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<usize>) {
+        // Three vector batches, including a packed RQ tail. Force both the
+        // memory and spill paths on the same immutable index representation.
+        let (batch, schema) = make_seeded_vector_batch(65);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                // Keep this tiny fixture out of the whole-file read cache so
+                // the source-I/O assertion also exercises PQ4 preparation.
+                store_params: Some(ObjectStoreParams {
+                    block_size: Some(64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut ivf = IvfBuildParams::new(1);
+        ivf.centroids = Some(Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        ));
+        let params = match bits {
+            None => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+            Some(5) => VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                ivf,
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+            ),
+            Some(bits) => VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                ivf,
+                PQBuildParams::with_codebook(
+                    16,
+                    bits,
+                    Arc::new(generate_random_array(DIM * (1 << bits))),
+                ),
+            ),
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("pairs".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = dataset.load_indices_by_name("pairs").await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &meta[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let session = dataset.session();
+        let store = session.spill_store();
+        dataset.object_store.as_ref().io_stats_incremental();
+        let memory = index
+            .prepare_pairwise_partition(0, 32, 16 * 1024 * 1024, store)
+            .await
+            .unwrap();
+        let spilled = index
+            .prepare_pairwise_partition(0, 32, 0, store)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .io_stats_incremental()
+                .read_iops
+                > 0
+        );
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            for batch_id in 0..3 {
+                let expected = memory.read_vectors(batch_id).await.unwrap();
+                let actual = spilled.read_vectors(batch_id).await.unwrap();
+                assert_eq!(actual.row_ids, expected.row_ids);
+                assert_eq!(actual.vectors, expected.vectors);
+                assert_eq!(actual.row_ids.len(), if batch_id == 2 { 1 } else { 32 });
+                seen.extend(actual.row_ids.values().iter().copied());
+            }
+        }
+        assert_eq!(seen, (0..65).collect());
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 0,
+            "replay must not reread the source index"
+        );
+        assert_eq!(stats.read_bytes, 0);
     }
 
     async fn search_lightweight_pq_index(

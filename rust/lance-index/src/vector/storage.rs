@@ -6,13 +6,11 @@
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
-    cast::AsArray,
-    types::{UInt8Type, UInt64Type},
+    ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, cast::AsArray, types::UInt8Type,
 };
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
-use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_arrow::{DataTypeExt, FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
@@ -20,6 +18,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
+use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
 use std::{
@@ -45,6 +44,7 @@ use crate::{
 
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
+use super::pairwise::{EncodedPartition, PairwisePartition, PairwiseSpillWriter};
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
@@ -758,13 +758,74 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         Ok(concat_batches(&schema, batches.iter())?)
     }
 
-    /// Read and reconstruct a bounded batch without populating the partition cache.
-    pub async fn read_pairwise_vectors(
+    /// Prepare invocation-owned compact codes once, coalescing small partitions
+    /// into one source read and spilling large partitions in bounded batches.
+    pub async fn prepare_pairwise_partition(
+        &self,
+        partition_id: usize,
+        batch_size: usize,
+        memory_limit: usize,
+        centroid: ArrayRef,
+        spill_store: &dyn SpillStore,
+    ) -> Result<PairwisePartition> {
+        if batch_size == 0 || !batch_size.is_multiple_of(32) {
+            return Err(Error::invalid_input(format!(
+                "pairwise batch_size={batch_size} must be a positive multiple of 32"
+            )));
+        }
+        if partition_id >= self.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        let num_rows = self.partition_size(partition_id);
+        let quantizer = self.quantizer()?;
+        let schema: arrow_schema::Schema = self.reader.schema().as_ref().into();
+        // Include conservative space for validity buffers and Arrow overhead.
+        let row_bytes = schema.fields().iter().try_fold(0usize, |sum, field| {
+            let width = field.data_type().byte_width_opt()?;
+            sum.checked_add(width.checked_add(width.div_ceil(8))?.checked_add(8)?)
+        });
+        let fits = row_bytes
+            .and_then(|width| width.checked_mul(num_rows))
+            .and_then(|bytes| bytes.checked_add(4096))
+            .is_some_and(|bytes| bytes <= memory_limit);
+        let encoded = if num_rows == 0 {
+            EncodedPartition::Memory(RecordBatch::new_empty(Arc::new(schema)))
+        } else if fits {
+            EncodedPartition::Memory(
+                self.read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
+                    .await?,
+            )
+        } else {
+            let mut writer = PairwiseSpillWriter::new(spill_store).await?;
+            for start in (0..num_rows).step_by(batch_size) {
+                let end = start.saturating_add(batch_size).min(num_rows);
+                let batch = self
+                    .read_pairwise_codes(partition_id, start..end, &quantizer)
+                    .await?;
+                writer.write(batch).await?;
+            }
+            writer.finish().await?
+        };
+        Ok(PairwisePartition {
+            encoded,
+            quantizer: Arc::new(quantizer),
+            centroid,
+            metric: self.distance_type,
+            remapper: self.frag_reuse_index.clone(),
+            batch_size,
+            num_rows,
+        })
+    }
+
+    async fn read_pairwise_codes(
         &self,
         partition_id: usize,
         range: std::ops::Range<usize>,
-        centroid: ArrayRef,
-    ) -> Result<super::pairwise::PairwiseVectorBatch> {
+        quantizer: &Quantizer,
+    ) -> Result<RecordBatch> {
         if partition_id >= self.num_partitions() {
             return Err(Error::invalid_input(format!(
                 "partition_id={partition_id} out of range 0..{}",
@@ -778,20 +839,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 partition.len()
             )));
         }
-        let quantizer = self.quantizer()?;
-        // RQ FastScan sign codes are packed in groups of 32 vectors, including
-        // a separately transposed tail. Decode complete groups before slicing.
-        let packed = matches!(&quantizer, Quantizer::Rabit(rq) if rq.metadata_ref().packed);
-        let start = if packed {
-            range.start / 32 * 32
-        } else {
-            range.start
-        };
-        let end = if packed {
-            range.end.next_multiple_of(32).min(partition.len())
-        } else {
-            range.end
-        };
+        // The preparation batch size is a multiple of 32, so packed RQ sign
+        // groups are always complete (except for the partition's own tail).
+        let start = range.start;
+        let end = range.end;
         let mut batch = self
             .read_vector_range(partition.start + start..partition.start + end)
             .await?;
@@ -802,6 +853,24 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .ok_or_else(|| Error::invalid_input(format!("missing {column}")))?
                 .as_fixed_size_list()
                 .value_length() as usize;
+            if range.len() == partition.len() {
+                // Common case: transpose compact PQ codes after one coalesced
+                // read, rather than performing a source read per code byte.
+                return spawn_cpu(move || {
+                    let values = batch
+                        .column_by_name(column)
+                        .ok_or_else(|| Error::internal(format!("missing {column}")))?
+                        .as_fixed_size_list()
+                        .values()
+                        .as_primitive::<UInt8Type>();
+                    let values = super::pq::storage::transpose(values, code_dim, range.len());
+                    let codes = FixedSizeListArray::try_new_from_values(values, code_dim as i32)?;
+                    batch
+                        .replace_column_by_name(column, Arc::new(codes))
+                        .map_err(Error::from)
+                })
+                .await;
+            }
             let mut codes = vec![0u8; (end - start) * code_dim];
             // PQ's Arrow rows contain a flattened column-major code matrix.
             // Fetch only the byte spans for this vector range in each column.
@@ -828,36 +897,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), code_dim as i32)?;
             batch = batch.replace_column_by_name(column, Arc::new(codes))?;
         }
-        let metric = self.distance_type;
-        let remapper = self.frag_reuse_index.clone();
-        spawn_cpu(move || {
-            let vectors = super::pairwise::reconstruct(&quantizer, &batch, centroid, metric)?;
-            let vectors = vectors.slice(range.start - start, range.len());
-            let ids = batch
-                .column_by_name(ROW_ID)
-                .ok_or_else(|| Error::invalid_input("index batch missing row IDs"))?
-                .as_primitive::<UInt64Type>()
-                .slice(range.start - start, range.len());
-            if let Some(remapper) = remapper {
-                let mapped = ids
-                    .values()
-                    .iter()
-                    .map(|&id| remapper.remap_row_id(id))
-                    .collect::<Vec<_>>();
-                // Keep physical positions so the outer/inner traversal has the
-                // same order even when compaction discarded a row.
-                Ok(super::pairwise::PairwiseVectorBatch {
-                    row_ids: UInt64Array::from(mapped),
-                    vectors,
-                })
-            } else {
-                Ok(super::pairwise::PairwiseVectorBatch {
-                    row_ids: ids,
-                    vectors,
-                })
-            }
-        })
-        .await
+        Ok(batch)
     }
 
     /// Materialize a compact partition for the parallel prewarm path.

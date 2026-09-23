@@ -179,10 +179,9 @@ def test_duplicate_pairs_cross_batch_order(tmp_path):
         ivf_centroids=np.ones((1, 2), dtype=np.float32),
     )
     with find_duplicate_pairs(ds, "vector", 0) as reader:
-        # Both a=0 and a=1 have matches in both vector batches. A batch-pair
-        # traversal would interleave those anchors. Close after these groups
-        # instead of spending the test scanning the remaining unique vectors.
-        batches = [next(reader) for _ in range(5)]
+        # Exhaust the reader: a prefix-only test misses repeated source I/O
+        # while scanning later anchors with no matching pairs.
+        batches = list(reader)
     assert [batch.num_rows for batch in batches] == [2, 1, 1, 1, 1]
     pairs = pa.Table.from_batches(batches).to_pylist()
     assert [(p["row_id_a"], p["row_id_b"]) for p in pairs] == [
@@ -197,6 +196,32 @@ def test_duplicate_pairs_cross_batch_order(tmp_path):
         assert next(reader).num_rows <= 1024
         # Closing a partially consumed reader cancels further enumeration.
     assert ds.count_rows() == n
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_duplicate_pairs_exhaust_pq_partition(tmp_path, bits):
+    # Fully consume the zero-output case that exposed per-anchor source reads.
+    rng = np.random.default_rng(9493)
+    vectors = rng.normal(size=(1025, 64)).astype(np.float32)
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 64)),
+            }
+        ),
+        tmp_path,
+    )
+    ds = ds.create_index(
+        "vector",
+        "IVF_PQ",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 64), dtype=np.float32),
+        num_bits=bits,
+        num_sub_vectors=16,
+        pq_codebook=rng.normal(size=(16, 2**bits, 4)).astype(np.float32),
+    )
+    with find_duplicate_pairs(ds, "vector", 0.0) as reader:
+        assert reader.read_all().num_rows == 0
 
 
 def test_duplicate_pairs_independent_segments(tmp_path):

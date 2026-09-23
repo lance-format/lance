@@ -14,7 +14,10 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::PreFilter;
-use lance_index::vector::{VectorIndex, pairwise::PairwiseVectorBatch};
+use lance_index::vector::{
+    VectorIndex,
+    pairwise::{PAIRWISE_MEMORY_LIMIT, PairwisePartition, PairwiseVectorBatch},
+};
 use lance_select::RowAddrMask;
 use uuid::Uuid;
 
@@ -26,7 +29,12 @@ use crate::index::{
 
 /// At most two decoded input batches and one output batch are retained. A
 /// multiple of 32 also matches RQ's packed sign-code group size.
+/// Compact index codes are separately staged in bounded memory or session spill.
 const VECTOR_BATCH_SIZE: usize = 1024;
+
+// Small SIMD batches do not justify a CPU-pool round trip. Larger distances
+// run on the CPU pool; inline batches yield cooperatively in the scan loop.
+const MIN_OFFLOAD_COORDINATES: usize = 256 * 1024;
 
 fn pair_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -48,6 +56,8 @@ fn pair_schema() -> SchemaRef {
 /// All output for one `row_id_a` is contiguous, even across output batches.
 /// Dropping the stream cancels further reads; only bounded in-flight CPU work
 /// can finish. See [`find_duplicate_pairs_in_partition`] for distributed use.
+/// Each partition's compact codes are prepared once; larger partitions use
+/// session spill storage, reclaimed when advancing partitions or dropping the stream.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -207,8 +217,11 @@ async fn plan(
     }
     let state = PairStream {
         partitions,
+        session: dataset.session(),
+        prepared: None,
         threshold,
         anchor: None,
+        candidate: None,
         anchor_start: 0,
         anchor_row: 0,
         candidate_start: 0,
@@ -233,8 +246,11 @@ struct Partition {
 
 struct PairStream {
     partitions: VecDeque<Partition>,
+    session: Arc<crate::session::Session>,
+    prepared: Option<PairwisePartition>,
     threshold: f32,
     anchor: Option<PairwiseVectorBatch>,
+    candidate: Option<(usize, PairwiseVectorBatch)>,
     anchor_start: usize,
     anchor_row: usize,
     candidate_start: usize,
@@ -243,6 +259,7 @@ struct PairStream {
 impl PairStream {
     async fn next_batch(&mut self) -> datafusion::error::Result<Option<RecordBatch>> {
         loop {
+            tokio::task::consume_budget().await;
             let Some(Partition {
                 index,
                 id: partition,
@@ -254,16 +271,33 @@ impl PairStream {
             let count = index.partition_size(*partition);
             if self.anchor_start >= count {
                 self.partitions.pop_front();
+                self.prepared = None;
                 self.anchor = None;
+                self.candidate = None;
                 self.anchor_start = 0;
                 self.anchor_row = 0;
                 continue;
             }
-            if self.anchor.is_none() {
-                let end = (self.anchor_start + VECTOR_BATCH_SIZE).min(count);
-                self.anchor = Some(
+            if self.prepared.is_none() {
+                self.prepared = Some(
                     index
-                        .read_pairwise_vectors(*partition, self.anchor_start..end)
+                        .prepare_pairwise_partition(
+                            *partition,
+                            VECTOR_BATCH_SIZE,
+                            PAIRWISE_MEMORY_LIMIT,
+                            self.session.spill_store(),
+                        )
+                        .await?,
+                );
+            }
+            let prepared = self
+                .prepared
+                .as_ref()
+                .ok_or_else(|| Error::internal("missing prepared pairwise partition"))?;
+            if self.anchor.is_none() {
+                self.anchor = Some(
+                    prepared
+                        .read_vectors(self.anchor_start / VECTOR_BATCH_SIZE)
                         .await?,
                 );
                 self.anchor_row = 0;
@@ -291,8 +325,14 @@ impl PairStream {
             let end = (start + VECTOR_BATCH_SIZE).min(count);
             let candidates = if start == self.anchor_start {
                 anchor.clone()
+            } else if let Some((_, batch)) = self.candidate.as_ref().filter(|(id, _)| *id == start)
+            {
+                batch.clone()
             } else {
-                index.read_pairwise_vectors(*partition, start..end).await?
+                self.candidate = None;
+                let batch = prepared.read_vectors(start / VECTOR_BATCH_SIZE).await?;
+                self.candidate = Some((start, batch.clone()));
+                batch
             };
             let query = anchor.vectors.value(self.anchor_row);
             let first = (self.anchor_start + self.anchor_row + 1)
@@ -305,7 +345,8 @@ impl PairStream {
             if first == candidates.row_ids.len() {
                 continue;
             }
-            let batch = spawn_cpu(move || -> Result<RecordBatch> {
+            let coordinates = (candidates.row_ids.len() - first).saturating_mul(query.len());
+            let score = move || -> Result<RecordBatch> {
                 // Score only the upper triangle, including within one batch.
                 let vectors = candidates
                     .vectors
@@ -335,8 +376,12 @@ impl PairStream {
                         Arc::new(Float32Array::from(d)),
                     ],
                 )?)
-            })
-            .await?;
+            };
+            let batch = if coordinates < MIN_OFFLOAD_COORDINATES {
+                score()?
+            } else {
+                spawn_cpu(score).await?
+            };
             if batch.num_rows() > 0 {
                 return Ok(Some(batch));
             }

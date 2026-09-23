@@ -806,6 +806,11 @@ def find_duplicate_pairs(
     across Arrow batches. Deleted rows are excluded at this dataset snapshot.
     Close the reader to cancel further work. This operation does not delete rows.
 
+    Each partition's compact index codes are prepared once. Small partitions
+    are buffered in memory; larger ones use temporary session spill storage,
+    reclaimed when the reader advances or closes. Decoded vectors and output
+    remain batched. This avoids rereading the source index for every anchor.
+
     Examples
     --------
     .. code-block:: python

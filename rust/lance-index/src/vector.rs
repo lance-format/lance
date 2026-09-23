@@ -448,13 +448,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         false
     }
 
-    /// Read a bounded range in a physical partition's stable storage order.
-    /// Quantized vectors are reconstructed from index data, not source rows.
-    async fn read_pairwise_vectors(
+    /// Stage compact codes once for repeated bounded decoding in storage order.
+    /// Partitions beyond `memory_limit` bytes use the caller's spill store.
+    async fn prepare_pairwise_partition(
         &self,
         _partition_id: usize,
-        _range: std::ops::Range<usize>,
-    ) -> Result<pairwise::PairwiseVectorBatch> {
+        _batch_size: usize,
+        _memory_limit: usize,
+        _spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<pairwise::PairwisePartition> {
         Err(lance_core::Error::not_supported(
             "pair enumeration requires a current-format vector index; rebuild this index",
         ))
