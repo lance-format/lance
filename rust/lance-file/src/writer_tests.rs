@@ -11,8 +11,7 @@ mod tests {
     use crate::version::ConcreteFileVersion;
     use crate::versions;
     use crate::writer::{
-        ArrowFieldType, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter,
-        FileWriterOptions,
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
@@ -604,7 +603,12 @@ mod tests {
     #[tokio::test]
     async fn test_writer_rejects_unconverted_arrow_json(
         #[case] nested: bool,
-        #[values(ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_3)]
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
         version: ConcreteFileVersion,
     ) {
         let arrow_json =
@@ -648,45 +652,45 @@ mod tests {
         writer.write_batch(&converted).await.unwrap();
         let mismatch = field_type_mismatch(writer.write_batch(&batch).await.unwrap_err());
         assert_eq!(mismatch.field_path, if nested { "s.j" } else { "j" });
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        assert_eq!(mismatch.expected.extension_type_name(), Some(JSON_EXT_NAME));
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
         assert_eq!(
-            mismatch.expected,
-            ArrowFieldType {
-                data_type: DataType::LargeBinary,
-                extension_name: Some(JSON_EXT_NAME.to_string()),
-                extension_metadata: None,
-            }
-        );
-        assert_eq!(
-            mismatch.actual,
-            ArrowFieldType {
-                data_type: DataType::Utf8,
-                extension_name: Some(ARROW_JSON_EXT_NAME.to_string()),
-                extension_metadata: None,
-            }
+            mismatch.actual.extension_type_name(),
+            Some(ARROW_JSON_EXT_NAME)
         );
         // The rejected batch reached no encoder.
         assert_eq!(writer.finish().await.unwrap().num_rows, 1);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_write_column_rejects_mismatched_type() {
+    async fn test_write_column_rejects_mismatched_type(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
         let file_schema =
             LanceSchema::try_from(&ArrowSchema::new(vec![json_field("j", true)])).unwrap();
         let fs = FsFixture::default();
         let mut writer = create_writer(
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             file_schema,
-            ConcreteFileVersion::V2_3,
+            version,
             FileWriterOptions::default(),
         )
         .unwrap();
         let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
         let mismatch = field_type_mismatch(writer.write_column(0, text).await.unwrap_err());
         assert_eq!(mismatch.field_path, "j");
-        assert_eq!(mismatch.expected.data_type, DataType::LargeBinary);
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
         // A bare array carries no extension of its own.
-        assert_eq!(mismatch.actual.data_type, DataType::Utf8);
-        assert_eq!(mismatch.actual.extension_name, None);
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(mismatch.actual.extension_type_name(), None);
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
