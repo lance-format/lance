@@ -91,6 +91,10 @@ impl TryFrom<&DataType> for JsonDataType {
                     length: Some(*len as usize),
                 });
             }
+            // Views have no logical type string: tables record them as an
+            // output encoding of `string` or `binary`.
+            DataType::Utf8View => ("string_view".to_string(), None),
+            DataType::BinaryView => ("binary_view".to_string(), None),
             DataType::Struct(fields) => {
                 let fields = fields
                     .iter()
@@ -164,6 +168,8 @@ impl TryFrom<&JsonDataType> for DataType {
                     _ => unreachable!(),
                 }
             }
+            "string_view" => Ok(Self::Utf8View),
+            "binary_view" => Ok(Self::BinaryView),
             "fixed_size_binary" => {
                 let length = value.length.ok_or_else(|| {
                     Error::arrow(
@@ -348,6 +354,30 @@ mod test {
         assert_primitive_types(DataType::Decimal256(76, 20), "decimal:256:76:20");
         assert_primitive_types(DataType::Decimal128(18, 6), "decimal:128:18:6");
         assert_primitive_types(DataType::Decimal256(50, 15), "decimal:256:50:15");
+        assert_primitive_types(DataType::Utf8View, "string_view");
+        assert_primitive_types(DataType::BinaryView, "binary_view");
+    }
+
+    /// JSON produced for a type reads back as the same type, including the
+    /// layouts a table's output encodings select.
+    #[test]
+    fn test_json_type_round_trip() {
+        for data_type in [
+            DataType::Utf8View,
+            DataType::BinaryView,
+            DataType::LargeUtf8,
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            DataType::Decimal256(10, 2),
+        ] {
+            let json = JsonDataType::try_new(&data_type).unwrap();
+            assert_eq!(DataType::try_from(&json).unwrap(), data_type);
+        }
+        // The canonical name of a semantic decimal type reads as its default layout.
+        let json: JsonDataType = serde_json::from_value(json!({ "type": "decimal:10:2" })).unwrap();
+        assert_eq!(
+            DataType::try_from(&json).unwrap(),
+            DataType::Decimal128(10, 2)
+        );
     }
 
     #[test]

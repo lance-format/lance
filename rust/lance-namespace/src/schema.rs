@@ -179,6 +179,10 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
             // For dictionary, return the value type
             arrow_type_to_json(value_type)
         }
+        // A view holds the same values as the offset layout; like a
+        // dictionary, it is described by its values.
+        DataType::Utf8View => Ok(JsonArrowDataType::new("utf8".to_string())),
+        DataType::BinaryView => Ok(JsonArrowDataType::new("binary".to_string())),
 
         DataType::Map(entries_field, keys_sorted) => {
             if *keys_sorted {
@@ -212,10 +216,6 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         ))),
         DataType::ListView(_) | DataType::LargeListView(_) => Err(Error::namespace(format!(
             "ListView types are not yet supported for JSON conversion: {:?}",
-            data_type
-        ))),
-        DataType::Utf8View | DataType::BinaryView => Err(Error::namespace(format!(
-            "View types are not yet supported for JSON conversion: {:?}",
             data_type
         ))),
     }
@@ -485,6 +485,21 @@ mod tests {
         assert_eq!(result.field(0).name(), "id");
         assert_eq!(result.field(1).name(), "name");
         assert_eq!(result.metadata(), &metadata);
+    }
+
+    /// Dictionaries and views are described by the values they hold.
+    #[test]
+    fn test_layouts_described_by_values() {
+        for (data_type, json_type) in [
+            (DataType::Utf8View, "utf8"),
+            (DataType::BinaryView, "binary"),
+            (
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::LargeUtf8)),
+                "large_utf8",
+            ),
+        ] {
+            assert_eq!(arrow_type_to_json(&data_type).unwrap().r#type, json_type);
+        }
     }
 
     #[test]
@@ -783,10 +798,6 @@ mod tests {
         // LargeListView
         let llv = DataType::LargeListView(Arc::new(Field::new("item", DataType::Int32, true)));
         assert!(arrow_type_to_json(&llv).is_err());
-
-        // Utf8View / BinaryView
-        assert!(arrow_type_to_json(&DataType::Utf8View).is_err());
-        assert!(arrow_type_to_json(&DataType::BinaryView).is_err());
     }
 
     #[test]
