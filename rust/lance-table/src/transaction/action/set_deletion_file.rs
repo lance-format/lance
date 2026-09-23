@@ -47,7 +47,7 @@ impl SetDeletionFile {
     /// The fragment's deletions, which is a distinct coordinate from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::FragmentDeletions(self.fragment));
+        footprint.write(Coordinate::FragmentDeletions(self.fragment));
     }
 }
 
