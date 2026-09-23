@@ -1953,13 +1953,8 @@ impl FilteredReadOptions {
 
     /// An alternative to [`Self::with_filter`] to set the filters from a FilterPlan if you already have one
     pub fn with_filter_plan(mut self, filter_plan: FilterPlan) -> Self {
-        // Debug-only: this setter cannot return an error, and every `FilterPlan`
-        // constructor upholds the pairing anyway.
-        debug_assert!(
-            !(filter_plan.refine_expr.is_some() && filter_plan.full_expr.is_none()),
-            "FilterPlan has a refine_expr but no full_expr: {:?}",
-            filter_plan.refine_expr
-        );
+        // This infallible setter does not validate the refine/full pairing, so
+        // statistics must check for refine filters even without a full filter.
         self.physical_filters.clear();
         self.refine_filter = filter_plan.refine_expr;
         self.full_filter = filter_plan.full_expr;
@@ -2064,8 +2059,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
-    /// Estimated once at construction: it depends only on the output schema, and
-    /// `partition_statistics` is called repeatedly by the optimizer.
+    /// Cached from the output schema and dataset blob metadata at construction.
     bytes_per_row: Option<f64>,
     materialization_context: Arc<BlobMaterializationContext>,
     properties: Arc<PlanProperties>,
@@ -2286,7 +2280,7 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref());
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2442,7 +2436,7 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref());
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -4843,40 +4837,20 @@ mod tests {
         assert_eq!(ranges, vec![0..1]);
     }
 
-    /// An after-filter range is a limit on what the node returns. A scalar-index
-    /// input reaches the no-filter branch with no expression set, where the range
-    /// is still legal, so the upper bound reported there has to follow it down.
-    #[test_log::test(tokio::test)]
-    async fn test_statistics_follow_an_after_filter_range_on_an_index_input() {
-        let fixture = TestFixture::new().await;
-        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
-        let index_filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
-        let index_input = fixture
-            .index_input(&base_options.clone().with_filter_plan(index_filter_plan))
-            .await;
-        assert!(index_input.is_some(), "expected a scalar-index input");
-
-        let options = base_options.with_scan_range_after_filter(0..10).unwrap();
-        let plan =
-            FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
-        assert!(plan.options().full_filter.is_none());
-
-        let stats = plan.partition_statistics(None).unwrap();
-        assert_eq!(stats.num_rows, Precision::Inexact(10));
-    }
-
     #[tokio::test]
     async fn test_statistics() {
         let fixture = Arc::new(TestFixture::new().await);
 
         let full_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
         let full_plan = fixture.make_plan(full_options.clone()).await;
+        // The fixture's utf8 column is seeded from the decoder's estimate, so the
+        // whole row reports a width rather than withdrawing.
         assert_eq!(
             full_plan
                 .partition_statistics(None)
                 .unwrap()
                 .total_byte_size,
-            Precision::Absent
+            Precision::Inexact(25282)
         );
 
         // Exclude the variable-width string. The remaining integers and vector
@@ -4916,13 +4890,27 @@ mod tests {
             .index_input(&base_options.clone().with_filter_plan(index_filter_plan))
             .await;
         assert!(index_input.is_some(), "expected a scalar-index input");
-        let plan =
-            FilteredReadExec::try_new(fixture.dataset.clone(), base_options.clone(), index_input)
-                .unwrap();
+        let plan = FilteredReadExec::try_new(
+            fixture.dataset.clone(),
+            base_options.clone(),
+            index_input.clone(),
+        )
+        .unwrap();
         assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
+
+        // A range also caps an index-selected read without a filter expression.
+        let options = base_options
+            .clone()
+            .with_scan_range_after_filter(0..10)
+            .unwrap();
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
         // `with_deleted_rows` emits the deleted rows as well, so the node produces
         // the fragments' physical rows (300) and not the live ones (250) that
@@ -5259,10 +5247,8 @@ mod tests {
         assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
     }
 
-    /// A refine filter drops rows on its own when the index result is exact, so a
-    /// read carrying one cannot promise its row count. An exact count here is not
-    /// just a bad estimate: DataFusion ships `AggregateStatistics` as a default
-    /// rule, which folds `COUNT(*)` straight to it.
+    /// Refine-only options must not expose an exact unfiltered row count that
+    /// DataFusion could fold into `COUNT(*)`.
     #[tokio::test]
     async fn a_refine_filter_alone_leaves_the_row_count_inexact() {
         let fixture = Arc::new(TestFixture::new().await);
@@ -5273,8 +5259,8 @@ mod tests {
             panic!("a read with nothing selecting rows knows how many it returns");
         };
 
-        // Set public fields directly to bypass the setters and proto decoder,
-        // which reject a refine filter without a full filter.
+        // Public fields can bypass the pairing check in `with_filter` and the
+        // proto decoder.
         let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
         let mut options = base_options;
         options.refine_filter = filter_plan.full_expr.clone();

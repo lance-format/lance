@@ -9422,130 +9422,45 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-        row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+          row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=Hash([key@1], ...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
 
-    /// Unknown string widths must not make the larger target appear smaller than
-    /// the materialized source when DataFusion chooses the hash join's build side.
-    #[tokio::test]
-    async fn test_plan_join_does_not_collect_a_target_it_cannot_measure() {
-        use arrow_array::{Array, RecordBatchIterator, StringArray, UInt32Array};
-        use arrow_schema::{DataType, Field, Schema};
-
-        fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
-            if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
-                return Some(join);
-            }
-            plan.children()
-                .into_iter()
-                .find_map(|child| find_hash_join(child.as_ref()))
-        }
-
-        // The target has more rows and bytes than the source, but a 64-byte
-        // string estimate would make it appear smaller. Both row counts fit
-        // below the default collect row threshold.
-        let wide = "x".repeat(1_024);
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::Utf8, false),
-            Field::new("other", DataType::Utf8, true),
-        ]));
-        let target = RecordBatch::try_new(
-            target_schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from((0..1_000).collect::<Vec<_>>())),
-                Arc::new(StringArray::from_iter_values((0..1_000).map(|_| "old"))),
-                Arc::new(StringArray::from_iter_values(
-                    (0..1_000).map(|_| wide.as_str()),
-                )),
-            ],
-        )
-        .unwrap();
-        // The columns the target scan reads: the join key and the `other` the
-        // row-rewrite fill pulls from the target side.
-        let target_bytes =
-            target.column(0).get_array_memory_size() + target.column(2).get_array_memory_size();
-        let ds = Arc::new(
-            Dataset::write(
-                RecordBatchIterator::new([Ok(target)], target_schema),
-                "memory://",
-                None,
-            )
-            .await
-            .unwrap(),
-        );
-
-        let source_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
-        let source = RecordBatch::try_new(
-            source_schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from((0..100).collect::<Vec<_>>())),
-                Arc::new(StringArray::from_iter_values(
-                    (0..100).map(|_| wide.as_str()),
-                )),
-            ],
-        )
-        .unwrap();
-        let source_bytes: usize = source
-            .columns()
-            .iter()
-            .map(|column| column.get_array_memory_size())
-            .sum();
-        assert!(
-            target_bytes > source_bytes * 4,
-            "the fixture has to make the target the clearly larger side: \
-             target={target_bytes}, source={source_bytes}"
-        );
-
-        let provider: Arc<dyn TableProvider> = Arc::new(
-            datafusion::datasource::MemTable::try_new(source_schema, vec![vec![source]]).unwrap(),
-        );
-        let plan = crate::dataset::MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-            .unwrap()
-            .when_matched(crate::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
-            .try_build()
-            .unwrap()
-            .create_plan(provider)
-            .await
-            .unwrap();
-        let join = find_hash_join(plan.as_ref()).expect("a materialized source plans a hash join");
-        assert_eq!(*join.partition_mode(), PartitionMode::CollectLeft);
-        let build = format!(
-            "{}",
-            datafusion::physical_plan::displayable(join.left().as_ref()).indent(true)
-        );
-        assert!(
-            build.contains("DataSourceExec") && !build.contains("LanceRead"),
-            "the {source_bytes}-byte source must be the collected side, not the \
-             {target_bytes}-byte target:\n{build}"
-        );
-    }
-
-    /// #4583 use case 3: which side of the hash join is buffered is decided by the
-    /// source's statistics, not by the order `create_plan` writes the join in. It
-    /// always puts the target on the left, so without a swap the target builds.
+    /// #4583 use case 3: which side of the merge_insert hash join gets buffered
+    /// is decided by the source's statistics, not by the order `create_plan`
+    /// writes the join in. `create_plan` always puts the target on the left, so
+    /// without a swap the target is always the build side.
     ///
-    /// The target here is past both of DataFusion's collect thresholds (1 MiB /
-    /// 128 Ki rows, its defaults -- Lance sets none of its own). The byte size is
-    /// what decides: `supports_collect_by_thresholds` reads `total_byte_size`
-    /// first and falls back to the row count only when it is absent. A
-    /// materialized source fits under both, so `JoinSelection` swaps it onto the
-    /// build side; a one-shot stream reports `Absent` for everything, so neither
-    /// side qualifies and the join stays partitioned with the target building.
-    /// The one-shot and spilling stream providers both report absent statistics.
+    /// The target here is one row past DataFusion's
+    /// `hash_join_single_partition_threshold_rows`, and its estimated width puts it
+    /// past the 1 MiB byte threshold too, so the target cannot be collected on
+    /// either count. That leaves the source: a materialized one reports exact
+    /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
+    /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
+    /// `Absent` for everything, neither side qualifies for `CollectLeft`, and the
+    /// plan falls back to a partitioned join whose build side is still the target.
     ///
-    /// Changes to the thresholds or width estimate can change this plan shape;
-    /// the test checks the build side and partition mode, not runtime memory use.
+    /// The one-shot provider used below stands in for every non-materialized
+    /// source: `stream_source_to_provider` sends the default path through
+    /// `spilling_table_provider`, which also hands back a `StreamingTable` and so
+    /// reports the same absent statistics.
+    ///
+    /// This is about which side is buffered, not about how much the target reads.
+    /// The target scan projects `other` either way, because the row-rewrite fill
+    /// reads it from the target side of the join.
+    ///
+    /// Both expectations characterise DataFusion's choice rather than any Lance
+    /// logic, and Lance sets no `hash_join_single_partition_threshold*` of its own,
+    /// so this rides on DataFusion's defaults (1 MiB / 128 Ki rows). A DataFusion
+    /// upgrade that changes them fails this test without anything in Lance
+    /// regressing, which is the point: the plan shape is what merge_insert's memory
+    /// use depends on, so a silent change to it should not go unnoticed.
     #[tokio::test]
     async fn test_plan_join_build_side_follows_source_statistics() {
         fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
@@ -9761,8 +9676,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -9811,8 +9727,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -9868,8 +9785,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"

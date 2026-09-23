@@ -471,8 +471,7 @@ pub struct TakeExec {
     schema_to_take: Arc<Schema>,
     // The schema of the output
     output_schema: SchemaRef,
-    /// Estimated once here, from the output schema: the take is where the plan gets
-    /// its width, and `partition_statistics` is called repeatedly.
+    /// Cached from the output schema and dataset blob metadata at construction.
     bytes_per_row: Option<f64>,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
@@ -576,7 +575,7 @@ impl TakeExec {
         );
 
         let schema_to_take = projection.into_schema_ref();
-        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref());
+        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
 
         Ok(Some(Self {
             dataset,
@@ -746,10 +745,8 @@ impl ExecutionPlan for TakeExec {
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
-        // The take adds the columns the input did not carry, so this node is where a
-        // late-materialized plan gets its width. That is why the size comes from the
-        // output schema: without it a join above the take sees no size at all and
-        // falls back to the row count, which is the case the estimate exists for.
+        // Include fetched columns as well as carried columns when costing the
+        // output of a late-materialized plan.
         let num_rows = self.input.partition_statistics(partition)?.num_rows;
         Ok(Arc::new(Statistics {
             num_rows,
@@ -770,6 +767,7 @@ impl ExecutionPlan for TakeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::datatypes::BlobHandling;
 
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray, StructArray,
@@ -888,26 +886,30 @@ mod tests {
         let stats = take_exec.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, input_stats.num_rows);
         assert_eq!(stats.total_byte_size, Precision::Inexact(484));
-        // Adding a variable-width column makes the output width unknown.
-        let unsizeable = dataset
+        // A variable-width column is seeded from the decoder's estimate rather than
+        // withdrawing the row: 64 bytes of string and a 4-byte offset on top.
+        let seeded = dataset
             .empty_projection()
             .union_column("s", OnMissing::Error)
             .unwrap();
-        let take_exec = TakeExec::try_new(dataset, input, unsizeable)
-            .unwrap()
-            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, seeded).unwrap().unwrap();
         let stats = take_exec.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, input_stats.num_rows);
-        assert_eq!(stats.total_byte_size, Precision::Absent);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2404));
     }
 
-    /// A carried binary payload must suppress the estimate even when the take
-    /// itself only fetches a fixed-width column.
-    #[tokio::test]
-    async fn test_take_statistics_suppress_a_carried_blob_payload() {
+    /// A take carries its input's payload columns through, so it must suppress the
+    /// estimate whatever blob mode its own projection uses: with descriptions the
+    /// projection renders a descriptor while the output still holds the payload.
+    #[rstest]
+    #[case::take_projects_descriptions(None)]
+    #[case::take_projects_binary(Some(BlobHandling::AllBinary))]
+    #[test_log::test(tokio::test)]
+    async fn test_take_statistics_suppress_a_carried_blob_payload(
+        #[case] take_blob_handling: Option<BlobHandling>,
+    ) {
         use arrow_array::UInt64Array;
         use datafusion::common::stats::Precision;
-        use lance_core::datatypes::BlobHandling;
         use lance_file::version::LanceFileVersion;
 
         use crate::blob::{BlobArrayBuilder, blob_field};
@@ -943,7 +945,7 @@ mod tests {
             .unwrap(),
         );
 
-        // Blob materialization exposes a LargeBinary field in the output schema.
+        // The input materializes the payload, and must not bill it.
         let scan_projection = dataset
             .empty_projection()
             .with_blob_handling(BlobHandling::AllBinary)
@@ -962,24 +964,27 @@ mod tests {
         assert_eq!(
             input.partition_statistics(None).unwrap().total_byte_size,
             Precision::Absent,
-            "the scan itself must not bill a blob payload"
+            "the scan must not bill the payload it materialized"
         );
 
-        // `idx` is the only column the take fetches, and it is an ordinary uint64.
-        let take_projection = dataset
-            .empty_projection()
-            .with_blob_handling(BlobHandling::AllBinary)
+        // The take fetches only `idx`, but carries the payload either way.
+        let mut take_projection = dataset.empty_projection();
+        if let Some(handling) = take_blob_handling {
+            take_projection = take_projection.with_blob_handling(handling);
+        }
+        let take_projection = take_projection
             .union_column("idx", OnMissing::Error)
             .unwrap();
         let take_exec = TakeExec::try_new(dataset, input, take_projection)
             .unwrap()
             .unwrap();
+
         let stats = take_exec.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(3));
         assert_eq!(
             stats.total_byte_size,
             Precision::Absent,
-            "the take carries the payload into its output, so it must suppress too"
+            "a carried payload must suppress whatever the take projects"
         );
     }
 
