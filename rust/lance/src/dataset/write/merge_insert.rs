@@ -73,6 +73,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
+use datafusion::common::Column as LogicalColumn;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
@@ -1087,6 +1088,35 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     let schema = stream.schema();
     let partition = Arc::new(OneShotPartitionStream::new(stream));
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// Fill omitted source fields in one projection so plan depth does not grow with schema width.
+fn fill_missing_columns(
+    df: DataFrame,
+    dataset_schema: &Schema,
+    source_field_names: &HashSet<String>,
+) -> std::result::Result<DataFrame, DataFusionError> {
+    let missing_fields: HashSet<&str> = dataset_schema
+        .fields()
+        .iter()
+        .filter(|field| !source_field_names.contains(field.name()))
+        .map(|field| field.name().as_str())
+        .collect();
+    if missing_fields.is_empty() {
+        return Ok(df);
+    }
+
+    let mut columns = Vec::with_capacity(df.schema().fields().len());
+    for (qualifier, field) in df.schema().iter() {
+        if missing_fields.contains(field.name().as_str()) {
+            columns.push(
+                logical_expr::col(format!("target.\"{}\"", field.name())).alias(field.name()),
+            );
+        } else {
+            columns.push(logical_expr::col(LogicalColumn::from((qualifier, field))));
+        }
+    }
+    df.select(columns)
 }
 
 /// Scans source partitions sequentially and removes duplicate non-null keys.
@@ -2448,15 +2478,15 @@ impl MergeInsertJob {
             )?;
 
         // Partial-schema upsert: for every dataset column missing from the
-        // source, add a synthetic unqualified column that copies the target
-        // side's value for that column. For matched rows this carries the
+        // source, replace the target-side field with a synthetic unqualified
+        // column that copies its value. For matched rows this carries the
         // existing target value (preserving non-source columns on update);
         // for unmatched source rows (inserts) the outer join leaves the
         // target side NULL, so inserts get NULL for missing columns. The
         // unqualified name matches the dataset field and becomes a normal
         // data column from the write exec's perspective.
         //
-        // We iterate the dataset schema in order so that the resulting
+        // The fill keeps the joined schema's column order so the resulting
         // physical plan is deterministic and easy to inspect in tests.
         //
         // `RewriteColumns` patches the source columns into the fragments that
@@ -2464,14 +2494,7 @@ impl MergeInsertJob {
         // stored values and must not be filled here. Skipping the fill is also
         // what keeps them out of the target scan's projection.
         if write_sink == WriteSink::RewriteRows {
-            for field in dataset_schema.fields() {
-                if !source_field_names.contains(field.name()) {
-                    df = df.with_column(
-                        field.name(),
-                        logical_expr::col(format!("target.\"{}\"", field.name())),
-                    )?;
-                }
-            }
+            df = fill_missing_columns(df, &dataset_schema, &source_field_names)?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -6757,6 +6780,53 @@ mod tests {
         use super::*;
         use rstest::rstest;
 
+        #[test]
+        fn test_missing_columns_use_one_projection() {
+            let target = record_batch!(
+                ("key", Int32, [1]),
+                ("value", Int32, [10]),
+                ("camelCase", Int32, [20]),
+                ("other", Int32, [30]),
+                ("third", Int32, [40])
+            )
+            .unwrap();
+            let source = record_batch!(("key", Int32, [1]), ("value", Int32, [11])).unwrap();
+            let context = SessionContext::new();
+            let target_df = context
+                .read_batch(target.clone())
+                .unwrap()
+                .alias("target")
+                .unwrap();
+            let source_df = context.read_batch(source).unwrap().alias("source").unwrap();
+            let joined = target_df
+                .join(source_df, JoinType::Full, &["key"], &["key"], None)
+                .unwrap();
+            let joined_column_count = joined.schema().fields().len();
+            let source_field_names = HashSet::from(["key".to_string(), "value".to_string()]);
+
+            let filled =
+                fill_missing_columns(joined, target.schema().as_ref(), &source_field_names)
+                    .unwrap();
+            let (_, plan) = filled.into_parts();
+            let LogicalPlan::Projection(projection) = plan else {
+                panic!("omitted columns must be added by a projection");
+            };
+            assert!(
+                matches!(projection.input.as_ref(), LogicalPlan::Join(_)),
+                "one projection must fill all omitted columns without nested projections"
+            );
+            assert_eq!(projection.expr.len(), joined_column_count);
+            let filled_names = projection
+                .expr
+                .iter()
+                .filter_map(|expr| match expr {
+                    Expr::Alias(alias) => Some(alias.name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(filled_names, ["camelCase", "other", "third"]);
+        }
+
         struct Fixtures {
             ds: Arc<Dataset>,
             new_data: RecordBatch,
@@ -7323,7 +7393,7 @@ mod tests {
         }
 
         /// Partial-schema v2 upsert must correctly handle `camelCase` column
-        /// names both in the join key and in a column that is *omitted* from
+        /// names both in the join key and in columns that are *omitted* from
         /// the source. DataFusion's `col()` lowercases unquoted identifiers,
         /// so the partial-schema fill-in wraps the target reference in double
         /// quotes (`target."<name>"`) and `on_cols` are likewise quoted. This
@@ -7331,12 +7401,13 @@ mod tests {
         /// path had no coverage for case-sensitive column names.
         #[tokio::test]
         async fn test_merge_insert_subcols_v2_camel_case_column() {
-            // Target dataset: camelCase join key AND a camelCase nullable
-            // column that will be omitted from the source schema.
+            // Target dataset: camelCase join key and two nullable columns
+            // that will be omitted from the source schema.
             let full_schema = Arc::new(Schema::new(vec![
                 Field::new("userId", DataType::Utf8, false),
                 Field::new("score", DataType::UInt32, true),
                 Field::new("extraData", DataType::Utf8, true),
+                Field::new("missingCount", DataType::UInt32, true),
             ]));
             let full_batch = RecordBatch::try_new(
                 full_schema.clone(),
@@ -7344,6 +7415,7 @@ mod tests {
                     Arc::new(StringArray::from(vec!["u1", "u2", "u3"])),
                     Arc::new(UInt32Array::from(vec![10, 20, 30])),
                     Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                    Arc::new(UInt32Array::from(vec![100, 200, 300])),
                 ],
             )
             .unwrap();
@@ -7356,7 +7428,8 @@ mod tests {
             .unwrap();
             let ds = Arc::new(ds);
 
-            // Partial-schema source: no `extraData`. Updates `u2` and inserts `u_new`.
+            // Partial-schema source omits both nullable columns. Updates `u2`
+            // and inserts `u_new`.
             let partial_schema = Arc::new(Schema::new(vec![
                 Field::new("userId", DataType::Utf8, false),
                 Field::new("score", DataType::UInt32, true),
@@ -7398,7 +7471,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(data.num_rows(), 4);
-            assert_eq!(data.num_columns(), 3);
+            assert_eq!(data.num_columns(), 4);
 
             let user_ids = data
                 .column_by_name("userId")
@@ -7418,8 +7491,14 @@ mod tests {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let missing_count = data
+                .column_by_name("missingCount")
+                .expect("second omitted column must be present in result")
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
 
-            let mut by_user: std::collections::HashMap<String, (u32, Option<String>)> =
+            let mut by_user: std::collections::HashMap<String, (u32, Option<String>, Option<u32>)> =
                 std::collections::HashMap::new();
             for i in 0..data.num_rows() {
                 let extra_val = if extra.is_null(i) {
@@ -7427,22 +7506,29 @@ mod tests {
                 } else {
                     Some(extra.value(i).to_string())
                 };
-                by_user.insert(user_ids.value(i).to_string(), (scores.value(i), extra_val));
+                by_user.insert(
+                    user_ids.value(i).to_string(),
+                    (
+                        scores.value(i),
+                        extra_val,
+                        (!missing_count.is_null(i)).then(|| missing_count.value(i)),
+                    ),
+                );
             }
 
             // Untouched rows: unchanged.
-            assert_eq!(by_user["u1"], (10, Some("a".to_string())));
-            assert_eq!(by_user["u3"], (30, Some("c".to_string())));
+            assert_eq!(by_user["u1"], (10, Some("a".to_string()), Some(100)));
+            assert_eq!(by_user["u3"], (30, Some("c".to_string()), Some(300)));
             // Updated row: score bumped, camelCase `extraData` preserved from target.
             assert_eq!(
                 by_user["u2"],
-                (22, Some("b".to_string())),
+                (22, Some("b".to_string()), Some(200)),
                 "partial-schema update must preserve camelCase `extraData` from the target side of the join"
             );
             // Inserted row: camelCase column must be NULL (outer-join target side is NULL).
             assert_eq!(
                 by_user["u_new"],
-                (99, None),
+                (99, None, None),
                 "partial-schema insert must produce NULL for omitted camelCase column"
             );
         }
