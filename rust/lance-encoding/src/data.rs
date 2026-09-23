@@ -3011,33 +3011,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dictionary_rejects_indices_wider_than_declared_key_type() {
+    /// Indices stored wider than the requested key type convert when every
+    /// index fits, and fail the read instead of wrapping when one does not.
+    #[rstest]
+    #[case::fits(vec![0_u32, 1, 0], true)]
+    #[case::out_of_range(vec![0_u32, 1, 128], false)]
+    fn dictionary_indices_convert_to_requested_key_type(
+        #[case] indices: Vec<u32>,
+        #[case] fits: bool,
+    ) {
+        let values: Vec<Option<&str>> = (0..=128)
+            .map(|i| match i {
+                0 => Some("zero"),
+                1 => Some("one"),
+                _ => None,
+            })
+            .collect();
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
             indices: FixedWidthDataBlock {
-                data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
+                data: LanceBuffer::reinterpret_vec(indices),
                 bits_per_value: 32,
                 num_values: 3,
                 block_info: BlockInfo::new(),
             },
-            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![
-                Some("zero"),
-                Some("one"),
-                None,
-            ]))),
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(values))),
         });
 
         let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
-        let error = dictionary
-            .into_arrow(data_type, false)
-            .expect_err("mismatched dictionary index widths must be rejected");
-
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(
-            error.to_string().contains(
-                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits"
-            )
-        );
+        let result = dictionary.into_arrow(data_type.clone(), false);
+        if fits {
+            let array = make_array(result.unwrap());
+            assert_eq!(array.data_type(), &data_type);
+            let expected: ArrayRef = Arc::new(StringArray::from(vec!["zero", "one", "zero"]));
+            assert_eq!(
+                arrow_cast::cast(&array, &DataType::Utf8).unwrap().as_ref(),
+                expected.as_ref()
+            );
+        } else {
+            let error = result.expect_err("an index outside the key type must fail");
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        }
     }
 
     #[rstest]

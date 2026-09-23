@@ -327,6 +327,13 @@ impl<'a> InsertBuilder<'a> {
                     context.storage_version
                 )));
             }
+            if dataset.manifest.uses_semantic_types()
+                && context.storage_version == ConcreteFileVersion::V2_0
+            {
+                return Err(Error::invalid_input(
+                    "Cannot append data files in version 2.0: tables that follow the semantic type contract need data file version 2.1 or later",
+                ));
+            }
             let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
             schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
             schema_cmp_opts.allow_missing_if_nullable = true;
@@ -530,11 +537,18 @@ mod test {
             data_storage_version: Some(target_version),
             ..Default::default()
         };
-        let dataset = InsertBuilder::new(Arc::new(dataset))
+        let result = InsertBuilder::new(Arc::new(dataset))
             .with_params(&explicit_params)
             .execute(vec![batch.clone()])
-            .await
-            .unwrap();
+            .await;
+        // A 2.3 table follows the semantic type contract, whose readers need
+        // data files of version 2.1 or later.
+        if default_version == LanceFileVersion::V2_3 && target_version == LanceFileVersion::V2_0 {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("2.1 or later"), "{err}");
+            return;
+        }
+        let dataset = result.unwrap();
 
         assert_eq!(
             dataset.manifest.data_storage_format.lance_file_format(),
