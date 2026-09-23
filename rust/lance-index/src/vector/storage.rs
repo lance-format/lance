@@ -21,10 +21,10 @@ use prost::Message;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -560,6 +560,17 @@ impl DeepSizeOf for PlaneAccess {
     }
 }
 
+/// Runtime promotion history shared by reconstructions of the same cached index.
+/// This contains no readers or object-store handles and is not persisted to disk.
+#[derive(Debug, Clone, Default)]
+pub struct PlaneAccessTracker(Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>);
+
+impl DeepSizeOf for PlaneAccessTracker {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
+    }
+}
+
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
 pub struct IvfQuantizationStorage<Q: Quantization> {
@@ -570,7 +581,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
     ivf: IvfModel,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    plane_access: Arc<std::sync::Mutex<std::collections::HashMap<(usize, u8), PlaneAccess>>>,
+    plane_access: PlaneAccessTracker,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -678,6 +689,17 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             frag_reuse_index,
             plane_access: Default::default(),
         }
+    }
+
+    /// Promotion history to retain in the index's cached runtime state.
+    pub fn plane_access_tracker(&self) -> &PlaneAccessTracker {
+        &self.plane_access
+    }
+
+    /// Reuse promotion history when binding new readers to a cached index.
+    pub fn with_plane_access_tracker(mut self, tracker: PlaneAccessTracker) -> Self {
+        self.plane_access = tracker;
+        self
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -945,7 +967,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     .is_some()
             {
                 let promote = {
-                    let mut accesses = self.plane_access.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut accesses = self
+                        .plane_access
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let access = accesses.entry((part_id, plane)).or_default();
                     access.reads = access.reads.saturating_add(1);
                     access.rows = access.rows.saturating_add(rows.len());

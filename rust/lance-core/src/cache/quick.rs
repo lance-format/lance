@@ -129,7 +129,8 @@ impl QuickCacheBackend {
                     let size = key_footprint(&key).saturating_add(value.size_bytes);
                     dropped.extend(entries.insert(key, value, size, 3, self.capacity));
                 }
-                self.cache.clear();
+                // Evict resident values without invalidating single-flight
+                // placeholders: their loaders still belong to this generation.
                 self.cache.set_capacity(0);
             }
             let size = key_footprint(&key).saturating_add(item.size_bytes);
@@ -337,6 +338,37 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    #[tokio::test]
+    async fn priority_transition_preserves_inflight_loads() {
+        let cache = Arc::new(QuickCacheBackend::with_capacity(1024));
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+            .with_memory_priority(3);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let loading_cache = cache.clone();
+        let loading = tokio::spawn(async move {
+            loading_cache
+                .get_or_insert(
+                    &key(1),
+                    Box::pin(async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Ok((Arc::new(1u64) as CacheEntry, 32))
+                    }),
+                    Some(codec),
+                )
+                .await
+                .unwrap()
+        });
+        started_rx.await.unwrap();
+        cache.insert(&key(2), Arc::new(2u64), 32, Some(codec)).await;
+        release_tx.send(()).unwrap();
+        loading.await.unwrap();
+        assert!(cache.get_resident(&key(1)).await.is_some());
+        assert!(cache.get_resident(&key(2)).await.is_some());
     }
 
     #[tokio::test]

@@ -62,8 +62,8 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext,
-    VectorStore,
+    PlaneAccessTracker, QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool,
+    RabitRawQueryContext, VectorStore,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -126,6 +126,8 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
+    /// Runtime-only counters survive reader reconstruction between queries.
+    pub(crate) plane_access: PlaneAccessTracker,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -620,6 +622,7 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
             + self.aux_ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
+            + self.plane_access.deep_size_of_children(context)
             + self
                 .rq_search_cache
                 .lock()
@@ -734,6 +737,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
+                plane_access: PlaneAccessTracker::default(),
             })))
         }
 
@@ -2363,6 +2367,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
+            plane_access: self.storage.plane_access_tracker().clone(),
         }))
     }
 }
@@ -3355,7 +3360,8 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.metadata.clone(),
         state.distance_type,
         frag_reuse_index,
-    );
+    )
+    .with_plane_access_tracker(state.plane_access.clone());
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
@@ -6644,6 +6650,62 @@ mod tests {
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 
         test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
+    }
+
+    #[tokio::test]
+    async fn test_layered_plane_promotion_survives_query_reconstruction() {
+        use lance_index::vector::bq::layered::PlaneKey;
+
+        let dir = TempStrDir::default();
+        let (mut dataset, vectors) =
+            generate_test_dataset::<Float32Type>(dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            RQBuildParams::new(7).with_layered(true),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let cold = crate::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::new(
+                64 * 1024 * 1024,
+                1024 * 1024,
+                Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+            )))
+            .load()
+            .await
+            .unwrap();
+        let index_id = cold.load_indices().await.unwrap()[0].uuid;
+        let cache = cold.index_cache.for_index(&index_id, None);
+        let query = vectors.value(0);
+        let num_rows = cold.count_rows(None).await.unwrap();
+        for pass in 0..3 {
+            let result = cold
+                .scan()
+                .nearest("vector", query.as_ref(), num_rows)
+                .unwrap()
+                .nprobes(4)
+                .rq_cascade_factor(1)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), num_rows);
+            for partition in 0..4 {
+                for plane in [1, 2] {
+                    let resident = cache
+                        .get_resident_with_key(&PlaneKey { partition, plane })
+                        .await;
+                    assert_eq!(
+                        resident.is_some(),
+                        pass == 2,
+                        "pass={pass}, partition={partition}, plane={plane}"
+                    );
+                }
+            }
+        }
     }
 
     #[rstest]
