@@ -807,9 +807,10 @@ def find_duplicate_pairs(
     Close the reader to cancel further work. This operation does not delete rows.
 
     Each partition's compact index codes are prepared once. Small partitions
-    are buffered in memory; larger ones use temporary session spill storage,
-    reclaimed when the reader advances or closes. Decoded vectors and output
-    remain batched. This avoids rereading the source index for every anchor.
+    are buffered in memory; larger ones are read in 8,192-row batches into
+    temporary session spill storage, reclaimed when the reader advances or
+    closes. Decoding uses 1,024-row vector batches and output remains batched.
+    This avoids rereading the source index for every anchor.
 
     Examples
     --------

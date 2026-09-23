@@ -48,6 +48,9 @@ use super::pairwise::{EncodedPartition, PairwisePartition, PairwiseSpillWriter};
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
+/// Coalesce source-index reads independently of the decoded vector batch size.
+const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
+
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
 where
     R: Send + 'static,
@@ -800,12 +803,18 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             )
         } else {
             let mut writer = PairwiseSpillWriter::new(spill_store).await?;
-            for start in (0..num_rows).step_by(batch_size) {
-                let end = start.saturating_add(batch_size).min(num_rows);
+            // Align source reads to whole vector batches so each spill range
+            // still corresponds to exactly one decoded batch during replay.
+            let read_batch_size = PAIRWISE_READ_BATCH_SIZE.div_ceil(batch_size) * batch_size;
+            for start in (0..num_rows).step_by(read_batch_size) {
+                let end = start.saturating_add(read_batch_size).min(num_rows);
                 let batch = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
-                writer.write(batch).await?;
+                for offset in (0..batch.num_rows()).step_by(batch_size) {
+                    let len = batch_size.min(batch.num_rows() - offset);
+                    writer.write(batch.slice(offset, len)).await?;
+                }
             }
             writer.finish().await?
         };

@@ -3840,9 +3840,11 @@ mod tests {
     #[case::rq5(Some(5))]
     #[tokio::test]
     async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<usize>) {
-        // Three vector batches, including a packed RQ tail. Force both the
-        // memory and spill paths on the same immutable index representation.
-        let (batch, schema) = make_seeded_vector_batch(65);
+        // Cross the 8K source-read boundary with a packed RQ tail. Force both
+        // memory and spill paths, replaying the same index in 1K vector batches.
+        const NUM_ROWS: usize = 8193;
+        const BATCH_SIZE: usize = 1024;
+        let (batch, schema) = make_seeded_vector_batch(NUM_ROWS);
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
             "memory://",
@@ -3899,11 +3901,11 @@ mod tests {
         let store = session.spill_store();
         dataset.object_store.as_ref().io_stats_incremental();
         let memory = index
-            .prepare_pairwise_partition(0, 32, 16 * 1024 * 1024, store)
+            .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
             .await
             .unwrap();
         let spilled = index
-            .prepare_pairwise_partition(0, 32, 0, store)
+            .prepare_pairwise_partition(0, BATCH_SIZE, 0, store)
             .await
             .unwrap();
         assert!(
@@ -3916,16 +3918,19 @@ mod tests {
         );
         let mut seen = HashSet::new();
         for _ in 0..3 {
-            for batch_id in 0..3 {
+            for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
                 let expected = memory.read_vectors(batch_id).await.unwrap();
                 let actual = spilled.read_vectors(batch_id).await.unwrap();
                 assert_eq!(actual.row_ids, expected.row_ids);
                 assert_eq!(actual.vectors, expected.vectors);
-                assert_eq!(actual.row_ids.len(), if batch_id == 2 { 1 } else { 32 });
+                assert_eq!(
+                    actual.row_ids.len(),
+                    BATCH_SIZE.min(NUM_ROWS - batch_id * BATCH_SIZE)
+                );
                 seen.extend(actual.row_ids.values().iter().copied());
             }
         }
-        assert_eq!(seen, (0..65).collect::<HashSet<u64>>());
+        assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_eq!(
             stats.read_iops, 0,
