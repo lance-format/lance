@@ -11,7 +11,7 @@ use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::utils::make_rowid_capture_stream;
+use crate::dataset::utils::{RowCapture, make_row_capture_stream};
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -347,8 +347,12 @@ impl UpdateJob {
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        let (stream, row_id_rx) = make_row_capture_stream(
+            stream,
+            RowCapture::RowId {
+                stable: self.dataset.manifest.uses_stable_row_ids(),
+            },
+        )?;
 
         let scan_schema = stream.schema();
         let expected_schema: ArrowSchema = self.dataset.schema().into();

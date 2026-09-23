@@ -2345,3 +2345,36 @@ async fn test_optimize_preserves_vector_overlay_masking() {
         "overlaid vector for id=40 dropped after optimize: {after:?}"
     );
 }
+
+/// A delete whose predicate is served by the scalar index must work when a data overlay has
+/// made rows stale. Delete projects `_rowaddr` without `_rowid`, which is the one flag
+/// combination that reaches `scalar_indexed_scan` alongside a non-empty stale-row set, and
+/// the stale-Take branch is unioned onto a plan whose schema carries `_rowid`.
+///
+/// Both targets matter: `age = 999` lives only on the stale-Take path (the index never saw
+/// it), while `age = 20` comes off the indexed path.
+#[rstest]
+#[tokio::test]
+async fn test_delete_indexed_predicate_with_overlay(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+
+    // Fragment 0, offset 1 is id=1, age=10; the overlay makes its age 999.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    dataset.delete("age = 999").await.unwrap();
+    assert_eq!(ids_matching(&dataset, "age = 999").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "id = 1").await, Vec::<i32>::new());
+
+    dataset.delete("age = 20").await.unwrap();
+    assert_eq!(ids_matching(&dataset, "age = 20").await, Vec::<i32>::new());
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+}

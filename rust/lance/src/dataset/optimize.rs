@@ -93,7 +93,7 @@ use super::rowids::load_row_id_sequences;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
-use super::utils::make_rowid_capture_stream;
+use super::utils::{RowCapture, make_row_capture_stream};
 use super::versions;
 use super::{
     WriteMode, WriteParams, cleanup_data_fragments,
@@ -2015,8 +2015,12 @@ async fn prepare_reader(
     if capture_row_ids {
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let (data_no_row_ids, rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
+        let (data_no_row_ids, rx) = make_row_capture_stream(
+            data,
+            RowCapture::RowId {
+                stable: dataset.manifest.uses_stable_row_ids(),
+            },
+        )?;
         Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
         Ok((
