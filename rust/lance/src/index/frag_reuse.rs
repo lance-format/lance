@@ -2206,6 +2206,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
     entry: &IndexMetadata,
 ) -> lance_core::Result<Vec<(String, Path)>> {
     use futures::TryStreamExt;
+    use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
 
     let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
@@ -2244,7 +2245,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
             .clone()
             .join("_fri")
             .join(reference.map_id.as_str());
-        let mut found = false;
+        let mut mapping_size = None;
         let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
         loop {
             match stream.try_next().await {
@@ -2260,24 +2261,44 @@ pub(crate) async fn collect_tagged_row_map_paths(
                             ))
                         })?
                         .trim_start_matches('/');
+                    if relative == MAPPING_FILE {
+                        mapping_size = Some(meta.size);
+                    }
                     paths.push((
                         format!("_fri/{}/{relative}", reference.map_id),
                         base_root.clone(),
                     ));
-                    found = true;
                 }
                 Ok(None) => break,
                 Err(Error::NotFound { .. }) => break,
                 Err(error) => return Err(error),
             }
         }
-        // A referenced map with no files cannot produce a working clone;
-        // refuse rather than commit a history that cannot translate.
-        if !found {
-            return Err(Error::corrupt_file_named(
-                "FRI details",
-                format!("row map {} has no files under its base", reference.map_id),
-            ));
+        // The copy must produce a working clone: the map's mapping file has
+        // to be there with the size the history records for it (the reader
+        // opens the file by that size). Refuse the clone now rather than
+        // hand the target a history whose first translating query fails.
+        match mapping_size {
+            Some(size) if size == reference.map_size_bytes => {}
+            Some(size) => {
+                return Err(Error::corrupt_file_named(
+                    "FRI details",
+                    format!(
+                        "row map {} has a {MAPPING_FILE} of {size} bytes under its base, \
+                         the history records {} bytes",
+                        reference.map_id, reference.map_size_bytes
+                    ),
+                ));
+            }
+            None => {
+                return Err(Error::corrupt_file_named(
+                    "FRI details",
+                    format!(
+                        "row map {} has no {MAPPING_FILE} under its base",
+                        reference.map_id
+                    ),
+                ));
+            }
         }
     }
     Ok(paths)
@@ -4866,6 +4887,85 @@ mod tests {
             list_fri_map_dirs, stable_partition_bases,
         };
         use super::*;
+
+        /// A tagged source whose single row map lives at `_fri/<map_id>/`:
+        /// the dataset, the map directory and the mapping file's path.
+        async fn tagged_source(uri: &str) -> (Dataset, Path, Path) {
+            let mut dataset = disk_fixture(uri).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let map_dirs = list_fri_map_dirs(&dataset).await;
+            assert_eq!(map_dirs.len(), 1);
+            let map_dir = dataset.base.clone().join("_fri").join(map_dirs[0].as_str());
+            let mapping = map_dir
+                .clone()
+                .join(lance_index::frag_reuse::stable_partition::MAPPING_FILE);
+            (dataset, map_dir, mapping)
+        }
+
+        /// The copy is validated before anything is written: a referenced
+        /// row map whose mapping file is missing fails the clone, not the
+        /// clone's first translating query.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_rejects_missing_mapping_file() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/deep", clone_dir.as_str());
+            let (mut dataset, map_dir, mapping) = tagged_source(source_dir.as_str()).await;
+            // The directory still lists a file, so only the mapping file's
+            // own presence can catch this.
+            dataset
+                .object_store
+                .put(&map_dir.join("stray.bin"), b"x")
+                .await
+                .unwrap();
+            dataset.object_store.delete(&mapping).await.unwrap();
+
+            let version = dataset.manifest.version;
+            let error = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("has no"), "{error}");
+            assert!(
+                !std::path::Path::new(&clone_uri).exists(),
+                "nothing may be written before the history is validated"
+            );
+        }
+
+        /// A mapping file whose size differs from the one the history
+        /// records is refused the same way.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deep_clone_rejects_mapping_file_size_mismatch() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/deep", clone_dir.as_str());
+            let (mut dataset, _, mapping) = tagged_source(source_dir.as_str()).await;
+            let bytes = dataset
+                .object_store
+                .open(&mapping)
+                .await
+                .unwrap()
+                .get_all()
+                .await
+                .unwrap();
+            dataset
+                .object_store
+                .put(&mapping, &bytes[..bytes.len() - 1])
+                .await
+                .unwrap();
+
+            let version = dataset.manifest.version;
+            let error = dataset
+                .deep_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("the history records"), "{error}");
+            assert!(!std::path::Path::new(&clone_uri).exists());
+        }
 
         /// Test 1: deep-cloning a tagged table copies its row maps into the
         /// clone's own `_fri/` and rewrites the entry with local references,
