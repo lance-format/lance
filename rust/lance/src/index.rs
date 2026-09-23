@@ -138,6 +138,102 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+/// Move a caller-defined segment group's coverage into the current fragment space.
+///
+/// A deferred compaction can combine several independently built segments into one
+/// new fragment. Remapping each segment bitmap separately would treat every segment
+/// as only partially covering the rewrite group and drop the new fragment. The
+/// merge owns the whole caller-defined group, so remap its union and use that
+/// representable group coverage while materializing every source.
+async fn remap_merged_segment_coverage(
+    dataset: &Dataset,
+    segments: &mut [IndexMetadata],
+) -> Result<bool> {
+    let mut merged_coverage = segments
+        .iter()
+        .map(|segment| {
+            segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+    let retired_coverage = &merged_coverage - dataset.fragment_bitmap.as_ref();
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let Some(frag_reuse_index) = frag_reuse_index.filter(|frag_reuse_index| {
+        append::fragment_reuse_affects_segments(frag_reuse_index, segments.iter())
+    }) else {
+        if !retired_coverage.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "merge_existing_index_segments: source segments cover retired fragments {:?}, \
+                 but no applicable fragment-reuse mapping is available; rebuild the segments \
+                 against dataset version {}",
+                retired_coverage, dataset.manifest.version
+            )));
+        }
+        return Ok(false);
+    };
+
+    // Validate the union before remapping. The generic bitmap remapper heals a
+    // straddling rewrite group by dropping its partial old coverage, which is
+    // appropriate for committed indices that can scan the gap. A caller-supplied
+    // merge has no such fallback and must not publish that loss as current.
+    let mut coverage_at_version = merged_coverage.clone();
+    for version in &frag_reuse_index.details.versions {
+        for group in &version.groups {
+            let old_fragment_ids = group
+                .old_frags
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<Vec<_>>();
+            let covered_old_fragment_ids = old_fragment_ids
+                .iter()
+                .copied()
+                .filter(|fragment_id| coverage_at_version.contains(*fragment_id))
+                .collect::<Vec<_>>();
+            if covered_old_fragment_ids.is_empty() {
+                continue;
+            }
+            if covered_old_fragment_ids.len() != old_fragment_ids.len() {
+                return Err(Error::invalid_input(format!(
+                    "merge_existing_index_segments: source segment group partially covers \
+                     fragment-reuse rewrite group at dataset version {}: covered old fragment \
+                     ids {:?}, rewrite group old fragment ids {:?}; rebuild the segments against \
+                     the current dataset",
+                    version.dataset_version, covered_old_fragment_ids, old_fragment_ids
+                )));
+            }
+
+            for fragment_id in old_fragment_ids {
+                coverage_at_version.remove(fragment_id);
+            }
+            coverage_at_version.extend(group.new_frags.iter().map(|fragment| fragment.id as u32));
+        }
+    }
+
+    let unmapped_retired_coverage = &coverage_at_version - dataset.fragment_bitmap.as_ref();
+    if !unmapped_retired_coverage.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "merge_existing_index_segments: retained fragment-reuse history does not account \
+             for retired source fragment ids {:?}; rebuild the segments against the current \
+             dataset",
+            unmapped_retired_coverage
+        )));
+    }
+
+    frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
+    merged_coverage &= dataset.fragment_bitmap.as_ref();
+
+    for segment in segments {
+        segment.fragment_bitmap = Some(merged_coverage.clone());
+    }
+    Ok(true)
+}
+
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
@@ -1986,6 +2082,16 @@ impl DatasetIndexExt for Dataset {
             ));
         }
 
+        // Vector merging reads physical files directly and RTree performs its own
+        // historical staleness pruning. Scalar merge helpers load their sources
+        // through the FRI row-address remapper, so they must filter and report
+        // coverage in that same current fragment space.
+        let has_remapped_source_coverage = if !all_vector && !all_rtree {
+            remap_merged_segment_coverage(self, &mut source_segments).await?
+        } else {
+            false
+        };
+
         let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
                 .iter()
@@ -1997,6 +2103,8 @@ impl DatasetIndexExt for Dataset {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
             self.manifest.version
+        } else if has_remapped_source_coverage {
+            self.manifest.version
         } else {
             source_dataset_version
         };
@@ -2006,7 +2114,12 @@ impl DatasetIndexExt for Dataset {
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                has_remapped_source_coverage,
+            )
+            .await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
         } else if all_bloomfilter {
