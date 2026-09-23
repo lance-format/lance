@@ -294,8 +294,9 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
 
 @pytest.mark.parametrize("metric", ["l2", "cosine"])
 @pytest.mark.parametrize("query_count", [3, 1], ids=["three_queries", "single_query"])
+@pytest.mark.parametrize("refine_factor", [None, 1, 4])
 def test_batch_indexed_query_matches_repeated_single_queries(
-    dataset, metric, query_count
+    dataset, metric, query_count, refine_factor
 ):
     indexed = dataset.create_index(
         "vector",
@@ -314,6 +315,8 @@ def test_batch_indexed_query_matches_repeated_single_queries(
     # nprobes covers every partition so the shared-scan batch path and the
     # repeated single-query path search the same partitions deterministically.
     nearest_kwargs = {"use_index": True, "nprobes": 4}
+    if refine_factor is not None:
+        nearest_kwargs["refine_factor"] = refine_factor
     batch = indexed.to_table(
         columns=["id"],
         nearest={"column": "vector", "q": queries, "k": k, **nearest_kwargs},

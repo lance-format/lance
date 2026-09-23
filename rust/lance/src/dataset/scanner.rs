@@ -125,8 +125,8 @@ use crate::io::exec::{
     LancePushdownScanExec, LanceScanExec, MinHashSearchExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
-        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
-        query_index_field,
+        BatchRefineExec, KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema,
+        new_knn_batch_exec, new_knn_exec, query_index_field,
     },
     project,
 };
@@ -5944,7 +5944,6 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -5969,14 +5968,6 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any refine factor sends the query onto a reranking path that the
-        // shared batch scan does not implement: the single-query path reranks
-        // with the original vectors even when the factor is 1, and rejects a
-        // factor of 0 outright (`Refine factor cannot be zero`). The batch path
-        // does neither, so fall back to the per-query loop for every `Some(_)`.
-        if q.refine_factor.is_some() {
-            return Ok(false);
-        }
         // Only fixed nprobes is provably equivalent to single-query search; see
         // the method docs. Adaptive nprobes falls back to the per-query loop.
         if q.maximum_nprobes != Some(q.minimum_nprobes) {
@@ -6089,24 +6080,48 @@ impl Scanner {
         // Fast path: when every index segment is an IVF index with a flat-style
         // sub-index (IVF_FLAT/PQ/SQ/RQ), search all query vectors in a single
         // pass that reads each partition's storage once and shares the prefilter
-        // across the batch. HNSW, refine, and mixed indexed/unindexed scans fall
+        // across the batch. HNSW and mixed indexed/unindexed scans fall
         // back to the per-query loop below, which never regresses behavior.
+        if q.refine_factor == Some(0) {
+            return Err(Error::invalid_input("Refine factor cannot be zero"));
+        }
         if self
             .batch_index_search_supported(index_name, index_segments, q)
             .await?
         {
             let mut batch_query = q.clone();
             batch_query.metric_type = Some(index_metric);
+            batch_query.k =
+                q.k.checked_mul(q.refine_factor.unwrap_or(1) as usize)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Candidate count overflows usize: k={}, refine_factor={:?}",
+                            q.k, q.refine_factor
+                        ))
+                    })?;
+            batch_query.refine_factor = None;
             let prefilter_source = self
                 .prefilter_source(filter_plan, self.get_indexed_frags(index_segments))
                 .await?;
-            return new_knn_batch_exec(
+            let input = new_knn_batch_exec(
                 self.dataset.clone(),
                 index_segments,
                 &batch_query,
                 self.nearest_query_count,
                 prefilter_source,
-            );
+            )?;
+            return if q.refine_factor.is_some() {
+                let mut refine_query = q.clone();
+                refine_query.metric_type = Some(index_metric);
+                Ok(Arc::new(BatchRefineExec::try_new(
+                    self.dataset.clone(),
+                    input,
+                    refine_query,
+                    self.nearest_query_count,
+                )?))
+            } else {
+                Ok(input)
+            };
         }
 
         let query_dim = q.key.len() / self.nearest_query_count;
@@ -10892,62 +10907,139 @@ mod test {
         );
     }
 
-    /// Any `refine_factor` sends the query onto a reranking path the shared-scan
-    /// batch node does not implement, so the scanner must fall back to the
-    /// per-query indexed loop and still produce correctly grouped results.
-    ///
-    /// All of `refine(0)`, `refine(1)`, and `refine(2)` must fall back:
-    /// `refine(1)` still reranks on the single-query path (a factor of 1 is not
-    /// a no-op), and `refine(0)` is rejected there with `Refine factor cannot be
-    /// zero` — the batch path would instead return empty results. Covering the
-    /// boundary factors guards the `refine_factor.is_some()` gate against
-    /// regressing back to a `> 1` check.
+    #[rstest]
+    #[case::factor_one(1, true, MetricType::L2, "none")]
+    #[case::shared(2, true, MetricType::L2, "none")]
+    #[case::cosine(2, true, MetricType::Cosine, "none")]
+    #[case::dot(2, true, MetricType::Dot, "none")]
+    #[case::adaptive(2, false, MetricType::L2, "none")]
+    #[case::prefilter(2, true, MetricType::L2, "prefilter")]
+    #[case::postfilter(2, true, MetricType::L2, "postfilter")]
+    #[case::empty(2, true, MetricType::L2, "empty")]
+    #[case::deleted(2, true, MetricType::L2, "deleted")]
+    #[case::bounded(2, true, MetricType::L2, "bounded")]
     #[tokio::test]
-    async fn test_batch_knn_indexed_refine_falls_back() {
+    async fn test_batch_knn_indexed_refine(
+        #[case] factor: u32,
+        #[case] fixed_probes: bool,
+        #[case] metric: MetricType,
+        #[case] scenario: &str,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index_with_metric(metric).await.unwrap();
+        if scenario == "deleted" {
+            test_ds.dataset.delete("i % 2 = 0").await.unwrap();
+        }
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 10).unwrap();
+        scan.refine(factor).project(&["i", "vec"]).unwrap();
+        if fixed_probes {
+            scan.nprobes(2);
+        }
+        match scenario {
+            "prefilter" | "postfilter" => {
+                scan.filter("i > 100")
+                    .unwrap()
+                    .prefilter(scenario == "prefilter");
+            }
+            "empty" => {
+                scan.filter("i < 0").unwrap().prefilter(true);
+            }
+            "bounded" => {
+                scan.distance_range(Some(1.0), Some(1_000_000.0));
+            }
+            _ => {}
+        }
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("BatchRefine"), fixed_probes, "{plan}");
+        assert_eq!(plan.contains("ANNIvfBatch"), fixed_probes, "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        for query_index in 0..2 {
+            let key =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut single = dataset.scan();
+            single.nearest("vec", &key, 10).unwrap();
+            single.refine(factor).project(&["i", "vec"]).unwrap();
+            if fixed_probes {
+                single.nprobes(2);
+            }
+            match scenario {
+                "prefilter" | "postfilter" => {
+                    single
+                        .filter("i > 100")
+                        .unwrap()
+                        .prefilter(scenario == "prefilter");
+                }
+                "empty" => {
+                    single.filter("i < 0").unwrap().prefilter(true);
+                }
+                "bounded" => {
+                    single.distance_range(Some(1.0), Some(1_000_000.0));
+                }
+                _ => {}
+            }
+            let single = single.try_into_batch().await.unwrap();
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let actual = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(actual["i"].as_ref(), single["i"].as_ref());
+            assert_eq!(actual["vec"].as_ref(), single["vec"].as_ref());
+            assert_eq!(actual[DIST_COL].as_ref(), single[DIST_COL].as_ref());
+            if scenario != "none" {
+                continue;
+            }
+            let exact = dataset
+                .scan()
+                .nearest("vec", &key, 10)
+                .unwrap()
+                .use_index(false)
+                .distance_metric(metric)
+                .project(&["i"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected_ids = exact["i"].as_primitive::<Int32Type>();
+            let hits = actual["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|id| expected_ids.values().contains(id))
+                .count();
+            assert!(
+                hits as f32 / 10.0 >= 0.5,
+                "recall={hits}/10, metric={metric:?}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::fixed(true)]
+    #[case::adaptive(false)]
+    #[tokio::test]
+    async fn test_batch_knn_indexed_refine_zero(#[case] fixed_probes: bool) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
-        let dataset = &test_ds.dataset;
-        let (queries, _query_values) = batch_knn_two_queries();
-
-        for refine_factor in [1u32, 2] {
-            let mut scan = dataset.scan();
-            scan.nearest("vec", &queries, 2).unwrap();
-            scan.refine(refine_factor);
-            scan.project(&["i"]).unwrap();
-
-            let plan = scan.explain_plan(false).await.unwrap();
-            assert!(
-                !plan.contains("ANNIvfBatch"),
-                "refine({refine_factor}) must not use the shared-scan batch node, got:\n{plan}"
-            );
-            assert!(
-                plan.contains("ANNSubIndex"),
-                "refine({refine_factor}) batch search should fall back to the per-query \
-                 indexed loop, got:\n{plan}"
-            );
-
-            let batch = scan.try_into_batch().await.unwrap();
-            assert_query_index_field(&batch);
-            assert_eq!(
-                batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
-                &[0, 0, 1, 1],
-                "refine({refine_factor}) should still group results per query"
-            );
+        let (queries, _) = batch_knn_two_queries();
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap().refine(0);
+        if fixed_probes {
+            scan.nprobes(2);
         }
-
-        // refine(0) is rejected on the fallback (per-query) path; the batch path
-        // must not silently accept it and return empty results instead.
-        let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap();
-        scan.refine(0);
-        scan.project(&["i"]).unwrap();
-        let result = scan.try_into_batch().await;
-        assert!(
-            result.is_err(),
-            "refine(0) must error rather than fall through to an empty batch result"
-        );
+        let error = scan.try_into_batch().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Refine factor cannot be zero"));
     }
 
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
@@ -11058,8 +11150,9 @@ mod test {
     /// query must therefore fall back to the per-query loop when a mask is present,
     /// and every returned row must honor the mask — otherwise the batch path would
     /// silently return masked-out rows.
+    #[rstest]
     #[tokio::test]
-    async fn test_batch_knn_indexed_external_mask_falls_back() {
+    async fn test_batch_knn_indexed_external_mask_falls_back(#[values(false, true)] refine: bool) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
@@ -11091,6 +11184,9 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, k).unwrap();
         scan.nprobes(2);
+        if refine {
+            scan.refine(2);
+        }
         scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
             allow.iter().copied(),
         )));
@@ -11130,8 +11226,11 @@ mod test {
     /// selected segments' coverage (as `knn_combined` does), not the whole
     /// logical index, so the scanner falls back to the per-query loop, which
     /// re-scores the uncovered fragment on the flat path and returns every row.
+    #[rstest]
     #[tokio::test]
-    async fn test_batch_knn_indexed_partial_segment_selection_falls_back() {
+    async fn test_batch_knn_indexed_partial_segment_selection_falls_back(
+        #[values(false, true)] refine: bool,
+    ) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -11150,6 +11249,9 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, k).unwrap();
         scan.nprobes(2);
+        if refine {
+            scan.refine(2);
+        }
         // Request both indexed fragments but select only the segment covering
         // fragment 0; fragment 1 is covered only by the unselected segment.
         scan.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
