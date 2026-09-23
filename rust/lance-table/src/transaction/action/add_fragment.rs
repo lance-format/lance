@@ -81,7 +81,7 @@ impl AddFragment {
     /// the same id and the second commit would silently win.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         if let Some(id) = self.id.committed() {
-            footprint.add(Coordinate::FragmentExistence(id));
+            footprint.write(Coordinate::FragmentExistence(id));
         }
     }
 }

@@ -79,9 +79,9 @@ impl AlterField {
     /// rewrite a cast needs is separate actions, which record their own
     /// coordinates.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add_field_definition(self.field);
+        footprint.write_field_definition(self.field);
         if let Some(name) = &self.name {
-            footprint.add(Coordinate::FieldName(name.clone()));
+            footprint.write(Coordinate::FieldName(name.clone()));
         }
     }
 }

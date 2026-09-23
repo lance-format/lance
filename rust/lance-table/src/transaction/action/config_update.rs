@@ -117,7 +117,7 @@ impl ConfigUpdate {
             (ConfigMap::SchemaMetadata, &self.schema_metadata),
         ] {
             if let Some(update) = update {
-                footprint.add_map_update(map, update);
+                footprint.write_map_update(map, update);
             }
         }
         for update in &self.field_metadata {
@@ -128,7 +128,7 @@ impl ConfigUpdate {
             if let Some(id) = update.field.committed()
                 && let Ok(id) = i32::try_from(id)
             {
-                footprint.add_map_update(ConfigMap::Field(id), &update.updates);
+                footprint.write_map_update(ConfigMap::Field(id), &update.updates);
                 footprint.require_field_definition(update.field);
             }
         }
@@ -139,10 +139,10 @@ impl ConfigUpdate {
             LANCE_UNENFORCED_PRIMARY_KEY,
             LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
         ]) {
-            footprint.add(Coordinate::UnenforcedKey(UnenforcedKey::Primary));
+            footprint.write(Coordinate::UnenforcedKey(UnenforcedKey::Primary));
         }
         if self.writes_any(&[LANCE_UNENFORCED_CLUSTERING_KEY_POSITION]) {
-            footprint.add(Coordinate::UnenforcedKey(UnenforcedKey::Clustering));
+            footprint.write(Coordinate::UnenforcedKey(UnenforcedKey::Clustering));
         }
     }
 

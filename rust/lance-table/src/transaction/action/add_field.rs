@@ -75,7 +75,7 @@ impl AddField {
     /// not rewrite the parent's definition, but it does need the parent to
     /// still be there.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::FieldName(self.def.name.clone()));
+        footprint.write(Coordinate::FieldName(self.def.name.clone()));
         if let Some(parent) = self.parent {
             footprint.require_field_definition(parent);
         }

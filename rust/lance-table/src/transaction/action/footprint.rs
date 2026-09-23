@@ -18,7 +18,7 @@
 
 use super::{CompositeOperation, Ref};
 use crate::transaction::UpdateMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// One thing an action set writes.
 ///
@@ -101,46 +101,105 @@ impl Coordinate {
     }
 }
 
+/// How an action set touches a coordinate. Ordered weakest to strongest, so
+/// that a set touching one coordinate two ways is summarized by the maximum.
+///
+/// The whole conflict rule between two sets is the table in
+/// [`pair_conflicts`]: one row per mode of the set being committed, one column
+/// per mode of the set that committed before it. A new way of touching a
+/// coordinate is a new variant here and a new row and column there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Mode {
+    /// Reads the coordinate and needs it to still hold what it read. Data
+    /// written for a committed field requires the field's definition, since
+    /// the values are encoded in the type it names. Unlike a write, two sets
+    /// may require the same coordinate -- two readers of one column do not
+    /// collide.
+    Requires,
+    /// Replaces the coordinate. Two of these on one coordinate never commute.
+    Writes,
+}
+
+/// A part of the manifest an action set touches wholesale, without being able
+/// to enumerate the coordinates inside it. Compared against the other set by
+/// containment: a region write is a write of every coordinate the region holds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Region {
+    /// A committed fragment: its existence, its deletions, and the data of
+    /// every field in it.
+    Fragment(u64),
+    /// One of the manifest's string maps, every key included.
+    Map(ConfigMap),
+}
+
+impl Region {
+    fn contains(&self, coordinate: &Coordinate) -> bool {
+        match self {
+            Self::Fragment(id) => coordinate.fragment() == Some(*id),
+            Self::Map(map) => coordinate.config_map() == Some(map),
+        }
+    }
+}
+
+/// Whether a claim of mode `committing` collides with a claim of mode
+/// `committed` on the same coordinate, where the `committed` set landed after
+/// the `committing` set read.
+///
+/// | committing \ committed | Writes   | Requires |
+/// |------------------------|----------|----------|
+/// | Writes                 | conflict | ok       |
+/// | Requires               | conflict | ok       |
+///
+/// The `Requires` column is all "ok": what the committed set required held when
+/// it committed, and it serialized first, so nothing arriving later can
+/// retroactively break it. The `Requires` row is the open question, because
+/// the committing set read before the other landed.
+///
+/// The table is monotone along [`Mode`]'s order in every row and column, which
+/// is what lets one coordinate touched two ways by one set be summarized by
+/// its strongest mode.
+fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
+    match (committing, committed) {
+        (Mode::Writes | Mode::Requires, Mode::Writes) => true,
+        (_, Mode::Requires) => false,
+    }
+}
+
 /// Everything an action set writes, in one set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Footprint {
-    writes: HashSet<Coordinate>,
-    /// Fragments this set removes outright. Removing a fragment writes every
-    /// coordinate inside it, which cannot be enumerated, so it is tracked
-    /// separately and matched against the other set by fragment id.
+    /// Every coordinate this set touches, with the strongest [`Mode`] it
+    /// touches it in.
     ///
-    /// There is no counterpart for fields. Dropping a field writes its
-    /// definition, and anything that depends on the field -- data written for
-    /// it, its metadata, a child added under it -- requires that definition, so
-    /// the drop-then-write order is caught by `requires`. The write-then-drop
-    /// order is safe, because [`DropField`](super::DropField) applies to every
-    /// fragment the manifest holds by then, including one a concurrent set just
-    /// added, and tombstones the field out of each.
-    removed_fragments: HashSet<u64>,
-    /// Coordinates this set reads and needs to still hold what it read, without
-    /// writing them itself.
-    ///
-    /// Data written for a committed field is the case this exists for: the
-    /// values are encoded in the type the schema names, so the definition has
-    /// to still say what it said. Unlike a write, two sets may require the same
-    /// coordinate -- two readers of one column do not collide.
-    requires: HashSet<Coordinate>,
+    /// There is no region for a dropped field, the way there is for a removed
+    /// fragment. Dropping a field writes its definition, and anything that
+    /// depends on the field -- data written for it, its metadata, a child added
+    /// under it -- requires that definition, so the drop-then-write order is a
+    /// `Requires`-vs-`Writes` collision. The write-then-drop order is safe,
+    /// because [`DropField`](super::DropField) applies to every fragment the
+    /// manifest holds by then, including one a concurrent set just added, and
+    /// tombstones the field out of each.
+    claims: HashMap<Coordinate, Mode>,
+    /// Regions this set writes wholesale: fragments it removes, string maps it
+    /// replaces rather than merges into. A region write counts as a write of
+    /// every coordinate inside the region, and of the region itself -- two sets
+    /// replacing one map name no key in common, and still collide.
+    regions: HashMap<Region, Mode>,
     /// Fragments this set needs to still be there, without writing anything a
     /// concurrent set could name inside them. Data for a field this set mints,
     /// written into a committed fragment, is the case this exists for: the
     /// field id is invisible to a concurrent writer, so the cells are not a
     /// coordinate, but they are gone if the fragment is.
     ///
-    /// Symmetric, unlike `requires`: a removal that lands second destroys the
-    /// cells just as surely as one that lands first.
+    /// Not a `Requires` claim on the region, because the check is symmetric: a
+    /// removal that lands second destroys the cells just as surely as one that
+    /// lands first. And not a write, because it must not collide with a
+    /// concurrent write to some other coordinate in the same fragment.
     required_fragments: HashSet<u64>,
-    /// String maps this set replaces outright rather than merging into. Like a
-    /// fragment removal, this writes every key in the map, including keys it
-    /// does not name, so it is matched by map rather than by key.
-    replaced_maps: HashSet<ConfigMap>,
-    /// Whether this set rewrites the table wholesale. Such a set writes every
-    /// coordinate there is, including ones a concurrent set would only mint, so
-    /// it is tracked as a flag rather than enumerated.
+    /// Whether this set rewrites the table wholesale. Such a set collides with
+    /// every concurrent set, including one that records no claim at all -- an
+    /// append's rows would vanish or survive the reset depending on which
+    /// commit landed first -- so it is a flag rather than a region.
     exclusive: bool,
 }
 
@@ -148,13 +207,17 @@ impl Footprint {
     /// Whether this set can still commit on top of `committed`, a set that
     /// landed after this one read.
     ///
-    /// Asymmetric, in the requirement check alone: what `committed` required
-    /// held when it committed, and it serializes first, so nothing this set
-    /// writes can retroactively break it. This set's requirements are the open
-    /// question, because it read before `committed` landed.
-    ///
-    /// Everything else is a claim on the same coordinate from both sides and
-    /// stays symmetric.
+    /// Coordinates and regions are compared through [`pair_conflicts`], with
+    /// this set in the committing role and `committed` in the committed role.
+    /// That is where the one asymmetry lives: a requirement of this set is
+    /// tested against what `committed` wrote, never the reverse, because
+    /// `committed` serialized first and nothing arriving later can break what
+    /// it required. The distinction is not academic. Data written for a field
+    /// requires the field's definition; a cast of that field writes it.
+    /// Checking both directions would also reject the cast that arrives
+    /// *after* the data -- an order [`AlterField`](super::AlterField) already
+    /// handles, by rebinding the field in every fragment the manifest has by
+    /// then.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -162,54 +225,74 @@ impl Footprint {
         if self.exclusive || committed.exclusive {
             return true;
         }
-        if !self.writes.is_disjoint(&committed.writes) {
+        if self.claims_conflict_with(committed) {
             return true;
         }
-        // Only this side's requirements. See the note on direction above.
-        if !self.requires.is_disjoint(&committed.writes) {
-            return true;
-        }
-        // Two sets replacing the same map collide even when neither names a
-        // key, since clearing a map is a replacement with no entries.
-        if !self.replaced_maps.is_disjoint(&committed.replaced_maps) {
-            return true;
-        }
-        self.removes_something_touched_by(committed) || committed.removes_something_touched_by(self)
+        self.anchors_removed_by(committed) || committed.anchors_removed_by(self)
     }
 
-    /// Whether this set wipes out something -- a fragment, a whole string map
-    /// -- that `other` also writes to or needs to still be there.
-    fn removes_something_touched_by(&self, other: &Self) -> bool {
-        if !self
-            .removed_fragments
-            .is_disjoint(&other.required_fragments)
-        {
-            return true;
-        }
-        other
-            .writes
+    /// Whether any coordinate touched by both sets, directly or through a
+    /// region, collides under [`pair_conflicts`] with this set committing after
+    /// `committed`.
+    ///
+    /// Every pair is enumerated from this side's point of view: our claims
+    /// against their claims and their regions, their claims against our
+    /// regions, and our regions against theirs. A region only matches a region
+    /// that is equal to it; containment is between a region and a coordinate.
+    fn claims_conflict_with(&self, committed: &Self) -> bool {
+        let ours_against_theirs = self.claims.iter().flat_map(|(coordinate, ours)| {
+            let same_coordinate = committed.claims.get(coordinate).copied();
+            let containing_regions = committed
+                .regions
+                .iter()
+                .filter(|(region, _)| region.contains(coordinate))
+                .map(|(_, theirs)| *theirs);
+            same_coordinate
+                .into_iter()
+                .chain(containing_regions)
+                .map(move |theirs| (*ours, theirs))
+        });
+        let theirs_inside_our_regions = committed.claims.iter().flat_map(|(coordinate, theirs)| {
+            self.regions
+                .iter()
+                .filter(|(region, _)| region.contains(coordinate))
+                .map(move |(_, ours)| (*ours, *theirs))
+        });
+        let same_region = self.regions.iter().filter_map(|(region, ours)| {
+            committed.regions.get(region).map(|theirs| (*ours, *theirs))
+        });
+        ours_against_theirs
+            .chain(theirs_inside_our_regions)
+            .chain(same_region)
+            .any(|(ours, theirs)| pair_conflicts(ours, theirs))
+    }
+
+    /// Whether `other` removes a fragment this set needs to still be there.
+    fn anchors_removed_by(&self, other: &Self) -> bool {
+        self.required_fragments
             .iter()
-            .any(|coordinate| self.removes(coordinate))
+            .any(|fragment| other.regions.contains_key(&Region::Fragment(*fragment)))
     }
 
-    /// Whether `coordinate` is inside a region this set removes outright.
-    fn removes(&self, coordinate: &Coordinate) -> bool {
-        coordinate
-            .fragment()
-            .is_some_and(|id| self.removed_fragments.contains(&id))
-            || coordinate
-                .config_map()
-                .is_some_and(|map| self.replaced_maps.contains(map))
+    /// Record a claim on `coordinate`, keeping the strongest mode if the set
+    /// already touches it another way. See [`pair_conflicts`] for why the
+    /// strongest mode is the right summary.
+    fn claim(&mut self, coordinate: Coordinate, mode: Mode) {
+        self.claims
+            .entry(coordinate)
+            .and_modify(|current| *current = (*current).max(mode))
+            .or_insert(mode);
     }
 
-    pub(super) fn add(&mut self, coordinate: Coordinate) {
-        self.writes.insert(coordinate);
+    /// Record that this set writes `coordinate`. See [`Mode::Writes`].
+    pub(super) fn write(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::Writes);
     }
 
     /// Record that this set reads `coordinate` and needs it to still hold what
-    /// it read.
+    /// it read. See [`Mode::Requires`].
     pub(super) fn require(&mut self, coordinate: Coordinate) {
-        self.requires.insert(coordinate);
+        self.claim(coordinate, Mode::Requires);
     }
 
     /// The data of each field within `fragment`.
@@ -236,7 +319,11 @@ impl Footprint {
     /// rejects a concurrent rename or nullability change that would not have
     /// invalidated the data. That matches the granularity of the coordinate:
     /// `AlterField` writes one `FieldDefinition` whichever facet it sets.
-    pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = Ref>) {
+    pub(super) fn write_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = Ref>,
+    ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
             self.require(Coordinate::FieldDefinition(field));
@@ -246,14 +333,14 @@ impl Footprint {
         };
         self.require_fragment(fragment);
         for field in fields {
-            self.add(Coordinate::FieldData { fragment, field });
+            self.write(Coordinate::FieldData { fragment, field });
         }
     }
 
     /// A field's entry in the schema.
-    pub(super) fn add_field_definition(&mut self, field: Ref) {
+    pub(super) fn write_field_definition(&mut self, field: Ref) {
         if let Some(field) = committed_field(field) {
-            self.add(Coordinate::FieldDefinition(field));
+            self.write(Coordinate::FieldDefinition(field));
         }
     }
 
@@ -271,20 +358,23 @@ impl Footprint {
         self.required_fragments.insert(fragment);
     }
 
+    /// Record that this set removes `fragment` outright: its existence, and
+    /// with it every coordinate inside it.
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
-        self.add(Coordinate::FragmentExistence(fragment));
-        self.removed_fragments.insert(fragment);
+        self.write(Coordinate::FragmentExistence(fragment));
+        self.regions
+            .insert(Region::Fragment(fragment), Mode::Writes);
     }
 
     /// Record an edit to one of the manifest's string maps: the keys it names,
     /// or the whole map when it replaces rather than merges.
-    pub(super) fn add_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
+    pub(super) fn write_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
         if update.replace {
-            self.replaced_maps.insert(map);
+            self.regions.insert(Region::Map(map), Mode::Writes);
             return;
         }
         for entry in &update.update_entries {
-            self.add(Coordinate::ConfigEntry {
+            self.write(Coordinate::ConfigEntry {
                 map: map.clone(),
                 key: entry.key.clone(),
             });
@@ -305,7 +395,7 @@ impl Footprint {
     /// write, so it is not caught here and fails when it is applied against the
     /// version where the child no longer exists.
     pub(super) fn remove_field(&mut self, field: Ref) {
-        self.add_field_definition(field);
+        self.write_field_definition(field);
     }
 }
 

@@ -78,7 +78,7 @@ impl TombstoneFieldData {
     /// The data of each named field in this fragment, and nothing else: another
     /// field's data in the same fragment is untouched.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add_field_data(self.fragment, self.field_ids.iter().copied());
+        footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
     }
 }
 

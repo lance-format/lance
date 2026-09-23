@@ -60,9 +60,9 @@ impl AddBase {
     /// nothing -- it is an optional alias, not a name to share.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         if let Some(name) = &self.base.name {
-            footprint.add(Coordinate::BaseName(name.clone()));
+            footprint.write(Coordinate::BaseName(name.clone()));
         }
-        footprint.add(Coordinate::BaseLocation(self.base.path.clone()));
+        footprint.write(Coordinate::BaseLocation(self.base.path.clone()));
     }
 }
 
