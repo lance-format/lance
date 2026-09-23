@@ -2080,3 +2080,165 @@ async fn dropped_unknown_transition_forces_scalar_query_to_scan(#[case] external
         );
     }
 }
+
+// Combination: FRI effective coverage x #9449 fragment-scope pruning.
+//
+// Two BTree segments each cover one source fragment (S1 -> F0, S2 -> F1). An FRI
+// reclusters F0,F1 into destinations {10,11} with rows interleaved, so after the
+// rewrite each segment's EFFECTIVE coverage spans both destinations. A scope over
+// one destination must therefore keep BOTH segments (querying one reclustered
+// fragment can still need multiple old segments). An unrelated index that never
+// covers the destinations must be pruned, proving the pruning actually fires
+// rather than opening everything.
+#[tokio::test]
+async fn fragment_scope_prunes_on_fri_effective_coverage() {
+    use crate::index::scalar_logical::{open_scalar_index_segments, scalar_index_fragment_bitmap};
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::default();
+    let source_fragments: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+    // One BTree segment per source fragment, committed as one logical index.
+    let mut segments = Vec::new();
+    for fragment in &source_fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+
+    // Recluster F0,F1 -> destinations {10,11}, rows interleaved by parity.
+    let (transition, destinations) = prepare(&dataset).await;
+    let destination_ids: Vec<u32> = destinations.iter().map(|f| f.id as u32).collect();
+    assert_eq!(destination_ids, vec![10, 11]);
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    // Effective coverage of the segmented index is now the destinations, not the
+    // dead source fragments. Pruning consumes THIS, not the raw manifest bitmap.
+    let effective = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(effective, RoaringBitmap::from_iter([10, 11]));
+
+    // The pruning consumes each segment's EFFECTIVE bitmap. Scope to a single
+    // destination fragment: both source segments were reclustered into it (rows
+    // interleaved), so both effective bitmaps intersect {10} and both survive.
+    // This mirrors open_scalar_index_segments' own retain against the effective
+    // listing, and proves "querying one reclustered fragment can still need
+    // multiple old segments".
+    let named = crate::index::scalar_logical::load_named_scalar_segments(&dataset, "i", "i_idx")
+        .await
+        .unwrap();
+    assert_eq!(named.len(), 2, "index has two segments");
+    let scope_f10 = RoaringBitmap::from_iter([10]);
+    let kept: Vec<_> = named
+        .iter()
+        .filter(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.intersection_len(&scope_f10) > 0)
+        })
+        .collect();
+    assert_eq!(
+        kept.len(),
+        2,
+        "both reclustered segments must survive a destination-F10-scoped prune"
+    );
+    // And opening under that scope succeeds (both segments open + remap).
+    open_scalar_index_segments(
+        &dataset,
+        "i",
+        "i_idx",
+        Some(&scope_f10),
+        &lance_index::metrics::NoOpMetricsCollector,
+    )
+    .await
+    .unwrap();
+
+    // A scope disjoint from the effective coverage prunes every segment, so no
+    // usable index remains. This proves the prune actually fires (an "open all"
+    // implementation would instead open the segments regardless).
+    let pruned = open_scalar_index_segments(
+        &dataset,
+        "i",
+        "i_idx",
+        Some(&RoaringBitmap::from_iter([999])),
+        &lance_index::metrics::NoOpMetricsCollector,
+    )
+    .await;
+    assert!(
+        pruned.is_err(),
+        "a scope disjoint from effective coverage must prune every segment"
+    );
+}
+
+// Combination: the derived-listing cache holds the FULL effective listing per
+// snapshot; each scoped query filters an independent copy. Querying one
+// destination then the other on the same snapshot must both be correct: the
+// first (cold) query populates the cache, the second (warm) query must not be
+// served a listing trimmed to the first scope.
+#[tokio::test]
+async fn fragment_scope_cache_hit_is_scope_independent() {
+    use crate::index::scalar_logical::scalar_index_fragment_bitmap;
+
+    let mut dataset = fixture_with_index(IndexType::BTree).await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    // Cold: first read derives and caches the full effective listing {10,11}.
+    let cold = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cold, RoaringBitmap::from_iter([10, 11]));
+
+    // Warm: a second read on the same snapshot hits the cache and must return
+    // the SAME full listing, not a scope-trimmed one.
+    let warm = scalar_index_fragment_bitmap(&dataset, "i", "i_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(warm, RoaringBitmap::from_iter([10, 11]));
+
+    // The derived listing is served from cache (identical Arc) across calls.
+    let first = dataset.load_indices().await.unwrap();
+    let second = dataset.load_indices().await.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+
+    // Every value is still found correctly on the reclustered snapshot, so the
+    // cache did not drop or stale any destination's rows.
+    for value in 0..8 {
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("i = {value}")))
+                .await
+                .unwrap(),
+            1,
+            "value {value}"
+        );
+    }
+}
