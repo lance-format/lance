@@ -1824,6 +1824,56 @@ mod tests {
             );
         }
 
+        /// Deletes after tagging (a row of F11, then every row of F10, which
+        /// drops the fragment) precede a full-coverage remap: the remapped
+        /// segment claims only the surviving destination, the dropped rows
+        /// translate to nothing, and every query equals the index-disabled
+        /// scan.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deletes_after_tagging_then_remap_keeps_results() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_two_fragments(dataset).await; // {2,3} uncovered
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            dataset.delete("i = 5").await.unwrap();
+            dataset
+                .delete("i = 0 OR i = 2 OR i = 4 OR i = 6")
+                .await
+                .unwrap();
+            assert!(!dataset.fragments().iter().any(|f| f.id == 10));
+            let expected: Vec<i32> = vec![1, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([11u32]),
+                "the remapped segment claims only the surviving destination"
+            );
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 3")).await, vec![3]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i = 5")).await,
+                Vec::<i32>::new()
+            );
+            assert_eq!(
+                sorted_values(&dataset, Some("i = 4")).await,
+                Vec::<i32>::new()
+            );
+            let plan = dataset
+                .scan()
+                .filter("i = 3")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        }
+
         /// A18: a stable-partition rewrite commit on a tagged table
         /// (deferred remap, no index work) leaves the covering user index's
         /// dataset_version AND fragment_bitmap untouched: nothing advances a
