@@ -884,7 +884,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
         use super::bq::layered::{PlaneKey, RQPrecision};
-        use super::bq::storage::{RABIT_CODE_COLUMN, pack_codes, unpack_codes};
+        use super::bq::storage::{RABIT_CODE_COLUMN, take_packed_codes};
         use arrow_array::cast::AsArray;
         if rows.windows(2).any(|w| w[0] >= w[1]) {
             return Err(Error::invalid_input(
@@ -912,8 +912,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 None
             };
             let batch = if plane == 0 {
-                // Sign codes are transposed across rows. Unpack before selection, then
-                // repack the candidate rows so partition-relative offsets stay correct.
+                // Sign codes are transposed across rows. Gather their physical
+                // offsets directly, then pack only the selected rows.
                 let raw = if let Some(value) = cached {
                     value.0.clone()
                 } else {
@@ -923,18 +923,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let codes = raw
                     .column_by_name(RABIT_CODE_COLUMN)
                     .ok_or_else(|| Error::invalid_input("missing sign codes"))?;
-                let raw = raw.replace_column_by_name(
-                    RABIT_CODE_COLUMN,
-                    Arc::new(unpack_codes(codes.as_fixed_size_list())),
-                )?;
-                let selected = raw.take(&indices)?;
-                let codes = selected
-                    .column_by_name(RABIT_CODE_COLUMN)
-                    .ok_or_else(|| Error::invalid_input("missing selected sign codes"))?;
-                selected.replace_column_by_name(
-                    RABIT_CODE_COLUMN,
-                    Arc::new(pack_codes(codes.as_fixed_size_list())),
-                )?
+                let selected_codes = take_packed_codes(codes.as_fixed_size_list(), &rows)?;
+                raw.take(&indices)?
+                    .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(selected_codes))?
             } else if let Some(value) = cached {
                 value.0.take(&indices)?
             } else if let Some(value) = selected_cached {

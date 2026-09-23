@@ -525,6 +525,199 @@ impl DeepSizeOf for RabitQuantizationStorage {
 }
 
 impl RabitQuantizationStorage {
+    fn from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &RabitQuantizationMetadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        prepack_ex: bool,
+    ) -> Result<Self> {
+        let distance_type = match (metadata.query_estimator, distance_type) {
+            (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
+            _ => distance_type,
+        };
+        validate_rq_num_bits(metadata.num_bits)?;
+        // The FastScan LUT is `4 * rotated_dim` bytes while the kernels index it
+        // as `BATCH_SIZE * rotated_dim.div_ceil(8)`, so the two agree only when
+        // the dimension is a multiple of 8. `RabitQuantizer::build` has rejected
+        // a non-multiple since #6024, but an index written before that still
+        // loads here, and the AVX-512, AVX2 and NEON kernels read the LUT
+        // through unchecked raw pointers. Only the scalar fallback panics.
+        //
+        // This has to go through `rotated_dim()`, not `metadata.code_dim`:
+        // `code_dim` was added by #6024 itself, so it deserializes to 0 for the
+        // very indices this rejects, and `rotated_dim()` recovers the real
+        // dimension from the rotation matrix that `parse_buffer` backfills.
+        let rotated_dim = metadata.rotated_dim();
+        if !rotated_dim.is_multiple_of(8) {
+            return Err(Error::invalid_input(format!(
+                "RabitQ vector dimension must be divisible by 8, got {rotated_dim}. \
+                 Rebuild the index."
+            )));
+        }
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+        // `rotated_dim() == 0` means the metadata never recorded a code
+        // dimension, so the width check below could only ever report that the
+        // column needs 0 bytes. Reject up front with the real cause.
+        if metadata.rotated_dim() == 0 {
+            return Err(Error::corrupt_file_named(
+                "rabitq metadata",
+                format!(
+                    "no code dimension: code_dim is 0 and the rotation matrix is not loaded \
+                     (rotation_type={:?}, rotate_mat_position={:?})",
+                    metadata.rotation_type, metadata.rotate_mat_position
+                ),
+            ));
+        }
+        let expected_code_bytes = metadata.binary_code_bytes();
+        if codes.value_length() as usize != expected_code_bytes {
+            return Err(Error::invalid_input(format!(
+                "RabitQ code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} requires {} bytes",
+                RABIT_CODE_COLUMN,
+                codes.value_length(),
+                metadata.rotated_dim(),
+                expected_code_bytes
+            )));
+        }
+        let add_factors = batch[ADD_FACTORS_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        let scale_factors = batch[SCALE_FACTORS_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        // Legacy error factors bound the binary estimator, not independently
+        // quantized prefixes. Layered top-k uses the explicit cascade instead.
+        let error_factors = (!metadata.layered)
+            .then(|| {
+                batch
+                    .column_by_name(ERROR_FACTORS_COLUMN)
+                    .map(|factors| factors.as_primitive::<Float32Type>().clone())
+            })
+            .flatten();
+        let ex_bits = rabit_ex_bits(metadata.num_bits)?;
+        let mut batch = batch;
+        let mut ex_codes = None;
+        let mut ex_add_factors = None;
+        let mut ex_scale_factors = None;
+        let mut ex_codes_lo = None;
+        if metadata.layered {
+            super::layered::RQLayout::try_new(metadata.num_bits)?;
+            for name in [
+                RABIT_BLOCKED_EX_CODE_LO_COLUMN,
+                super::layered::HIGH_ADD_FACTORS_COLUMN,
+                super::layered::HIGH_SCALE_FACTORS_COLUMN,
+            ] {
+                if batch.column_by_name(name).is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "RabitQ layered index missing column {name}"
+                    )));
+                }
+            }
+        } else if batch
+            .column_by_name(RABIT_BLOCKED_EX_CODE_LO_COLUMN)
+            .is_some()
+        {
+            return Err(Error::invalid_input(
+                "RabitQ low plane requires layered metadata",
+            ));
+        }
+        if ex_bits != 0 {
+            let (normalized_batch, codes, lo) =
+                load_ex_code_planes(batch, metadata.rotated_dim(), metadata.num_bits)?;
+            batch = normalized_batch;
+            ex_codes = Some(codes);
+            ex_codes_lo = lo;
+            ex_add_factors = Some(
+                batch
+                    .column_by_name(EX_ADD_FACTORS_COLUMN)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "RabitQ num_bits={} requires {} column",
+                            metadata.num_bits, EX_ADD_FACTORS_COLUMN
+                        ))
+                    })?
+                    .as_primitive::<Float32Type>()
+                    .clone(),
+            );
+            ex_scale_factors = Some(
+                batch
+                    .column_by_name(EX_SCALE_FACTORS_COLUMN)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "RabitQ num_bits={} requires {} column",
+                            metadata.num_bits, EX_SCALE_FACTORS_COLUMN
+                        ))
+                    })?
+                    .as_primitive::<Float32Type>()
+                    .clone(),
+            );
+        } else if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            if batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
+                || batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
+                || batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
+                || batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
+            {
+                return Err(Error::invalid_input(
+                    "RabitQ num_bits=1 raw-query indexes must not contain ex-code columns"
+                        .to_string(),
+                ));
+            }
+        } else if batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
+            || batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "RabitQ num_bits={} does not support ex-code columns",
+                metadata.num_bits
+            )));
+        }
+
+        let (batch, codes) = if !metadata.packed {
+            let codes = pack_codes(&codes);
+            let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
+            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+            (batch, codes)
+        } else {
+            (batch, codes)
+        };
+
+        let mut metadata = metadata.clone();
+        metadata.packed = true;
+        // The FastScan transpose only understands single-plane widths.
+        let packed_ex_codes = if ex_codes_lo.is_some() || !prepack_ex {
+            None
+        } else {
+            maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref())
+        };
+
+        let storage = Self {
+            high_add_factors: batch
+                .column_by_name(super::layered::HIGH_ADD_FACTORS_COLUMN)
+                .map(|a| a.as_primitive::<Float32Type>().clone()),
+            high_scale_factors: batch
+                .column_by_name(super::layered::HIGH_SCALE_FACTORS_COLUMN)
+                .map(|a| a.as_primitive::<Float32Type>().clone()),
+            metadata,
+            batch,
+            distance_type,
+            row_ids,
+            codes,
+            add_factors,
+            scale_factors,
+            error_factors,
+            ex_codes,
+            ex_codes_lo,
+            packed_ex_codes,
+            ex_add_factors,
+            ex_scale_factors,
+        };
+
+        match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
+            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
+            None => Ok(storage),
+        }
+    }
+
     fn code_dim(&self) -> usize {
         self.metadata.code_dim()
     }
@@ -2530,6 +2723,47 @@ pub fn pack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     FixedSizeListArray::try_new_from_values(UInt8Array::from(blocks), code_len as i32).unwrap()
 }
 
+/// Gather only selected physical rows from partition-transposed sign codes.
+/// The result keeps the packed layout expected by the selected-row calculator.
+pub fn take_packed_codes(codes: &FixedSizeListArray, rows: &[u32]) -> Result<FixedSizeListArray> {
+    let width = codes.value_length() as usize;
+    let total = codes.len();
+    let packed_rows = total / BATCH_SIZE * BATCH_SIZE;
+    let remainder = total - packed_rows;
+    let source = codes.values().as_primitive::<UInt8Type>().values();
+    let mut selected = Vec::with_capacity(rows.len() * width);
+    for &row in rows {
+        let row = row as usize;
+        if row >= total {
+            return Err(Error::invalid_input("candidate sign offset out of bounds"));
+        }
+        if row < packed_rows {
+            let lane = row % BATCH_SIZE;
+            let index = PERM0_INVERSE[lane % 16];
+            let base = row / BATCH_SIZE * BATCH_SIZE * width;
+            for column in 0..width {
+                let offset = base + column * BATCH_SIZE + index;
+                let low = source[offset];
+                let high = source[offset + 16];
+                selected.push(if lane < 16 {
+                    (low & 15) | (high << 4)
+                } else {
+                    (low >> 4) | (high & 240)
+                });
+            }
+        } else {
+            let offset = packed_rows * width;
+            for column in 0..width {
+                selected.push(source[offset + column * remainder + row - packed_rows]);
+            }
+        }
+    }
+    Ok(pack_codes(&FixedSizeListArray::try_new_from_values(
+        UInt8Array::from(selected),
+        width as i32,
+    )?))
+}
+
 // Inverse of pack_codes
 pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     let code_len = codes.value_length() as usize;
@@ -2677,7 +2911,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
             columns.push(column.clone());
         }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
-        Self::try_from_batch_with_remapper(batch, &metadata, distance_type, remapper)
+        // The projected store is reconstructed per query. Its blocked kernels
+        // consume codes directly, so rebuilding an ex FastScan transpose here
+        // would cost more than scoring the requested prefix.
+        Self::from_batch_with_remapper(batch, &metadata, distance_type, remapper, false)
     }
 
     type Metadata = RabitQuantizationMetadata;
@@ -2698,190 +2935,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
-        let distance_type = match (metadata.query_estimator, distance_type) {
-            (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
-            _ => distance_type,
-        };
-        validate_rq_num_bits(metadata.num_bits)?;
-        // The FastScan LUT is `4 * rotated_dim` bytes while the kernels index it
-        // as `BATCH_SIZE * rotated_dim.div_ceil(8)`, so the two agree only when
-        // the dimension is a multiple of 8. `RabitQuantizer::build` has rejected
-        // a non-multiple since #6024, but an index written before that still
-        // loads here, and the AVX-512, AVX2 and NEON kernels read the LUT
-        // through unchecked raw pointers. Only the scalar fallback panics.
-        //
-        // This has to go through `rotated_dim()`, not `metadata.code_dim`:
-        // `code_dim` was added by #6024 itself, so it deserializes to 0 for the
-        // very indices this rejects, and `rotated_dim()` recovers the real
-        // dimension from the rotation matrix that `parse_buffer` backfills.
-        let rotated_dim = metadata.rotated_dim();
-        if rotated_dim % 8 != 0 {
-            return Err(Error::invalid_input(format!(
-                "RabitQ vector dimension must be divisible by 8, got {rotated_dim}. \
-                 Rebuild the index."
-            )));
-        }
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-        // `rotated_dim() == 0` means the metadata never recorded a code
-        // dimension, so the width check below could only ever report that the
-        // column needs 0 bytes. Reject up front with the real cause.
-        if metadata.rotated_dim() == 0 {
-            return Err(Error::corrupt_file_named(
-                "rabitq metadata",
-                format!(
-                    "no code dimension: code_dim is 0 and the rotation matrix is not loaded \
-                     (rotation_type={:?}, rotate_mat_position={:?})",
-                    metadata.rotation_type, metadata.rotate_mat_position
-                ),
-            ));
-        }
-        let expected_code_bytes = metadata.binary_code_bytes();
-        if codes.value_length() as usize != expected_code_bytes {
-            return Err(Error::invalid_input(format!(
-                "RabitQ code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} requires {} bytes",
-                RABIT_CODE_COLUMN,
-                codes.value_length(),
-                metadata.rotated_dim(),
-                expected_code_bytes
-            )));
-        }
-        let add_factors = batch[ADD_FACTORS_COLUMN]
-            .as_primitive::<Float32Type>()
-            .clone();
-        let scale_factors = batch[SCALE_FACTORS_COLUMN]
-            .as_primitive::<Float32Type>()
-            .clone();
-        // Legacy error factors bound the binary estimator, not independently
-        // quantized prefixes. Layered top-k uses the explicit cascade instead.
-        let error_factors = (!metadata.layered)
-            .then(|| {
-                batch
-                    .column_by_name(ERROR_FACTORS_COLUMN)
-                    .map(|factors| factors.as_primitive::<Float32Type>().clone())
-            })
-            .flatten();
-        let ex_bits = rabit_ex_bits(metadata.num_bits)?;
-        let mut batch = batch;
-        let mut ex_codes = None;
-        let mut ex_add_factors = None;
-        let mut ex_scale_factors = None;
-        let mut ex_codes_lo = None;
-        if metadata.layered {
-            super::layered::RQLayout::try_new(metadata.num_bits)?;
-            for name in [
-                RABIT_BLOCKED_EX_CODE_LO_COLUMN,
-                super::layered::HIGH_ADD_FACTORS_COLUMN,
-                super::layered::HIGH_SCALE_FACTORS_COLUMN,
-            ] {
-                if batch.column_by_name(name).is_none() {
-                    return Err(Error::invalid_input(format!(
-                        "RabitQ layered index missing column {name}"
-                    )));
-                }
-            }
-        } else if batch
-            .column_by_name(RABIT_BLOCKED_EX_CODE_LO_COLUMN)
-            .is_some()
-        {
-            return Err(Error::invalid_input(
-                "RabitQ low plane requires layered metadata",
-            ));
-        }
-        if ex_bits != 0 {
-            let (normalized_batch, codes, lo) =
-                load_ex_code_planes(batch, metadata.rotated_dim(), metadata.num_bits)?;
-            batch = normalized_batch;
-            ex_codes = Some(codes);
-            ex_codes_lo = lo;
-            ex_add_factors = Some(
-                batch
-                    .column_by_name(EX_ADD_FACTORS_COLUMN)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "RabitQ num_bits={} requires {} column",
-                            metadata.num_bits, EX_ADD_FACTORS_COLUMN
-                        ))
-                    })?
-                    .as_primitive::<Float32Type>()
-                    .clone(),
-            );
-            ex_scale_factors = Some(
-                batch
-                    .column_by_name(EX_SCALE_FACTORS_COLUMN)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "RabitQ num_bits={} requires {} column",
-                            metadata.num_bits, EX_SCALE_FACTORS_COLUMN
-                        ))
-                    })?
-                    .as_primitive::<Float32Type>()
-                    .clone(),
-            );
-        } else if metadata.query_estimator == RabitQueryEstimator::RawQuery {
-            if batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
-                || batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
-                || batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
-                || batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
-            {
-                return Err(Error::invalid_input(
-                    "RabitQ num_bits=1 raw-query indexes must not contain ex-code columns"
-                        .to_string(),
-                ));
-            }
-        } else if batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
-            || batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
-        {
-            return Err(Error::invalid_input(format!(
-                "RabitQ num_bits={} does not support ex-code columns",
-                metadata.num_bits
-            )));
-        }
-
-        let (batch, codes) = if !metadata.packed {
-            let codes = pack_codes(&codes);
-            let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
-            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-            (batch, codes)
-        } else {
-            (batch, codes)
-        };
-
-        let mut metadata = metadata.clone();
-        metadata.packed = true;
-        // The FastScan transpose only understands single-plane widths.
-        let packed_ex_codes = if ex_codes_lo.is_some() {
-            None
-        } else {
-            maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref())
-        };
-
-        let storage = Self {
-            high_add_factors: batch
-                .column_by_name(super::layered::HIGH_ADD_FACTORS_COLUMN)
-                .map(|a| a.as_primitive::<Float32Type>().clone()),
-            high_scale_factors: batch
-                .column_by_name(super::layered::HIGH_SCALE_FACTORS_COLUMN)
-                .map(|a| a.as_primitive::<Float32Type>().clone()),
-            metadata,
-            batch,
-            distance_type,
-            row_ids,
-            codes,
-            add_factors,
-            scale_factors,
-            error_factors,
-            ex_codes,
-            ex_codes_lo,
-            packed_ex_codes,
-            ex_add_factors,
-            ex_scale_factors,
-        };
-
-        match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
-            None => Ok(storage),
-        }
+        Self::from_batch_with_remapper(batch, metadata, distance_type, fri, true)
     }
 
     fn metadata(&self) -> &Self::Metadata {
@@ -3100,6 +3154,31 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sparse_packed_sign_gather_matches_full_unpack() {
+        for count in [1usize, 31, 32, 33, 63, 64, 65, 511] {
+            for width in [8usize, 128, 256] {
+                let values: Vec<u8> = (0..count * width)
+                    .map(|i| ((i * 71 + 13) % 251) as u8)
+                    .collect();
+                let original =
+                    FixedSizeListArray::try_new_from_values(UInt8Array::from(values), width as i32)
+                        .unwrap();
+                let packed = pack_codes(&original);
+                let rows: Vec<u32> = (0..count)
+                    .filter(|row| row % 3 == 0 || *row == count - 1)
+                    .map(|row| row as u32)
+                    .collect();
+                let selected = take_packed_codes(&packed, &rows).unwrap();
+                let expected =
+                    arrow_select::take::take(&original, &UInt32Array::from(rows), None).unwrap();
+                assert_eq!(unpack_codes(&selected), *expected.as_fixed_size_list());
+                assert!(take_packed_codes(&packed, &[count as u32]).is_err());
+            }
+        }
+    }
+
     use rstest::rstest;
     use std::collections::{BinaryHeap, HashMap};
 
