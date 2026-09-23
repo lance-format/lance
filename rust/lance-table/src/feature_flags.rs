@@ -64,8 +64,14 @@ pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// The dataset carries liquid-clustering configuration or fragment layout stamps.
+///
+/// Reserved ahead of its implementation. Readers may ignore the metadata, but
+/// writers must preserve it across every operation that produces a new manifest.
+/// This build keeps the bit unsupported until that preservation logic lands.
+pub const FLAG_CLUSTERING_METADATA: u64 = 1 << 11;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 11;
+pub const FLAG_UNKNOWN: u64 = 1 << 12;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -77,6 +83,7 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_CLUSTERING_METADATA < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -212,6 +219,8 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
     // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
     // until its reader/writer handling lands.
     mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
+    // Reserved until manifest and fragment clustering metadata is preserved.
+    mark_supported(&mut supported, FLAG_CLUSTERING_METADATA, false);
     supported
 }
 
@@ -313,6 +322,16 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    /// Reserved ahead of its implementation so a build from the gap cannot
+    /// write a manifest that silently discards clustering metadata.
+    #[test]
+    fn test_clustering_metadata_flag_is_reserved_not_supported() {
+        assert!(!can_read_dataset(FLAG_CLUSTERING_METADATA));
+        assert!(!can_write_dataset(FLAG_CLUSTERING_METADATA));
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert_eq!(FLAG_UNKNOWN, FLAG_CLUSTERING_METADATA << 1);
+    }
 
     /// Reserved ahead of its implementation: refused for reading and writing
     /// until the handling lands, so a build from the gap cannot open the table.

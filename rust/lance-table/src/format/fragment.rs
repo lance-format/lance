@@ -753,6 +753,8 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            clustering_generation: 0,
+            clustering_group_id: None,
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
