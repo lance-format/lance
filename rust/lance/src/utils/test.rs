@@ -927,3 +927,135 @@ impl CommitHandler for AmbiguousCommitHandler {
             .await
     }
 }
+
+/// Geometry fixtures shared by the RTree tests.
+#[cfg(feature = "geo")]
+pub mod geo {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use geo_types::line_string;
+    use geoarrow_array::GeoArrowArray;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_table::format::IndexMetadata;
+
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::dataset::optimize::CompactionOptions;
+    use crate::index::DatasetIndexExt;
+    use geoarrow_array::builder::LineStringBuilder;
+    use geoarrow_schema::{Dimension, LineStringType};
+
+    fn line_string_type() -> LineStringType {
+        LineStringType::new(Dimension::XY, Default::default())
+    }
+
+    /// `rows` diagonal line segments starting at `first`, each one distinct.
+    pub fn line_strings(first: i32, rows: i32) -> ArrayRef {
+        let mut builder = LineStringBuilder::new(line_string_type());
+        for row in 0..rows {
+            let x = (first + row) as f64;
+            builder
+                .push_line_string(Some(&line_string![(x: x, y: x), (x: x + 1.0, y: x + 1.0)]))
+                .unwrap();
+        }
+        builder.finish().to_array_ref()
+    }
+
+    /// An `id` and `geometry` schema with one batch per fragment. Writing these
+    /// with `max_rows_per_file = rows_per_fragment` puts each batch in its own
+    /// fragment.
+    pub fn batches(rows_per_fragment: i32, fragments: i32) -> (Arc<ArrowSchema>, Vec<RecordBatch>) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            line_string_type().to_field("geometry", true),
+        ]));
+        let batches = (0..fragments)
+            .map(|fragment| {
+                let first = fragment * rows_per_fragment;
+                let ids = Int32Array::from_iter_values(first..first + rows_per_fragment);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ids), line_strings(first, rows_per_fragment)],
+                )
+                .unwrap()
+            })
+            .collect();
+        (schema, batches)
+    }
+
+    /// Geometry fragments with one committed RTree index, so a deferred
+    /// compaction has something to defer and writes the reuse mapping a merge
+    /// reads.
+    pub async fn dataset_with_committed_rtree_index(
+        uri: &str,
+        rows_per_fragment: i32,
+        fragments: i32,
+    ) -> (Dataset, ScalarIndexParams) {
+        let (schema, batches) = batches(rows_per_fragment, fragments);
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                // A rewrite moves every row address, which is what leaves staged
+                // coverage needing the reuse index.
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), fragments as usize);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+        dataset
+            .create_index(
+                &["geometry"],
+                IndexType::RTree,
+                Some("committed_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        (dataset, params)
+    }
+
+    /// One uncommitted RTree segment per named fragment, each holding that
+    /// fragment's share of what a compaction then rewrites.
+    pub async fn stage_rtree_segments(
+        dataset: &mut Dataset,
+        params: &ScalarIndexParams,
+        fragment_ids: Vec<u32>,
+    ) -> Vec<IndexMetadata> {
+        let mut staged = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            staged.push(
+                dataset
+                    .create_index_builder(&["geometry"], IndexType::RTree, params)
+                    .name("geometry_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        staged
+    }
+
+    /// A compaction that leaves its index remap to the reuse index.
+    pub fn deferred_compaction(
+        rows_per_fragment: i32,
+        fragments_per_group: i32,
+    ) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: (rows_per_fragment * fragments_per_group) as usize,
+            defer_index_remap: true,
+            ..Default::default()
+        }
+    }
+}

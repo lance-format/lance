@@ -41,6 +41,10 @@ use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
+#[cfg(feature = "geo")]
+use crate::utils::test::geo;
+#[cfg(feature = "geo")]
+use lance_core::utils::tempfile::TempStrDir;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -2404,5 +2408,195 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     assert_eq!(
         minhash_ids(&dataset, "mango sorbet", true).await.unwrap()[0],
         6
+    );
+}
+
+/// Every fragment below holds this many rows, so a compaction targeting a
+/// multiple of it rewrites that many fragments as one group.
+#[cfg(feature = "geo")]
+const RTREE_ROWS_PER_FRAGMENT: i32 = 10;
+
+#[cfg(feature = "geo")]
+fn rtree_fragment_ids(dataset: &Dataset) -> Vec<u32> {
+    dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect()
+}
+
+#[cfg(feature = "geo")]
+async fn rtree_compact(dataset: &mut Dataset, fragments_per_group: i32) {
+    compact_files(
+        dataset,
+        geo::deferred_compaction(RTREE_ROWS_PER_FRAGMENT, fragments_per_group),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// Replaces the geometry of one row of `fragment_id`, over the field the RTree
+/// index is built on.
+#[cfg(feature = "geo")]
+async fn rtree_overlay_geometry(dataset: Dataset, field_id: i32, fragment_id: u64) -> Dataset {
+    commit_overlay(
+        dataset,
+        "geometry_overlay",
+        fragment_id,
+        &[field_id],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![geo::line_strings(9_999, 1)],
+    )
+    .await
+}
+
+/// The merged index must cover nothing, so the rows it would otherwise answer
+/// for are rescanned instead of served from entries an overlay has superseded.
+#[cfg(feature = "geo")]
+async fn assert_merge_covers_nothing(
+    dataset: &Dataset,
+    staged: Vec<lance_table::format::IndexMetadata>,
+    what: &str,
+) {
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert!(
+        coverage.is_empty(),
+        "the merged index claimed a fragment {what}, so its superseded entries \
+         would be served instead of rescanned"
+    );
+}
+
+/// A merged RTree index may cover the fragment a rewrite produced: the remap puts
+/// it there, and no source segment has it in its own history for the staleness
+/// pass to judge. An overlay over the indexed column is the separate question,
+/// and it takes that coverage away, because the segments hold entries those rows
+/// have moved past and need a rescan rather than an index answer.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0] as u64;
+    let dataset = rtree_overlay_geometry(dataset, geometry, rewritten).await;
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "whose indexed column an overlay has moved past",
+    )
+    .await;
+}
+
+/// A rewrite folds an overlay on its inputs into the fragment it produces, so
+/// afterwards that fragment carries no overlay of its own. Segments built before
+/// the overlay hold the values it superseded.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_into() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 3).await;
+
+    assert_merge_covers_nothing(&dataset, staged, "a rewrite folded an overlay into").await;
+}
+
+/// The same overlay across two rewrites. The fragment that absorbed it is itself
+/// rewritten, so it appears in neither the staged coverage nor the final one, and
+/// the superseded values reach the final fragment all the same.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_two_rewrites_carried_a_folded_overlay_to() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 2).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    assert_merge_covers_nothing(&dataset, staged, "two rewrites carried a folded overlay to").await;
+}
+
+/// An overlay that lands on a fragment a rewrite produced and is folded in by the
+/// next rewrite. The fragment it overlaid is named by neither the staged coverage
+/// nor the final one, so it is reached only by following what that coverage
+/// becomes at each rewrite.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_a_rewrite_folded_an_overlay_on_its_own_output() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    rtree_compact(&mut dataset, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let intermediate = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, intermediate).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "a rewrite folded an overlay on its own output",
+    )
+    .await;
+}
+
+/// A compaction can rewrite several groups at once, and an overlay folded into
+/// one of them says nothing about the rows a segment covering a different group
+/// holds. Refusing those segments their coverage costs a flat scan for nothing.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_coverage_when_a_folded_overlay_is_on_another_group() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    // Only the pair that the overlay below leaves alone.
+    let ours = rtree_fragment_ids(&dataset).split_off(2);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, ours).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert_eq!(
+        coverage.len(),
+        1,
+        "the merged index gave up coverage over an overlay folded into a rewrite \
+         group its segments never covered, costing a flat scan for nothing"
     );
 }
