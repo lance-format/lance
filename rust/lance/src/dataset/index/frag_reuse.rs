@@ -1309,7 +1309,7 @@ mod tests {
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::format::Fragment;
         use lance_table::system_index::frag_reuse::ledger::Mapping;
-        use lance_table::transaction::{FragReuseUpdate, FragmentReuseRewrite, RewriteGroup};
+        use lance_table::transaction::RewriteGroup;
         use uuid::Uuid;
 
         fn digest(id: u64) -> pb_fri::FragmentDigest {
@@ -1485,6 +1485,11 @@ mod tests {
             let (transition, destinations) =
                 reader_tests::prepare_partition(&dataset, source_ids, dest_base_id).await;
             let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
             CommitBuilder::new(Arc::new(dataset))
                 .execute(Transaction::new(
                     read_version,
@@ -1494,9 +1499,7 @@ mod tests {
                             new_fragments: destinations,
                         }],
                         rewritten_indices: vec![],
-                        frag_reuse: Some(FragReuseUpdate::AppendTransitions(
-                            FragmentReuseRewrite::new(vec![transition]),
-                        )),
+                        frag_reuse_index,
                     },
                     None,
                 ))
@@ -1582,6 +1585,119 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(dataset.count_rows(None).await.unwrap(), 12);
+        }
+
+        /// Deletes after tagging (rows of one destination, then the other
+        /// destination entirely) leave the history and the segment's stored
+        /// provenance alone: the segment keeps translating, trim retains the
+        /// transition it translates through, indexed queries equal the
+        /// index-disabled scan, and draining afterwards still trims.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn deletes_after_tagging_keep_translation_and_trim_honest() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let entry = fri_entry(&dataset).await.unwrap();
+
+            // A delta segment over an appended fragment sits next to the
+            // translating segment, so index retention has a sibling with live
+            // coverage to compare against.
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(100, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(4))
+                .unwrap();
+            let mut dataset = crate::dataset::InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            let appended = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+            let mut delta = crate::index::CreateIndexBuilder::new(
+                &mut dataset,
+                &["i"],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name("i_idx_delta".into())
+            .fragments(vec![appended as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            delta.name = "i_idx".into();
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![delta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+
+            // A row of F11 (odds), then every even value: all of F10 goes
+            // (the fragment is dropped) and two rows of the appended fragment.
+            dataset.delete("i = 5").await.unwrap();
+            dataset.delete("i % 2 = 0").await.unwrap();
+            assert_eq!(
+                dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![11, appended]
+            );
+            // The translating segment (provenance {0, 1}, empty against the
+            // live fragments) is kept next to its delta sibling.
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2, "{segments:?}");
+            assert!(segments.iter().any(|segment| segment.fragment_bitmap
+                == Some(roaring::RoaringBitmap::from_iter([0u32, 1]))));
+            let expected = vec![1, 3, 7, 101, 103];
+            assert_eq!(sorted_values(&dataset).await, expected);
+            for value in [0, 1, 2, 3, 4, 5, 6, 7, 100, 101, 102, 103] {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                let plan = scan.explain_plan(false).await.unwrap();
+                assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+                assert_eq!(
+                    scan.try_into_batch().await.unwrap().num_rows(),
+                    usize::from(expected.contains(&value)),
+                    "value {value}"
+                );
+            }
+
+            // Still translating through the transition: the trim is a no-op.
+            let version_before = dataset.manifest.version;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(dataset.manifest.version, version_before);
+            assert_eq!(fri_entry(&dataset).await.unwrap().uuid, entry.uuid);
+            assert_eq!(sorted_values(&dataset).await, expected);
+
+            // Draining after the deletes trims the entry away as usual.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(fri_entry(&dataset).await.is_none());
+            assert_eq!(sorted_values(&dataset).await, expected);
+            assert_eq!(dataset.count_rows(Some("i = 3".into())).await.unwrap(), 1);
+            assert_eq!(dataset.count_rows(Some("i = 4".into())).await.unwrap(), 0);
+            assert_eq!(dataset.count_rows(Some("i = 101".into())).await.unwrap(), 1);
         }
 
         /// A trim committed from a stale read must re-derive at commit time:
