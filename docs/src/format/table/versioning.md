@@ -34,7 +34,8 @@ they should return an "unsupported" error on any read or write operation.
 | 256      | `FLAG_MIXED_DATA_FILE_VERSIONS` | Yes             | Yes             | The snapshot may reference recognized V2 data files with different exact versions. Both bits must be set and remain set on later versions. |
 | 512      | `FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` | Yes       | Yes             | The table uses stable row IDs and carries a [Fragment Reuse Index](../index/system/frag_reuse.md). |
 | 1024     | `FLAG_FRAGMENT_REUSE_INDEX`     | Yes             | Yes             | The fragment reuse index records tagged transitions (`IndexMetadata.index_version >= 1`). Readers must translate row addresses through them; writers must preserve them. An implementation without this flag would decode the details as the legacy format and silently drop the transitions when it next rewrites the fragment reuse index. See [FRI index versions](../index/system/frag_reuse.md#fri-index-versions). |
+| 2048     | `FLAG_MANAGED_BLOBS`            | Yes             | Yes             | Blob v2 descriptors may independently address Lance-owned objects. Readers resolve explicit base references; writers and cleanup preserve their lifetimes. Both bits remain set on later versions, including restores. See [Blob v2 table capability](blob.md#table-capability). |
 
 </div>
 
-Flags with bit values 2048 and above are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error. The paired mixed-version reader and writer bits must either both be set or both be clear; a half-set manifest is invalid.
+Flags with bit values 4096 and above are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error. For each of `FLAG_MIXED_DATA_FILE_VERSIONS` and `FLAG_MANAGED_BLOBS`, the paired reader and writer bits must either both be set or both be clear; a half-set manifest is invalid.

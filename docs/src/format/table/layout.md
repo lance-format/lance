@@ -5,11 +5,16 @@
 This specification defines how Lance datasets are organized on object storage.
 The layout design emphasizes portability, allowing datasets to be relocated or referenced across multiple storage systems with minimal metadata changes.
 
+Blob v2 stores independently addressed Managed payload objects under `_blobs/`
+and can also reference legacy sidecars or externally owned objects. Their paths
+and base resolution rules are defined in the
+[Blob v2 Specification](blob.md#managed-object-layout).
+
 ## Dataset Root
 
 The dataset root is the location where the dataset was initially created.
 Every Lance dataset has exactly one dataset root, which serves as the primary storage location for the dataset's files.
-The dataset root contains the standard subdirectory structure (`data/`, `_versions/`, `_deletions/`, `_indices/`, `_refs/`, `tree/`) that organizes the dataset's files.
+The dataset root contains the standard subdirectory structure (`data/`, `_blobs/`, `_versions/`, `_deletions/`, `_indices/`, `_refs/`, `tree/`) that organizes the dataset's files.
 
 ## Basic Layout
 
@@ -19,6 +24,10 @@ A Lance dataset in its basic form stores all files within the dataset root direc
 {dataset_root}/
     data/
         *.lance           -- Data files containing column data
+        {data_file_stem}/
+            *.blob        -- Legacy blob sidecars, including adopted Managed objects
+    _blobs/
+        {UUID}.blob       -- Independently addressed Managed blob payloads
     _versions/
         *.manifest                -- Manifest files (one per version)
         latest_version_hint.json  -- Optional hint of the latest version (see below)
@@ -77,6 +86,12 @@ First, the reader determines the base path: if `base_id` is absent, the base pat
 Second, the reader constructs the full file path based on whether the base path represents a dataset root.
 For dataset roots (when `is_dataset_root` is true), the full path includes standard subdirectories: data files are located under `data/`, deletion files under `_deletions/`, and indices under `_indices/`.
 For non-root base paths (when `is_dataset_root` is false), the base path points directly to the file directory, and the file path is appended directly without subdirectory prefixes.
+
+Managed blob descriptors also reference this base-path namespace, including an
+explicit binding for the default dataset root. Their `blob_uri` already contains
+the complete relative object path and is appended directly to the base without
+adding subdirectories, regardless of `is_dataset_root`. See
+[Managed descriptors](blob.md#managed-kind-4) for path and binding requirements.
 
 ### Example Complex Layout Scenarios
 

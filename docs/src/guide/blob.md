@@ -3,6 +3,9 @@
 Lance can store large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
 
+For the logical input contract, stored descriptors, and payload ownership rules,
+see the [Blob v2 Specification](../format/table/blob.md).
+
 !!! tip "Choosing between `read_blobs` and `take_blobs`"
     - For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
     - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
