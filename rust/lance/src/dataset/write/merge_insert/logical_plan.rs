@@ -57,6 +57,8 @@ pub struct MergeInsertWriteNode {
     pub(crate) params: MergeInsertParams,
     pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
     pub(crate) write_sink: WriteSink,
+    /// Blob columns supplied by the source, excluding target-filled columns.
+    pub(crate) source_blob_columns: Vec<String>,
     schema: Arc<DFSchema>,
 }
 
@@ -64,6 +66,7 @@ impl PartialEq for MergeInsertWriteNode {
     fn eq(&self, other: &Self) -> bool {
         self.params == other.params
             && self.write_sink == other.write_sink
+            && self.source_blob_columns == other.source_blob_columns
             && self.input == other.input
             && self.dataset.base == other.dataset.base
     }
@@ -75,6 +78,7 @@ impl std::hash::Hash for MergeInsertWriteNode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.params.hash(state);
         self.write_sink.hash(state);
+        self.source_blob_columns.hash(state);
         self.input.hash(state);
         self.dataset.base.hash(state);
     }
@@ -84,7 +88,10 @@ impl PartialOrd for MergeInsertWriteNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match self.params.partial_cmp(&other.params) {
             Some(Ordering::Equal) => match self.write_sink.cmp(&other.write_sink) {
-                Ordering::Equal => self.input.partial_cmp(&other.input),
+                Ordering::Equal => match self.source_blob_columns.cmp(&other.source_blob_columns) {
+                    Ordering::Equal => self.input.partial_cmp(&other.input),
+                    cmp => Some(cmp),
+                },
                 cmp => Some(cmp),
             },
             cmp => cmp,
@@ -99,6 +106,7 @@ impl MergeInsertWriteNode {
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         write_sink: WriteSink,
+        source_blob_columns: Vec<String>,
     ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
@@ -108,6 +116,7 @@ impl MergeInsertWriteNode {
             params,
             source_skipped_duplicates,
             write_sink,
+            source_blob_columns,
             schema,
         }
     }
@@ -183,6 +192,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             self.params.clone(),
             self.source_skipped_duplicates.clone(),
             self.write_sink,
+            self.source_blob_columns.clone(),
         ))
     }
 
@@ -303,6 +313,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        write_node.source_blob_columns.clone(),
                     )?)
                 };
                 Some(exec)

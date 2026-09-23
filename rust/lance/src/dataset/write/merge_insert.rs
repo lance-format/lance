@@ -2423,6 +2423,17 @@ impl MergeInsertJob {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+        let source_blob_columns = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| {
+                source_field_names.contains(&field.name)
+                    && crate::dataset::optimize::field_contains_blob_v2(field)
+            })
+            .map(|field| field.name.clone())
+            .collect();
         // Inject a sentinel literal column so we can reliably determine, after the join,
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
@@ -2482,6 +2493,7 @@ impl MergeInsertJob {
             self.params.clone(),
             source_skipped_duplicates,
             write_sink,
+            source_blob_columns,
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
@@ -15234,6 +15246,113 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_preserves_carried_external_blob() {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let dataset_dir = TempStrDir::default();
+        let external_dir = TempStrDir::default();
+        let external_path = format!("{external_dir}/external.bin");
+        std::fs::write(&external_path, b"external blob").unwrap();
+        let external_uri = format!("file://{external_path}");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            blob_field("payload", true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_uri(external_uri.clone()).unwrap();
+        blobs.push_bytes(b"internal blob").unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                blobs.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["a", "other"])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &dataset_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 1,
+                    allow_external_blob_outside_bases: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let source = record_batch!(("id", Int64, [1]), ("tag", Utf8, ["updated"])).unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, _) = job
+            .execute_reader(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .project(&["id", "tag"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let ids = result["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let row = ids.values().iter().position(|id| *id == 1).unwrap();
+        assert_eq!(result["tag"].as_string::<i32>().value(row), "updated");
+        let blobs = dataset
+            .take_blobs_by_indices(&[row as u64], "payload")
+            .await
+            .unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), lance_core::datatypes::BlobKind::External);
+        assert_eq!(blob.uri(), Some(external_uri.as_str()));
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"external blob");
+
+        let mut source_blob = BlobArrayBuilder::new(1);
+        source_blob.push_uri(external_uri).unwrap();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                source_blob.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["another update"])),
+            ],
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let error = job
+            .execute_reader(RecordBatchIterator::new(vec![Ok(source)], schema))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("in field 'payload' is outside registered external bases"),
+            "{error:?}"
         );
     }
 
