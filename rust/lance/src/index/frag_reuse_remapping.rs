@@ -30,6 +30,56 @@ impl CacheKey for VectorFormatKey {
     }
 }
 
+#[derive(Clone)]
+struct InvertedFormatKey(uuid::Uuid);
+
+impl CacheKey for InvertedFormatKey {
+    type ValueType = bool;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string().into()
+    }
+    fn type_name() -> &'static str {
+        "InvertedBatchRemapping"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.inverted-batch-remapping", 1)
+    }
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.0.as_bytes());
+    }
+}
+
+/// Whether a full-text segment can be loaded under a translating remapper.
+///
+/// The plugin supports batch remapping, but a legacy-layout index (no
+/// `metadata.lance`; the loader's own format probe) stores per-document
+/// lengths aligned with the row ids it was built with and cannot be
+/// translated. Such a segment is excluded from coverage so the planner scans
+/// its fragments; an untouched (identity) legacy segment still loads.
+pub async fn inverted_supports_batch_remapping(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<bool> {
+    let supported = dataset
+        .index_cache
+        .get_or_insert_with_key(InvertedFormatKey(index.uuid), || async {
+            use crate::dataset::index::LanceIndexStoreExt;
+            let store =
+                lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_existing(
+                    dataset, index,
+                )
+                .await?;
+            Ok(lance_index::scalar::IndexStore::open_index_file(
+                &store,
+                lance_index::scalar::inverted::METADATA_FILE,
+            )
+            .await
+            .is_ok())
+        })
+        .await?;
+    Ok(*supported)
+}
+
 /// Legacy vector file readers keep their existing V1 behavior and scan fallback.
 pub async fn vector_supports_batch_remapping(
     dataset: &Dataset,

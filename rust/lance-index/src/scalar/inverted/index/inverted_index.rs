@@ -649,8 +649,20 @@ impl InvertedIndex {
                 }))
             }
             Err(_) => {
-                // old index format
-                Self::load_legacy_index_with_remapping(store, remapping, index_cache).await
+                // Old index format. Its document store keeps per-document
+                // lengths positionally aligned with the row ids it was built
+                // with; translating the row ids under a mapping that drops
+                // rows would misalign them and change scoring, so a legacy
+                // layout is only loadable without translation. The tagged
+                // reader excludes such a segment from coverage and the
+                // planner scans its fragments instead.
+                if remapping.is_some() {
+                    return Err(Error::not_supported(
+                        "a legacy-layout full-text index cannot be translated under a tagged \
+                         fragment reuse history; rebuild the index to use it there",
+                    ));
+                }
+                Self::load_legacy_index_with_remapping(store, None, index_cache).await
             }
         }
     }

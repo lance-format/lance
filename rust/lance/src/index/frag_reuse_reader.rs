@@ -82,6 +82,13 @@ pub(super) async fn load_indices(
                 let can_remap = if super::segment_has_vector_details(index) {
                     super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index)
                         .await?
+                } else if index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+                {
+                    super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
+                        .await?
                 } else {
                     index
                         .index_details

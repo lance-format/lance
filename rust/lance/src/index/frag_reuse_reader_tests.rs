@@ -3116,3 +3116,130 @@ async fn identity_segment_survives_two_appends() {
     assert_eq!(count(&dataset, 100).await, 1);
     assert_eq!(count(&dataset, 300).await, 1);
 }
+
+// A legacy-layout full-text index (tokens, postings and documents at the
+// index root, no metadata file) keeps its per-document lengths aligned with
+// the row ids it was built with, so it cannot be translated under a tagged
+// history. The tagged reader excludes the segment from coverage, and a real
+// full-text query on the tagged table returns exactly what an index-free scan
+// returns: neither misaligned scores nor an error.
+#[tokio::test]
+async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
+    let batch = arrow_array::record_batch!(
+        ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+        (
+            "text",
+            Utf8,
+            [
+                Some("even"),
+                Some("odd"),
+                Some("even"),
+                Some("odd"),
+                None,
+                Some("odd"),
+                Some("even"),
+                Some("odd")
+            ]
+        )
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let index = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Rewrite the single-partition index into the legacy layout: the
+    // partition files move to the root names and the metadata file goes.
+    let index_dir = dataset.indices_dir().join(index.uuid.to_string());
+    for name in ["tokens.lance", "invert.lance", "docs.lance"] {
+        let from = index_dir.clone().join(format!("part_0_{name}"));
+        let to = index_dir.clone().join(name);
+        dataset.object_store.copy(&from, &to).await.unwrap();
+        dataset.object_store.delete(&from).await.unwrap();
+    }
+    dataset
+        .object_store
+        .delete(&index_dir.clone().join("metadata.lance"))
+        .await
+        .unwrap();
+
+    dataset.delete("i = 3").await.unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    // Excluded from coverage: no usable segment is advertised for the column.
+    let usable =
+        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", "text_idx")
+            .await
+            .unwrap();
+    assert!(usable.is_empty(), "{usable:?}");
+
+    // The truth: an index-free scan of the tagged snapshot.
+    let mut scan = dataset.scan();
+    scan.filter("text = 'even'").unwrap();
+    scan.use_scalar_index(false);
+    let expected = scan
+        .try_into_batch()
+        .await
+        .unwrap()
+        .column_by_name("i")
+        .unwrap()
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(expected, std::collections::BTreeSet::from([0, 2, 6]));
+
+    // A real full-text query on the tagged table matches it, cold and warm.
+    for _ in 0..2 {
+        let mut scan = dataset.scan();
+        // The column is named: a column-less query discovers its columns from
+        // the usable segments, and this snapshot advertises none.
+        scan.full_text_search(
+            lance_index::scalar::FullTextSearchQuery::new("even".into())
+                .with_column("text".into())
+                .unwrap(),
+        )
+        .unwrap();
+        let actual = scan
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column_by_name("i")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+}
