@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
+use crate::index::frag_reuse_reader::SegmentPlanParts;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
@@ -36,7 +37,12 @@ pub(crate) enum ResolvedRemapping {
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
-    V1Translate(Arc<dyn BatchRowIdRemapper>),
+    V1Translate {
+        remapper: Arc<dyn BatchRowIdRemapper>,
+        /// The segment's translation identity (see
+        /// [`super::frag_reuse_reader::FragmentReuseIndex::translation_fingerprint`]).
+        fingerprint: [u8; 32],
+    },
 }
 
 impl std::fmt::Debug for ResolvedRemapping {
@@ -44,27 +50,73 @@ impl std::fmt::Debug for ResolvedRemapping {
         match self {
             Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
-            Self::V1Translate(remapper) => f.debug_tuple("V1Translate").field(remapper).finish(),
+            Self::V1Translate { remapper, .. } => {
+                f.debug_tuple("V1Translate").field(remapper).finish()
+            }
         }
+    }
+}
+
+/// The FRI identity that belongs in an index's cache namespace, if any.
+///
+/// Only a v0 history is applied while the index is decoded (its remapper is
+/// handed to the plugin's load path), so only then does the FRI entry's UUID
+/// identify cached content. Under a tagged history the FRI UUID is
+/// deliberately left out: every rewrite and trim mints a new one, even for
+/// transitions a segment never touches, and the translated namespace from
+/// [`scoped_index_cache`] already carries the segment's own translation
+/// identity.
+pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
+    match resolved {
+        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        _ => None,
     }
 }
 
 /// Scope the dataset-level index cache for one resolved remapping.
 ///
-/// This owns the single cache-scoping rule: a tagged history (FRI
-/// index_version != 0) rewrites what each segment covers per manifest
-/// snapshot, so its entries are keyed under the manifest path; v0 and
-/// FRI-less datasets keep the pre-existing keys.
+/// This owns the single cache-scoping rule, which classifies cached objects
+/// by what they depend on rather than by snapshot:
+///
+/// * Content decoded without translation (an identity segment under a
+///   tagged history, a v0 history, no history) depends only on the index
+///   file, so it lives in the plain per-index namespace and an append or an
+///   unrelated rewrite never cold-starts it.
+/// * Content that embeds translated addresses (pages, postings, partitions
+///   loaded through a `V1Translate` remapper) depends on the segment's
+///   translation state, so it lives under a namespace named by the segment's
+///   translation fingerprint. The entry goes cold exactly when that state
+///   changes: a transition on the segment's path trimmed or replaced, a
+///   fragment on its path dropped from the manifest, a sibling taking direct
+///   ownership of one of its destinations. An append, a row-level delete, or
+///   a rewrite of fragments the segment never covered leaves the fingerprint,
+///   and the entry, in place.
+///
+/// Soundness rests on the fingerprint covering every input of
+/// `remap_row_ids_excluding` (see `translation_fingerprint`); cached
+/// translated objects hold the `FragmentReuseIndex` they were filled with, so
+/// a stale one must never be served under a changed state.
 pub(crate) fn scoped_index_cache(
     dataset: &Dataset,
     resolved: &Option<(Uuid, ResolvedRemapping)>,
 ) -> crate::session::index_caches::DSIndexCache {
     crate::session::index_caches::DSIndexCache(match resolved {
-        Some((_, ResolvedRemapping::V1Identity | ResolvedRemapping::V1Translate(_))) => dataset
+        Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => dataset
             .index_cache
-            .with_key_prefix(dataset.manifest_location.path.as_ref()),
+            .with_key_prefix(&translated_namespace(fingerprint)),
         _ => dataset.index_cache.0.clone(),
     })
+}
+
+/// The cache namespace of translated content for one translation identity.
+fn translated_namespace(fingerprint: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut prefix = String::with_capacity("fri-xlat/".len() + 2 * fingerprint.len());
+    prefix.push_str("fri-xlat/");
+    for byte in fingerprint {
+        write!(prefix, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    prefix
 }
 
 /// The translation inputs one segment needs under a tagged history.
@@ -73,10 +125,12 @@ pub(crate) enum SegmentRemappingPlan {
     /// The segment's stored coverage cannot intersect any rewritten path.
     Identity,
     /// The rewritten query coverage plus the fragments owned by other
-    /// selected sibling segments of the same logical index.
+    /// selected sibling segments of the same logical index, and the
+    /// translation identity derived from them.
     Translate {
         coverage: RoaringBitmap,
         excluded_fragments: RoaringBitmap,
+        fingerprint: [u8; 32],
     },
     /// Committed metadata exists but the filtered listing carries no query
     /// coverage for this segment (it was skipped or lost its bitmap).
@@ -101,7 +155,12 @@ impl DeepSizeOf for FriQueryPlan {
                 SegmentRemappingPlan::Translate {
                     coverage,
                     excluded_fragments,
-                } => coverage.serialized_size() + excluded_fragments.serialized_size(),
+                    fingerprint,
+                } => {
+                    coverage.serialized_size()
+                        + excluded_fragments.serialized_size()
+                        + fingerprint.len()
+                }
                 _ => 0,
             })
             .sum::<usize>()
@@ -177,7 +236,7 @@ async fn fri_query_plan(
                             .push(entry.uuid);
                     }
                 }
-                let mut excluded_by_uuid: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+                let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
                 for members in groups.into_values() {
                     let provenance: Vec<RoaringBitmap> = members
                         .iter()
@@ -189,7 +248,7 @@ async fn fri_query_plan(
                         })
                         .collect();
                     for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
-                        excluded_by_uuid.insert(*uuid, parts.excluded);
+                        parts_by_uuid.insert(*uuid, parts);
                     }
                 }
                 let mut segments = HashMap::with_capacity(stored.len());
@@ -204,11 +263,16 @@ async fn fri_query_plan(
                         // Drop paths entering those fragments before later
                         // mappings can merge them with this segment's
                         // contribution.
-                        let excluded_fragments =
-                            excluded_by_uuid.remove(&source.uuid).unwrap_or_default();
+                        let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
+                        let fingerprint = mapping.translation_fingerprint(
+                            &coverage,
+                            &parts.excluded,
+                            &parts.path,
+                        );
                         SegmentRemappingPlan::Translate {
                             coverage,
-                            excluded_fragments,
+                            excluded_fragments: parts.excluded,
+                            fingerprint,
                         }
                     } else {
                         SegmentRemappingPlan::MissingCoverage
@@ -268,15 +332,17 @@ pub(super) async fn open_row_id_remapping(
         Some(SegmentRemappingPlan::Translate {
             coverage,
             excluded_fragments,
+            fingerprint,
         }) => Ok(Some((
             fri.uuid,
-            ResolvedRemapping::V1Translate(Arc::new(
-                super::frag_reuse_remapping::QueryRowIdRemapper::new(
+            ResolvedRemapping::V1Translate {
+                remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
                     mapping,
                     coverage.clone(),
                     excluded_fragments.clone(),
-                ),
-            )),
+                )),
+                fingerprint: *fingerprint,
+            },
         ))),
     }
 }

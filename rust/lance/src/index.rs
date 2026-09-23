@@ -3220,6 +3220,18 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
+/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// is resolved: only a v0 history, whose remapper is applied while the index
+/// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
+async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
+        .map(|idx| idx.uuid)
+}
+
 #[async_trait]
 impl DatasetIndexInternalExt for Dataset {
     async fn open_generic_index(
@@ -3231,7 +3243,7 @@ impl DatasetIndexInternalExt for Dataset {
         // Checking for cache existence is cheap so we just check the vector caches.
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -3310,19 +3322,24 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
         let resolved = frag_reuse::open_row_id_remapping(self, &index_meta, metrics).await?;
+        // The index state (paths, model, quantizer metadata) and a legacy
+        // whole-index entry embed no translated rows: they live in the plain
+        // per-index namespace and stay warm across appends and unrelated
+        // rewrites. Partitions decoded through a translating remapper live in
+        // the translated namespace of `query_cache`.
+        let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(entry) = query_cache.get_with_key(&state_key).await {
+        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             return entry
@@ -3338,7 +3355,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         // Fallback: in-memory cache for legacy indices.
         let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(cached) = query_cache.get_with_key(&cache_key).await {
+        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached.0.clone());
         }
 
@@ -3619,11 +3636,11 @@ impl DatasetIndexInternalExt for Dataset {
             io_stats.add_scan_stats(&open_stats);
         }
         if let Some(ivf_entry) = ivf_entry {
-            query_cache
+            self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
         } else {
-            query_cache
+            self.index_cache
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
                 .await;
         }

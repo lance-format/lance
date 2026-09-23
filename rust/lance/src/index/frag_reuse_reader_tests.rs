@@ -485,6 +485,9 @@ async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+    // Translated entries are keyed by the segment's translation identity, not
+    // by the manifest snapshot: a snapshot whose path differs but whose
+    // coverage, exclusions and mapping path are unchanged is a cache hit.
     let mut other_snapshot = dataset.clone();
     other_snapshot.manifest_location.path =
         dataset.base.clone().join("_versions").join("999.manifest");
@@ -495,7 +498,8 @@ async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
         metrics
             .index_loads
             .load(std::sync::atomic::Ordering::Relaxed),
-        1
+        0,
+        "a path-only snapshot change must not evict translated entries"
     );
     let inputs = [
         u64::from(RowAddress::new_from_parts(1, 3)),
@@ -1503,10 +1507,16 @@ async fn vector_partition_uses_shared_remapping_and_cached_reconstruction(#[case
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
     if prewarm {
         dataset.prewarm_index("vector_idx").await.unwrap();
     }
-    for _ in 0..2 {
+    let search = |dataset: Dataset| async move {
         let mut scan = dataset.scan();
         scan.nearest("vector", query, 1).unwrap();
         let plan = scan.explain_plan(false).await.unwrap();
@@ -1521,7 +1531,53 @@ async fn vector_partition_uses_shared_remapping_and_cached_reconstruction(#[case
                 .value(0),
             2
         );
+    };
+    for _ in 0..2 {
+        search(dataset.clone()).await;
     }
+
+    // The IVF state embeds no rows and the translated partition is keyed by
+    // the segment's translation identity, which an append leaves unchanged:
+    // both survive the commit. Before this keying every commit cold-started
+    // the whole index.
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(original.clone())], original.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset
+        .load_index_by_name("vector_idx")
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    let index = dataset
+        .open_vector_index("vector", &uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the IVF state entry survives an append"
+    );
+    let ivf = index
+        .as_any()
+        .downcast_ref::<crate::index::vector::ivf::v2::IvfFlatIndex>()
+        .unwrap();
+    ivf.load_partition(0, true, &metrics).await.unwrap();
+    assert_eq!(
+        metrics
+            .parts_loaded
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the translated partition entry survives an append"
+    );
+    search(dataset.clone()).await;
 }
 
 #[tokio::test]
@@ -1617,7 +1673,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .unwrap();
     assert!(matches!(
         first,
-        Some((_, ResolvedRemapping::V1Translate(_)))
+        Some((_, ResolvedRemapping::V1Translate { .. }))
     ));
     let plan = plan_cache
         .get_with_key(&key)
@@ -1649,7 +1705,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .unwrap();
     assert!(matches!(
         second,
-        Some((_, ResolvedRemapping::V1Translate(_)))
+        Some((_, ResolvedRemapping::V1Translate { .. }))
     ));
     let republished = plan_cache.get_with_key(&key).await.unwrap();
     assert!(
@@ -1683,7 +1739,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .await
         .unwrap();
     assert!(
-        matches!(warm, Some((_, ResolvedRemapping::V1Translate(_)))),
+        matches!(warm, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "a warm open must resolve purely from the cached plan"
     );
 }
@@ -1753,7 +1809,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
         .await
         .unwrap();
     assert!(
-        matches!(resolved, Some((_, ResolvedRemapping::V1Translate(_)))),
+        matches!(resolved, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "{resolved:?}"
     );
 
@@ -2648,4 +2704,415 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
     // All F10 matches, no F11 leak; scan-based scalar prefilter control agrees.
     assert_eq!(run(true).await, vec![4, 6]);
     assert_eq!(run(false).await, vec![4, 6]);
+}
+
+// ---- cache identity: translated entries follow the translation state ----
+
+/// Open `i_idx` through the real scalar path, returning how many index loads
+/// it took (0 = served from the cache) and the cached container.
+async fn open_i_idx(dataset: &Dataset) -> (usize, Arc<dyn lance_index::scalar::ScalarIndex>) {
+    let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
+    let (loads, container) = open_segment(dataset, &index).await;
+    (
+        loads,
+        container.expect("a translating open leaves its container in the cache"),
+    )
+}
+
+/// `(index loads, cached container)`: the container is absent on a plugin's
+/// non-batch path when it caches state instead of a whole object.
+async fn open_segment(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> (usize, Option<Arc<dyn lance_index::scalar::ScalarIndex>>) {
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    crate::index::scalar::open_scalar_index(dataset, "i", index, &metrics)
+        .await
+        .unwrap();
+    let container = crate::index::scalar::cached_scalar_index_container(dataset, &index.uuid).await;
+    (
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        container,
+    )
+}
+
+fn same_container(
+    a: &Arc<dyn lance_index::scalar::ScalarIndex>,
+    b: &Arc<dyn lance_index::scalar::ScalarIndex>,
+) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+}
+
+async fn count(dataset: &Dataset, value: i32) -> usize {
+    dataset
+        .count_rows(Some(format!("i = {value}")))
+        .await
+        .unwrap()
+}
+
+/// A translating `i_idx` over the reclustered fixture, persisted so later
+/// commits (appends, deletes, new histories) build on a real snapshot.
+async fn persisted_translating_fixture() -> Dataset {
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let plan = dataset
+        .scan()
+        .filter("i = 2")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    dataset
+}
+
+fn fri_entry(indices: &[IndexMetadata]) -> &IndexMetadata {
+    indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap()
+}
+
+async fn append_rows(dataset: &mut Dataset, values: &[i32]) -> lance_table::format::Fragment {
+    let batch = RecordBatch::try_from_iter([(
+        "i",
+        Arc::new(arrow_array::Int32Array::from(values.to_vec())) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .fragments()
+        .iter()
+        .max_by_key(|fragment| fragment.id)
+        .unwrap()
+        .clone()
+}
+
+/// Rewrite fragment `source_id` into a new fragment `dest_id` with an
+/// ordered-compaction transition (rows keep their order): the transition and
+/// the uncommitted destination fragment.
+async fn compact_fragment(
+    dataset: &Dataset,
+    source_id: u64,
+    dest_id: u64,
+) -> (Transition, lance_table::format::Fragment) {
+    let source = dataset
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id == source_id)
+        .unwrap()
+        .clone();
+    let batch = {
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![source.clone()]);
+        scan.try_into_batch().await.unwrap()
+    };
+    let transaction = crate::dataset::InsertBuilder::new(Arc::new(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: crate::dataset::WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+    let lance_table::transaction::Operation::Append { fragments } = transaction.operation else {
+        unreachable!()
+    };
+    let mut destination = fragments.into_iter().next().unwrap();
+    destination.id = dest_id;
+    let physical_rows = source.physical_rows.unwrap() as u64;
+    let deleted: Vec<u32> = dataset
+        .get_fragment(source_id as usize)
+        .unwrap()
+        .get_deletion_vector()
+        .await
+        .unwrap()
+        .map(|vector| vector.iter().collect())
+        .unwrap_or_default();
+    let mut changed_row_addrs = Vec::new();
+    roaring::RoaringTreemap::from_iter(
+        (0..physical_rows as u32)
+            .filter(|row| !deleted.contains(row))
+            .map(|row| u64::from(RowAddress::new_from_parts(source_id as u32, row))),
+    )
+    .serialize_into(&mut changed_row_addrs)
+    .unwrap();
+    let transition = Transition {
+        sources: vec![FragmentDigest {
+            id: source_id,
+            physical_rows,
+            num_deleted_rows: deleted.len() as u64,
+        }],
+        destinations: vec![FragmentDigest {
+            id: dest_id,
+            physical_rows: destination.physical_rows.unwrap() as u64,
+            num_deleted_rows: 0,
+        }],
+        mapping: Some(transition::Mapping::OrderedCompaction(
+            pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+        )),
+    };
+    (transition, destination)
+}
+
+/// Persist a snapshot over exactly the `live` fragments with every index
+/// entry, the FRI included, left as it is.
+async fn persist_live(dataset: &mut Dataset, live: Vec<lance_table::format::Fragment>) {
+    let indices = crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    Arc::make_mut(&mut dataset.manifest).fragments = live.into();
+    persist_fixture(dataset, indices).await;
+}
+
+/// Replace the FRI entry with a fresh one (new UUID) holding `transitions`,
+/// over exactly the `live` fragments, and persist the snapshot. Stored
+/// segment provenance is taken from the raw listing, as a real rewrite
+/// commit would keep it.
+async fn install_history(
+    dataset: &mut Dataset,
+    transitions: Vec<Transition>,
+    live: Vec<lance_table::format::Fragment>,
+) -> IndexMetadata {
+    let mut indices = crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices.retain(|index| index.name != FRAG_REUSE_INDEX_NAME);
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions,
+    }
+    .encode_to_vec();
+    let fri = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        fields: vec![],
+        covering_fields: vec![],
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(live.iter().map(|fragment| fragment.id as u32).collect()),
+        index_details: Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(1, &content),
+        })),
+        index_version: 1,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    indices.push(fri.clone());
+    Arc::make_mut(&mut dataset.manifest).fragments = live.into();
+    persist_fixture(dataset, indices).await;
+    fri
+}
+
+// An append adds fragments no stored address refers to: the segment's
+// coverage, exclusions and mapping path are unchanged, so its translated
+// entries stay warm. Before this keying, every commit cold-started them.
+#[tokio::test]
+async fn tagged_append_keeps_translated_entries_warm() {
+    let mut dataset = persisted_translating_fixture().await;
+    let (loads, before) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1, "cold open loads the index");
+    assert_eq!(count(&dataset, 2).await, 1);
+
+    append_rows(&mut dataset, &[100]).await;
+    let (loads, after) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 0, "an append must not evict translated entries");
+    assert!(same_container(&before, &after));
+    assert_eq!(count(&dataset, 2).await, 1);
+    assert_eq!(count(&dataset, 100).await, 1, "the appended row is scanned");
+}
+
+// Dropping a live destination changes the segment's coverage: the entry must
+// go cold even though the FRI entry (and its UUID) is untouched.
+#[tokio::test]
+async fn coverage_change_misses_without_new_fri() {
+    let mut dataset = persisted_translating_fixture().await;
+    let (loads, _) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1);
+    let fri_before = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+
+    // F10 holds the even values. Drop it from the manifest (what deleting all
+    // of its rows does once tagged maintenance lands) with the FRI entry left
+    // exactly as it is.
+    let live: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| fragment.id != 10)
+        .cloned()
+        .collect();
+    persist_live(&mut dataset, live).await;
+    assert!(
+        !dataset.fragment_bitmap.contains(10),
+        "{:?}",
+        dataset.fragment_bitmap
+    );
+    let fri_after = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+    assert_eq!(fri_before, fri_after);
+
+    let (loads, _) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1, "a coverage change must miss");
+    for value in 0..8 {
+        assert_eq!(count(&dataset, value).await, usize::from(value % 2 == 1));
+    }
+}
+
+// A new transition over a fragment on the segment's path changes the path:
+// the entry must go cold, and the new hop must be applied.
+#[tokio::test]
+async fn relevant_transition_misses_translated_entries() {
+    let mut dataset = persisted_translating_fixture().await;
+    let (loads, _) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1);
+    let first = decode_transitions(&dataset).await;
+    assert_eq!(first.len(), 1);
+
+    let (second, destination) = compact_fragment(&dataset, 10, 20).await;
+    let live = vec![
+        dataset
+            .fragments()
+            .iter()
+            .find(|f| f.id == 11)
+            .unwrap()
+            .clone(),
+        destination,
+    ];
+    let mut transitions = first;
+    transitions.push(second);
+    install_history(&mut dataset, transitions, live).await;
+
+    let (loads, _) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1, "a transition on the path must miss");
+    for value in 0..8 {
+        assert_eq!(count(&dataset, value).await, 1, "value {value}");
+    }
+}
+
+// A new history (fresh FRI UUID) whose extra transition rewrites fragments
+// the segment never covered leaves the segment's translation identity
+// unchanged: its entries stay warm. This pins the "relevant state only"
+// rule; keying on the FRI UUID would cold-start every segment here.
+#[tokio::test]
+async fn unrelated_transition_keeps_translated_entries_warm() {
+    let mut dataset = persisted_translating_fixture().await;
+    let (loads, before) = open_i_idx(&dataset).await;
+    assert_eq!(loads, 1);
+    let fri_before = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+    let first = decode_transitions(&dataset).await;
+
+    let appended = append_rows(&mut dataset, &[100, 101]).await;
+    let (second, destination) = compact_fragment(&dataset, appended.id, 20).await;
+    let mut live: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| fragment.id != appended.id)
+        .cloned()
+        .collect();
+    live.push(destination);
+    let mut transitions = first;
+    transitions.push(second);
+    let fri_after = install_history(&mut dataset, transitions, live).await.uuid;
+    assert_ne!(fri_before, fri_after);
+
+    let (loads, after) = open_i_idx(&dataset).await;
+    assert_eq!(
+        loads, 0,
+        "a transition off the segment's path must not evict its entries"
+    );
+    assert!(same_container(&before, &after));
+    for value in 0..8 {
+        assert_eq!(count(&dataset, value).await, 1, "value {value}");
+    }
+    assert_eq!(count(&dataset, 100).await, 1);
+    assert_eq!(count(&dataset, 101).await, 1);
+}
+
+/// The transitions of the dataset's current (inline) FRI history.
+async fn decode_transitions(dataset: &Dataset) -> Vec<Transition> {
+    let indices = crate::index::load_all_indices(dataset).await.unwrap();
+    let fri = fri_entry(&indices);
+    let details = fri.index_details.as_ref().unwrap();
+    let details = pb::FragmentReuseIndexDetails::decode(details.value.as_slice()).unwrap();
+    let Some(pb::fragment_reuse_index_details::Content::Inline(inline)) = details.content else {
+        panic!("fixture histories are inline");
+    };
+    inline.transitions
+}
+
+// An untouched segment loads without a remapper, so its entries depend only
+// on the index file: two appends later they are still warm.
+#[tokio::test]
+async fn identity_segment_survives_two_appends() {
+    use crate::index::frag_reuse::{ResolvedRemapping, open_row_id_remapping};
+
+    let mut dataset = fixture().await;
+    let (transition, mut destinations) = prepare(&dataset).await;
+    let untouched_fragment = append_rows(&mut dataset, &[100]).await;
+    let untouched = CreateIndexBuilder::new(
+        &mut dataset,
+        &["i"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .name("i_untouched".into())
+    .replace(true)
+    .fragments(vec![untouched_fragment.id as u32])
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    destinations.push(untouched_fragment);
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let mut all = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    all.push(untouched.clone());
+    persist_fixture(&mut dataset, all).await;
+    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(matches!(resolved, Some((_, ResolvedRemapping::V1Identity))));
+
+    let (loads, before) = open_segment(&dataset, &untouched).await;
+    assert_eq!(loads, 1);
+    assert_eq!(count(&dataset, 100).await, 1);
+    append_rows(&mut dataset, &[200]).await;
+    append_rows(&mut dataset, &[300]).await;
+    let (loads, after) = open_segment(&dataset, &untouched).await;
+    assert_eq!(loads, 0, "identity entries depend only on the index file");
+    if let (Some(before), Some(after)) = (&before, &after) {
+        assert!(same_container(before, after));
+    }
+    assert_eq!(count(&dataset, 100).await, 1);
+    assert_eq!(count(&dataset, 300).await, 1);
 }

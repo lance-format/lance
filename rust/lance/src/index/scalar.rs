@@ -579,7 +579,7 @@ pub async fn open_scalar_index(
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
     let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, metrics).await?;
-    let cache_id = resolved.as_ref().map(|(uuid, _)| uuid);
+    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
     let (frag_reuse_index, batch_remapping) =
@@ -589,7 +589,7 @@ pub async fn open_scalar_index(
             // with no remapper; every plugin (including legacy-API-only ones)
             // supports this.
             Some(ResolvedRemapping::V1Identity) => (None, None),
-            Some(ResolvedRemapping::V1Translate(remapper)) => (None, Some(remapper.clone())),
+            Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
             None => (None, None),
         };
 
@@ -662,7 +662,7 @@ pub(crate) async fn cached_scalar_index_container(
     let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
         .await
         .ok()?;
-    let cache_id = resolved.as_ref().map(|(fri_uuid, _)| fri_uuid);
+    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(uuid, cache_id);
     index_cache

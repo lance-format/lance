@@ -128,13 +128,17 @@ pub(super) async fn load_indices(
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SegmentPlanParts {
     /// Live fragments this segment answers for in the current snapshot.
     pub coverage: RoaringBitmap,
     /// Fragments directly covered by other selected group members; translated
     /// paths entering them belong to those siblings.
     pub excluded: RoaringBitmap,
+    /// Positions (in ledger order) of the transitions this segment's rows
+    /// pass through on their way to `coverage`: every transition whose
+    /// resolved contributors include this segment.
+    pub path: Vec<usize>,
 }
 
 /// A validated FRI graph whose mapping payloads are opened only when needed.
@@ -291,14 +295,74 @@ impl FragmentReuseIndex {
             }
         }
         let group_direct: RoaringBitmap = direct.keys().copied().collect();
+        // Invert the resolutions: a transition whose contributors include a
+        // segment is on that segment's translation path.
+        let mut paths = vec![Vec::new(); provenance.len()];
+        for (&index, resolution) in &transitions {
+            for &segment in resolution.iter().flatten() {
+                paths[segment].push(index);
+            }
+        }
         provenance
             .iter()
             .zip(coverage)
-            .map(|(own, coverage)| SegmentPlanParts {
-                coverage,
-                excluded: &group_direct - own,
+            .zip(paths)
+            .map(|((own, coverage), mut path)| {
+                path.sort_unstable();
+                SegmentPlanParts {
+                    coverage,
+                    excluded: &group_direct - own,
+                    path,
+                }
             })
             .collect()
+    }
+
+    /// The translation identity of one segment: a hash of everything that
+    /// decides its translated output, so cached objects that embed translated
+    /// addresses can be keyed by it and go cold only when that state changes.
+    ///
+    /// `remap_row_ids_excluding` is a function of the mappings on the
+    /// segment's path, the liveness of the fragments along it, `excluded`
+    /// and `coverage`. The hash therefore covers `coverage` (live fragments
+    /// only, so a fragment dropped from the manifest changes it), `excluded`
+    /// restricted to the destinations of the path (sibling churn elsewhere in
+    /// the group cannot change this segment's output), the fingerprints of
+    /// the path transitions in ledger order (a trimmed or replaced transition
+    /// on the path changes it; one elsewhere does not) and whether the ledger
+    /// dropped unsupported transitions. The FRI entry's UUID is deliberately
+    /// not part of it: every rewrite and trim mints a new one, even for
+    /// transitions this segment never touches.
+    pub fn translation_fingerprint(
+        &self,
+        coverage: &RoaringBitmap,
+        excluded: &RoaringBitmap,
+        path: &[usize],
+    ) -> [u8; 32] {
+        let transitions = self.ledger.transitions();
+        let path_destinations: RoaringBitmap = path
+            .iter()
+            .flat_map(|&index| transitions[index].destinations())
+            .map(|destination| destination.id as u32)
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fri-translation/1");
+        hasher.update(&[u8::from(self.ledger.has_unsupported_transitions())]);
+        hasher.update(b"coverage");
+        // The serialized form is canonical for a given set; the hasher
+        // implements `io::Write`, so nothing is buffered.
+        coverage
+            .serialize_into(&mut hasher)
+            .expect("hashing a bitmap cannot fail");
+        hasher.update(b"excluded");
+        (excluded & path_destinations)
+            .serialize_into(&mut hasher)
+            .expect("hashing a bitmap cannot fail");
+        hasher.update(b"path");
+        for &index in path {
+            hasher.update(transitions[index].fingerprint());
+        }
+        *hasher.finalize().as_bytes()
     }
 
     /// Remap physical row IDs through supported lineage, stopping at live fragments.
@@ -1651,6 +1715,59 @@ mod tests {
         assert_eq!(plans[0].excluded, RoaringBitmap::from_iter([1, 4]));
         assert_eq!(plans[1].excluded, RoaringBitmap::from_iter([0, 4]));
         assert_eq!(plans[2].excluded, RoaringBitmap::from_iter([0, 1]));
+        // X and Y reach F5 through both transitions; Z covers F4 directly and
+        // passes through none.
+        assert_eq!(plans[0].path, vec![0, 1]);
+        assert_eq!(plans[1].path, vec![0, 1]);
+        assert!(plans[2].path.is_empty());
+
+        // The translation identity follows exactly the inputs of the
+        // translated output: coverage, the exclusions on the path's
+        // destinations, and the path itself.
+        let fingerprint = |plan: &SegmentPlanParts| {
+            reader.translation_fingerprint(&plan.coverage, &plan.excluded, &plan.path)
+        };
+        let base = fingerprint(&plans[0]);
+        assert_eq!(base, fingerprint(&plans[0]), "deterministic");
+        // X and Y share coverage, path and on-path exclusions ({4}), so they
+        // share an identity; their own content is told apart by the index
+        // UUID namespace layered on top.
+        assert_eq!(base, fingerprint(&plans[1]));
+        assert_ne!(base, fingerprint(&plans[2]), "a direct segment differs");
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(
+                &RoaringBitmap::new(),
+                &plans[0].excluded,
+                &plans[0].path
+            ),
+            "coverage is part of the identity"
+        );
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(
+                &plans[0].coverage,
+                &plans[0].excluded,
+                &plans[0].path[..1]
+            ),
+            "a transition dropped from the path changes the identity"
+        );
+        // Exclusions outside the path's destinations {2, 3, 4, 5} are inert:
+        // sibling churn elsewhere in the group cannot change X's output.
+        let mut off_path = plans[0].excluded.clone();
+        off_path.insert(99);
+        assert_eq!(
+            base,
+            reader.translation_fingerprint(&plans[0].coverage, &off_path, &plans[0].path),
+            "an exclusion off the path leaves the identity unchanged"
+        );
+        let mut on_path = plans[0].excluded.clone();
+        on_path.insert(5);
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(&plans[0].coverage, &on_path, &plans[0].path),
+            "an exclusion on a path destination changes the identity"
+        );
     }
 
     #[rstest::rstest]
