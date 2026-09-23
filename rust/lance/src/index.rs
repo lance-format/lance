@@ -12640,9 +12640,12 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        // Row-id-domain: its coverage is recalculated (not dropped) across a
+        // rewrite under stable row ids, which is exactly the property this test
+        // checks. BTree moved to row-address domain and no longer exercises it.
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
-            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
             .name("id_idx".to_string())
             .train(false)
             .await

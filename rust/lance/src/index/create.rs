@@ -83,10 +83,11 @@ async fn reject_row_id_domain_index_under_frag_reuse(
     }
 
     // Hard-coded list of row-id-domain indexes.  As we migrate away from
-    // row-id domain indexes this list will shrink and then vanish.
+    // row-id domain indexes this list will shrink and then vanish.  BTree
+    // stores row addresses (BTREE_ROW_ADDR_DOMAIN_VERSION) and is no longer
+    // in it.
     match index_type {
-        IndexType::BTree
-        | IndexType::Bitmap
+        IndexType::Bitmap
         | IndexType::Inverted
         | IndexType::IvfFlat
         | IndexType::IvfHnswFlat
@@ -2135,8 +2136,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        // The worker scans the dataset's `(id, _rowid)` rows and sorts them by value,
-        // producing the BTree training stream `(value, _rowid)` externally — the "scan,
+        // The worker scans the dataset's `(id, _rowaddr)` rows and sorts them by value,
+        // producing the BTree training stream `(value, _rowaddr)` externally — the "scan,
         // sort, then hand a pre-sorted reader to the builder" path; no `range_id`.
         let sorted_batches: Vec<RecordBatch> = {
             let mut scan = dataset.scan();
@@ -2144,7 +2145,7 @@ mod tests {
                 "id".to_string(),
             )]))
             .unwrap();
-            scan.with_row_id();
+            scan.with_row_address();
             scan.project_with_transform(&[("value", "id")]).unwrap();
             scan.try_into_stream()
                 .await

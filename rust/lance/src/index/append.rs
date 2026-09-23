@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
@@ -122,15 +122,72 @@ async fn live_row_ids(
     })
 }
 
+/// The live physical addresses of an "effective" fragment set: every
+/// `(fragment, offset)` not marked gone by that fragment's deletion vector.
+///
+/// Coarse `Fragments` filtering (whole-fragment granularity) cannot tell a
+/// fragment's still-valid rows from ones a same-fragment update superseded --
+/// under stable row ids, updating an indexed column deletes the row's old
+/// physical copy and writes the new value elsewhere, but the old fragment
+/// keeps its id and stays "effective". An address-domain index's stored old
+/// data is exact physical addresses, so it needs this same exact-membership
+/// treatment `build_stable_row_id_filter` gives row ids, just without needing
+/// the row-id sequence: an address only needs the deletion vector.
+async fn build_live_row_addr_filter(
+    dataset: &Dataset,
+    effective_old_frags: &RoaringBitmap,
+) -> Result<RowAddrTreeMap> {
+    let mut live = RowAddrTreeMap::new();
+    for frag_id in effective_old_frags.iter() {
+        let Some(fragment) = dataset.get_fragment(frag_id as usize) else {
+            continue;
+        };
+        let Some(physical_rows) = fragment.metadata().physical_rows else {
+            continue;
+        };
+        // Propagate a deletion-vector read failure rather than swallowing it: a
+        // swallowed error would fall through to "no deletions", putting the
+        // deleted rows back into the allow-list as stale entries.
+        let deletion_vector = if fragment.metadata().deletion_file.is_some() {
+            fragment.get_deletion_vector().await?
+        } else {
+            None
+        };
+        for offset in 0..physical_rows {
+            let offset = offset as u32;
+            if deletion_vector
+                .as_ref()
+                .is_some_and(|dv| dv.contains(offset))
+            {
+                continue;
+            }
+            live.insert(u64::from(RowAddress::new_from_parts(frag_id, offset)));
+        }
+    }
+    Ok(live)
+}
+
 /// Build the [`OldIndexDataFilter`] that must be applied to existing index
 /// rows when their owning fragments have been pruned by compaction or
 /// deletions.
+///
+/// `address_domain` must be `true` when the consuming index stores physical
+/// row addresses rather than row ids (see
+/// `ScalarIndex::results_are_row_addresses`). Such an index needs exact
+/// address-level filtering regardless of the dataset's row-id scheme: a
+/// same-fragment update can leave some of a still-"effective" fragment's rows
+/// live and others superseded (see [`build_live_row_addr_filter`]), which
+/// coarse fragment-granularity filtering cannot distinguish.
 pub async fn build_old_data_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
     deleted_old_frags: &RoaringBitmap,
+    address_domain: bool,
 ) -> Result<Option<OldIndexDataFilter>> {
-    if dataset.manifest.uses_stable_row_ids() {
+    if address_domain {
+        let valid_old_addrs = build_live_row_addr_filter(dataset, effective_old_frags).await?;
+        Ok(Some(OldIndexDataFilter::RowIds(valid_old_addrs)))
+    } else if dataset.manifest.uses_stable_row_ids() {
         let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
@@ -198,11 +255,14 @@ pub fn fragment_reuse_affects_segment(
 }
 
 /// Build one [`OldIndexDataFilter`] per segment and return their effective coverage.
+///
+/// See [`build_old_data_filter`] for the meaning of `address_domain`.
 pub async fn build_per_segment_filters(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
+    address_domain: bool,
 ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
-    if dataset.manifest.uses_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() && !address_domain {
         let mut effective_union = RoaringBitmap::new();
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
@@ -215,7 +275,10 @@ pub async fn build_per_segment_filters(
                     ))
                 })?;
             effective_union |= &effective;
-            filters.push(build_old_data_filter(dataset, &effective, &RoaringBitmap::new()).await?);
+            filters.push(
+                build_old_data_filter(dataset, &effective, &RoaringBitmap::new(), address_domain)
+                    .await?,
+            );
         }
         return Ok((effective_union, filters));
     }
@@ -236,7 +299,8 @@ pub async fn build_per_segment_filters(
             .deleted_fragment_bitmap(&dataset.fragment_bitmap)
             .unwrap_or_default();
         effective_union |= &effective;
-        filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
+        filters
+            .push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
     }
     Ok((effective_union, filters))
 }
@@ -491,6 +555,18 @@ async fn merge_scalar_indices<'a>(
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
 
+    // A BTree segment persisted before address-domain support stores row ids
+    // directly. Merging it with newly scanned address-domain data on a
+    // stable-row-id dataset would silently combine two different domains in
+    // the same `ids` column, so such a segment must be rebuilt from scratch
+    // (a full rescan, never touching its stale page data) rather than merged.
+    // Harmless elsewhere: without stable row ids the two domains coincide.
+    let btree_legacy_domain_mismatch = index_type == IndexType::BTree
+        && dataset.manifest.uses_stable_row_ids()
+        && selected_old_indices
+            .iter()
+            .any(|segment| !segment.results_are_row_addrs());
+
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
@@ -505,6 +581,7 @@ async fn merge_scalar_indices<'a>(
     let can_merge_segments = !effective_old_frags.is_empty()
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
+        && !btree_legacy_domain_mismatch
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
     let (created_index, new_dataset_version) = if !can_merge_segments {
@@ -559,8 +636,12 @@ async fn merge_scalar_indices<'a>(
 
             match index_type {
                 IndexType::BTree => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        true,
+                    )
+                    .await?;
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -572,8 +653,12 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        false,
+                    )
+                    .await?;
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
@@ -588,6 +673,7 @@ async fn merge_scalar_indices<'a>(
                         dataset.as_ref(),
                         &effective_old_frags,
                         &deleted_old_frags,
+                        false,
                     )
                     .await?;
                     reference_index
@@ -3674,6 +3760,15 @@ mod tests {
         assert_eq!(segments, 2, "optimization should add one FTS delta segment");
     }
 
+    /// BTree stores row addresses (`BTREE_ROW_ADDR_DOMAIN_VERSION`), so a plain
+    /// eager compaction on a stable-row-id dataset invalidates it exactly like a
+    /// zone map: with nothing to repair the addresses it stores, the rewritten
+    /// fragment drops out of its coverage (still correct -- the scanner falls
+    /// back to a full scan for it -- just uncovered). `defer_index_remap` is
+    /// what keeps the guarantee this test used to make about eager compaction:
+    /// the FRI it writes lets the btree follow its data to the new fragment, and
+    /// draining that FRI via `optimize_indices` (a segment merge, not a rescan)
+    /// must not change any answer either.
     #[tokio::test]
     async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
@@ -3725,12 +3820,22 @@ mod tests {
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
                 target_rows_per_fragment: 512,
+                defer_index_remap: true,
                 ..Default::default()
             },
             None,
         )
         .await
         .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "a deferred compaction over an address-domain index must write an FRI"
+        );
 
         let frags = dataset.get_fragments();
         assert!(!frags.is_empty());
@@ -3740,9 +3845,13 @@ mod tests {
                 .unindexed_fragments("id_idx")
                 .await
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "the FRI must let the btree follow its data to the rewritten fragment"
         );
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
 
+        // Draining the FRI into the index (a segment merge, not a rescan) must
+        // not change any answer.
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -3750,6 +3859,9 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+        for i in [0, 42, 128, 255] {
+            assert_eq!(query_id_count(&dataset, &format!("song-{i}")).await, 1);
+        }
     }
 
     /// Updating an indexed vector column in place (`update_columns` +

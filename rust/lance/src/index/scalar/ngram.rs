@@ -124,7 +124,7 @@ pub(in crate::index) async fn merge_segments(
         )
     } else {
         let (fragment_bitmap, old_data_filters) =
-            crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
+            crate::index::append::build_per_segment_filters(dataset, &segment_refs, false).await?;
         let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
         (
             open_and_merge_segments(dataset, &segment_refs, None, &new_store, &old_data_filters)

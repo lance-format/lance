@@ -2488,6 +2488,7 @@ pub(crate) async fn merge_segments(
                 dataset,
                 owned_fragments,
                 &no_deleted_fragments,
+                false,
             )
             .await?
             .ok_or_else(|| {

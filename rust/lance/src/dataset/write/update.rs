@@ -1563,11 +1563,15 @@ mod tests {
             .await
             .unwrap();
 
-        let scalar_params = ScalarIndexParams::default();
+        // Bitmap specifically: this test's point is that a row-id-domain index
+        // on an untouched column picks up a rewritten row's new fragment for
+        // free, which needs a row-id-domain index to demonstrate. `str`'s low
+        // cardinality (6 values) also suits bitmap well.
+        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
             .create_index(
                 &["str"],
-                IndexType::Scalar,
+                IndexType::Bitmap,
                 Some("str_idx".to_string()),
                 &scalar_params,
                 true,
@@ -1656,6 +1660,7 @@ mod tests {
     #[rstest]
     #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
     #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::btree(BuiltinIndexType::BTree, IndexType::BTree, "i", "i < 100", 100)]
     #[case::fm(
         BuiltinIndexType::Fm,
         IndexType::Fm,

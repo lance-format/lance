@@ -450,8 +450,13 @@ mod tests {
         let mut legacy_covered = current[0].clone();
         legacy_covered.fields = vec![a_id, b_id];
         legacy_covered.covering_fields = vec![b_id];
-        // Force the legacy migration path this fix touches.
+        // Force the legacy migration path this fix touches. A real
+        // `index_details: None` entry predates every version bump too (it was
+        // written before `index_details` existed at all), so `index_version`
+        // must go back to 0 along with it -- otherwise `unsupported_index_version`
+        // reads it as a too-new version of an unrecognized type and hides it.
         legacy_covered.index_details = None;
+        legacy_covered.index_version = 0;
 
         let transaction = Transaction::new(
             dataset.manifest.version,
@@ -534,6 +539,11 @@ mod tests {
                 // to be longer than `fields` -- more carried fields than fields
                 // at all. No normal commit can produce this.
                 idx.index_details = None;
+                // A real `index_details: None` entry predates every version bump
+                // too, so `index_version` must go back to 0 along with it --
+                // otherwise `unsupported_index_version` hides it as a too-new
+                // version of an unrecognized type before this path is even reached.
+                idx.index_version = 0;
                 idx.covering_fields = idx
                     .fields
                     .iter()
