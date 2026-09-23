@@ -3925,7 +3925,7 @@ mod tests {
                 seen.extend(actual.row_ids.values().iter().copied());
             }
         }
-        assert_eq!(seen, (0..65).collect());
+        assert_eq!(seen, (0..65).collect::<HashSet<u64>>());
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_eq!(
             stats.read_iops, 0,

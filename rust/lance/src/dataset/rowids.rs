@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
@@ -29,30 +29,24 @@ pub async fn load_row_id_sequence(
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
         .metadata_cache
-        .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
+        .get_or_insert_with_key(key, || read_row_id_sequence(fragment))
         .await
 }
 
 /// Decode the row id sequence of `fragment`, bypassing every cache.
-async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
+async fn read_row_id_sequence(fragment: &Fragment) -> Result<RowIdSequence> {
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => read_row_ids(data),
-        Some(RowIdMeta::External(file_slice)) => {
-            let path = dataset.base.clone().join(file_slice.path.as_str());
-            let range =
-                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
-            let data = dataset
-                .object_store
-                .open(&path)
-                .await?
-                .get_range(range)
-                .await?;
-            read_row_ids(&data)
-        }
+        Some(RowIdMeta::Column) => Err(Error::not_supported(format!(
+            "row ids of fragment {} are spilled to a data file column, which this build \
+             cannot read",
+            fragment.id
+        ))),
     }
 }
 
@@ -258,7 +252,7 @@ async fn read_fragment_row_id_index(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<FragmentRowIdIndex> {
-    let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
+    let row_id_sequence = Arc::new(read_row_id_sequence(fragment).await?);
     let deletion_vector = match &fragment.deletion_file {
         None => Arc::new(DeletionVector::default()),
         Some(deletion_file) => {

@@ -71,8 +71,8 @@ use lance_arrow::*;
 
 use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
-    SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
+    PreFilterSource, SelectionVectorToPrefilter,
 };
 
 mod adaptive_probe;
@@ -1226,7 +1226,7 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// [`ANNIvfSubIndexExec`] and the batch [`ANNIvfBatchExec`] so the prefilter is
 /// wired identically (and, for a batch, built once and shared across queries).
 ///
-/// `overlay_block`, when `Some`, excludes rows whose index entries may be stale
+/// `masks.overlay_block`, when `Some`, excludes rows whose index entries may be stale
 /// due to a newer data overlay (see [`DatasetPreFilter::with_overlay_block`]).
 fn build_dataset_prefilter(
     dataset: Arc<Dataset>,
@@ -1234,13 +1234,16 @@ fn build_dataset_prefilter(
     prefilter_source: &PreFilterSource,
     partition: usize,
     context: Arc<datafusion::execution::context::TaskContext>,
-    overlay_block: Option<RowAddrMask>,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
 ) -> DataFusionResult<Arc<DatasetPreFilter>> {
     let prefilter_loader = match prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
-            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            Some(
+                Box::new(FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition))
+                    as Box<dyn FilterLoader>,
+            )
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
             let stream = src_node.execute(partition, context)?;
@@ -1249,14 +1252,14 @@ fn build_dataset_prefilter(
         PreFilterSource::None => None,
     };
     // AND the external row-address mask into whatever the filter produced.
-    let prefilter_loader = match external_mask {
+    let prefilter_loader = match masks.external_mask {
         Some(mask) => {
             Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
         }
         None => prefilter_loader,
     };
     let mut pre_filter = DatasetPreFilter::new(dataset, indices, prefilter_loader);
-    if let Some(overlay_block) = overlay_block {
+    if let Some(overlay_block) = masks.overlay_block {
         pre_filter = pre_filter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(pre_filter))
@@ -2332,8 +2335,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             &prefilter_source,
             partition,
             context,
-            self.overlay_block.clone(),
-            self.external_mask.clone(),
+            PreFilterMasks {
+                overlay_block: self.overlay_block.clone(),
+                external_mask: self.external_mask.clone(),
+            },
+            &self.metrics,
         )?;
         let indices_by_uuid = Arc::new(
             indices
@@ -2698,11 +2704,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
             &self.prefilter_source,
             partition,
             context,
-            // The batch node has no data overlay to reconcile against, so no
-            // stale-row block is applied (see `ANNIvfSubIndexExec::overlay_block`).
-            None,
-            // The batch node does not support an external row-address mask.
-            None,
+            // Batch queries have no overlay or external row-address mask.
+            PreFilterMasks {
+                overlay_block: None,
+                external_mask: None,
+            },
+            &self.metrics,
         )?;
 
         let result_schema = schema.clone();
@@ -3753,8 +3760,10 @@ mod tests {
     #[rstest]
     #[case::l2("l2", true)]
     #[case::cosine("cosine", true)]
-    #[case::dot("dot", false)]
+    #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
+    #[case::bounded_dot("bounded_dot", false)]
+    #[case::large_k_dot("large_k_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
@@ -3773,14 +3782,18 @@ mod tests {
         #[case] reads_config: bool,
     ) {
         let mut query = base_query();
-        query.k = if scenario == "large_k" { 101 } else { 1 };
+        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
+            101
+        } else {
+            1
+        };
         query.key = match scenario {
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
             "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
             "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if scenario == "bounded" {
+        if matches!(scenario, "bounded" | "bounded_dot") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3801,7 +3814,7 @@ mod tests {
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
                 "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" => DistanceType::Dot,
+                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },

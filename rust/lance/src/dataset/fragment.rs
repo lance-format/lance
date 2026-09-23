@@ -52,8 +52,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
-use lance_table::format::{DataFile, DeletionFile, Fragment};
+use lance_table::format::{DataFile, DeletionFile, Fragment, RowDatasetVersionMeta};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
@@ -1156,6 +1155,28 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
+        // The reader builders below decode version sequences from the manifest
+        // and fall back to version 1 when they cannot; a spilled sequence must
+        // not fall through to that.
+        for (wanted, meta) in [
+            (
+                read_config.with_row_created_at_version,
+                &self.metadata.created_at_version_meta,
+            ),
+            (
+                read_config.with_row_last_updated_at_version,
+                &self.metadata.last_updated_at_version_meta,
+            ),
+        ] {
+            if wanted && matches!(meta, Some(RowDatasetVersionMeta::Column)) {
+                return Err(Error::not_supported(format!(
+                    "row versions of fragment {} are spilled to a data file column, which \
+                     this build cannot read",
+                    self.id()
+                )));
+            }
+        }
+
         let (opened_files, deletion_vec, row_id_sequence) =
             join!(open_files, deletion_vec_load, row_id_load);
         let opened_files = opened_files?;
@@ -1715,9 +1736,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
-                // A tombstone marks a field superseded by a later data file.
-                // It is not a field id: it has no ordering and can repeat.
-                if *field_id == TOMBSTONE_FIELD_ID {
+                // Negative ids are not schema fields: the tombstone marks a
+                // field superseded by a later data file, and the others are
+                // hidden system columns such as spilled row lineage. None has
+                // an ordering, and a tombstone can repeat.
+                if *field_id < 0 {
                     continue;
                 }
                 if *field_id <= last {

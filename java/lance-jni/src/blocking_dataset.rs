@@ -1198,7 +1198,8 @@ fn inner_create_index<'local>(
         | IndexType::ZoneMap
         | IndexType::BloomFilter
         | IndexType::Fm
-        | IndexType::RTree => {
+        | IndexType::RTree
+        | IndexType::MinHashLsh => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
@@ -3986,6 +3987,7 @@ fn inner_describe_indices<'local>(
             must_support_fts,
             fts_document_granularity: None,
             must_support_exact_equality,
+            must_support_minhash: false,
         })
     })?;
 
@@ -4164,6 +4166,7 @@ fn inner_get_zonemap_stats<'local>(
                     must_support_fts: false,
                     fts_document_granularity: None,
                     must_support_exact_equality: false,
+                    must_support_minhash: false,
                 }))
                 .await
                 .map_err(Error::from)?;

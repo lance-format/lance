@@ -779,24 +779,39 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows, index_upper_ranges) =
-            if dataset.manifest.uses_stable_row_ids() {
-                let (row_id_sequence, index_upper_ranges) =
-                    if let Some(routing) = stable_index_routing {
-                        (routing.row_id_sequence, routing.upper_ranges)
-                    } else {
-                        (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
-                    };
-                let num_logical_rows = row_id_sequence.len();
-                (row_id_sequence, num_logical_rows, index_upper_ranges)
+        let num_deleted_rows = deletion_vector
+            .as_ref()
+            .map_or(0_u64, |deletion_vector| deletion_vector.len() as u64);
+        // Row-ID sequences describe physical slots, including tombstoned slots. Scan ranges use
+        // visible ordinals, so ordinary scans must exclude the loaded deletions in either row-ID
+        // mode. When deleted rows are requested the deletion vector is intentionally absent.
+        let num_logical_rows =
+            num_physical_rows
+                .checked_sub(num_deleted_rows)
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        dataset.base.clone(),
+                        format!(
+                            "Fragment {} has {} physical rows but {} deleted rows",
+                            frag.id, num_physical_rows, num_deleted_rows
+                        ),
+                    )
+                })?;
+        let (row_id_sequence, index_upper_ranges) = if dataset.manifest.uses_stable_row_ids() {
+            let (row_id_sequence, index_upper_ranges) = if let Some(routing) = stable_index_routing
+            {
+                (routing.row_id_sequence, routing.upper_ranges)
             } else {
-                debug_assert!(stable_index_routing.is_none());
-                let row_ids_start = frag.id << 32;
-                let row_ids_end = row_ids_start + num_physical_rows;
-                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
-                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-                (addrs_as_ids, num_logical_rows, None)
+                (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
             };
+            (row_id_sequence, index_upper_ranges)
+        } else {
+            debug_assert!(stable_index_routing.is_none());
+            let row_ids_start = frag.id << 32;
+            let row_ids_end = row_ids_start + num_physical_rows;
+            let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+            (addrs_as_ids, None)
+        };
         Ok(LoadedFragment {
             row_id_sequence,
             index_upper_ranges,

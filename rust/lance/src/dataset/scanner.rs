@@ -79,6 +79,7 @@ use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
     INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
 };
+use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_io::stream::RecordBatchStream;
@@ -120,8 +121,9 @@ use crate::io::exec::fts::{
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
-    LanceScanExec, Planner, PreFilterSource, RowAddrMaskFilterExec, ScanConfig, TakeExec,
+    AddRowAddrExec, FilterPlan as ExprFilterPlan, FlatMinHashExec, KNNVectorDistanceExec,
+    LancePushdownScanExec, LanceScanExec, MinHashSearchExec, Planner, PreFilterSource,
+    RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
         KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
         query_index_field,
@@ -638,6 +640,12 @@ pub(super) struct PlannedFilteredScan {
     pub(super) filter_pushed_down: bool,
 }
 
+#[derive(Debug)]
+struct ScanRangePlan {
+    fragments: Option<Arc<Vec<Fragment>>>,
+    range: Range<u64>,
+}
+
 pub struct FilterPlan {
     // Query filter plan
     query_filter: Option<QueryFilter>,
@@ -1101,6 +1109,10 @@ pub struct Scanner {
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
 
+    /// MinHash similarity search. The scan source is the index lookup and the
+    /// output gains a `_distance` column.
+    minhash_query: Option<MinHashQuery>,
+
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
@@ -1403,6 +1415,7 @@ impl Scanner {
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
+            minhash_query: None,
             batch_size: None,
             batch_size_bytes: None,
             batch_readahead: get_num_compute_intensive_cpus(),
@@ -1686,6 +1699,22 @@ impl Scanner {
     /// ```
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
         self.full_text_query = Some(query);
+        Ok(self)
+    }
+
+    /// Return the rows of `query.column` most similar to `query.text` under
+    /// the column's MinHash LSH index.
+    ///
+    /// The number of rows is the scan [`limit`](Self::limit), which is
+    /// required. Results are ordered by ascending `_distance`
+    /// (`1 - estimated Jaccard similarity`), which is added to the output.
+    pub fn minhash_search(&mut self, query: MinHashQuery) -> Result<&mut Self> {
+        if query.column.is_empty() {
+            return Err(Error::invalid_input(
+                "MinHash search requires the column to search".to_string(),
+            ));
+        }
+        self.minhash_query = Some(query);
         Ok(self)
     }
 
@@ -2406,12 +2435,12 @@ impl Scanner {
     ) -> Result<Schema> {
         let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
-        if self.nearest.as_ref().is_some() {
+        if self.nearest.is_some() || self.minhash_query.is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
-            if self.is_batch_nearest {
-                extra_columns.push(query_index_field());
-            }
-        };
+        }
+        if self.is_batch_nearest {
+            extra_columns.push(query_index_field());
+        }
 
         if self.full_text_query.is_some() {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
@@ -2483,7 +2512,9 @@ impl Scanner {
         // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
         // projection behavior
         if self.autoproject_scoring_columns {
-            if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
+            if (self.nearest.is_some() || self.minhash_query.is_some())
+                && output_expr.iter().all(|(_, name)| name != DIST_COL)
+            {
                 if self.explicit_projection {
                     log::warn!(
                         "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
@@ -3021,7 +3052,68 @@ impl Scanner {
         Ok(filter_plan)
     }
 
-    async fn get_scan_range(&self, filter_plan: &ExprFilterPlan) -> Result<Option<Range<u64>>> {
+    fn requested_scan_range(&self, total_rows: u64) -> Option<Range<u64>> {
+        let offset = u64::try_from(self.offset.unwrap_or(0)).ok()?;
+        let start = offset.min(total_rows);
+        let end = match self.limit {
+            Some(limit) => offset
+                .checked_add(u64::try_from(limit).ok()?)?
+                .min(total_rows),
+            None => total_rows,
+        };
+        Some(start..end)
+    }
+
+    fn plan_metadata_scan_range(&self) -> Option<ScanRangePlan> {
+        self.dataset.manifest().writer_version.as_ref()?;
+
+        let fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
+        let mut visible_prefix = Vec::with_capacity(fragments.len() + 1);
+        visible_prefix.push(0_u64);
+
+        for fragment in fragments {
+            // Metadata-only pruning is an optimization. Any missing or inconsistent count must
+            // preserve the unpruned path instead of guessing where a visible ordinal lands.
+            let physical_rows = u64::try_from(fragment.physical_rows?).ok()?;
+            let deleted_rows = match fragment.deletion_file.as_ref() {
+                Some(deletion_file) => u64::try_from(deletion_file.num_deleted_rows?).ok()?,
+                None => 0,
+            };
+            let visible_rows = physical_rows.checked_sub(deleted_rows)?;
+            visible_prefix.push(visible_prefix.last()?.checked_add(visible_rows)?);
+        }
+
+        let requested_range = self.requested_scan_range(*visible_prefix.last()?)?;
+        let start = requested_range.start;
+        let end = requested_range.end;
+
+        if start == end {
+            return Some(ScanRangePlan {
+                fragments: Some(Arc::new(Vec::new())),
+                range: 0..0,
+            });
+        }
+
+        let first_fragment = visible_prefix
+            .windows(2)
+            .position(|window| window[1] > start)?;
+        let final_visible_ordinal = end.checked_sub(1)?;
+        let last_fragment = visible_prefix
+            .windows(2)
+            .position(|window| window[1] > final_visible_ordinal)?;
+        let visible_before_first = visible_prefix[first_fragment];
+        let selected_fragments = fragments[first_fragment..=last_fragment].to_vec();
+        Some(ScanRangePlan {
+            fragments: Some(Arc::new(selected_fragments)),
+            range: start.checked_sub(visible_before_first)?
+                ..end.checked_sub(visible_before_first)?,
+        })
+    }
+
+    async fn plan_scan_range(&self, filter_plan: &ExprFilterPlan) -> Result<Option<ScanRangePlan>> {
         if filter_plan.has_any_filter() {
             // If there is a filter we can't pushdown limit / offset
             Ok(None)
@@ -3029,32 +3121,47 @@ impl Scanner {
             // If there is ordering, we can't pushdown limit / offset
             // because we need to sort all data first before applying the limit
             Ok(None)
-        } else if self.dataset.manifest.uses_stable_row_ids() {
-            // Stable-row-id datasets can contain deleted / rewritten rows that still occupy
-            // physical positions in older fragments while the live replacement rows are appended
-            // to new fragments. `scan_range_before_filter` is a logical offset over visible rows,
-            // but filtered-read planning trims fragments before the stable-row-id/deletion-aware
-            // remapping is finished. Pushing limit / offset down here can spend the range on
-            // tombstoned positions and skip still-live rows in later fragments.
+        } else if self.include_deleted_rows || (self.limit.is_none() && self.offset.is_none()) {
+            // FilteredReadOptions does not support scan ranges when deleted rows are included.
             Ok(None)
         } else {
-            match (self.limit, self.offset) {
-                (None, None) => Ok(None),
-                (Some(limit), None) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(0..limit.min(num_rows) as u64))
-                }
-                (None, Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(offset.min(num_rows) as u64..num_rows as u64))
-                }
-                (Some(limit), Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(
-                        offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64,
-                    ))
-                }
+            let fragments = self
+                .fragments
+                .as_deref()
+                .unwrap_or_else(|| self.dataset.fragments());
+            let has_deletions = fragments
+                .iter()
+                .any(|fragment| fragment.deletion_file.is_some());
+            let is_v1 = self
+                .dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format()
+                == lance_file::version::ConcreteFileVersion::V1;
+
+            // V2 range planning is independent of row-ID encoding. Manifest live-row counts
+            // remove whole fragments first; filtered read loads deletion vectors only for the
+            // retained fragments and trims the residual logical range inside them.
+            if !is_v1 && let Some(plan) = self.plan_metadata_scan_range() {
+                return Ok(Some(plan));
             }
+
+            // Keep V1 behavior unchanged. For V2 fragments with deletions, incomplete metadata
+            // cannot safely locate the requested visible ordinals, so retain the non-pushdown
+            // fallback instead of guessing.
+            if has_deletions && (!is_v1 || self.dataset.manifest().uses_stable_row_ids()) {
+                return Ok(None);
+            }
+
+            let total_rows = u64::try_from(self.dataset.count_all_rows().await?).map_err(|_| {
+                Error::internal("Dataset row count does not fit in u64".to_string())
+            })?;
+            Ok(self
+                .requested_scan_range(total_rows)
+                .map(|range| ScanRangePlan {
+                    fragments: self.fragments.clone().map(Arc::new),
+                    range,
+                }))
         }
     }
 
@@ -3146,10 +3253,17 @@ impl Scanner {
 
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
-        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &full_text_query) {
-            (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
-            (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
-            (None, None) => {
+        let mut plan: Arc<dyn ExecutionPlan> = match (
+            &self.nearest,
+            &full_text_query,
+            &self.minhash_query,
+        ) {
+            (Some(_), None, None) => self.vector_search_source(&mut filter_plan).await?,
+            (None, Some(query), None) => self.fts_search_source(&mut filter_plan, query).await?,
+            (None, None, Some(query)) => {
+                self.minhash_search_source(&mut filter_plan, query).await?
+            }
+            (None, None, None) => {
                 if self.projection_plan.has_output_cols()
                     && self.projection_plan.physical_projection.is_empty()
                 {
@@ -3192,9 +3306,14 @@ impl Scanner {
                     planned_read.plan
                 }
             }
-            _ => {
+            (Some(_), Some(_), None) => {
                 return Err(Error::invalid_input_source(
                     "Cannot have both nearest and full text search".into(),
+                ));
+            }
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "Cannot combine a MinHash search with nearest or full text search".into(),
                 ));
             }
         };
@@ -3446,11 +3565,15 @@ impl Scanner {
     // A plain-scan external row mask is fed as the FilteredReadExec row source so
     // only masked rows are read, with any SQL filter applied as a refine on top.
     // Vector and full-text searches apply the mask via their own prefilter paths
-    // (KNN external_mask / FTS build_prefilter), so this plain-scan source is
-    // scoped to scans that are neither. FTS in particular has nearest.is_none(),
-    // so excluding it here keeps the FTS prefilter's own filtered read unmasked.
+    // (KNN external_mask / FTS build_prefilter / MinHash search node and its
+    // flat branch), so this plain-scan source is scoped to scans that are none
+    // of them. FTS and MinHash in particular have nearest.is_none(), so excluding
+    // them here keeps their prefilter's own filtered read unmasked.
     fn use_external_mask(&self) -> bool {
-        self.nearest.is_none() && self.full_text_query.is_none() && self.external_row_mask.is_some()
+        self.nearest.is_none()
+            && self.full_text_query.is_none()
+            && self.minhash_query.is_none()
+            && self.external_row_mask.is_some()
     }
 
     // The filter plan actually handed to the filtered read. With an external mask
@@ -3786,18 +3909,22 @@ impl Scanner {
         // limit/offset must not be pushed down as a pre-mask range (that would limit
         // rows before masking). Leaving scan_range None keeps limit_pushed_down false
         // so the limit is applied by a node above the masked source instead.
-        let scan_range = if filter_plan.is_empty() && !self.use_external_mask() {
+        let scan_range_plan = if filter_plan.is_empty() && !self.use_external_mask() {
             log::trace!("pushing scan_range into filtered_read");
-            self.get_scan_range(filter_plan).await?
+            self.plan_scan_range(filter_plan).await?
         } else {
             None
+        };
+        let (fragments, scan_range) = match scan_range_plan {
+            Some(plan) => (plan.fragments, Some(plan.range)),
+            None => (self.fragments.clone().map(Arc::new), None),
         };
 
         self.filtered_read(
             filter_plan,
             projection,
             self.include_deleted_rows,
-            self.fragments.clone().map(Arc::new),
+            fragments,
             scan_range,
             /*is_prefilter= */ false,
             session,
@@ -3838,6 +3965,290 @@ impl Scanner {
             filter_plan.make_refine_only();
             self.fts(&ExprFilterPlan::default(), query).await
         }
+    }
+
+    /// The source plan of a scan whose `nearest` is a MinHash search.
+    ///
+    /// With prefiltering the search node applies the whole filter before
+    /// ranking, so `filter_plan` is left with nothing to refine; otherwise the
+    /// search ranks unfiltered rows and the filter is kept as a refine step
+    /// over the ranked output. Deleted rows cannot be included: a deleted row
+    /// has no current text to rank.
+    async fn minhash_search_source(
+        &self,
+        filter_plan: &mut FilterPlan,
+        query: &MinHashQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("source is a minhash search");
+        if self.include_deleted_rows {
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in a MinHash search".into(),
+            ));
+        }
+
+        if self.prefilter {
+            let source = self.minhash(&filter_plan.expr_filter_plan, query).await?;
+            // The search node applies the filter before ranking; nothing is left to refine
+            filter_plan.disable_refine();
+            Ok(source)
+        } else {
+            // Postfiltering runs the filter in memory on the ranked rows
+            filter_plan.make_refine_only();
+            self.minhash(&ExprFilterPlan::default(), query).await
+        }
+    }
+
+    /// Create an execution plan for a MinHash similarity search over every
+    /// segment of the column's MinHash LSH index.
+    async fn minhash(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        query: &MinHashQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(limit) = self.limit else {
+            return Err(Error::invalid_input(
+                "MinHash search requires a limit (the number of most similar rows to return)"
+                    .to_string(),
+            ));
+        };
+        // Offset rows are skipped by the limit node, so the search must produce them too
+        let search_limit = limit
+            .checked_add(self.offset.unwrap_or(0))
+            .and_then(|search_limit| usize::try_from(search_limit).ok())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "MinHash search limit {limit} plus offset {:?} is out of range",
+                    self.offset
+                ))
+            })?;
+
+        let index = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(&query.column)
+                    .supports_minhash(),
+            )
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "No MinHash LSH index found for column {}; create a \"minhashlsh\" scalar index on the column before running a MinHash search",
+                    query.column
+                ))
+            })?;
+        let segments = self.dataset.load_indices_by_name(&index.name).await?;
+        let details = segments
+            .first()
+            .and_then(|segment| segment.index_details.as_deref())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "MinHash LSH index {} on column {} has no segment with index details",
+                    index.name, query.column
+                ))
+            })?;
+        let params = MinHashLshIndexParams::from_details_any(details)?;
+
+        let target_fragments: &[Fragment] = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
+        if target_fragments.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(false))));
+        }
+        let unindexed_fragments =
+            self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+        let all_unindexed = unindexed_fragments.len() == target_fragments.len();
+
+        // Rows whose value was replaced by a data overlay newer than the index
+        // have stale signatures: the index branch blocks them and the flat
+        // branch re-scores them from their current value.
+        let mut stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
+        if target_fragments
+            .iter()
+            .any(|fragment| !fragment.overlays.is_empty())
+        {
+            let overlaid_frags = overlaid_fragments(target_fragments);
+            for segment in &segments {
+                collect_overlay_stale_rows_for_segment(
+                    segment,
+                    &overlaid_frags,
+                    &mut stale_rows,
+                    self.dataset.schema(),
+                )?;
+            }
+        }
+
+        let indexed_plan = if all_unindexed {
+            None
+        } else {
+            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let prefilter_source = self
+                .prefilter_source(filter_plan, self.get_indexed_frags(&segments))
+                .await?;
+            Some(Arc::new(MinHashSearchExec::new(
+                self.dataset.clone(),
+                query.clone(),
+                search_limit,
+                segments,
+                prefilter_source,
+                overlay_block,
+                self.external_row_mask.clone(),
+            )) as Arc<dyn ExecutionPlan>)
+        };
+        // fast_search trades the unindexed rows for the index-only cost
+        let flat_plan =
+            if !self.fast_search && (!unindexed_fragments.is_empty() || !stale_rows.is_empty()) {
+                Some(
+                    self.plan_flat_minhash(
+                        unindexed_fragments,
+                        stale_rows,
+                        query,
+                        &params,
+                        search_limit,
+                        filter_plan,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+        let plan = match (indexed_plan, flat_plan) {
+            (Some(indexed_plan), Some(flat_plan)) => {
+                UnionExec::try_new(vec![indexed_plan, flat_plan])?
+            }
+            // Each branch already emits its top-k in distance order
+            (Some(indexed_plan), None) => return Ok(indexed_plan),
+            (None, Some(flat_plan)) => return Ok(flat_plan),
+            (None, None) => {
+                return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(false))));
+            }
+        };
+        let plan = Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        let schema = plan.schema();
+        let sort_exprs = [
+            PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, schema.as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            },
+            PhysicalSortExpr {
+                expr: expressions::col(ROW_ID, schema.as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            },
+        ];
+        Ok(Arc::new(
+            SortExec::new(sort_exprs.into(), plan).with_fetch(Some(search_limit)),
+        ))
+    }
+
+    /// One plan over the rows an index does not cover: whole unindexed
+    /// fragments (filtered while reading) and stale rows of a data overlay
+    /// (taken by address, then filtered), projected to `_rowid` plus
+    /// `columns` and the filter's columns.
+    async fn plan_uncovered_rows_scan(
+        &self,
+        fragments: Vec<Fragment>,
+        stale_rows: HashMap<u32, RoaringBitmap>,
+        mut columns: Vec<String>,
+        filter_plan: &ExprFilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_expr = if stale_rows.is_empty() {
+            filter_plan.refine_expr.as_ref()
+        } else {
+            filter_plan.full_expr.as_ref()
+        };
+        if let Some(filter_expr) = filter_expr {
+            columns.extend(Planner::column_names_in_expr(filter_expr));
+        }
+        let scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&columns, OnMissing::Error)?;
+
+        let mut inputs = Vec::with_capacity(2);
+        if !fragments.is_empty() {
+            // A prefilter read applies the whole filter plan, refine included
+            let PlannedFilteredScan { plan, .. } = self
+                .filtered_read(
+                    filter_plan,
+                    scan_projection.clone(),
+                    /*make_deletions_null=*/ false,
+                    Some(Arc::new(fragments)),
+                    None,
+                    /*is_prefilter=*/ true,
+                    None,
+                )
+                .await?;
+            inputs.push(plan);
+        }
+        if !stale_rows.is_empty() {
+            // A take by address applies no filter, so the whole plan runs here
+            let mut plan = self.stale_rows_take(&stale_rows, scan_projection).await?;
+            if let Some(filter) = filter_plan.full_expr.as_ref() {
+                let planner = Planner::new(plan.schema());
+                let filter = planner.optimize_expr(filter.clone())?;
+                plan = Arc::new(LanceFilterExec::try_new(filter, plan)?);
+            }
+            inputs.push(plan);
+        }
+        match inputs.len() {
+            0 => Err(Error::internal(
+                "an uncovered-rows scan requires unindexed fragments or stale rows",
+            )),
+            1 => inputs
+                .pop()
+                .ok_or_else(|| Error::internal("uncovered-rows scan input vanished")),
+            _ => Ok(UnionExec::try_new(inputs)?),
+        }
+    }
+
+    /// The flat branch of a MinHash search: rows the index does not cover
+    /// (`fragments` indexed by no segment, and `stale_rows` whose text a data
+    /// overlay replaced after the index was built) are read with the filter
+    /// and the external row mask applied, signed with the index `params` on
+    /// the fly, kept when they share a band with the query, and ranked to
+    /// `limit` hits. The caller merges them with the index hits;
+    /// `fast_search` skips this branch.
+    async fn plan_flat_minhash(
+        &self,
+        fragments: Vec<Fragment>,
+        stale_rows: HashMap<u32, RoaringBitmap>,
+        query: &MinHashQuery,
+        params: &MinHashLshIndexParams,
+        limit: usize,
+        filter_plan: &ExprFilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = self
+            .plan_uncovered_rows_scan(
+                fragments,
+                stale_rows,
+                vec![query.column.clone()],
+                filter_plan,
+            )
+            .await?;
+        let mut plan = self.ensure_column_alias(plan, &query.column)?;
+        // Unindexed rows never reach the index-side prefilter, so the external
+        // mask is applied here, before the flat search keeps its top `limit`
+        // rows: a masked row must not take one of those slots.
+        if let Some(mask) = self.external_row_mask.clone() {
+            plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
+        }
+        Ok(Arc::new(FlatMinHashExec::new(
+            plan,
+            query.clone(),
+            params.clone(),
+            limit,
+        )))
     }
 
     async fn vector_search_source(
@@ -5220,59 +5631,9 @@ impl Scanner {
         } else {
             resolved.canonical_path.clone()
         };
-        let mut columns = vec![scan_column.clone()];
-        let filter_expr = if stale_rows.is_empty() {
-            filter_plan.refine_expr.as_ref()
-        } else {
-            filter_plan.full_expr.as_ref()
-        };
-        if let Some(filter_expr) = filter_expr {
-            columns.extend(Planner::column_names_in_expr(filter_expr));
-        }
-        let scan_projection = self
-            .dataset
-            .empty_projection()
-            .with_row_id()
-            .union_columns(&columns, OnMissing::Error)?;
-
-        let mut inputs = Vec::with_capacity(2);
-        if !fragments.is_empty() {
-            let PlannedFilteredScan { mut plan, .. } = self
-                .filtered_read(
-                    filter_plan,
-                    scan_projection.clone(),
-                    /*make_deletions_null=*/ false,
-                    Some(Arc::new(fragments)),
-                    None,
-                    /*is_prefilter=*/ true,
-                    None,
-                )
-                .await?;
-            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
-            }
-            inputs.push(plan);
-        }
-
-        if !stale_rows.is_empty() {
-            let mut plan = self.stale_rows_take(&stale_rows, scan_projection).await?;
-            if let Some(filter) = filter_plan.full_expr.as_ref() {
-                let planner = Planner::new(plan.schema());
-                let filter = planner.optimize_expr(filter.clone())?;
-                plan = Arc::new(LanceFilterExec::try_new(filter, plan)?);
-            }
-            inputs.push(plan);
-        }
-
-        let mut plan: Arc<dyn ExecutionPlan> = match inputs.len() {
-            0 => {
-                return Err(Error::internal(
-                    "flat FTS input requires unindexed fragments or stale rows",
-                ));
-            }
-            1 => inputs.pop().unwrap(),
-            _ => UnionExec::try_new(inputs)?,
-        };
+        let mut plan = self
+            .plan_uncovered_rows_scan(fragments, stale_rows, vec![scan_column], filter_plan)
+            .await?;
         if resolved.has_lists() {
             plan = Arc::new(FtsDocumentExec::new(plan, resolved.clone()));
         } else {
@@ -6968,9 +7329,24 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
-        if filter_plan.is_empty() && self.fragments.is_none() {
-            log::trace!("no filter plan, no prefilter");
-            return Ok(PreFilterSource::None);
+        if filter_plan.is_empty() {
+            let has_full_fragment_coverage = self.fragments.as_ref().is_none_or(|fragments| {
+                let selected: HashSet<_> = fragments.iter().map(|fragment| fragment.id).collect();
+                selected.len() == self.dataset.manifest.fragments.len()
+                    && self
+                        .dataset
+                        .manifest
+                        .fragments
+                        .iter()
+                        .all(|fragment| selected.contains(&fragment.id))
+            });
+            // A full-snapshot scope cannot reject any live row. Avoid materializing its row IDs,
+            // but retain self.fragments for unindexed fallback and leave deletion/overlay masks
+            // to DatasetPreFilter. Comparing IDs also prevents duplicate fragments hiding a gap.
+            if has_full_fragment_coverage {
+                log::trace!("no filter plan or effective fragment restriction, no prefilter");
+                return Ok(PreFilterSource::None);
+            }
         }
 
         // get fragments covered by index
@@ -7620,6 +7996,7 @@ pub mod test_dataset {
 mod test {
 
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use std::vec;
 
@@ -9258,6 +9635,329 @@ mod test {
             let actual = scan.limit(Some(0), None)?.try_into_batch().await?;
             assert_eq!(actual.num_rows(), 0);
         }
+        Ok(())
+    }
+
+    async fn assert_scan_slice_matches(
+        dataset: &Dataset,
+        fragments: Option<&[Fragment]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<()> {
+        let mut full_scan = dataset.scan();
+        if let Some(fragments) = fragments {
+            full_scan.with_fragments(fragments.to_vec());
+        }
+        let full = full_scan.try_into_batch().await?;
+        let expected_offset = offset.min(full.num_rows());
+        let expected_len = limit.min(full.num_rows() - expected_offset);
+        let expected = full.slice(expected_offset, expected_len);
+
+        let mut scan = dataset.scan();
+        if let Some(fragments) = fragments {
+            scan.with_fragments(fragments.to_vec());
+        }
+        scan.limit(Some(limit as i64), Some(offset as i64))?;
+        let actual = scan.try_into_batch().await?;
+        assert_eq!(actual, expected, "offset={offset}, limit={limit}");
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_v2_limit_pushdown_correctness(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] with_deletions: bool,
+    ) -> Result<()> {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: stable_row_ids,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        if with_deletions {
+            dataset.delete("idx % 10 = 0").await?;
+        }
+
+        for (offset, limit) in [
+            (0, 5),
+            (8, 8),
+            (9, 3),
+            (17, 10),
+            (35, 10),
+            (100, 5),
+            (15, 0),
+        ] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        let fragments = dataset.fragments();
+        let reordered = vec![fragments[3].clone(), fragments[1].clone()];
+        assert_scan_slice_matches(&dataset, Some(&reordered), 8, 10).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_limit_pushdown_with_deletions() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
+        let mut dataset = test_ds.dataset;
+
+        assert_scan_slice_matches(&dataset, None, 19, 2).await?;
+        let mut scan = dataset.scan();
+        scan.limit(Some(2), Some(19))?;
+        let scan_range_plan = scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(scan_range_plan.range, 19..21);
+
+        dataset
+            .delete("i IN (0, 20, 25, 198, 200, 205, 399)")
+            .await?;
+
+        // Deletions before OFFSET, within the boundary fragment, at the LIMIT endpoint,
+        // and a LIMIT spanning fragments all match full-scan slice semantics.
+        for (offset, limit) in [
+            (0, 10),
+            (19, 2),
+            (20, 10),
+            (190, 20),
+            (196, 10),
+            (200, 10),
+            (390, 10),
+            (500, 10),
+            (196, 0),
+        ] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        // Fragment 0 has 196 visible rows, so an offset on that exact boundary can
+        // discard it and express the remaining range relative to fragment 1.
+        let mut scan = dataset.scan();
+        scan.limit(Some(10), Some(196))?;
+        let scan_range_plan = scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(scan_range_plan.range, 0..10);
+        let plan = scan.create_plan().await?;
+        let filtered = find_filtered_read(plan.as_ref()).expect("filtered read");
+        let selected = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 1);
+
+        // Explicit fragment subsets and order define scan order; stable row IDs need not be
+        // contiguous or increasing.
+        let fragments = dataset.fragments().as_ref().clone();
+        assert_scan_slice_matches(&dataset, Some(&fragments[1..]), 10, 10).await?;
+        let reversed = vec![fragments[1].clone(), fragments[0].clone()];
+        assert_scan_slice_matches(&dataset, Some(&reversed), 197, 10).await?;
+        let mut reversed_scan = dataset.scan();
+        reversed_scan.with_fragments(reversed);
+        reversed_scan.limit(Some(10), Some(197))?;
+        let reversed_plan = reversed_scan.create_plan().await?;
+        let filtered = find_filtered_read(reversed_plan.as_ref()).expect("filtered read");
+        let selected = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 0);
+
+        // A zero-live-row fragment does not consume visible ordinals and can be pruned.
+        let mut fully_deleted = fragments[0].clone();
+        let physical_rows = fully_deleted.physical_rows;
+        fully_deleted
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = physical_rows;
+        let mut fully_deleted_scan = dataset.scan();
+        fully_deleted_scan.with_fragments(vec![fully_deleted, fragments[1].clone()]);
+        fully_deleted_scan.limit(Some(10), Some(0))?;
+        let fully_deleted_plan = fully_deleted_scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(fully_deleted_plan.range, 0..10);
+        assert_eq!(
+            fully_deleted_plan.fragments.expect("pruned fragments")[0].id,
+            1
+        );
+
+        // Unknown or inconsistent metadata conservatively preserves the fallback.
+        let mut unknown_count = dataset.fragments()[0].clone();
+        unknown_count
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = None;
+        let mut unknown_scan = dataset.scan();
+        unknown_scan.with_fragments(vec![unknown_count]);
+        unknown_scan.limit(Some(10), Some(1))?;
+        assert!(
+            unknown_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut missing_physical_rows = dataset.fragments()[0].clone();
+        missing_physical_rows.physical_rows = None;
+        let mut missing_rows_scan = dataset.scan();
+        missing_rows_scan.with_fragments(vec![missing_physical_rows]);
+        missing_rows_scan.limit(Some(10), Some(1))?;
+        assert!(
+            missing_rows_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut invalid_deleted_rows = dataset.fragments()[0].clone();
+        let physical_rows = invalid_deleted_rows.physical_rows.expect("physical rows");
+        invalid_deleted_rows
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = physical_rows.checked_add(1);
+        let mut invalid_rows_scan = dataset.scan();
+        invalid_rows_scan.with_fragments(vec![invalid_deleted_rows]);
+        invalid_rows_scan.limit(Some(10), Some(1))?;
+        assert!(
+            invalid_rows_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut include_deleted_scan = dataset.scan();
+        include_deleted_scan.with_row_id().include_deleted_rows();
+        include_deleted_scan.limit(Some(10), Some(1))?;
+        assert!(
+            include_deleted_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut untrusted_dataset = dataset.clone();
+        Arc::make_mut(&mut untrusted_dataset.manifest).writer_version = None;
+        let mut untrusted_scan = untrusted_dataset.scan();
+        untrusted_scan.limit(Some(10), Some(1))?;
+        assert!(
+            untrusted_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let legacy_test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, true).await?;
+        let mut legacy_dataset = legacy_test_ds.dataset;
+        legacy_dataset.delete("i = 0").await?;
+        let mut legacy_scan = legacy_dataset.scan();
+        legacy_scan.limit(Some(10), Some(1))?;
+        assert!(
+            legacy_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+        assert_scan_slice_matches(&legacy_dataset, None, 1, 10).await?;
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_v2_limit_pushdown_prunes_fragments(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] with_deletions: bool,
+    ) -> Result<()> {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(32),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: stable_row_ids,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let offset = if with_deletions {
+            dataset.delete("idx % 10 = 0").await?;
+            25 * 9
+        } else {
+            25 * 10
+        };
+
+        let candidate_fragments = dataset.fragments().len();
+        let mut scan = dataset.scan();
+        scan.limit(Some(3), Some(offset))?;
+        let plan = scan.create_plan().await?;
+        let filtered = find_filtered_read(plan.as_ref()).expect("filtered read");
+        let planned_fragments = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments")
+            .len();
+
+        assert_eq!(candidate_fragments, 32);
+        assert_eq!(planned_fragments, 1);
+        assert_scan_slice_matches(&dataset, None, offset as usize, 3).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_limit_pushdown_after_update() -> Result<()> {
+        let dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where("idx IN (1, 11, 21)")?
+            .set("idx", "idx + 1000")?
+            .build()?
+            .execute()
+            .await?
+            .new_dataset;
+        let mut dataset =
+            Arc::try_unwrap(dataset).unwrap_or_else(|dataset| dataset.as_ref().clone());
+
+        for (offset, limit) in [(0, 5), (8, 8), (18, 8), (27, 3)] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        compact_files(&mut dataset, CompactionOptions::default(), None).await?;
+        for (offset, limit) in [(0, 5), (8, 8), (18, 8), (27, 3)] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
         Ok(())
     }
 
@@ -17643,6 +18343,252 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(get_default_io_buffer_size_override(), None);
     }
 
+    #[rstest]
+    #[case::all(vec![0, 1], false, true)]
+    #[case::reordered(vec![1, 0], false, true)]
+    #[case::duplicates(vec![0, 0], false, false)]
+    #[case::subset(vec![0], false, false)]
+    #[case::empty(vec![], false, false)]
+    #[case::filtered(vec![0, 1], true, false)]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter(
+        #[case] selected: Vec<usize>,
+        #[case] has_filter: bool,
+        #[case] no_prefilter: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let fragments = &test_ds.dataset.manifest.fragments;
+        assert_eq!(fragments.len(), 2);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.with_fragments(selected.iter().map(|i| fragments[*i].clone()).collect());
+        let filter = if has_filter {
+            ExprFilterPlan::new_refine_only(col("i").gt(lit(100)))
+        } else {
+            ExprFilterPlan::default()
+        };
+        let source = scanner
+            .prefilter_source(&filter, fragments.iter().map(|f| f.id as u32).collect())
+            .await
+            .unwrap();
+        assert_eq!(matches!(source, PreFilterSource::None), no_prefilter);
+        // Planning must preserve the explicit scope used by unindexed-fragment fallback.
+        assert_eq!(scanner.fragments.as_ref().unwrap().len(), selected.len());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter_preserves_deleted_and_unindexed_rows(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] pin_segment: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let indexed_snapshot = test_ds.dataset.clone();
+        test_ds.dataset.delete("i = 7").await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        for dataset in [&indexed_snapshot, &test_ds.dataset] {
+            let mut scanner = dataset.scan();
+            scanner.prefilter(true);
+            scanner.with_fragments(dataset.manifest.fragments.as_ref().clone());
+            scanner
+                .nearest("vec", &Float32Array::from(vec![0.0; 32]), 500)
+                .unwrap();
+            scanner.nprobes(2);
+            if pin_segment {
+                let indices = dataset.load_indices().await.unwrap();
+                scanner.with_index_segments(vec![indices[0].uuid]).unwrap();
+            }
+            let batch = scanner.try_into_batch().await.unwrap();
+            let actual: BTreeSet<i32> = batch["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            let expected: BTreeSet<i32> =
+                if dataset.version().version == indexed_snapshot.version().version {
+                    (0..400).collect()
+                } else {
+                    (0..410).filter(|i| *i != 7).collect()
+                };
+            assert_eq!(actual, expected);
+            assert_eq!(batch.num_rows(), expected.len());
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter_4bit_pq_recall(
+        #[values(MetricType::L2, MetricType::Dot)] metric: MetricType,
+        #[values(false, true)] postfilter: bool,
+    ) {
+        const DIM: usize = 8;
+        const K: usize = 10;
+        let mut dataset = gen_batch()
+            .with_seed(lance_datagen::Seed(42))
+            .col("id", array::step::<UInt64Type>())
+            .col("vec", array::rand_vec::<Float32Type>((DIM as u32).into()))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        );
+        let codebook = Arc::new(Float32Array::from_iter_values(
+            (0..DIM).flat_map(|_| (0..16).map(|i| i as f32 / 15.0)),
+        ));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            metric,
+            IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+            PQBuildParams::with_codebook(DIM, 4, codebook),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let vectors = data["vec"].as_fixed_size_list();
+
+        // One 512-row partition and k=10 exceed max(FLAT_NUM_4BIT_PQ=200, k).
+        // Thus bulk scoring quantizes the middle rows; small fixtures or a large
+        // refinement budget would accidentally test only the exact prefix.
+        for query_row in [240, 360, 480] {
+            let query = vectors.value(query_row);
+            let make_scanner = |use_index| {
+                let mut scanner = dataset.scan();
+                scanner.project(&["id"]).unwrap();
+                scanner
+                    .nearest("vec", query.as_ref(), K)
+                    .unwrap()
+                    .distance_metric(metric)
+                    .nprobes(1)
+                    .use_index(use_index);
+                if postfilter {
+                    // Postfilter predicates are not passed to the ANN prefilter.
+                    scanner.filter("id >= 16").unwrap();
+                } else {
+                    scanner.prefilter(true);
+                }
+                scanner
+            };
+            let expected = make_scanner(false).try_into_batch().await.unwrap();
+            let implicit = make_scanner(true).try_into_batch().await.unwrap();
+            let mut scoped = make_scanner(true);
+            scoped.with_fragments(dataset.manifest.fragments.as_ref().clone());
+            let plan = scoped.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ANNSubIndex"), "{plan}");
+            let actual = scoped.try_into_batch().await.unwrap();
+            assert_eq!(actual, implicit);
+            let ids = |batch: &RecordBatch| {
+                batch["id"]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            };
+            let expected = ids(&expected);
+            assert!(!expected.is_empty());
+            let actual = ids(&actual);
+            let recall = actual.intersection(&expected).count() as f64 / expected.len() as f64;
+            assert!(
+                recall >= 0.5,
+                "{metric:?}, postfilter={postfilter}, query={query_row}: {recall}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::single("single")]
+    #[case::batch("batch")]
+    #[case::fts("fts")]
+    #[tokio::test]
+    async fn test_full_snapshot_prefilter_execution_metrics(
+        #[values(false, true)] filtered: bool,
+        #[case] search_type: &str,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        if search_type == "fts" {
+            test_ds.make_fts_index().await.unwrap();
+        } else {
+            test_ds.make_vector_index().await.unwrap();
+        }
+        let stats = Arc::new(Mutex::new(None));
+        let collected = stats.clone();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .prefilter(true)
+            .with_fragments(test_ds.dataset.manifest.fragments.as_ref().clone())
+            .scan_stats_callback(Arc::new(move |summary| {
+                *collected.lock().unwrap() = Some(summary.clone());
+            }));
+        if search_type == "batch" {
+            let queries =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 64]), 32)
+                    .unwrap();
+            scanner.nearest("vec", &queries, 100).unwrap();
+        } else if search_type == "fts" {
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+                .unwrap()
+                .limit(Some(100), None)
+                .unwrap();
+        } else {
+            scanner
+                .nearest("vec", &Float32Array::from(vec![0.0; 32]), 100)
+                .unwrap();
+        }
+        scanner.nprobes(2);
+        if filtered {
+            scanner.filter("i >= 200").unwrap();
+        }
+        if search_type == "batch" {
+            assert!(
+                scanner
+                    .explain_plan(false)
+                    .await
+                    .unwrap()
+                    .contains("ANNIvfBatch")
+            );
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            if search_type == "batch" { 200 } else { 100 }
+        );
+        let summary = stats.lock().unwrap().take().unwrap();
+        // The batch node must materialize the shared filter once, not once per query.
+        for (name, expected) in [
+            ("prefilter_loads", 1),
+            ("prefilter_input_rows", 200),
+            ("prefilter_row_ids", 200),
+        ] {
+            let value = summary.all_counts.get(name).copied().unwrap_or_default();
+            assert_eq!(value, if filtered { expected } else { 0 }, "{name}");
+        }
+        let batches = summary
+            .all_counts
+            .get("prefilter_input_batches")
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(batches > 0, filtered);
+        for name in [
+            "prefilter_load_time",
+            "prefilter_input_time",
+            "prefilter_build_time",
+        ] {
+            let value = summary.all_times.get(name).copied().unwrap_or_default();
+            assert_eq!(value > 0, filtered, "{name}: {value}");
+        }
+    }
+
     fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {
         assert!(!array.is_empty(), "Expected some results but got none");
         assert!(
@@ -17690,6 +18636,16 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_has_all_fragments(i_array);
+
+        // A complete explicit scope must preserve indexed hits and unindexed fallback.
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(fragments.to_vec());
+        let scoped = scanner.try_into_batch().await.unwrap();
+        let mut expected = i_array.values().to_vec();
+        let mut actual = scoped["i"].as_primitive::<Int32Type>().values().to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
 
         // Test 2: Query only one unindexed fragment (fragment 2), excluding fragment 3
         let mut scanner = build_scanner(&test_ds.dataset);

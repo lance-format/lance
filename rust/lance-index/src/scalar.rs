@@ -39,6 +39,7 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
 #[cfg(feature = "geo")]
