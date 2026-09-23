@@ -4196,6 +4196,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            uses_stable_row_ids: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
