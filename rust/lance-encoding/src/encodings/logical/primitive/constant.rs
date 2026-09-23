@@ -205,6 +205,42 @@ impl ConstantPageScheduler {
     }
 }
 
+/// The layout a constant page's scalar was written in, for a reader that
+/// requested `requested`.
+///
+/// A column's files may store different layouts of the same values, and a
+/// scalar records only its buffers, whose lengths tell the layouts apart: one
+/// value has an offsets buffer of 8 bytes with 32-bit offsets and 16 bytes with
+/// 64-bit offsets, and a decimal value takes 16 or 32 bytes.
+fn stored_scalar_type(requested: &DataType, buffer_lengths: &[usize]) -> DataType {
+    use DataType::*;
+    let wide_offsets = buffer_lengths.first() == Some(&16);
+    match requested {
+        Utf8 | LargeUtf8 | Utf8View => {
+            if wide_offsets {
+                LargeUtf8
+            } else {
+                Utf8
+            }
+        }
+        Binary | LargeBinary | BinaryView => {
+            if wide_offsets {
+                LargeBinary
+            } else {
+                Binary
+            }
+        }
+        Dictionary(_, value) => stored_scalar_type(value, buffer_lengths),
+        Decimal128(precision, scale) | Decimal256(precision, scale) => {
+            match buffer_lengths.first() {
+                Some(32) => Decimal256(*precision, *scale),
+                _ => Decimal128(*precision, *scale),
+            }
+        }
+        _ => requested.clone(),
+    }
+}
+
 impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantPageScheduler {
     fn init_layout(&self) -> Result<PageInitialization> {
         // Order must match `init_from_buffers`' consumption: scalar, rep, def.
@@ -229,17 +265,29 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
 
             let scalar = match (scalar_source, scalar_buffer) {
                 (ScalarSource::Inline(inline), None) => {
-                    lance_arrow::scalar::decode_scalar_from_inline_value(&data_type, &inline)?
+                    let stored_type = stored_scalar_type(&data_type, &[inline.len()]);
+                    lance_arrow::scalar::decode_scalar_from_inline_value(&stored_type, &inline)?
                 }
                 (ScalarSource::ValueBuffer(_), Some(bytes)) => {
                     let buf = LanceBuffer::from_bytes(bytes, 1);
-                    lance_arrow::scalar::decode_scalar_from_value_buffer(&data_type, buf.as_ref())?
+                    let buffer_lengths =
+                        lance_arrow::scalar::scalar_value_buffer_lengths(buf.as_ref())?;
+                    let stored_type = stored_scalar_type(&data_type, &buffer_lengths);
+                    lance_arrow::scalar::decode_scalar_from_value_buffer(
+                        &stored_type,
+                        buf.as_ref(),
+                    )?
                 }
                 _ => {
                     return Err(Error::internal(
                         "Constant page scalar buffer does not match its initialization layout",
                     ));
                 }
+            };
+            let scalar = if scalar.data_type() == &data_type {
+                scalar
+            } else {
+                arrow_cast::cast(&scalar, &data_type)?
             };
 
             let rep = rep_buffer.map(|rep| {

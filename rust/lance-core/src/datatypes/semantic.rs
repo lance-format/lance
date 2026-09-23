@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field as ArrowField};
 
 use super::LogicalType;
+use crate::deepsize::DeepSizeOf;
 use crate::{Error, Result};
 
 /// Field metadata entry naming the Arrow layout that reads return for a field
@@ -195,6 +196,15 @@ pub enum OutputEncoding {
     ArrowJson,
     /// JSONB with the `lance.json` extension.
     LanceJson,
+}
+
+impl DeepSizeOf for OutputEncoding {
+    fn deep_size_of_children(&self, _context: &mut crate::deepsize::Context) -> usize {
+        match self {
+            Self::Dictionary { value, .. } => std::mem::size_of::<Self>() + value.deep_size_of(),
+            _ => 0,
+        }
+    }
 }
 
 impl OutputEncoding {

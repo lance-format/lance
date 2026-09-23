@@ -5285,6 +5285,17 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     }
 }
 
+/// Name the field in an error about converting its stored layout to the
+/// requested one; other errors pass through unchanged.
+fn name_layout_error(err: Error, field_name: &str) -> Error {
+    if let Error::InvalidInput { source, .. } = &err
+        && let Some(conversion) = source.downcast_ref::<crate::data::LayoutConversionError>()
+    {
+        return Error::invalid_input(format!("field '{field_name}': {conversion}"));
+    }
+    err
+}
+
 /// Takes the output from several pages decoders and
 /// concatenates them.
 #[derive(Debug)]
@@ -5292,6 +5303,8 @@ pub struct StructuralCompositeDecodeArrayTask {
     tasks: Vec<Box<dyn DecodePageTask>>,
     should_validate: bool,
     data_type: DataType,
+    /// Names the field in errors about the requested layout.
+    field_name: String,
 }
 
 impl StructuralCompositeDecodeArrayTask {
@@ -5342,7 +5355,8 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             let array = make_array(
                 decoded
                     .data
-                    .into_arrow(self.data_type.clone(), self.should_validate)?,
+                    .into_arrow(self.data_type.clone(), self.should_validate)
+                    .map_err(|err| name_layout_error(err, &self.field_name))?,
             );
 
             arrays.push(array);
@@ -5468,6 +5482,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             tasks,
             should_validate: self.should_validate,
             data_type: self.field.data_type().clone(),
+            field_name: self.field.name().clone(),
         }))
     }
 

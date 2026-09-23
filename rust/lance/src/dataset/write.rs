@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -204,15 +205,17 @@ impl Dataset {
             .parts_dir(&self.data_file_dir_for_base(target.base_id)?)
             .join(file_name.as_str());
         let store = self.object_store(target.base_id).await?;
+        let file_schema = target.schema.to_data_file_schema()?;
         let mut writer = V2WriterAdapter::new(
             file_versions::create_writer(
                 target.version,
                 store.create(&path).await?,
-                target.schema.as_ref().clone(),
+                file_schema.clone(),
                 FileWriterOptions::default(),
             )?,
             None,
             preprocessor,
+            &file_schema,
         );
         let mut data = Box::pin(data);
         let write_result = async {
@@ -940,6 +943,7 @@ where
 
     // Keep a copy so failure paths can clean up files written to target bases.
     let cleanup_bases = target_bases_info.clone();
+    let file_schema = ArrowSchema::from(&schema.to_data_file_schema()?);
     let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
@@ -1003,7 +1007,7 @@ where
                 // writer then finds nothing left to convert.
                 let batch_chunk = batch_chunk
                     .into_iter()
-                    .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch))
+                    .map(|batch| SchemaAdapter::to_file_batch(batch, &file_schema))
                     .collect::<Result<Vec<_>>>()?;
 
                 if writer.is_none() {
@@ -1802,6 +1806,15 @@ pub(super) fn prepare_write_schema(
             &normalized_converted_schema,
             dataset.schema(),
         )?;
+        if dataset.manifest.uses_semantic_types() {
+            // Representation-only inputs are written in their own layout, and
+            // each data file records it; the table schema does not change.
+            normalized_converted_schema
+                .check_compatible(dataset.schema(), &schema_compare_options)?;
+            return dataset
+                .schema()
+                .project_for_write(&normalized_converted_schema);
+        }
         if normalized_converted_schema
             .check_compatible(dataset.schema(), &schema_compare_options)
             .is_ok()
@@ -2031,26 +2044,31 @@ pub(in crate::dataset) struct V2WriterAdapter {
     writer: current_writer::FileWriter,
     data_file: Option<DataFile>,
     preprocessor: Option<BlobPreprocessor>,
+    /// The Arrow schema the data file records, which batches are converted to.
+    file_schema: ArrowSchemaRef,
 }
 
 impl V2WriterAdapter {
     /// `data_file` describes the file being written and is completed by
     /// [`GenericWriter::finish`]. Writers that describe their output
-    /// themselves pass `None` and use [`Self::finish_file`].
+    /// themselves pass `None` and use [`Self::finish_file`]. `file_schema` is
+    /// the schema `writer` records, as [`Schema::to_data_file_schema`] makes it.
     pub(in crate::dataset) fn new(
         writer: current_writer::FileWriter,
         data_file: Option<DataFile>,
         preprocessor: Option<BlobPreprocessor>,
+        file_schema: &Schema,
     ) -> Self {
         Self {
             writer,
             data_file,
             preprocessor,
+            file_schema: Arc::new(ArrowSchema::from(file_schema)),
         }
     }
 
     pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
+        let batch = SchemaAdapter::to_file_batch(batch.clone(), &self.file_schema)?;
         let batch = match self.preprocessor.as_mut() {
             Some(pre) => pre.preprocess_batch(&batch).await?,
             None => batch,
@@ -2215,6 +2233,7 @@ where
     } = options;
     let (_data_file_key, filename, _data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
+    let schema = schema.to_data_file_schema()?;
     let writer = object_store.create(&full_path).await?;
     let (file_writer, data_file) = create_file_writer(
         writer,
@@ -2227,6 +2246,7 @@ where
         file_writer,
         Some(data_file),
         None,
+        &schema,
     )))
 }
 
@@ -2259,6 +2279,7 @@ where
     } = options;
     let (data_file_key, filename, data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
+    let schema = &schema.to_data_file_schema()?;
     let writer = object_store.create(&full_path).await?;
     let (file_writer, data_file) = create_file_writer(
         writer,
@@ -2283,6 +2304,7 @@ where
         file_writer,
         Some(data_file),
         Some(preprocessor),
+        schema,
     )))
 }
 

@@ -94,6 +94,15 @@ pub fn encode_scalar_value_buffer(scalar: &ArrayRef) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The lengths of the Arrow buffers a scalar value buffer holds, in order.
+pub fn scalar_value_buffer_lengths(value_buffer: &[u8]) -> Result<Vec<usize>> {
+    let mut offset = 0;
+    let num_buffers = read_u32(value_buffer, &mut offset)? as usize;
+    (0..num_buffers)
+        .map(|_| read_u32(value_buffer, &mut offset).map(|len| len as usize))
+        .collect()
+}
+
 pub fn decode_scalar_from_value_buffer(
     data_type: &DataType,
     value_buffer: &[u8],

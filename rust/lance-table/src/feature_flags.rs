@@ -5,6 +5,7 @@
 
 use crate::format::Manifest;
 use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
 
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
@@ -64,8 +65,18 @@ pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// The table schema follows the semantic type contract: `logical_type` names a
+/// semantic type, `lance-schema:output-encoding` selects the Arrow layout of
+/// reads, and data files of one column may use different physical layouts.
+///
+/// A reader without this bit would return other Arrow types than the table
+/// specifies and cannot parse canonical names such as `decimal:10:2`; a writer
+/// without it would reject appends the contract accepts and write legacy
+/// aliases. Set only when a table is created with data storage version 2.3 or
+/// later, and kept in every later version.
+pub const FLAG_SEMANTIC_TYPES: u64 = 1 << 11;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 11;
+pub const FLAG_UNKNOWN: u64 = 1 << 12;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -77,8 +88,28 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+// Builds released before the semantic type contract treat bit 11 and above as
+// unknown, so they refuse flagged tables.
+const _: () = assert!(FLAG_SEMANTIC_TYPES >= 1 << 11);
+const _: () = assert!(FLAG_SEMANTIC_TYPES < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+/// Capabilities whose reader and writer bits are set together and, once set,
+/// stay set in every later version, including restores.
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_SEMANTIC_TYPES;
+
+/// Whether a table created with data storage `version` follows the semantic
+/// type contract and sets [`FLAG_SEMANTIC_TYPES`].
+///
+/// Existing tables never switch: the flag is decided once, at creation.
+pub fn creates_semantic_types(version: ConcreteFileVersion) -> bool {
+    match version {
+        ConcreteFileVersion::V1
+        | ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2 => false,
+        ConcreteFileVersion::V2_3 => true,
+    }
+}
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -272,14 +303,21 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
-    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    if reader != writer {
-        return Err(Error::corrupt_file_named(
-            "manifest",
-            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
-             so its semantics are undefined",
-        ));
+    for (flag, capability) in [
+        (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
+        (FLAG_SEMANTIC_TYPES, "semantic type"),
+    ] {
+        let reader = manifest.reader_feature_flags & flag != 0;
+        let writer = manifest.writer_feature_flags & flag != 0;
+        if reader != writer {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "Manifest has only one of the {capability} reader and writer feature bits set, \
+                     so its semantics are undefined"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -612,6 +650,46 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         )
+    }
+
+    /// This build reads and writes tables under the semantic type contract,
+    /// while a build released before it, whose unknown boundary is bit 11,
+    /// refuses them.
+    #[test]
+    fn semantic_types_flag_fences_older_builds() {
+        assert!(can_read_dataset(FLAG_SEMANTIC_TYPES));
+        assert!(can_write_dataset(FLAG_SEMANTIC_TYPES));
+        let supported_before_contract = (1 << 11) - 1;
+        assert_ne!(FLAG_SEMANTIC_TYPES & !supported_before_contract, 0);
+    }
+
+    #[rstest::rstest]
+    #[case::v1(ConcreteFileVersion::V1, false)]
+    #[case::v2_0(ConcreteFileVersion::V2_0, false)]
+    #[case::v2_1(ConcreteFileVersion::V2_1, false)]
+    #[case::v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::v2_3(ConcreteFileVersion::V2_3, true)]
+    fn semantic_types_start_at_v2_3(#[case] version: ConcreteFileVersion, #[case] expected: bool) {
+        assert_eq!(creates_semantic_types(version), expected);
+    }
+
+    #[test]
+    fn semantic_types_flag_is_sticky_and_paired() {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_SEMANTIC_TYPES;
+        manifest.writer_feature_flags = FLAG_SEMANTIC_TYPES;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.reader_feature_flags & FLAG_SEMANTIC_TYPES, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_SEMANTIC_TYPES, 0);
+
+        let mut derived = empty_manifest();
+        inherit_sticky_feature_flags(&mut derived, &manifest).unwrap();
+        assert_ne!(derived.reader_feature_flags & FLAG_SEMANTIC_TYPES, 0);
+        assert_ne!(derived.writer_feature_flags & FLAG_SEMANTIC_TYPES, 0);
+
+        manifest.writer_feature_flags = 0;
+        let err = validate_paired_feature_flags(&manifest).unwrap_err();
+        assert!(err.to_string().contains("semantic type"), "{err}");
     }
 
     #[test]

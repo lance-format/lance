@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
+use lance_core::datatypes::{
+    Dictionary, Encoding, Field, LogicalType, OUTPUT_ENCODING_META_KEY, Schema,
+};
 use lance_core::{Error, Result};
 use std::collections::HashMap;
 
@@ -51,17 +53,21 @@ impl From<&pb::Field> for Field {
             } else {
                 None
             },
+            output_encoding: None,
         }
     }
 }
 
 impl From<&Field> for pb::Field {
     fn from(field: &Field) -> Self {
-        let pb_metadata = field
+        let mut pb_metadata: HashMap<String, Vec<u8>> = field
             .metadata
             .iter()
             .map(|(key, value)| (key.clone(), value.clone().into_bytes()))
             .collect();
+        if let Some(entry) = field.output_encoding_entry() {
+            pb_metadata.insert(OUTPUT_ENCODING_META_KEY.to_string(), entry.into_bytes());
+        }
         Self {
             id: field.id,
             parent_id: field.parent_id,

@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use super::{Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_SEMANTIC_TYPES, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -544,12 +546,23 @@ impl Manifest {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
+    /// Whether the table schema follows the semantic type contract
+    /// ([`FLAG_SEMANTIC_TYPES`]).
+    pub fn uses_semantic_types(&self) -> bool {
+        self.reader_feature_flags & FLAG_SEMANTIC_TYPES != 0
+    }
+
     /// How this table compares field types for schema compatibility.
     ///
-    /// Every table currently names exactly one Arrow type per `logical_type`,
-    /// so types are compared exactly.
+    /// Legacy tables name exactly one Arrow type per `logical_type` and compare
+    /// types exactly; tables under the semantic type contract compare semantic
+    /// types.
     pub fn type_comparison(&self) -> TypeComparison {
-        TypeComparison::Exact
+        if self.uses_semantic_types() {
+            TypeComparison::Semantic
+        } else {
+            TypeComparison::Exact
+        }
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -1022,6 +1035,13 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::try_from(fields_with_meta)?;
+        // A table under the semantic type contract holds its schema in
+        // canonical form, with output encodings resolved from field metadata.
+        let schema = if p.reader_feature_flags & FLAG_SEMANTIC_TYPES != 0 {
+            schema.to_canonical_types()?
+        } else {
+            schema
+        };
 
         Ok(Self {
             schema,
