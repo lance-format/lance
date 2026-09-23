@@ -12234,9 +12234,11 @@ mod test {
                 .await
                 .unwrap();
 
+            // 1 IVF state + 4 partition entries + 1 reconstructed index, plus
+            // index metadata (one per dataset version).
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                5 + dataset.versions().await.unwrap().len()
+                6 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];

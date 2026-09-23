@@ -41,6 +41,19 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
+    /// Build the sub-index query params for one IVF partition.
+    ///
+    /// `dist_q_c` is the distance from the query to that partition's centroid.
+    /// Callers share one [`Query`] across probes and pass the per-partition
+    /// distance here. The default goes through `From<&Query>` and therefore
+    /// still clones the query once per probe; implementations that can build
+    /// their params directly should override it to avoid that clone.
+    fn query_params(query: &Query, dist_q_c: f32) -> Self::QueryParams {
+        let mut query = query.clone();
+        query.dist_q_c = dist_q_c;
+        Self::QueryParams::from(&query)
+    }
+
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
     /// * `query` - The query vector
