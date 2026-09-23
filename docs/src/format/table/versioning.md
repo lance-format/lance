@@ -34,7 +34,17 @@ they should return an "unsupported" error on any read or write operation.
 | 256      | `FLAG_MIXED_DATA_FILE_VERSIONS` | Yes             | Yes             | The snapshot may reference recognized V2 data files with different exact versions. Both bits must be set and remain set on later versions. |
 | 512      | `FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` | Yes       | Yes             | The table uses stable row IDs and carries a [Fragment Reuse Index](../index/system/frag_reuse.md). |
 | 1024     | `FLAG_FRAGMENT_REUSE_INDEX`     | Yes             | Yes             | The fragment reuse index records tagged transitions (`IndexMetadata.index_version >= 1`). Readers must translate row addresses through them; writers must preserve them. An implementation without this flag would decode the details as the legacy format and silently drop the transitions when it next rewrites the fragment reuse index. See [FRI index versions](../index/system/frag_reuse.md#fri-index-versions). |
+| 2048     | `FLAG_SEMANTIC_TYPES`           | Yes             | Yes             | The table schema follows the [semantic type contract](schema.md#semantic-types): `logical_type` names a semantic type, `lance-schema:output-encoding` selects the Arrow layout of reads, and data files of one column may use different physical layouts. An implementation without this flag would return different Arrow types than the table specifies, reject appends the contract accepts, and fail to parse canonical names such as `decimal:10:2`. |
 
 </div>
 
-Flags with bit values 2048 and above are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error. The paired mixed-version reader and writer bits must either both be set or both be clear; a half-set manifest is invalid.
+Flags with bit values 4096 and above are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error. The paired mixed-version reader and writer bits must either both be set or both be clear; a half-set manifest is invalid.
+
+### Semantic Types Flag
+
+`FLAG_SEMANTIC_TYPES` is set in both `reader_feature_flags` and `writer_feature_flags`.
+A writer sets it when it creates a new table whose data storage version is 2.3 or later.
+It never sets the flag implicitly on an existing table, including when the table is overwritten, so tables created with an earlier data storage version, or before this flag existed, stay legacy tables.
+Once set, the flag remains set in every later version of the table, including versions created by a restore.
+An existing table adopts the contract only through an explicit, metadata-only commit: it rewrites each legacy alias in the table schema to its canonical type with the output encoding that keeps the Arrow type reads return, and sets the flag. Data files are not rewritten. A table can adopt the contract only when all of its data files have version 2.1 or later, every field has a semantic type, and no field carries a `lance-schema:output-encoding` entry yet. There is no downgrade.
+Legacy tables interpret each `logical_type` as exactly one Arrow type, compare those types for schema compatibility, and do not apply output encodings.
