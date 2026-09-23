@@ -1694,6 +1694,13 @@ impl Dataset {
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         // TODO: consolidate the count_rows into Scanner plan.
         if let Some(filter) = filter {
+            // A filter every row satisfies needs no scan. `col IS NOT NULL` on
+            // a column the schema declares non-nullable is the common one, and
+            // it reduces to `true` against that schema, leaving the fragment
+            // metadata to answer -- which already nets out deleted rows.
+            if self.filter_is_trivially_true(&filter) {
+                return self.count_all_rows().await;
+            }
             let mut scanner = self.scan();
             scanner.filter(&filter)?;
             Ok(scanner
@@ -1704,6 +1711,31 @@ impl Dataset {
         } else {
             self.count_all_rows().await
         }
+    }
+
+    /// Whether `filter` is satisfied by every row, judged against the schema
+    /// alone.
+    ///
+    /// Anything this cannot decide is `false`, so an unparseable filter still
+    /// reaches the scanner and reports its own error rather than being
+    /// answered here.
+    pub(crate) fn filter_is_trivially_true(&self, filter: &str) -> bool {
+        use arrow_schema::Schema as ArrowSchema;
+        use datafusion::logical_expr::Expr;
+        use datafusion::scalar::ScalarValue;
+        use lance_datafusion::planner::Planner;
+
+        let planner = Planner::new(Arc::new(ArrowSchema::from(self.schema())));
+        let Ok(expr) = planner.parse_filter(filter) else {
+            return false;
+        };
+        let Ok(simplified) = planner.optimize_expr(expr) else {
+            return false;
+        };
+        matches!(
+            simplified,
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+        )
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {

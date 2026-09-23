@@ -4170,3 +4170,72 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
         .expect("removing the offending rows must not be blocked under MemWAL");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 }
+
+/// A filter every row satisfies is answered from fragment metadata, and has to
+/// agree with the scan it replaces -- including after a delete, since the
+/// metadata path nets out deleted rows and the scan never sees them.
+#[tokio::test]
+async fn count_rows_with_an_always_true_filter_matches_the_scan() {
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("maybe", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("c"),
+                None,
+                Some("e"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
+    let uri = test_dir.path().to_str().unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    // The predicate itself, so the test fails if the reduction stops firing
+    // rather than only if a count comes out wrong.
+    assert!(dataset.filter_is_trivially_true("id IS NOT NULL"));
+    assert!(!dataset.filter_is_trivially_true("maybe IS NOT NULL"));
+    assert!(!dataset.filter_is_trivially_true("id > 2"));
+    assert!(!dataset.filter_is_trivially_true("not a filter at all"));
+
+    // `id` cannot hold a null, so this reduces to `true` and skips the scan.
+    assert_eq!(
+        dataset
+            .count_rows(Some("id IS NOT NULL".into()))
+            .await
+            .unwrap(),
+        5
+    );
+    // A nullable column keeps the scan, and counts what is there.
+    assert_eq!(
+        dataset
+            .count_rows(Some("maybe IS NOT NULL".into()))
+            .await
+            .unwrap(),
+        3
+    );
+
+    // After a delete the two must still agree: the metadata path subtracts
+    // deletions, and a scan cannot see them either.
+    dataset.delete("id = 0 OR id = 1").await.unwrap();
+    assert_eq!(
+        dataset
+            .count_rows(Some("id IS NOT NULL".into()))
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    assert_eq!(dataset.count_rows(Some("id >= 0".into())).await.unwrap(), 3);
+}
