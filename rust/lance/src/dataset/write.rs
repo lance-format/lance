@@ -998,6 +998,13 @@ where
                 if batch_chunk.is_empty() {
                     continue;
                 }
+                // Seed observers must see the values the data file stores, so
+                // convert before handing the batches to both. The data file
+                // writer then finds nothing left to convert.
+                let batch_chunk = batch_chunk
+                    .into_iter()
+                    .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch))
+                    .collect::<Result<Vec<_>>>()?;
 
                 if writer.is_none() {
                     let (new_writer, new_fragment) = writer_generator.new_writer().await?;
@@ -2468,7 +2475,8 @@ mod tests {
     use std::path::{Component, Prefix};
 
     use arrow_array::{
-        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StructArray,
+        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
+        StringViewArray, StructArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
@@ -2478,6 +2486,8 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
     use lance_file::versions::v1::reader::FileReader as V1FileReader;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
@@ -5456,6 +5466,72 @@ mod tests {
         );
         let frags = scalar_index.calculate_included_frags().await.unwrap();
         assert_eq!(frags.len(), 2, "Index should cover both fragments");
+    }
+
+    /// Seed observers see the values the data file stores, so appending a
+    /// view array to a seeded string column succeeds.
+    #[tokio::test]
+    async fn test_append_view_array_to_seeded_string_column() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        assert!(
+            !create_seed_writers_current(Some(&dataset), &append_params)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the append must observe seeds for this test to cover them"
+        );
+
+        let view_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Utf8View,
+            false,
+        )]));
+        let view_batch = RecordBatch::try_new(
+            view_schema.clone(),
+            vec![Arc::new(StringViewArray::from(vec!["c", "d"]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(view_batch)], view_schema),
+            Arc::new(dataset),
+            Some(append_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset
+                .count_rows(Some("val = 'c'".to_string()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
     }
 
     /// A covered scalar index must still get a seed writer. The loop skipped any
