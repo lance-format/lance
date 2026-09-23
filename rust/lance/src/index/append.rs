@@ -696,17 +696,10 @@ async fn rebuild_vector_segment(
         .await
 }
 
-/// True when a segment carries only its definition.
+/// True when a segment carries only its definition
 ///
-/// This can happen when an index is trained against an empty table or the
-/// table doesn't have enough rows to justify the index.
-///
-/// Both halves of the check carry weight. Coverage alone is not enough: a
-/// segment initialized from another dataset's model holds centroids while
-/// covering no fragments, and retraining it from its parameters would discard
-/// them. An absent file list counts as "no files recorded", because the
-/// manifest stores it as a repeated field whose empty case reads back as
-/// absent.
+/// This can happen when an index is trained against an empty table or
+/// the table doesn't have enough rows to justify the index.
 fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
@@ -937,16 +930,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(merged);
             }
             let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
-            // A segment still awaiting training has no file to open and nothing
-            // to append to, so the whole column is trained from the parameters
-            // its definition carries, superseding every old segment.
-            //
-            // Training removes every old segment, and every path that would add
-            // one routes here first, so such a segment should be the only one
-            // under its name. The check is written over all of them anyway: the
-            // logical index is opened by name and that open materialises every
-            // segment, so one with no file behind it would break the open
-            // whichever segments the caller asked for.
+            // A segment awaiting training has no file to open, so the column is
+            // trained from its definition rather than appended to. Checked over
+            // every segment because the logical index is opened by name, which
+            // opens all of them.
             let awaits_training = old_indices
                 .iter()
                 .any(|idx| is_definition_only_segment(idx));

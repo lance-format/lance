@@ -544,17 +544,13 @@ pub(crate) async fn count_trainable_vectors(
     while let Some(batch) = batches.try_next().await? {
         let lists = utils::get_column_from_batch(&batch, column)?;
         let lists = lists.as_list::<i32>();
-        // A row's list holds vectors that can be null themselves, and a null
-        // vector is not one to train on -- so the row contributes its elements
-        // less its own nulls, not its length. `value` slices the child without
-        // copying, and the batch is already here.
         for row in 0..lists.len() {
             if lists.is_null(row) {
                 continue;
             }
-            let elements = lists.value(row);
-            let trainable = elements.len() - elements.null_count();
-            vectors = vectors.saturating_add(trainable);
+            // A vector inside the row can be null, and is not one to train on.
+            let row_vectors = lists.value(row);
+            vectors = vectors.saturating_add(row_vectors.len() - row_vectors.null_count());
         }
         if vectors >= enough {
             return Ok(vectors);
