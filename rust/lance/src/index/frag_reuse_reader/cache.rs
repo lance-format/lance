@@ -12,7 +12,7 @@ use lance_core::Result;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
-use lance_index::frag_reuse::row_map::RowMapBlockCache;
+use lance_index::frag_reuse::row_map::{ROW_MAP_CACHE_CHUNK_BYTES, RowMapBlockCache};
 use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -206,15 +206,29 @@ pub async fn open_mapping(
                     // v0 placement choice: FRI file content is index-cached, not
                     // file-cached). Keyed by the transition fingerprint so the
                     // chunk entries are stable across queries and snapshots.
-                    let block_cache = RowMapBlockCache::new(
-                        WeakLanceCache::from(&dataset.index_cache),
-                        *transition.fingerprint(),
-                    );
+                    //
+                    // A cache known to be smaller than one chunk can never
+                    // retain a chunk entry: every request would read a whole
+                    // chunk and discard it. Open the reader without a block
+                    // cache then, so a request reads exactly the blocks it
+                    // touches (a point lookup reads one block). When the
+                    // capacity is unknown the chunk cache is used, and a
+                    // request still pays at most one read per chunk because
+                    // the reader holds the chunk it loaded across the blocks
+                    // of one request.
+                    let capacity = dataset.index_cache.capacity_bytes();
+                    let block_cache = match capacity {
+                        Some(capacity) if capacity < ROW_MAP_CACHE_CHUNK_BYTES => None,
+                        _ => Some(RowMapBlockCache::new(
+                            WeakLanceCache::from(&dataset.index_cache),
+                            *transition.fingerprint(),
+                        )),
+                    };
                     Arc::new(StablePartitionMapping::try_new_with_cache(
                         Arc::new(store),
                         transition.sources().to_vec(),
                         transition.destinations().to_vec(),
-                        Some(block_cache),
+                        block_cache,
                     )?)
                 }
             };

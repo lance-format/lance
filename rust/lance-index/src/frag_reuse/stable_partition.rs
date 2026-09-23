@@ -184,13 +184,21 @@ impl MappingReader for StablePartitionMapping {
         let reader = self.open_reader().await?;
         requests.sort_unstable_by_key(|&(row, _)| row);
         let mut remaining = requests.as_slice();
+        // Blocks are visited in row order, so consecutive blocks reuse the
+        // labels loaded for the first of them: one read per cache chunk, or
+        // without a chunk cache one read for the span of blocks this request
+        // touches. The request never pays a read per block.
+        let last_block = reader.counts().block_of(requests.last().unwrap().0);
+        let mut held = None;
         while let Some(&(first, _)) = remaining.first() {
             let counts = reader.counts();
             let block = counts.block_of(first);
             let range = counts.block_range(block);
             let end = remaining.partition_point(|&(row, _)| row < range.end);
             let (batch, rest) = remaining.split_at(end);
-            let labels = reader.block_labels(block).await?;
+            let labels = reader
+                .block_labels_reusing(block, last_block, &mut held)
+                .await?;
             if labels.len() as u64 != range.end - range.start {
                 return Err(corrupt(format!(
                     "row-map block {block} has an unexpected label count"
