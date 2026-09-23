@@ -696,10 +696,11 @@ async fn rebuild_vector_segment(
         .await
 }
 
-/// True when a segment carries only its definition
+/// True when a segment carries only its definition: nothing to open, nothing
+/// to append to, so training is what it is waiting for.
 ///
-/// This can happen when an index is trained against an empty table or
-/// the table doesn't have enough rows to justify the index.
+/// Happens when an index is created against an empty table, or one without
+/// enough rows to justify training it.
 fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata

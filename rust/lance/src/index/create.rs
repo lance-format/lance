@@ -287,12 +287,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 warn!(
                     column,
                     requested_num_partitions = requested,
-                    "You attempted to create an index with {requested} partitions. \
-                     However, there are not enough rows to train even a single \
-                     partition. An empty index will be created until more data is \
-                     added. Future index updates will use target_partition_size \
-                     (possibly a default value) instead of the num_partitions that \
-                     was supplied in this call."
+                    "Not enough rows to train even one partition, so the index is \
+                     recorded empty and will be trained once more data arrives. Its \
+                     partition count will come from target_partition_size then, not \
+                     from the num_partitions requested here."
                 );
             }
         }
