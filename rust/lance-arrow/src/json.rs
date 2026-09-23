@@ -1515,7 +1515,7 @@ mod tests {
             .into(),
         );
         let values = StringArray::from(vec![Some("{}"), None, Some("{")]);
-        let nested = Fields::from(vec![json.clone()]);
+        let nested = Fields::from(vec![json]);
         let schema = Arc::new(Schema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(nested.clone()),
