@@ -600,30 +600,6 @@ impl Field {
         }
     }
 
-    /// This table field with the Arrow layouts a data file records for it.
-    ///
-    /// Representation-only fields that `file_schema` holds, matched by field
-    /// ID, take the file's layout; everything else is unchanged. Decoders only
-    /// produce the layout a file stores, so readers decode in it and convert to
-    /// the table's output encodings afterwards.
-    pub fn with_file_layout(&self, file_schema: &super::Schema) -> Self {
-        let mut field = self.clone();
-        if !self.is_blob()
-            && let Some(file_field) = file_schema.field_by_id(self.id)
-            && self.is_representation_only()
-            && file_field.type_matches(self, TypeComparison::Semantic)
-        {
-            field.logical_type = file_field.logical_type.clone();
-            field.output_encoding = None;
-        }
-        field.children = self
-            .children
-            .iter()
-            .map(|child| child.with_file_layout(file_schema))
-            .collect();
-        field
-    }
-
     fn is_representation_only(&self) -> bool {
         self.logical_type.semantic().is_ok_and(|semantic| {
             semantic.semantic_type.class() == SemanticTypeClass::RepresentationOnly
@@ -2028,9 +2004,9 @@ mod tests {
     }
 
     /// A write takes field IDs and metadata from the table and layouts from
-    /// the input; a read takes layouts from the data file.
+    /// the input.
     #[test]
-    fn test_input_and_file_layouts() {
+    fn test_input_layouts() {
         let struct_of = |data_type: DataType| {
             DataType::Struct(vec![ArrowField::new("b", data_type, true)].into())
         };
@@ -2057,17 +2033,9 @@ mod tests {
             Some(&"zstd".to_string())
         );
 
-        let file_schema = crate::datatypes::Schema {
-            fields: vec![write.to_data_file_field().unwrap()],
-            metadata: HashMap::new(),
-        };
-        let read = table.with_file_layout(&file_schema);
-        assert_eq!(read.children[0].data_type(), DataType::LargeUtf8);
-        assert_eq!(table.children[0].data_type(), DataType::Utf8View);
         // Exact comparisons of fields with output encodings compare layouts.
-        assert!(read.type_matches(&write, TypeComparison::Exact));
-        assert!(!read.children[0].type_matches(&table.children[0], TypeComparison::Exact));
-        assert!(read.children[0].type_matches(&table.children[0], TypeComparison::Semantic));
+        assert!(!write.children[0].type_matches(&table.children[0], TypeComparison::Exact));
+        assert!(write.children[0].type_matches(&table.children[0], TypeComparison::Semantic));
     }
 
     #[test]

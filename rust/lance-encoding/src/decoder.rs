@@ -716,13 +716,16 @@ impl CoreFieldDecoderStrategy {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Dictionary(_, value_type) => Self::is_structural_primitive(value_type),
+                // Views are decoded from the offset layout they are stored as.
                 DataType::Boolean
                 | DataType::Null
                 | DataType::FixedSizeBinary(_)
                 | DataType::Binary
                 | DataType::LargeBinary
+                | DataType::BinaryView
                 | DataType::Utf8
-                | DataType::LargeUtf8 => true,
+                | DataType::LargeUtf8
+                | DataType::Utf8View => true,
                 DataType::FixedSizeList(inner, _) => {
                     Self::is_structural_primitive(inner.data_type())
                 }

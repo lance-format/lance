@@ -4740,3 +4740,29 @@ async fn test_semantic_merge_insert_accepts_other_layout() {
         )
     );
 }
+
+/// Readers of a table under the semantic type contract ask every data file for
+/// the table's output layouts, which 2.0 decoders cannot produce, so such a
+/// table cannot reference 2.0 files even with mixed file versions enabled.
+#[tokio::test]
+async fn test_semantic_table_rejects_v2_0_data_files() {
+    let dir = TempStrDir::default();
+    let dataset = write_single_column(
+        dir.as_str(),
+        string_array(&DataType::Utf8, &[Some("a")]),
+        WriteMode::Create,
+        Some(LanceFileVersion::V2_3),
+    )
+    .await
+    .unwrap();
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    crate::dataset::versions::check_manifest_storage_version(&mut manifest).unwrap();
+
+    let fragments = Arc::make_mut(&mut manifest.fragments);
+    fragments[0].files[0].file_major_version = 2;
+    fragments[0].files[0].file_minor_version = 0;
+    let err = crate::dataset::versions::check_manifest_storage_version(&mut manifest).unwrap_err();
+    assert!(err.to_string().contains("2.1 or later"), "{err}");
+}

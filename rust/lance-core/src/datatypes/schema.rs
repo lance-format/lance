@@ -271,19 +271,6 @@ impl Schema {
         }
     }
 
-    /// This table schema with the Arrow layouts `file_schema` records. See
-    /// [`Field::with_file_layout`].
-    pub fn with_file_layouts(&self, file_schema: &Self) -> Self {
-        Self {
-            fields: self
-                .fields
-                .iter()
-                .map(|field| field.with_file_layout(file_schema))
-                .collect(),
-            metadata: self.metadata.clone(),
-        }
-    }
-
     /// This write schema with the Arrow layouts of `input`, the schema of the
     /// data being written. Fields `input` does not hold keep their layout.
     /// See [`Field::with_input_layout`].

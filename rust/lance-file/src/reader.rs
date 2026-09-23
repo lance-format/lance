@@ -4732,3 +4732,170 @@ mod tests {
         assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
     }
 }
+
+/// A reader may request any layout of the values a column stores: each page
+/// describes its own offset width, value width, and dictionary key width, so
+/// files of one column can store different layouts.
+#[cfg(test)]
+mod layout_request_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        ArrayRef, BinaryArray, Decimal128Array, RecordBatch, RecordBatchIterator, StringArray,
+    };
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use lance_core::datatypes::{Field, OutputEncoding, Schema};
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+    use lance_io::utils::CachedFileSize;
+    use rstest::rstest;
+
+    use crate::reader::{FileReader, FileReaderOptions, ReaderProjection};
+    use crate::testing::{FsFixture, test_cache, write_lance_file};
+    use crate::version::ConcreteFileVersion;
+    use crate::writer::FileWriterOptions;
+
+    fn dictionary(key: DataType, value: DataType) -> DataType {
+        DataType::Dictionary(Box::new(key), Box::new(value))
+    }
+
+    /// Stored arrays, each with the layouts it can be read as.
+    fn cases() -> Vec<(ArrayRef, Vec<DataType>)> {
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            None,
+            Some("bb"),
+            Some("a"),
+        ]));
+        let bytes: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(b"a".as_ref()),
+            None,
+            Some(b"bb".as_ref()),
+        ]));
+        let decimals: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(1), None, Some(-12345)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let string_layouts = vec![
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            dictionary(DataType::Int16, DataType::Utf8),
+            dictionary(DataType::UInt32, DataType::LargeUtf8),
+        ];
+        let binary_layouts = vec![
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            dictionary(DataType::Int8, DataType::Binary),
+        ];
+        let decimal_layouts = vec![DataType::Decimal128(10, 2), DataType::Decimal256(10, 2)];
+        // Repeated values are written as constant pages, whose scalar records
+        // only its own buffers.
+        let constant_strings: ArrayRef = Arc::new(StringArray::from(vec!["a"; 4]));
+        let constant_decimals: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(7); 4])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let mut cases = Vec::new();
+        for (values, layouts) in [
+            (strings, string_layouts.clone()),
+            (constant_strings, string_layouts),
+            (bytes, binary_layouts),
+            (decimals, decimal_layouts.clone()),
+            (constant_decimals, decimal_layouts),
+        ] {
+            for stored in layouts
+                .iter()
+                .filter(|layout| !matches!(layout, DataType::Utf8View | DataType::BinaryView))
+            {
+                cases.push((arrow_cast::cast(&values, stored).unwrap(), layouts.clone()));
+            }
+        }
+        cases
+    }
+
+    fn requested_field(data_type: &DataType) -> Field {
+        let mut field = Field::try_from(ArrowField::new("c", data_type.clone(), true)).unwrap();
+        field.id = 0;
+        if matches!(data_type, DataType::Utf8View | DataType::BinaryView) {
+            field.output_encoding = OutputEncoding::of_data_type(data_type);
+        }
+        field
+    }
+
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_read_any_layout_of_stored_values(#[case] version: ConcreteFileVersion) {
+        for (stored, requested_layouts) in cases() {
+            let fs = FsFixture::default();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "c",
+                stored.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![stored.clone()]).unwrap();
+            write_lance_file(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &fs,
+                version,
+                FileWriterOptions::default(),
+            )
+            .await;
+            for requested in requested_layouts {
+                let file = fs
+                    .scheduler
+                    .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                    .await
+                    .unwrap();
+                let reader = FileReader::try_open(
+                    file,
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    &test_cache(),
+                    FileReaderOptions::default(),
+                )
+                .await
+                .unwrap();
+                let projection = ReaderProjection {
+                    column_indices: vec![0],
+                    schema: Arc::new(Schema {
+                        fields: vec![requested_field(&requested)],
+                        metadata: Default::default(),
+                    }),
+                };
+                let batches = reader
+                    .read_stream_projected(
+                        lance_io::ReadBatchParams::RangeFull,
+                        1024,
+                        16,
+                        projection,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_or_else(|err| panic!("{} as {requested}: {err}", stored.data_type()));
+                let read = batches[0].column(0);
+                assert_eq!(
+                    read.data_type(),
+                    &requested,
+                    "{} as {requested}",
+                    stored.data_type()
+                );
+                assert_eq!(
+                    arrow_cast::cast(read, stored.data_type()).unwrap().as_ref(),
+                    stored.as_ref(),
+                    "{} as {requested}",
+                    stored.data_type()
+                );
+            }
+        }
+    }
+}

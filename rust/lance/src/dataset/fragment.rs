@@ -425,84 +425,6 @@ mod v2_adapter {
         )?)
     }
 
-    /// Convert columns decoded in a data file's own layouts to the layouts of
-    /// `output_schema`, which carries the table's output encodings.
-    fn convert_to_output_layouts(
-        batch: RecordBatch,
-        output_schema: &Schema,
-    ) -> Result<RecordBatch> {
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(&output_schema.fields)
-            .map(|(array, field)| {
-                let output_type = field.data_type();
-                if array.data_type() == &output_type {
-                    Ok(array.clone())
-                } else {
-                    cast_to_output_layout(array, field, &output_type, i32::MAX as usize)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(
-            Arc::new(ArrowSchema::from(output_schema)),
-            columns,
-        )?)
-    }
-
-    /// Convert `array` to `output_type`, the layout of `field`'s output
-    /// encoding, failing instead of truncating when the values do not fit.
-    /// `max_offset` is the largest byte offset of a layout with 32-bit offsets.
-    pub(super) fn cast_to_output_layout(
-        array: &ArrayRef,
-        field: &LanceField,
-        output_type: &DataType,
-        max_offset: usize,
-    ) -> Result<ArrayRef> {
-        let encoding = || {
-            field
-                .output_encoding
-                .clone()
-                .or_else(|| {
-                    field
-                        .logical_type
-                        .semantic()
-                        .ok()
-                        .and_then(|semantic| semantic.output_encoding())
-                })
-                .map(|encoding| encoding.to_string())
-                .unwrap_or_else(|| output_type.to_string())
-        };
-        if matches!(output_type, DataType::Utf8 | DataType::Binary) {
-            let offset_span = |offsets: &[i64]| (offsets[offsets.len() - 1] - offsets[0]) as usize;
-            // The low 32 bits of a view hold the value's length.
-            let view_lengths =
-                |views: &[u128]| views.iter().map(|view| *view as u32 as usize).sum();
-            let value_bytes = match array.data_type() {
-                DataType::LargeUtf8 => Some(offset_span(array.as_string::<i64>().offsets())),
-                DataType::LargeBinary => Some(offset_span(array.as_binary::<i64>().offsets())),
-                DataType::Utf8View => Some(view_lengths(array.as_string_view().views())),
-                DataType::BinaryView => Some(view_lengths(array.as_binary_view().views())),
-                _ => None,
-            };
-            if let Some(value_bytes) = value_bytes.filter(|bytes| *bytes > max_offset) {
-                return Err(Error::invalid_input(format!(
-                    "field '{}' holds {value_bytes} bytes of values in {} rows, more than output encoding '{}' can hold in one batch; read it with a large or view output encoding",
-                    field.name,
-                    array.len(),
-                    encoding()
-                )));
-            }
-        }
-        arrow_cast::cast(array.as_ref(), output_type).map_err(|err| {
-            Error::invalid_input(format!(
-                "cannot convert field '{}' to output encoding '{}': {err}",
-                field.name,
-                encoding()
-            ))
-        })
-    }
-
     #[derive(Debug, Clone)]
     pub struct Reader {
         reader: Arc<ProjectedFileReader>,
@@ -510,9 +432,6 @@ mod v2_adapter {
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
         file_scheduler: FileScheduler,
-        /// Whether the table follows the semantic type contract, so this file
-        /// may store a column in another layout than the table returns.
-        semantic_types: bool,
     }
 
     impl Reader {
@@ -522,7 +441,6 @@ mod v2_adapter {
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
             file_scheduler: FileScheduler,
-            semantic_types: bool,
         ) -> Self {
             Self {
                 reader,
@@ -530,7 +448,6 @@ mod v2_adapter {
                 field_id_to_column_idx,
                 default_priority,
                 file_scheduler,
-                semantic_types,
             }
         }
         async fn read_tasks(
@@ -551,13 +468,6 @@ mod v2_adapter {
             } else {
                 output_schema.as_ref().clone()
             };
-            let physical_schema = if self.semantic_types {
-                physical_schema.with_file_layouts(reader.schema())
-            } else {
-                physical_schema
-            };
-            let convert_layouts = self.semantic_types
-                && ArrowSchema::from(&physical_schema) != ArrowSchema::from(output_schema.as_ref());
             let projection = file_versions::reader_projection_from_field_ids(
                 reader.version(),
                 &physical_schema,
@@ -576,13 +486,8 @@ mod v2_adapter {
                     ReadBatchTask {
                         task: async move {
                             let batch = task.task.await?;
-                            let batch = if has_legacy_blobs {
-                                normalize_legacy_blob_batch(batch, &output_schema)?
-                            } else {
-                                batch
-                            };
-                            if convert_layouts {
-                                convert_to_output_layouts(batch, &output_schema)
+                            if has_legacy_blobs {
+                                normalize_legacy_blob_batch(batch, &output_schema)
                             } else {
                                 Ok(batch)
                             }
@@ -1540,14 +1445,9 @@ impl FileFragment {
                     .iter()
                     .filter(|column_index| **column_index >= 0)
                     .count();
-        // The table schema only stands in for the file's own schema when it
-        // names the file's layouts, which a table under the semantic type
-        // contract does not.
-        let semantic_types = self.dataset.manifest.uses_semantic_types();
         let known_schema = self
             .metadata
             .physical_rows
-            .filter(|_| !semantic_types)
             .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
 
         let encodings_io = Arc::new(
@@ -1601,7 +1501,6 @@ impl FileFragment {
             field_id_to_column_idx,
             reader_priority,
             file_scheduler,
-            semantic_types,
         ))))
     }
 
@@ -4058,27 +3957,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    /// A value that does not fit the requested output layout fails the read
-    /// with the field, the size, and the encoding, instead of being truncated.
-    #[test]
-    fn test_output_layout_overflow_is_an_error() {
-        let values: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec!["abc", "de"]));
-        let field = lance_core::datatypes::Field::new_arrow("s", DataType::Utf8, true).unwrap();
-        let err = v2_adapter::cast_to_output_layout(&values, &field, &DataType::Utf8, 4)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("field 's'") && err.contains("5 bytes") && err.contains("'utf8'"),
-            "{err}"
-        );
-        let converted =
-            v2_adapter::cast_to_output_layout(&values, &field, &DataType::Utf8, 5).unwrap();
-        assert_eq!(
-            converted.as_ref(),
-            &arrow_array::StringArray::from(vec!["abc", "de"]) as &dyn Array
-        );
-    }
     use crate::{
         dataset::{
             CommitBuilder, InsertBuilder,

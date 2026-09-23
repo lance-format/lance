@@ -374,6 +374,7 @@ fn check_manifest_storage_contract(
 
     let mut saw_v1 = false;
     let mut saw_v2 = false;
+    let mut first_v2_0 = None;
     let mut first_file_version = None;
     let mut first_mismatch = None;
     let mut first_non_default = None;
@@ -383,6 +384,9 @@ fn check_manifest_storage_contract(
     for fragment in manifest.fragments.iter() {
         for data_file in fragment.referenced_lance_files() {
             let file_version = data_file.file_version()?;
+            if file_version == ConcreteFileVersion::V2_0 && first_v2_0.is_none() {
+                first_v2_0 = Some(data_file.path.clone());
+            }
             match file_version {
                 ConcreteFileVersion::V1 => saw_v1 = true,
                 ConcreteFileVersion::V2_0
@@ -454,6 +458,15 @@ fn check_manifest_storage_contract(
         return Err(Error::invalid_input(
             "Dataset snapshot mixes V1 and V2 data files",
         ));
+    }
+    // Readers of these tables ask each file for the table's output layouts,
+    // which 2.0 decoders cannot produce from another stored layout.
+    if manifest.uses_semantic_types()
+        && let Some(path) = first_v2_0
+    {
+        return Err(Error::invalid_input(format!(
+            "Data file '{path}' has version 2.0, but tables that follow the semantic type contract need data file version 2.1 or later"
+        )));
     }
 
     if mixed_enabled && saw_v1 {

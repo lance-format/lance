@@ -1154,6 +1154,95 @@ impl DictionaryDataBlock {
     }
 }
 
+/// A stored layout could not be converted to the layout a reader requested,
+/// for example because the values exceed the 32-bit offsets of `Utf8`.
+///
+/// Returned as the source of an [`Error::InvalidInput`] so readers that know
+/// the field can report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutConversionError {
+    /// The layout the data is stored in.
+    pub stored: DataType,
+    /// The layout the reader requested.
+    pub requested: DataType,
+    /// The bytes of values that do not fit, when known.
+    pub value_bytes: Option<u64>,
+    /// Why the conversion failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for LayoutConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot read {} values as {}",
+            self.stored, self.requested
+        )?;
+        if let Some(value_bytes) = self.value_bytes {
+            write!(f, " ({value_bytes} bytes of values)")?;
+        }
+        write!(f, ": {}", self.reason)
+    }
+}
+
+impl std::error::Error for LayoutConversionError {}
+
+fn dictionary_key_type(bits: u64, signed: bool) -> Option<DataType> {
+    use DataType::*;
+    Some(match (bits, signed) {
+        (8, true) => Int8,
+        (16, true) => Int16,
+        (32, true) => Int32,
+        (64, true) => Int64,
+        (8, false) => UInt8,
+        (16, false) => UInt16,
+        (32, false) => UInt32,
+        (64, false) => UInt64,
+        _ => return None,
+    })
+}
+
+/// Convert values decoded in their stored layout to the requested layout of
+/// the same values, failing instead of truncating when they do not fit.
+fn convert_layout(stored: ArrayData, requested: &DataType) -> Result<ArrayData> {
+    convert_layout_within(stored, requested, i32::MAX as u64)
+}
+
+/// [`convert_layout`], where `max_offset` is the largest byte offset a layout
+/// with 32-bit offsets holds.
+fn convert_layout_within(
+    stored: ArrayData,
+    requested: &DataType,
+    max_offset: u64,
+) -> Result<ArrayData> {
+    let array = arrow_array::make_array(stored);
+    let failure = |value_bytes: Option<u64>, reason: String| {
+        Error::invalid_input_source(Box::new(LayoutConversionError {
+            stored: array.data_type().clone(),
+            requested: requested.clone(),
+            value_bytes,
+            reason,
+        }))
+    };
+    if matches!(requested, DataType::Utf8 | DataType::Binary) {
+        let span = |offsets: &[i64]| (offsets[offsets.len() - 1] - offsets[0]) as u64;
+        let value_bytes = match array.data_type() {
+            DataType::LargeUtf8 => Some(span(array.as_string::<i64>().offsets())),
+            DataType::LargeBinary => Some(span(array.as_binary::<i64>().offsets())),
+            _ => None,
+        };
+        if let Some(value_bytes) = value_bytes.filter(|bytes| *bytes > max_offset) {
+            return Err(failure(
+                Some(value_bytes),
+                "the values exceed 32-bit offsets".to_string(),
+            ));
+        }
+    }
+    arrow_cast::cast(&array, requested)
+        .map(|converted| converted.to_data())
+        .map_err(|err| failure(None, err.to_string()))
+}
+
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
 ///
 /// The output of each decoder is a DataBlock.  Decoders can be chained together to transform
@@ -1192,6 +1281,12 @@ impl DataBlock {
     }
 
     fn into_arrow_impl(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        if let Some(stored_type) = self.stored_layout(&data_type)
+            && stored_type != data_type
+        {
+            let stored = self.into_arrow_impl(stored_type, validate)?;
+            return convert_layout(stored, &data_type);
+        }
         match self {
             Self::Empty() => Ok(new_empty_array(&data_type).to_data()),
             Self::Constant(inner) => inner.into_arrow(data_type, validate),
@@ -1205,6 +1300,54 @@ impl DataBlock {
             Self::Opaque(_) => Err(Error::internal(
                 "Cannot convert OpaqueBlock to Arrow".to_string(),
             )),
+        }
+    }
+
+    /// The Arrow type this block stores when `requested` names another layout
+    /// of the same values.
+    ///
+    /// Each block describes its own physical layout (offset width, value width,
+    /// dictionary key width), so a reader may ask for any layout of the stored
+    /// values: strings or bytes with 32- or 64-bit offsets, views, or a
+    /// dictionary of them, and decimals of either width. `None` means the
+    /// block is decoded as `requested` directly.
+    fn stored_layout(&self, requested: &DataType) -> Option<DataType> {
+        use DataType::*;
+        match (self, requested) {
+            (Self::Nullable(inner), _) => inner.data.stored_layout(requested),
+            (Self::VariableWidth(block), Utf8 | LargeUtf8 | Utf8View) => {
+                Some(if block.bits_per_offset == 64 {
+                    LargeUtf8
+                } else {
+                    Utf8
+                })
+            }
+            (Self::VariableWidth(block), Binary | LargeBinary | BinaryView) => {
+                Some(if block.bits_per_offset == 64 {
+                    LargeBinary
+                } else {
+                    Binary
+                })
+            }
+            (Self::VariableWidth(_), Dictionary(_, value)) => self.stored_layout(value),
+            (
+                Self::FixedWidth(block),
+                Decimal128(precision, scale) | Decimal256(precision, scale),
+            ) => match block.bits_per_value {
+                128 => Some(Decimal128(*precision, *scale)),
+                256 => Some(Decimal256(*precision, *scale)),
+                _ => None,
+            },
+            (Self::Dictionary(block), Dictionary(key, value)) => {
+                let key =
+                    dictionary_key_type(block.indices.bits_per_value, key.is_signed_integer())?;
+                let value = block
+                    .dictionary
+                    .stored_layout(value)
+                    .unwrap_or_else(|| value.as_ref().clone());
+                Some(Dictionary(Box::new(key), Box::new(value)))
+            }
+            _ => None,
         }
     }
 
@@ -2141,6 +2284,27 @@ mod tests {
         AllNullDataBlock, BlockInfo, DataBlock, DataBlockBuilder, DictionaryDataBlock,
         FixedWidthDataBlock, VariableWidthBlock,
     };
+
+    /// Values that do not fit the requested layout fail the read with their
+    /// size instead of being truncated.
+    #[test]
+    fn test_convert_layout_overflow() {
+        let values = arrow_array::LargeStringArray::from(vec!["abc", "de"]).to_data();
+        let err = super::convert_layout_within(values.clone(), &DataType::Utf8, 4).unwrap_err();
+        let Error::InvalidInput { source, .. } = &err else {
+            panic!("{err}");
+        };
+        let conversion = source
+            .downcast_ref::<super::LayoutConversionError>()
+            .unwrap();
+        assert_eq!(conversion.value_bytes, Some(5));
+        assert_eq!(conversion.requested, DataType::Utf8);
+        let converted = super::convert_layout_within(values, &DataType::Utf8, 5).unwrap();
+        assert_eq!(
+            arrow_array::make_array(converted).as_ref(),
+            &arrow_array::StringArray::from(vec!["abc", "de"]) as &dyn Array
+        );
+    }
 
     use arrow_array::Array;
 
