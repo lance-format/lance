@@ -656,6 +656,16 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self, column: str, distance_threshold: float
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,

@@ -2812,6 +2812,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(Box::pin(stream))
     }
 
+    fn supports_pairwise_vectors(&self) -> bool {
+        true
+    }
+
+    async fn prepare_pairwise_partition(
+        &self,
+        partition_id: usize,
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<lance_index::vector::pairwise::PairwisePartition> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::invalid_input(format!("partition_id={partition_id} has no centroid"))
+        })?;
+        self.storage
+            .prepare_pairwise_partition(
+                partition_id,
+                batch_size,
+                memory_limit,
+                centroid,
+                spill_store,
+            )
+            .await
+    }
+
     async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
         unimplemented!("this method is for only sub index");
     }
@@ -3800,6 +3831,112 @@ mod tests {
             .unwrap();
         let schema = batch.schema();
         (batch, schema)
+    }
+
+    #[rstest]
+    #[case::flat(None)]
+    #[case::pq4(Some(4))]
+    #[case::pq8(Some(8))]
+    #[case::rq5(Some(5))]
+    #[tokio::test]
+    async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<usize>) {
+        // Cross the 8K source-read boundary with a packed RQ tail. Force both
+        // memory and spill paths, replaying the same index in 1K vector batches.
+        const NUM_ROWS: usize = 8193;
+        const BATCH_SIZE: usize = 1024;
+        let (batch, schema) = make_seeded_vector_batch(NUM_ROWS);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                // Keep this tiny fixture out of the whole-file read cache so
+                // the source-I/O assertion also exercises PQ4 preparation.
+                store_params: Some(ObjectStoreParams {
+                    block_size: Some(64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut ivf = IvfBuildParams::new(1);
+        ivf.centroids = Some(Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        ));
+        let params = match bits {
+            None => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+            Some(5) => VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                ivf,
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+            ),
+            Some(bits) => VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                ivf,
+                PQBuildParams::with_codebook(
+                    16,
+                    bits,
+                    Arc::new(generate_random_array(DIM * (1 << bits))),
+                ),
+            ),
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("pairs".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = dataset.load_indices_by_name("pairs").await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &meta[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let session = dataset.session();
+        let store = session.spill_store();
+        dataset.object_store.as_ref().io_stats_incremental();
+        let memory = index
+            .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
+            .await
+            .unwrap();
+        let spilled = index
+            .prepare_pairwise_partition(0, BATCH_SIZE, 0, store)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .object_store
+                .as_ref()
+                .io_stats_incremental()
+                .read_iops
+                > 0
+        );
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
+                let expected = memory.read_vectors(batch_id).await.unwrap();
+                let actual = spilled.read_vectors(batch_id).await.unwrap();
+                assert_eq!(actual.row_ids, expected.row_ids);
+                assert_eq!(actual.vectors, expected.vectors);
+                assert_eq!(
+                    actual.row_ids.len(),
+                    BATCH_SIZE.min(NUM_ROWS - batch_id * BATCH_SIZE)
+                );
+                seen.extend(actual.row_ids.values().iter().copied());
+            }
+        }
+        assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 0,
+            "replay must not reread the source index"
+        );
+        assert_eq!(stats.read_bytes, 0);
     }
 
     async fn search_lightweight_pq_index(

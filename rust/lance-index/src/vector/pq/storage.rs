@@ -90,6 +90,10 @@ impl PartialEq for ProductQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for ProductQuantizationMetadata {
+    fn is_transposed(&self) -> bool {
+        self.transposed
+    }
+
     fn buffer_index(&self) -> Option<u32> {
         if self.codebook_position > 0 {
             // the global buffer index starts from 1
