@@ -622,7 +622,13 @@ mod x86 {
             if byte + 1 < code_bytes {
                 let next = row_start(byte + 1);
                 for line in planes[next..next + 1024].chunks_exact(64) {
-                    _mm_prefetch::<_MM_HINT_T0>(line.as_ptr().cast());
+                    // `_mm_prefetch` is safe in newer toolchains but unsafe at
+                    // the 1.91 MSRV, so allow both.
+                    // SAFETY: prefetching an in-bounds address has no side effects.
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        _mm_prefetch::<_MM_HINT_T0>(line.as_ptr().cast())
+                    };
                 }
             }
             // SAFETY: each register loads 64 of the row's 1024 bytes.
