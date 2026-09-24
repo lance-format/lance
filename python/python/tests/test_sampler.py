@@ -180,6 +180,84 @@ def test_filtered_data_handling(sample_dataset):
     assert all(id_val % 4 == 0 for id_val in all_ids), "Should keep rank 0 shard"
 
 
+def _filtered_ids(sampler, ds, filter):
+    batches = list(sampler(ds, batch_size=1, columns=["id"], filter=filter))
+    return [row for batch in batches for row in batch.column("id").to_pylist()]
+
+
+@pytest.mark.parametrize("randomize", [False, True])
+def test_sharded_batch_sampler_empty_filtered_shard(tmp_path, randomize):
+    """Empty filtered shards must yield an empty stream, not crash.
+
+    ShardedBatchSampler._shard_scan has two empty cases on the filtered path:
+
+    1. Global zero-match: the filter matches no rows, so nothing accumulates and
+       the final pa.Table.from_batches([]) raises ValueError.
+    2. Empty per-rank shard: a sparse filter with world_size > 1 leaves some
+       ranks with zero rows after round-robin, so batch.take([]) builds a
+       null-typed index array and raises ArrowNotImplementedError.
+
+    A rank with no matching rows must produce an empty iterator, matching the
+    unfiltered (_sample_all) path's contract.
+    """
+    uri = str(tmp_path / "ds")
+    lance.write_dataset(
+        pa.table({"id": list(range(6)), "seg": [f"s{i % 2}" for i in range(6)]}),
+        uri,
+    )
+    ds = lance.dataset(uri)
+
+    # 3 rows match seg='s1' (ids 1,3,5); rank 3 of 4 gets none.
+    sampler = ShardedBatchSampler(rank=3, world_size=4, randomize=randomize)
+    assert _filtered_ids(sampler, ds, "seg IN ('s1')") == []
+
+    # Filter matching nothing -> empty stream, no crash.
+    sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=randomize)
+    assert _filtered_ids(sampler, ds, "seg IN ('nope')") == []
+
+    # Non-empty shard unchanged: rank 0 of 4 from [1,3,5] -> [1].
+    sampler = ShardedBatchSampler(rank=0, world_size=4, randomize=randomize)
+    assert _filtered_ids(sampler, ds, "seg IN ('s1')") == [1]
+
+
+def test_sharded_batch_sampler_filtered_carryover_across_fragments(tmp_path):
+    """Round-robin offset must carry correctly across small filtered batches.
+
+    When a filtered scan splits matches across several small batches/fragments,
+    a rank's offset has to carry from one batch to the next. If the carry is
+    computed from a sliced (truncated) batch instead of the full batch length,
+    ranks desync and rows are dropped or double-assigned. Here every row matches
+    and each fragment holds a single row, so the per-rank shards must partition
+    the global sequence exactly.
+    """
+    uri = str(tmp_path / "ds")
+    num_rows = 8
+    for i in range(num_rows):
+        lance.write_dataset(
+            pa.table({"id": [i], "seg": ["s1"]}),
+            uri,
+            mode="overwrite" if i == 0 else "append",
+        )
+    ds = lance.dataset(uri)
+
+    world_size = 4
+    shards = {
+        rank: _filtered_ids(
+            ShardedBatchSampler(rank=rank, world_size=world_size),
+            ds,
+            "seg IN ('s1')",
+        )
+        for rank in range(world_size)
+    }
+
+    # Each rank owns global positions rank, rank + world_size, ...; ids equal
+    # their global position here, so the shards are a disjoint, complete cover.
+    for rank in range(world_size):
+        assert shards[rank] == list(range(rank, num_rows, world_size))
+    combined = sorted(i for ids in shards.values() for i in ids)
+    assert combined == list(range(num_rows))
+
+
 def test_randomization_effect():
     """Verify epoch-based randomization behavior."""
     # Initialize randomized sampler
