@@ -114,6 +114,7 @@ static RABIT_PRUNE_STATS_INTERVAL: OnceLock<u64> = OnceLock::new();
 // The gamma_n form below also disables pruning if an enormous dimension makes
 // the floating-point accumulation bound unrepresentable.
 const LAYERED_ROUNDING_OPERATIONS_PER_DIM: f64 = 32.0;
+const LAYERED_NORMAL_ROUNDING_OPERATIONS_PER_DIM: f64 = 8.0;
 
 fn rabit_prune_stats_enabled() -> bool {
     *RABIT_PRUNE_STATS_ENABLED.get_or_init(|| match std::env::var(RABIT_PRUNE_STATS_ENV) {
@@ -592,7 +593,7 @@ impl RabitQuantizationStorage {
             .as_primitive::<Float32Type>()
             .clone();
         // Legacy error factors bound the binary estimator, not independently
-        // quantized prefixes. Layered top-k uses the explicit cascade instead.
+        // quantized prefixes. Layered levels use their own estimator bounds.
         let error_factors = (!metadata.layered)
             .then(|| {
                 batch
@@ -621,17 +622,6 @@ impl RabitQuantizationStorage {
                 {
                     return Err(Error::invalid_input(format!(
                         "RaBitQ bounds column {name} requires three non-null float32 values per row"
-                    )));
-                }
-                if bounds
-                    .values()
-                    .as_primitive::<Float32Type>()
-                    .values()
-                    .iter()
-                    .any(|v| v.is_nan() || *v < 0.0)
-                {
-                    return Err(Error::invalid_input(format!(
-                        "RaBitQ bounds column {name} contains an invalid error magnitude"
                     )));
                 }
             }
@@ -777,8 +767,9 @@ impl RabitQuantizationStorage {
         rotated_centroid: Option<&[f32]>,
     ) -> RabitQueryFactors {
         let gated = self.metadata.num_bits > 1 && self.error_factors.is_some();
-        match self.distance_type {
+        let mut factors = match self.distance_type {
             DistanceType::L2 | DistanceType::Cosine => RabitQueryFactors {
+                centered_query: None,
                 add_scale: 1.0,
                 add_offset: 0.0,
                 add: if self.distance_type == DistanceType::Cosine {
@@ -803,6 +794,7 @@ impl RabitQuantizationStorage {
                     (ip, if alpha.is_finite() { alpha } else { 0.0 })
                 });
                 RabitQueryFactors {
+                    centered_query: None,
                     add_scale: alpha,
                     // Center the stored factor before scaling: splitting the
                     // constant as alpha*A + (1-alpha-ip) loses it for large alpha.
@@ -852,7 +844,29 @@ impl RabitQuantizationStorage {
                 "RabitQ does not support distance type: {}",
                 self.distance_type
             ),
+        };
+        if self.distance_type != DistanceType::Dot
+            && self.metadata.num_bits > 1
+            && (self.metadata.layered
+                || self
+                    .batch
+                    .column_by_name(super::layered::FULL_BOUNDS_COLUMN)
+                    .is_some())
+            && let Some(centroid) = rotated_centroid
+            && centroid.len() == rotated_query.len()
+        {
+            let alpha = f64::from(factors.add_scale);
+            let (norm_square, centroid_l1) =
+                rotated_query
+                    .iter()
+                    .zip(centroid)
+                    .fold((0.0, 0.0), |(norm, l1), (&q, &c)| {
+                        let residual = f64::from(q) - alpha * f64::from(c);
+                        (norm + residual * residual, l1 + f64::from(c).abs())
+                    });
+            factors.centered_query = Some((norm_square.sqrt(), alpha.abs() * centroid_l1));
         }
+        factors
     }
 
     fn distance_calculator_from_parts<'a>(
@@ -944,7 +958,11 @@ impl RabitQuantizationStorage {
                 _ => super::layered::FULL_BOUNDS_COLUMN,
             };
             if let Some(bounds) = self.batch.column_by_name(column) {
-                calculator.prepare_layered_bounds(bounds.as_fixed_size_list());
+                calculator.prepare_layered_bounds(
+                    bounds.as_fixed_size_list(),
+                    query_factors.centered_query,
+                    self.distance_type,
+                );
             }
         }
         calculator
@@ -1118,6 +1136,8 @@ struct RabitQueryFactors {
     add_offset: f32,
     add: f32,
     error: f32,
+    // Norm of q - a*c, and ||a*c||_1 for the centroid-correction rounding margin.
+    centered_query: Option<(f64, f64)>,
 }
 
 struct RabitDistCalculatorParts<'a> {
@@ -1195,14 +1215,27 @@ pub struct RabitDistCalculator<'a> {
 }
 
 impl<'a> RabitDistCalculator<'a> {
-    fn prepare_layered_bounds(&mut self, bounds: &FixedSizeListArray) {
+    fn prepare_layered_bounds(
+        &mut self,
+        bounds: &FixedSizeListArray,
+        centered_query: Option<(f64, f64)>,
+        metric: DistanceType,
+    ) {
         let values = bounds.values().as_primitive::<Float32Type>().values();
-        let norm = self
-            .ex_query
-            .iter()
-            .map(|&q| f64::from(q).powi(2))
-            .sum::<f64>()
-            .sqrt();
+        // Retain the wider enclosure for signed Dot scores: tightening that
+        // statistical bound changed a top-k boundary under a different scan order.
+        let use_projection = self.approx_mode == ApproxMode::Normal && metric != DistanceType::Dot;
+        let centered_query = centered_query.filter(|_| use_projection);
+        let norm = centered_query.map_or_else(
+            || {
+                self.ex_query
+                    .iter()
+                    .map(|&q| f64::from(q).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            },
+            |(norm, _)| norm,
+        );
         let l1 = self
             .ex_query
             .iter()
@@ -1217,17 +1250,24 @@ impl<'a> RabitDistCalculator<'a> {
         // The sign LUT may be quantized even when the ex-dot is exact. Include
         // its worst-case error and dot-product/reconstruction rounding; both
         // estimators use the same LUT value with different coefficients.
-        let rounding_epsilon = LAYERED_ROUNDING_OPERATIONS_PER_DIM * f64::from(f32::EPSILON);
+        let rounding_operations = if use_projection {
+            LAYERED_NORMAL_ROUNDING_OPERATIONS_PER_DIM
+        } else {
+            LAYERED_ROUNDING_OPERATIONS_PER_DIM
+        };
+        let rounding_epsilon = rounding_operations * f64::from(f32::EPSILON);
         let accumulated_error = rounding_epsilon * (self.dim + 8) as f64;
-        let rounding_error = if accumulated_error < 1.0 {
-            accumulated_error / (1.0 - accumulated_error) * l1
+        let rounding_gamma = if accumulated_error < 1.0 {
+            accumulated_error / (1.0 - accumulated_error)
         } else {
             f64::INFINITY
         };
-        let numeric_error = (self.dist_table.len() / SEGMENT_NUM_CODES) as f64
+        let lut_error = (self.dist_table.len() / SEGMENT_NUM_CODES) as f64
             * (f64::from(max) - f64::from(min))
-            / f64::from(u8::MAX)
-            + rounding_error;
+            / f64::from(u8::MAX);
+        let rounding_error =
+            rounding_gamma * (l1 + centered_query.map_or(0.0, |(_, centroid_l1)| centroid_l1));
+        let code_scale = f64::from(1u32 << (self.num_bits - 1));
         // Normal uses the same angular confidence policy as native RaBitQ,
         // applied to this level's actual estimator difference. Accurate retains
         // the Cauchy-Schwarz bound; it trades more ex-dot work for no statistical
@@ -1249,11 +1289,33 @@ impl<'a> RabitDistCalculator<'a> {
                             + f64::from(self.add_factor_offset).abs()
                             + f64::from(b[1]))
                         + f64::from(self.query_factor).abs());
+                // Both estimators reconstruct from the same sign LUT value.
+                // Its error is multiplied by the coefficient difference, not
+                // the sum of absolute coefficients used for reduction rounding.
+                let lut_coefficient = self.ex_scale_factors.map_or(f64::from(b[2]), |scales| {
+                    (code_scale * f64::from(scales[row]) - f64::from(self.scale_factors[row])).abs()
+                });
+                // add_level-add_sign cancels the centroid dot of the weight
+                // difference. Normal uses q-a*c and encloses the encoder's
+                // floating correction in the centroid rounding margin above.
+                let add_difference = if centered_query.is_some() {
+                    0.0
+                } else {
+                    f64::from(b[1]) * add_scale
+                };
+                let numeric_margin = if metric == DistanceType::Dot {
+                    f64::from(b[2]) * (lut_error + rounding_error)
+                } else {
+                    lut_coefficient * lut_error + f64::from(b[2]) * rounding_error
+                };
                 let margin = f64::from(b[0]) * norm * angular_scale
-                    + f64::from(b[1]) * add_scale
-                    + f64::from(b[2]) * numeric_error
+                    + add_difference
+                    + numeric_margin
                     + rounding;
-                if margin.is_finite() {
+                // Invalid optional hints fail closed: score the row in full.
+                // Fold this check into preparation instead of rescanning both
+                // levels' columns on every reconstructed partition.
+                if margin.is_finite() && b.iter().all(|v| *v >= 0.0) {
                     (margin as f32).next_up()
                 } else {
                     f32::INFINITY
@@ -2626,6 +2688,7 @@ impl VectorStore for RabitQuantizationStorage {
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
         let query_factors = match self.metadata.query_estimator {
             RabitQueryEstimator::ResidualQuery => RabitQueryFactors {
+                centered_query: None,
                 add_scale: 1.0,
                 add_offset: 0.0,
                 add: self.residual_query_factor(dist_q_c),
@@ -2722,6 +2785,7 @@ impl VectorStore for RabitQuantizationStorage {
             }
             query_factors = match (self.metadata.query_estimator, residual) {
                 (RabitQueryEstimator::ResidualQuery, _) => RabitQueryFactors {
+                    centered_query: None,
                     add_scale: 1.0,
                     add_offset: 0.0,
                     add: self.residual_query_factor(dist_q_c),

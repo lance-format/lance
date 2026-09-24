@@ -305,9 +305,11 @@ mod tests {
         transform::RQTransformer,
     };
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
-    use crate::vector::storage::{DistCalculator, DistanceCalculatorOptions, VectorStore};
+    use crate::vector::storage::{
+        DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore,
+    };
     use crate::vector::transform::Transformer;
-    use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
+    use crate::vector::{ApproxMode, CENTROID_DIST_COLUMN, PART_ID_COLUMN};
     use arrow_array::types::Float32Type;
     use arrow_array::{Float32Array, UInt32Array, UInt64Array, cast::AsArray};
     use lance_arrow::RecordBatchExt;
@@ -325,6 +327,7 @@ mod tests {
         #[case] bits: u8,
         #[case] distance_type: DistanceType,
         #[values(64, 72)] dim: usize,
+        #[values(0.0, 0.25)] centroid_value: f32,
     ) {
         const ROWS: usize = 37;
         let values: Vec<f32> = (0..dim * ROWS)
@@ -358,9 +361,16 @@ mod tests {
             (CENTROID_DIST_COLUMN, Arc::new(norms) as ArrayRef),
         ])
         .unwrap();
-        let centroids =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.; dim]), dim as i32)
-                .unwrap();
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![centroid_value; dim]),
+            dim as i32,
+        )
+        .unwrap();
+        let rotated_centroid = rq
+            .quantize_split(&centroids)
+            .unwrap()
+            .rotated_residuals
+            .unwrap();
         let batch = RQTransformer::new(rq.clone(), distance_type, centroids, "vector")
             .unwrap()
             .transform(&input)
@@ -399,6 +409,31 @@ mod tests {
             full.dist_calculator(query.clone(), 1.).distance_all(ROWS),
             single.dist_calculator(query.clone(), 1.).distance_all(ROWS)
         );
+        for invalid in [f32::NAN, -1.0] {
+            let hints = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![invalid; ROWS * 3]),
+                3,
+            )
+            .unwrap();
+            let invalid_batch = batch
+                .replace_column_by_name(FULL_BOUNDS_COLUMN, Arc::new(hints))
+                .unwrap();
+            let store = RabitQuantizationStorage::try_from_batch(
+                invalid_batch,
+                rq.metadata_ref(),
+                distance_type,
+                None,
+            )
+            .unwrap();
+            let calc = store.dist_calculator(query.clone(), 1.);
+            assert_eq!(
+                calc.distance_all(ROWS),
+                full.dist_calculator(query.clone(), 1.).distance_all(ROWS)
+            );
+            for (row, ip) in calc.binary_inner_products().into_iter().enumerate() {
+                assert_eq!(calc.raw_query_lower_bound(row, ip), Some(f32::NEG_INFINITY));
+            }
+        }
         for precision in [RQPrecision::Sign, RQPrecision::High, RQPrecision::Full] {
             let projected = RabitQuantizationStorage::try_from_batch_at_precision(
                 batch.clone(),
@@ -408,88 +443,95 @@ mod tests {
                 precision,
             )
             .unwrap();
-            let mut scratch = Vec::new();
-            let calc = full.dist_calculator_with_scratch(
-                query.clone(),
-                1.,
-                None,
-                &mut scratch,
-                DistanceCalculatorOptions {
-                    approx_mode: Default::default(),
-                    rq_precision: precision,
-                },
-            );
-            assert_eq!(
-                calc.distance_all(ROWS),
-                projected
-                    .dist_calculator(query.clone(), 1.)
-                    .distance_all(ROWS)
-            );
-            if precision != RQPrecision::Sign {
-                let mut audit_scratch = Vec::new();
-                let audit = full.dist_calculator_with_scratch(
-                    query.clone(),
-                    1.,
-                    None,
-                    &mut audit_scratch,
-                    DistanceCalculatorOptions {
-                        approx_mode: crate::vector::ApproxMode::Accurate,
-                        rq_precision: precision,
-                    },
-                );
-                let binary = audit.binary_inner_products();
-                let distances = audit.distance_all(ROWS);
-                for (row, &ip) in binary.iter().enumerate() {
-                    let bound = audit.raw_query_lower_bound(row, ip).unwrap();
-                    assert!(
-                        bound <= distances[row],
-                        "invalid bound at row {row}: {bound} > {}",
-                        distances[row]
+            for centered in [false, true] {
+                let context = || {
+                    centered.then_some(QueryResidual::RabitRawQuery {
+                        rotated_centroid: Some(&rotated_centroid),
+                        query: None,
+                    })
+                };
+                for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+                    let mut scratch = Vec::new();
+                    let mut projected_scratch = Vec::new();
+                    let calc = full.dist_calculator_with_scratch(
+                        query.clone(),
+                        1.,
+                        context(),
+                        &mut scratch,
+                        DistanceCalculatorOptions {
+                            approx_mode,
+                            rq_precision: precision,
+                        },
                     );
+                    let projected_calc = projected.dist_calculator_with_scratch(
+                        query.clone(),
+                        1.,
+                        context(),
+                        &mut projected_scratch,
+                        DistanceCalculatorOptions {
+                            approx_mode,
+                            rq_precision: RQPrecision::Full,
+                        },
+                    );
+                    assert_eq!(calc.distance_all(ROWS), projected_calc.distance_all(ROWS));
+                    if precision != RQPrecision::Sign && approx_mode == ApproxMode::Accurate {
+                        let binary = calc.binary_inner_products();
+                        let distances = calc.distance_all(ROWS);
+                        for (row, &ip) in binary.iter().enumerate() {
+                            let bound = calc.raw_query_lower_bound(row, ip).unwrap();
+                            assert!(
+                                bound <= distances[row],
+                                "invalid bound at row {row}: {bound} > {}",
+                                distances[row]
+                            );
+                        }
+                        let best = distances.iter().copied().min_by(f32::total_cmp).unwrap();
+                        assert!(
+                            binary
+                                .iter()
+                                .enumerate()
+                                .any(|(row, &ip)| calc.raw_query_lower_bound(row, ip).unwrap()
+                                    > best),
+                            "fixture must exercise pruning"
+                        );
+                    }
+                    // Exercise SIMD plus tail rows, both context forms, and range cuts.
+                    for (lower, upper) in [(None, None), (Some(-0.5), Some(20.0))] {
+                        let distances = calc.distance_all(ROWS);
+                        let mut expected: Vec<_> = distances
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(_, d)| {
+                                lower.is_none_or(|v| *d >= v) && upper.is_none_or(|v| *d < v)
+                            })
+                            .map(|(id, d)| (id as u64, d))
+                            .collect();
+                        expected.sort_by(|a, b| a.1.total_cmp(&b.1));
+                        expected.truncate(3);
+                        let mut heap = std::collections::BinaryHeap::new();
+                        calc.accumulate_topk_with_scratch(
+                            3,
+                            lower,
+                            upper,
+                            u64::from,
+                            &mut heap,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        );
+                        let actual: Vec<_> = heap
+                            .into_sorted_vec()
+                            .into_iter()
+                            .map(|n| (n.id, n.dist.0))
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "bits={bits} precision={precision:?} dim={dim} centered={centered} mode={approx_mode:?}"
+                        );
+                    }
                 }
-                let best = distances.iter().copied().min_by(f32::total_cmp).unwrap();
-                assert!(
-                    binary
-                        .iter()
-                        .enumerate()
-                        .any(|(row, &ip)| audit.raw_query_lower_bound(row, ip).unwrap() > best),
-                    "fixture must exercise pruning"
-                );
-            }
-            // A precision-specific bound must preserve the unpruned result,
-            // including non-block-aligned code dimensions and heap/range cuts.
-            for (lower, upper) in [(None, None), (Some(-0.5), Some(20.0))] {
-                let distances = calc.distance_all(ROWS);
-                let mut expected: Vec<_> = distances
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter(|(_, d)| lower.is_none_or(|v| *d >= v) && upper.is_none_or(|v| *d < v))
-                    .map(|(id, d)| (id as u64, d))
-                    .collect();
-                expected.sort_by(|a, b| a.1.total_cmp(&b.1));
-                expected.truncate(3);
-                let mut heap = std::collections::BinaryHeap::new();
-                calc.accumulate_topk_with_scratch(
-                    3,
-                    lower,
-                    upper,
-                    u64::from,
-                    &mut heap,
-                    &mut Vec::new(),
-                    &mut Vec::new(),
-                    &mut Vec::new(),
-                    &mut Vec::new(),
-                );
-                let actual: Vec<_> = heap
-                    .into_sorted_vec()
-                    .into_iter()
-                    .map(|n| (n.id, n.dist.0))
-                    .collect();
-                assert_eq!(
-                    actual, expected,
-                    "bits={bits} precision={precision:?} dim={dim}"
-                );
             }
         }
         let missing = batch.drop_column(RABIT_BLOCKED_EX_CODE_LO_COLUMN).unwrap();

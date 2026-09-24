@@ -1935,8 +1935,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .io_parallelism
             .max(1)
             .min(get_num_compute_intensive_cpus().max(1));
-        // Preserve sorted partition order for deterministic ties. Fetching each
-        // partition serially otherwise multiplies origin latency by nprobes.
+        // Match the dense scan's probe order, including centroid-distance ties.
+        // Statistical pruning must see the same evolving top-k threshold when
+        // the candidate cut retains every row. Physical partition order is not
+        // probe order. Recompute the small centroid ordering for public rerank
+        // callers, whose candidate list need not retain its original ordering.
+        let mut candidates: Vec<_> = candidates.into_iter().collect();
+        if candidates.len() > 1 {
+            let (probes, _) = self.find_partitions(query)?;
+            let mut ranks = vec![usize::MAX; self.ivf.num_partitions()];
+            for (rank, &partition) in probes.values().iter().enumerate() {
+                ranks[partition as usize] = rank;
+            }
+            candidates.sort_by_key(|(part_id, _)| ranks[*part_id]);
+        }
         let mut prepared = stream::iter(candidates)
             .map(|(part_id, mut rows)| async move {
                 rows.sort_unstable_by_key(|row| row.row_offset);
@@ -2010,10 +2022,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     let node = OrderedNode::new(storage.row_id(row as u32), distance.into());
                     if full_heap.len() < k {
                         full_heap.push(node);
-                    } else if full_heap.peek().is_some_and(|top| node.dist < top.dist)
-                        && let Some(mut top) = full_heap.peek_mut()
-                    {
-                        *top = node;
+                    } else if full_heap.peek().is_some_and(|top| node.dist < top.dist) {
+                        // Match dense top-k's replacement order for equal scores.
+                        full_heap.pop();
+                        full_heap.push(node);
                     }
                 }
                 Ok(full_heap)
