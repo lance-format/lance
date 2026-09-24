@@ -3082,41 +3082,56 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
     );
 }
 
-/// One commit publishes every group a compaction rewrites, so dating them takes
-/// one search of the version history however many groups there are. A merge that
-/// searched per group would re-read the same snapshots, which on remote storage
-/// is the expensive part of the walk.
+/// How many times a merge over `fragments` fragments, compacted into pairs,
+/// reads version history.
 #[cfg(feature = "geo")]
-#[tokio::test]
-async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
-    let dir = TempStrDir::default();
+async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
     let (mut dataset, params) =
-        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 8).await;
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, fragments)
+            .await;
     let fragment_ids = rtree_fragment_ids(&dataset);
     let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
     rtree_compact(&mut dataset, 2).await;
-    assert_eq!(dataset.get_fragments().len(), 4, "four groups to date");
+    let groups = fragments / 2;
+    assert_eq!(dataset.get_fragments().len(), groups as usize);
 
     let _ = dataset.object_store.as_ref().io_stats_incremental();
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert_eq!(
-        merged.fragment_bitmap.as_ref().unwrap().len(),
-        4,
-        "all four groups are covered whole, so coverage follows the rows"
+        merged.fragment_bitmap.as_ref().unwrap().len() as i32,
+        groups,
+        "every group is covered whole, so coverage follows the rows"
     );
-
-    let history = dataset
+    dataset
         .object_store
         .as_ref()
         .io_stats_incremental()
         .requests
         .iter()
         .filter(|request| request.path.to_string().contains("_versions"))
-        .count();
-    assert!(
-        history <= 5,
-        "the merge read version history {history} times for four groups, so it is \
-         searching once per group rather than once per compaction"
+        .count()
+}
+
+/// One commit publishes every group a compaction rewrites, so dating them takes
+/// one search of the version history however many groups there are. A merge that
+/// searched per group would re-read the same snapshots once for each, which on
+/// remote storage is the expensive part of the walk.
+///
+/// The count itself is platform-specific, so what is asserted is that it does not
+/// grow with the number of groups. Both datasets have the same version history,
+/// and differ only in how many groups the compaction produced.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
+    let two = TempStrDir::default();
+    let four = TempStrDir::default();
+    let two_groups = rtree_merge_history_reads(&two, 4).await;
+    let four_groups = rtree_merge_history_reads(&four, 8).await;
+    assert_eq!(
+        four_groups, two_groups,
+        "doubling the groups took the merge from {two_groups} reads of version \
+         history to {four_groups}, so it is searching once per group rather than \
+         once per compaction"
     );
 }
 

@@ -447,7 +447,6 @@ enum Recorded {
 async fn recorded_state(
     dataset: &Dataset,
     read: &mut HashMap<u64, Dataset>,
-    dated: &mut HashMap<u64, u64>,
     retained: &[u64],
     recorded: Recorded,
     fragment: u32,
@@ -455,30 +454,28 @@ async fn recorded_state(
 ) -> Result<Option<Dataset>> {
     let version = match recorded {
         Recorded::At(version) => version,
-        // One commit published every group a compaction rewrote, so dating one of
-        // its fragments dates the rest.
-        Recorded::ProducedAfter(after) => match dated.get(&after) {
-            Some(&created) => created,
-            None => {
-                if !at.fragments().iter().any(|f| f.id as u32 == fragment) {
-                    return Ok(None);
-                }
-                let Some(created) = proven_creation_version(
-                    dataset,
-                    read,
-                    retained,
-                    after,
-                    at.manifest.version,
-                    fragment,
-                )
-                .await?
-                else {
-                    return Ok(None);
-                };
-                dated.insert(after, created);
-                created
+        Recorded::ProducedAfter(after) => {
+            // Nothing to date, and nothing worth keeping, once the fragment is
+            // gone from where the comparison would be made.
+            if !at.fragments().iter().any(|f| f.id as u32 == fragment) {
+                return Ok(None);
             }
-        },
+            // Every group a compaction published shares its commit, so these
+            // searches agree and read the same snapshots, already held.
+            let Some(created) = proven_creation_version(
+                dataset,
+                read,
+                retained,
+                after,
+                at.manifest.version,
+                fragment,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            created
+        }
     };
     Ok(snapshot_at(dataset, read, version).await)
 }
@@ -519,7 +516,6 @@ async fn indexed_data_moved_on(
         .collect::<Vec<_>>();
 
     let mut read = HashMap::new();
-    let mut dated = HashMap::new();
     let mut following = staged_coverage
         .iter()
         .map(|fragment| (fragment, Recorded::At(oldest_segment)))
@@ -552,10 +548,8 @@ async fn indexed_data_moved_on(
                 let Some(&recorded) = following.get(&old) else {
                     continue;
                 };
-                let Some(against) = recorded_state(
-                    dataset, &mut read, &mut dated, &retained, recorded, old, &at_read,
-                )
-                .await?
+                let Some(against) =
+                    recorded_state(dataset, &mut read, &retained, recorded, old, &at_read).await?
                 else {
                     return Ok(true);
                 };
@@ -581,10 +575,8 @@ async fn indexed_data_moved_on(
     }
 
     for (fragment, recorded) in following {
-        let Some(against) = recorded_state(
-            dataset, &mut read, &mut dated, &retained, recorded, fragment, dataset,
-        )
-        .await?
+        let Some(against) =
+            recorded_state(dataset, &mut read, &retained, recorded, fragment, dataset).await?
         else {
             return Ok(true);
         };
