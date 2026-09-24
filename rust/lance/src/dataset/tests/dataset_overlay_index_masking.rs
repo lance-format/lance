@@ -2688,3 +2688,196 @@ async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_
          value it replaced"
     );
 }
+
+/// A data replacement rewrites an indexed column into a different file. The
+/// segments describe the fragment as the compaction wrote it, so the merge has
+/// to give the fragment up rather than answer from entries the replacement
+/// superseded.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = dataset.get_fragments()[0].id() as u32;
+
+    let age_schema = dataset.schema().project(&["age"]).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(&age_schema)),
+        vec![Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef],
+    )
+    .unwrap();
+    let replacement = dataset
+        .get_fragment(rewritten as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &age_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await.len(),
+        12,
+        "the replaced values are missing: the merged index claimed a fragment whose \
+         indexed column was rewritten after the compaction produced it"
+    );
+}
+
+/// The same rule for RTree, which reaches the remap through the same path.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_replaced_since_the_compaction() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0];
+
+    let geometry_schema = dataset.schema().project(&["geometry"]).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(&geometry_schema)),
+        vec![geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT * 3)],
+    )
+    .unwrap();
+    let replacement = dataset
+        .get_fragment(rewritten as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &geometry_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        !merged.fragment_bitmap.as_ref().unwrap().contains(rewritten),
+        "the merged index claimed a remapped fragment whose geometry file was replaced"
+    );
+}
+
+/// An overlay landing on the fragment after the compaction produced it. RTree
+/// reaches this through its staleness pass; every other scalar family reaches it
+/// only through the comparison against the fragment the compaction wrote.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = dataset.get_fragments()[0].id() as u64;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        rewritten,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        merged.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "the merged index claimed a fragment an overlay has changed since the \
+         compaction produced it"
+    );
+}
