@@ -5,21 +5,20 @@
 
 use lance_core::{Error, Result};
 
-/// Plane widths and build-time scale-search policy. The scale is not persisted.
+/// Plane widths for splitting a native full-precision code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RQLayout {
     pub high_bits: u8,
     pub low_bits: u8,
-    pub search_bits: u8,
 }
 
 impl RQLayout {
     /// Resolve the only supported layered layouts: 1+2+2, 1+4+2 and 1+4+4.
     pub fn try_new(num_bits: u8) -> Result<Self> {
-        let (high_bits, low_bits, search_bits) = match num_bits {
-            5 => (2, 2, 3),
-            7 => (4, 2, 5),
-            9 => (4, 4, 6),
+        let (high_bits, low_bits) = match num_bits {
+            5 => (2, 2),
+            7 => (4, 2),
+            9 => (4, 4),
             _ => {
                 return Err(Error::invalid_input(format!(
                     "IVF_RQ layered requires num_bits=5, 7 or 9, got {num_bits}"
@@ -29,7 +28,6 @@ impl RQLayout {
         Ok(Self {
             high_bits,
             low_bits,
-            search_bits,
         })
     }
 }
@@ -371,7 +369,7 @@ mod tests {
             .unwrap()
             .rotated_residuals
             .unwrap();
-        let batch = RQTransformer::new(rq.clone(), distance_type, centroids, "vector")
+        let batch = RQTransformer::new(rq.clone(), distance_type, centroids.clone(), "vector")
             .unwrap()
             .transform(&input)
             .unwrap();
@@ -382,32 +380,45 @@ mod tests {
             None,
         )
         .unwrap();
-        let codes = rq.quantize_split(&vectors).unwrap().ex_codes.unwrap();
-        let single_batch = batch
-            .drop_column(RABIT_BLOCKED_EX_CODE_LO_COLUMN)
-            .unwrap()
-            .drop_column(HIGH_ADD_FACTORS_COLUMN)
-            .unwrap()
-            .drop_column(HIGH_SCALE_FACTORS_COLUMN)
-            .unwrap()
-            .drop_column(RABIT_BLOCKED_EX_CODE_COLUMN)
-            .unwrap()
-            .try_with_column(
-                super::super::storage::rabit_ex_code_field(dim, bits)
-                    .unwrap()
-                    .unwrap(),
-                codes,
-            )
-            .unwrap();
         let mut metadata = rq.metadata_ref().clone();
         metadata.layered = false;
+        let native_rq = RabitQuantizer::try_from(
+            RabitQuantizer::from_metadata(&metadata, distance_type).unwrap(),
+        )
+        .unwrap();
+        let layered_codes = rq.quantize_split(&vectors).unwrap();
+        let native_codes = native_rq.quantize_split(&vectors).unwrap();
+        assert_eq!(
+            layered_codes.binary_codes.as_ref(),
+            native_codes.binary_codes.as_ref()
+        );
+        assert_eq!(layered_codes.ex_code_values, native_codes.ex_code_values);
+        assert_eq!(
+            layered_codes.ex_res_dot_dists,
+            native_codes.ex_res_dot_dists
+        );
+        let single_batch = RQTransformer::new(native_rq, distance_type, centroids, "vector")
+            .unwrap()
+            .transform(&input)
+            .unwrap();
         let single =
             RabitQuantizationStorage::try_from_batch(single_batch, &metadata, distance_type, None)
                 .unwrap();
+        let dist_q_c = match distance_type {
+            DistanceType::L2 => values[..dim]
+                .iter()
+                .map(|v| (v - centroid_value).powi(2))
+                .sum(),
+            DistanceType::Dot => 1.0 - values[..dim].iter().sum::<f32>() * centroid_value,
+            _ => unreachable!(),
+        };
         let query: ArrayRef = Arc::new(Float32Array::from(values[..dim].to_vec()));
         assert_eq!(
-            full.dist_calculator(query.clone(), 1.).distance_all(ROWS),
-            single.dist_calculator(query.clone(), 1.).distance_all(ROWS)
+            full.dist_calculator(query.clone(), dist_q_c)
+                .distance_all(ROWS),
+            single
+                .dist_calculator(query.clone(), dist_q_c)
+                .distance_all(ROWS)
         );
         for invalid in [f32::NAN, -1.0] {
             let hints = FixedSizeListArray::try_new_from_values(
@@ -416,19 +427,30 @@ mod tests {
             )
             .unwrap();
             let invalid_batch = batch
-                .replace_column_by_name(FULL_BOUNDS_COLUMN, Arc::new(hints))
+                .replace_column_by_name(HIGH_BOUNDS_COLUMN, Arc::new(hints))
                 .unwrap();
-            let store = RabitQuantizationStorage::try_from_batch(
+            let store = RabitQuantizationStorage::try_from_batch_at_precision(
                 invalid_batch,
                 rq.metadata_ref(),
                 distance_type,
                 None,
+                RQPrecision::High,
             )
             .unwrap();
-            let calc = store.dist_calculator(query.clone(), 1.);
+            let calc = store.dist_calculator(query.clone(), dist_q_c);
             assert_eq!(
                 calc.distance_all(ROWS),
-                full.dist_calculator(query.clone(), 1.).distance_all(ROWS)
+                full.dist_calculator_with_scratch(
+                    query.clone(),
+                    dist_q_c,
+                    None,
+                    &mut Vec::new(),
+                    DistanceCalculatorOptions {
+                        approx_mode: ApproxMode::Normal,
+                        rq_precision: RQPrecision::High,
+                    },
+                )
+                .distance_all(ROWS)
             );
             for (row, ip) in calc.binary_inner_products().into_iter().enumerate() {
                 assert_eq!(calc.raw_query_lower_bound(row, ip), Some(f32::NEG_INFINITY));
@@ -455,7 +477,7 @@ mod tests {
                     let mut projected_scratch = Vec::new();
                     let calc = full.dist_calculator_with_scratch(
                         query.clone(),
-                        1.,
+                        dist_q_c,
                         context(),
                         &mut scratch,
                         DistanceCalculatorOptions {
@@ -465,7 +487,7 @@ mod tests {
                     );
                     let projected_calc = projected.dist_calculator_with_scratch(
                         query.clone(),
-                        1.,
+                        dist_q_c,
                         context(),
                         &mut projected_scratch,
                         DistanceCalculatorOptions {
@@ -474,7 +496,30 @@ mod tests {
                         },
                     );
                     assert_eq!(calc.distance_all(ROWS), projected_calc.distance_all(ROWS));
-                    if precision != RQPrecision::Sign && approx_mode == ApproxMode::Accurate {
+                    if precision == RQPrecision::Full {
+                        let mut native_scratch = Vec::new();
+                        let native = single.dist_calculator_with_scratch(
+                            query.clone(),
+                            dist_q_c,
+                            context(),
+                            &mut native_scratch,
+                            DistanceCalculatorOptions {
+                                approx_mode,
+                                rq_precision: RQPrecision::Full,
+                            },
+                        );
+                        let binary = calc.binary_inner_products();
+                        assert_eq!(binary, native.binary_inner_products());
+                        assert_eq!(calc.distance_all(ROWS), native.distance_all(ROWS));
+                        for (row, &ip) in binary.iter().enumerate() {
+                            assert_eq!(
+                                calc.raw_query_lower_bound(row, ip),
+                                native.raw_query_lower_bound(row, ip),
+                                "full pruning differs from native at row {row}, mode={approx_mode:?}",
+                            );
+                        }
+                    }
+                    if precision == RQPrecision::High && approx_mode == ApproxMode::Accurate {
                         let binary = calc.binary_inner_products();
                         let distances = calc.distance_all(ROWS);
                         for (row, &ip) in binary.iter().enumerate() {

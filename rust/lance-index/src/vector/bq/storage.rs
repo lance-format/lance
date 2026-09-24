@@ -592,15 +592,12 @@ impl RabitQuantizationStorage {
         let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
-        // Legacy error factors bound the binary estimator, not independently
-        // quantized prefixes. Layered levels use their own estimator bounds.
-        let error_factors = (!metadata.layered)
-            .then(|| {
-                batch
-                    .column_by_name(ERROR_FACTORS_COLUMN)
-                    .map(|factors| factors.as_primitive::<Float32Type>().clone())
-            })
-            .flatten();
+        // Full precision preserves native binary pruning regardless of how
+        // the ex codes are stored. Projected prefixes remove these factors and
+        // use their own estimator-difference bounds instead.
+        let error_factors = batch
+            .column_by_name(ERROR_FACTORS_COLUMN)
+            .map(|factors| factors.as_primitive::<Float32Type>().clone());
         let ex_bits = rabit_ex_bits(metadata.num_bits)?;
         let mut batch = batch;
         let mut ex_codes = None;
@@ -952,7 +949,10 @@ impl RabitQuantizationStorage {
         );
         calculator.add_factor_scale = query_factors.add_scale;
         calculator.add_factor_offset = query_factors.add_offset;
-        if num_bits > 1 && approx_mode != ApproxMode::Fast {
+        if num_bits > 1
+            && approx_mode != ApproxMode::Fast
+            && (rq_precision == super::layered::RQPrecision::High || self.error_factors.is_none())
+        {
             let column = match rq_precision {
                 super::layered::RQPrecision::High => super::layered::HIGH_BOUNDS_COLUMN,
                 _ => super::layered::FULL_BOUNDS_COLUMN,

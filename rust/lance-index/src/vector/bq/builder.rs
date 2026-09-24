@@ -751,26 +751,7 @@ impl RabitQuantizer {
                 .zip(ex_res_dot_dists.par_iter_mut())
                 .zip(rotated_residuals.par_chunks(code_dim))
                 .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
-                    *ex_dot_dst = if self.metadata.layered {
-                        let layout = super::layered::RQLayout::try_new(self.metadata.num_bits)
-                            .expect("layered layout validated at build");
-                        if let Some(abs) = ex_abs_normalized(rotated) {
-                            let t = best_ex_rescale_factor(&abs, layout.search_bits)
-                                * (1u32 << (ex_bits - layout.search_bits)) as f32;
-                            quantize_ex_code_with_scale(
-                                rotated,
-                                &abs,
-                                ex_bits,
-                                t,
-                                ex_dst,
-                                ex_values_dst,
-                            )
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst)
-                    };
+                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
                 });
         }
 
