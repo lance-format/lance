@@ -27,7 +27,7 @@ use object_store::{
         AwsCredentialProvider,
     },
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
@@ -489,8 +489,11 @@ fn extract_static_s3_credentials(
 pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
-    // RefCell can't be shared across threads, so we use HashMap
-    cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
+    // The cached credential, if any.
+    credentials: RwLock<Option<Arc<aws_credential_types::Credentials>>>,
+
+    // Serialize refreshes without holding the cache lock during network requests.
+    refresh_lock: Mutex<()>,
 
     // The amount of time before expiry to refresh credentials
     credentials_refresh_offset: Duration,
@@ -503,13 +506,12 @@ impl AwsCredentialAdapter {
     ) -> Self {
         Self {
             inner: provider,
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            credentials: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
             credentials_refresh_offset,
         }
     }
 }
-
-const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 
 /// Convert std::time::SystemTime from AWS SDK to our mockable SystemTime
 fn to_system_time(time: std::time::SystemTime) -> SystemTime {
@@ -524,50 +526,88 @@ impl CredentialProvider for AwsCredentialAdapter {
     type Credential = ObjectStoreAwsCredential;
 
     async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-        let cached_creds = {
-            let cache_value = self.cache.read().await.get(AWS_CREDS_CACHE_KEY).cloned();
-            let expired = cache_value
-                .clone()
-                .map(|cred| {
-                    cred.expiry()
-                        .map(|exp| {
-                            to_system_time(exp)
-                                .checked_sub(self.credentials_refresh_offset)
-                                .expect("this time should always be valid")
-                                < SystemTime::now()
-                        })
-                        // no expiry is never expire
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true); // no cred is the same as expired;
-            if expired { None } else { cache_value.clone() }
+        let cached = self.credentials.read().await.clone();
+        let credentials = match cached {
+            None => self.must_refresh().await?,
+            Some(credentials) => {
+                let (is_expired, is_stale) = self.check_staleness(&credentials);
+                if is_expired {
+                    self.must_refresh().await?
+                } else if is_stale {
+                    self.maybe_refresh(credentials).await?
+                } else {
+                    credentials
+                }
+            }
         };
+        Ok(Arc::new(Self::Credential {
+            key_id: credentials.access_key_id().to_string(),
+            secret_key: credentials.secret_access_key().to_string(),
+            token: credentials.session_token().map(|s| s.to_string()),
+        }))
+    }
+}
 
-        if let Some(creds) = cached_creds {
-            Ok(Arc::new(Self::Credential {
-                key_id: creds.access_key_id().to_string(),
-                secret_key: creds.secret_access_key().to_string(),
-                token: creds.session_token().map(|s| s.to_string()),
-            }))
-        } else {
-            let refreshed_creds = Arc::new(
-                self.inner
-                    .provide_credentials()
-                    .await
-                    .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
-            );
-
-            self.cache
-                .write()
-                .await
-                .insert(AWS_CREDS_CACHE_KEY.to_string(), refreshed_creds.clone());
-
-            Ok(Arc::new(Self::Credential {
-                key_id: refreshed_creds.access_key_id().to_string(),
-                secret_key: refreshed_creds.secret_access_key().to_string(),
-                token: refreshed_creds.session_token().map(|s| s.to_string()),
-            }))
+impl AwsCredentialAdapter {
+    // Return a tuple of (credential expired, credential stale).
+    fn check_staleness(&self, credentials: &aws_credential_types::Credentials) -> (bool, bool) {
+        match credentials.expiry() {
+            None => (false, false),
+            Some(expiry) => {
+                let remaining = to_system_time(expiry).duration_since(SystemTime::now());
+                match remaining {
+                    Ok(remaining) => (
+                        remaining.is_zero(),
+                        remaining <= self.credentials_refresh_offset,
+                    ),
+                    Err(_) => (true, true),
+                }
+            }
         }
+    }
+
+    /// Wait for an in-flight refresh, or fetch credentials ourselves.
+    async fn must_refresh(&self) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
+        let _lock = self.refresh_lock.lock().await;
+        if let Some(credentials) = self.credentials.read().await.clone()
+            && !self.check_staleness(&credentials).0
+        {
+            return Ok(credentials);
+        }
+        self.do_refresh().await
+    }
+
+    /// Let concurrent requests use valid cached credentials during a refresh.
+    async fn maybe_refresh(
+        &self,
+        old_credentials: Arc<aws_credential_types::Credentials>,
+    ) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
+        let Ok(_lock) = self.refresh_lock.try_lock() else {
+            return Ok(old_credentials);
+        };
+        if let Some(credentials) = self.credentials.read().await.clone()
+            && !Arc::ptr_eq(&credentials, &old_credentials)
+            && !self.check_staleness(&credentials).0
+        {
+            return Ok(credentials);
+        }
+        match self.do_refresh().await {
+            Ok(credentials) => Ok(credentials),
+            // The cached credentials may have expired while the request was in flight.
+            Err(_) if !self.check_staleness(&old_credentials).0 => Ok(old_credentials),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn do_refresh(&self) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
+        let credentials = Arc::new(
+            self.inner
+                .provide_credentials()
+                .await
+                .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
+        );
+        *self.credentials.write().await = Some(credentials.clone());
+        Ok(credentials)
     }
 }
 
@@ -645,7 +685,7 @@ mod tests {
     use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -718,6 +758,115 @@ mod tests {
         assert!(message.contains("Failed to get AWS credentials"));
         assert!(message.contains("Glue credential endpoint unavailable"));
         assert!(!message.contains("Encountered internal error"));
+    }
+
+    #[derive(Debug, Default)]
+    struct RefreshingAwsCredentialsProvider {
+        calls: AtomicUsize,
+        fail: AtomicBool,
+        advance_seconds: u64,
+    }
+
+    impl ProvideCredentials for RefreshingAwsCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            aws_credential_types::provider::future::ProvideCredentials::new(async {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                MockClock::advance_system_time(Duration::from_secs(self.advance_seconds));
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(CredentialsError::provider_error(std::io::Error::other(
+                        "STS unavailable",
+                    )));
+                }
+                Ok(aws_credential_types::Credentials::new(
+                    format!("key-{call}"),
+                    "secret",
+                    Some("token".to_string()),
+                    Some(
+                        std::time::UNIX_EPOCH + MockClock::system_time() + Duration::from_secs(120),
+                    ),
+                    "test",
+                ))
+            })
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::fresh(Some(120), 0, true, 0)]
+    #[case::no_expiry(None, 0, true, 0)]
+    #[case::refresh_boundary(Some(60), 0, true, 1)]
+    #[case::stale(Some(30), 0, true, 1)]
+    #[case::expires_during_refresh(Some(30), 30, false, 1)]
+    #[case::expiry_boundary(Some(0), 0, false, 1)]
+    #[case::expired(Some(-1), 0, false, 1)]
+    #[tokio::test]
+    async fn test_aws_credential_refresh_failure(
+        #[case] expires_in: Option<i64>,
+        #[case] advance_seconds: u64,
+        #[case] succeeds: bool,
+        #[case] expected_calls: usize,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let inner = Arc::new(RefreshingAwsCredentialsProvider {
+            fail: AtomicBool::new(true),
+            advance_seconds,
+            ..Default::default()
+        });
+        let provider = AwsCredentialAdapter::new(inner.clone(), Duration::from_secs(60));
+        *provider.credentials.write().await =
+            Some(Arc::new(aws_credential_types::Credentials::new(
+                "cached-key",
+                "cached-secret",
+                Some("cached-token".to_string()),
+                expires_in.map(|seconds| {
+                    std::time::UNIX_EPOCH + Duration::from_secs((100_000 + seconds) as u64)
+                }),
+                "test",
+            )));
+
+        let result = provider.get_credential().await;
+        if succeeds {
+            let credentials = result.unwrap();
+            assert_eq!(credentials.key_id, "cached-key");
+            assert_eq!(credentials.secret_key, "cached-secret");
+            assert_eq!(credentials.token.as_deref(), Some("cached-token"));
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, object_store::Error::Generic { .. }));
+            assert!(error.to_string().contains("STS unavailable"));
+        }
+        assert_eq!(inner.calls.load(Ordering::Relaxed), expected_calls);
+    }
+
+    #[tokio::test]
+    async fn test_aws_credential_concurrent_refresh() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let inner = Arc::new(RefreshingAwsCredentialsProvider::default());
+        let provider = AwsCredentialAdapter::new(inner.clone(), Duration::from_secs(60));
+
+        let (first, second) = tokio::join!(provider.get_credential(), provider.get_credential());
+        assert_eq!(first.unwrap().key_id, "key-0");
+        assert_eq!(second.unwrap().key_id, "key-0");
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+
+        MockClock::advance_system_time(Duration::from_secs(60));
+        let (refreshed, cached) =
+            tokio::join!(provider.get_credential(), provider.get_credential());
+        assert_eq!(refreshed.unwrap().key_id, "key-1");
+        assert_eq!(cached.unwrap().key_id, "key-0");
+        assert_eq!(provider.get_credential().await.unwrap().key_id, "key-1");
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+
+        MockClock::advance_system_time(Duration::from_secs(120));
+        let (first, second) = tokio::join!(provider.get_credential(), provider.get_credential());
+        assert_eq!(first.unwrap().key_id, "key-2");
+        assert_eq!(second.unwrap().key_id, "key-2");
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
