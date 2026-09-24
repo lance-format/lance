@@ -89,6 +89,20 @@ def prepare(args):
             Path(args.output).write_text(json.dumps(cases, indent=2))
 
 
+# Any threshold at or above this value must emit every pair of the partition.
+ALL_PAIRS_THRESHOLD = 1e9
+
+
+def pair_hash_sum(batch):
+    a = batch.column(0).to_numpy(zero_copy_only=True)
+    b = batch.column(1).to_numpy(zero_copy_only=True)
+    x = np.minimum(a, b) * np.uint64(0x9E3779B97F4A7C15) ^ np.maximum(a, b)
+    x ^= x >> np.uint64(33)
+    x *= np.uint64(0xFF51AFD7ED558CCD)
+    x ^= x >> np.uint64(33)
+    return x.sum(dtype=np.uint64)
+
+
 def process_snapshot():
     stats = resource.getrusage(resource.RUSAGE_SELF)
     status = {}
@@ -158,6 +172,9 @@ def run(args):
     observer = threading.Thread(target=monitor, daemon=True)
     observer.start()
     hashes = [hashlib.sha256() for _ in range(3)]
+    # Order-independent multiset hash of unordered ID pairs, so implementations
+    # with different (but deterministic) emission orders can be compared.
+    pair_set_hash = 0
     count = 0
     batches = 0
     kwargs = {}
@@ -179,6 +196,7 @@ def run(args):
                 batches += 1
                 for column, digest in zip(batch.columns, hashes):
                     digest.update(column.to_numpy(zero_copy_only=True).tobytes())
+                pair_set_hash = (pair_set_hash + int(pair_hash_sum(batch))) % 2**64
         elapsed = time.perf_counter() - start
     finally:
         stop.set()
@@ -188,7 +206,7 @@ def run(args):
     assert final["source_write_iops"] == 0
     assert final["source_written_bytes"] == 0
     possible_pairs = case["rows"] * (case["rows"] - 1) // 2
-    if args.threshold == 2.0:
+    if args.threshold >= ALL_PAIRS_THRESHOLD:
         assert count == possible_pairs, (count, possible_pairs)
     source_windows = [
         (a, b)
@@ -208,6 +226,7 @@ def run(args):
         output_rows=count,
         output_batches=batches,
         output_sha256=[h.hexdigest() for h in hashes],
+        pair_set_hash=f"{pair_set_hash:016x}",
         pairs_per_s=possible_pairs / elapsed,
         cpu_s=trace[-1]["cpu_s"] - trace[0]["cpu_s"],
         cpu_cores=(trace[-1]["cpu_s"] - trace[0]["cpu_s"]) / elapsed,

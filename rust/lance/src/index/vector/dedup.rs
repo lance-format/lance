@@ -4,9 +4,10 @@
 //! Streaming embedding duplicate pairs over existing index representations.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -19,6 +20,7 @@ use lance_index::vector::{
     pairwise::{PAIRWISE_MEMORY_LIMIT, PairwisePartition, PairwiseVectorBatch},
 };
 use lance_select::RowAddrMask;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -27,20 +29,36 @@ use crate::index::{
     segment_has_vector_details,
 };
 
-/// Scoring and output remain bounded even when the encoded partition spills.
+/// Scoring and output remain bounded even when the staged partition spills.
 /// A multiple of 32 also matches RQ's packed sign-code group size.
 const MAX_VECTOR_BATCH_SIZE: usize = 8192;
 
-// Small SIMD batches do not justify a CPU-pool round trip. Larger distances
-// run on the CPU pool; inline batches yield cooperatively in the scan loop.
-const MIN_OFFLOAD_BYTES: usize = 256 * 1024;
+/// Anchor rows per scoring job. A job scores these rows against one candidate
+/// batch (at most 32 x 8,192 pairs, a few milliseconds for typical codes), so
+/// jobs are uniform enough for ordered completion and dense output per job
+/// stays near 5 MiB, while each candidate row loaded into cache is reused by
+/// 32 anchors.
+const ANCHOR_BLOCK_ROWS: usize = 32;
+
+/// Jobs touching less staged data than this (anchor rows x candidate rows x
+/// staged row bytes) run inline; a CPU-pool round trip would cost more.
+const MIN_OFFLOAD_WORK_BYTES: usize = 1024 * 1024;
+
+/// Lower bound on decoded spilled batches kept alive at once: the current
+/// anchor plus the candidate batches of two consecutive tiles, so loading the
+/// next tile never waits on the previous one when tiles have many jobs.
+const MIN_LIVE_SPILLED_BATCHES: usize = 3;
 
 /// Per-invocation code staging and ordered scoring concurrency.
 ///
 /// The staging budget is not a process-wide memory limit. It excludes quantizer
-/// models, row masks, spill metadata and in-flight scoring buffers.
-/// With spilled codes, each in-flight job may retain an anchor batch, a
-/// candidate batch and at most one output batch, each bounded to 8,192 rows (smaller batches for wide codes).
+/// models, row masks, spill metadata and in-flight scoring buffers. Each
+/// in-flight job shares its anchor and candidate batches (at most 8,192 rows
+/// and about 16 MiB of staged codes) with the other jobs of its tile, and
+/// produces at most one output batch of `32 x vector batch size` pairs. A
+/// spilled partition's batches are read back as decoded copies; those alive at
+/// once hold at most `memory_limit` bytes of staged codes (or three batches, if
+/// larger), even when sparse selection leaves only one job per tile.
 ///
 /// ```
 /// use lance::index::vector::dedup::DuplicatePairsOptions;
@@ -58,13 +76,13 @@ impl Default for DuplicatePairsOptions {
     fn default() -> Self {
         Self {
             memory_limit: PAIRWISE_MEMORY_LIMIT,
-            max_concurrency: get_num_compute_intensive_cpus().min(8),
+            max_concurrency: get_num_compute_intensive_cpus(),
         }
     }
 }
 
 impl DuplicatePairsOptions {
-    /// Set the compact code staging budget in bytes (default 256 MiB).
+    /// Set the staged code budget in bytes (default 256 MiB).
     /// Partitions estimated to exceed it spill; zero forces spill. Source reads,
     /// quantizer preparation and scoring retain additional bounded batches.
     pub fn with_memory_limit(mut self, memory_limit: usize) -> Self {
@@ -73,7 +91,7 @@ impl DuplicatePairsOptions {
     }
 
     /// Set the maximum number of in-flight scoring jobs. Must be positive.
-    /// The default is the CPU pool size capped at eight. Output remains ordered.
+    /// The default is the CPU pool size. Output order does not depend on it.
     pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.max_concurrency = max_concurrency;
         self
@@ -92,16 +110,33 @@ fn pair_schema() -> SchemaRef {
 ///
 /// `column` must have exactly one logical, current-format vector index covering
 /// all current fragments. Deleted rows are excluded at the dataset snapshot.
-/// Quantized distances use native code-to-code batch kernels, not exact
-/// source-vector distances. Cross-partition and cross-segment
-/// pairs are not evaluated. No top-k limit is applied.
+/// Cross-partition and cross-segment pairs are not evaluated. No top-k limit
+/// is applied. A pair qualifies when its finite distance is `<= threshold`.
 ///
-/// Pairs follow stable index traversal (`i < j`), not numeric row-ID order.
-/// All output for one `row_id_a` is contiguous, even across output batches.
+/// Distances are computed natively between the index representations `x̂`
+/// (the vectors the codes reconstruct, exact vectors for IVF_FLAT) without
+/// reconstructing them, using the metric's definition:
+///
+/// | metric  | distance                                          |
+/// |---------|---------------------------------------------------|
+/// | l2      | squared L2 `‖x̂a − x̂b‖²`                           |
+/// | cosine  | `1 − cos(x̂a, x̂b)` in `[0, 2]`; 0 for identical codes |
+/// | dot     | `1 − x̂a·x̂b`                                       |
+/// | hamming | number of differing bits                          |
+///
+/// Cosine renormalizes quantized representations, as exact or refined search
+/// does; unrefined ANN search over quantized cosine indices reports roughly
+/// twice this value. Distances are bit-identical across concurrency, memory
+/// limits and the scoped [`find_duplicate_pairs_in_partition`] API.
+///
+/// Output order is deterministic: segments, partitions ascending, then tiles
+/// of staged vector batches `(I, J >= I)`, row-major within a tile (anchor row,
+/// then candidate row). Each pair appears once with `row_id_a` at the lower
+/// storage position; `row_id_a` values are not contiguous across tiles.
 /// Dropping the stream cancels further reads; only bounded in-flight CPU work
-/// can finish. See [`find_duplicate_pairs_in_partition`] for distributed use.
-/// Each partition's compact codes are prepared once; larger partitions use
-/// session spill storage, reclaimed when advancing partitions or dropping the stream.
+/// can finish. Each partition's codes are staged once; larger partitions use
+/// session spill storage, reclaimed when advancing partitions or dropping the
+/// stream, and are read O(B²) times for B vector batches.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -152,8 +187,9 @@ pub async fn find_duplicate_pairs_with_options(
 /// Enumerate pairs only within the specified physical segment and partition.
 ///
 /// The segment UUID must belong to the index of `column`; `partition_id` is
-/// local to that segment. This uses the same scorer and ordering as
-/// [`find_duplicate_pairs`], and does not require other fragments to be indexed.
+/// local to that segment. This uses the same scorer, distances and ordering as
+/// [`find_duplicate_pairs`]. It does not require other fragments to be indexed,
+/// so rows of unindexed fragments are not paired.
 /// The caller must pin the same dataset version on every worker.
 ///
 /// ```
@@ -368,103 +404,151 @@ async fn partition_stream(
             session.spill_store(),
         )
         .await?;
-    let batch_size = prepared.vector_batch_size();
-    let prepared = Arc::new(prepared);
-    let state = PairWork {
-        prepared,
-        count,
-        batch_size,
+    // In-memory reads share the staged buffers; spilled reads decode copies.
+    let live_batches = prepared.is_spilled().then(|| {
+        let batch_bytes = prepared
+            .vector_batch_size()
+            .saturating_mul(prepared.row_bytes())
+            .max(1);
+        Arc::new(Semaphore::new(
+            (options.memory_limit / batch_bytes).max(MIN_LIVE_SPILLED_BATCHES),
+        ))
+    });
+    let state = TileJobs {
+        num_batches: prepared.num_batches(),
+        live_batches,
+        prepared: Arc::new(prepared),
         filter: partition.mask,
         threshold,
         schema: schema.clone(),
+        anchor_batch: 0,
+        candidate_batch: 0,
         anchor: None,
-        anchor_start: 0,
-        anchor_row: 0,
-        candidate_start: 0,
+        candidates: None,
+        next_row: 0,
     };
     let jobs = stream::try_unfold(state, |mut state| async move {
         state
-            .next_work()
+            .next_job()
             .await
-            .map(|work| work.map(|work| (work, state)))
+            .map(|job| job.map(|job| (job, state)))
     });
-    // Bounded ordered completion preserves contiguous anchors without collecting
-    // an entire anchor's matches or an entire block-pair distance matrix.
+    // Ordered completion keeps the tile order independent of concurrency
+    // without collecting a whole tile's matches.
     let batches = jobs
-        .map_ok(|work| work.score())
+        .map_ok(|job| job.score())
         .try_buffered(options.max_concurrency)
         .try_filter(|batch| std::future::ready(batch.num_rows() != 0))
         .map_err(datafusion::error::DataFusionError::from);
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
 }
 
-struct PairWork {
+/// Produces scoring jobs lazily in tile order: anchor batch `I`, candidate
+/// batch `J >= I`, then blocks of anchor rows. Each batch is read once per
+/// tile side (O(B²) reads for B batches) and shared by that tile's jobs.
+struct TileJobs {
     prepared: Arc<PairwisePartition>,
-    count: usize,
-    batch_size: usize,
+    num_batches: usize,
+    /// Bounds decoded spilled batches held by the generator and in-flight jobs.
+    /// The generator holds at most one permit (its anchor) while waiting, and
+    /// jobs release theirs on completion, so the wait always makes progress.
+    live_batches: Option<Arc<Semaphore>>,
     filter: Arc<RowAddrMask>,
     threshold: f32,
     schema: SchemaRef,
-    anchor: Option<PairwiseVectorBatch>,
-    anchor_start: usize,
-    anchor_row: usize,
-    candidate_start: usize,
+    anchor_batch: usize,
+    candidate_batch: usize,
+    anchor: Option<Arc<LoadedBatch>>,
+    candidates: Option<Arc<LoadedBatch>>,
+    next_row: usize,
 }
 
-impl PairWork {
-    async fn next_work(&mut self) -> Result<Option<ScoreWork>> {
+/// A loaded batch with its row selection, holding a live-batch permit while
+/// any job still references it.
+struct LoadedBatch {
+    batch: PairwiseVectorBatch,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+fn has_selected(selected: &[bool]) -> bool {
+    selected.iter().any(|&selected| selected)
+}
+
+impl TileJobs {
+    /// Read a batch and resolve row selection once for every pair it joins.
+    async fn load(&self, batch_id: usize) -> Result<Arc<LoadedBatch>> {
+        let permit = match &self.live_batches {
+            Some(live) => Some(
+                live.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::internal("pairwise live batch semaphore closed"))?,
+            ),
+            None => None,
+        };
+        let mut batch = self.prepared.read_vectors(batch_id).await?;
+        batch.filter_rows(|id| self.filter.selected(id));
+        Ok(Arc::new(LoadedBatch {
+            batch,
+            _permit: permit,
+        }))
+    }
+
+    async fn next_job(&mut self) -> Result<Option<ScoreJob>> {
         loop {
             tokio::task::consume_budget().await;
-            if self.anchor_start >= self.count {
+            if self.anchor_batch >= self.num_batches {
                 return Ok(None);
             }
-            if self.anchor.is_none() {
-                self.anchor = Some(
-                    self.prepared
-                        .read_vectors(self.anchor_start / self.batch_size)
-                        .await?,
-                );
-                self.anchor_row = 0;
-                self.candidate_start = self.anchor_start;
-            }
-            let anchor = self
-                .anchor
-                .as_ref()
-                .ok_or_else(|| Error::internal("missing anchor batch"))?;
-            if self.anchor_row == anchor.row_ids.len() {
-                self.anchor_start += anchor.row_ids.len();
-                self.anchor = None;
+            let anchor = match &self.anchor {
+                Some(anchor) => anchor.clone(),
+                None => {
+                    let anchor = self.load(self.anchor_batch).await?;
+                    if !has_selected(anchor.batch.selected()) {
+                        self.anchor_batch += 1;
+                        continue;
+                    }
+                    self.anchor = Some(anchor.clone());
+                    self.candidate_batch = self.anchor_batch;
+                    self.next_row = 0;
+                    anchor
+                }
+            };
+            let is_diagonal = self.candidate_batch == self.anchor_batch;
+            let candidates = match &self.candidates {
+                Some(candidates) => candidates.clone(),
+                None => {
+                    let candidates = if is_diagonal {
+                        anchor.clone()
+                    } else {
+                        self.load(self.candidate_batch).await?
+                    };
+                    self.candidates = Some(candidates.clone());
+                    self.next_row = 0;
+                    candidates
+                }
+            };
+            // The last row of a diagonal tile has no later candidate.
+            let anchor_end = anchor.batch.num_rows() - usize::from(is_diagonal);
+            if self.next_row >= anchor_end || !has_selected(candidates.batch.selected()) {
+                self.candidates = None;
+                self.candidate_batch += 1;
+                if self.candidate_batch >= self.num_batches {
+                    self.anchor = None;
+                    self.anchor_batch += 1;
+                }
                 continue;
             }
-            let a = anchor.row_ids.value(self.anchor_row);
-            if !anchor.row_ids.is_valid(self.anchor_row)
-                || !self.filter.selected(a)
-                || self.candidate_start >= self.count
-            {
-                self.anchor_row += 1;
-                self.candidate_start = self.anchor_start;
+            let rows = self.next_row..(self.next_row + ANCHOR_BLOCK_ROWS).min(anchor_end);
+            self.next_row = rows.end;
+            if !has_selected(&anchor.batch.selected()[rows.clone()]) {
                 continue;
             }
-            let start = self.candidate_start;
-            let end = start.saturating_add(self.batch_size).min(self.count);
-            let query = anchor.clone();
-            let first = (self.anchor_start + self.anchor_row + 1)
-                .saturating_sub(start)
-                .min(end - start);
-            self.candidate_start = end;
-            if first == end - start {
-                continue;
-            }
-            return Ok(Some(ScoreWork {
+            return Ok(Some(ScoreJob {
                 prepared: self.prepared.clone(),
-                a,
-                query,
-                query_row: self.anchor_row,
-                first,
-                candidate_batch: start / self.batch_size,
-                // Reuse the anchor's codes for same-batch comparisons.
-                candidate: (start == self.anchor_start).then(|| anchor.clone()),
-                filter: self.filter.clone(),
+                anchor,
+                rows,
+                candidates,
                 threshold: self.threshold,
                 schema: self.schema.clone(),
             }));
@@ -472,72 +556,39 @@ impl PairWork {
     }
 }
 
-struct ScoreWork {
+struct ScoreJob {
     prepared: Arc<PairwisePartition>,
-    a: u64,
-    query: PairwiseVectorBatch,
-    query_row: usize,
-    first: usize,
-    candidate_batch: usize,
-    candidate: Option<PairwiseVectorBatch>,
-    filter: Arc<RowAddrMask>,
+    anchor: Arc<LoadedBatch>,
+    rows: Range<usize>,
+    candidates: Arc<LoadedBatch>,
     threshold: f32,
     schema: SchemaRef,
 }
 
-impl ScoreWork {
+impl ScoreJob {
     async fn score(self) -> Result<RecordBatch> {
-        let candidates = match self.candidate {
-            Some(candidate) => candidate,
-            None => self.prepared.read_vectors(self.candidate_batch).await?,
-        };
-        let Self {
-            a,
-            query,
-            query_row,
-            prepared,
-            first,
-            filter,
-            threshold,
-            schema,
-            ..
-        } = self;
-        let work_bytes = candidates.codes.get_array_memory_size();
+        let work_bytes = self
+            .rows
+            .len()
+            .saturating_mul(self.candidates.batch.num_rows())
+            .saturating_mul(self.prepared.row_bytes());
         let score = move || -> Result<RecordBatch> {
-            // Score only the upper triangle, including within one batch.
-            let candidates = PairwiseVectorBatch {
-                row_ids: candidates
-                    .row_ids
-                    .slice(first, candidates.row_ids.len() - first),
-                codes: candidates
-                    .codes
-                    .slice(first, candidates.row_ids.len() - first),
-            };
-            let distances = prepared.distance_batch(&query, query_row, &candidates)?;
-            let mut b = Vec::new();
-            let mut d = Vec::new();
-            for (i, distance) in distances.into_iter().enumerate() {
-                let id = candidates.row_ids.value(i);
-                if candidates.row_ids.is_valid(i)
-                    && filter.selected(id)
-                    && id != a
-                    && distance.is_finite()
-                    && distance <= threshold
-                {
-                    b.push(id);
-                    d.push(distance);
-                }
-            }
+            let hits = self.prepared.score_block(
+                &self.anchor.batch,
+                self.rows,
+                &self.candidates.batch,
+                self.threshold,
+            )?;
             Ok(RecordBatch::try_new(
-                schema,
+                self.schema,
                 vec![
-                    Arc::new(UInt64Array::from(vec![a; b.len()])),
-                    Arc::new(UInt64Array::from(b)),
-                    Arc::new(Float32Array::from(d)),
+                    Arc::new(UInt64Array::from(hits.row_id_a)),
+                    Arc::new(UInt64Array::from(hits.row_id_b)),
+                    Arc::new(Float32Array::from(hits.distances)),
                 ],
             )?)
         };
-        if work_bytes < MIN_OFFLOAD_BYTES {
+        if work_bytes < MIN_OFFLOAD_WORK_BYTES {
             score()
         } else {
             spawn_cpu(score).await

@@ -448,8 +448,10 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         false
     }
 
-    /// Stage compact codes once for native batch scoring in storage order.
-    /// Partitions beyond `memory_limit` bytes use the caller's spill store.
+    /// Stage a partition's codes once, in storage order, for native
+    /// code-to-code tile scoring (see [`pairwise`] for the distance
+    /// definitions). `batch_size` is the maximum rows per staged batch.
+    /// Partitions staged beyond `memory_limit` bytes use the caller's spill store.
     async fn prepare_pairwise_partition(
         &self,
         _partition_id: usize,

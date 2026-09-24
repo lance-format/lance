@@ -30,10 +30,11 @@ LANCE_CPU_THREADS=8 RAYON_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
   --memory-limit 268435456 --max-concurrency 8 --output result.json
 ```
 
-Use cases 0..3 and thresholds 0.01 (sparse output) and 2.0 (all pairs). Omit the
-two new resource arguments when running an older baseline. Each invocation is a
-fresh process, fully consumes the stream, and asserts zero writes on the source
-object store. Run only one measured process at a time, with no concurrent builds.
+Use cases 0..3 and thresholds 0.01 (sparse output) and 1e9 (all pairs; any
+threshold at or above `ALL_PAIRS_THRESHOLD` asserts N*(N-1)/2 output pairs).
+Omit the two resource arguments when running a baseline that predates them.
+Each invocation is a fresh process, fully consumes the stream, and asserts zero
+writes on the source object store. Run only one measured process at a time, with no concurrent builds.
 The optional global `--credentials` argument reads an AWS credential-process
 JSON file; credential values are never written to results. Normal environment
 credentials work without that argument.
@@ -45,11 +46,17 @@ credentials work without that argument.
   opening is reported separately as `dataset_open_s`. Table/index creation is
   not timed.
 - Three independent SHA-256 hashes cover the ordered row-ID and float32-distance
-  columns. Compare ID hashes and pair counts between implementations. Quantizer-native
-  cosine uses normalized L2 / 2; distance bits may differ from older versions
-  that renormalized reconstructed vectors. Compare distance hashes only for
-  implementations with the same scoring semantics. Hashes do
-  not depend on output batch boundaries. Dense output must contain N*(N-1)/2 pairs.
+  columns; they depend on output order but not on batch boundaries. Output is
+  in tile order (vector batch pairs, row-major within a tile), which differs
+  from implementations that kept each `row_id_a` contiguous. Compare
+  `pair_set_hash` (an order-independent hash of the unordered ID pairs) and
+  `output_rows` between implementations; compare the ordered hashes only
+  between runs of one implementation, for example across `--max-concurrency`
+  and `--memory-limit`, where they must match exactly.
+- Cosine distances are `1 - cos` of the renormalized index reconstructions, in
+  [0, 2]. Compare distance hashes only between implementations with the same
+  scoring semantics; versions that reported normalized L2 / 2 for quantized
+  cosine differ.
 - `cpu_cores` is process user+system CPU time divided by wall time. It includes
   the Python consumer and monitoring overhead, not just Rust scoring threads.
 - RSS is for the whole process, including Python, shared libraries and native
@@ -70,19 +77,7 @@ The adjacent `.trace.json` file contains the time series, so short I/O preparati
 can be distinguished from a long compute phase. Report repetitions and statistics
 explicitly; a single long scan must not be described as a median.
 
-## Reachable S3 throughput reference
-
-Run separately from enumeration, on the same host and CPU affinity:
-
-```sh
-taskset -c 0-7 uv run --no-sync python python/benchmarks/duplicate_pairs_io.py \
-  --config cases.json --seconds 10 --output s3-reference.json
-```
-
-This performs only conditional range GETs on an existing fixture data file, at
-concurrency 1/8/16. It measures reachable bulk S3 throughput, not a hardware limit
-or Lance scan throughput. A low whole-query S3 average does not imply an I/O
-bottleneck when all source reads finish early and CPU work dominates afterward.
+## Resource diagnostics
 
 Also compare `--max-concurrency 1` to 8 and force code spill with
 `--memory-limit 0`. The latter changes the storage/memory tradeoff; OS file

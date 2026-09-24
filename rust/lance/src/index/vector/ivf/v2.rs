@@ -3912,17 +3912,27 @@ mod tests {
             .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
             .await
             .unwrap();
+        let memory_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
         let spilled = index
             .prepare_pairwise_partition(0, BATCH_SIZE, 0, store)
             .await
             .unwrap();
+        let spilled_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+        assert!(memory_bytes > 0);
+        // Spilled source reads fetch each column's bytes about once; small
+        // tail ranges round up to encoding chunks. Rereading the PQ code
+        // column for every source window used to cost ~2.6x.
         assert!(
-            dataset
-                .object_store
-                .as_ref()
-                .io_stats_incremental()
-                .read_iops
-                > 0
+            spilled_bytes < 2 * memory_bytes,
+            "spilled preparation read {spilled_bytes} bytes, in-memory {memory_bytes}"
         );
         dataset.object_store.as_ref().io_stats_incremental();
         let mut seen = HashSet::new();
@@ -3946,6 +3956,36 @@ mod tests {
             "replay must not reread the source index"
         );
         assert_eq!(stats.read_bytes, 0);
+
+        // Spilled and in-memory staging score bit-identically, in every tile.
+        let anchor = memory.read_vectors(0).await.unwrap();
+        let spilled_anchor = spilled.read_vectors(0).await.unwrap();
+        for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
+            let expected = memory
+                .score_block(
+                    &anchor,
+                    0..32,
+                    &memory.read_vectors(batch_id).await.unwrap(),
+                    f32::MAX,
+                )
+                .unwrap();
+            let actual = spilled
+                .score_block(
+                    &spilled_anchor,
+                    0..32,
+                    &spilled.read_vectors(batch_id).await.unwrap(),
+                    f32::MAX,
+                )
+                .unwrap();
+            let candidates = BATCH_SIZE.min(NUM_ROWS - batch_id * BATCH_SIZE);
+            let pairs = if batch_id == 0 {
+                (0..32).map(|row| candidates - row - 1).sum()
+            } else {
+                32 * candidates
+            };
+            assert_eq!(expected.distances.len(), pairs);
+            assert_eq!(actual, expected);
+        }
     }
 
     async fn search_lightweight_pq_index(
