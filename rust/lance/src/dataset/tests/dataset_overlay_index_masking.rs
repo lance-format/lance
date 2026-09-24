@@ -3170,3 +3170,40 @@ async fn test_rtree_merge_keeps_coverage_when_later_commits_follow_a_retired_out
          intermediate one it came from"
     );
 }
+
+/// A compaction that leaves no reuse mapping simply retires the fragments it
+/// rewrote, and coverage of them is intersected away. That says nothing about a
+/// group whose mapping is intact, which keeps its coverage.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_a_mapped_group_when_another_was_retired_unmapped() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids.clone()).await;
+
+    let pair = |excluded: Vec<u32>, defer: bool| CompactionOptions {
+        target_rows_per_fragment: (RTREE_ROWS_PER_FRAGMENT * 2) as usize,
+        defer_index_remap: defer,
+        excluded_fragment_ids: excluded,
+        ..Default::default()
+    };
+    // One pair rewritten with its index remapped inline, so it leaves no mapping
+    // and those staged fragments simply vanish from the manifest.
+    compact_files(&mut dataset, pair(fragment_ids[2..].to_vec(), false), None)
+        .await
+        .unwrap();
+    // The other pair deferred, so its coverage has a mapping to follow.
+    compact_files(&mut dataset, pair(fragment_ids[..2].to_vec(), true), None)
+        .await
+        .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        1,
+        "the deferred pair's coverage was given up because an unrelated pair was \
+         retired without a reuse mapping"
+    );
+}

@@ -575,6 +575,11 @@ async fn indexed_data_moved_on(
     }
 
     for (fragment, recorded) in following {
+        // A fragment the manifest no longer has is intersected out of the
+        // coverage regardless, so it claims nothing and has nothing to match.
+        if !dataset.fragments().iter().any(|f| f.id as u32 == fragment) {
+            continue;
+        }
         let Some(against) =
             recorded_state(dataset, &mut read, &retained, recorded, fragment, dataset).await?
         else {
