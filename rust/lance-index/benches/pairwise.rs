@@ -146,7 +146,7 @@ fn bench_pairwise_tile(c: &mut Criterion) {
         .build()
         .unwrap();
     let mut rng = SmallRng::seed_from_u64(42);
-    let cases: Vec<(&str, DistanceType, (Quantizer, [RecordBatch; 2]))> = vec![
+    let cases = vec![
         (
             "flat_l2",
             DistanceType::L2,
