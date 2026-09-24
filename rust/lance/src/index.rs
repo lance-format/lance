@@ -1525,12 +1525,14 @@ pub(crate) async fn remap_index(
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
 ) -> Result<RemapResult> {
-    // Load indices from the disk.
-    let indices = dataset.load_indices().await?;
-    let matched = indices
-        .iter()
-        .find(|i| i.uuid == *index_id)
+    // A remap is maintenance: a segment the tagged reader excludes from the
+    // listing is still reachable here (its caller decided whether to touch
+    // it), so the metadata comes from the maintenance lookup.
+    let matched = dataset
+        .load_index_with_purpose(index_id, frag_reuse::OpenPurpose::Maintenance)
+        .await?
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
+    let matched = &matched;
 
     // Corrupt metadata fails closed before anything else: a declaration that is
     // not a valid suffix of `fields` cannot be reasoned about at all, and the

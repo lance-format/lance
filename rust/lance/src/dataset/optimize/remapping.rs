@@ -8,7 +8,8 @@ use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
-    decode_frag_reuse_ledger, load_frag_reuse_index_details, open_frag_reuse_index,
+    MissingCoverageReason, decode_frag_reuse_ledger, load_frag_reuse_index_details,
+    open_frag_reuse_index,
 };
 use crate::index::frag_reuse_reader::{CachedMapping, open_mapping};
 use crate::{Dataset, index};
@@ -776,6 +777,34 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
                 "index {index_id} not found in manifest; it may have been concurrently dropped"
             ))
         })?;
+    // Eligibility is decided at the plan level, before any file is read: a
+    // segment the reader derives no coverage for is skipped when it will be
+    // replaced anyway (withdrawn, superseded) or cannot be translated by
+    // this build (nothing to restamp), and refused when its metadata cannot
+    // be interpreted. A remap never publishes a bitmap for rows it did not
+    // translate.
+    match crate::index::frag_reuse::segment_coverage_reason(dataset, &curr_index_meta).await? {
+        None => {}
+        Some(
+            reason @ (MissingCoverageReason::Withdrawn
+            | MissingCoverageReason::NoDerivedCoverage
+            | MissingCoverageReason::Unsupported),
+        ) => {
+            log::info!(
+                "Skipping remap of index {} ({}): {reason}. A rebuild (optimize) replaces it; \
+                 queries are unaffected",
+                curr_index_meta.name,
+                curr_index_meta.uuid
+            );
+            return Ok(());
+        }
+        Some(MissingCoverageReason::Corrupt) => {
+            return Err(Error::index(format!(
+                "index {} ({}) has metadata this build cannot interpret; rebuild the index",
+                curr_index_meta.name, curr_index_meta.uuid
+            )));
+        }
+    }
     let Some(provenance) = curr_index_meta.fragment_bitmap.clone() else {
         log::warn!(
             "Index {} ({}) has no stored fragment bitmap; its lineage through the tagged \
@@ -2187,18 +2216,15 @@ mod tests {
             assert!(entry.dataset_version > after.dataset_version);
         }
 
-        /// A8/A9 integration: a segment covering only part of a compaction
-        /// group takes the straddle fallback -- the group's coverage is
-        /// dropped from the swapped bitmap -- and the affected rows are
-        /// served by scan with correct results.
-        ///
-        /// The compaction planner never bins indexed and unindexed fragments
-        /// together, so this state cannot arise from a planned compaction;
-        /// the fallback is defensive. Recreate it by narrowing the segment's
-        /// stored bitmap (a legal under-claim) after the compaction.
+        /// A segment straddling a compaction (it covers only some of the
+        /// group's sources) derives no coverage for the group's destination:
+        /// the plan skips its remap outright and the manifest is untouched.
+        /// The rows it covered come back through scans; a rebuild catches it
+        /// up. (A segment that straddles one group while owning other coverage
+        /// still remaps, dropping only the straddled group's coverage.)
         #[tokio::test]
         #[serial_test::serial(frag_reuse_maintenance)]
-        async fn straddled_segment_drops_coverage_and_scans() {
+        async fn straddled_segment_is_skipped_and_scans() {
             let dataset = reader_tests::fixture().await;
             let mut dataset = append_two_fragments(dataset).await;
             reserve_fragments(&mut dataset, 40).await;
@@ -2223,17 +2249,15 @@ mod tests {
             remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
                 .await
                 .unwrap();
-            // The drop is committed (with no address movement to apply, the
-            // segment may keep its uuid through the empty-remap shortcut).
-            assert_eq!(dataset.manifest.version, version_before + 1);
-            let after = stored_index(&dataset, "i_idx").await;
-            assert!(
-                after.fragment_bitmap.as_ref().unwrap().is_empty(),
-                "the straddled group's coverage is dropped, not partially claimed"
+            assert_eq!(
+                dataset.manifest.version, version_before,
+                "nothing committed"
             );
-            assert!(after.dataset_version > before.dataset_version);
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(after.uuid, before.uuid);
+            assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
 
-            // The dropped rows come back correct through scans.
+            // The straddled rows come back correct through scans.
             assert_eq!(
                 sorted_values(&dataset, Some("i < 4")).await,
                 (0..4).collect::<Vec<_>>()
@@ -2372,6 +2396,133 @@ mod tests {
             assert_eq!(segment_fragments_for(&dataset, 3).await, Vec::<u32>::new());
             assert_eq!(segment_fragments_for(&dataset, 0).await, Vec::<u32>::new());
             assert_eq!(segment_fragments_for(&dataset, 9).await, vec![12]);
+        }
+
+        /// Segments the reader derives no coverage for are not remapped: the
+        /// plan decides before any file is read and the manifest is left
+        /// alone. A translating segment a newer direct sibling superseded, the
+        /// last segment of a name emptied by an in-place rewrite, and a
+        /// legacy-format vector segment this build cannot translate.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn ineligible_segments_are_skipped_at_the_plan_level() {
+            // Superseded: a direct sibling over both destinations.
+            let mut dataset = keyed_dataset(2).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let superseded = stored_index(&dataset, "i_idx").await;
+            let direct = crate::index::CreateIndexBuilder::new(
+                &mut dataset,
+                &["i"],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name("i_idx".into())
+            .replace(true)
+            .fragments(vec![10, 11])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![direct.clone()],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !dataset
+                    .load_indices()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|idx| idx.uuid == superseded.uuid),
+                "the direct sibling supersedes the translating segment"
+            );
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version, "nothing committed");
+            let stored = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap();
+            assert!(stored.iter().any(|idx| idx.uuid == superseded.uuid));
+            assert!(stored.iter().any(|idx| idx.uuid == direct.uuid));
+
+            // Withdrawn: the last segment of its name emptied by a rewrite.
+            let mut dataset = keyed_dataset(2).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let mut dataset = rewrite_in_place(dataset, 2, 222).await;
+            let withdrawn = stored_index(&dataset, "i_idx").await;
+            assert!(withdrawn.fragment_bitmap.as_ref().unwrap().is_empty());
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version, "nothing committed");
+            assert_eq!(stored_index(&dataset, "i_idx").await.uuid, withdrawn.uuid);
+
+            // Unsupported: a legacy-format vector segment cannot be translated.
+            use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .col(
+                    "vector",
+                    lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+                )
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+                .await
+                .unwrap();
+            let mut params = crate::index::vector::VectorIndexParams::ivf_pq(
+                1,
+                4,
+                2,
+                lance_linalg::distance::DistanceType::L2,
+                10,
+            );
+            params.version(crate::index::vector::IndexFileVersion::Legacy);
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("vector_idx".into()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let legacy = stored_index(&dataset, "vector_idx").await;
+            assert!(
+                !dataset
+                    .load_indices()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|idx| idx.uuid == legacy.uuid),
+                "excluded: this build cannot translate a legacy-format segment"
+            );
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["vector"], Some("vector_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version, "nothing committed");
+            assert_eq!(stored_index(&dataset, "vector_idx").await.uuid, legacy.uuid);
         }
 
         /// A merged segment keeps its sources' provenance while its pages hold
