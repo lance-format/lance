@@ -139,6 +139,10 @@ impl IndexMetadata {
     ///
     /// Such an index cannot follow its data through a rewrite: the addresses it stores
     /// name fragments and offsets, and neither kind supports remap.
+    ///
+    /// Currently this is a rather short list.  We will soon be migrating the remaining
+    /// row-id-domain indexes to use row addresses.  At that point this list will grow and
+    /// likely turn from an allow-list into a block-list.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             let is_fm = details

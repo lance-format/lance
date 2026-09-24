@@ -16,6 +16,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::system_index::is_system_index;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -37,6 +38,13 @@ pub struct TransactionRebase<'a> {
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
+}
+
+/// Whether a fragment-reuse index would corrupt `index` rather than repair it.
+///
+/// This happens when we have SRID, FRI, and row-id based indexes
+fn corrupted_by_frag_reuse(index: &IndexMetadata) -> bool {
+    !is_system_index(index) && !index.results_are_row_addrs()
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -1071,6 +1079,31 @@ impl<'a> TransactionRebase<'a> {
                         // would produce a bitmap with a mix of indexed and
                         // non-indexed fragments, which load_indices rejects.
                         (None, Some(_)) => {
+                            // The compaction planned before this index existed, so
+                            // its own guard could not see it. Refuse the pair here.
+                            //
+                            // This should be relatively rare as we are moving indexes
+                            // away from row ids
+                            //
+                            // `old_fragments` come from the dataset's manifest at the
+                            // rewrite's read version (never freshly constructed, where
+                            // `row_id_meta` would default to `None` regardless of the
+                            // feature flag), so `row_id_meta.is_some()` is equivalent to
+                            // the manifest's stable-row-ids flag being set. This is an
+                            // inference from fragment metadata rather than reading the
+                            // flag directly, and would silently stop detecting the
+                            // conflict below if that equivalence ever broke.
+                            let uses_stable_row_ids = groups
+                                .iter()
+                                .flat_map(|g| &g.old_fragments)
+                                .any(|f| f.row_id_meta.is_some());
+                            if uses_stable_row_ids
+                                && new_indices.iter().any(corrupted_by_frag_reuse)
+                            {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
                             for index in new_indices {
                                 let Some(frag_bitmap) = &index.fragment_bitmap else {
                                     return Err(self
@@ -2358,6 +2391,7 @@ mod tests {
     use uuid::Uuid;
 
     use lance_table::format::IndexMetadata;
+    use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -4704,6 +4738,93 @@ mod tests {
                 assert!(
                     result.is_ok(),
                     "disjoint staged NGram index should remain compatible, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
+        let row_id_domain_index = |fragment_id| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_ivf".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "lance.index.IvfPqIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let frag_reuse_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 2,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        // The rewrite's own `old_fragments` are what the SRID inference reads:
+        // `row_id_meta` set means stable row ids were on at the read version.
+        for (row_id_meta, expect_conflict) in [
+            (Some(RowIdMeta::Inline(InlineRowIds::from(vec![7]))), true),
+            (None, false),
+        ] {
+            let mut old_fragment = Fragment::new(1);
+            old_fragment.row_id_meta = row_id_meta;
+
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(
+                    1,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments: vec![old_fragment],
+                            new_fragments: vec![Fragment::new(2)],
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: Some(frag_reuse_index.clone()),
+                    },
+                    None,
+                ),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            // Disjoint from the rewritten fragment, so this only exercises the
+            // stable-row-ids check and not the group-straddling check below it.
+            let create_index = Transaction::new(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![row_id_domain_index(5u32)],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let result = rebase.check_txn(&create_index, 2);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "stable row ids should conflict with a row-id-domain index built \
+                     during a deferred rewrite, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "fragments without row ids should not trip the stable-row-ids \
+                     inference, got {result:?}"
                 );
             }
         }
