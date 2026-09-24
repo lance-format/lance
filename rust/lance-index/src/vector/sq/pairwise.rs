@@ -33,14 +33,13 @@ use crate::vector::pairwise::{
 };
 use crate::vector::quantizer::Quantization;
 
-/// Staged `Σ code` per row.
+/// Staged `Σ code` per row, for dot and for the batched kernels.
 const CODE_SUM_COLUMN: &str = "__pairwise_sq_code_sum";
-/// Staged `Σ code²` per row, for l2 and cosine.
+/// Staged `Σ code²` per row, for the batched l2 and cosine kernels.
 const CODE_SQUARES_COLUMN: &str = "__pairwise_sq_code_squares";
 
 /// Largest dimension whose code statistics, `Σ a·b` and squared L2 all fit
 /// in an i32 (`dim · 255² < 2³¹`), as the batched SIMD kernels require.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const MAX_BATCHED_DIM: usize = 32768;
 
 pub struct SQPairScorer {
@@ -50,6 +49,10 @@ pub struct SQPairScorer {
     value_scale: f32,
     /// `value_scale²`, the factor from integer to reconstructed squared L2.
     distance_scale: f32,
+    /// Whether this host runs the batched SIMD kernels, which need the staged
+    /// code statistics. Staged batches, spilled or not, never leave the
+    /// process that staged them, so staging and scoring agree on it.
+    batched: bool,
 }
 
 impl SQPairScorer {
@@ -75,6 +78,7 @@ impl SQPairScorer {
             lower_bound: bounds.start as f32,
             value_scale: sq_value_scale(&bounds),
             distance_scale: sq_distance_scale(&bounds),
+            batched: batched_kernels_available(sq.code_dim()),
         })
     }
 }
@@ -83,12 +87,15 @@ impl PairScorer for SQPairScorer {
     type Kernel<'a> = SQKernel<'a>;
 
     fn row_bytes(&self) -> usize {
-        self.dim
-            + match self.metric {
-                DistanceType::Dot => 8,
-                DistanceType::Cosine => 24,
-                _ => 16,
-            }
+        let is_dot = self.metric == DistanceType::Dot;
+        let sums = if is_dot || self.batched { 8 } else { 0 };
+        let squares = if !is_dot && self.batched { 8 } else { 0 };
+        let norms = if self.metric == DistanceType::Cosine {
+            8
+        } else {
+            0
+        };
+        self.dim + sums + squares + norms
     }
 
     fn stage(&self, source: &RecordBatch, rows: Range<usize>) -> Result<Vec<(Field, ArrayRef)>> {
@@ -103,27 +110,23 @@ impl PairScorer for SQPairScorer {
             .and_then(|codes| codes.values().as_primitive_opt::<UInt8Type>())
             .ok_or_else(|| Error::internal("SQ codes must be a fixed-size list of u8"))?
             .values();
-        let (sums, squares): (Vec<u64>, Vec<u64>) = values
-            .chunks_exact(self.dim)
-            .map(|codes| {
-                codes.iter().fold((0, 0), |(sum, squares), &code| {
-                    let code = u64::from(code);
-                    (sum + code, squares + code * code)
-                })
-            })
-            .unzip();
-        let mut columns = vec![
-            (field, codes.clone()),
+        let is_dot = self.metric == DistanceType::Dot;
+        let row_stat = |name: &str, stat: fn(u64) -> u64| -> (Field, ArrayRef) {
+            let stats: Vec<u64> = values
+                .chunks_exact(self.dim)
+                .map(|codes| codes.iter().map(|&code| stat(u64::from(code))).sum())
+                .collect();
             (
-                Field::new(CODE_SUM_COLUMN, DataType::UInt64, false),
-                Arc::new(UInt64Array::from(sums)) as ArrayRef,
-            ),
-        ];
-        if self.metric != DistanceType::Dot {
-            columns.push((
-                Field::new(CODE_SQUARES_COLUMN, DataType::UInt64, false),
-                Arc::new(UInt64Array::from(squares)),
-            ));
+                Field::new(name, DataType::UInt64, false),
+                Arc::new(UInt64Array::from(stats)),
+            )
+        };
+        let mut columns = vec![(field, codes.clone())];
+        if is_dot || self.batched {
+            columns.push(row_stat(CODE_SUM_COLUMN, |code| code));
+        }
+        if !is_dot && self.batched {
+            columns.push(row_stat(CODE_SQUARES_COLUMN, |code| code * code));
         }
         if self.metric == DistanceType::Cosine {
             let lower = f64::from(self.lower_bound);
@@ -152,14 +155,20 @@ impl PairScorer for SQPairScorer {
         anchor: &'a RecordBatch,
         candidates: &'a RecordBatch,
     ) -> Result<Self::Kernel<'a>> {
+        let is_dot = self.metric == DistanceType::Dot;
         let rows = |batch: &'a RecordBatch| -> Result<StagedRows<'a>> {
             let staged = StagedRows {
                 codes: list_values::<UInt8Type>(batch, SQ_CODE_COLUMN)?,
-                sums: column_values::<UInt64Type>(batch, CODE_SUM_COLUMN)?,
-                squares: if self.metric == DistanceType::Dot {
-                    &[]
+                sums: if is_dot || self.batched {
+                    column_values::<UInt64Type>(batch, CODE_SUM_COLUMN)?
                 } else {
+                    &[]
+                },
+                #[cfg(target_arch = "x86_64")]
+                squares: if !is_dot && self.batched {
                     column_values::<UInt64Type>(batch, CODE_SQUARES_COLUMN)?
+                } else {
+                    &[]
                 },
                 norms: if self.metric == DistanceType::Cosine {
                     column_values::<Float64Type>(batch, NORM_COLUMN)?
@@ -167,11 +176,11 @@ impl PairScorer for SQPairScorer {
                     &[]
                 },
             };
-            if staged.codes.len() != staged.sums.len() * self.dim {
+            if staged.codes.len() != batch.num_rows() * self.dim {
                 return Err(Error::internal(format!(
                     "SQ pairwise batch has {} code bytes for {} rows of dim {}",
                     staged.codes.len(),
-                    staged.sums.len(),
+                    batch.num_rows(),
                     self.dim
                 )));
             }
@@ -181,31 +190,30 @@ impl PairScorer for SQPairScorer {
             scorer: self,
             anchor: rows(anchor)?,
             candidates: rows(candidates)?,
-            batched: batched_kernels_available(self.dim),
+            batched: self.batched,
         })
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Whether this host runs the batched SIMD kernels at dimension `dim`.
 fn batched_kernels_available(dim: usize) -> bool {
-    dim <= MAX_BATCHED_DIM
-        && std::arch::is_x86_feature_detected!("avx512f")
+    #[cfg(target_arch = "x86_64")]
+    let has_vnni = std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vnni")
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn batched_kernels_available(_dim: usize) -> bool {
-    false
+        && std::arch::is_x86_feature_detected!("avx512vnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_vnni = false;
+    dim <= MAX_BATCHED_DIM && has_vnni
 }
 
 /// One staged batch's rows as raw slices.
 #[derive(Clone, Copy)]
 struct StagedRows<'a> {
     codes: &'a [u8],
+    /// For dot or the batched kernels; empty otherwise.
     sums: &'a [u64],
-    /// Empty for dot. Only the batched kernels read it.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    /// For the batched l2 and cosine kernels; empty otherwise.
+    #[cfg(target_arch = "x86_64")]
     squares: &'a [u64],
     /// Cosine only.
     norms: &'a [f64],
@@ -236,7 +244,8 @@ pub struct SQKernel<'a> {
     scorer: &'a SQPairScorer,
     anchor: StagedRows<'a>,
     candidates: StagedRows<'a>,
-    /// Whether the batched SIMD kernels apply, resolved once per binding.
+    /// Whether the batched SIMD kernels apply, from the scorer; tests clear
+    /// it to compare against the portable kernels.
     batched: bool,
 }
 
@@ -246,9 +255,9 @@ impl PairKernel for SQKernel<'_> {
         let dim = scorer.dim;
         let a = &self.anchor.codes[anchor_row * dim..(anchor_row + 1) * dim];
         let codes = &self.candidates.codes[candidates.start * dim..candidates.end * dim];
-        let sums = &self.candidates.sums[candidates.clone()];
         let out = &mut out[..candidates.len()];
         if scorer.metric == DistanceType::Dot {
+            let sums = &self.candidates.sums[candidates];
             let lower = scorer.lower_bound;
             let terms = DotTerms {
                 constant: dim as f32 * lower * lower,
@@ -276,7 +285,7 @@ impl PairKernel for SQKernel<'_> {
                     a,
                     self.anchor.squares[anchor_row],
                     codes,
-                    sums,
+                    &self.candidates.sums[candidates.clone()],
                     &self.candidates.squares[candidates.clone()],
                     scorer.distance_scale,
                     out,
@@ -611,6 +620,8 @@ mod tests {
         // Row 1 repeats row 0.
         codes.copy_within(0..dim, dim);
         let staged = stage(&scorer, &codes, 0..rows);
+        // Codes plus one 8-byte statistic or norm per extra column.
+        assert_eq!(scorer.row_bytes(), dim + 8 * (staged.num_columns() - 1));
         // Stage a slice so offsets into the source are exercised.
         let tail = stage(&scorer, &codes, 4..rows);
         let reconstruct = |r: usize| -> Vec<f64> {
