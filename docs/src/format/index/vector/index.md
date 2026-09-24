@@ -475,17 +475,18 @@ packing, including zero padding to a 64-dimensional boundary. The sign plane
 retains its existing partition-local transposition. Selecting sign rows requires
 undoing that transposition before gathering rows and repacking the result.
 
-For each rotated residual, the encoder chooses one rescale factor `t` by the
-existing threshold search, at 3, 5 or 6 ex bits for total widths 5, 7 or 9,
-respectively. It multiplies that scale by `2^(h+l-search_width)` and quantizes
-one `(h+l)`-bit ex code. The high code is `code >> l`; the low code is
+For each rotated residual, the encoder chooses the rescale factor `t` and
+quantizes at `(h+l)` ex bits exactly as the native index does. Splitting that
+code must preserve the full code values, binary factors and full factors.
+The high code is `code >> l`; the low code is
 `code & (2^l-1)`. Negative components use the existing complemented encoding
 `!code & (2^(h+l)-1)`, so truncation also preserves their prefix. The high code
 is the code obtained at `h` bits with scale `t / 2^l`. The scale is build-time
 state and is not stored; a change to the search policy does not change decoding.
 
-The binary estimator keeps its existing factors and error bound. High and full
-levels each store their own raw-query add/scale factors, computed with their own
+Full-precision queries use the native binary error factors and query error for
+pruning, including the native approximation-mode policy. Storage layout must
+not change that policy. High and full levels each store their own raw-query add/scale factors, computed with their own
 code bias and quantized residual/centroid inner products. Full scoring combines
 codes before accumulation as `2^l * high + low`; high scoring omits the low code
 and uses the high factor pair. Reusing full-level factors for a prefix is invalid.
@@ -514,10 +515,12 @@ centered query `q-c`: the encoder's add-factor difference cancels the centroid d
 `w-w_sign`, with a separate floating-point margin for that cancellation.
 Dot and Accurate mode retain the generic norm-plus-add-factor bound. A reader skips a row when its chosen
 lower bound cannot beat the current top-k threshold or falls above the
-query's upper distance bound. The legacy
-`__error_factors` bound relative to the original vector is not a substitute
-for either level's estimator-difference bound. This pruning neither reads
-original vectors nor requires a fixed candidate expansion factor.
+query's upper distance bound. A high-prefix query uses its estimator-difference
+bound instead of the native `__error_factors`, which bounds error relative to
+the original vector. Full queries retain native pruning and do not use
+`__rq_bounds_full`; that column does not determine full-query semantics.
+Neither policy reads original vectors or requires a fixed candidate expansion
+factor.
 
 Appending, merging, splitting, reassigning and remapping an index must preserve
 the layout flag and every plane's factors. All segments merged into a single
