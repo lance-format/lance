@@ -6,7 +6,7 @@
 
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -459,6 +459,129 @@ async fn prune_stale_segment_coverage(
         }
     }
     Ok(())
+}
+
+/// Validate staged (uncommitted) segments against the current snapshot on a
+/// table with a tagged fragment reuse history.
+///
+/// A staged segment was built at its own dataset version; every commit
+/// since then may have moved its rows (a rewrite recording a transition:
+/// the provenance stays and translates) or rewritten an indexed column in
+/// place (the values it holds are stale: the transition's coverage is
+/// withdrawn). Those are the conflict resolver's own rules for an index
+/// committed from an old read version, so the segments are replayed through
+/// it: a CreateIndex of the segments at the oldest build version, checked
+/// against every transaction up to this snapshot. The returned segments
+/// carry the corrected bitmaps; their addresses are still the ones they
+/// were built with, which the merge translates. A rewrite the rules cannot
+/// carry the segment across (a bare compaction of a fragment it covers, or a
+/// group it covers only partly) means the segment must be rebuilt, as does a
+/// version in the window that can no longer be read. The cost is
+/// proportional to the commits crossed. On a table without a tagged history
+/// nothing is replayed: coverage is reconciled when the segments commit.
+pub(crate) async fn replay_staged_segments(
+    dataset: &Dataset,
+    segments: Vec<IndexMetadata>,
+) -> Result<Vec<IndexMetadata>> {
+    let tagged = load_all_indices(dataset)
+        .await?
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+    if !tagged {
+        return Ok(segments);
+    }
+    // One replay per build version: a segment is carried across the commits
+    // it did not see, so a segment built after a rewrite is not withdrawn for
+    // it again.
+    let mut by_build_version: BTreeMap<u64, Vec<IndexMetadata>> = BTreeMap::new();
+    for segment in segments {
+        by_build_version
+            .entry(segment.dataset_version)
+            .or_default()
+            .push(segment);
+    }
+    let mut validated = Vec::new();
+    for (read_version, group) in by_build_version {
+        if read_version >= dataset.manifest.version {
+            validated.extend(group);
+        } else {
+            validated.extend(replay_staged_segments_from(dataset, read_version, group).await?);
+        }
+    }
+    Ok(validated)
+}
+
+async fn replay_staged_segments_from(
+    dataset: &Dataset,
+    read_version: u64,
+    segments: Vec<IndexMetadata>,
+) -> Result<Vec<IndexMetadata>> {
+    let rebuild = |version: u64, error: &Error| {
+        Error::invalid_input(format!(
+            "staged index segments built at dataset version {read_version} cannot be carried \
+             across version {version}: {error}. Rebuild the segments from the current dataset"
+        ))
+    };
+    let read_dataset = dataset
+        .checkout_version(read_version)
+        .await
+        .map_err(|error| rebuild(read_version, &error))?;
+    let transaction = Transaction::new(
+        read_version,
+        Operation::CreateIndex {
+            new_indices: segments,
+            removed_indices: vec![],
+        },
+        None,
+    );
+    let mut rebase = crate::io::commit::conflict_resolver::TransactionRebase::try_new(
+        &read_dataset,
+        transaction,
+        None,
+    )
+    .await?;
+    rebase.load_current_lineage(dataset).await?;
+    let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(&read_dataset)
+        .await
+        .map_err(|error| rebuild(read_version, &error))?;
+    let snapshot = dataset.manifest.version;
+    let window: Vec<_> = transactions
+        .into_iter()
+        .filter(|(version, _)| *version <= snapshot)
+        .collect();
+    // The listing only knows the manifests that still exist. A version
+    // cleaned up between the build and the snapshot leaves no trace in it,
+    // and whatever that commit did to the indexed columns cannot be
+    // replayed: the history has to be complete, one manifest per version.
+    let gone = || {
+        Error::invalid_input(
+            "its manifest is gone (cleaned up), so the commits since the build cannot be replayed",
+        )
+    };
+    let mut expected = read_version + 1;
+    for (version, _) in &window {
+        if *version != expected {
+            return Err(rebuild(expected, &gone()));
+        }
+        expected += 1;
+    }
+    if expected != snapshot + 1 {
+        return Err(rebuild(expected, &gone()));
+    }
+    for (version, transaction) in &window {
+        rebase
+            .check_txn(transaction, *version)
+            .map_err(|error| match error {
+                Error::RetryableCommitConflict { .. } | Error::CommitConflict { .. } => {
+                    rebuild(*version, &error)
+                }
+                other => other,
+            })?;
+    }
+    match rebase.finish(dataset).await?.operation {
+        Operation::CreateIndex { new_indices, .. } => Ok(new_indices),
+        _ => unreachable!("a CreateIndex rebase yields a CreateIndex"),
+    }
 }
 
 pub(crate) async fn build_index_metadata_from_segments(
@@ -2099,6 +2222,15 @@ impl DatasetIndexExt for Dataset {
         Ok(results)
     }
 
+    /// From the derived listing only: a segment the tagged reader excludes
+    /// (it derives no coverage for it) is absent here, so a query opening it
+    /// by uuid fails instead of answering with nothing. Maintenance reaches
+    /// such a segment through `Dataset::load_index_with_purpose`.
+    async fn load_index(&self, uuid: &Uuid) -> Result<Option<IndexMetadata>> {
+        self.load_index_with_purpose(uuid, frag_reuse::OpenPurpose::Query)
+            .await
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
         if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
@@ -2148,7 +2280,7 @@ impl DatasetIndexExt for Dataset {
 
     async fn merge_existing_index_segments(
         &self,
-        mut source_segments: Vec<IndexMetadata>,
+        source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata> {
         validate_segment_metadata("uncommitted", &source_segments)?;
         if let Some(segment) = source_segments
@@ -2160,6 +2292,13 @@ impl DatasetIndexExt for Dataset {
                 segment.uuid, segment.dataset_version, self.manifest.version
             )));
         }
+        // On a tagged table the staged segments are validated against this
+        // snapshot before anything reads their addresses or projects their
+        // coverage: a rewrite since their build may have moved their rows
+        // (fine, they translate) or rewritten an indexed column in place (the
+        // affected coverage is withdrawn). See `replay_staged_segments`.
+        let source_segments = replay_staged_segments(self, source_segments).await?;
+        let mut source_segments = source_segments;
         let source_dataset_version = source_segments
             .iter()
             .map(|segment| segment.dataset_version)
@@ -2366,6 +2505,24 @@ impl DatasetIndexExt for Dataset {
                 ));
             }
         }
+        // On a tagged table the segments are first validated against this
+        // snapshot (`replay_staged_segments`): a rewrite since their build
+        // keeps their provenance translating, an in-place column rewrite
+        // withdraws the affected coverage, a rewrite they cannot be carried
+        // across says to rebuild. The commit then reads from this snapshot,
+        // and the commit loop carries the segments across anything newer
+        // through the same rules.
+        let segments = replay_staged_segments(
+            self,
+            segments
+                .into_iter()
+                .map(|segment| segment.into_metadata(index_name))
+                .collect(),
+        )
+        .await?
+        .into_iter()
+        .map(IntoIndexSegment::into_index_segment)
+        .collect::<Result<Vec<_>>>()?;
         let new_indices =
             build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
         validate_segment_metadata(index_name, &new_indices)?;
@@ -3257,6 +3414,31 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
+    /// [`Self::open_generic_index`] for maintenance (merge, rebuild, remap):
+    /// a registered segment the tagged reader excludes from the listing opens
+    /// as contributing nothing instead of failing. Never for queries.
+    async fn open_generic_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>>;
+    /// [`Self::open_scalar_index`] for maintenance; see
+    /// [`Self::open_generic_index_for_maintenance`].
+    async fn open_scalar_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>>;
+    /// [`Self::open_vector_index`] for maintenance; see
+    /// [`Self::open_generic_index_for_maintenance`].
+    async fn open_vector_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>>;
     /// Opens all segments for one logical vector index and returns a materialized snapshot.
     async fn open_logical_vector_index(
         &self,
@@ -3308,13 +3490,42 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .map(|idx| idx.uuid)
 }
 
-#[async_trait]
-impl DatasetIndexInternalExt for Dataset {
-    async fn open_generic_index(
+impl Dataset {
+    /// The segment's metadata for the given purpose. A query sees the derived
+    /// listing only. Maintenance also reaches a registered segment the tagged
+    /// reader left out of the listing (its coverage was withdrawn by an
+    /// in-place rewrite, or its translation cannot be honored): it gets the
+    /// stored metadata and opens the segment as contributing nothing, to
+    /// rebuild or replace it.
+    pub(crate) async fn load_index_with_purpose(
+        &self,
+        uuid: &Uuid,
+        purpose: frag_reuse::OpenPurpose,
+    ) -> Result<Option<IndexMetadata>> {
+        if let Some(index) = self
+            .load_indices()
+            .await?
+            .iter()
+            .find(|idx| idx.uuid == *uuid)
+        {
+            return Ok(Some(index.clone()));
+        }
+        if purpose == frag_reuse::OpenPurpose::Query {
+            return Ok(None);
+        }
+        Ok(load_all_indices(self)
+            .await?
+            .iter()
+            .find(|idx| idx.uuid == *uuid && !is_system_index(idx) && index_is_usable(idx))
+            .cloned())
+    }
+
+    pub(crate) async fn open_generic_index_with_purpose(
         &self,
         column: &str,
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
+        purpose: frag_reuse::OpenPurpose,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check the vector caches.
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
@@ -3325,7 +3536,9 @@ impl DatasetIndexInternalExt for Dataset {
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if self.index_cache.get_with_key(&state_key).await.is_some() {
             // Reconstruct via open_vector_index which will hit the same sized key.
-            let index = self.open_vector_index(column, uuid, metrics).await?;
+            let index = self
+                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
+                .await?;
             return Ok(index.as_index());
         }
 
@@ -3347,7 +3560,7 @@ impl DatasetIndexInternalExt for Dataset {
         // file list (available since file sizes tracking was added). If the file list is not
         // available (older indices), we fall back to checking file existence via HEAD request.
         let index_meta = self
-            .load_index(uuid)
+            .load_index_with_purpose(uuid, purpose)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
@@ -3370,43 +3583,51 @@ impl DatasetIndexInternalExt for Dataset {
         };
 
         if is_vector_index {
-            let index = self.open_vector_index(column, uuid, metrics).await?;
+            let index = self
+                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
+                .await?;
             Ok(index.as_index())
         } else {
-            let index = self.open_scalar_index(column, uuid, metrics).await?;
+            let index = self
+                .open_scalar_index_with_purpose(column, uuid, metrics, purpose)
+                .await?;
             Ok(index.as_index())
         }
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn open_scalar_index(
+    pub(crate) async fn open_scalar_index_with_purpose(
         &self,
         column: &str,
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
+        purpose: frag_reuse::OpenPurpose,
     ) -> Result<Arc<dyn ScalarIndex>> {
         // Caching (including the choice of in-memory vs. serializable state) is
         // a plugin implementation detail handled inside `scalar::open_scalar_index`.
         let index_meta = self
-            .load_index(uuid)
+            .load_index_with_purpose(uuid, purpose)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
-        scalar::open_scalar_index(self, column, &index_meta, metrics).await
+        scalar::open_scalar_index_with_plan(self, column, &index_meta, None, purpose, metrics).await
     }
 
-    async fn open_vector_index(
+    pub(crate) async fn open_vector_index_with_purpose(
         &self,
         column: &str,
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
+        purpose: frag_reuse::OpenPurpose,
     ) -> Result<Arc<dyn VectorIndex>> {
         let index_meta = self
-            .load_index(uuid)
+            .load_index_with_purpose(uuid, purpose)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
-        let resolved = frag_reuse::open_row_id_remapping(self, &index_meta, metrics).await?;
+        let resolved =
+            frag_reuse::open_row_id_remapping_with_plan(self, &index_meta, None, purpose, metrics)
+                .await?;
         // The index state (paths, model, quantizer metadata) and a legacy
         // whole-index entry embed no translated rows: they live in the plain
         // per-index namespace and stay warm across appends and unrelated
@@ -3724,6 +3945,84 @@ impl DatasetIndexInternalExt for Dataset {
                 .await;
         }
         Ok(index)
+    }
+}
+
+#[async_trait]
+impl DatasetIndexInternalExt for Dataset {
+    async fn open_generic_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>> {
+        self.open_generic_index_with_purpose(column, uuid, metrics, frag_reuse::OpenPurpose::Query)
+            .await
+    }
+
+    async fn open_scalar_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        self.open_scalar_index_with_purpose(column, uuid, metrics, frag_reuse::OpenPurpose::Query)
+            .await
+    }
+
+    async fn open_vector_index(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        self.open_vector_index_with_purpose(column, uuid, metrics, frag_reuse::OpenPurpose::Query)
+            .await
+    }
+
+    async fn open_generic_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn Index>> {
+        self.open_generic_index_with_purpose(
+            column,
+            uuid,
+            metrics,
+            frag_reuse::OpenPurpose::Maintenance,
+        )
+        .await
+    }
+
+    async fn open_scalar_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        self.open_scalar_index_with_purpose(
+            column,
+            uuid,
+            metrics,
+            frag_reuse::OpenPurpose::Maintenance,
+        )
+        .await
+    }
+
+    async fn open_vector_index_for_maintenance(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        self.open_vector_index_with_purpose(
+            column,
+            uuid,
+            metrics,
+            frag_reuse::OpenPurpose::Maintenance,
+        )
+        .await
     }
 
     async fn open_logical_vector_index(

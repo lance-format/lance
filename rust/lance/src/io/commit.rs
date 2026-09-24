@@ -1468,7 +1468,7 @@ async fn prepare_attempt(
     )
 }
 
-async fn load_and_sort_new_transactions(
+pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
     let NewTransactionResult {

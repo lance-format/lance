@@ -122,6 +122,17 @@ fn translated_namespace(fingerprint: &[u8; 32]) -> String {
     prefix
 }
 
+/// Why a segment is being opened. A query takes its segments from the
+/// listing and must never see one the tagged reader excluded (it derives no
+/// coverage for it, so nothing scheduled a scan of its rows); maintenance
+/// opens by uuid to rebuild or replace a segment and reads such a segment as
+/// contributing nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenPurpose {
+    Query,
+    Maintenance,
+}
+
 /// The translation inputs one segment needs under a tagged history.
 #[derive(Clone, Debug)]
 pub(crate) enum SegmentRemappingPlan {
@@ -360,7 +371,7 @@ pub(super) async fn open_row_id_remapping(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
-    open_row_id_remapping_with_plan(dataset, index, None, metrics).await
+    open_row_id_remapping_with_plan(dataset, index, None, OpenPurpose::Query, metrics).await
 }
 
 /// [`open_row_id_remapping`] for a segment whose plan the caller supplies
@@ -370,6 +381,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     dataset: &Dataset,
     index: &IndexMetadata,
     staged: Option<&SegmentRemappingPlan>,
+    purpose: OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
     // The cheap cached stored listing decides the generation; the filtered
@@ -406,6 +418,12 @@ pub(super) async fn open_row_id_remapping_with_plan(
             snapshot_plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
             match snapshot_plan.segments.get(&index.uuid) {
                 Some(plan) => plan,
+                // A registered segment the reader left out of the plan: it
+                // derives no coverage, so it is out of the listing too. What
+                // that means depends on who asks (below).
+                None if stored.iter().any(|entry| entry.uuid == index.uuid) => {
+                    &SegmentRemappingPlan::MissingCoverage
+                }
                 None => {
                     return Err(Error::not_supported(format!(
                         "FRI remapping requires committed segment metadata for {}; a staged \
@@ -418,10 +436,33 @@ pub(super) async fn open_row_id_remapping_with_plan(
     };
     match plan {
         SegmentRemappingPlan::Identity => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
-        SegmentRemappingPlan::MissingCoverage => Err(Error::not_supported(format!(
-            "FRI query coverage is unavailable for segment {}",
-            index.uuid
-        ))),
+        // No derivable coverage (withdrawn or unresolvable). A query must not
+        // open such a segment: the listing excludes it, so no scan was
+        // scheduled for its rows, and an empty answer would silently drop
+        // them. Maintenance reads it as an empty segment (every stored row
+        // translates to nothing) and replaces it.
+        SegmentRemappingPlan::MissingCoverage if purpose == OpenPurpose::Query => {
+            Err(Error::not_supported(format!(
+                "FRI query coverage is unavailable for segment {}: the reader excludes it from \
+                 the index listing on this snapshot; open it through the listing, not by uuid",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage => {
+            let empty = RoaringBitmap::new();
+            let fingerprint = mapping.translation_fingerprint(&empty, &empty, &[]);
+            Ok(Some((
+                fri.uuid,
+                ResolvedRemapping::V1Translate {
+                    remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
+                        mapping,
+                        RoaringBitmap::new(),
+                        RoaringBitmap::new(),
+                    )),
+                    fingerprint,
+                },
+            )))
+        }
         SegmentRemappingPlan::Translate {
             coverage,
             excluded_fragments,

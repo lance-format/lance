@@ -1678,7 +1678,10 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
 
 #[tokio::test]
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
-    use crate::index::frag_reuse::{FriQueryPlanKey, ResolvedRemapping, open_row_id_remapping};
+    use crate::index::frag_reuse::{
+        FriQueryPlanKey, OpenPurpose, ResolvedRemapping, open_row_id_remapping,
+        open_row_id_remapping_with_plan,
+    };
 
     let mut dataset = fixture().await;
     let params = ScalarIndexParams::default();
@@ -1750,19 +1753,47 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
 
     // Later opens must resolve from the published plan instead of re-running
     // the whole-dataset sibling scan: with the sibling dropped from the cached
-    // plan, its open must fail with the plan-miss error.
+    // plan, it is a registered segment the plan derives no coverage for. A
+    // query refuses it (the listing excludes it, no scan covers its rows);
+    // maintenance opens it as an empty translation, not with the coverage a
+    // fresh scan would find.
     let mut pruned = plan.as_ref().clone();
     pruned.segments.remove(&siblings[1].uuid);
     plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
-    let error = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+    let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
+    let empty = RoaringBitmap::new();
+    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
+    let planned = match &plan.segments[&siblings[1].uuid] {
+        crate::index::frag_reuse::SegmentRemappingPlan::Translate { fingerprint, .. } => {
+            *fingerprint
+        }
+        other => panic!("the sibling translates: {other:?}"),
+    };
+    assert_ne!(planned, no_coverage);
+    let refused = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
         .await
         .unwrap_err();
     assert!(
-        error
+        refused
             .to_string()
-            .contains("requires committed segment metadata"),
-        "{error}"
+            .contains("excludes it from the index listing"),
+        "{refused}"
     );
+    match open_row_id_remapping_with_plan(
+        &dataset,
+        &siblings[1],
+        None,
+        OpenPurpose::Maintenance,
+        &NoOpMetricsCollector,
+    )
+    .await
+    .unwrap()
+    {
+        Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
+            assert_eq!(fingerprint, no_coverage, "the pruned plan was recomputed");
+        }
+        other => panic!("expected an empty translation, got {other:?}"),
+    }
 
     // With the real plan restored, the sibling opens as a cache hit on the
     // same plan entry; nothing is recomputed or re-published.

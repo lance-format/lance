@@ -24,7 +24,8 @@ use lance_table::transaction::{
 };
 use roaring::RoaringBitmap;
 
-/// Two fragments of four rows: `i` 0..8 and a constant `text`.
+/// Two fragments of four rows: `i` 0..8, a constant `text` and a payload
+/// `w` equal to `i` (a key no index covers, for in-place rewrites).
 async fn disk_fixture(uri: &str) -> Dataset {
     lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -32,6 +33,7 @@ async fn disk_fixture(uri: &str) -> Dataset {
             "text",
             lance_datagen::array::fill_utf8("document".to_string()),
         )
+        .col("w", lance_datagen::array::step::<Int32Type>())
         .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
         .await
         .unwrap()
@@ -419,8 +421,9 @@ async fn staged_segments_merge_across_deferred_compaction_on_tagged_table() {
 }
 
 /// The NGram merge reads spill files and translates only through the v0
-/// remapper: a staged NGram segment that needs translation is refused rather
-/// than merged with stale addresses.
+/// remapper: a staged NGram segment that needs translation is refused by the
+/// replay (the resolver's NGram rule) rather than merged with stale
+/// addresses; the error says to rebuild.
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn staged_ngram_segments_needing_translation_are_refused() {
@@ -434,7 +437,7 @@ async fn staged_ngram_segments_needing_translation_are_refused() {
         .merge_existing_index_segments(vec![s1, s2])
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("NGram"), "{error}");
+    assert!(error.to_string().contains("Rebuild"), "{error}");
 }
 
 /// A segment that is neither staged nor listed in the manifest is an error
@@ -469,7 +472,8 @@ async fn unlisted_segment_without_a_plan_is_an_error() {
     );
 }
 
-/// Two fragments of four rows: `i` 0..8 and a random 4-dim `vector`.
+/// Two fragments of four rows: `i` 0..8, a random 4-dim `vector` and a
+/// payload `w` equal to `i`.
 async fn vector_fixture(uri: &str) -> Dataset {
     lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -477,6 +481,7 @@ async fn vector_fixture(uri: &str) -> Dataset {
             "vector",
             lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
         )
+        .col("w", lance_datagen::array::step::<Int32Type>())
         .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
         .await
         .unwrap()
@@ -602,4 +607,234 @@ async fn staged_vector_segments_merge_across_stable_partition_keep_provenance() 
     let (plan, found) = nearest(&dataset, &query, 1, true).await;
     assert!(plan.contains("ANN"), "{plan}");
     assert_eq!(found, vec![6]);
+}
+
+/// Rewrite `column` of the row `w = key` in place with `value`: a
+/// partial-schema merge insert keyed on `w`, which no index covers, in
+/// `RewriteColumns` mode. The dataset is reopened afterwards.
+async fn rewrite_in_place(uri: &str, column: &str, key: i32, value: arrow_array::ArrayRef) {
+    use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let schema = Arc::new(arrow_schema::Schema::from(
+        &dataset.schema().project(&["w", column]).unwrap(),
+    ));
+    let source = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow_array::Int32Array::from(vec![key])), value],
+    )
+    .unwrap();
+    MergeInsertBuilder::try_new(Arc::new(dataset), vec!["w".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+}
+
+/// The sequence that forces the replay to run BEFORE the merge: segments
+/// staged over F0 and F1, `i` of a row in F1 rewritten in place (admitted:
+/// no committed index covers `i`), F1 partitioned into F10 and F11, the
+/// segments merged, the result committed. The merge translates addresses
+/// but never rereads values, so without the replay the merged segment
+/// would claim the destinations with the pre-rewrite value inside.
+/// Replayed first, the rewrite withdraws F1 from its segment; the merge has
+/// nothing to claim for F10 and F11, keeps F0, and the new value comes from
+/// the scan.
+#[rstest::rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_segments_rewritten_before_the_partition_are_validated_before_the_merge(
+    #[case] index_type: IndexType,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "i", index_type, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "i", index_type, vec![1]).await;
+    // Row w = 6 lives in F1.
+    rewrite_in_place(
+        dir.as_str(),
+        "i",
+        6,
+        Arc::new(arrow_array::Int32Array::from(vec![666])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[1], 10).await;
+    assert_eq!(
+        dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0, 10, 11]
+    );
+
+    let merged = dataset
+        .merge_existing_index_segments(vec![s1, s2])
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32]),
+        "the rewritten source was withdrawn before the merge; F0 stays"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![merged])
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([0u32]))
+    );
+    assert_eq!(values(&dataset, Some("i = 666"), true).await, vec![666]);
+    assert_eq!(
+        values(&dataset, Some("i = 6"), true).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(values(&dataset, Some("i = 2"), true).await, vec![2]);
+    assert_eq!(
+        values(&dataset, None, true).await,
+        values(&dataset, None, false).await
+    );
+}
+
+/// The replay needs the whole history between the build and the snapshot.
+/// The listing only knows the manifests that still exist: with the build
+/// version kept by a tag and the versions after it cleaned up, the partition
+/// and the in-place rewrite between them leave no trace, so the segments
+/// cannot be validated and both the merge and the commit refuse them.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_segments_refuse_a_history_with_a_cleaned_up_version() {
+    use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
+
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "i", IndexType::BTree, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "i", IndexType::BTree, vec![1]).await;
+    let build_version = dataset.manifest.version;
+    dataset.tags().create("build", build_version).await.unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    commit_stable_partition(dataset, &[1], 10).await;
+    // Row w = 6 was in F1 and now lives in a partition destination.
+    rewrite_in_place(
+        dir.as_str(),
+        "i",
+        6,
+        Arc::new(arrow_array::Int32Array::from(vec![666])),
+    )
+    .await;
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(dataset.manifest.version, build_version + 3);
+    let policy = CleanupPolicyBuilder::default()
+        .before_timestamp(chrono::Utc::now() + chrono::Duration::days(1))
+        .error_if_tagged_old_versions(false)
+        .build();
+    cleanup_old_versions(&dataset, policy).await.unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(dataset.checkout_version(build_version).await.is_ok());
+    assert!(
+        dataset.checkout_version(build_version + 1).await.is_err(),
+        "the intermediate versions are gone"
+    );
+
+    let error = dataset
+        .merge_existing_index_segments(vec![s1.clone(), s2.clone()])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cleaned up") && error.to_string().contains("Rebuild"),
+        "{error}"
+    );
+    let error = dataset
+        .commit_existing_index_segments("staged", "i", vec![s1, s2])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cleaned up") && error.to_string().contains("Rebuild"),
+        "{error}"
+    );
+    assert!(
+        crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .all(|idx| idx.name != "staged"),
+        "nothing was committed"
+    );
+}
+
+/// The same sequence for IVF_FLAT shards: the vector of a row in F1 is
+/// rewritten in place, F1 is partitioned, the shards merged and committed.
+/// The merged segment keeps F0 only and the nearest neighbour of the new
+/// vector is found by the scan of the uncovered destinations.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_vector_segments_rewritten_before_the_partition_are_validated_before_the_merge() {
+    let dir = TempStrDir::default();
+    let mut dataset = vector_fixture(dir.as_str()).await;
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    let mut segments = Vec::new();
+    for fragment in [0u32, 1] {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("staged".to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    // Row w = 6 (F1) gets a vector far from every other; the shard over F1
+    // still holds its old vector.
+    let far = arrow_array::FixedSizeListArray::from_iter_primitive::<
+        arrow_array::types::Float32Type,
+        _,
+        _,
+    >(vec![Some(vec![Some(1000.0f32); 4])], 4);
+    rewrite_in_place(dir.as_str(), "vector", 6, Arc::new(far)).await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[1], 10).await;
+
+    let merged = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32]),
+        "the rewritten source was withdrawn before the merge; F0 stays"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "vector", vec![merged])
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(RoaringBitmap::from_iter([0u32]))
+    );
+    let query = arrow_array::Float32Array::from(vec![1000.0f32; 4]);
+    let (_, truth) = nearest(&dataset, &query, 1, false).await;
+    assert_eq!(truth, vec![6]);
+    let (_, found) = nearest(&dataset, &query, 1, true).await;
+    assert_eq!(found, vec![6], "the rewritten row is found by the scan");
+    let (_, flat) = nearest(&dataset, &query, 8, false).await;
+    let (_, indexed) = nearest(&dataset, &query, 8, true).await;
+    assert_eq!(indexed, flat);
 }

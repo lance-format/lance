@@ -73,6 +73,7 @@ pub(crate) async fn open_and_merge_segments(
             field_path,
             segment,
             staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
             &NoOpMetricsCollector,
         )
         .await?;

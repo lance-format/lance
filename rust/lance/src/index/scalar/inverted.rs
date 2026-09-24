@@ -877,6 +877,7 @@ pub(crate) async fn merge_segments(
             &resolved.canonical_path,
             segment,
             staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
             &NoOpMetricsCollector,
         )
         .await?;

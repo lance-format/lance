@@ -564,7 +564,7 @@ async fn merge_scalar_indices<'a>(
         .copied()
         .unwrap_or(old_indices[old_indices.len() - 1]);
     let reference_index = dataset
-        .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
+        .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
     let update_criteria = reference_index.update_criteria();
 
@@ -1411,7 +1411,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let mut indices = Vec::with_capacity(old_indices.len());
             for idx in old_indices {
                 match dataset
-                    .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                    .open_generic_index_for_maintenance(
+                        &field_path,
+                        &idx.uuid,
+                        &NoOpMetricsCollector,
+                    )
                     .await
                 {
                     Ok(index) => indices.push(index),
@@ -1450,7 +1454,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .copied()
                         .unwrap_or(old_indices[old_indices.len() - 1]);
                     let reference_index = dataset
-                        .open_scalar_index(&field_path, &reference_idx.uuid, &NoOpMetricsCollector)
+                        .open_scalar_index_for_maintenance(
+                            &field_path,
+                            &reference_idx.uuid,
+                            &NoOpMetricsCollector,
+                        )
                         .await?;
                     let update_criteria = reference_index.update_criteria();
                     if update_criteria.requires_old_data {
@@ -1519,7 +1527,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             effective_old_frags |= &effective;
                         }
                         let scalar_index = dataset
-                            .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                            .open_scalar_index_for_maintenance(
+                                &field_path,
+                                &idx.uuid,
+                                &NoOpMetricsCollector,
+                            )
                             .await?;
                         let inverted_index = scalar_index
                             .as_any()
