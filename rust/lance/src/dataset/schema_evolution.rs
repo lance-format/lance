@@ -1036,7 +1036,15 @@ pub(super) async fn alter_columns(
 /// underlying storage. In order to remove the data, you must subsequently
 /// call `compact_files` to rewrite the data without the removed columns and
 /// then call `cleanup_old_versions` to remove the old files.
-pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
+/// The schema a [`drop_columns`] of `columns` would project to, with every
+/// validation that drop performs and no mutation of its own.
+///
+/// Split out for a caller that must not write anything until the whole
+/// projection is known to be valid against this revision: approximating the
+/// rules here is easy to get wrong, because dropping a struct's last child
+/// removes the struct, and a field whose data files disagree on metadata
+/// semantics is refused outright.
+pub fn plan_drop_columns(dataset: &Dataset, columns: &[&str]) -> Result<Schema> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
         if dataset.schema().field(col).is_none() {
@@ -1103,6 +1111,12 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
             "Cannot drop all columns from a dataset",
         ));
     }
+
+    Ok(new_schema)
+}
+
+pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
+    let new_schema = plan_drop_columns(dataset, columns)?;
 
     let transaction = Transaction::new(
         dataset.manifest.version,
@@ -3920,6 +3934,48 @@ mod test {
             }
         }
 
+        Ok(())
+    }
+
+    /// Planning validates without writing, which is what a caller relying on
+    /// it to gate an earlier commit depends on. A struct's last child taking
+    /// the struct with it is the case a survivor approximation gets wrong.
+    #[tokio::test]
+    async fn test_plan_drop_columns_validates_without_committing() -> Result<()> {
+        use arrow_array::{ArrayRef, Int32Array, StructArray};
+        use arrow_schema::Fields;
+
+        let inner = Arc::new(Int32Array::from(vec![1, 2]));
+        let nested = StructArray::from(vec![(
+            Arc::new(ArrowField::new("only", DataType::Int32, true)),
+            inner as ArrayRef,
+        )]);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "only",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested)])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let dataset = Dataset::write(reader, uri, None).await?;
+        let version = dataset.version().version;
+
+        // Dropping the struct's only child empties the struct, so this is the
+        // all-columns case even though no top-level name was mentioned.
+        let err = dataset.plan_drop_columns(&["parent.only"]).unwrap_err();
+        assert!(err.to_string().contains("Cannot drop all columns"), "{err}");
+        let err = dataset.plan_drop_columns(&["nope"]).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        // Nothing was written by either attempt.
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(Dataset::open(uri).await?.version().version, version);
         Ok(())
     }
 

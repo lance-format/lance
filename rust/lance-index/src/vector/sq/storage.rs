@@ -433,12 +433,12 @@ impl VectorStore for ScalarQuantizationStorage {
 }
 
 #[inline]
-fn sq_value_scale(bounds: &Range<f64>) -> f32 {
+pub(crate) fn sq_value_scale(bounds: &Range<f64>) -> f32 {
     (bounds.end - bounds.start) as f32 / 255.0_f32
 }
 
 #[inline]
-fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
+pub(crate) fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
     let scale = sq_value_scale(bounds);
     scale * scale
 }
@@ -508,7 +508,7 @@ impl<'a> SQDotQuery<'a> {
     }
 }
 
-fn sq_code_sum(sq_code: &[u8]) -> f32 {
+pub(crate) fn sq_code_sum(sq_code: &[u8]) -> f32 {
     sq_code.iter().map(|code| *code as u32).sum::<u32>() as f32
 }
 

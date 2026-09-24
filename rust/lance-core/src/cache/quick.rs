@@ -35,6 +35,7 @@ impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
 
 pub struct QuickCacheBackend {
     cache: quick_cache::sync::Cache<InternalCacheKey, QuickEntry, EntryWeighter>,
+    capacity: usize,
 }
 
 impl std::fmt::Debug for QuickCacheBackend {
@@ -92,7 +93,7 @@ impl QuickCacheBackend {
             Default::default(),
             Default::default(),
         );
-        Self { cache }
+        Self { cache, capacity }
     }
 }
 
@@ -141,6 +142,10 @@ impl CacheBackend for QuickCacheBackend {
 
     async fn size_bytes(&self) -> usize {
         self.cache.weight() as usize
+    }
+
+    fn capacity_bytes(&self) -> Option<usize> {
+        Some(self.capacity)
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -211,6 +216,14 @@ mod tests {
         assert_eq!(
             quick_cache::Weighter::weight(&EntryWeighter, &key, &entry),
             23
+        );
+    }
+
+    #[test]
+    fn capacity_bytes_reports_configured_capacity() {
+        assert_eq!(
+            QuickCacheBackend::with_capacity(1 << 20).capacity_bytes(),
+            Some(1 << 20)
         );
     }
 

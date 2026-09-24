@@ -430,7 +430,7 @@ impl BitmapIndex {
         // Stream keys in bounded batches to avoid loading the entire keys
         // column into memory at once.
         let mut keys_stream = page_lookup_file
-            .read_range_stream(0..total_rows, Some(&["keys"]))
+            .read_range_stream(0..total_rows, Some(&["keys"]), 4096, 2)
             .await?;
         let mut row_offset: usize = 0;
         while let Some(keys_batch) = keys_stream.try_next().await? {

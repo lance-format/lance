@@ -1116,6 +1116,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
@@ -1186,6 +1187,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     overlay_block: None,
                     external_mask: None,
                 },
+                &metrics_set,
             )?;
             let indexed_search = compound_search_with_base_scorer(
                 &indices,
@@ -1410,6 +1412,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1465,6 +1468,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -1962,6 +1966,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1995,6 +2000,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2947,6 +2953,7 @@ impl ExecutionPlan for MatchQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -2985,6 +2992,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -4256,6 +4264,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -4284,6 +4293,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices

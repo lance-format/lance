@@ -30,7 +30,7 @@ use crate::{Error, Result};
 /// - Simple column names: "column"
 /// - Nested paths: "parent.child" or "parent.child.grandchild"
 /// - Backtick-escaped field names: "parent.`field.with.dots`"
-fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+pub(crate) fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
     // Try to get the column directly first (fast path for simple columns)
     if let Some(col) = batch.column_by_name(column) {
         return Ok(col.clone());
@@ -85,7 +85,7 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
     Ok(current_array)
 }
 
-async fn estimate_multivector_vectors_per_row(
+pub(crate) async fn estimate_multivector_vectors_per_row(
     dataset: &Dataset,
     column: &str,
     num_rows: usize,

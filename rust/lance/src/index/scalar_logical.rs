@@ -341,7 +341,28 @@ pub async fn open_named_scalar_index(
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    open_scalar_index_segments(dataset, column, index_name, None, metrics).await
+}
+
+/// Open scalar index segments whose coverage intersects `fragments`.
+///
+/// `None` preserves the unscoped behavior and opens every usable segment.
+pub async fn open_scalar_index_segments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    fragments: Option<&RoaringBitmap>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    let mut indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    if let Some(fragments) = fragments {
+        indices.retain(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
+        });
+    }
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -482,6 +503,19 @@ mod tests {
         let committed = dataset.load_indices_by_name("value_btree").await.unwrap();
         assert_eq!(committed.len(), fragments.len());
 
+        let target_fragment = fragments[1].id() as u32;
+        let scope = RoaringBitmap::from_iter([target_fragment]);
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree",
+            Some(&scope),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.calculate_included_frags().await.unwrap(), scope);
+
         let logical =
             open_named_scalar_index(&dataset, "value", "value_btree", &NoOpMetricsCollector)
                 .await
@@ -515,6 +549,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_segments_keeps_partial_overlap() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::with_capacity(2);
+        for pair in fragments.chunks(2) {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_pairs".to_string())
+                    .fragments(pair.iter().map(|fragment| fragment.id() as u32).collect())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_btree_pairs", "value", segments)
+            .await
+            .unwrap();
+
+        let target_fragment = fragments[1].id() as u32;
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree_pairs",
+            Some(&RoaringBitmap::from_iter([target_fragment])),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            scoped.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([fragments[0].id() as u32, target_fragment])
+        );
     }
 
     #[tokio::test]

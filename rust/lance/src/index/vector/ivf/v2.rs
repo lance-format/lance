@@ -2812,6 +2812,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(Box::pin(stream))
     }
 
+    fn supports_pairwise_vectors(&self) -> bool {
+        true
+    }
+
+    async fn prepare_pairwise_partition(
+        &self,
+        partition_id: usize,
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<lance_index::vector::pairwise::PairwisePartition> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::invalid_input(format!("partition_id={partition_id} has no centroid"))
+        })?;
+        self.storage
+            .prepare_pairwise_partition(
+                partition_id,
+                batch_size,
+                memory_limit,
+                centroid,
+                spill_store,
+            )
+            .await
+    }
+
     async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
         unimplemented!("this method is for only sub index");
     }
@@ -3028,11 +3059,19 @@ mod tests {
     // while 20 neighbors provide a useful recall oracle.
     const PQ_MATRIX_NUM_ROWS: usize = 320;
     const PQ_MATRIX_K: usize = 20;
-    // An 8-bit PQ codebook has 256 centroids, so this is the smallest valid
-    // training fixture shared by the 8-bit and 4-bit runtime cases.
-    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
+    const LIGHTWEIGHT_IVF_SAMPLE_RATE: usize = 16;
+    // An 8-bit PQ codebook has 256 codes and needs a training vector for each,
+    // so this is the smallest valid fixture, shared by the 8-bit and 4-bit
+    // runtime cases.
+    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
+
+    /// How many partitions `rows` supports when each one is trained on
+    /// `sample_rate` vectors. At least 1, and never more than `requested`.
+    fn supported_partitions(rows: usize, sample_rate: usize, requested: usize) -> usize {
+        requested.min(rows / sample_rate).max(1)
+    }
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -3802,6 +3841,153 @@ mod tests {
         (batch, schema)
     }
 
+    #[rstest]
+    #[case::flat(None)]
+    #[case::pq4(Some(4))]
+    #[case::pq8(Some(8))]
+    #[case::rq5(Some(5))]
+    #[tokio::test]
+    async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<usize>) {
+        // Cross the 8K source-read boundary with a packed RQ tail. Force both
+        // memory and spill paths, replaying the same index in 1K vector batches.
+        const NUM_ROWS: usize = 8193;
+        const BATCH_SIZE: usize = 1024;
+        let (batch, schema) = make_seeded_vector_batch(NUM_ROWS);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                // Keep this tiny fixture out of the whole-file read cache so
+                // the source-I/O assertion also exercises PQ4 preparation.
+                store_params: Some(ObjectStoreParams {
+                    block_size: Some(64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut ivf = IvfBuildParams::new(1);
+        ivf.centroids = Some(Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap(),
+        ));
+        let params = match bits {
+            None => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+            Some(5) => VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                ivf,
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+            ),
+            Some(bits) => VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                ivf,
+                PQBuildParams::with_codebook(
+                    16,
+                    bits,
+                    Arc::new(generate_random_array(DIM * (1 << bits))),
+                ),
+            ),
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("pairs".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let meta = dataset.load_indices_by_name("pairs").await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &meta[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let session = dataset.session();
+        let store = session.spill_store();
+        dataset.object_store.as_ref().io_stats_incremental();
+        let memory = index
+            .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
+            .await
+            .unwrap();
+        let memory_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+        let spilled = index
+            .prepare_pairwise_partition(0, BATCH_SIZE, 0, store)
+            .await
+            .unwrap();
+        let spilled_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+        assert!(memory_bytes > 0);
+        // Spilled source reads fetch each column's bytes about once; small
+        // tail ranges round up to encoding chunks. Rereading the PQ code
+        // column for every source window used to cost ~2.6x.
+        assert!(
+            spilled_bytes < 2 * memory_bytes,
+            "spilled preparation read {spilled_bytes} bytes, in-memory {memory_bytes}"
+        );
+        dataset.object_store.as_ref().io_stats_incremental();
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
+                let expected = memory.read_vectors(batch_id).await.unwrap();
+                let actual = spilled.read_vectors(batch_id).await.unwrap();
+                assert_eq!(actual.row_ids, expected.row_ids);
+                assert_eq!(actual.codes, expected.codes);
+                assert_eq!(
+                    actual.row_ids.len(),
+                    BATCH_SIZE.min(NUM_ROWS - batch_id * BATCH_SIZE)
+                );
+                seen.extend(actual.row_ids.values().iter().copied());
+            }
+        }
+        assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 0,
+            "replay must not reread the source index"
+        );
+        assert_eq!(stats.read_bytes, 0);
+
+        // Spilled and in-memory staging score bit-identically, in every tile.
+        let anchor = memory.read_vectors(0).await.unwrap();
+        let spilled_anchor = spilled.read_vectors(0).await.unwrap();
+        for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
+            let expected = memory
+                .score_block(
+                    &anchor,
+                    0..32,
+                    &memory.read_vectors(batch_id).await.unwrap(),
+                    f32::MAX,
+                )
+                .unwrap();
+            let actual = spilled
+                .score_block(
+                    &spilled_anchor,
+                    0..32,
+                    &spilled.read_vectors(batch_id).await.unwrap(),
+                    f32::MAX,
+                )
+                .unwrap();
+            let candidates = BATCH_SIZE.min(NUM_ROWS - batch_id * BATCH_SIZE);
+            let pairs = if batch_id == 0 {
+                (0..32).map(|row| candidates - row - 1).sum()
+            } else {
+                32 * candidates
+            };
+            assert_eq!(expected.distances.len(), pairs);
+            assert_eq!(actual, expected);
+        }
+    }
+
     async fn search_lightweight_pq_index(
         dataset: &Dataset,
         query: &dyn Array,
@@ -3843,7 +4029,7 @@ mod tests {
 
         let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
         ivf_params.max_iters = 2;
-        ivf_params.sample_rate = 16;
+        ivf_params.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
         let pq_params = lightweight_pq_params_with_bits(num_bits);
         let expected_num_sub_vectors = pq_params.num_sub_vectors;
         let params = if use_hnsw {
@@ -3872,10 +4058,12 @@ mod tests {
         let expected_index_type = if use_hnsw { "IVF_HNSW_PQ" } else { "IVF_PQ" };
         let expected_sub_index = if use_hnsw { "HNSW" } else { "PQ" };
         assert_eq!(stats["index_type"], expected_index_type);
-        assert_eq!(
-            stats["indices"][0]["num_partitions"],
-            LIGHTWEIGHT_PQ_PARTITIONS
+        let expected_partitions = supported_partitions(
+            LIGHTWEIGHT_PQ_ROWS,
+            LIGHTWEIGHT_IVF_SAMPLE_RATE,
+            LIGHTWEIGHT_PQ_PARTITIONS,
         );
+        assert_eq!(stats["indices"][0]["num_partitions"], expected_partitions);
         assert_eq!(
             stats["indices"][0]["sub_index"]["index_type"],
             expected_sub_index
@@ -5603,7 +5791,7 @@ mod tests {
         }
     }
 
-    fn pq_matrix_batch<T>() -> RecordBatch
+    fn pq_matrix_batch<T>(rows: usize) -> RecordBatch
     where
         T: ArrowPrimitiveType + 'static,
         T::Native: Copy + 'static,
@@ -5614,7 +5802,7 @@ mod tests {
             .with_seed(Seed(42))
             .col("id", array::step::<UInt64Type>())
             .col("vector", array::rand_vec::<T>(Dimension::from(DIM as u32)))
-            .into_batch_rows(RowCount::from(PQ_MATRIX_NUM_ROWS as u64))
+            .into_batch_rows(RowCount::from(rows as u64))
             .unwrap()
     }
 
@@ -5648,12 +5836,15 @@ mod tests {
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let batch = pq_matrix_batch::<Float32Type>();
+        let params = pq_matrix_params(nlist, distance_type, version.clone());
+        let batch = pq_matrix_batch::<Float32Type>(PQ_MATRIX_NUM_ROWS);
+        // `pq_matrix_params` fits each centroid on the whole fixture.
+        let expected_partitions =
+            supported_partitions(PQ_MATRIX_NUM_ROWS, PQ_MATRIX_NUM_ROWS, nlist);
         let schema = batch.schema();
         let query = batch["vector"].as_fixed_size_list().value(0);
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-        let params = pq_matrix_params(nlist, distance_type, version.clone());
         dataset
             .create_index(
                 &["vector"],
@@ -5673,7 +5864,7 @@ mod tests {
         let index = &indices[0];
         assert_eq!(index["index_type"], "IVF_PQ");
         assert_eq!(index["metric_type"], distance_type.to_string());
-        assert_eq!(index["num_partitions"], nlist);
+        assert_eq!(index["num_partitions"], expected_partitions);
         assert_eq!(index["sub_index"]["index_type"], "PQ");
         assert_eq!(
             index["index_file_version"],
@@ -6051,7 +6242,7 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
         let test_dir = TempStrDir::default();
-        let batch = pq_matrix_batch::<Float64Type>();
+        let batch = pq_matrix_batch::<Float64Type>(PQ_MATRIX_NUM_ROWS);
         let schema = batch.schema();
         let vectors = Arc::new(batch["vector"].as_fixed_size_list().clone());
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -6872,11 +7063,11 @@ mod tests {
     #[tokio::test]
     async fn test_index_stats(
         #[values(
-            (VectorIndexParams::ivf_flat(4, DistanceType::Hamming), IndexType::IvfFlat),
-            (VectorIndexParams::ivf_pq(4, 8, 8, DistanceType::L2, 10), IndexType::IvfPq),
+            (VectorIndexParams::ivf_flat(2, DistanceType::Hamming), IndexType::IvfFlat),
+            (VectorIndexParams::ivf_pq(2, 8, 8, DistanceType::L2, 10), IndexType::IvfPq),
             (VectorIndexParams::with_ivf_hnsw_sq_params(
                 DistanceType::Cosine,
-                IvfBuildParams::new(4),
+                IvfBuildParams::new(2),
                 Default::default(),
                 Default::default()
             ), IndexType::IvfHnswSq),
@@ -6887,7 +7078,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 4;
+        let nlist = 2;
         let (mut dataset, _) = match params.metric_type {
             DistanceType::Hamming => generate_test_dataset::<UInt8Type>(test_uri, 0..2).await,
             _ => generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await,
