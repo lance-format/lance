@@ -2881,3 +2881,156 @@ async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
          compaction produced it"
     );
 }
+
+/// A replacement on a source the compaction then reads. The compaction carries
+/// the new values into the fragment it produces, so the segments -- built before
+/// the replacement -- describe rows that fragment no longer holds.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
+    let dir = TempStrDir::default();
+    let (schema, batches) = geo::batches(RTREE_ROWS_PER_FRAGMENT, 3);
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: RTREE_ROWS_PER_FRAGMENT as usize,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // On `id`, so the compaction has an index to defer while `geometry` is left
+    // to the segments under test.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("committed_id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+    let source = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, source.clone()).await;
+    let replaced = source[0];
+
+    let geometry_schema = dataset.schema().project(&["geometry"]).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(&geometry_schema)),
+        vec![geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT)],
+    )
+    .unwrap();
+    let replacement = dataset
+        .get_fragment(replaced as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &geometry_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let before = dataset
+        .merge_existing_index_segments(staged.clone())
+        .await
+        .unwrap();
+    assert!(
+        !before.fragment_bitmap.as_ref().unwrap().contains(replaced),
+        "a merge before the compaction must already refuse the replaced source"
+    );
+
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0];
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        !merged.fragment_bitmap.as_ref().unwrap().contains(rewritten),
+        "the merged index claimed a fragment the compaction wrote replacement \
+         geometry into"
+    );
+}
+
+/// The comparison against the fragment the compaction wrote needs the manifest
+/// that wrote it, and cleanup deletes old manifests. With that one gone, the
+/// earliest surviving version holding the fragment is a later commit, which
+/// would compare equal to itself and prove nothing, so the merge gives the
+/// coverage up instead.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_up() {
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = dataset.get_fragments()[0].id() as u64;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        rewritten,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Everything up to and including the compaction's own commit.
+    dataset
+        .cleanup_old_versions(chrono::Duration::zero(), None, None)
+        .await
+        .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        merged.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "the merged index claimed a fragment it can no longer prove anything about: \
+         the manifest the compaction wrote has been cleaned up"
+    );
+}

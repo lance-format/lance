@@ -200,23 +200,16 @@ async fn remap_merged_segment_coverage(
         return Ok(None);
     };
 
-    // Compaction materializes an overlay into the fragment it produces and drops
-    // the overlay, leaving nothing to detect afterwards. Segments built before
-    // the overlay hold the old values, so no mapping can carry coverage there.
-    if compaction_materialized_a_newer_overlay(
-        dataset,
-        &frag_reuse_index,
-        segments,
-        &staged_coverage,
-    )
-    .await?
-    {
+    // Coverage may follow the rows through a compaction only while nothing else
+    // has rewritten the indexed fields on the way, and only while the manifests
+    // that would show it are still there to be read.
+    if indexed_data_moved_on(dataset, &frag_reuse_index, segments, &staged_coverage).await? {
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
-            "Merging index segments across a compaction that materialized an overlay \
-             committed after they were built: the merged index will not cover those rows, \
-             which fall back to a flat scan. Rebuild the index to cover them."
+            "Merging index segments whose indexed data has been rewritten since they were \
+             built, or whose history has been cleaned up: the merged index will not cover \
+             those rows, which fall back to a flat scan. Rebuild the index to cover them."
         );
         return Ok(None);
     }
@@ -259,22 +252,7 @@ async fn remap_merged_segment_coverage(
 
     // Fragments the remap added. Compaction created them after these segments
     // were built, so none of the segments has them in its history.
-    let mut introduced = &merged_coverage - &staged_coverage;
-
-    let changed =
-        indexed_data_changed_since_compaction(dataset, &frag_reuse_index, segments, &introduced)
-            .await?;
-    if !changed.is_empty() {
-        tracing::warn!(
-            index_name,
-            changed_fragments = changed.len(),
-            "Merged index will not cover fragments whose indexed data has been rewritten \
-             since the compaction that produced them: these segments describe what that \
-             compaction wrote. Rebuild the index to cover those rows."
-        );
-        merged_coverage -= &changed;
-        introduced -= &changed;
-    }
+    let introduced = &merged_coverage - &staged_coverage;
 
     for segment in segments {
         segment.fragment_bitmap = Some(merged_coverage.clone());
@@ -372,111 +350,76 @@ fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i
     })
 }
 
-/// The earliest dataset version after `read_version` that holds `fragment`, which
-/// is the compaction that produced it. Fragment ids are never reused, so the
-/// versions holding one form a suffix and can be bisected.
-async fn version_that_produced(
+/// The version that produced `fragment`, proven rather than guessed: the
+/// earliest retained version holding it, accepted only when the version before
+/// it is retained too. Cleanup deletes old manifests, and the earliest surviving
+/// version holding a fragment is evidence of nothing if the one before it is
+/// gone -- a later commit could have rewritten the fragment in between.
+async fn proven_creation_version(
     dataset: &Dataset,
-    later_versions: &[u64],
+    retained: &[u64],
+    after: u64,
     fragment: u32,
 ) -> Result<Option<Dataset>> {
-    let (mut low, mut high) = (0usize, later_versions.len());
-    let mut produced = None;
+    let later = retained
+        .iter()
+        .copied()
+        .filter(|version| *version > after)
+        .collect::<Vec<_>>();
+    let (mut low, mut high) = (0usize, later.len());
+    let mut created = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        let at = dataset.checkout_version(later_versions[middle]).await?;
+        let at = dataset.checkout_version(later[middle]).await?;
         if at.fragments().iter().any(|f| f.id as u32 == fragment) {
-            produced = Some(at);
+            created = Some((later[middle], at));
             high = middle;
         } else {
             low = middle + 1;
         }
     }
-    Ok(produced)
+    let Some((version, at)) = created else {
+        return Ok(None);
+    };
+    // The bisect only ever saw retained versions, so the one before this is
+    // proof only while it is still there to have been looked at.
+    Ok((version > 0 && retained.contains(&(version - 1))).then_some(at))
 }
 
-/// Fragments the remap introduced that no longer hold the data the compaction
-/// wrote into them.
-///
-/// The segments' rows were indexed from what that compaction read, so their
-/// entries describe the fragment as it was written. Any later commit that
-/// rewrites one of the indexed fields puts it in a different file, and an
-/// overlay adds one, so comparing the fragment then against the fragment now
-/// catches every such commit without naming any of them.
-async fn indexed_data_changed_since_compaction(
-    dataset: &Dataset,
-    frag_reuse_index: &CompactFragReuseIndex,
-    segments: &[IndexMetadata],
-    introduced: &RoaringBitmap,
-) -> Result<RoaringBitmap> {
-    if introduced.is_empty() {
-        return Ok(RoaringBitmap::new());
-    }
-    let mut indexed = HashSet::new();
-    for segment in segments {
-        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
-    }
-
-    // The compaction that produced each fragment, by the version it read.
-    let mut read_version_of = HashMap::new();
-    for version in &frag_reuse_index.details.versions {
-        for group in &version.groups {
-            for new in &group.new_frags {
-                if introduced.contains(new.id as u32) {
-                    read_version_of.insert(new.id as u32, version.dataset_version);
-                }
-            }
-        }
-    }
-
-    let all_versions = dataset.versions().await?;
-    let mut changed = RoaringBitmap::new();
-    for fragment in introduced {
-        // Without the compaction that produced it there is nothing to compare
-        // against, and coverage may not rest on an unchecked fragment.
-        let Some(read_version) = read_version_of.get(&fragment) else {
-            changed.insert(fragment);
-            continue;
-        };
-        let later_versions = all_versions
-            .iter()
-            .map(|version| version.version)
-            .filter(|version| version > read_version)
-            .collect::<Vec<_>>();
-        let Some(written) = version_that_produced(dataset, &later_versions, fragment).await? else {
-            changed.insert(fragment);
-            continue;
-        };
-        let (Some(then), Some(now)) = (
-            written.fragments().iter().find(|f| f.id as u32 == fragment),
-            dataset.fragments().iter().find(|f| f.id as u32 == fragment),
-        ) else {
-            changed.insert(fragment);
-            continue;
-        };
-        let files_then = fragment_field_files(&written, then, &indexed);
-        let files_now = fragment_field_files(dataset, now, &indexed);
-        if files_then.is_none()
-            || files_then != files_now
-            || has_overlay_newer_than(now, written.manifest.version, &indexed)
-        {
-            changed.insert(fragment);
-        }
-    }
-    Ok(changed)
+/// Whether `fragment` holds different data for the `indexed` fields in `after`
+/// than it did in `before`. Any commit that rewrites one of those fields puts it
+/// in a different file and an overlay adds one, so this one comparison stands in
+/// for every way the data could have moved on.
+fn indexed_data_differs(
+    before: &Dataset,
+    after: &Dataset,
+    fragment: u32,
+    indexed: &HashSet<i32>,
+) -> bool {
+    let (Some(then), Some(now)) = (
+        before.fragments().iter().find(|f| f.id as u32 == fragment),
+        after.fragments().iter().find(|f| f.id as u32 == fragment),
+    ) else {
+        return true;
+    };
+    let files_then = fragment_field_files(before, then, indexed);
+    files_then.is_none()
+        || files_then != fragment_field_files(after, now, indexed)
+        || has_overlay_newer_than(now, before.manifest.version, indexed)
 }
 
-/// Whether a compaction materialized an overlay into the fragments these
-/// segments' rows now live in.
+/// Whether the data these segments indexed has moved on from the fragments the
+/// merge would have them cover.
 ///
-/// Compacting a fragment that has an overlay materializes the overlay's values
-/// into the new fragment and drops the overlay, so afterwards nothing on that
-/// fragment shows one was ever there. A segment built before the overlay holds
-/// the old values and cannot cover those rows.
-///
-/// Every compaction is checked, and the set of fragments being followed advances
-/// to what each one produced, so a fragment compacted twice is still followed.
-async fn compaction_materialized_a_newer_overlay(
+/// The segments describe the dataset at their own version. A compaction carries
+/// those rows into the fragments it produces, and coverage may follow only while
+/// nothing else rewrites the indexed fields on the way. That leaves one gap per
+/// step -- from the state the segments describe to the state the first
+/// compaction read, from each compaction's own output to what the next one read,
+/// and from the last output to now -- and each is closed by comparing the
+/// fragments across it. Where a manifest a comparison needs has been cleaned up,
+/// the answer is that they have.
+async fn indexed_data_moved_on(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
@@ -490,11 +433,20 @@ async fn compaction_materialized_a_newer_overlay(
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
+    let retained = dataset
+        .versions()
+        .await?
+        .iter()
+        .map(|version| version.version)
+        .collect::<Vec<_>>();
+    let Ok(mut baseline) = dataset.checkout_version(oldest_segment).await else {
+        return Ok(true);
+    };
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
     versions.sort_by_key(|version| version.dataset_version);
 
-    let mut descends_from = staged_coverage.clone();
+    let mut following = staged_coverage.clone();
     for version in versions {
         let ours = version
             .groups
@@ -503,55 +455,52 @@ async fn compaction_materialized_a_newer_overlay(
                 group
                     .old_frags
                     .iter()
-                    .any(|fragment| descends_from.contains(fragment.id as u32))
+                    .any(|fragment| following.contains(fragment.id as u32))
             })
             .collect::<Vec<_>>();
         if ours.is_empty() {
             continue;
         }
 
-        // An overlay this old was already read by every segment, so only a later
-        // compaction can have materialized values they lack.
-        if version.dataset_version > oldest_segment {
-            // The reuse index records the version each compaction read. Its
-            // input fragments still exist there, with their overlays.
-            let inputs = dataset
-                .checkout_version(version.dataset_version)
-                .await
-                .map_err(|error| {
-                    Error::invalid_input(format!(
-                        "CreateIndex: cannot read dataset version {}, which a rewrite read: {error}",
-                        version.dataset_version
-                    ))
-                })?;
-            let inputs = inputs
-                .fragments()
-                .iter()
-                .map(|fragment| (fragment.id, fragment))
-                .collect::<HashMap<_, _>>();
-            if ours.iter().any(|group| {
-                group.old_frags.iter().any(|old| {
-                    inputs.get(&old.id).is_some_and(|input| {
-                        has_overlay_newer_than(input, oldest_segment, &indexed)
-                    })
-                })
-            }) {
-                return Ok(true);
+        let Ok(read) = dataset.checkout_version(version.dataset_version).await else {
+            return Ok(true);
+        };
+        for group in &ours {
+            for old in &group.old_frags {
+                let old = old.id as u32;
+                if following.contains(old) && indexed_data_differs(&baseline, &read, old, &indexed)
+                {
+                    return Ok(true);
+                }
             }
         }
 
-        // Follow the rows: what this compaction produced is what a later one
-        // will rewrite.
+        let mut produced = None;
         for group in ours {
             for old in &group.old_frags {
-                descends_from.remove(old.id as u32);
+                following.remove(old.id as u32);
             }
             for new in &group.new_frags {
-                descends_from.insert(new.id as u32);
+                following.insert(new.id as u32);
+                produced.get_or_insert(new.id as u32);
             }
         }
+        // Everything this compaction wrote was written by the same commit, so one
+        // of its fragments dates the rest.
+        let Some(produced) = produced else {
+            continue;
+        };
+        let Some(created) =
+            proven_creation_version(dataset, &retained, version.dataset_version, produced).await?
+        else {
+            return Ok(true);
+        };
+        baseline = created;
     }
-    Ok(false)
+
+    Ok(following
+        .iter()
+        .any(|fragment| indexed_data_differs(&baseline, dataset, fragment, &indexed)))
 }
 
 /// Resolve the field ids a segment's staleness check must consider: the subtree of
@@ -5124,6 +5073,62 @@ mod tests {
             vec![carried_field_id],
             "merge_segments must neither drop the covering declaration nor \
              produce an uncommittable one"
+        );
+    }
+
+    /// The version before a fragment's first appearance is what makes that
+    /// appearance its creation. Cleanup can delete it, and then the earliest
+    /// surviving version holding the fragment says nothing about when it was
+    /// written.
+    #[tokio::test]
+    async fn test_creation_version_is_only_proven_while_its_predecessor_is_retained() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        // A second fragment, so its creation sits after a version holding only
+        // the first.
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        dataset.append(reader, None).await.unwrap();
+        let appended = all_fragment_ids(&dataset)[1];
+
+        let retained = dataset
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>();
+        let created = proven_creation_version(&dataset, &retained, 0, appended)
+            .await
+            .unwrap()
+            .expect("the version before the append is retained, so creation is proven");
+        assert!(
+            created
+                .fragments()
+                .iter()
+                .any(|fragment| fragment.id as u32 == appended)
+        );
+
+        // The same search over a history missing that predecessor proves nothing.
+        let gapped = retained
+            .iter()
+            .copied()
+            .filter(|version| *version != created.manifest.version - 1)
+            .collect::<Vec<_>>();
+        assert!(
+            proven_creation_version(&dataset, &gapped, 0, appended)
+                .await
+                .unwrap()
+                .is_none(),
+            "a fragment's first surviving version is not its creation once the \
+             version before it has been cleaned up"
         );
     }
 
