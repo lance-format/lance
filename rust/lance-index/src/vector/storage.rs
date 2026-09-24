@@ -816,7 +816,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     writer.write(batch.slice(offset, len)).await?;
                 }
             }
-            writer.finish().await?
+            EncodedPartition::Spilled(writer.finish().await?)
         };
         Ok(PairwisePartition {
             encoded,
@@ -826,6 +826,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             remapper: self.frag_reuse_index.clone(),
             batch_size,
             num_rows,
+            rotated_center: tokio::sync::OnceCell::new(),
         })
     }
 

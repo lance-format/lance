@@ -788,6 +788,9 @@ def find_duplicate_pairs(
     dataset: LanceDataset,
     column: str,
     distance_threshold: float,
+    *,
+    decoded_cache_size: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream embedding duplicate pairs from an existing vector index.
 
@@ -809,8 +812,17 @@ def find_duplicate_pairs(
     Each partition's compact index codes are prepared once. Small partitions
     are buffered in memory; larger ones are read in 8,192-row batches into
     temporary session spill storage, reclaimed when the reader advances or
-    closes. Decoding uses 1,024-row vector batches and output remains batched.
-    This avoids rereading the source index for every anchor.
+    closes. Each 1,024-row vector batch is reconstructed once. Decoded vectors
+    are cached up to ``decoded_cache_size`` bytes (default 256 MiB). Earlier
+    decoded batches spill when necessary; later batches stay cached because
+    upper-triangle enumeration revisits them most. Staging completes before
+    emitting pairs from the partition, and no batch is reconstructed again.
+    Zero forces decoded spill. This budget excludes encoded staging, models,
+    row masks, spill metadata and in-flight buffers; it is not a process limit.
+    ``max_concurrency`` limits in-flight scoring jobs (positive; defaults to the
+    CPU pool size capped at eight). Each job produces at most 1,024 pairs and,
+    on the spill path, may retain an anchor batch and a candidate batch.
+    Completion is ordered so the pair order is independent of concurrency.
 
     Examples
     --------
@@ -826,7 +838,12 @@ def find_duplicate_pairs(
     --------
     find_duplicate_pairs_in_partition : Execute one segment/partition.
     """
-    return dataset._ds.find_duplicate_pairs(column, distance_threshold)
+    return dataset._ds.find_duplicate_pairs(
+        column,
+        distance_threshold,
+        decoded_cache_size=decoded_cache_size,
+        max_concurrency=max_concurrency,
+    )
 
 
 def find_duplicate_pairs_in_partition(
@@ -835,6 +852,9 @@ def find_duplicate_pairs_in_partition(
     segment_id: Union[str, uuid.UUID],
     partition_id: int,
     distance_threshold: float,
+    *,
+    decoded_cache_size: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream duplicate pairs from one physical index segment and partition.
 
@@ -843,6 +863,8 @@ def find_duplicate_pairs_in_partition(
     not an index name or fragment ID. ``partition_id`` is local to that segment.
     Other dataset fragments need not be indexed for this scoped operation.
     Distributed callers must open the same dataset version on every worker.
+    ``decoded_cache_size`` and ``max_concurrency`` have the same meaning and
+    defaults as in :func:`find_duplicate_pairs` and apply to this invocation.
 
     Examples
     --------
@@ -858,7 +880,12 @@ def find_duplicate_pairs_in_partition(
                 consume(batch)
     """
     return dataset._ds.find_duplicate_pairs_in_partition(
-        column, str(segment_id), partition_id, distance_threshold
+        column,
+        str(segment_id),
+        partition_id,
+        distance_threshold,
+        decoded_cache_size=decoded_cache_size,
+        max_concurrency=max_concurrency,
     )
 
 

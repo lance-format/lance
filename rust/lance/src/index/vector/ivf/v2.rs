@@ -3924,6 +3924,11 @@ mod tests {
                 .read_iops
                 > 0
         );
+        let memory = memory.materialize(usize::MAX, store).await.unwrap();
+        let spilled = spilled.materialize(0, store).await.unwrap();
+        // Materialization may still read encoded source buffers. All subsequent
+        // replay is exclusively decoded data, including the forced-spill path.
+        dataset.object_store.as_ref().io_stats_incremental();
         let mut seen = HashSet::new();
         for _ in 0..3 {
             for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {

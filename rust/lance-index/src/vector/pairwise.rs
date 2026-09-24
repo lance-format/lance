@@ -3,13 +3,13 @@
 
 //! Bounded reconstruction of index representations for symmetric pair scoring.
 
-use std::{io::Cursor, ops::Range, sync::Arc};
+use std::{collections::VecDeque, io::Cursor, ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float64Array, RecordBatch, UInt64Array};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
@@ -19,6 +19,7 @@ use lance_io::{
 };
 use lance_linalg::distance::DistanceType;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OnceCell;
 
 use crate::scalar::RowIdRemapper;
 
@@ -41,12 +42,30 @@ pub const PAIRWISE_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) enum EncodedPartition {
     Memory(RecordBatch),
-    Spilled {
-        ranges: Vec<Range<usize>>,
-        reader: Box<dyn Reader>,
-        // Keep the spill alive until its reader has been dropped.
-        _spill: Box<dyn Spill>,
-    },
+    Spilled(SpilledPartition),
+}
+
+pub(crate) struct SpilledPartition {
+    ranges: Vec<Range<usize>>,
+    reader: Box<dyn Reader>,
+    // Keep the spill alive until its reader has been dropped.
+    _spill: Box<dyn Spill>,
+}
+
+impl SpilledPartition {
+    async fn read_batch(&self, batch_id: usize) -> Result<RecordBatch> {
+        let range = self.ranges.get(batch_id).ok_or_else(|| {
+            Error::invalid_input(format!("pairwise spill batch_id={batch_id} out of range"))
+        })?;
+        let bytes = self.reader.get_range(range.clone()).await?;
+        spawn_cpu(move || {
+            StreamReader::try_new(Cursor::new(bytes), None)?
+                .next()
+                .ok_or_else(|| Error::internal("empty pairwise spill batch"))?
+                .map_err(Error::from)
+        })
+        .await
+    }
 }
 
 /// An invocation-owned, prepared partition. Reads replay compact index codes;
@@ -59,6 +78,7 @@ pub struct PairwisePartition {
     pub(crate) remapper: Option<Arc<dyn RowIdRemapper>>,
     pub(crate) batch_size: usize,
     pub(crate) num_rows: usize,
+    pub(crate) rotated_center: OnceCell<Arc<Vec<f32>>>,
 }
 
 impl PairwisePartition {
@@ -74,22 +94,33 @@ impl PairwisePartition {
         let len = self.batch_size.min(self.num_rows - start);
         let batch = match &self.encoded {
             EncodedPartition::Memory(batch) => batch.slice(start, len),
-            EncodedPartition::Spilled { ranges, reader, .. } => {
-                let range = ranges.get(batch_id).ok_or_else(|| {
-                    Error::internal(format!("missing spilled pairwise batch_id={batch_id}"))
-                })?;
-                let bytes = reader.get_range(range.clone()).await?;
-                spawn_cpu(move || {
-                    StreamReader::try_new(Cursor::new(bytes), None)?
-                        .next()
-                        .ok_or_else(|| Error::internal("empty pairwise spill batch"))?
-                        .map_err(Error::from)
-                })
-                .await?
-            }
+            EncodedPartition::Spilled(spill) => spill.read_batch(batch_id).await?,
         };
         let quantizer = self.quantizer.clone();
         let centroid = self.centroid.clone();
+        let rotated_center = if matches!(quantizer.as_ref(), Quantizer::Rabit(_)) {
+            Some(
+                self.rotated_center
+                    .get_or_try_init(|| async {
+                        let quantizer = quantizer.clone();
+                        let centroid = centroid.clone();
+                        spawn_cpu(move || {
+                            let Quantizer::Rabit(rq) = quantizer.as_ref() else {
+                                return Err(Error::internal("expected RQ quantizer"));
+                            };
+                            let dim = centroid.len();
+                            let centroid =
+                                FixedSizeListArray::try_new_from_values(centroid, dim as i32)?;
+                            rq.rotate_fsl_to_f32(&centroid).map(Arc::new)
+                        })
+                        .await
+                    })
+                    .await?
+                    .clone(),
+            )
+        } else {
+            None
+        };
         let metric = self.metric;
         let remapper = self.remapper.clone();
         let is_flat = matches!(
@@ -97,7 +128,7 @@ impl PairwisePartition {
             Quantizer::Flat(_) | Quantizer::FlatBin(_)
         );
         let decode = move || {
-            let vectors = reconstruct(&quantizer, &batch, centroid, metric)?;
+            let vectors = reconstruct(&quantizer, &batch, centroid, rotated_center, metric)?;
             let ids = batch
                 .column_by_name(ROW_ID)
                 .ok_or_else(|| Error::internal("index batch missing row IDs"))?
@@ -122,6 +153,130 @@ impl PairwisePartition {
             spawn_cpu(decode).await
         }
     }
+
+    /// Reconstruct every batch once, retaining decoded vectors within the given
+    /// cache budget or writing independently readable decoded spill records.
+    /// Cache the tail: upper-triangle traversal revisits later batches most.
+    /// Consuming `self` releases the encoded staging once reconstruction finishes.
+    /// The budget excludes one in-flight batch, models, and spill range metadata.
+    pub async fn materialize(
+        self,
+        decoded_cache_size: usize,
+        spill_store: &dyn SpillStore,
+    ) -> Result<DecodedPairwisePartition> {
+        let mut batches = VecDeque::<(PairwiseVectorBatch, usize)>::new();
+        let mut retained_bytes = 0usize;
+        let mut writer: Option<PairwiseSpillWriter> = None;
+        for batch_id in 0..self.num_rows.div_ceil(self.batch_size) {
+            let mut batch = self.read_vectors(batch_id).await?;
+            // An IPC row-ID slice can pin the entire encoded message. Keep
+            // owned IDs so decoded caching releases the quantized buffers.
+            batch.row_ids = UInt64Array::from(batch.row_ids.iter().collect::<Vec<_>>());
+            let bytes = batch
+                .row_ids
+                .get_array_memory_size()
+                .checked_add(batch.vectors.get_array_memory_size())
+                .ok_or_else(|| Error::invalid_input("decoded pairwise batch size overflow"))?;
+            let next_bytes = retained_bytes.checked_add(bytes);
+            if writer.is_none() && next_bytes.is_none_or(|size| size > decoded_cache_size) {
+                writer = Some(PairwiseSpillWriter::new(spill_store).await?);
+            }
+            while !batches.is_empty()
+                && retained_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|size| size > decoded_cache_size)
+            {
+                let (cached, cached_bytes) = batches
+                    .pop_front()
+                    .ok_or_else(|| Error::internal("missing decoded cache entry"))?;
+                retained_bytes -= cached_bytes;
+                writer
+                    .as_mut()
+                    .ok_or_else(|| Error::internal("missing decoded spill writer"))?
+                    .write(decoded_record_batch(cached)?)
+                    .await?;
+            }
+            if bytes > decoded_cache_size {
+                writer
+                    .as_mut()
+                    .ok_or_else(|| Error::internal("missing decoded spill writer"))?
+                    .write(decoded_record_batch(batch)?)
+                    .await?;
+            } else {
+                retained_bytes = retained_bytes.checked_add(bytes).ok_or_else(|| {
+                    Error::invalid_input("decoded pairwise partition size overflow")
+                })?;
+                batches.push_back((batch, bytes));
+            }
+        }
+        let cached = batches.into_iter().map(|(batch, _)| batch).collect();
+        let storage = if let Some(writer) = writer {
+            DecodedStorage::Spilled {
+                prefix: writer.finish().await?,
+                cached,
+            }
+        } else {
+            DecodedStorage::Memory(cached)
+        };
+        Ok(DecodedPairwisePartition { storage })
+    }
+}
+
+enum DecodedStorage {
+    Memory(Vec<PairwiseVectorBatch>),
+    Spilled {
+        prefix: SpilledPartition,
+        cached: Vec<PairwiseVectorBatch>,
+    },
+}
+
+/// Read-only reconstructed vectors. Replay never invokes a quantizer or reads
+/// the original index, even when decoded vectors exceed the memory budget.
+pub struct DecodedPairwisePartition {
+    storage: DecodedStorage,
+}
+
+impl DecodedPairwisePartition {
+    /// Read a decoded batch by its zero-based position in the partition.
+    pub async fn read_vectors(&self, batch_id: usize) -> Result<PairwiseVectorBatch> {
+        match &self.storage {
+            DecodedStorage::Memory(batches) => batches.get(batch_id).cloned().ok_or_else(|| {
+                Error::invalid_input(format!("decoded pairwise batch_id={batch_id} out of range"))
+            }),
+            DecodedStorage::Spilled { prefix, cached } => {
+                if let Some(cached_id) = batch_id.checked_sub(prefix.ranges.len()) {
+                    return cached.get(cached_id).cloned().ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "decoded pairwise batch_id={batch_id} out of range"
+                        ))
+                    });
+                }
+                let batch = prefix.read_batch(batch_id).await?;
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .and_then(|array| array.as_primitive_opt::<arrow_array::types::UInt64Type>())
+                    .ok_or_else(|| Error::internal("decoded pairwise spill missing row IDs"))?
+                    .clone();
+                let vectors = batch
+                    .column_by_name("vector")
+                    .and_then(|array| array.as_fixed_size_list_opt())
+                    .ok_or_else(|| Error::internal("decoded pairwise spill missing vectors"))?
+                    .clone();
+                Ok(PairwiseVectorBatch { row_ids, vectors })
+            }
+        }
+    }
+}
+
+fn decoded_record_batch(batch: PairwiseVectorBatch) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(ROW_ID, DataType::UInt64, true),
+        Field::new("vector", batch.vectors.data_type().clone(), true),
+    ]));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(batch.row_ids), Arc::new(batch.vectors)],
+    )?)
 }
 
 /// Each Arrow stream is independently readable, so replay needs one local
@@ -162,11 +317,11 @@ impl PairwiseSpillWriter {
         Ok(())
     }
 
-    pub(crate) async fn finish(mut self) -> Result<EncodedPartition> {
+    pub(crate) async fn finish(mut self) -> Result<SpilledPartition> {
         Writer::shutdown(self.writer.as_mut()).await?;
         drop(self.writer);
         let reader = self.spill.reader().await?;
-        Ok(EncodedPartition::Spilled {
+        Ok(SpilledPartition {
             ranges: self.ranges,
             reader,
             _spill: self.spill,
@@ -209,13 +364,18 @@ pub(crate) fn reconstruct(
     quantizer: &Quantizer,
     batch: &RecordBatch,
     centroid: ArrayRef,
+    rotated_center: Option<Arc<Vec<f32>>>,
     metric: DistanceType,
 ) -> Result<FixedSizeListArray> {
     let encoded = codes(batch, quantizer.column())?;
     if matches!(quantizer, Quantizer::Flat(_) | Quantizer::FlatBin(_)) {
         return Ok(encoded.clone());
     }
-    let center = float_values(centroid.as_ref())?;
+    let center = if matches!(quantizer, Quantizer::Product(_)) {
+        float_values(centroid.as_ref())?
+    } else {
+        Vec::new()
+    };
     let dim;
     let mut values = Vec::new();
     match quantizer {
@@ -267,8 +427,9 @@ pub(crate) fn reconstruct(
                 ));
             }
             dim = meta.rotated_dim();
-            let centroid = FixedSizeListArray::try_new_from_values(centroid, center.len() as i32)?;
-            let rotated_center = rq.rotate_fsl_to_f32(&centroid)?;
+            let rotated_center = rotated_center.ok_or_else(|| {
+                Error::internal("RQ pair reconstruction missing prepared centroid")
+            })?;
             // FastScan packs groups of 32 rows. The reader aligns the batch to
             // those groups before calling this decoder.
             let signs = if meta.packed {
@@ -353,13 +514,9 @@ mod tests {
         let mut writer = PairwiseSpillWriter::new(&store).await.unwrap();
         writer.write(batch.clone()).await.unwrap();
         let encoded = writer.finish().await.unwrap();
-        let (bytes, spill_path) = match &encoded {
-            EncodedPartition::Spilled { reader, .. } => (
-                reader.size().await.unwrap(),
-                std::path::PathBuf::from(lance_io::local::to_local_path(reader.path())),
-            ),
-            _ => unreachable!(),
-        };
+        let bytes = encoded.reader.size().await.unwrap();
+        let spill_path =
+            std::path::PathBuf::from(lance_io::local::to_local_path(encoded.reader.path()));
         let spill_dir = spill_path.parent().unwrap().to_owned();
         drop(encoded);
         let mut aborted = PairwiseSpillWriter::new(&store).await.unwrap();
@@ -397,13 +554,14 @@ mod tests {
         writer.write(batch.clone()).await.unwrap();
         writer.write(batch.slice(0, 1)).await.unwrap();
         let prepared = PairwisePartition {
-            encoded: writer.finish().await.unwrap(),
+            encoded: EncodedPartition::Spilled(writer.finish().await.unwrap()),
             quantizer: Arc::new(Quantizer::Flat(FlatQuantizer::new(2, DistanceType::L2))),
             centroid: Arc::new(arrow_array::Float32Array::from(vec![0.0, 0.0])),
             metric: DistanceType::L2,
             remapper: None,
             batch_size: 32,
             num_rows: 33,
+            rotated_center: OnceCell::new(),
         };
         for _ in 0..3 {
             for (id, expected) in [batch.clone(), batch.slice(0, 1)].iter().enumerate() {
@@ -423,5 +581,69 @@ mod tests {
             assert!(matches!(err, Error::InvalidInput { .. }));
             assert!(err.to_string().contains("batch_id"));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::spill(0)]
+    #[case::spill_after_first_batch(1)]
+    #[case::memory(usize::MAX)]
+    #[tokio::test]
+    async fn test_decoded_replay_releases_encoded_storage(#[case] cached_batches: usize) {
+        let batch = flat_batch();
+        let quantizer = FlatQuantizer::new(2, DistanceType::L2);
+        let store = LocalSpillStore::default();
+        let mut writer = PairwiseSpillWriter::new(&store).await.unwrap();
+        writer.write(batch.clone()).await.unwrap();
+        writer.write(batch.slice(0, 1)).await.unwrap();
+        let encoded = writer.finish().await.unwrap();
+        let encoded_path =
+            std::path::PathBuf::from(lance_io::local::to_local_path(encoded.reader.path()));
+        let spill_dir = encoded_path.parent().unwrap().to_owned();
+        let prepared = PairwisePartition {
+            encoded: EncodedPartition::Spilled(encoded),
+            quantizer: Arc::new(Quantizer::Flat(quantizer.clone())),
+            centroid: Arc::new(arrow_array::Float32Array::from(vec![0.0, 0.0])),
+            metric: DistanceType::L2,
+            remapper: None,
+            batch_size: 32,
+            num_rows: 33,
+            rotated_center: OnceCell::new(),
+        };
+        let mut first = prepared.read_vectors(0).await.unwrap();
+        first.row_ids = UInt64Array::from(first.row_ids.iter().collect::<Vec<_>>());
+        let batch_bytes =
+            first.row_ids.get_array_memory_size() + first.vectors.get_array_memory_size();
+        let limit = cached_batches.saturating_mul(batch_bytes);
+        let decoded = prepared.materialize(limit, &store).await.unwrap();
+        assert!(
+            !encoded_path.exists(),
+            "encoded staging must be released before replay"
+        );
+        assert_eq!(
+            matches!(decoded.storage, DecodedStorage::Memory(_)),
+            cached_batches == usize::MAX
+        );
+        if let DecodedStorage::Spilled { prefix, cached } = &decoded.storage {
+            assert_eq!(prefix.ranges.len(), if cached_batches == 0 { 2 } else { 1 });
+            assert_eq!(cached.len(), if cached_batches == 0 { 0 } else { 1 });
+        }
+        for _ in 0..3 {
+            for (id, expected) in [batch.clone(), batch.slice(0, 1)].iter().enumerate() {
+                let actual = decoded.read_vectors(id).await.unwrap();
+                assert_eq!(
+                    &actual.row_ids,
+                    expected[ROW_ID].as_primitive::<UInt64Type>()
+                );
+                assert_eq!(
+                    &actual.vectors,
+                    expected[quantizer.column()].as_fixed_size_list()
+                );
+            }
+        }
+        let error = decoded.read_vectors(2).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("batch_id=2"));
+        drop(decoded);
+        assert_eq!(std::fs::read_dir(spill_dir).unwrap().count(), 0);
     }
 }

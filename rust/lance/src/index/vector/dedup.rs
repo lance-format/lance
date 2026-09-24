@@ -3,21 +3,22 @@
 
 //! Streaming embedding duplicate pairs over existing index representations.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
-use futures::stream;
-use lance_core::utils::tokio::spawn_cpu;
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
     VectorIndex,
-    pairwise::{PAIRWISE_MEMORY_LIMIT, PairwisePartition, PairwiseVectorBatch},
+    pairwise::{DecodedPairwisePartition, PAIRWISE_MEMORY_LIMIT, PairwiseVectorBatch},
 };
+use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
 use uuid::Uuid;
 
@@ -27,14 +28,57 @@ use crate::index::{
     segment_has_vector_details,
 };
 
-/// At most two decoded input batches and one output batch are retained. A
-/// multiple of 32 also matches RQ's packed sign-code group size.
-/// Compact index codes are separately staged in bounded memory or session spill.
+/// Scoring and output remain bounded even when the decoded partition spills.
+/// A multiple of 32 also matches RQ's packed sign-code group size.
 const VECTOR_BATCH_SIZE: usize = 1024;
 
 // Small SIMD batches do not justify a CPU-pool round trip. Larger distances
 // run on the CPU pool; inline batches yield cooperatively in the scan loop.
 const MIN_OFFLOAD_COORDINATES: usize = 256 * 1024;
+
+/// Per-invocation decoded-vector caching and ordered scoring concurrency.
+///
+/// The cache budget is not a process-wide memory limit. It excludes encoded
+/// staging, models, row masks, spill metadata and in-flight scoring buffers.
+/// With spilled vectors, each in-flight job may retain an anchor batch, a
+/// candidate batch and at most one output batch, each bounded to 1,024 rows.
+///
+/// ```
+/// use lance::index::vector::dedup::DuplicatePairsOptions;
+/// let options = DuplicatePairsOptions::default()
+///     .with_decoded_cache_size(128 * 1024 * 1024)
+///     .with_max_concurrency(4);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct DuplicatePairsOptions {
+    decoded_cache_size: usize,
+    max_concurrency: usize,
+}
+
+impl Default for DuplicatePairsOptions {
+    fn default() -> Self {
+        Self {
+            decoded_cache_size: 256 * 1024 * 1024,
+            max_concurrency: get_num_compute_intensive_cpus().min(8),
+        }
+    }
+}
+
+impl DuplicatePairsOptions {
+    /// Set the decoded cache budget in bytes (default 256 MiB). Zero forces
+    /// decoded spill. Reconstruction retains at most one extra in-flight batch.
+    pub fn with_decoded_cache_size(mut self, decoded_cache_size: usize) -> Self {
+        self.decoded_cache_size = decoded_cache_size;
+        self
+    }
+
+    /// Set the maximum number of in-flight scoring jobs. Must be positive.
+    /// The default is the CPU pool size capped at eight. Output remains ordered.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = max_concurrency;
+        self
+    }
+}
 
 fn pair_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -74,7 +118,35 @@ pub async fn find_duplicate_pairs(
     column: &str,
     distance_threshold: f32,
 ) -> Result<SendableRecordBatchStream> {
-    plan(dataset, column, None, distance_threshold).await
+    find_duplicate_pairs_with_options(
+        dataset,
+        column,
+        distance_threshold,
+        DuplicatePairsOptions::default(),
+    )
+    .await
+}
+
+/// Enumerate pairs with explicit resource settings; semantics are identical to
+/// [`find_duplicate_pairs`]. See [`DuplicatePairsOptions`] for memory accounting.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{Dataset, Result};
+/// # use lance::index::vector::dedup::{find_duplicate_pairs_with_options, DuplicatePairsOptions};
+/// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+/// let pairs = find_duplicate_pairs_with_options(
+///     dataset, "embedding", 0.05, DuplicatePairsOptions::default().with_max_concurrency(4),
+/// ).await?;
+/// # Ok(()) }
+/// ```
+pub async fn find_duplicate_pairs_with_options(
+    dataset: Arc<Dataset>,
+    column: &str,
+    distance_threshold: f32,
+    options: DuplicatePairsOptions,
+) -> Result<SendableRecordBatchStream> {
+    plan(dataset, column, None, distance_threshold, options).await
 }
 
 /// Enumerate pairs only within the specified physical segment and partition.
@@ -101,11 +173,46 @@ pub async fn find_duplicate_pairs_in_partition(
     partition_id: usize,
     distance_threshold: f32,
 ) -> Result<SendableRecordBatchStream> {
+    find_duplicate_pairs_in_partition_with_options(
+        dataset,
+        column,
+        segment_id,
+        partition_id,
+        distance_threshold,
+        DuplicatePairsOptions::default(),
+    )
+    .await
+}
+
+/// Run one segment/partition with explicit decoded caching and concurrency.
+/// Uses the snapshot, distance and ordering contract of
+/// [`find_duplicate_pairs_in_partition`].
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{Dataset, Result};
+/// # use lance::index::vector::dedup::{find_duplicate_pairs_in_partition_with_options, DuplicatePairsOptions};
+/// # async fn example(dataset: Arc<Dataset>, segment: uuid::Uuid) -> Result<()> {
+/// let pairs = find_duplicate_pairs_in_partition_with_options(
+///     dataset, "embedding", segment, 0, 0.05,
+///     DuplicatePairsOptions::default().with_decoded_cache_size(0),
+/// ).await?;
+/// # Ok(()) }
+/// ```
+pub async fn find_duplicate_pairs_in_partition_with_options(
+    dataset: Arc<Dataset>,
+    column: &str,
+    segment_id: Uuid,
+    partition_id: usize,
+    distance_threshold: f32,
+    options: DuplicatePairsOptions,
+) -> Result<SendableRecordBatchStream> {
     plan(
         dataset,
         column,
         Some((segment_id, partition_id)),
         distance_threshold,
+        options,
     )
     .await
 }
@@ -115,7 +222,13 @@ async fn plan(
     column: &str,
     selection: Option<(Uuid, usize)>,
     threshold: f32,
+    options: DuplicatePairsOptions,
 ) -> Result<SendableRecordBatchStream> {
+    if options.max_concurrency == 0 {
+        return Err(Error::invalid_input(
+            "max_concurrency must be positive, got 0",
+        ));
+    }
     if !threshold.is_finite() {
         return Err(Error::invalid_input(format!(
             "distance_threshold must be finite, got {threshold}"
@@ -154,7 +267,7 @@ async fn plan(
             "segment_id={id} is not an active segment of column '{column}'"
         )));
     }
-    let mut partitions = VecDeque::new();
+    let mut partitions = Vec::new();
     for meta in segments
         .into_iter()
         .filter(|meta| selection.is_none_or(|(id, _)| id == meta.uuid))
@@ -206,7 +319,7 @@ async fn plan(
                     meta.uuid
                 )));
             }
-            partitions.push_back(Partition { index, id: p, mask });
+            partitions.push(Partition { index, id: p, mask });
         } else {
             partitions.extend((0..count).map(|id| Partition {
                 index: index.clone(),
@@ -215,23 +328,11 @@ async fn plan(
             }));
         }
     }
-    let state = PairStream {
-        partitions,
-        session: dataset.session(),
-        prepared: None,
-        threshold,
-        anchor: None,
-        candidate: None,
-        anchor_start: 0,
-        anchor_row: 0,
-        candidate_start: 0,
-    };
-    let stream = stream::try_unfold(state, |mut state| async move {
-        state
-            .next_batch()
-            .await
-            .map(|batch| batch.map(|batch| (batch, state)))
-    });
+    let session = dataset.session();
+    let stream = stream::iter(partitions)
+        .then(move |partition| partition_stream(partition, session.clone(), threshold, options))
+        .map_err(datafusion::error::DataFusionError::from)
+        .try_flatten();
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         pair_schema(),
         stream,
@@ -244,59 +345,86 @@ struct Partition {
     mask: Arc<RowAddrMask>,
 }
 
-struct PairStream {
-    partitions: VecDeque<Partition>,
+async fn partition_stream(
+    partition: Partition,
     session: Arc<crate::session::Session>,
-    prepared: Option<PairwisePartition>,
     threshold: f32,
+    options: DuplicatePairsOptions,
+) -> Result<SendableRecordBatchStream> {
+    let count = partition.index.partition_size(partition.id);
+    let metric = partition.index.metric_type();
+    let schema = pair_schema();
+    if count == 0 {
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::empty(),
+        )));
+    }
+    let prepared = partition
+        .index
+        .prepare_pairwise_partition(
+            partition.id,
+            VECTOR_BATCH_SIZE,
+            PAIRWISE_MEMORY_LIMIT,
+            session.spill_store(),
+        )
+        .await?;
+    let prepared = Arc::new(
+        prepared
+            .materialize(options.decoded_cache_size, session.spill_store())
+            .await?,
+    );
+    let state = PairWork {
+        prepared,
+        count,
+        metric,
+        filter: partition.mask,
+        threshold,
+        schema: schema.clone(),
+        anchor: None,
+        anchor_start: 0,
+        anchor_row: 0,
+        candidate_start: 0,
+    };
+    let jobs = stream::try_unfold(state, |mut state| async move {
+        state
+            .next_work()
+            .await
+            .map(|work| work.map(|work| (work, state)))
+    });
+    // Bounded ordered completion preserves contiguous anchors without collecting
+    // an entire anchor's matches or an entire block-pair distance matrix.
+    let batches = jobs
+        .map_ok(|work| work.score())
+        .try_buffered(options.max_concurrency)
+        .try_filter(|batch| std::future::ready(batch.num_rows() != 0))
+        .map_err(datafusion::error::DataFusionError::from);
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+}
+
+struct PairWork {
+    prepared: Arc<DecodedPairwisePartition>,
+    count: usize,
+    metric: DistanceType,
+    filter: Arc<RowAddrMask>,
+    threshold: f32,
+    schema: SchemaRef,
     anchor: Option<PairwiseVectorBatch>,
-    candidate: Option<(usize, PairwiseVectorBatch)>,
     anchor_start: usize,
     anchor_row: usize,
     candidate_start: usize,
 }
 
-impl PairStream {
-    async fn next_batch(&mut self) -> datafusion::error::Result<Option<RecordBatch>> {
+impl PairWork {
+    async fn next_work(&mut self) -> Result<Option<ScoreWork>> {
         loop {
             tokio::task::consume_budget().await;
-            let Some(Partition {
-                index,
-                id: partition,
-                mask: filter,
-            }) = self.partitions.front()
-            else {
+            if self.anchor_start >= self.count {
                 return Ok(None);
-            };
-            let count = index.partition_size(*partition);
-            if self.anchor_start >= count {
-                self.partitions.pop_front();
-                self.prepared = None;
-                self.anchor = None;
-                self.candidate = None;
-                self.anchor_start = 0;
-                self.anchor_row = 0;
-                continue;
             }
-            if self.prepared.is_none() {
-                self.prepared = Some(
-                    index
-                        .prepare_pairwise_partition(
-                            *partition,
-                            VECTOR_BATCH_SIZE,
-                            PAIRWISE_MEMORY_LIMIT,
-                            self.session.spill_store(),
-                        )
-                        .await?,
-                );
-            }
-            let prepared = self
-                .prepared
-                .as_ref()
-                .ok_or_else(|| Error::internal("missing prepared pairwise partition"))?;
             if self.anchor.is_none() {
                 self.anchor = Some(
-                    prepared
+                    self.prepared
                         .read_vectors(self.anchor_start / VECTOR_BATCH_SIZE)
                         .await?,
                 );
@@ -314,77 +442,105 @@ impl PairStream {
             }
             let a = anchor.row_ids.value(self.anchor_row);
             if !anchor.row_ids.is_valid(self.anchor_row)
-                || !filter.selected(a)
-                || self.candidate_start >= count
+                || !self.filter.selected(a)
+                || self.candidate_start >= self.count
             {
                 self.anchor_row += 1;
                 self.candidate_start = self.anchor_start;
                 continue;
             }
             let start = self.candidate_start;
-            let end = (start + VECTOR_BATCH_SIZE).min(count);
-            let candidates = if start == self.anchor_start {
-                anchor.clone()
-            } else if let Some((_, batch)) = self.candidate.as_ref().filter(|(id, _)| *id == start)
-            {
-                batch.clone()
-            } else {
-                self.candidate = None;
-                let batch = prepared.read_vectors(start / VECTOR_BATCH_SIZE).await?;
-                self.candidate = Some((start, batch.clone()));
-                batch
-            };
+            let end = start.saturating_add(VECTOR_BATCH_SIZE).min(self.count);
             let query = anchor.vectors.value(self.anchor_row);
             let first = (self.anchor_start + self.anchor_row + 1)
                 .saturating_sub(start)
-                .min(candidates.row_ids.len());
-            let metric = index.metric_type();
-            let filter = filter.clone();
-            let threshold = self.threshold;
+                .min(end - start);
             self.candidate_start = end;
-            if first == candidates.row_ids.len() {
+            if first == end - start {
                 continue;
             }
-            let coordinates = (candidates.row_ids.len() - first).saturating_mul(query.len());
-            let score = move || -> Result<RecordBatch> {
-                // Score only the upper triangle, including within one batch.
-                let vectors = candidates
-                    .vectors
-                    .slice(first, candidates.row_ids.len() - first);
-                let distances = metric.arrow_batch_func()(query.as_ref(), &vectors)?;
-                let mut b = Vec::new();
-                let mut d = Vec::new();
-                for i in first..candidates.row_ids.len() {
-                    let id = candidates.row_ids.value(i);
-                    let distance = distances.value(i - first);
-                    if candidates.row_ids.is_valid(i)
-                        && filter.selected(id)
-                        && id != a
-                        && distances.is_valid(i - first)
-                        && distance.is_finite()
-                        && distance <= threshold
-                    {
-                        b.push(id);
-                        d.push(distance);
-                    }
+            return Ok(Some(ScoreWork {
+                prepared: self.prepared.clone(),
+                a,
+                query,
+                first,
+                candidate_batch: start / VECTOR_BATCH_SIZE,
+                // Reuse the anchor's decoded view for same-batch comparisons.
+                candidate: (start == self.anchor_start).then(|| anchor.clone()),
+                metric: self.metric,
+                filter: self.filter.clone(),
+                threshold: self.threshold,
+                schema: self.schema.clone(),
+            }));
+        }
+    }
+}
+
+struct ScoreWork {
+    prepared: Arc<DecodedPairwisePartition>,
+    a: u64,
+    query: ArrayRef,
+    first: usize,
+    candidate_batch: usize,
+    candidate: Option<PairwiseVectorBatch>,
+    metric: DistanceType,
+    filter: Arc<RowAddrMask>,
+    threshold: f32,
+    schema: SchemaRef,
+}
+
+impl ScoreWork {
+    async fn score(self) -> Result<RecordBatch> {
+        let candidates = match self.candidate {
+            Some(candidate) => candidate,
+            None => self.prepared.read_vectors(self.candidate_batch).await?,
+        };
+        let Self {
+            a,
+            query,
+            first,
+            metric,
+            filter,
+            threshold,
+            schema,
+            ..
+        } = self;
+        let coordinates = (candidates.row_ids.len() - first).saturating_mul(query.len());
+        let score = move || -> Result<RecordBatch> {
+            // Score only the upper triangle, including within one batch.
+            let vectors = candidates
+                .vectors
+                .slice(first, candidates.row_ids.len() - first);
+            let distances = metric.arrow_batch_func()(query.as_ref(), &vectors)?;
+            let mut b = Vec::new();
+            let mut d = Vec::new();
+            for i in first..candidates.row_ids.len() {
+                let id = candidates.row_ids.value(i);
+                let distance = distances.value(i - first);
+                if candidates.row_ids.is_valid(i)
+                    && filter.selected(id)
+                    && id != a
+                    && distances.is_valid(i - first)
+                    && distance.is_finite()
+                    && distance <= threshold
+                {
+                    b.push(id);
+                    d.push(distance);
                 }
-                Ok(RecordBatch::try_new(
-                    pair_schema(),
-                    vec![
-                        Arc::new(UInt64Array::from(vec![a; b.len()])),
-                        Arc::new(UInt64Array::from(b)),
-                        Arc::new(Float32Array::from(d)),
-                    ],
-                )?)
-            };
-            let batch = if coordinates < MIN_OFFLOAD_COORDINATES {
-                score()?
-            } else {
-                spawn_cpu(score).await?
-            };
-            if batch.num_rows() > 0 {
-                return Ok(Some(batch));
             }
+            Ok(RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from(vec![a; b.len()])),
+                    Arc::new(UInt64Array::from(b)),
+                    Arc::new(Float32Array::from(d)),
+                ],
+            )?)
+        };
+        if coordinates < MIN_OFFLOAD_COORDINATES {
+            score()
+        } else {
+            spawn_cpu(score).await
         }
     }
 }

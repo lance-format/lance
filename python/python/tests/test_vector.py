@@ -161,7 +161,11 @@ def test_duplicate_pairs_validation_and_snapshot(tmp_path):
         find_duplicate_pairs(current, "vector", 0)
 
 
-def test_duplicate_pairs_cross_batch_order(tmp_path):
+@pytest.mark.parametrize("decoded_cache_size", [0, 256 * 1024 * 1024])
+@pytest.mark.parametrize("max_concurrency", [1, 4])
+def test_duplicate_pairs_cross_batch_order(
+    tmp_path, decoded_cache_size, max_concurrency
+):
     # One anchor has matches on both sides of the vector batch boundary.
     n = 1025
     vectors = np.column_stack((np.arange(n), np.ones(n))).astype(np.float32)
@@ -178,7 +182,13 @@ def test_duplicate_pairs_cross_batch_order(tmp_path):
         num_partitions=1,
         ivf_centroids=np.ones((1, 2), dtype=np.float32),
     )
-    with find_duplicate_pairs(ds, "vector", 0) as reader:
+    with find_duplicate_pairs(
+        ds,
+        "vector",
+        0,
+        decoded_cache_size=decoded_cache_size,
+        max_concurrency=max_concurrency,
+    ) as reader:
         # Exhaust the reader: a prefix-only test misses repeated source I/O
         # while scanning later anchors with no matching pairs.
         batches = list(reader)
@@ -196,6 +206,48 @@ def test_duplicate_pairs_cross_batch_order(tmp_path):
         assert next(reader).num_rows <= 1024
         # Closing a partially consumed reader cancels further enumeration.
     assert ds.count_rows() == n
+
+
+@pytest.mark.parametrize("decoded_cache_size", [0, 256 * 1024 * 1024])
+def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, decoded_cache_size):
+    # Enough coordinates per score to use the CPU pool, with few pairs so this
+    # tests ordered completion without a large quadratic fixture.
+    vectors = np.ones((128, 4096), dtype=np.float32)
+    table = pa.table(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(vectors.reshape(-1)), 4096
+            )
+        }
+    )
+    ds = lance.write_dataset(
+        table, tmp_path, max_rows_per_file=64, max_rows_per_group=64
+    )
+    ds = ds.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.ones((1, 4096), dtype=np.float32),
+    )
+    with find_duplicate_pairs(
+        ds, "vector", 0, max_concurrency=1, decoded_cache_size=decoded_cache_size
+    ) as reader:
+        expected = reader.read_all()
+    segment = ds.describe_indices()[0].segments[0].uuid
+    with find_duplicate_pairs_in_partition(
+        ds,
+        "vector",
+        segment,
+        0,
+        0,
+        max_concurrency=4,
+        decoded_cache_size=decoded_cache_size,
+    ) as reader:
+        actual = reader.read_all()
+    assert actual.equals(expected)
+    assert actual.num_rows == 128 * 127 // 2
+    with pytest.raises(ValueError, match="max_concurrency must be positive"):
+        find_duplicate_pairs(ds, "vector", 0, max_concurrency=0)
 
 
 @pytest.mark.parametrize("bits", [4, 8])
