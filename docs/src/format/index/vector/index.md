@@ -449,15 +449,23 @@ The auxiliary file retains its IVF partition row ranges and rotation metadata.
 For a rotated dimension `d`, let `p = 64 * ceil(d / 64)` and `(h, l)` be the fixed
 high and low widths. Each partition has this schema:
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `_rowid` | uint64 | Row identity |
-| `_rabit_codes` | fixed-size-list<uint8>[ceil(d/8)] | Transposed sign codes |
-| `__add_factors`, `__scale_factors`, `__error_factors` | float32 each | Binary estimator factors |
-| `__blocked_ex_codes` | fixed-size-list<uint8>[p*h/8] | High prefix plane |
-| `__add_factors_ex_hi`, `__scale_factors_ex_hi` | float32 each | High-level factors |
-| `__blocked_ex_codes_lo` | fixed-size-list<uint8>[p*l/8] | Low plane |
-| `__add_factors_ex`, `__scale_factors_ex` | float32 each | Full-level factors |
+```python
+pa.schema([
+    pa.field("_rowid", pa.uint64()),
+    pa.field("_rabit_codes", pa.list_(pa.uint8(), (d + 7) // 8)),
+    pa.field("__add_factors", pa.float32()),
+    pa.field("__scale_factors", pa.float32()),
+    pa.field("__error_factors", pa.float32()),
+    pa.field("__rq_bounds_hi", pa.list_(pa.float32(), 3)),
+    pa.field("__rq_bounds_full", pa.list_(pa.float32(), 3)),
+    pa.field("__blocked_ex_codes", pa.list_(pa.uint8(), p * h // 8)),
+    pa.field("__add_factors_ex_hi", pa.float32()),
+    pa.field("__scale_factors_ex_hi", pa.float32()),
+    pa.field("__blocked_ex_codes_lo", pa.list_(pa.uint8(), p * l // 8)),
+    pa.field("__add_factors_ex", pa.float32()),
+    pa.field("__scale_factors_ex", pa.float32()),
+])
+```
 
 All fields retain the existing nullable schema convention. Null codes or factors
 are not valid encoded rows.
@@ -481,6 +489,30 @@ levels each store their own raw-query add/scale factors, computed with their own
 code bias and quantized residual/centroid inner products. Full scoring combines
 codes before accumulation as `2^l * high + low`; high scoring omits the low code
 and uses the high factor pair. Reusing full-level factors for a prefix is invalid.
+
+The two `__rq_bounds_*` columns belong to the sign-plane projection. For a
+level with `b` ex bits, let `s_j` be its sign bit, `e_j` its ex code,
+`w_j = scale_level * (2^b*s_j + e_j - (2^b - 1/2))`, and
+`w_sign_j = scale_sign * (s_j - 1/2)`. Each row stores three nonnegative
+float32 values, rounded upwards: `||w-w_sign||_2`,
+`|add_level-add_sign|`, and `|scale_sign| + 2^b*|scale_level|`.
+Infinite bounds disable pruning; NaN and negative bounds are invalid.
+
+For a rotated query `q` and the metric's add-factor multiplier `a`, the
+real-arithmetic score difference is bounded by
+`||w-w_sign||_2 * ||q||_2 + |a| * |add_level-add_sign|`.
+Readers must additionally allow for their sign-LUT quantization and floating
+point reconstruction error, using the third coefficient. Accurate mode uses
+the conservative norm bound. Normal mode applies the native RaBitQ angular
+confidence policy to the norm term, multiplying it by
+`min(1, 1.9 / sqrt(d - 1))` for `d > 1`. This statistical bound can lose
+candidates and must be evaluated together with recall; the add-factor and
+arithmetic margins are not reduced. A reader skips a row when its chosen
+lower bound cannot beat the current top-k threshold or falls above the
+query's upper distance bound. The legacy
+`__error_factors` bound relative to the original vector is not a substitute
+for either level's estimator-difference bound. This pruning neither reads
+original vectors nor requires a fixed candidate expansion factor.
 
 Appending, merging, splitting, reassigning and remapping an index must preserve
 the layout flag and every plane's factors. All segments merged into a single
