@@ -19,7 +19,10 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
-use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
+use lance_core::{
+    deepsize::DeepSizeOf,
+    utils::cpu::{SIMD_SUPPORT, SimdSupport},
+};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
@@ -94,6 +97,96 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
     1.0 - T::dot(from, to)
+}
+
+/// Accumulate one query dimension into the Dot distances for all targets.
+///
+/// Keeping this in a separate function tells LLVM that `row` and `distances`
+/// do not alias, allowing it to vectorize across targets on every architecture.
+#[inline(never)]
+fn accumulate_dot_dimension(q: f32, row: &[f32], distances: &mut [f32]) {
+    for (distance, &target) in distances.iter_mut().zip(row) {
+        *distance -= q * target;
+    }
+}
+
+/// Pre-transposed target vectors for batched Dot distance computation.
+///
+/// Stores targets in SoA layout `[dimension][num_targets]`, allowing one query
+/// dimension to be multiplied with many contiguous target values. Construction
+/// performs the AoS-to-SoA transpose once, so callers should reuse this across
+/// queries. This is intended for small target sets whose transposed values fit
+/// in cache, such as PQ sub-vector codebooks.
+///
+/// # Example
+///
+/// ```
+/// use lance_linalg::distance::dot::DotPrepared;
+///
+/// let targets = [1.0, 0.0, 0.0, 1.0];
+/// let prepared = DotPrepared::new(&targets, 2);
+/// assert_eq!(prepared.distances(&[1.0, 0.0]), [0.0, 1.0]);
+/// ```
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct DotPrepared {
+    transposed: Vec<f32>,
+    dimension: usize,
+    num_targets: usize,
+}
+
+impl DotPrepared {
+    /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    pub fn new(targets: &[f32], dimension: usize) -> Self {
+        let num_targets = targets.len() / dimension;
+        debug_assert_eq!(targets.len(), num_targets * dimension);
+
+        let mut transposed = vec![0.0; targets.len()];
+        for target in 0..num_targets {
+            for dim in 0..dimension {
+                transposed[dim * num_targets + target] = targets[target * dimension + dim];
+            }
+        }
+
+        Self {
+            transposed,
+            dimension,
+            num_targets,
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target, writing into `out`.
+    pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(query.len(), self.dimension);
+        debug_assert_eq!(out.len(), self.num_targets);
+
+        out.fill(1.0);
+        for (dim, &q) in query.iter().enumerate() {
+            let row = &self.transposed[dim * self.num_targets..][..self.num_targets];
+            accumulate_dot_dimension(q, row, out);
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target.
+    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0; self.num_targets];
+        self.distances_into(query, &mut result);
+        result
+    }
+
+    /// Number of targets in this set.
+    pub fn num_targets(&self) -> usize {
+        self.num_targets
+    }
+
+    /// Dimension of each target vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Size of the transposed values in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.transposed.len() * std::mem::size_of::<f32>()
+    }
 }
 
 /// Dot product
@@ -882,6 +975,51 @@ mod tests {
             let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
             assert_relative_eq!(dot_f32(&x, &y), dot(&x, &y), max_relative = 1e-5);
         }
+    }
+
+    #[test]
+    fn test_dot_prepared_matches_per_target_distance() {
+        for (dimension, num_targets) in
+            [(1_usize, 32_usize), (3, 20), (8, 256), (16, 17), (128, 64)]
+        {
+            let query = (0..dimension)
+                .map(|idx| idx as f32 * 0.125 - 1.5)
+                .collect::<Vec<_>>();
+            let targets = (0..dimension * num_targets)
+                .map(|idx| ((idx * 7) % 101) as f32 * 0.02 - 1.0)
+                .collect::<Vec<_>>();
+            let expected = targets
+                .chunks_exact(dimension)
+                .map(|target| dot_distance(&query, target))
+                .collect::<Vec<_>>();
+
+            let prepared = DotPrepared::new(&targets, dimension);
+            let actual = prepared.distances(&query);
+
+            assert_eq!(prepared.dimension(), dimension);
+            assert_eq!(prepared.num_targets(), num_targets);
+            assert_eq!(
+                prepared.size_bytes(),
+                targets.len() * std::mem::size_of::<f32>()
+            );
+            for (target, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    approx::relative_eq!(actual, expected, epsilon = 1e-4, max_relative = 1e-5),
+                    "target {target}, dimension {dimension}: prepared={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dot_prepared_reuses_output() {
+        let prepared = DotPrepared::new(&[1.0, 0.0, 0.0, 1.0], 2);
+        let mut distances = vec![f32::NAN; 2];
+
+        prepared.distances_into(&[1.0, 0.0], &mut distances);
+        assert_eq!(distances, [0.0, 1.0]);
+        prepared.distances_into(&[0.0, 1.0], &mut distances);
+        assert_eq!(distances, [1.0, 0.0]);
     }
 
     #[test]

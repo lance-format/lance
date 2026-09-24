@@ -3604,6 +3604,7 @@ mod tests {
             &mut f32_scratch,
             DistanceCalculatorOptions {
                 approx_mode: ApproxMode::Fast,
+                ..Default::default()
             },
         );
         let mut distances = Vec::new();
@@ -3682,6 +3683,7 @@ mod tests {
                 &mut f32_scratch,
                 DistanceCalculatorOptions {
                     approx_mode: ApproxMode::Accurate,
+                    ..Default::default()
                 },
             );
             let mut distances = Vec::new();

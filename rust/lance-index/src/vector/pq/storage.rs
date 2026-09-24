@@ -28,15 +28,18 @@ use lance_file::versions::v1::{
     reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{object_store::ObjectStore, utils::read_message};
-use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
+use lance_linalg::distance::{Cosine, DistanceType, Dot, L2, dot::DotPrepared, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use super::ProductQuantizer;
-use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
+use super::distance::{
+    build_distance_table_dot, build_distance_table_dot_prepared, build_distance_table_l2,
+    build_distance_table_l2_prepared, compute_pq_distance, prepare_dot_targets, prepare_l2_targets,
+};
+use super::{LazyPreparedTargets, ProductQuantizer};
 use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::scalar::RowIdRemapper;
 use crate::vector::graph::{OrderedFloat, OrderedNode};
@@ -45,8 +48,8 @@ use crate::{
     vector::{
         PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
-        quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, VectorStore},
+        quantizer::{Quantizer, QuantizerMetadata, QuantizerStorage},
+        storage::{DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore},
         transform::Transformer,
     },
 };
@@ -168,6 +171,11 @@ pub struct ProductQuantizationStorage {
     pq_code: Arc<UInt8Array>,
     row_ids: Arc<UInt64Array>,
     pairwise_distance_table: Arc<OnceLock<Vec<f32>>>,
+    // Current-format IVF loaders install shared lazy caches. Keeping them empty preserves the
+    // legacy storage path; delaying initialization avoids prepared-codebook setup for low-work
+    // queries.
+    l2_targets: Option<Arc<LazyPreparedTargets<L2Prepared>>>,
+    dot_targets: Option<Arc<LazyPreparedTargets<DotPrepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
@@ -186,6 +194,8 @@ impl DeepSizeOf for ProductQuantizationStorage {
                 .get()
                 .map(|table| table.deep_size_of_children(context))
                 .unwrap_or(0)
+            + self.l2_targets.deep_size_of_children(context)
+            + self.dot_targets.deep_size_of_children(context)
     }
 }
 
@@ -350,7 +360,15 @@ impl ProductQuantizationStorage {
             pq_code,
             row_ids,
             pairwise_distance_table: Arc::new(OnceLock::new()),
+            l2_targets: None,
+            dot_targets: None,
         })
+    }
+
+    fn with_prepared_targets(mut self, quantizer: &ProductQuantizer) -> Self {
+        self.l2_targets = quantizer.l2_targets.clone();
+        self.dot_targets = quantizer.dot_targets.clone();
+        self
     }
 
     pub fn batch(&self) -> &RecordBatch {
@@ -604,6 +622,24 @@ impl QuantizerStorage for ProductQuantizationStorage {
         )
     }
 
+    fn try_from_batch_with_quantizer(
+        batch: RecordBatch,
+        quantizer: &Quantizer,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        let Quantizer::Product(quantizer) = quantizer else {
+            return Err(Error::internal(
+                "product quantization storage received a non-product quantizer".to_string(),
+            ));
+        };
+        Ok(
+            Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)?
+                .with_prepared_targets(quantizer),
+        )
+    }
+
     fn metadata(&self) -> &Self::Metadata {
         &self.metadata
     }
@@ -666,6 +702,8 @@ impl QuantizerStorage for ProductQuantizationStorage {
             pq_code: Arc::new(transposed_codes),
             row_ids: new_row_ids,
             pairwise_distance_table: self.pairwise_distance_table.clone(),
+            l2_targets: self.l2_targets.clone(),
+            dot_targets: self.dot_targets.clone(),
         })
     }
 
@@ -760,17 +798,71 @@ impl VectorStore for ProductQuantizationStorage {
                 query.as_primitive::<datatypes::Float16Type>().values(),
                 self.distance_type,
             ),
-            DataType::Float32 => PQDistCalculator::new(
-                codebook
+            DataType::Float32 => {
+                let codebook = codebook
                     .values()
                     .as_primitive::<datatypes::Float32Type>()
-                    .values(),
-                self.metadata.nbits,
-                self.metadata.num_sub_vectors,
-                self.pq_code.clone(),
-                query.as_primitive::<datatypes::Float32Type>().values(),
-                self.distance_type,
-            ),
+                    .values();
+                let query = query.as_primitive::<datatypes::Float32Type>().values();
+                match self.distance_type {
+                    DistanceType::L2 => match &self.l2_targets {
+                        Some(targets) => PQDistCalculator::new_l2_prepared(
+                            targets.get_or_init(|| {
+                                prepare_l2_targets(
+                                    codebook,
+                                    self.metadata.nbits,
+                                    self.metadata.num_sub_vectors,
+                                    self.metadata.dimension,
+                                )
+                            }),
+                            self.metadata.nbits,
+                            self.metadata.num_sub_vectors,
+                            self.pq_code.clone(),
+                            query,
+                        ),
+                        None => PQDistCalculator::new(
+                            codebook,
+                            self.metadata.nbits,
+                            self.metadata.num_sub_vectors,
+                            self.pq_code.clone(),
+                            query,
+                            self.distance_type,
+                        ),
+                    },
+                    DistanceType::Dot => match &self.dot_targets {
+                        Some(targets) => PQDistCalculator::new_dot_prepared(
+                            targets.get_or_init(|| {
+                                prepare_dot_targets(
+                                    codebook,
+                                    self.metadata.nbits,
+                                    self.metadata.num_sub_vectors,
+                                    self.metadata.dimension,
+                                )
+                            }),
+                            self.metadata.nbits,
+                            self.metadata.num_sub_vectors,
+                            self.pq_code.clone(),
+                            query,
+                        ),
+                        None => PQDistCalculator::new(
+                            codebook,
+                            self.metadata.nbits,
+                            self.metadata.num_sub_vectors,
+                            self.pq_code.clone(),
+                            query,
+                            self.distance_type,
+                        ),
+                    },
+                    _ => PQDistCalculator::new(
+                        codebook,
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        self.pq_code.clone(),
+                        query,
+                        self.distance_type,
+                    ),
+                }
+            }
             DataType::Float64 => PQDistCalculator::new(
                 codebook
                     .values()
@@ -784,6 +876,35 @@ impl VectorStore for ProductQuantizationStorage {
             ),
             _ => unimplemented!("Unsupported data type: {:?}", codebook.value_type()),
         }
+    }
+
+    fn dist_calculator_with_scratch<'a>(
+        &'a self,
+        query: ArrayRef,
+        _dist_q_c: f32,
+        _residual: Option<QueryResidual<'a>>,
+        _f32_scratch: &'a mut Vec<f32>,
+        options: DistanceCalculatorOptions,
+    ) -> Self::DistanceCalculator<'a> {
+        if options.prefer_low_setup_cost
+            && matches!(self.distance_type, DistanceType::L2 | DistanceType::Dot)
+        {
+            let codebook = self.metadata.codebook.as_ref().unwrap();
+            if codebook.value_type() == DataType::Float32 {
+                return PQDistCalculator::new(
+                    codebook
+                        .values()
+                        .as_primitive::<datatypes::Float32Type>()
+                        .values(),
+                    self.metadata.nbits,
+                    self.metadata.num_sub_vectors,
+                    self.pq_code.clone(),
+                    query.as_primitive::<datatypes::Float32Type>().values(),
+                    self.distance_type,
+                );
+            }
+        }
+        self.dist_calculator(query, 0.0)
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
@@ -846,6 +967,38 @@ pub struct PQDistCalculator {
 }
 
 impl PQDistCalculator {
+    fn new_l2_prepared(
+        targets: &[L2Prepared],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        pq_code: Arc<UInt8Array>,
+        query: &[f32],
+    ) -> Self {
+        Self {
+            distance_table: build_distance_table_l2_prepared(targets, query),
+            pq_code,
+            num_sub_vectors,
+            num_bits,
+            distance_type: DistanceType::L2,
+        }
+    }
+
+    fn new_dot_prepared(
+        targets: &[DotPrepared],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        pq_code: Arc<UInt8Array>,
+        query: &[f32],
+    ) -> Self {
+        Self {
+            distance_table: build_distance_table_dot_prepared(targets, query),
+            pq_code,
+            num_sub_vectors,
+            num_bits,
+            distance_type: DistanceType::Dot,
+        }
+    }
+
     fn new<T: L2 + Dot>(
         codebook: &[T],
         num_bits: u32,
@@ -1205,7 +1358,7 @@ fn get_centroids_4bit<T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use crate::vector::storage::StorageBuilder;
+    use crate::vector::{quantizer::Quantization, storage::StorageBuilder};
 
     use super::*;
 
@@ -1221,9 +1374,15 @@ mod tests {
     const NUM_SUB_VECTORS: usize = 16;
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
+        create_pq_storage_with_distance(DistanceType::Dot).await
+    }
+
+    async fn create_pq_storage_with_distance(
+        distance_type: DistanceType,
+    ) -> ProductQuantizationStorage {
         let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|_| rand::random()));
         let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
-        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Dot);
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, distance_type);
 
         let schema = ArrowSchema::new(vec![
             Field::new(
@@ -1294,9 +1453,14 @@ mod tests {
         assert_eq!(storage.row_ids.len(), TOTAL);
     }
 
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_distance_all() {
-        let storage = create_pq_storage().await;
+    async fn test_distance_all(#[case] distance_type: DistanceType) {
+        let storage = create_pq_storage_with_distance(distance_type).await;
+        assert!(storage.l2_targets.is_none());
+        assert!(storage.dot_targets.is_none());
         let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
         let dist_calc = storage.dist_calculator(query, 0.0);
         let expected = (0..storage.len())
@@ -1304,6 +1468,159 @@ mod tests {
             .collect::<Vec<_>>();
         let distances = dist_calc.distance_all(100);
         assert_eq!(distances, expected);
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
+    #[tokio::test]
+    async fn test_partition_storages_share_prepared_targets(#[case] distance_type: DistanceType) {
+        let source = create_pq_storage_with_distance(distance_type).await;
+        let quantizer = ProductQuantizer::from_metadata(source.metadata(), distance_type).unwrap();
+        let first = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            source.batch.clone(),
+            &quantizer,
+            source.metadata(),
+            distance_type,
+            None,
+        )
+        .unwrap();
+        let second = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            source.batch.clone(),
+            &quantizer,
+            source.metadata(),
+            distance_type,
+            None,
+        )
+        .unwrap();
+
+        match distance_type {
+            DistanceType::L2 => {
+                let first_targets = first.l2_targets.as_ref().unwrap();
+                assert!(first_targets.get().is_none());
+                assert!(Arc::ptr_eq(
+                    first_targets,
+                    second.l2_targets.as_ref().unwrap()
+                ));
+            }
+            DistanceType::Dot => {
+                let first_targets = first.dot_targets.as_ref().unwrap();
+                assert!(first_targets.get().is_none());
+                assert!(Arc::ptr_eq(
+                    first_targets,
+                    second.dot_targets.as_ref().unwrap()
+                ));
+            }
+            _ => unreachable!(),
+        }
+
+        let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
+        let legacy_table = source.dist_calculator(query.clone(), 0.0).distance_table;
+        let low_setup_table = first
+            .dist_calculator_with_scratch(
+                query.clone(),
+                0.0,
+                None,
+                &mut Vec::new(),
+                DistanceCalculatorOptions {
+                    prefer_low_setup_cost: true,
+                    ..Default::default()
+                },
+            )
+            .distance_table;
+        assert_eq!(low_setup_table, legacy_table);
+        match distance_type {
+            DistanceType::L2 => assert!(first.l2_targets.as_ref().unwrap().get().is_none()),
+            DistanceType::Dot => assert!(first.dot_targets.as_ref().unwrap().get().is_none()),
+            _ => unreachable!(),
+        }
+
+        let calculator = first.dist_calculator(query, 0.0);
+        match distance_type {
+            DistanceType::L2 => assert!(first.l2_targets.as_ref().unwrap().get().is_some()),
+            DistanceType::Dot => assert!(first.dot_targets.as_ref().unwrap().get().is_some()),
+            _ => unreachable!(),
+        }
+        let expected = (0..first.len())
+            .map(|id| calculator.distance(id as u32))
+            .collect::<Vec<_>>();
+        assert_eq!(calculator.distance_all(100), expected);
+    }
+
+    /// Regression test for the prewarm path: `IvfQuantizationStorage::
+    /// materialize_partition_for_prewarm` must pass the retained index-level
+    /// quantizer through to each partition storage (via
+    /// `try_from_batch_with_quantizer`). The pre-fix code rebuilt every
+    /// partition from metadata alone, so each prewarmed partition owned an
+    /// empty prepared-target cache and re-transposed the codebook on first use.
+    ///
+    /// This exercises the same construction the fixed prewarm materialization
+    /// takes and proves multiple partitions share one lazily initialized target
+    /// cache.
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
+    #[tokio::test]
+    async fn test_prewarm_materialization_shares_prepared_targets(
+        #[case] distance_type: DistanceType,
+    ) {
+        let source = create_pq_storage_with_distance(distance_type).await;
+        let quantizer = ProductQuantizer::from_metadata(source.metadata(), distance_type).unwrap();
+
+        // Two partitions materialized through the shared quantizer, matching
+        // the fixed prewarm path.
+        let first = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            source.batch.clone(),
+            &quantizer,
+            source.metadata(),
+            distance_type,
+            None,
+        )
+        .unwrap();
+        let second = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            source.batch.clone(),
+            &quantizer,
+            source.metadata(),
+            distance_type,
+            None,
+        )
+        .unwrap();
+
+        // Both partitions alias the same Arc-backed lazy target cache, which
+        // starts uninitialized.
+        match distance_type {
+            DistanceType::L2 => {
+                let first_targets = first.l2_targets.as_ref().unwrap();
+                let second_targets = second.l2_targets.as_ref().unwrap();
+                assert!(Arc::ptr_eq(first_targets, second_targets));
+                assert!(first_targets.get().is_none());
+                assert!(second_targets.get().is_none());
+            }
+            DistanceType::Dot => {
+                let first_targets = first.dot_targets.as_ref().unwrap();
+                let second_targets = second.dot_targets.as_ref().unwrap();
+                assert!(Arc::ptr_eq(first_targets, second_targets));
+                assert!(first_targets.get().is_none());
+                assert!(second_targets.get().is_none());
+            }
+            _ => unreachable!(),
+        }
+
+        // First use initializes the shared cache exactly once; the second
+        // partition observes the same already-initialized targets.
+        let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
+        let _ = first.dist_calculator(query, 0.0);
+        match distance_type {
+            DistanceType::L2 => {
+                assert!(first.l2_targets.as_ref().unwrap().get().is_some());
+                assert!(second.l2_targets.as_ref().unwrap().get().is_some());
+            }
+            DistanceType::Dot => {
+                assert!(first.dot_targets.as_ref().unwrap().get().is_some());
+                assert!(second.dot_targets.as_ref().unwrap().get().is_some());
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]
