@@ -7178,7 +7178,9 @@ class ScannerBuilder:
             RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
-            recall and may increase latency.
+            recall and may increase latency. Layered RQ uses the native angular
+            confidence policy in normal mode and a conservative estimator-difference
+            pruning bound in accurate mode. Neither requires raw-vector refinement.
         rq_precision: {"sign", "high", "full"}, default "full"
             Select a stored level of a layered IVF_RQ index. High uses 3 total
             bits for RQ5 and 5 total bits for RQ7/RQ9. Non-layered indexes only

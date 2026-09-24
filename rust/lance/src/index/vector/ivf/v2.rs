@@ -1839,6 +1839,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 );
                 let binary_inner_products = calc.binary_inner_products();
                 for row in filter.filter_row_ids(Box::new(entry.storage.row_ids())) {
+                    if coarse_heap.len() == limit
+                        && calc
+                            .lower_bound_with_binary_inner_product(
+                                row as u32,
+                                binary_inner_products[row as usize],
+                            )
+                            .is_some_and(|bound| {
+                                coarse_heap.peek().is_some_and(|top| bound >= top.dist.0)
+                            })
+                    {
+                        continue;
+                    }
                     let node = OrderedNode::new(
                         (
                             part_id,
@@ -1854,9 +1866,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     );
                     if coarse_heap.len() < limit {
                         coarse_heap.push(node);
-                    } else if coarse_heap.peek().is_some_and(|top| node.dist < top.dist) {
-                        coarse_heap.pop();
-                        coarse_heap.push(node);
+                    } else if coarse_heap.peek().is_some_and(|top| node.dist < top.dist)
+                        && let Some(mut top) = coarse_heap.peek_mut()
+                    {
+                        *top = node;
                     }
                 }
                 Ok(coarse_heap)
@@ -1976,6 +1989,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                             "candidate row id does not match its physical offset",
                         ));
                     }
+                    if let Some(bound) = calc.lower_bound_with_binary_inner_product(
+                        row as u32,
+                        candidate.binary_inner_product,
+                    ) && (upper_bound.is_some_and(|upper| bound >= upper)
+                        || (full_heap.len() == k
+                            && full_heap.peek().is_some_and(|top| bound >= top.dist.0)))
+                    {
+                        continue;
+                    }
                     let distance = calc.distance_with_binary_inner_product(
                         row as u32,
                         candidate.binary_inner_product,
@@ -1988,9 +2010,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     let node = OrderedNode::new(storage.row_id(row as u32), distance.into());
                     if full_heap.len() < k {
                         full_heap.push(node);
-                    } else if full_heap.peek().is_some_and(|top| node.dist < top.dist) {
-                        full_heap.pop();
-                        full_heap.push(node);
+                    } else if full_heap.peek().is_some_and(|top| node.dist < top.dist)
+                        && let Some(mut top) = full_heap.peek_mut()
+                    {
+                        *top = node;
                     }
                 }
                 Ok(full_heap)

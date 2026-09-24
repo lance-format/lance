@@ -37,13 +37,82 @@ impl RQLayout {
 use super::ex_dot::{blocked_ex_code_bytes, pack_blocked_row};
 use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN};
 use super::transform::{EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD};
-use arrow_array::{ArrayRef, FixedSizeListArray, UInt8Array};
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
 use std::sync::Arc;
 
 pub const HIGH_ADD_FACTORS_COLUMN: &str = "__add_factors_ex_hi";
 pub const HIGH_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex_hi";
+pub const HIGH_BOUNDS_COLUMN: &str = "__rq_bounds_hi";
+pub const FULL_BOUNDS_COLUMN: &str = "__rq_bounds_full";
+
+// Each level stores ||w_level-w_sign||, |add_level-add_sign| and a
+// coefficient for floating-point/LUT error. These bound the stored estimator,
+// rather than its error relative to the unquantized vector.
+fn bounds_field(name: &str) -> Field {
+    Field::new(
+        name,
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+        true,
+    )
+}
+
+pub(crate) fn estimator_bounds(
+    residuals: &[f32],
+    codes: &[u8],
+    dim: usize,
+    bits: u8,
+    binary: &super::transform::RabitRawQueryFactors,
+    level: &super::transform::RabitRawQueryFactors,
+) -> Result<ArrayRef> {
+    let adds = level
+        .ex_add_factors
+        .as_ref()
+        .ok_or_else(|| Error::internal("missing level add factors"))?;
+    let scales = level
+        .ex_scale_factors
+        .as_ref()
+        .ok_or_else(|| Error::internal("missing level scale factors"))?;
+    let code_scale = (1u32 << bits) as f64;
+    let bias = -(code_scale - 0.5);
+    let mut bounds = Vec::with_capacity(residuals.len() / dim * 3);
+    for (row, (residual, codes)) in residuals
+        .chunks_exact(dim)
+        .zip(codes.chunks_exact(dim))
+        .enumerate()
+    {
+        let binary_scale = binary.scale_factors.value(row) as f64;
+        let scale = scales.value(row) as f64;
+        let norm = residual
+            .iter()
+            .zip(codes)
+            .map(|(&r, &c)| {
+                let sign = f64::from(u8::from(r.is_sign_positive()));
+                let delta =
+                    (code_scale * sign + f64::from(c) + bias) * scale - (sign - 0.5) * binary_scale;
+                delta * delta
+            })
+            .sum::<f64>()
+            .sqrt();
+        for value in [
+            norm,
+            (f64::from(adds.value(row)) - f64::from(binary.add_factors.value(row))).abs(),
+            binary_scale.abs() + code_scale * scale.abs(),
+        ] {
+            let rounded = value as f32;
+            bounds.push(if f64::from(rounded) < value {
+                rounded.next_up()
+            } else {
+                rounded
+            });
+        }
+    }
+    Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+        Float32Array::from(bounds),
+        3,
+    )?))
+}
 
 pub(crate) fn storage_fields(
     dim: usize,
@@ -69,6 +138,8 @@ pub(crate) fn storage_fields(
         EX_SCALE_FACTORS_FIELD.clone(),
         Field::new(HIGH_ADD_FACTORS_COLUMN, DataType::Float32, true),
         Field::new(HIGH_SCALE_FACTORS_COLUMN, DataType::Float32, true),
+        bounds_field(HIGH_BOUNDS_COLUMN),
+        bounds_field(FULL_BOUNDS_COLUMN),
     ]);
     Ok(fields)
 }
@@ -193,6 +264,8 @@ pub fn plane_columns(plane: u8) -> &'static [&'static str] {
             ADD_FACTORS_COLUMN,
             SCALE_FACTORS_COLUMN,
             ERROR_FACTORS_COLUMN,
+            HIGH_BOUNDS_COLUMN,
+            FULL_BOUNDS_COLUMN,
         ],
         1 => &[
             RABIT_BLOCKED_EX_CODE_COLUMN,
@@ -248,9 +321,13 @@ mod tests {
     #[case::rq5_dot(5, DistanceType::Dot)]
     #[case::rq7_dot(7, DistanceType::Dot)]
     #[case::rq9_dot(9, DistanceType::Dot)]
-    fn layered_roundtrip_and_levels(#[case] bits: u8, #[case] distance_type: DistanceType) {
-        let dim = 64;
-        let values: Vec<f32> = (0..dim * 16)
+    fn layered_roundtrip_and_levels(
+        #[case] bits: u8,
+        #[case] distance_type: DistanceType,
+        #[values(64, 72)] dim: usize,
+    ) {
+        const ROWS: usize = 37;
+        let values: Vec<f32> = (0..dim * ROWS)
             .map(|i| ((i * 17 % 101) as f32 - 50.) / 50.)
             .collect();
         let vectors =
@@ -272,11 +349,11 @@ mod tests {
             ("vector", Arc::new(vectors.clone()) as ArrayRef),
             (
                 lance_core::ROW_ID,
-                Arc::new(UInt64Array::from((0..16).collect::<Vec<_>>())) as ArrayRef,
+                Arc::new(UInt64Array::from((0..ROWS as u64).collect::<Vec<_>>())) as ArrayRef,
             ),
             (
                 PART_ID_COLUMN,
-                Arc::new(UInt32Array::from(vec![0; 16])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0; ROWS])) as ArrayRef,
             ),
             (CENTROID_DIST_COLUMN, Arc::new(norms) as ArrayRef),
         ])
@@ -319,10 +396,10 @@ mod tests {
                 .unwrap();
         let query: ArrayRef = Arc::new(Float32Array::from(values[..dim].to_vec()));
         assert_eq!(
-            full.dist_calculator(query.clone(), 1.).distance_all(16),
-            single.dist_calculator(query.clone(), 1.).distance_all(16)
+            full.dist_calculator(query.clone(), 1.).distance_all(ROWS),
+            single.dist_calculator(query.clone(), 1.).distance_all(ROWS)
         );
-        for precision in [RQPrecision::Sign, RQPrecision::High] {
+        for precision in [RQPrecision::Sign, RQPrecision::High, RQPrecision::Full] {
             let projected = RabitQuantizationStorage::try_from_batch_at_precision(
                 batch.clone(),
                 rq.metadata_ref(),
@@ -343,11 +420,77 @@ mod tests {
                 },
             );
             assert_eq!(
-                calc.distance_all(16),
+                calc.distance_all(ROWS),
                 projected
                     .dist_calculator(query.clone(), 1.)
-                    .distance_all(16)
+                    .distance_all(ROWS)
             );
+            if precision != RQPrecision::Sign {
+                let mut audit_scratch = Vec::new();
+                let audit = full.dist_calculator_with_scratch(
+                    query.clone(),
+                    1.,
+                    None,
+                    &mut audit_scratch,
+                    DistanceCalculatorOptions {
+                        approx_mode: crate::vector::ApproxMode::Accurate,
+                        rq_precision: precision,
+                    },
+                );
+                let binary = audit.binary_inner_products();
+                let distances = audit.distance_all(ROWS);
+                for (row, &ip) in binary.iter().enumerate() {
+                    let bound = audit.raw_query_lower_bound(row, ip).unwrap();
+                    assert!(
+                        bound <= distances[row],
+                        "invalid bound at row {row}: {bound} > {}",
+                        distances[row]
+                    );
+                }
+                let best = distances.iter().copied().min_by(f32::total_cmp).unwrap();
+                assert!(
+                    binary
+                        .iter()
+                        .enumerate()
+                        .any(|(row, &ip)| audit.raw_query_lower_bound(row, ip).unwrap() > best),
+                    "fixture must exercise pruning"
+                );
+            }
+            // A precision-specific bound must preserve the unpruned result,
+            // including non-block-aligned code dimensions and heap/range cuts.
+            for (lower, upper) in [(None, None), (Some(-0.5), Some(20.0))] {
+                let distances = calc.distance_all(ROWS);
+                let mut expected: Vec<_> = distances
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, d)| lower.is_none_or(|v| *d >= v) && upper.is_none_or(|v| *d < v))
+                    .map(|(id, d)| (id as u64, d))
+                    .collect();
+                expected.sort_by(|a, b| a.1.total_cmp(&b.1));
+                expected.truncate(3);
+                let mut heap = std::collections::BinaryHeap::new();
+                calc.accumulate_topk_with_scratch(
+                    3,
+                    lower,
+                    upper,
+                    u64::from,
+                    &mut heap,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                let actual: Vec<_> = heap
+                    .into_sorted_vec()
+                    .into_iter()
+                    .map(|n| (n.id, n.dist.0))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "bits={bits} precision={precision:?} dim={dim}"
+                );
+            }
         }
         let missing = batch.drop_column(RABIT_BLOCKED_EX_CODE_LO_COLUMN).unwrap();
         assert!(
@@ -365,7 +508,7 @@ mod tests {
             batch[HIGH_ADD_FACTORS_COLUMN]
                 .as_primitive::<Float32Type>()
                 .len(),
-            16
+            ROWS
         );
     }
 

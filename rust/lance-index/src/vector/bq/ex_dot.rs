@@ -1107,14 +1107,21 @@ mod x86 {
                 };
             }
         }
-        let sum = acc[1..]
-            .iter()
-            .fold(acc[0], |sum, &lane| _mm512_add_ps(sum, lane));
+        let sum = if CHAINS == 2 {
+            _mm512_add_ps(acc[0], acc[1])
+        } else {
+            _mm512_add_ps(_mm512_add_ps(acc[0], acc[1]), _mm512_add_ps(acc[2], acc[3]))
+        };
         _mm512_reduce_add_ps(sum)
     }
     pub(super) fn prefix_avx512_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         // SAFETY: dispatcher checks CPU features.
-        unsafe { prefix_avx512::<H, 4>(q, hi, lo) }
+        // Match the accumulation order of the equivalent native width.
+        if H == 2 {
+            unsafe { prefix_avx512::<H, 2>(q, hi, lo) }
+        } else {
+            unsafe { prefix_avx512::<H, 4>(q, hi, lo) }
+        }
     }
     pub(super) fn prefix_avx512_two_chain<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         // SAFETY: the profiling selector checks the required CPU features.
@@ -1186,14 +1193,22 @@ mod x86 {
             ];
             for (run, codes) in runs.into_iter().enumerate() {
                 unsafe {
-                    fma16_avx512(codes, q.as_ptr().add(block * 64 + run * 16), &mut acc[run]);
+                    fma16_avx512(
+                        codes,
+                        q.as_ptr().add(block * 64 + run * 16),
+                        &mut acc[if H == 2 { run % 2 } else { run }],
+                    );
                 }
             }
         }
-        _mm512_reduce_add_ps(_mm512_add_ps(
-            _mm512_add_ps(acc[0], acc[1]),
-            _mm512_add_ps(acc[2], acc[3]),
-        ))
+        if H == 2 {
+            _mm512_reduce_add_ps(_mm512_add_ps(acc[0], acc[1]))
+        } else {
+            _mm512_reduce_add_ps(_mm512_add_ps(
+                _mm512_add_ps(acc[0], acc[1]),
+                _mm512_add_ps(acc[2], acc[3]),
+            ))
+        }
     }
     pub(super) fn prefix_vbmi_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         // SAFETY: the dispatch and profiling selectors check all required features.
@@ -1727,6 +1742,15 @@ mod tests {
                 "{name}, bits={bits}, dim={dim}"
             );
         }
+        // Dyadic inputs above mask changes to floating-point reduction order.
+        // Dispatched kernels must also match their native-width accumulation
+        // for ordinary queries, particularly native u4 versus fused 2+2.
+        let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        assert_eq!(
+            ex_dot_prefix_kernel(bits)(&query, &hi, &lo).to_bits(),
+            ex_dot_kernel(bits - 1)(&query, &packed).to_bits(),
+            "dispatched bits={bits}, dim={dim}"
+        );
     }
 
     #[rstest]

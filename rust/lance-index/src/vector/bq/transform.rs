@@ -35,7 +35,7 @@ pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
 pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
 pub const ERROR_FACTORS_COLUMN: &str = "__error_factors";
 
-const RABIT_ERROR_EPSILON: f32 = 1.9;
+pub(super) const RABIT_ERROR_EPSILON: f32 = 1.9;
 
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
@@ -486,7 +486,23 @@ impl Transformer for RQTransformer {
                     layout.high_bits,
                     self.rq.dim(),
                 )?;
-                Some((hi, lo, factors))
+                let high_bounds = super::layered::estimator_bounds(
+                    &rotated_residuals,
+                    &hi_values,
+                    self.rq.dim(),
+                    layout.high_bits,
+                    &raw_query_factors,
+                    &factors,
+                )?;
+                let full_bounds = super::layered::estimator_bounds(
+                    &rotated_residuals,
+                    values,
+                    self.rq.dim(),
+                    ex_bits,
+                    &raw_query_factors,
+                    &raw_query_factors,
+                )?;
+                Some((hi, lo, factors, high_bounds, full_bounds))
             } else {
                 None
             };
@@ -505,11 +521,13 @@ impl Transformer for RQTransformer {
                     Arc::new(raw_query_factors.error_factors),
                 )?;
 
-            if let Some((hi, lo, factors)) = layered {
+            if let Some((hi, lo, factors, high_bounds, full_bounds)) = layered {
                 let fields = storage_fields(self.rq.dim(), self.rq.num_bits(), Vec::new())?;
                 batch = batch
                     .try_with_column(fields[0].clone(), hi)?
                     .try_with_column(fields[1].clone(), lo)?
+                    .try_with_column(fields[6].clone(), high_bounds)?
+                    .try_with_column(fields[7].clone(), full_bounds)?
                     .try_with_column(
                         fields[4].clone(),
                         Arc::new(

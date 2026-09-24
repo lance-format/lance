@@ -26,6 +26,10 @@ parser.add_argument("--nprobes", type=int, default=64)
 parser.add_argument("--bits", default="3,5,7,9")
 parser.add_argument("--repeats", type=int, default=3)
 parser.add_argument("--prepare-only", action="store_true")
+parser.add_argument("--build-only", action="store_true")
+parser.add_argument(
+    "--cascade-factors", default="", help="Optional code-only cascade diagnostics"
+)
 args = parser.parse_args()
 root, out = Path(args.dataset), Path(args.output)
 out.mkdir(parents=True, exist_ok=True)
@@ -270,16 +274,18 @@ for bits in map(int, args.bits.split(",")):
                 }
             )
         modes = [("full", None, None)]
+        if args.build_only:
+            continue
         if layered:
             modes += [
                 ("sign", None, None),
                 ("high", None, None),
-                ("full", 4, None),
-                ("full", 8, None),
-                ("full", 16, None),
             ]
-        else:
-            modes += [("full", None, 2)]
+            modes += [
+                ("full", int(factor), None)
+                for factor in args.cascade_factors.split(",")
+                if factor
+            ]
         for precision, cascade, refine in modes:
             ds = lance.dataset(uri, index_cache_size_bytes=128 * 1024**3)
             for index in ds.list_indices():

@@ -110,6 +110,11 @@ static RABIT_PRUNE_BYPASS_STATS: OnceLock<RabitPruneBypassStats> = OnceLock::new
 static RABIT_PRUNE_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
 static RABIT_PRUNE_STATS_INTERVAL: OnceLock<u64> = OnceLock::new();
 
+// Enclose the LUT reduction, ex-dot, bias and final score reconstruction.
+// The gamma_n form below also disables pruning if an enormous dimension makes
+// the floating-point accumulation bound unrepresentable.
+const LAYERED_ROUNDING_OPERATIONS_PER_DIM: f64 = 32.0;
+
 fn rabit_prune_stats_enabled() -> bool {
     *RABIT_PRUNE_STATS_ENABLED.get_or_init(|| match std::env::var(RABIT_PRUNE_STATS_ENV) {
         Ok(value) => str_is_truthy(value.trim()),
@@ -601,12 +606,44 @@ impl RabitQuantizationStorage {
         let mut ex_add_factors = None;
         let mut ex_scale_factors = None;
         let mut ex_codes_lo = None;
+        for name in [
+            super::layered::HIGH_BOUNDS_COLUMN,
+            super::layered::FULL_BOUNDS_COLUMN,
+        ] {
+            if let Some(column) = batch.column_by_name(name) {
+                let bounds = column.as_fixed_size_list_opt().ok_or_else(|| {
+                    Error::invalid_input(format!("invalid RaBitQ bounds column {name}"))
+                })?;
+                if bounds.value_length() != 3
+                    || bounds.value_type() != DataType::Float32
+                    || bounds.null_count() != 0
+                    || bounds.values().null_count() != 0
+                {
+                    return Err(Error::invalid_input(format!(
+                        "RaBitQ bounds column {name} requires three non-null float32 values per row"
+                    )));
+                }
+                if bounds
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .any(|v| v.is_nan() || *v < 0.0)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "RaBitQ bounds column {name} contains an invalid error magnitude"
+                    )));
+                }
+            }
+        }
         if metadata.layered {
             super::layered::RQLayout::try_new(metadata.num_bits)?;
             for name in [
                 RABIT_BLOCKED_EX_CODE_LO_COLUMN,
                 super::layered::HIGH_ADD_FACTORS_COLUMN,
                 super::layered::HIGH_SCALE_FACTORS_COLUMN,
+                super::layered::HIGH_BOUNDS_COLUMN,
+                super::layered::FULL_BOUNDS_COLUMN,
             ] {
                 if batch.column_by_name(name).is_none() {
                     return Err(Error::invalid_input(format!(
@@ -901,6 +938,15 @@ impl RabitQuantizationStorage {
         );
         calculator.add_factor_scale = query_factors.add_scale;
         calculator.add_factor_offset = query_factors.add_offset;
+        if num_bits > 1 && approx_mode != ApproxMode::Fast {
+            let column = match rq_precision {
+                super::layered::RQPrecision::High => super::layered::HIGH_BOUNDS_COLUMN,
+                _ => super::layered::FULL_BOUNDS_COLUMN,
+            };
+            if let Some(bounds) = self.batch.column_by_name(column) {
+                calculator.prepare_layered_bounds(bounds.as_fixed_size_list());
+            }
+        }
         calculator
     }
 
@@ -1134,6 +1180,7 @@ pub struct RabitDistCalculator<'a> {
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
     error_factors: Option<&'a [f32]>,
+    layered_errors: Option<Vec<f32>>,
     ex_add_factors: Option<&'a [f32]>,
     ex_scale_factors: Option<&'a [f32]>,
     packed_ex_codes: Option<&'a [u8]>,
@@ -1148,6 +1195,79 @@ pub struct RabitDistCalculator<'a> {
 }
 
 impl<'a> RabitDistCalculator<'a> {
+    fn prepare_layered_bounds(&mut self, bounds: &FixedSizeListArray) {
+        let values = bounds.values().as_primitive::<Float32Type>().values();
+        let norm = self
+            .ex_query
+            .iter()
+            .map(|&q| f64::from(q).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let l1 = self
+            .ex_query
+            .iter()
+            .map(|&q| f64::from(q).abs())
+            .sum::<f64>();
+        let (min, max) = self
+            .dist_table
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+        // The sign LUT may be quantized even when the ex-dot is exact. Include
+        // its worst-case error and dot-product/reconstruction rounding; both
+        // estimators use the same LUT value with different coefficients.
+        let rounding_epsilon = LAYERED_ROUNDING_OPERATIONS_PER_DIM * f64::from(f32::EPSILON);
+        let accumulated_error = rounding_epsilon * (self.dim + 8) as f64;
+        let rounding_error = if accumulated_error < 1.0 {
+            accumulated_error / (1.0 - accumulated_error) * l1
+        } else {
+            f64::INFINITY
+        };
+        let numeric_error = (self.dist_table.len() / SEGMENT_NUM_CODES) as f64
+            * (f64::from(max) - f64::from(min))
+            / f64::from(u8::MAX)
+            + rounding_error;
+        // Normal uses the same angular confidence policy as native RaBitQ,
+        // applied to this level's actual estimator difference. Accurate retains
+        // the Cauchy-Schwarz bound; it trades more ex-dot work for no statistical
+        // candidate loss. Quantization and arithmetic margins are never shrunk.
+        let angular_scale = if self.approx_mode == ApproxMode::Accurate || self.dim <= 1 {
+            1.0
+        } else {
+            (f64::from(super::transform::RABIT_ERROR_EPSILON) / ((self.dim - 1) as f64).sqrt())
+                .min(1.0)
+        };
+        let errors = values
+            .chunks_exact(3)
+            .enumerate()
+            .map(|(row, b)| {
+                let add_scale = f64::from(self.add_factor_scale).abs();
+                let rounding = rounding_epsilon
+                    * (add_scale
+                        * (f64::from(self.add_factors[row]).abs()
+                            + f64::from(self.add_factor_offset).abs()
+                            + f64::from(b[1]))
+                        + f64::from(self.query_factor).abs());
+                let margin = f64::from(b[0]) * norm * angular_scale
+                    + f64::from(b[1]) * add_scale
+                    + f64::from(b[2]) * numeric_error
+                    + rounding;
+                if margin.is_finite() {
+                    (margin as f32).next_up()
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .collect();
+        self.layered_errors = Some(errors);
+        self.query_error = 1.0;
+    }
+
+    fn pruning_errors(&self) -> Option<&[f32]> {
+        self.layered_errors.as_deref().or(self.error_factors)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dim: usize,
@@ -1190,6 +1310,7 @@ impl<'a> RabitDistCalculator<'a> {
             scale_factors,
             error_factors,
             ex_add_factors,
+            layered_errors: None,
             ex_scale_factors,
             packed_ex_codes,
             query_factor,
@@ -1605,8 +1726,22 @@ impl<'a> RabitDistCalculator<'a> {
     }
 
     #[inline]
-    fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
-        let error_factors = self.error_factors?;
+    /// Lower bound for this precision's score using the original partition's
+    /// binary LUT value. Normal mode uses RaBitQ's statistical angular bound;
+    /// Accurate layered mode uses the conservative estimator-difference norm.
+    /// Returns `None` when this calculator cannot prune.
+    pub fn lower_bound_with_binary_inner_product(&self, id: u32, binary_ip: f32) -> Option<f32> {
+        if self
+            .raw_query_lower_bound_gating_disabled_reason()
+            .is_some()
+        {
+            return None;
+        }
+        self.raw_query_lower_bound(id as usize, binary_ip)
+    }
+
+    pub(crate) fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
+        let error_factors = self.pruning_errors()?;
         Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
     }
 
@@ -1811,7 +1946,7 @@ impl<'a> RabitDistCalculator<'a> {
         let scale_factors = &self.scale_factors[..ctx.n];
         let add_factors = &self.add_factors[..ctx.n];
         let error_factors = &self
-            .error_factors
+            .pruning_errors()
             .expect("raw-query lower-bound gating requires error factors")[..ctx.n];
         // Same expression as `raw_query_lower_bound` with `error_factors`
         // already resolved; the masks below match it bit for bit.
@@ -1899,7 +2034,7 @@ impl<'a> RabitDistCalculator<'a> {
             Some("residual_query_estimator")
         } else if self.num_bits <= 1 {
             Some("num_bits_le_one")
-        } else if self.error_factors.is_none() {
+        } else if self.pruning_errors().is_none() {
             Some("missing_error_factors")
         } else {
             None
@@ -2884,6 +3019,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             let name = field.name().as_str();
             if [
                 ERROR_FACTORS_COLUMN,
+                super::layered::FULL_BOUNDS_COLUMN,
                 RABIT_BLOCKED_EX_CODE_LO_COLUMN,
                 EX_ADD_FACTORS_COLUMN,
                 EX_SCALE_FACTORS_COLUMN,
@@ -2903,6 +3039,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 continue;
             }
             let renamed = match name {
+                super::layered::HIGH_BOUNDS_COLUMN => super::layered::FULL_BOUNDS_COLUMN,
                 HIGH_ADD_FACTORS_COLUMN => EX_ADD_FACTORS_COLUMN,
                 HIGH_SCALE_FACTORS_COLUMN => EX_SCALE_FACTORS_COLUMN,
                 _ => name,
