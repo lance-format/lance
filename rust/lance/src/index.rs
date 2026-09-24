@@ -179,7 +179,7 @@ async fn remap_merged_segment_coverage(
                     .as_ref()
                     .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
-                Some(SegmentRemappingPlan::MissingCoverage) | None => {
+                Some(SegmentRemappingPlan::MissingCoverage(_)) | None => {
                     return Err(Error::not_supported(format!(
                         "FRI query coverage is unavailable for staged segment {}",
                         segment.uuid

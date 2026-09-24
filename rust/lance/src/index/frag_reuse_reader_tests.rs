@@ -3786,6 +3786,209 @@ async fn optimize_is_a_no_op_under_an_unsupported_history() {
     }
 }
 
+// The segment state matrix at the open layer. On one tagged snapshot
+// (F0, F1 partitioned into F10, F11; F12 appended) a segment of every state:
+//
+// | state                | listing         | query open by uuid | maintenance open        |
+// |----------------------|-----------------|--------------------|-------------------------|
+// | identity (live only) | served, {12}    | serves             | serves (identity)       |
+// | translating          | served, {10,11} | serves             | serves (translation)    |
+// | partially withdrawn  | excluded        | error              | empty translation       |
+// | empty last (files)   | excluded        | error              | empty translation       |
+// | superseded           | excluded        | error              | empty translation       |
+// | bitmap None          | excluded        | error              | skip (NotSupported)     |
+// | corrupt details      | excluded        | error              | error                   |
+//
+// A query never opens an excluded segment (no scan was scheduled for its
+// rows); maintenance replaces what it reads as empty, skips what it cannot
+// translate and fails on what it cannot interpret. The deferred definition
+// (no files) never reaches an open: the optimizer trains it from its
+// definition (`awaits_training`); the withdrawn-to-empty scalar and vector
+// rebuilds, the superseded prune and the remap skips are pinned by their own
+// tests.
+#[tokio::test]
+async fn segment_state_matrix_at_the_open_layer() {
+    use crate::index::frag_reuse::{
+        OpenPurpose, ResolvedRemapping, open_row_id_remapping, open_row_id_remapping_with_plan,
+    };
+    use arrow_array::{ArrayRef, Int32Array};
+
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    let fri = install(&mut dataset, content, destinations, false).await;
+    let appended = RecordBatch::try_from_iter(vec![(
+        "i",
+        Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+    )])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    // The appended fragment: live and on no lineage.
+    let live_only = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .find(|id| !matches!(id, 10 | 11))
+        .unwrap();
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let translating = indices
+        .iter()
+        .find(|index| index.name == "i_idx")
+        .cloned()
+        .unwrap();
+    let derive = |name: &str, bitmap: Option<RoaringBitmap>| {
+        let mut segment = translating.clone();
+        segment.uuid = Uuid::new_v4();
+        segment.name = name.to_string();
+        segment.fragment_bitmap = bitmap;
+        segment
+    };
+    let identity = derive("identity_idx", Some(RoaringBitmap::from_iter([live_only])));
+    let partial = derive("partial_idx", Some(RoaringBitmap::from_iter([0u32])));
+    let empty_last = derive("empty_idx", Some(RoaringBitmap::new()));
+    let unknown = derive("unknown_idx", None);
+    let mut corrupt = derive("corrupt_idx", translating.fragment_bitmap.clone());
+    corrupt.index_details = None;
+    // A newer sibling over both destinations supersedes the translating
+    // segment of its own name.
+    let mut superseded = derive("superseded_idx", translating.fragment_bitmap.clone());
+    superseded.name = "superseded_idx".into();
+    let direct = CreateIndexBuilder::new(
+        &mut dataset,
+        &["i"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .name("superseded_idx".into())
+    .replace(true)
+    .fragments(vec![10, 11])
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    indices.extend([
+        identity.clone(),
+        partial.clone(),
+        empty_last.clone(),
+        unknown.clone(),
+        corrupt.clone(),
+        superseded.clone(),
+        direct.clone(),
+    ]);
+    persist_fixture(&mut dataset, indices).await;
+
+    let listed: HashMap<Uuid, RoaringBitmap> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|index| Some((index.uuid, index.fragment_bitmap.clone()?)))
+        .collect();
+    let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+    let empty = RoaringBitmap::new();
+    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
+
+    #[derive(Debug, PartialEq)]
+    enum Cell {
+        Serves,
+        Empty,
+        Skip,
+        Error,
+    }
+    let query = |segment: &IndexMetadata| {
+        let dataset = dataset.clone();
+        let segment = segment.clone();
+        async move {
+            match open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector).await {
+                Ok(_) => Cell::Serves,
+                Err(_) => Cell::Error,
+            }
+        }
+    };
+    let maintenance = |segment: &IndexMetadata| {
+        let dataset = dataset.clone();
+        let segment = segment.clone();
+        async move {
+            match open_row_id_remapping_with_plan(
+                &dataset,
+                &segment,
+                None,
+                OpenPurpose::Maintenance,
+                &NoOpMetricsCollector,
+            )
+            .await
+            {
+                Ok(Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })))
+                    if fingerprint == no_coverage =>
+                {
+                    Cell::Empty
+                }
+                Ok(_) => Cell::Serves,
+                Err(error) if error.to_string().contains("cannot be translated") => Cell::Skip,
+                Err(_) => Cell::Error,
+            }
+        }
+    };
+    let rows: [(&str, &IndexMetadata, Option<RoaringBitmap>, Cell, Cell); 7] = [
+        (
+            "identity",
+            &identity,
+            Some(RoaringBitmap::from_iter([live_only])),
+            Cell::Serves,
+            Cell::Serves,
+        ),
+        (
+            "translating",
+            &translating,
+            Some(RoaringBitmap::from_iter([10u32, 11])),
+            Cell::Serves,
+            Cell::Serves,
+        ),
+        (
+            "partially withdrawn",
+            &partial,
+            None,
+            Cell::Error,
+            Cell::Empty,
+        ),
+        ("empty last", &empty_last, None, Cell::Error, Cell::Empty),
+        ("superseded", &superseded, None, Cell::Error, Cell::Empty),
+        ("bitmap None", &unknown, None, Cell::Error, Cell::Skip),
+        ("corrupt", &corrupt, None, Cell::Error, Cell::Error),
+    ];
+    for (state, segment, listing, query_cell, maintenance_cell) in rows {
+        assert_eq!(
+            listed.get(&segment.uuid).cloned(),
+            listing,
+            "{state}: listing"
+        );
+        assert_eq!(query(segment).await, query_cell, "{state}: query open");
+        assert_eq!(
+            maintenance(segment).await,
+            maintenance_cell,
+            "{state}: maintenance open"
+        );
+    }
+    assert_eq!(
+        listed.get(&direct.uuid),
+        Some(&RoaringBitmap::from_iter([10u32, 11])),
+        "the direct sibling serves the destinations"
+    );
+}
+
 // The untested seam: a legacy-format vector file on a tagged table. Legacy
 // readers only take the v0 remapper handle, which is `None` on a tagged
 // history, so the tagged reader must exclude such a segment from coverage

@@ -79,27 +79,9 @@ pub(super) async fn load_indices(
                 continue;
             }
             if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                let can_remap = if super::segment_has_vector_details(index) {
-                    super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index)
-                        .await?
-                } else if index
-                    .index_details
-                    .as_ref()
-                    .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
-                {
-                    super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
-                        .await?
-                } else {
-                    index
-                        .index_details
-                        .as_ref()
-                        .and_then(|details| {
-                            super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-                                .get_plugin_by_details(details)
-                                .ok()
-                        })
-                        .is_some_and(|plugin| plugin.supports_batch_row_id_remapping())
-                };
+                let can_remap = segment_supports_batch_remapping(dataset, index)
+                    .await?
+                    .unwrap_or(false);
                 if index.fragment_bitmap.is_none() || !can_remap {
                     continue;
                 }
@@ -132,6 +114,39 @@ pub(super) async fn load_indices(
         }
     }
     Ok(Arc::new(result.into_iter().flatten().collect()))
+}
+
+impl FragmentReuseIndex {
+    /// Whether the history carries transitions this build cannot interpret.
+    pub(crate) fn has_unsupported_transitions(&self) -> bool {
+        self.ledger.has_unsupported_transitions()
+    }
+}
+
+/// Whether this build can translate `index`'s stored addresses in batches:
+/// `Some(true)` when its type has a batch remapper, `Some(false)` when it
+/// does not, `None` when its details are missing or cannot be interpreted.
+pub(super) async fn segment_supports_batch_remapping(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<bool>> {
+    let Some(details) = index.index_details.as_ref() else {
+        return Ok(None);
+    };
+    if super::segment_has_vector_details(index) {
+        return Ok(Some(
+            super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,
+        ));
+    }
+    if details.type_url.ends_with("InvertedIndexDetails") {
+        return Ok(Some(
+            super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
+        ));
+    }
+    Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+        .get_plugin_by_details(details)
+        .ok()
+        .map(|plugin| plugin.supports_batch_row_id_remapping()))
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.

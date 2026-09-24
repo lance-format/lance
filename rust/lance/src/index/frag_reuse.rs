@@ -146,10 +146,50 @@ pub(crate) enum SegmentRemappingPlan {
         excluded_fragments: RoaringBitmap,
         fingerprint: [u8; 32],
     },
-    /// Committed metadata exists but the filtered listing carries no query
-    /// coverage for this segment (it was skipped or lost its bitmap).
-    MissingCoverage,
+    /// Committed metadata exists but the reader derives no query coverage
+    /// for this segment; the reason decides what maintenance may do with it.
+    MissingCoverage(MissingCoverageReason),
 }
+
+/// Why the reader derives no coverage for a registered segment. Queries
+/// refuse every kind by uuid (the listing excludes the segment, so no scan
+/// was scheduled for its rows); maintenance consumes the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissingCoverageReason {
+    /// The stored bitmap is empty: every fragment the segment covered was
+    /// withdrawn (an in-place rewrite), or it is a deferred definition.
+    /// Maintenance reads it as an empty translation and replaces it.
+    Withdrawn,
+    /// The backtrack derives nothing from a non-empty bitmap: newer siblings
+    /// own its direct coverage (superseded), or a destination lacks
+    /// contributing sources. Maintenance reads it as an empty translation.
+    NoDerivedCoverage,
+    /// This build cannot translate the segment: its type has no batch
+    /// remapper, its coverage is unknown (no stored bitmap), or the history
+    /// carries transitions this build cannot interpret. Maintenance skips it.
+    Unsupported,
+    /// The stored metadata cannot be interpreted (no or undecodable index
+    /// details). Maintenance fails.
+    Corrupt,
+}
+
+impl std::fmt::Display for MissingCoverageReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Withdrawn => "its coverage was withdrawn",
+            Self::NoDerivedCoverage => {
+                "the reader derives no coverage for it (superseded, or missing contributors)"
+            }
+            Self::Unsupported => "this build cannot translate it",
+            Self::Corrupt => "its metadata cannot be interpreted",
+        })
+    }
+}
+
+/// The plan of a registered segment the snapshot plan does not know (a
+/// stale cached plan): nothing is derived for it.
+const PLAN_MISS: SegmentRemappingPlan =
+    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::NoDerivedCoverage);
 
 /// Snapshot-level plan of every committed segment's translation inputs.
 ///
@@ -267,7 +307,15 @@ async fn fri_query_plan(
                 }
                 let mut segments = HashMap::with_capacity(stored.len());
                 for source in stored.iter() {
-                    let plan = if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
+                    let plan = if source
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.is_empty())
+                    {
+                        // An empty bitmap needs no translation, but its pages
+                        // may still hold the withdrawn rows: never identity.
+                        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
+                    } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
                         SegmentRemappingPlan::Identity
                     } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
                         && let Some(bitmap) = &entry.fragment_bitmap
@@ -289,7 +337,9 @@ async fn fri_query_plan(
                             fingerprint,
                         }
                     } else {
-                        SegmentRemappingPlan::MissingCoverage
+                        SegmentRemappingPlan::MissingCoverage(
+                            missing_coverage_reason(dataset, mapping, source).await?,
+                        )
                     };
                     segments.insert(source.uuid, plan);
                 }
@@ -297,6 +347,33 @@ async fn fri_query_plan(
             },
         )
         .await
+}
+
+/// Why the reader derives no coverage for `source`, from what it can see of
+/// the segment without opening its files.
+async fn missing_coverage_reason(
+    dataset: &Dataset,
+    mapping: &super::frag_reuse_reader::FragmentReuseIndex,
+    source: &IndexMetadata,
+) -> lance_core::Result<MissingCoverageReason> {
+    if mapping.has_unsupported_transitions() {
+        return Ok(MissingCoverageReason::Unsupported);
+    }
+    match &source.fragment_bitmap {
+        Some(bitmap) if bitmap.is_empty() => return Ok(MissingCoverageReason::Withdrawn),
+        None => return Ok(MissingCoverageReason::Unsupported),
+        Some(_) => {}
+    }
+    if source.index_details.is_none() {
+        return Ok(MissingCoverageReason::Corrupt);
+    }
+    Ok(
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await? {
+            Some(true) => MissingCoverageReason::NoDerivedCoverage,
+            Some(false) => MissingCoverageReason::Unsupported,
+            None => MissingCoverageReason::Corrupt,
+        },
+    )
 }
 
 /// Translation plans for segments the manifest does not list: a staged
@@ -421,9 +498,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
                 // A registered segment the reader left out of the plan: it
                 // derives no coverage, so it is out of the listing too. What
                 // that means depends on who asks (below).
-                None if stored.iter().any(|entry| entry.uuid == index.uuid) => {
-                    &SegmentRemappingPlan::MissingCoverage
-                }
+                None if stored.iter().any(|entry| entry.uuid == index.uuid) => &PLAN_MISS,
                 None => {
                     return Err(Error::not_supported(format!(
                         "FRI remapping requires committed segment metadata for {}; a staged \
@@ -441,14 +516,31 @@ pub(super) async fn open_row_id_remapping_with_plan(
         // scheduled for its rows, and an empty answer would silently drop
         // them. Maintenance reads it as an empty segment (every stored row
         // translates to nothing) and replaces it.
-        SegmentRemappingPlan::MissingCoverage if purpose == OpenPurpose::Query => {
+        SegmentRemappingPlan::MissingCoverage(reason) if purpose == OpenPurpose::Query => {
             Err(Error::not_supported(format!(
-                "FRI query coverage is unavailable for segment {}: the reader excludes it from \
-                 the index listing on this snapshot; open it through the listing, not by uuid",
+                "FRI query coverage is unavailable for segment {} ({reason}): the reader \
+                 excludes it from the index listing on this snapshot; open it through the \
+                 listing, not by uuid",
                 index.uuid
             )))
         }
-        SegmentRemappingPlan::MissingCoverage => {
+        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unsupported) => {
+            Err(Error::not_supported(format!(
+                "segment {} cannot be translated by this build under the tagged fragment reuse \
+                 history; leave it for a rebuild or a newer version of Lance",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Corrupt) => {
+            Err(Error::index(format!(
+                "segment {} has metadata this build cannot interpret; the index must be \
+                 rebuilt",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage(
+            MissingCoverageReason::Withdrawn | MissingCoverageReason::NoDerivedCoverage,
+        ) => {
             let empty = RoaringBitmap::new();
             let fingerprint = mapping.translation_fingerprint(&empty, &empty, &[]);
             Ok(Some((

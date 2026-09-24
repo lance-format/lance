@@ -184,7 +184,7 @@ pub async fn tagged_segment_coverage(
                     .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
                 SegmentRemappingPlan::Translate { coverage, .. } => coverage.clone(),
-                SegmentRemappingPlan::MissingCoverage => {
+                SegmentRemappingPlan::MissingCoverage(_) => {
                     return Err(Error::not_supported(format!(
                         "FRI query coverage is unavailable for staged segment {}",
                         segment.uuid
