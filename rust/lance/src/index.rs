@@ -350,40 +350,19 @@ fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i
     })
 }
 
-/// The version that produced `fragment`, proven rather than guessed: the
-/// earliest retained version holding it, accepted only when the version before
-/// it is retained too. Cleanup deletes old manifests, and the earliest surviving
-/// version holding a fragment is evidence of nothing if the one before it is
-/// gone -- a later commit could have rewritten the fragment in between.
-async fn proven_creation_version(
+/// The dataset at `version`, reusing one already read. Absent once cleanup has
+/// removed that manifest.
+async fn snapshot_at(
     dataset: &Dataset,
-    retained: &[u64],
-    after: u64,
-    fragment: u32,
-) -> Result<Option<Dataset>> {
-    let later = retained
-        .iter()
-        .copied()
-        .filter(|version| *version > after)
-        .collect::<Vec<_>>();
-    let (mut low, mut high) = (0usize, later.len());
-    let mut created = None;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let at = dataset.checkout_version(later[middle]).await?;
-        if at.fragments().iter().any(|f| f.id as u32 == fragment) {
-            created = Some((later[middle], at));
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
+    read: &mut HashMap<u64, Dataset>,
+    version: u64,
+) -> Option<Dataset> {
+    if let Some(at) = read.get(&version) {
+        return Some(at.clone());
     }
-    let Some((version, at)) = created else {
-        return Ok(None);
-    };
-    // The bisect only ever saw retained versions, so the one before this is
-    // proof only while it is still there to have been looked at.
-    Ok((version > 0 && retained.contains(&(version - 1))).then_some(at))
+    let at = dataset.checkout_version(version).await.ok()?;
+    read.insert(version, at.clone());
+    Some(at)
 }
 
 /// Whether `fragment` holds different data for the `indexed` fields in `after`
@@ -408,19 +387,100 @@ fn indexed_data_differs(
         || has_overlay_newer_than(now, before.manifest.version, indexed)
 }
 
-/// The dataset at `version`, reusing one already read. Absent once cleanup has
-/// removed that manifest.
-async fn snapshot_at(
+/// The version that produced `fragment`, proven rather than guessed: the earliest
+/// retained version holding it, accepted only when the version before it is
+/// retained too. Cleanup deletes old manifests, and the earliest surviving
+/// version holding a fragment is evidence of nothing if the one before it is
+/// gone -- a later commit could have rewritten the fragment in between.
+///
+/// A fragment is present from its creation until a compaction retires it, so the
+/// search is bounded at `until`, a version known to hold it. Searching past that
+/// reads its retirement as absence and walks away from the creation entirely.
+async fn proven_creation_version(
     dataset: &Dataset,
     read: &mut HashMap<u64, Dataset>,
-    version: u64,
-) -> Option<Dataset> {
-    if let Some(at) = read.get(&version) {
-        return Some(at.clone());
+    retained: &[u64],
+    after: u64,
+    until: u64,
+    fragment: u32,
+) -> Result<Option<u64>> {
+    let range = retained
+        .iter()
+        .copied()
+        .filter(|version| *version > after && *version <= until)
+        .collect::<Vec<_>>();
+    let (mut low, mut high) = (0usize, range.len());
+    let mut created = None;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let Some(at) = snapshot_at(dataset, read, range[middle]).await else {
+            return Ok(None);
+        };
+        if at.fragments().iter().any(|f| f.id as u32 == fragment) {
+            created = Some(range[middle]);
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
     }
-    let at = dataset.checkout_version(version).await.ok()?;
-    read.insert(version, at.clone());
-    Some(at)
+    let Some(version) = created else {
+        return Ok(None);
+    };
+    // The bisect only ever saw retained versions, so the one before this is proof
+    // only while it is still there to have been looked at.
+    Ok((version > 0 && retained.contains(&(version - 1))).then_some(version))
+}
+
+/// The version a followed fragment's index entries describe.
+#[derive(Clone, Copy)]
+enum Recorded {
+    /// A version already established.
+    At(u64),
+    /// Produced by the compaction that read this version. Dating it needs a
+    /// version known to hold the fragment, so it waits until one is at hand.
+    ProducedAfter(u64),
+}
+
+/// The dataset whose state `fragment`'s index entries describe, established
+/// against `at` -- a version that must hold the fragment for anything to be
+/// worth keeping. Absent once the state cannot be established at all.
+async fn recorded_state(
+    dataset: &Dataset,
+    read: &mut HashMap<u64, Dataset>,
+    dated: &mut HashMap<u64, u64>,
+    retained: &[u64],
+    recorded: Recorded,
+    fragment: u32,
+    at: &Dataset,
+) -> Result<Option<Dataset>> {
+    let version = match recorded {
+        Recorded::At(version) => version,
+        // One commit published every group a compaction rewrote, so dating one of
+        // its fragments dates the rest.
+        Recorded::ProducedAfter(after) => match dated.get(&after) {
+            Some(&created) => created,
+            None => {
+                if !at.fragments().iter().any(|f| f.id as u32 == fragment) {
+                    return Ok(None);
+                }
+                let Some(created) = proven_creation_version(
+                    dataset,
+                    read,
+                    retained,
+                    after,
+                    at.manifest.version,
+                    fragment,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                dated.insert(after, created);
+                created
+            }
+        },
+    };
+    Ok(snapshot_at(dataset, read, version).await)
 }
 
 /// Whether the data these segments indexed has moved on from the fragments the
@@ -449,8 +509,8 @@ async fn indexed_data_moved_on(
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
-    // Ids only: reading every retained manifest to list them would cost more
-    // than the handful of snapshots the walk actually opens.
+    // Ids only: reading every retained manifest to list them would cost more than
+    // the handful of snapshots the walk actually opens.
     let retained = dataset
         .version_refs()
         .await?
@@ -459,9 +519,10 @@ async fn indexed_data_moved_on(
         .collect::<Vec<_>>();
 
     let mut read = HashMap::new();
+    let mut dated = HashMap::new();
     let mut following = staged_coverage
         .iter()
-        .map(|fragment| (fragment, oldest_segment))
+        .map(|fragment| (fragment, Recorded::At(oldest_segment)))
         .collect::<HashMap<_, _>>();
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
@@ -491,7 +552,11 @@ async fn indexed_data_moved_on(
                 let Some(&recorded) = following.get(&old) else {
                     continue;
                 };
-                let Some(against) = snapshot_at(dataset, &mut read, recorded).await else {
+                let Some(against) = recorded_state(
+                    dataset, &mut read, &mut dated, &retained, recorded, old, &at_read,
+                )
+                .await?
+                else {
                     return Ok(true);
                 };
                 if indexed_data_differs(&against, &at_read, old, &indexed) {
@@ -500,22 +565,6 @@ async fn indexed_data_moved_on(
             }
         }
 
-        // One commit published every group in this entry, so one of its fragments
-        // dates them all.
-        let Some(produced) = ours
-            .iter()
-            .find_map(|group| group.new_frags.first().map(|new| new.id as u32))
-        else {
-            continue;
-        };
-        let Some(created) =
-            proven_creation_version(dataset, &retained, version.dataset_version, produced).await?
-        else {
-            return Ok(true);
-        };
-        let created_at = created.manifest.version;
-        read.insert(created_at, created);
-
         // Only the groups this compaction rewrote advance; every other followed
         // fragment stays recorded against the version it already was.
         for group in ours {
@@ -523,13 +572,20 @@ async fn indexed_data_moved_on(
                 following.remove(&(old.id as u32));
             }
             for new in &group.new_frags {
-                following.insert(new.id as u32, created_at);
+                following.insert(
+                    new.id as u32,
+                    Recorded::ProducedAfter(version.dataset_version),
+                );
             }
         }
     }
 
     for (fragment, recorded) in following {
-        let Some(against) = snapshot_at(dataset, &mut read, recorded).await else {
+        let Some(against) = recorded_state(
+            dataset, &mut read, &mut dated, &retained, recorded, fragment, dataset,
+        )
+        .await?
+        else {
             return Ok(true);
         };
         if indexed_data_differs(&against, dataset, fragment, &indexed) {
@@ -5141,12 +5197,17 @@ mod tests {
             .iter()
             .map(|version| version.version)
             .collect::<Vec<_>>();
-        let created = proven_creation_version(&dataset, &retained, 0, appended)
-            .await
-            .unwrap()
-            .expect("the version before the append is retained, so creation is proven");
+        let until = dataset.manifest.version;
+        let created =
+            proven_creation_version(&dataset, &mut HashMap::new(), &retained, 0, until, appended)
+                .await
+                .unwrap()
+                .expect("the version before the append is retained, so creation is proven");
         assert!(
-            created
+            dataset
+                .checkout_version(created)
+                .await
+                .unwrap()
                 .fragments()
                 .iter()
                 .any(|fragment| fragment.id as u32 == appended)
@@ -5156,10 +5217,10 @@ mod tests {
         let gapped = retained
             .iter()
             .copied()
-            .filter(|version| *version != created.manifest.version - 1)
+            .filter(|version| *version != created - 1)
             .collect::<Vec<_>>();
         assert!(
-            proven_creation_version(&dataset, &gapped, 0, appended)
+            proven_creation_version(&dataset, &mut HashMap::new(), &gapped, 0, until, appended)
                 .await
                 .unwrap()
                 .is_none(),

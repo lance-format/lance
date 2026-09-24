@@ -3119,3 +3119,39 @@ async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
          searching once per group rather than once per compaction"
     );
 }
+
+/// A fragment is present from its creation until a compaction retires it, so
+/// dating one has to search within that span. Searching to the end of history
+/// reads the retirement of an intermediate output as absence, and unrelated
+/// commits afterwards are enough to lose coverage the geometry never left.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_coverage_when_later_commits_follow_a_retired_output() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    // Two compactions, so the first one's outputs are retired by the second.
+    rtree_compact(&mut dataset, 2).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    // Commits that touch no fragment at all.
+    for setting in 0..10 {
+        dataset
+            .update_config([("unrelated".to_string(), setting.to_string())])
+            .await
+            .unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        1,
+        "coverage was given up over commits that changed no geometry, because \
+         dating the rewritten fragment searched past the retirement of the \
+         intermediate one it came from"
+    );
+}
