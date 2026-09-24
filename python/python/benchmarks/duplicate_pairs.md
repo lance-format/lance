@@ -27,7 +27,7 @@ rebuilding the indices between implementations.
 LANCE_CPU_THREADS=8 RAYON_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
   taskset -c 0-7 uv run --no-sync python python/benchmarks/duplicate_pairs.py run \
   --config cases.json --case 0 --threshold 0.01 --label candidate \
-  --decoded-cache-size 268435456 --max-concurrency 8 --output result.json
+  --memory-limit 268435456 --max-concurrency 8 --output result.json
 ```
 
 Use cases 0..3 and thresholds 0.01 (sparse output) and 2.0 (all pairs). Omit the
@@ -40,18 +40,21 @@ credentials work without that argument.
 
 ## What the results mean
 
-- `elapsed_s` includes native planning, staging, reconstruction, scoring and
+- `elapsed_s` includes native planning, code staging, quantizer batch scoring and
   streaming output hashing. Imports and opening the pinned dataset are excluded;
   opening is reported separately as `dataset_open_s`. Table/index creation is
   not timed.
 - Three independent SHA-256 hashes cover the ordered row-ID and float32-distance
-  columns. Compare all hashes and pair counts between implementations; hashes do
+  columns. Compare ID hashes and pair counts between implementations. Quantizer-native
+  cosine uses normalized L2 / 2; distance bits may differ from older versions
+  that renormalized reconstructed vectors. Compare distance hashes only for
+  implementations with the same scoring semantics. Hashes do
   not depend on output batch boundaries. Dense output must contain N*(N-1)/2 pairs.
 - `cpu_cores` is process user+system CPU time divided by wall time. It includes
   the Python consumer and monitoring overhead, not just Rust scoring threads.
 - RSS is for the whole process, including Python, shared libraries and native
   allocations. `peak_rss_bytes` is Linux's process high-water mark; it is not the
-  decoded-cache budget. Each run also records its initial RSS.
+  code staging budget. Each run also records its initial RSS.
 - Source bytes/IOPS come from Lance's object-store counters after dataset open.
   They are distinct from temporary-file I/O. The last observed source read and
   peak source rate use approximately 100 ms sampling, not exact span timing.
@@ -81,6 +84,6 @@ concurrency 1/8/16. It measures reachable bulk S3 throughput, not a hardware lim
 or Lance scan throughput. A low whole-query S3 average does not imply an I/O
 bottleneck when all source reads finish early and CPU work dominates afterward.
 
-Also compare `--max-concurrency 1` to 8 and force decoded spill with
-`--decoded-cache-size 0`. The latter changes the storage/memory tradeoff; OS file
-cache is not included in process RSS and may retain the decoded spill pages.
+Also compare `--max-concurrency 1` to 8 and force code spill with
+`--memory-limit 0`. The latter changes the storage/memory tradeoff; OS file
+cache is not included in process RSS and may retain the code spill pages.

@@ -443,12 +443,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         unimplemented!("only for IVF")
     }
 
-    /// Whether bounded index-vector reconstruction is available (current format).
+    /// Whether bounded native code-to-code scoring is available (current format).
     fn supports_pairwise_vectors(&self) -> bool {
         false
     }
 
-    /// Stage compact codes once for repeated bounded decoding in storage order.
+    /// Stage compact codes once for native batch scoring in storage order.
     /// Partitions beyond `memory_limit` bytes use the caller's spill store.
     async fn prepare_pairwise_partition(
         &self,

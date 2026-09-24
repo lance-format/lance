@@ -161,11 +161,9 @@ def test_duplicate_pairs_validation_and_snapshot(tmp_path):
         find_duplicate_pairs(current, "vector", 0)
 
 
-@pytest.mark.parametrize("decoded_cache_size", [0, 256 * 1024 * 1024])
+@pytest.mark.parametrize("memory_limit", [0, 256 * 1024 * 1024])
 @pytest.mark.parametrize("max_concurrency", [1, 4])
-def test_duplicate_pairs_cross_batch_order(
-    tmp_path, decoded_cache_size, max_concurrency
-):
+def test_duplicate_pairs_cross_batch_order(tmp_path, memory_limit, max_concurrency):
     # One anchor has matches on both sides of the vector batch boundary.
     n = 1025
     vectors = np.column_stack((np.arange(n), np.ones(n))).astype(np.float32)
@@ -186,7 +184,7 @@ def test_duplicate_pairs_cross_batch_order(
         ds,
         "vector",
         0,
-        decoded_cache_size=decoded_cache_size,
+        memory_limit=memory_limit,
         max_concurrency=max_concurrency,
     ) as reader:
         # Exhaust the reader: a prefix-only test misses repeated source I/O
@@ -208,8 +206,8 @@ def test_duplicate_pairs_cross_batch_order(
     assert ds.count_rows() == n
 
 
-@pytest.mark.parametrize("decoded_cache_size", [0, 256 * 1024 * 1024])
-def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, decoded_cache_size):
+@pytest.mark.parametrize("memory_limit", [0, 256 * 1024 * 1024])
+def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, memory_limit):
     # Enough coordinates per score to use the CPU pool, with few pairs so this
     # tests ordered completion without a large quadratic fixture.
     vectors = np.ones((128, 4096), dtype=np.float32)
@@ -230,7 +228,7 @@ def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, decoded_cach
         ivf_centroids=np.ones((1, 4096), dtype=np.float32),
     )
     with find_duplicate_pairs(
-        ds, "vector", 0, max_concurrency=1, decoded_cache_size=decoded_cache_size
+        ds, "vector", 0, max_concurrency=1, memory_limit=memory_limit
     ) as reader:
         expected = reader.read_all()
     segment = ds.describe_indices()[0].segments[0].uuid
@@ -241,7 +239,7 @@ def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, decoded_cach
         0,
         0,
         max_concurrency=4,
-        decoded_cache_size=decoded_cache_size,
+        memory_limit=memory_limit,
     ) as reader:
         actual = reader.read_all()
     assert actual.equals(expected)
@@ -368,7 +366,7 @@ def test_duplicate_pairs_hamming(tmp_path):
 
 
 @pytest.mark.parametrize("index_type", ["IVF_PQ", "IVF_SQ"])
-def test_duplicate_pairs_reconstruction_distances(tmp_path, index_type):
+def test_duplicate_pairs_exactly_representable_codes(tmp_path, index_type):
     vectors = np.array([[0, 0, 2, 2], [3, 3, 4, 4], [8, 8, 6, 6]], dtype=np.float32)
     params = {}
     if index_type == "IVF_PQ":
@@ -444,7 +442,10 @@ def test_duplicate_pairs_after_compaction(tmp_path, stable_ids):
         ("IVF_RQ", 9),
     ],
 )
-def test_duplicate_pairs_quantized_batch_boundary(tmp_path, index_type, bits):
+@pytest.mark.parametrize("memory_limit", [0, 256 * 1024 * 1024])
+def test_duplicate_pairs_quantized_batch_boundary(
+    tmp_path, index_type, bits, memory_limit
+):
     # A 1024-row batch followed by one row exercises partial transposed PQ
     # reads and the packed RQ tail without collecting quadratic output.
     rng = np.random.default_rng(83)
@@ -471,7 +472,7 @@ def test_duplicate_pairs_quantized_batch_boundary(tmp_path, index_type, bits):
         ivf_centroids=np.ones((1, 8), dtype=np.float32),
         **params,
     )
-    with find_duplicate_pairs(ds, "vector", 1e6) as reader:
+    with find_duplicate_pairs(ds, "vector", 1e6, memory_limit=memory_limit) as reader:
         first, second = next(reader), next(reader)
     assert first.num_rows == 1023
     assert set(first["row_id_a"].to_pylist()) == {0}
@@ -773,3 +774,42 @@ def test_hamming_clustering_multi_segment(tmp_path, byte_width):
         get_ivf_partition_info(dataset, index.name, index_segments=[123])
     with pytest.raises(TypeError, match="not a single"):
         get_ivf_partition_info(dataset, index.name, index_segments=first_segment.uuid)
+
+
+@pytest.mark.parametrize("index_type", ["IVF_PQ", "IVF_SQ"])
+def test_duplicate_pairs_quantized_cosine_uses_normalized_l2(tmp_path, index_type):
+    # A deliberately coarse codebook distinguishes native normalized L2 / 2
+    # from cosine obtained by renormalizing quantized codebook entries.
+    vectors = np.array([[1, 0], [0, 1], [-1, 0], [1, 0]], dtype=np.float32)
+    params = {}
+    if index_type == "IVF_PQ":
+        codebook = np.tile(np.array([[2, 0], [0, 3], [-2, 0]], np.float32), (86, 1))[
+            :256
+        ]
+        params = dict(num_bits=8, num_sub_vectors=1, pq_codebook=codebook[None])
+        expected = 6.5
+    else:
+        expected = 1.0  # Bounds [-1,1] place zero between two integer codes.
+    ds = lance.write_dataset(
+        pa.table({"vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 2))}),
+        tmp_path,
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type,
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 2), np.float32),
+        **params,
+    )
+    pairs = find_duplicate_pairs(ds, "vector", 100).read_all().to_pylist()
+    distances = {
+        tuple(sorted((p["row_id_a"], p["row_id_b"]))): p["distance"] for p in pairs
+    }
+    assert distances[(0, 1)] == pytest.approx(expected, abs=0.01)
+    assert distances[(0, 3)] == 0
+    # Threshold filtering must use the same native score as enumeration.
+    selected = find_duplicate_pairs(ds, "vector", expected - 0.1).read_all().to_pylist()
+    assert (0, 1) not in {
+        tuple(sorted((p["row_id_a"], p["row_id_b"]))) for p in selected
+    }

@@ -789,7 +789,7 @@ def find_duplicate_pairs(
     column: str,
     distance_threshold: float,
     *,
-    decoded_cache_size: Optional[int] = None,
+    memory_limit: Optional[int] = None,
     max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream embedding duplicate pairs from an existing vector index.
@@ -797,9 +797,11 @@ def find_duplicate_pairs(
     The column must have exactly one current-format vector index covering all
     dataset fragments. Segments and partitions are evaluated independently;
     cross-partition and cross-segment pairs are omitted. No search or top-k
-    truncation is performed. For quantized indices, distances are computed
-    between vectors reconstructed from index codes, not source-table vectors
-    or asymmetric query-to-code estimates. Thresholds use the index metric:
+    truncation is performed. Quantized indices use native code-to-code batch
+    kernels: PQ codebook lookup, SQ integer kernels, and RQ bit-plane products
+    with scale factors. No source vector is fetched or reconstructed.
+    Quantized cosine indices use normalized L2 / 2, as in vector search.
+    Thresholds use the index metric:
     squared L2, cosine distance, dot distance, or Hamming distance.
 
     Returns a reader with non-null ``row_id_a: uint64``, ``row_id_b: uint64``
@@ -812,13 +814,12 @@ def find_duplicate_pairs(
     Each partition's compact index codes are prepared once. Small partitions
     are buffered in memory; larger ones are read in 8,192-row batches into
     temporary session spill storage, reclaimed when the reader advances or
-    closes. Each 1,024-row vector batch is reconstructed once. Decoded vectors
-    are cached up to ``decoded_cache_size`` bytes (default 256 MiB). Earlier
-    decoded batches spill when necessary; later batches stay cached because
-    upper-triangle enumeration revisits them most. Staging completes before
-    emitting pairs from the partition, and no batch is reconstructed again.
-    Zero forces decoded spill. This budget excludes encoded staging, models,
-    row masks, spill metadata and in-flight buffers; it is not a process limit.
+    closes. ``memory_limit`` (default 256 MiB) controls compact code staging;
+    partitions estimated to exceed it spill, and zero forces spill. RQ codes
+    are repacked into bit planes once during staging. Staging completes before
+    emitting pairs from the partition. This budget excludes quantizer models,
+    row masks, spill metadata, preparation and in-flight buffers; it is not a
+    process RSS limit. Scoring uses vector batches of at most 1,024 rows.
     ``max_concurrency`` limits in-flight scoring jobs (positive; defaults to the
     CPU pool size capped at eight). Each job produces at most 1,024 pairs and,
     on the spill path, may retain an anchor batch and a candidate batch.
@@ -841,7 +842,7 @@ def find_duplicate_pairs(
     return dataset._ds.find_duplicate_pairs(
         column,
         distance_threshold,
-        decoded_cache_size=decoded_cache_size,
+        memory_limit=memory_limit,
         max_concurrency=max_concurrency,
     )
 
@@ -853,7 +854,7 @@ def find_duplicate_pairs_in_partition(
     partition_id: int,
     distance_threshold: float,
     *,
-    decoded_cache_size: Optional[int] = None,
+    memory_limit: Optional[int] = None,
     max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream duplicate pairs from one physical index segment and partition.
@@ -863,7 +864,7 @@ def find_duplicate_pairs_in_partition(
     not an index name or fragment ID. ``partition_id`` is local to that segment.
     Other dataset fragments need not be indexed for this scoped operation.
     Distributed callers must open the same dataset version on every worker.
-    ``decoded_cache_size`` and ``max_concurrency`` have the same meaning and
+    ``memory_limit`` and ``max_concurrency`` have the same meaning and
     defaults as in :func:`find_duplicate_pairs` and apply to this invocation.
 
     Examples
@@ -884,7 +885,7 @@ def find_duplicate_pairs_in_partition(
         str(segment_id),
         partition_id,
         distance_threshold,
-        decoded_cache_size=decoded_cache_size,
+        memory_limit=memory_limit,
         max_concurrency=max_concurrency,
     )
 

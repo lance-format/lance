@@ -161,8 +161,8 @@ def run(args):
     count = 0
     batches = 0
     kwargs = {}
-    if args.decoded_cache_size is not None:
-        kwargs["decoded_cache_size"] = args.decoded_cache_size
+    if args.memory_limit is not None:
+        kwargs["memory_limit"] = args.memory_limit
     if args.max_concurrency is not None:
         kwargs["max_concurrency"] = args.max_concurrency
     try:
@@ -199,7 +199,7 @@ def run(args):
         label=args.label,
         case=case,
         threshold=args.threshold,
-        decoded_cache_size=args.decoded_cache_size,
+        memory_limit=args.memory_limit,
         max_concurrency=args.max_concurrency,
         package_file=lance.__file__,
         dataset_open_s=open_s,
@@ -255,7 +255,7 @@ def main():
     measure.add_argument("--threshold", type=float, required=True)
     measure.add_argument("--label", required=True)
     measure.add_argument("--output", required=True)
-    measure.add_argument("--decoded-cache-size", type=int)
+    measure.add_argument("--memory-limit", type=int)
     measure.add_argument("--max-concurrency", type=int)
     args = parser.parse_args()
     credentials(args.credentials)

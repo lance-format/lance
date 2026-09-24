@@ -44,11 +44,11 @@ use crate::{
 
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
-use super::pairwise::{EncodedPartition, PairwisePartition, PairwiseSpillWriter};
+use super::pairwise::{EncodedPartition, PairwisePartition, PairwiseScorer, PairwiseSpillWriter};
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
-/// Coalesce source-index reads independently of the decoded vector batch size.
+/// Coalesce source-index reads independently of the scoring vector batch size.
 const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
 
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
@@ -784,12 +784,26 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let num_rows = self.partition_size(partition_id);
         let quantizer = self.quantizer()?;
+        let scorer = {
+            let quantizer = quantizer.clone();
+            let metric = self.distance_type;
+            Arc::new(spawn_cpu(move || PairwiseScorer::new(&quantizer, centroid, metric)).await?)
+        };
         let schema: arrow_schema::Schema = self.reader.schema().as_ref().into();
         // Include conservative space for validity buffers and Arrow overhead.
-        let row_bytes = schema.fields().iter().try_fold(0usize, |sum, field| {
-            let width = field.data_type().byte_width_opt()?;
-            sum.checked_add(width.checked_add(width.div_ceil(8))?.checked_add(8)?)
-        });
+        // RQ staging adds scalar summaries and at most one padded word per bit.
+        let overhead = if matches!(quantizer, Quantizer::Rabit(_)) {
+            128
+        } else {
+            0
+        };
+        let row_bytes = schema
+            .fields()
+            .iter()
+            .try_fold(overhead, |sum: usize, field| {
+                let width = field.data_type().byte_width_opt()?;
+                sum.checked_add(width.checked_add(width.div_ceil(8))?.checked_add(8)?)
+            });
         let fits = row_bytes
             .and_then(|width| width.checked_mul(num_rows))
             .and_then(|bytes| bytes.checked_add(4096))
@@ -797,20 +811,23 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let encoded = if num_rows == 0 {
             EncodedPartition::Memory(RecordBatch::new_empty(Arc::new(schema)))
         } else if fits {
-            EncodedPartition::Memory(
-                self.read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
-                    .await?,
-            )
+            let batch = self
+                .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
+                .await?;
+            let scorer = scorer.clone();
+            EncodedPartition::Memory(spawn_cpu(move || scorer.prepare(batch)).await?)
         } else {
             let mut writer = PairwiseSpillWriter::new(spill_store).await?;
             // Align source reads to whole vector batches so each spill range
-            // still corresponds to exactly one decoded batch during replay.
+            // still corresponds to exactly one code batch during replay.
             let read_batch_size = PAIRWISE_READ_BATCH_SIZE.div_ceil(batch_size) * batch_size;
             for start in (0..num_rows).step_by(read_batch_size) {
                 let end = start.saturating_add(read_batch_size).min(num_rows);
                 let batch = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
+                let scorer = scorer.clone();
+                let batch = spawn_cpu(move || scorer.prepare(batch)).await?;
                 for offset in (0..batch.num_rows()).step_by(batch_size) {
                     let len = batch_size.min(batch.num_rows() - offset);
                     writer.write(batch.slice(offset, len)).await?;
@@ -820,13 +837,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         };
         Ok(PairwisePartition {
             encoded,
-            quantizer: Arc::new(quantizer),
-            centroid,
-            metric: self.distance_type,
+            scorer,
             remapper: self.frag_reuse_index.clone(),
             batch_size,
             num_rows,
-            rotated_center: tokio::sync::OnceCell::new(),
         })
     }
 

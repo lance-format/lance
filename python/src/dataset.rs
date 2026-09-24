@@ -3380,18 +3380,18 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
-    #[pyo3(signature = (column, distance_threshold, *, decoded_cache_size=None, max_concurrency=None))]
+    #[pyo3(signature = (column, distance_threshold, *, memory_limit=None, max_concurrency=None))]
     fn find_duplicate_pairs(
         &self,
         py: Python<'_>,
         column: &str,
         distance_threshold: f32,
-        decoded_cache_size: Option<usize>,
+        memory_limit: Option<usize>,
         max_concurrency: Option<usize>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
-        if let Some(size) = decoded_cache_size {
-            options = options.with_decoded_cache_size(size);
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
         }
         if let Some(concurrency) = max_concurrency {
             options = options.with_max_concurrency(concurrency);
@@ -3412,7 +3412,7 @@ impl Dataset {
         ))))
     }
 
-    #[pyo3(signature = (column, segment_id, partition_id, distance_threshold, *, decoded_cache_size=None, max_concurrency=None))]
+    #[pyo3(signature = (column, segment_id, partition_id, distance_threshold, *, memory_limit=None, max_concurrency=None))]
     // Keep the binding aligned with the Python utility's keyword-only controls.
     #[allow(clippy::too_many_arguments)]
     fn find_duplicate_pairs_in_partition(
@@ -3422,12 +3422,12 @@ impl Dataset {
         segment_id: &str,
         partition_id: usize,
         distance_threshold: f32,
-        decoded_cache_size: Option<usize>,
+        memory_limit: Option<usize>,
         max_concurrency: Option<usize>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
-        if let Some(size) = decoded_cache_size {
-            options = options.with_decoded_cache_size(size);
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
         }
         if let Some(concurrency) = max_concurrency {
             options = options.with_max_concurrency(concurrency);

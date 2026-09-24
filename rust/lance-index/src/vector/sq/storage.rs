@@ -413,22 +413,7 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let (offset, chunk) = self.chunk(id);
-        let query_sq_code = chunk.sq_code_slice(id - offset);
-        let bounds = self.quantizer.bounds();
-        let lower_bound = bounds.start as f32;
-        let value_scale = sq_value_scale(&bounds);
-        let query_dot = match self.distance_type {
-            DistanceType::Dot => Some(SQDotQuery::from_sq_code(query_sq_code)),
-            _ => None,
-        };
-        SQDistCalculator {
-            query_sq_code: SQQueryCode::Borrowed(query_sq_code),
-            query_dot,
-            scale: sq_distance_scale(&bounds),
-            lower_bound,
-            value_scale,
-            storage: self,
-        }
+        SQDistCalculator::from_codes(chunk.sq_code_slice(id - offset), self)
     }
 }
 
@@ -528,6 +513,19 @@ impl SQQueryCode<'_> {
 }
 
 impl<'a> SQDistCalculator<'a> {
+    pub(crate) fn from_codes(query: &'a [u8], storage: &'a ScalarQuantizationStorage) -> Self {
+        let bounds = storage.quantizer.bounds();
+        Self {
+            query_sq_code: SQQueryCode::Borrowed(query),
+            query_dot: (storage.distance_type == DistanceType::Dot)
+                .then(|| SQDotQuery::from_sq_code(query)),
+            scale: sq_distance_scale(&bounds),
+            lower_bound: bounds.start as f32,
+            value_scale: sq_value_scale(&bounds),
+            storage,
+        }
+    }
+
     fn new(query: ArrayRef, storage: &'a ScalarQuantizationStorage, bounds: Range<f64>) -> Self {
         // This is okay-ish to use hand-rolled dynamic dispatch here
         // since we search 10s-100s of partitions, we can afford the overhead

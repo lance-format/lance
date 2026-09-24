@@ -661,7 +661,7 @@ class _Dataset:
         column: str,
         distance_threshold: float,
         *,
-        decoded_cache_size: Optional[int] = None,
+        memory_limit: Optional[int] = None,
         max_concurrency: Optional[int] = None,
     ) -> pa.RecordBatchReader: ...
     def find_duplicate_pairs_in_partition(
@@ -671,7 +671,7 @@ class _Dataset:
         partition_id: int,
         distance_threshold: float,
         *,
-        decoded_cache_size: Optional[int] = None,
+        memory_limit: Optional[int] = None,
         max_concurrency: Optional[int] = None,
     ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(

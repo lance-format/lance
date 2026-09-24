@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -16,9 +16,8 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::{
     VectorIndex,
-    pairwise::{DecodedPairwisePartition, PAIRWISE_MEMORY_LIMIT, PairwiseVectorBatch},
+    pairwise::{PAIRWISE_MEMORY_LIMIT, PairwisePartition, PairwiseVectorBatch},
 };
-use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
 use uuid::Uuid;
 
@@ -28,47 +27,48 @@ use crate::index::{
     segment_has_vector_details,
 };
 
-/// Scoring and output remain bounded even when the decoded partition spills.
+/// Scoring and output remain bounded even when the encoded partition spills.
 /// A multiple of 32 also matches RQ's packed sign-code group size.
 const VECTOR_BATCH_SIZE: usize = 1024;
 
 // Small SIMD batches do not justify a CPU-pool round trip. Larger distances
 // run on the CPU pool; inline batches yield cooperatively in the scan loop.
-const MIN_OFFLOAD_COORDINATES: usize = 256 * 1024;
+const MIN_OFFLOAD_BYTES: usize = 256 * 1024;
 
-/// Per-invocation decoded-vector caching and ordered scoring concurrency.
+/// Per-invocation code staging and ordered scoring concurrency.
 ///
-/// The cache budget is not a process-wide memory limit. It excludes encoded
-/// staging, models, row masks, spill metadata and in-flight scoring buffers.
-/// With spilled vectors, each in-flight job may retain an anchor batch, a
+/// The staging budget is not a process-wide memory limit. It excludes quantizer
+/// models, row masks, spill metadata and in-flight scoring buffers.
+/// With spilled codes, each in-flight job may retain an anchor batch, a
 /// candidate batch and at most one output batch, each bounded to 1,024 rows.
 ///
 /// ```
 /// use lance::index::vector::dedup::DuplicatePairsOptions;
 /// let options = DuplicatePairsOptions::default()
-///     .with_decoded_cache_size(128 * 1024 * 1024)
+///     .with_memory_limit(128 * 1024 * 1024)
 ///     .with_max_concurrency(4);
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct DuplicatePairsOptions {
-    decoded_cache_size: usize,
+    memory_limit: usize,
     max_concurrency: usize,
 }
 
 impl Default for DuplicatePairsOptions {
     fn default() -> Self {
         Self {
-            decoded_cache_size: 256 * 1024 * 1024,
+            memory_limit: PAIRWISE_MEMORY_LIMIT,
             max_concurrency: get_num_compute_intensive_cpus().min(8),
         }
     }
 }
 
 impl DuplicatePairsOptions {
-    /// Set the decoded cache budget in bytes (default 256 MiB). Zero forces
-    /// decoded spill. Reconstruction retains at most one extra in-flight batch.
-    pub fn with_decoded_cache_size(mut self, decoded_cache_size: usize) -> Self {
-        self.decoded_cache_size = decoded_cache_size;
+    /// Set the compact code staging budget in bytes (default 256 MiB).
+    /// Partitions estimated to exceed it spill; zero forces spill. Source reads,
+    /// quantizer preparation and scoring retain additional bounded batches.
+    pub fn with_memory_limit(mut self, memory_limit: usize) -> Self {
+        self.memory_limit = memory_limit;
         self
     }
 
@@ -92,8 +92,8 @@ fn pair_schema() -> SchemaRef {
 ///
 /// `column` must have exactly one logical, current-format vector index covering
 /// all current fragments. Deleted rows are excluded at the dataset snapshot.
-/// Quantized distances are symmetric distances between reconstructed index
-/// vectors, not exact source-vector distances. Cross-partition and cross-segment
+/// Quantized distances use native code-to-code batch kernels, not exact
+/// source-vector distances. Cross-partition and cross-segment
 /// pairs are not evaluated. No top-k limit is applied.
 ///
 /// Pairs follow stable index traversal (`i < j`), not numeric row-ID order.
@@ -184,7 +184,7 @@ pub async fn find_duplicate_pairs_in_partition(
     .await
 }
 
-/// Run one segment/partition with explicit decoded caching and concurrency.
+/// Run one segment/partition with explicit code staging and concurrency.
 /// Uses the snapshot, distance and ordering contract of
 /// [`find_duplicate_pairs_in_partition`].
 ///
@@ -195,7 +195,7 @@ pub async fn find_duplicate_pairs_in_partition(
 /// # async fn example(dataset: Arc<Dataset>, segment: uuid::Uuid) -> Result<()> {
 /// let pairs = find_duplicate_pairs_in_partition_with_options(
 ///     dataset, "embedding", segment, 0, 0.05,
-///     DuplicatePairsOptions::default().with_decoded_cache_size(0),
+///     DuplicatePairsOptions::default().with_memory_limit(0),
 /// ).await?;
 /// # Ok(()) }
 /// ```
@@ -352,7 +352,6 @@ async fn partition_stream(
     options: DuplicatePairsOptions,
 ) -> Result<SendableRecordBatchStream> {
     let count = partition.index.partition_size(partition.id);
-    let metric = partition.index.metric_type();
     let schema = pair_schema();
     if count == 0 {
         return Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -365,19 +364,14 @@ async fn partition_stream(
         .prepare_pairwise_partition(
             partition.id,
             VECTOR_BATCH_SIZE,
-            PAIRWISE_MEMORY_LIMIT,
+            options.memory_limit,
             session.spill_store(),
         )
         .await?;
-    let prepared = Arc::new(
-        prepared
-            .materialize(options.decoded_cache_size, session.spill_store())
-            .await?,
-    );
+    let prepared = Arc::new(prepared);
     let state = PairWork {
         prepared,
         count,
-        metric,
         filter: partition.mask,
         threshold,
         schema: schema.clone(),
@@ -403,9 +397,8 @@ async fn partition_stream(
 }
 
 struct PairWork {
-    prepared: Arc<DecodedPairwisePartition>,
+    prepared: Arc<PairwisePartition>,
     count: usize,
-    metric: DistanceType,
     filter: Arc<RowAddrMask>,
     threshold: f32,
     schema: SchemaRef,
@@ -451,7 +444,7 @@ impl PairWork {
             }
             let start = self.candidate_start;
             let end = start.saturating_add(VECTOR_BATCH_SIZE).min(self.count);
-            let query = anchor.vectors.value(self.anchor_row);
+            let query = anchor.clone();
             let first = (self.anchor_start + self.anchor_row + 1)
                 .saturating_sub(start)
                 .min(end - start);
@@ -463,11 +456,11 @@ impl PairWork {
                 prepared: self.prepared.clone(),
                 a,
                 query,
+                query_row: self.anchor_row,
                 first,
                 candidate_batch: start / VECTOR_BATCH_SIZE,
-                // Reuse the anchor's decoded view for same-batch comparisons.
+                // Reuse the anchor's codes for same-batch comparisons.
                 candidate: (start == self.anchor_start).then(|| anchor.clone()),
-                metric: self.metric,
                 filter: self.filter.clone(),
                 threshold: self.threshold,
                 schema: self.schema.clone(),
@@ -477,13 +470,13 @@ impl PairWork {
 }
 
 struct ScoreWork {
-    prepared: Arc<DecodedPairwisePartition>,
+    prepared: Arc<PairwisePartition>,
     a: u64,
-    query: ArrayRef,
+    query: PairwiseVectorBatch,
+    query_row: usize,
     first: usize,
     candidate_batch: usize,
     candidate: Option<PairwiseVectorBatch>,
-    metric: DistanceType,
     filter: Arc<RowAddrMask>,
     threshold: f32,
     schema: SchemaRef,
@@ -498,29 +491,33 @@ impl ScoreWork {
         let Self {
             a,
             query,
+            query_row,
+            prepared,
             first,
-            metric,
             filter,
             threshold,
             schema,
             ..
         } = self;
-        let coordinates = (candidates.row_ids.len() - first).saturating_mul(query.len());
+        let work_bytes = candidates.codes.get_array_memory_size();
         let score = move || -> Result<RecordBatch> {
             // Score only the upper triangle, including within one batch.
-            let vectors = candidates
-                .vectors
-                .slice(first, candidates.row_ids.len() - first);
-            let distances = metric.arrow_batch_func()(query.as_ref(), &vectors)?;
+            let candidates = PairwiseVectorBatch {
+                row_ids: candidates
+                    .row_ids
+                    .slice(first, candidates.row_ids.len() - first),
+                codes: candidates
+                    .codes
+                    .slice(first, candidates.row_ids.len() - first),
+            };
+            let distances = prepared.distance_batch(&query, query_row, &candidates)?;
             let mut b = Vec::new();
             let mut d = Vec::new();
-            for i in first..candidates.row_ids.len() {
+            for (i, distance) in distances.into_iter().enumerate() {
                 let id = candidates.row_ids.value(i);
-                let distance = distances.value(i - first);
                 if candidates.row_ids.is_valid(i)
                     && filter.selected(id)
                     && id != a
-                    && distances.is_valid(i - first)
                     && distance.is_finite()
                     && distance <= threshold
                 {
@@ -537,7 +534,7 @@ impl ScoreWork {
                 ],
             )?)
         };
-        if coordinates < MIN_OFFLOAD_COORDINATES {
+        if work_bytes < MIN_OFFLOAD_BYTES {
             score()
         } else {
             spawn_cpu(score).await

@@ -12,7 +12,7 @@ use std::{
 };
 
 use arrow::datatypes::{self, UInt8Type};
-use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
@@ -837,6 +837,67 @@ impl VectorStore for ProductQuantizationStorage {
 }
 
 /// Distance calculator backed by PQ code.
+/// Symmetric PQ scoring using the same codebook tables and batch kernel as
+/// `dist_calculator_from_id`, with query and candidates in separate batches.
+pub(crate) struct PQCodeDistance {
+    table: Vec<f32>,
+    num_bits: u32,
+    num_sub_vectors: usize,
+    metric: DistanceType,
+}
+
+impl PQCodeDistance {
+    pub(crate) fn new(pq: &ProductQuantizer, metric: DistanceType) -> Result<Self> {
+        let metric = if metric == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            metric
+        };
+        let values = pq.codebook.values();
+        macro_rules! table {
+            ($ty:ty) => {
+                build_pairwise_distance_table(
+                    values.as_primitive::<$ty>().values(),
+                    pq.num_bits,
+                    pq.num_sub_vectors,
+                    pq.dimension,
+                    metric,
+                )
+            };
+        }
+        let table = match values.data_type() {
+            DataType::Float16 => table!(datatypes::Float16Type),
+            DataType::Float32 => table!(datatypes::Float32Type),
+            DataType::Float64 => table!(datatypes::Float64Type),
+            other => {
+                return Err(Error::not_supported(format!(
+                    "PQ pair scoring codebook type {other}"
+                )));
+            }
+        };
+        Ok(Self {
+            table,
+            num_bits: pq.num_bits,
+            num_sub_vectors: pq.num_sub_vectors,
+            metric,
+        })
+    }
+
+    pub(crate) fn distance_batch(&self, query: &[u8], candidates: &FixedSizeListArray) -> Vec<f32> {
+        let values = candidates.values().as_primitive::<UInt8Type>();
+        let transposed = transpose(values, candidates.len(), candidates.value_length() as usize);
+        PQDistCalculator::new_from_codes(
+            &self.table,
+            self.num_bits,
+            self.num_sub_vectors,
+            Arc::new(transposed),
+            query.iter().copied(),
+            self.metric,
+        )
+        .distance_all(candidates.len())
+    }
+}
+
 pub struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
