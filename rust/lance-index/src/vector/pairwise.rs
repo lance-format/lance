@@ -409,6 +409,33 @@ pub struct PairwisePartition {
 }
 
 impl PairwisePartition {
+    /// Stage each source batch as one in-memory staged batch, without row ID
+    /// remapping. PQ sources must hold column-major codes. Benchmark support
+    /// only; production staging goes through the IVF storage reader.
+    #[doc(hidden)]
+    pub fn stage_in_memory(
+        quantizer: &Quantizer,
+        centroid: ArrayRef,
+        metric: DistanceType,
+        sources: &[RecordBatch],
+    ) -> Result<Self> {
+        let schema = sources
+            .first()
+            .ok_or_else(|| Error::invalid_input("pairwise staging needs a source batch"))?
+            .schema();
+        let scorer = PairwiseScorer::new(quantizer, centroid, metric, &schema)?;
+        let batches = sources
+            .iter()
+            .map(|source| scorer.stage(source, 0..source.num_rows(), None))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            batch_size: sources.iter().map(RecordBatch::num_rows).max().unwrap_or(0),
+            num_rows: sources.iter().map(RecordBatch::num_rows).sum(),
+            encoded: EncodedPartition::Memory(batches),
+            scorer: Arc::new(scorer),
+        })
+    }
+
     /// Number of rows per staged batch, possibly smaller than the requested
     /// maximum to bound wide code arrays. The final batch can contain fewer rows.
     pub fn vector_batch_size(&self) -> usize {

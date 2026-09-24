@@ -180,6 +180,10 @@ harness = false
 name = "two_file_shuffle_read"
 harness = false
 
+[[bench]]
+name = "pairwise"
+harness = false
+
 [lints]
 workspace = true
 
