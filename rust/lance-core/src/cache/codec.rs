@@ -188,6 +188,17 @@ impl<T> CacheDecode<T> {
 // CacheCodecImpl — trait for serializable cache entry types
 // ---------------------------------------------------------------------------
 
+/// Bounded random reads from a persistent cache payload. Backends may coalesce
+/// and align physical I/O while codecs request logical byte ranges.
+pub trait CacheRangeReader {
+    fn read_range(&self, range: std::ops::Range<usize>) -> Result<Bytes>;
+}
+impl<F: Fn(std::ops::Range<usize>) -> Result<Bytes>> CacheRangeReader for F {
+    fn read_range(&self, range: std::ops::Range<usize>) -> Result<Bytes> {
+        self(range)
+    }
+}
+
 /// Serialization trait for cache entries.
 ///
 /// **Experimental**: the serialized format is not yet covered by a stability
@@ -207,6 +218,22 @@ impl<T> CacheDecode<T> {
 /// The read sequence mirroring the write sequence for each `type_version` is
 /// the invariant the implementor owns.
 pub trait CacheCodecImpl: Send + Sync {
+    /// Whether this body supports gathering sorted, unique row offsets.
+    const SUPPORTS_ROW_SELECTION: bool = false;
+    fn deserialize_rows(
+        _reader: &dyn CacheRangeReader,
+        _body_offset: usize,
+        _version: u32,
+        _rows: &[u32],
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(Error::invalid_input(
+            "cache codec does not support row selection",
+        ))
+    }
+
     /// Stable identity for this entry type. **Must not change once shipped.**
     /// This is a deliberate author-assigned string, not `std::any::type_name`
     /// (which is not stable across compiler versions).
@@ -234,15 +261,19 @@ pub trait CacheCodecImpl: Send + Sync {
 
 pub(crate) type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 
+type RowDecoder = fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<ArcAny>;
+
 /// Type-erased codec for serializing and deserializing cache entries.
 ///
-/// `CacheCodec` carries the entry's stable `type_id`/`version` plus two plain
+/// `CacheCodec` carries the entry's stable `type_id`/`version` plus plain
 /// function pointers — it is `Copy` and has no heap allocation. Construct one
 /// via [`CacheCodec::from_impl`] for types that implement [`CacheCodecImpl`],
 /// or [`CacheCodec::new`] for custom cases (e.g. when the orphan rule prevents
 /// a direct impl).
 #[derive(Copy, Clone)]
 pub struct CacheCodec {
+    row_decoder: Option<RowDecoder>,
+    memory_priority: u8,
     type_id: &'static str,
     version: u32,
     serialize_body: fn(&ArcAny, &mut CacheEntryWriter<'_>) -> Result<()>,
@@ -289,6 +320,8 @@ impl CacheCodec {
         deserialize_body: fn(&mut CacheEntryReader<'_>) -> Result<ArcAny>,
     ) -> Self {
         Self {
+            row_decoder: None,
+            memory_priority: 0,
             type_id,
             version,
             serialize_body,
@@ -299,11 +332,29 @@ impl CacheCodec {
     /// Create a `CacheCodec` from a [`CacheCodecImpl`] implementation.
     pub fn from_impl<T: CacheCodecImpl + 'static>() -> Self {
         Self {
+            row_decoder: if T::SUPPORTS_ROW_SELECTION {
+                Some(|reader, offset, version, rows| {
+                    Ok(Arc::new(T::deserialize_rows(reader, offset, version, rows)?) as ArcAny)
+                })
+            } else {
+                None
+            },
+            memory_priority: 0,
             type_id: T::TYPE_ID,
             version: T::CURRENT_VERSION,
             serialize_body: serialize_via_impl::<T>,
             deserialize_body: deserialize_via_impl::<T>,
         }
+    }
+
+    /// Hint for priority-aware memory tiers. Larger values survive pressure first.
+    pub fn with_memory_priority(mut self, priority: u8) -> Self {
+        self.memory_priority = priority;
+        self
+    }
+
+    pub fn memory_priority(&self) -> u8 {
+        self.memory_priority
     }
 
     /// Return the stable entry type identity.
@@ -319,6 +370,39 @@ impl CacheCodec {
         let body_offset = write_envelope(writer, self.type_id, self.version)?;
         let mut entry_writer = CacheEntryWriter::with_pos(writer, body_offset);
         (self.serialize_body)(value, &mut entry_writer)
+    }
+
+    pub fn supports_row_selection(&self) -> bool {
+        self.row_decoder.is_some()
+    }
+
+    /// Gather rows without loading the complete persistent entry.
+    pub fn deserialize_rows(
+        &self,
+        reader: &dyn CacheRangeReader,
+        rows: &[u32],
+    ) -> CacheDecode<ArcAny> {
+        let decode = || -> Result<ArcAny> {
+            let decoder = self
+                .row_decoder
+                .ok_or_else(|| Error::invalid_input("row selection unsupported"))?;
+            let prefix = reader.read_range(0..7)?;
+            let id_bytes = prefix
+                .get(5..7)
+                .ok_or_else(|| Error::invalid_input("short cache envelope"))?;
+            let id_len = u16::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
+            let header = reader.read_range(0..(11 + id_len))?;
+            let envelope = parse_envelope(&header)
+                .ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
+            if envelope.type_id != self.type_id || envelope.type_version > self.version {
+                return Err(Error::invalid_input("incompatible cache entry"));
+            }
+            decoder(reader, envelope.body_offset, envelope.type_version, rows)
+        };
+        match decode() {
+            Ok(entry) => CacheDecode::Hit(entry),
+            Err(_) => CacheDecode::Miss(CacheMissReason::BodyError),
+        }
     }
 
     /// Deserialize an entry from `data`.

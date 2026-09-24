@@ -2013,6 +2013,7 @@ impl Scanner {
         };
 
         self.nearest = Some(Query {
+            rq_cascade_factor: None,
             column: column.to_string(),
             key,
             k,
@@ -2027,6 +2028,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_precision: Default::default(),
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -2195,11 +2197,30 @@ impl Scanner {
         self
     }
 
+    /// Rerank at most k * factor high-level candidates using full code planes.
+    pub fn rq_cascade_factor(&mut self, factor: u32) -> Result<&mut Self> {
+        if factor == 0 {
+            return Err(Error::invalid_input("rq_cascade_factor must be positive"));
+        }
+        if let Some(query) = self.nearest.as_mut() {
+            query.rq_cascade_factor = Some(factor);
+        }
+        Ok(self)
+    }
+
+    /// Select the precision of a layered IVF_RQ index (full by default).
+    pub fn rq_precision(
+        &mut self,
+        precision: lance_index::vector::bq::layered::RQPrecision,
+    ) -> &mut Self {
+        if let Some(query) = self.nearest.as_mut() {
+            query.rq_precision = precision;
+        }
+        self
+    }
+
     /// Configure the speed / accuracy tradeoff for approximate vector search.
-    ///
-    /// This setting is currently used by RQ-quantized indexes (such as
-    /// IVF_RQ) and by prefiltered search on HNSW indexes, where `Fast`
-    /// enables the ACORN traversal. Other index types ignore this setting.
+    /// RQ uses this for estimation; HNSW Fast mode enables ACORN traversal.
     pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.approx_mode = approx_mode;

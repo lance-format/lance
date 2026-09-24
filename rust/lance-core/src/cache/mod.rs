@@ -51,13 +51,16 @@ pub mod codec;
 mod entry_io;
 mod key;
 mod moka;
+mod priority;
 mod quick;
+pub use priority::PriorityEntries;
 mod registry;
 
 pub use backend::{CacheBackend, CacheEntry};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
-    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
+    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
+    has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
@@ -135,6 +138,11 @@ pub trait CacheKey {
     /// paths override this with typed, allocation-free field encoding.
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.key().as_ref());
+    }
+
+    /// Per-key cache policy, defaulting to the value type's codec.
+    fn codec_for_key(&self) -> Option<CacheCodec> {
+        Self::codec()
     }
 
     /// Optional codec for serializing/deserializing this key's value type.
@@ -363,8 +371,59 @@ impl LanceCache {
         let key = self.sized_key(cache_key);
         self.state
             .backend
-            .insert(&key, metadata, size, K::codec())
+            .insert(&key, metadata, size, cache_key.codec_for_key())
             .await;
+    }
+
+    /// Read a resident entry without loading its disk copy.
+    pub async fn get_resident_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        self.state
+            .backend
+            .get_resident(&key)
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
+    }
+
+    /// Read memory or persistent storage without promoting a persistent hit.
+    pub async fn get_without_promotion_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        self.state
+            .backend
+            .get_without_promotion(&key, cache_key.codec_for_key())
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
+    }
+
+    /// Read selected rows from a persistent entry without memory admission.
+    pub async fn get_rows_with_key<K>(
+        &self,
+        cache_key: &K,
+        rows: &[u32],
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.state
+            .backend
+            .get_rows(&self.sized_key(cache_key), rows, cache_key.codec_for_key())
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -373,7 +432,12 @@ impl LanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let key = self.sized_key(cache_key);
-        let Some(entry) = self.state.backend.get(&key, K::codec()).await else {
+        let Some(entry) = self
+            .state
+            .backend
+            .get(&key, cache_key.codec_for_key())
+            .await
+        else {
             self.state.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -449,7 +513,7 @@ impl LanceCache {
         let (entry, was_cached) = self
             .state
             .backend
-            .get_or_insert(&key, typed_loader, K::codec())
+            .get_or_insert(&key, typed_loader, cache_key.codec_for_key())
             .await?;
         let entry = entry.downcast::<K::ValueType>().map_err(|_| {
             self.state.misses.fetch_add(1, Ordering::Relaxed);
@@ -583,6 +647,42 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Read RAM only, avoiding whole-entry promotion for candidate range reads.
+    pub async fn get_resident_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?.get_resident_with_key(cache_key).await
+    }
+
+    /// Read a cached candidate plane without whole-entry RAM admission.
+    pub async fn get_without_promotion_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?
+            .get_without_promotion_with_key(cache_key)
+            .await
+    }
+
+    /// Read selected cached rows without promoting a whole plane.
+    pub async fn get_rows_with_key<K>(
+        &self,
+        cache_key: &K,
+        rows: &[u32],
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?.get_rows_with_key(cache_key, rows).await
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

@@ -420,6 +420,13 @@ pub(crate) fn build_scanner_with_options<'a>(
 
         let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
         scanner.approx_mode(parse_approx_mode(&approx_mode_str)?);
+        scanner.rq_precision(
+            env.get_string_from_method(&java_obj, "getRqPrecisionString")?
+                .parse()?,
+        );
+        if let Some(factor) = env.get_optional_u32_from_method(&java_obj, "getRqCascadeFactor")? {
+            scanner.rq_cascade_factor(factor)?;
+        }
         Ok(())
     })?;
 

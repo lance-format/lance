@@ -1641,25 +1641,38 @@ impl DisplayAs for ANNIvfSubIndexExec {
             .metric_type
             .map(|m| format!("{:?}", m))
             .unwrap_or_else(|| "default".to_string());
+        let precision = if self.query.rq_precision
+            != lance_index::vector::bq::layered::RQPrecision::Full
+            || self.query.rq_cascade_factor.is_some()
+        {
+            format!(
+                ", rq_precision={:?}, rq_cascade_factor={:?}",
+                self.query.rq_precision, self.query.rq_cascade_factor
+            )
+        } else {
+            String::new()
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNSubIndex: name={}, k={}, deltas={}, metric={}",
+                    "ANNSubIndex: name={}, k={}, deltas={}, metric={}{}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
+                    metric_str,
+                    precision
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNSubIndex\nname={}\nk={}\ndeltas={}\nmetric={}",
+                    "ANNSubIndex\nname={}\nk={}\ndeltas={}\nmetric={}{}",
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
+                    metric_str,
+                    precision
                 )
             }
         }
@@ -3092,6 +3105,8 @@ mod tests {
 
     fn base_query() -> Query {
         Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vec".to_string(),
             key: Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef,
             k: 10,
@@ -4721,6 +4736,8 @@ mod tests {
     #[tokio::test]
     async fn test_multivector_score() {
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key: Arc::new(generate_random_array(1)),
             k: 10,

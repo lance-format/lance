@@ -299,6 +299,8 @@ mod tests {
 
     fn query() -> Query {
         Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key: Arc::new(Float32Array::from(vec![1.0, 0.0])),
             k: 10,

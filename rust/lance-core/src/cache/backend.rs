@@ -53,6 +53,32 @@ pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Look up RAM only, without reading or promoting a persistent entry.
+    /// Backends without a resident lookup return a miss safely.
+    async fn get_resident(&self, _key: &InternalCacheKey) -> Option<CacheEntry> {
+        None
+    }
+
+    /// Read an entry without admitting a persistent hit into RAM.
+    /// Backends without this capability safely fall back to resident entries.
+    async fn get_without_promotion(
+        &self,
+        key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+    ) -> Option<CacheEntry> {
+        self.get_resident(key).await
+    }
+
+    /// Gather selected rows from persistent storage, without RAM admission.
+    async fn get_rows(
+        &self,
+        _key: &InternalCacheKey,
+        _rows: &[u32],
+        _codec: Option<CacheCodec>,
+    ) -> Option<CacheEntry> {
+        None
+    }
+
     /// Look up an entry by its key.
     ///
     /// `codec` is provided so that persistent backends can deserialize the

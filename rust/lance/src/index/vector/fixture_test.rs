@@ -252,6 +252,8 @@ mod test {
                 key = normalize_arrow(&key).unwrap().0;
             };
             let q = Query {
+                rq_cascade_factor: None,
+                rq_precision: Default::default(),
                 column: "test".to_string(),
                 key,
                 k: 1,

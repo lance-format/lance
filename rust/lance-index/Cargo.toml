@@ -74,6 +74,8 @@ async-channel = "2.3.1"
 rand_distr.workspace = true
 rangemap.workspace = true
 
+uuid.workspace = true
+
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
@@ -87,7 +89,6 @@ test-log.workspace = true
 rstest.workspace = true
 serial_test.workspace = true
 chrono.workspace = true
-uuid.workspace = true
 
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]

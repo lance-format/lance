@@ -21,10 +21,10 @@ use prost::Message;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -278,6 +278,7 @@ impl QueryScratchCapacity {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DistanceCalculatorOptions {
     pub approx_mode: ApproxMode,
+    pub rq_precision: super::bq::layered::RQPrecision,
 }
 
 #[derive(Debug)]
@@ -542,6 +543,34 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 }
 
+/// Avoid loading whole cold planes for isolated candidate reads. Repeated reads
+/// covering half a partition amortize promotion, with a cooldown after admission pressure.
+const PLANE_PROMOTION_READS: usize = 3;
+const PLANE_PROMOTION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct PlaneAccess {
+    reads: usize,
+    rows: usize,
+    last_attempt: Option<std::time::Instant>,
+}
+impl DeepSizeOf for PlaneAccess {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+        0
+    }
+}
+
+/// Runtime promotion history shared by reconstructions of the same cached index.
+/// This contains no readers or object-store handles and is not persisted to disk.
+#[derive(Debug, Clone, Default)]
+pub struct PlaneAccessTracker(Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>);
+
+impl DeepSizeOf for PlaneAccessTracker {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
+    }
+}
+
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
 pub struct IvfQuantizationStorage<Q: Quantization> {
@@ -552,11 +581,14 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
     ivf: IvfModel,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    plane_access: PlaneAccessTracker,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
+        self.metadata.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+            + self.plane_access.deep_size_of_children(context)
     }
 }
 
@@ -623,6 +655,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            plane_access: Default::default(),
         })
     }
 
@@ -654,7 +687,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            plane_access: Default::default(),
         }
+    }
+
+    /// Promotion history to retain in the index's cached runtime state.
+    pub fn plane_access_tracker(&self) -> &PlaneAccessTracker {
+        &self.plane_access
+    }
+
+    /// Reuse promotion history when binding new readers to a cached index.
+    pub fn with_plane_access_tracker(mut self, tracker: PlaneAccessTracker) -> Self {
+        self.plane_access = tracker;
+        self
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -736,6 +781,325 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             self.distance_type,
             self.frag_reuse_index.clone(),
         )
+    }
+
+    /// Warm all sign planes first, then high, then low. Backend admission enforces its byte budget.
+    pub async fn prewarm_planes(&self, cache: &lance_core::cache::WeakLanceCache) -> Result<()> {
+        use super::bq::layered::{PlaneBatch, PlaneKey};
+        for plane in 0..=2 {
+            for part_id in 0..self.num_partitions() {
+                if plane > 0
+                    && cache
+                        .get_resident_with_key(&PlaneKey {
+                            partition: part_id,
+                            plane: 0,
+                        })
+                        .await
+                        .is_none()
+                {
+                    continue;
+                }
+                cache
+                    .get_or_insert_with_key(
+                        PlaneKey {
+                            partition: part_id,
+                            plane,
+                        },
+                        || async {
+                            Ok(PlaneBatch(
+                                self.read_plane(part_id, plane, None, None).await?,
+                            ))
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this loader owns an opt-in layered RaBitQ index.
+    pub fn is_layered_rq(&self) -> bool {
+        matches!(self.quantizer(), Ok(Quantizer::Rabit(rq)) if rq.metadata_ref().layered)
+    }
+
+    /// Read independent plane entries through the existing persistent cache.
+    pub async fn load_partition_at_precision(
+        &self,
+        part_id: usize,
+        precision: super::bq::layered::RQPrecision,
+        cache: &lance_core::cache::WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        use super::bq::layered::{PlaneBatch, PlaneKey, RQPrecision};
+        if !self.is_layered_rq() {
+            if precision != RQPrecision::Full {
+                return Err(Error::invalid_input(
+                    "rq_precision requires a layered IVF_RQ index",
+                ));
+            }
+            return self.load_partition(part_id, io_stats).await;
+        }
+        let last = match precision {
+            RQPrecision::Sign => 0,
+            RQPrecision::High => 1,
+            RQPrecision::Full => 2,
+        };
+        let load_plane = |plane| {
+            let io_stats = io_stats.clone();
+            async move {
+                let key = PlaneKey {
+                    partition: part_id,
+                    plane,
+                };
+                let sign_resident = plane == 0
+                    || cache
+                        .get_resident_with_key(&PlaneKey {
+                            partition: part_id,
+                            plane: 0,
+                        })
+                        .await
+                        .is_some();
+                let batch = if sign_resident {
+                    cache
+                        .get_or_insert_with_key_hit(key, || async {
+                            Ok(PlaneBatch(
+                                self.read_plane(part_id, plane, None, io_stats.clone())
+                                    .await?,
+                            ))
+                        })
+                        .await?
+                        .0
+                } else if let Some(batch) = cache.get_without_promotion_with_key(&key).await {
+                    batch
+                } else {
+                    // An oversized sign plane falls back to partition streaming; do
+                    // not admit smaller ex entries without their sign dependency.
+                    Arc::new(PlaneBatch(
+                        self.read_plane(part_id, plane, None, io_stats.clone())
+                            .await?,
+                    ))
+                };
+                Ok::<_, Error>(batch)
+            }
+        };
+        // Admit the sign dependency first. The high and low reads can then
+        // overlap without changing admission policy or assembled column order.
+        let sign = load_plane(0).await?;
+        let ex = futures::future::try_join_all((1..=last).map(load_plane)).await?;
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for batch in std::iter::once(sign).chain(ex) {
+            fields.extend(batch.0.schema().fields().iter().cloned());
+            columns.extend(batch.0.columns().iter().cloned());
+        }
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
+        Q::Storage::try_from_batch_at_precision(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+            precision,
+        )
+    }
+
+    /// Remappers can remove physical rows, so candidate offsets require an identity mapping.
+    pub fn supports_candidate_reads(&self) -> bool {
+        self.frag_reuse_index.is_none()
+    }
+
+    /// Assemble a full-precision store from candidate rows only.
+    pub async fn load_candidates(
+        &self,
+        part_id: usize,
+        rows: Vec<u32>,
+        cache: &lance_core::cache::WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        use super::bq::layered::{PlaneKey, RQPrecision};
+        use super::bq::storage::{RABIT_CODE_COLUMN, take_packed_codes};
+        use arrow_array::cast::AsArray;
+        if rows.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(Error::invalid_input(
+                "candidate offsets must be sorted and unique",
+            ));
+        }
+        let indices = arrow_array::UInt32Array::from(rows.clone());
+        // The three planes are independent. Overlap their cache/origin reads,
+        // while preserving plane order when assembling the full row schema.
+        let batches = futures::future::try_join_all((0..=2).map(|plane| {
+            let rows = &rows;
+            let indices = &indices;
+            let io_stats = io_stats.clone();
+            async move {
+                let key = PlaneKey {
+                    partition: part_id,
+                    plane,
+                };
+                let resident = cache.get_resident_with_key(&key).await;
+                let was_resident = resident.is_some();
+                let cached = if plane == 0 && resident.is_none() {
+                    cache.get_without_promotion_with_key(&key).await
+                } else {
+                    resident
+                };
+                let selected_cached = if plane > 0 && cached.is_none() {
+                    cache.get_rows_with_key(&key, rows).await
+                } else {
+                    None
+                };
+                let batch = if plane == 0 {
+                    // Sign codes are transposed across rows. Gather their physical
+                    // offsets directly, then pack only the selected rows.
+                    let raw = if let Some(value) = cached {
+                        value.0.clone()
+                    } else {
+                        self.read_plane(part_id, plane, None, io_stats.clone())
+                            .await?
+                    };
+                    let codes = raw
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .ok_or_else(|| Error::invalid_input("missing sign codes"))?;
+                    let selected_codes = take_packed_codes(codes.as_fixed_size_list(), rows)?;
+                    // The transposed sign column cannot be gathered with Arrow
+                    // take. Avoid copying it only to replace that copy immediately.
+                    let field = raw.schema().field_with_name(RABIT_CODE_COLUMN)?.clone();
+                    raw.drop_column(RABIT_CODE_COLUMN)?
+                        .take(indices)?
+                        .try_with_column(field, Arc::new(selected_codes))?
+                } else if let Some(value) = cached {
+                    value.0.take(indices)?
+                } else if let Some(value) = selected_cached {
+                    value.0.clone()
+                } else {
+                    self.read_plane(part_id, plane, Some(rows.clone()), io_stats.clone())
+                        .await?
+                };
+                if plane > 0
+                    && !was_resident
+                    && cache
+                        .get_resident_with_key(&PlaneKey {
+                            partition: part_id,
+                            plane: 0,
+                        })
+                        .await
+                        .is_some()
+                {
+                    let promote = {
+                        let mut accesses = self
+                            .plane_access
+                            .0
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let access = accesses.entry((part_id, plane)).or_default();
+                        access.reads = access.reads.saturating_add(1);
+                        access.rows = access.rows.saturating_add(rows.len());
+                        let cooled = access
+                            .last_attempt
+                            .is_none_or(|last| last.elapsed() >= PLANE_PROMOTION_COOLDOWN);
+                        if cooled
+                            && access.reads >= PLANE_PROMOTION_READS
+                            && access.rows >= self.partition_size(part_id).div_ceil(2)
+                        {
+                            access.reads = 0;
+                            access.rows = 0;
+                            access.last_attempt = Some(std::time::Instant::now());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if promote {
+                        cache
+                            .get_or_insert_with_key(
+                                PlaneKey {
+                                    partition: part_id,
+                                    plane,
+                                },
+                                || async {
+                                    Ok(super::bq::layered::PlaneBatch(
+                                        self.read_plane(part_id, plane, None, io_stats.clone())
+                                            .await?,
+                                    ))
+                                },
+                            )
+                            .await?;
+                    }
+                }
+                Ok::<_, Error>(batch)
+            }
+        }))
+        .await?;
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for batch in batches {
+            fields.extend(batch.schema().fields().iter().cloned());
+            columns.extend(batch.columns().iter().cloned());
+        }
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
+        Q::Storage::try_from_batch_at_precision(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+            RQPrecision::Full,
+        )
+    }
+
+    /// Read only selected rows of a plane; sorted indices are coalesced by the reader.
+    pub async fn read_plane(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
+        let projection = lance_file::versions::reader_projection_from_column_names(
+            self.reader.metadata().version(),
+            self.reader.schema(),
+            super::bq::layered::plane_columns(plane),
+        )?;
+        let schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+        let range = self.ivf.row_range(part_id);
+        if range.is_empty() || rows.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        let params = if let Some(rows) = rows {
+            let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+            for row in rows {
+                if row as usize >= range.len() {
+                    return Err(Error::invalid_input(
+                        "candidate offset exceeds partition length",
+                    ));
+                }
+                let start = range.start as u64 + u64::from(row);
+                if let Some(last) = ranges.last_mut()
+                    && last.end == start
+                {
+                    last.end += 1;
+                } else {
+                    ranges.push(start..start + 1);
+                }
+            }
+            ReadBatchParams::Ranges(ranges.into())
+        } else {
+            ReadBatchParams::Range(range)
+        };
+        let reader = match &io_stats {
+            Some(stats) => Cow::Owned(self.reader.with_io_stats(stats.recorder())),
+            None => Cow::Borrowed(&self.reader),
+        };
+        let batches = reader
+            .read_stream_projected(
+                params,
+                u32::MAX,
+                1,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        concat_batches(&schema, batches.iter()).map_err(Into::into)
     }
 
     /// Materialize a compact partition for the parallel prewarm path.

@@ -7972,7 +7972,7 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_flat_remap_and_trim() {
         let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, small_ivf());
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     // Regression: PQ storage used to remap its codes through the frag-reuse
@@ -7993,7 +7993,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -8004,7 +8004,7 @@ mod tests {
             small_ivf(),
             SQBuildParams::default(),
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -8015,7 +8015,7 @@ mod tests {
             small_ivf(),
             RQBuildParams::new(1),
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -8028,7 +8028,7 @@ mod tests {
             SQBuildParams::default(),
         );
         // Physical remap rebuilds the HNSW graph, so use a recall-tolerant overlap.
-        check_vector_remap_and_trim(params, 10, 7, None).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 7, None)).await;
     }
 
     #[tokio::test]
@@ -8049,7 +8049,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_vector_remap_and_trim(params, 10, 7, None).await;
+        Box::pin(check_vector_remap_and_trim(params, 10, 7, None)).await;
     }
 
     // Scalar index correctness across deferred compaction WITH materialized
