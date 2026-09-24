@@ -925,11 +925,21 @@ mod tests {
 
     /// Every backend sums each candidate's sub-vectors in the same order, so
     /// its values are bit-identical to the reference for any byte grouping,
-    /// SIMD block and tail.
+    /// SIMD block and tail. An 8-bit table is 16x larger per sub-vector than
+    /// a 4-bit one, so 8-bit cases stop at 34 sub-vectors to stay fast in
+    /// debug builds; any multi-byte case already exercises the VBMI kernel's
+    /// next-row prefetch.
     #[rstest]
+    #[case::bits4_subs2(4, 2)]
+    #[case::bits4_subs18(4, 18)]
+    #[case::bits4_subs34(4, 34)]
+    #[case::bits4_subs96(4, 96)]
+    #[case::bits8_subs2(8, 2)]
+    #[case::bits8_subs18(8, 18)]
+    #[case::bits8_subs34(8, 34)]
     fn test_pq_lookup_backends_bit_identical(
-        #[values(4, 8)] num_bits: u32,
-        #[values(2, 18, 34, 96)] num_sub_vectors: usize,
+        #[case] num_bits: u32,
+        #[case] num_sub_vectors: usize,
     ) {
         use rand::{Rng, SeedableRng, rngs::SmallRng};
 
