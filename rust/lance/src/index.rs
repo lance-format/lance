@@ -408,17 +408,33 @@ fn indexed_data_differs(
         || has_overlay_newer_than(now, before.manifest.version, indexed)
 }
 
+/// The dataset at `version`, reusing one already read. Absent once cleanup has
+/// removed that manifest.
+async fn snapshot_at(
+    dataset: &Dataset,
+    read: &mut HashMap<u64, Dataset>,
+    version: u64,
+) -> Option<Dataset> {
+    if let Some(at) = read.get(&version) {
+        return Some(at.clone());
+    }
+    let at = dataset.checkout_version(version).await.ok()?;
+    read.insert(version, at.clone());
+    Some(at)
+}
+
 /// Whether the data these segments indexed has moved on from the fragments the
 /// merge would have them cover.
 ///
-/// The segments describe the dataset at their own version. A compaction carries
-/// those rows into the fragments it produces, and coverage may follow only while
-/// nothing else rewrites the indexed fields on the way. That leaves one gap per
-/// step -- from the state the segments describe to the state the first
-/// compaction read, from each compaction's own output to what the next one read,
-/// and from the last output to now -- and each is closed by comparing the
-/// fragments across it. Where a manifest a comparison needs has been cleaned up,
-/// the answer is that they have.
+/// Each fragment being followed carries the version whose state its index
+/// entries describe: the segments' own version to begin with, and then the
+/// commit of whichever compaction last rewrote it. A compaction may carry those
+/// rows forward only if its inputs still match the state they are each recorded
+/// against, and the fragments left at the end must still match theirs. A commit
+/// that rewrites an indexed field puts it in a different file and an overlay
+/// adds one, so one comparison per fragment stands in for every way the data
+/// could have moved on. Where a manifest a comparison needs has been cleaned up,
+/// the answer is that it has.
 async fn indexed_data_moved_on(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
@@ -433,20 +449,24 @@ async fn indexed_data_moved_on(
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
+    // Ids only: reading every retained manifest to list them would cost more
+    // than the handful of snapshots the walk actually opens.
     let retained = dataset
-        .versions()
+        .version_refs()
         .await?
         .iter()
         .map(|version| version.version)
         .collect::<Vec<_>>();
-    let Ok(mut baseline) = dataset.checkout_version(oldest_segment).await else {
-        return Ok(true);
-    };
+
+    let mut read = HashMap::new();
+    let mut following = staged_coverage
+        .iter()
+        .map(|fragment| (fragment, oldest_segment))
+        .collect::<HashMap<_, _>>();
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
     versions.sort_by_key(|version| version.dataset_version);
 
-    let mut following = staged_coverage.clone();
     for version in versions {
         let ours = version
             .groups
@@ -455,52 +475,63 @@ async fn indexed_data_moved_on(
                 group
                     .old_frags
                     .iter()
-                    .any(|fragment| following.contains(fragment.id as u32))
+                    .any(|fragment| following.contains_key(&(fragment.id as u32)))
             })
             .collect::<Vec<_>>();
         if ours.is_empty() {
             continue;
         }
-
-        let Ok(read) = dataset.checkout_version(version.dataset_version).await else {
+        let Some(at_read) = snapshot_at(dataset, &mut read, version.dataset_version).await else {
             return Ok(true);
         };
+
         for group in &ours {
             for old in &group.old_frags {
                 let old = old.id as u32;
-                if following.contains(old) && indexed_data_differs(&baseline, &read, old, &indexed)
-                {
+                let Some(&recorded) = following.get(&old) else {
+                    continue;
+                };
+                let Some(against) = snapshot_at(dataset, &mut read, recorded).await else {
+                    return Ok(true);
+                };
+                if indexed_data_differs(&against, &at_read, old, &indexed) {
                     return Ok(true);
                 }
             }
         }
 
-        let mut produced = None;
+        // Only the groups this compaction rewrote advance; every other followed
+        // fragment stays recorded against the version it already was.
         for group in ours {
             for old in &group.old_frags {
-                following.remove(old.id as u32);
+                following.remove(&(old.id as u32));
             }
+            let Some(produced) = group.new_frags.first().map(|new| new.id as u32) else {
+                continue;
+            };
+            let Some(created) =
+                proven_creation_version(dataset, &retained, version.dataset_version, produced)
+                    .await?
+            else {
+                return Ok(true);
+            };
+            let created_at = created.manifest.version;
+            read.insert(created_at, created);
             for new in &group.new_frags {
-                following.insert(new.id as u32);
-                produced.get_or_insert(new.id as u32);
+                following.insert(new.id as u32, created_at);
             }
         }
-        // Everything this compaction wrote was written by the same commit, so one
-        // of its fragments dates the rest.
-        let Some(produced) = produced else {
-            continue;
-        };
-        let Some(created) =
-            proven_creation_version(dataset, &retained, version.dataset_version, produced).await?
-        else {
-            return Ok(true);
-        };
-        baseline = created;
     }
 
-    Ok(following
-        .iter()
-        .any(|fragment| indexed_data_differs(&baseline, dataset, fragment, &indexed)))
+    for (fragment, recorded) in following {
+        let Some(against) = snapshot_at(dataset, &mut read, recorded).await else {
+            return Ok(true);
+        };
+        if indexed_data_differs(&against, dataset, fragment, &indexed) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Resolve the field ids a segment's staleness check must consider: the subtree of

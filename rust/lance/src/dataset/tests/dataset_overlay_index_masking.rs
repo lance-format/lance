@@ -3034,3 +3034,50 @@ async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_u
          the manifest the compaction wrote has been cleaned up"
     );
 }
+
+/// Two groups compacted by separate commits, with an overlay landing on the one
+/// that goes second before either runs. Each followed fragment is recorded
+/// against its own version, so the first compaction advancing its own output
+/// does not vouch for inputs the second one had yet to read.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids.clone()).await;
+
+    // The overlay lands on the second group before either compaction runs.
+    let held_back = [fragment_ids[2], fragment_ids[3]];
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, held_back[0] as u64).await;
+
+    let pair = CompactionOptions {
+        target_rows_per_fragment: (RTREE_ROWS_PER_FRAGMENT * 2) as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            excluded_fragment_ids: held_back.to_vec(),
+            ..pair.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    compact_files(&mut dataset, pair, None).await.unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert!(
+        coverage.is_empty(),
+        "the merged index kept coverage over a group an overlay changed, because \
+         another group's compaction had advanced the state it was compared against"
+    );
+}
