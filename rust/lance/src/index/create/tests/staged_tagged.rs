@@ -19,9 +19,7 @@ use crate::index::frag_reuse_reader::tests as reader_tests;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_table::format::Fragment;
-use lance_table::transaction::{
-    FragReuseUpdate, FragmentReuseRewrite, Operation, RewriteGroup, Transaction,
-};
+use lance_table::transaction::{Operation, RewriteGroup, Transaction};
 use roaring::RoaringBitmap;
 
 /// Two fragments of four rows: `i` 0..8, a constant `text` and a payload
@@ -75,6 +73,11 @@ async fn commit_stable_partition(
     let (transition, destinations) =
         reader_tests::prepare_partition(&dataset, source_ids, dest_base_id).await;
     let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
     CommitBuilder::new(Arc::new(dataset))
         .execute(Transaction::new(
             read_version,
@@ -84,9 +87,7 @@ async fn commit_stable_partition(
                     new_fragments: destinations,
                 }],
                 rewritten_indices: vec![],
-                frag_reuse: Some(FragReuseUpdate::AppendTransitions(
-                    FragmentReuseRewrite::new(vec![transition]),
-                )),
+                frag_reuse_index,
             },
             None,
         ))
@@ -701,6 +702,268 @@ async fn staged_segments_rewritten_before_the_partition_are_validated_before_the
         values(&dataset, None, true).await,
         values(&dataset, None, false).await
     );
+}
+
+/// A committed vector index whose coverage an in-place rewrite of the
+/// vector column withdrew entirely: queries scan, and `optimize_indices`
+/// rebuilds the index from the live fragments (the withdrawn segment is
+/// dormant, opened through the maintenance entry for its parameters only),
+/// replacing it with a segment that claims the live fragments and answers
+/// through the ANN path exactly like the flat scan.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn withdrawn_vector_index_is_rebuilt_by_optimize() {
+    use lance_index::optimize::OptimizeOptions;
+
+    let dir = TempStrDir::default();
+    let mut dataset = vector_fixture(dir.as_str()).await;
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    let before = stored_segment(&dataset, "vec_idx").await;
+    assert_eq!(
+        before.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1])
+    );
+
+    // Row w = 6 gets a vector far from every other, rewritten in place: the
+    // whole transition is withdrawn and the segment is left empty.
+    let far = arrow_array::FixedSizeListArray::from_iter_primitive::<
+        arrow_array::types::Float32Type,
+        _,
+        _,
+    >(vec![Some(vec![Some(1000.0f32); 4])], 4);
+    rewrite_in_place(dir.as_str(), "vector", 6, Arc::new(far)).await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let withdrawn = stored_segment(&dataset, "vec_idx").await;
+    assert_eq!(withdrawn.uuid, before.uuid);
+    assert!(withdrawn.fragment_bitmap.as_ref().unwrap().is_empty());
+    assert!(
+        derived_coverage(&dataset, "vec_idx")
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let query = arrow_array::Float32Array::from(vec![1000.0f32; 4]);
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(!plan.contains("ANN"), "scanned while withdrawn: {plan}");
+    assert_eq!(found, vec![6]);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let rebuilt = stored_segment(&dataset, "vec_idx").await;
+    assert_ne!(rebuilt.uuid, withdrawn.uuid);
+    assert_eq!(
+        rebuilt.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11]),
+        "the new segment claims the live fragments"
+    );
+    assert!(
+        crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .all(|idx| idx.uuid != withdrawn.uuid),
+        "the withdrawn segment is replaced"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "vec_idx").await,
+        Some(RoaringBitmap::from_iter([10u32, 11]))
+    );
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, vec![6]);
+    let (_, flat) = nearest(&dataset, &query, 8, false).await;
+    let (_, indexed) = nearest(&dataset, &query, 8, true).await;
+    assert_eq!(indexed, flat);
+}
+
+/// Routine maintenance of the logical index the staged segments rebuild is
+/// no conflict for the replay. A distributed rebuild of `staged` (committed
+/// over F0 and F1) stages one segment per fragment; F1 is partitioned, a
+/// fragment is appended and `optimize_indices` adds a same-name delta for
+/// it in the window. The staged segments still merge and commit, replacing
+/// the old segment while the delta is retained, and the whole index answers.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_segments_survive_a_same_name_optimize_in_the_window() {
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use lance_index::optimize::OptimizeOptions;
+
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let params = ScalarIndexParams::for_builtin(IndexType::BTree.try_into().unwrap());
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("staged".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let old = stored_segment(&dataset, "staged").await;
+    let mut staged = Vec::new();
+    for fragment in [0u32, 1] {
+        staged.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("staged".to_string())
+                .fragments(vec![fragment])
+                .replace(true)
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[1], 10).await;
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col(
+            "text",
+            lance_datagen::array::fill_utf8("document".to_string()),
+        )
+        .col("w", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+    let appended = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .find(|id| *id > 11)
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let delta = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| idx.name == "staged" && idx.uuid != old.uuid)
+        .cloned()
+        .expect("the same-name delta the window added");
+    assert_eq!(
+        delta.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([appended])
+    );
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 10, 11]),
+        "the staged segments translate across the partition despite the same-name delta"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![merged])
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let remaining: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "staged")
+        .map(|idx| idx.uuid)
+        .collect();
+    assert!(
+        !remaining.contains(&old.uuid),
+        "the old segment is replaced"
+    );
+    assert!(remaining.contains(&delta.uuid), "the delta is retained");
+    let listed = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "staged")
+        .filter_map(|idx| idx.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+    assert_eq!(listed, RoaringBitmap::from_iter([0u32, 10, 11, appended]));
+    assert_queries_match_scans(&dataset, true).await;
+}
+
+/// A same-name CreateIndex in the window that changed what the index is (a
+/// replacement of another index type) is a real conflict: the staged
+/// segments are refused with the rebuild error.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_segments_refuse_an_incompatible_same_name_replacement() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let params = ScalarIndexParams::for_builtin(IndexType::BTree.try_into().unwrap());
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("staged".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let mut staged = Vec::new();
+    for fragment in [0u32, 1] {
+        staged.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("staged".to_string())
+                .fragments(vec![fragment])
+                .replace(true)
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[1], 10).await;
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Bitmap,
+            Some("staged".into()),
+            &ScalarIndexParams::for_builtin(IndexType::Bitmap.try_into().unwrap()),
+            true,
+        )
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let error = dataset
+        .merge_existing_index_segments(staged)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Rebuild"), "{error}");
 }
 
 /// The replay needs the whole history between the build and the snapshot.

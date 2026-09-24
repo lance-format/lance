@@ -3497,6 +3497,295 @@ async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
     assert_eq!(found, truth);
 }
 
+// The default optimize's steady-state rebalance of a translated vector
+// segment: the rebalanced file is read through the translating loader, so
+// its bitmap is the stored provenance (as a merge publishes), not stored ∩
+// live, which is empty for the retired sources and would turn every indexed
+// row of the partition's destinations into a scan.
+#[tokio::test]
+async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let mut ivf = lance_index::vector::ivf::IvfBuildParams::new(1);
+    ivf.target_partition_size = Some(1);
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        ivf,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query.as_primitive::<Float32Type>().clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        (0..4).map(|_| Some(vec![Some(1000.0f32); 4])),
+        4,
+    );
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        ("vector", Arc::new(vectors) as ArrayRef),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let derived = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "vector_idx")
+                .filter_map(|index| index.fragment_bitmap.clone())
+                .fold(RoaringBitmap::new(), |acc, b| acc | b)
+        }
+    };
+    let nearest = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 1).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            (plan, batch["i"].as_primitive::<Int32Type>().value(0))
+        }
+    };
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone()
+    );
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the rebalance keeps the translated coverage"
+    );
+    let (plan, found) = nearest(&dataset).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, 6);
+}
+
+// Inverted append then merge on a tagged table: the merged segment's old
+// data is the coverage the reader derives for the translated segment and it
+// keeps the stored provenance, so the full-text index still covers the
+// partition's destinations after both optimizations.
+#[tokio::test]
+async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hit"; 4])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let derived = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "text_idx")
+                .filter_map(|index| index.fragment_bitmap.clone())
+                .fold(RoaringBitmap::new(), |acc, b| acc | b)
+        }
+    };
+    let hits = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+    };
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone()
+    );
+    assert_eq!(hits(&dataset).await, 12);
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "text_idx")
+        .cloned()
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let provenance = stored[0].fragment_bitmap.clone().unwrap();
+    assert!(
+        provenance.contains(0) && provenance.contains(1),
+        "the merge keeps the provenance: {provenance:?}"
+    );
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the merge keeps the translated coverage"
+    );
+    assert_eq!(hits(&dataset).await, 12);
+}
+
+// Under a history this build cannot interpret the reader lists no user
+// segment, so every fragment looks unindexed; optimize must not rebuild the
+// table over and over (each result would be excluded again) but leave it
+// alone like trim, superseded pruning and remap do.
+#[tokio::test]
+async fn optimize_is_a_no_op_under_an_unsupported_history() {
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = fixture().await;
+    let (mut transition, destinations) = prepare(&dataset).await;
+    transition.mapping = None;
+    let mut raw = transition.encode_to_vec();
+    raw.extend(field(17, b"future mapping"));
+    install(&mut dataset, field(2, &raw), destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let version = dataset.manifest.version;
+    let before: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| index.uuid)
+        .collect();
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.name != "i_idx")
+    );
+    for _ in 0..2 {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version, "nothing committed");
+        let after: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect();
+        assert_eq!(after, before, "no segment written");
+    }
+}
+
 // The untested seam: a legacy-format vector file on a tagged table. Legacy
 // readers only take the v0 remapper handle, which is `None` on a tagged
 // history, so the tagged reader must exclude such a segment from coverage

@@ -67,6 +67,13 @@ pub struct TransactionRebase<'a> {
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
     reuse: RewriteReuseState,
+    /// Set by the staged-segment replay (`replay_staged_segments`): the
+    /// CreateIndex being carried is not about to be committed, so a
+    /// same-name CreateIndex in the window (routine `optimize_indices` on the
+    /// logical index the segments extend) is no conflict; the overlap rules
+    /// settle it at commit time. A same-name CreateIndex that changed what
+    /// the index is (its fields or type) still conflicts.
+    staged_replay: bool,
 }
 
 /// A rewrite's fragment reuse intent as the rebase reads it: the entry at
@@ -88,6 +95,18 @@ struct RewriteReuseState {
     /// a tagged entry. `None` for a v0 entry, which `finish_rewrite` converts
     /// only when the table turned out tagged at commit.
     added_transitions: Option<Vec<Transition>>,
+}
+
+/// Whether two segments describe the same logical index: the same keyed and
+/// covering fields and the same index type.
+fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
+    let type_url = |index: &IndexMetadata| {
+        index
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone())
+    };
+    a.fields == b.fields && a.covering_fields == b.covering_fields && type_url(a) == type_url(b)
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -179,6 +198,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments,
                     read_schema,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Delete {
@@ -214,6 +234,7 @@ impl<'a> TransactionRebase<'a> {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
+                        staged_replay: false,
                     });
                 }
 
@@ -233,6 +254,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -258,6 +280,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse,
+                    staged_replay: false,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -279,6 +302,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -300,6 +324,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -320,6 +345,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
         }
@@ -397,6 +423,12 @@ impl<'a> TransactionRebase<'a> {
     /// where `frag_reuse` is never serialized, so the entry is the only
     /// durable evidence that a rewrite appended a transition (see the Rewrite
     /// arm of `check_create_index_txn`). A no-op for every other operation.
+    /// Mark this rebase as the staged-segment replay; see `staged_replay`.
+    pub(crate) fn for_staged_replay(mut self) -> Self {
+        self.staged_replay = true;
+        self
+    }
+
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
@@ -928,10 +960,22 @@ impl<'a> TransactionRebase<'a> {
                             })
                         });
 
+                    // In the staged replay a same-name CreateIndex is routine
+                    // maintenance of the index the segments extend, no
+                    // conflict, unless it changed what the index is.
+                    let name_conflict = if self.staged_replay {
+                        new_indices.iter().any(|new_index| {
+                            created_indices.iter().any(|created_index| {
+                                created_index.name == new_index.name
+                                    && !same_logical_index(new_index, created_index)
+                            })
+                        })
+                    } else {
+                        has_regular_name_conflict || has_append_drop_conflict
+                    };
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
-                        || has_regular_name_conflict
-                        || has_append_drop_conflict
+                        || name_conflict
                         || has_replaced_identity_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -4243,6 +4287,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -4453,6 +4498,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4518,6 +4564,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4665,6 +4712,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4713,6 +4761,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -4734,6 +4783,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4820,6 +4870,7 @@ mod tests {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
+                        staged_replay: false,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4876,6 +4927,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -5013,6 +5065,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let update = Transaction::new(
             1,
@@ -5095,6 +5148,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5122,6 +5176,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5172,6 +5227,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let same_name = Transaction::new(
@@ -5233,6 +5289,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5297,6 +5354,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5344,6 +5402,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5392,6 +5451,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5467,6 +5527,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6154,6 +6215,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6223,6 +6285,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6267,6 +6330,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6312,6 +6376,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6357,6 +6422,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6413,6 +6479,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6444,6 +6511,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -6496,6 +6564,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

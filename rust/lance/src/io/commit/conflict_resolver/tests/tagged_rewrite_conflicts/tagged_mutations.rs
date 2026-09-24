@@ -1839,12 +1839,56 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         [0, 1, 2, 3, 4, 5, 6, 7].map(|i| (i, if i == 2 { 222 } else { i }))
     );
 
-    // Optimizing rebuilds the coverage over the live fragments.
+    // Optimizing rebuilds the coverage over the live fragments: the withdrawn
+    // segment (kept as the record of what to build) is replaced by a new one
+    // that claims the live fragments and holds their rows.
     dataset
         .optimize_indices(&OptimizeOptions::default())
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
+    let rebuilt: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "v_idx")
+        .cloned()
+        .collect();
+    assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
+    assert_ne!(
+        rebuilt[0].uuid, v_idx.uuid,
+        "the withdrawn segment is replaced"
+    );
+    assert_eq!(
+        rebuilt[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11])
+    );
+    {
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        let index = dataset
+            .open_scalar_index("v", &rebuilt[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(rows) = index
+            .search(
+                &SargableQuery::Equals(datafusion::scalar::ScalarValue::Int32(Some(222))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected an exact result");
+        };
+        let fragments: Vec<u32> = rows
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|addr| lance_core::utils::address::RowAddress::from(u64::from(addr)).fragment_id())
+            .collect();
+        assert_eq!(fragments, vec![10], "the new segment holds the live row");
+    }
     let derived = dataset.load_indices().await.unwrap();
     assert_eq!(
         derived
@@ -1895,9 +1939,9 @@ async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired
     let (transition, destinations) = prepare_partition(&dataset, &[10, 11], 20).await;
     let version = dataset.manifest.version;
     let mut dataset = commit_sp(
-        dataset,
+        &dataset,
         version,
-        tagged_rewrite(old_fragments, destinations, vec![transition]),
+        tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
     )
     .await
     .unwrap();
@@ -2002,7 +2046,7 @@ async fn tagged_table_commit_of_a_staged_index_over_a_bare_rewritten_source_says
                     new_fragments: fragments,
                 }],
                 rewritten_indices: vec![],
-                frag_reuse: None,
+                frag_reuse_index: None,
             },
             None,
         ))
