@@ -601,7 +601,13 @@ pub async fn open_scalar_index(
             }
 
             let index = plugin
-                .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                .load_index(
+                    index_store,
+                    &index_details,
+                    u32::try_from(index.index_version).unwrap_or(0),
+                    frag_reuse_index,
+                    &index_cache,
+                )
                 .await?;
 
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());

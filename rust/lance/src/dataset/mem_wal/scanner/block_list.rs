@@ -410,7 +410,7 @@ async fn open_pk_index(
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
     let index = plugin
-        .load_index(store.clone(), &details, None, &index_cache)
+        .load_index(store.clone(), &details, 0, None, &index_cache)
         .await?;
     plugin
         .put_in_cache(store, &index_cache, index.clone())
