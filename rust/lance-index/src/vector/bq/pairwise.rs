@@ -526,7 +526,8 @@ mod x86 {
 
     /// Starts of the `N` rows of width `dim` in a group of `rows.len() / dim`
     /// candidates, repeating the last row to fill the group; lanes past the
-    /// real candidates are never stored.
+    /// real candidates are never stored. Each start has at least `dim`
+    /// readable elements, as the slicing is bounds-checked.
     #[inline]
     fn group_rows<T, const N: usize>(rows: &[T], dim: usize) -> [*const T; N] {
         let last = rows.len() / dim - 1;
@@ -535,6 +536,10 @@ mod x86 {
 
     /// Stores lanes `mask` of `(4r + coef·Σb + offset) / 4`, evaluated in
     /// wrapping i32 arithmetic: exact because the true value fits in i32.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F, and `mask` is a [`group_mask`] of at most
+    /// `sums.len()` and `out.len()` lanes.
     #[inline]
     #[target_feature(enable = "avx512f")]
     unsafe fn store_centered(
@@ -545,11 +550,25 @@ mod x86 {
         mask: __mmask16,
         out: &mut [f32],
     ) {
-        let low = _mm512_maskz_loadu_epi64(mask as __mmask8, sums.as_ptr().cast());
-        let high = _mm512_maskz_loadu_epi64(
-            (mask >> 8) as __mmask8,
-            sums.as_ptr().wrapping_add(8).cast(),
+        let lanes = (u16::BITS - mask.leading_zeros()) as usize;
+        debug_assert!(
+            lanes <= sums.len() && lanes <= out.len(),
+            "RQ store mask={mask:#06x} covers {lanes} lanes, sums.len()={}, out.len()={}",
+            sums.len(),
+            out.len()
         );
+        // SAFETY: masked loads read only the lanes set in `mask`, which are in
+        // bounds of `sums`; the high half reads nothing unless `mask` sets a
+        // lane past 8.
+        let (low, high) = unsafe {
+            (
+                _mm512_maskz_loadu_epi64(mask as __mmask8, sums.as_ptr().cast()),
+                _mm512_maskz_loadu_epi64(
+                    (mask >> 8) as __mmask8,
+                    sums.as_ptr().wrapping_add(8).cast(),
+                ),
+            )
+        };
         let sums = _mm512_inserti64x4::<1>(
             _mm512_castsi256_si512(_mm512_cvtepi64_epi32(low)),
             _mm512_cvtepi64_epi32(high),
@@ -562,7 +581,9 @@ mod x86 {
             _mm512_set1_epi32(offset as i32),
         );
         let values = _mm512_mul_ps(_mm512_cvtepi32_ps(centered), _mm512_set1_ps(0.25));
-        _mm512_mask_storeu_ps(out.as_mut_ptr(), mask, values);
+        // SAFETY: the masked store writes only the lanes set in `mask`, which
+        // are in bounds of `out`.
+        unsafe { _mm512_mask_storeu_ps(out.as_mut_ptr(), mask, values) };
     }
 
     /// Accumulators for a group of `m` candidates. Short tails use a narrower
@@ -580,6 +601,9 @@ mod x86 {
     /// `Σ ōa·ōb` for u8 codes. VPDPBUSD takes the candidate as the unsigned
     /// operand and the anchor biased to `a − 128` as the signed one, so
     /// `r = Σ b·(a − 128)` and `Σab = r + 128·Σb`.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub(super) unsafe fn u8_dots(
         anchor: &[u8],
@@ -591,7 +615,12 @@ mod x86 {
     ) {
         let dim = anchor.len();
         let n = out.len();
-        assert!(candidates.len() >= n * dim && sums.len() >= n);
+        assert!(
+            dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
+            "RQ u8 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
+            candidates.len(),
+            sums.len()
+        );
         // 4Σab − 2·bias·(Σa + Σb) + dim·bias² = 4r + coef·Σb + offset.
         let coef = 512 - 2 * bias;
         let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
@@ -599,20 +628,28 @@ mod x86 {
         while first < n {
             let m = (n - first).min(GROUP);
             let rows = &candidates[first * dim..(first + m) * dim];
-            let acc = group_by_width!(m, u8_group(anchor, rows));
-            let mask = group_mask(m);
-            store_centered(
-                transpose_sum(&acc),
-                coef,
-                offset,
-                &sums[first..],
-                mask,
-                &mut out[first..],
-            );
+            // SAFETY: the caller guarantees this function's CPU features.
+            let acc = unsafe { group_by_width!(m, u8_group(anchor, rows)) };
+            // SAFETY: as above, and `sums` and `out` hold at least
+            // `n - first >= m` values from `first`.
+            unsafe {
+                store_centered(
+                    transpose_sum(&acc),
+                    coef,
+                    offset,
+                    &sums[first..],
+                    group_mask(m),
+                    &mut out[first..],
+                )
+            };
             first += m;
         }
     }
 
+    /// Accumulators of `Σ b·(a − 128)` per candidate row of a group.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     unsafe fn u8_group<const N: usize>(anchor: &[u8], rows: &[u8]) -> [__m512i; GROUP] {
@@ -624,19 +661,26 @@ mod x86 {
         let mut acc = [_mm512_setzero_si512(); GROUP];
         for step in 0..steps {
             let at = step * 64;
-            let a = _mm512_xor_si512(_mm512_loadu_si512(x.add(at).cast()), flip);
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_loadu_si512(row.add(at).cast());
-                *sum = _mm512_dpbusd_epi32(*sum, b, a);
+            // SAFETY: `at + 64 <= dim`, and the anchor and every group row
+            // hold `dim` bytes.
+            unsafe {
+                let a = _mm512_xor_si512(_mm512_loadu_si512(x.add(at).cast()), flip);
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_loadu_si512(row.add(at).cast());
+                    *sum = _mm512_dpbusd_epi32(*sum, b, a);
+                }
             }
         }
         let tail = (1u64 << (dim % 64)) - 1;
         if tail != 0 {
             let at = steps * 64;
-            let a = _mm512_xor_si512(_mm512_maskz_loadu_epi8(tail, x.add(at).cast()), flip);
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_maskz_loadu_epi8(tail, row.add(at).cast());
-                *sum = _mm512_dpbusd_epi32(*sum, b, a);
+            // SAFETY: masked loads touch only the `dim - at` in-bounds bytes.
+            unsafe {
+                let a = _mm512_xor_si512(_mm512_maskz_loadu_epi8(tail, x.add(at).cast()), flip);
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_maskz_loadu_epi8(tail, row.add(at).cast());
+                    *sum = _mm512_dpbusd_epi32(*sum, b, a);
+                }
             }
         }
         acc
@@ -644,6 +688,9 @@ mod x86 {
 
     /// `Σ ōa·ōb` for u16 codes below 2^15, which VPDPWSSD multiplies exactly
     /// as signed words.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     pub(super) unsafe fn u16_dots(
         anchor: &[u16],
@@ -655,27 +702,40 @@ mod x86 {
     ) {
         let dim = anchor.len();
         let n = out.len();
-        assert!(candidates.len() >= n * dim && sums.len() >= n);
+        assert!(
+            dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
+            "RQ u16 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
+            candidates.len(),
+            sums.len()
+        );
         let coef = -2 * bias;
         let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
         let mut first = 0;
         while first < n {
             let m = (n - first).min(GROUP);
             let rows = &candidates[first * dim..(first + m) * dim];
-            let acc = group_by_width!(m, u16_group(anchor, rows));
-            let mask = group_mask(m);
-            store_centered(
-                transpose_sum(&acc),
-                coef,
-                offset,
-                &sums[first..],
-                mask,
-                &mut out[first..],
-            );
+            // SAFETY: the caller guarantees this function's CPU features.
+            let acc = unsafe { group_by_width!(m, u16_group(anchor, rows)) };
+            // SAFETY: as above, and `sums` and `out` hold at least
+            // `n - first >= m` values from `first`.
+            unsafe {
+                store_centered(
+                    transpose_sum(&acc),
+                    coef,
+                    offset,
+                    &sums[first..],
+                    group_mask(m),
+                    &mut out[first..],
+                )
+            };
             first += m;
         }
     }
 
+    /// Accumulators of `Σ a·b` per candidate row of a group.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     unsafe fn u16_group<const N: usize>(anchor: &[u16], rows: &[u16]) -> [__m512i; GROUP] {
@@ -686,25 +746,35 @@ mod x86 {
         let mut acc = [_mm512_setzero_si512(); GROUP];
         for step in 0..steps {
             let at = step * 32;
-            let a = _mm512_loadu_si512(x.add(at).cast());
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_loadu_si512(row.add(at).cast());
-                *sum = _mm512_dpwssd_epi32(*sum, a, b);
+            // SAFETY: `at + 32 <= dim`, and the anchor and every group row
+            // hold `dim` words.
+            unsafe {
+                let a = _mm512_loadu_si512(x.add(at).cast());
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_loadu_si512(row.add(at).cast());
+                    *sum = _mm512_dpwssd_epi32(*sum, a, b);
+                }
             }
         }
         let tail = ((1u64 << (dim % 32)) - 1) as __mmask32;
         if tail != 0 {
             let at = steps * 32;
-            let a = _mm512_maskz_loadu_epi16(tail, x.add(at).cast());
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_maskz_loadu_epi16(tail, row.add(at).cast());
-                *sum = _mm512_dpwssd_epi32(*sum, a, b);
+            // SAFETY: masked loads touch only the `dim - at` in-bounds words.
+            unsafe {
+                let a = _mm512_maskz_loadu_epi16(tail, x.add(at).cast());
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_maskz_loadu_epi16(tail, row.add(at).cast());
+                    *sum = _mm512_dpwssd_epi32(*sum, a, b);
+                }
             }
         }
         acc
     }
 
     /// `(dim − 2·popcount(a ⊕ b)) / 4` for packed sign words.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F and AVX-512 VPOPCNTDQ.
     #[target_feature(enable = "avx512f,avx512vpopcntdq")]
     pub(super) unsafe fn sign_dots(
         anchor: &[u64],
@@ -714,23 +784,34 @@ mod x86 {
     ) {
         let words = anchor.len();
         let n = out.len();
-        assert!(candidates.len() >= n * words);
+        assert!(
+            words > 0 && candidates.len() >= n * words,
+            "RQ sign kernel needs n={n} rows of {words} > 0 words (dim={dim}), got candidates.len()={}",
+            candidates.len()
+        );
         let dim = _mm512_set1_ps(dim as f32);
         let mut first = 0;
         while first < n {
             let m = (n - first).min(GROUP);
             let rows = &candidates[first * words..(first + m) * words];
-            let acc = group_by_width!(m, sign_group(anchor, rows));
+            // SAFETY: the caller guarantees this function's CPU features.
+            let acc = unsafe { group_by_width!(m, sign_group(anchor, rows)) };
             let differences = _mm512_cvtepi32_ps(transpose_sum(&acc));
             let values = _mm512_mul_ps(
                 _mm512_sub_ps(dim, _mm512_mul_ps(_mm512_set1_ps(2.0), differences)),
                 _mm512_set1_ps(0.25),
             );
-            _mm512_mask_storeu_ps(out[first..].as_mut_ptr(), group_mask(m), values);
+            // SAFETY: the masked store writes only the first `m` lanes, and
+            // `out` holds `n - first >= m` floats from `first`.
+            unsafe { _mm512_mask_storeu_ps(out[first..].as_mut_ptr(), group_mask(m), values) };
             first += m;
         }
     }
 
+    /// Accumulators of `popcount(a ⊕ b)` per candidate row of a group.
+    ///
+    /// # Safety
+    /// The CPU supports AVX-512F and AVX-512 VPOPCNTDQ.
     #[inline]
     #[target_feature(enable = "avx512f,avx512vpopcntdq")]
     unsafe fn sign_group<const N: usize>(anchor: &[u64], rows: &[u64]) -> [__m512i; GROUP] {
@@ -741,19 +822,26 @@ mod x86 {
         let mut acc = [_mm512_setzero_si512(); GROUP];
         for step in 0..steps {
             let at = step * 8;
-            let a = _mm512_loadu_si512(x.add(at).cast());
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_loadu_si512(row.add(at).cast());
-                *sum = _mm512_add_epi32(*sum, _mm512_popcnt_epi32(_mm512_xor_si512(a, b)));
+            // SAFETY: `at + 8 <= words`, and the anchor and every group row
+            // hold `words` words.
+            unsafe {
+                let a = _mm512_loadu_si512(x.add(at).cast());
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_loadu_si512(row.add(at).cast());
+                    *sum = _mm512_add_epi32(*sum, _mm512_popcnt_epi32(_mm512_xor_si512(a, b)));
+                }
             }
         }
         let tail = ((1u32 << (words % 8)) - 1) as __mmask8;
         if tail != 0 {
             let at = steps * 8;
-            let a = _mm512_maskz_loadu_epi64(tail, x.add(at).cast());
-            for (sum, row) in acc.iter_mut().zip(&rows) {
-                let b = _mm512_maskz_loadu_epi64(tail, row.add(at).cast());
-                *sum = _mm512_add_epi32(*sum, _mm512_popcnt_epi32(_mm512_xor_si512(a, b)));
+            // SAFETY: masked loads touch only the `words - at` in-bounds words.
+            unsafe {
+                let a = _mm512_maskz_loadu_epi64(tail, x.add(at).cast());
+                for (sum, row) in acc.iter_mut().zip(&rows) {
+                    let b = _mm512_maskz_loadu_epi64(tail, row.add(at).cast());
+                    *sum = _mm512_add_epi32(*sum, _mm512_popcnt_epi32(_mm512_xor_si512(a, b)));
+                }
             }
         }
         acc
