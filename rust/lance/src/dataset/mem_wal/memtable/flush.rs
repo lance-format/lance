@@ -1723,8 +1723,16 @@ mod tests {
         let plugin = registry.get_plugin_by_name("BTree").unwrap();
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
+        // The sidecar is always freshly built by `to_training_batches`, never a
+        // legacy segment, so it's always at the current (row-address-domain) version.
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -1820,8 +1828,16 @@ mod tests {
         let plugin = registry.get_plugin_by_name("BTree").unwrap();
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
+        // The sidecar is always freshly built by `to_training_batches`, never a
+        // legacy segment, so it's always at the current (row-address-domain) version.
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 

@@ -505,23 +505,32 @@ pub struct UpdateCriteria {
 
 /// Filter used when merging existing scalar-index rows during update.
 ///
-/// The caller must pick a filter mode that matches the row-id semantics of the
-/// dataset:
-/// - address-style row IDs: fragment filtering is valid
-/// - stable row IDs: use exact row-id membership instead
+/// The caller must pick a filter mode that matches the row identifiers the
+/// consuming index actually stores:
+/// - address-style identifiers (row-id-domain index without stable row ids,
+///   *or* an address-domain index in either row-id scheme): fragment
+///   filtering is valid, since deleting a fragment deletes every address in it
+/// - stable row IDs stored directly (row-id-domain index with stable row
+///   ids): use exact row-id membership instead, since row ids are opaque and
+///   should not be interpreted as encoded row addresses
+/// - physical addresses stored by an address-domain index on a stable-row-id
+///   dataset: also use exact membership, over the live addresses (not row
+///   ids) -- a same-fragment update can otherwise leave some of a fragment's
+///   addresses superseded while the fragment itself stays "effective", which
+///   fragment-granularity filtering cannot see
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
     /// Keeps track of which fragments are still valid and which are no longer valid.
     ///
-    /// This is valid for address-style row IDs.
+    /// Valid only when every kept fragment's rows are either all still live or
+    /// all superseded together -- true for address-style identifiers, false
+    /// for a fragment a same-fragment update has partially superseded.
     Fragments {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
-    /// Keep old rows whose row IDs are in this exact allow-list.
-    ///
-    /// This is required for stable row IDs, where row IDs are opaque and
-    /// should not be interpreted as encoded row addresses.
+    /// Keep old rows whose identifier (a stable row id, or a physical address
+    /// for an address-domain index) is in this exact allow-list.
     RowIds(RowAddrTreeMap),
 }
 

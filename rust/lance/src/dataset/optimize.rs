@@ -6464,7 +6464,7 @@ mod tests {
     /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
     /// dataset: the FRI is applied to every index on load, and a stable row id
     /// is numerically indistinguishable from an address into fragment 0, so it
-    /// would silently rewrite the btree's valid row ids.
+    /// would silently rewrite the bitmap index's valid row ids.
     ///
     /// Compaction refuses to create that pair, at the plan boundary and again at
     /// the commit boundary.
@@ -6474,9 +6474,9 @@ mod tests {
         dataset
             .create_index(
                 &["id"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 false,
             )
             .await
@@ -6531,9 +6531,9 @@ mod tests {
         let err = dataset
             .create_index(
                 &["id"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 false,
             )
             .await
@@ -6542,7 +6542,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("fragment-reuse index"), "{msg}");
 
-        // An address-domain index is still allowed: the FRI repairs it.
+        // Address-domain indices are still allowed: the FRI repairs them. BTree
+        // migrated to row addresses, so it is now allowed here too.
         dataset
             .create_index(
                 &["id"],
@@ -6553,17 +6554,28 @@ mod tests {
             )
             .await
             .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_btree".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
         assert_zonemap_answers_match_scan(&dataset).await;
+        assert_id_idx_answers_every_row(&dataset, "id_btree").await;
     }
 
     /// Index creation and a deferred compaction race, and each one's guard looks
     /// at a snapshot taken before the other committed.
     ///
     /// The compaction plans and rewrites while no row-id-domain index exists, so
-    /// its plan-time guard passes. A btree is then created and commits: no FRI
-    /// exists yet, so its guard passes too. The compaction finally commits from
-    /// the handle it planned on, which still cannot see the btree, and the
-    /// rewrite rebases on top of the `CreateIndex`.
+    /// its plan-time guard passes. A bitmap index is then created and commits: no
+    /// FRI exists yet, so its guard passes too. The compaction finally commits
+    /// from the handle it planned on, which still cannot see the bitmap index,
+    /// and the rewrite rebases on top of the `CreateIndex`.
     ///
     /// The result is the combination both guards exist to prevent: stable row
     /// ids, an FRI, and a row-id-domain index whose row ids the FRI will rewrite
@@ -6594,9 +6606,9 @@ mod tests {
         concurrent
             .create_index(
                 &["id"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 false,
             )
             .await
@@ -6635,7 +6647,7 @@ mod tests {
             "committed the invalid combination: stable row ids + fragment reuse index + \
              row-id-domain index(es) {row_id_indices:?}"
         );
-        assert_btree_answers_every_row(&after).await;
+        assert_id_idx_answers_every_row(&after, "id_idx").await;
     }
 
     /// The mirror ordering: the rewrite commits its FRI first, and the index
@@ -6760,11 +6772,11 @@ mod tests {
         );
     }
 
-    /// Every row must be reachable through the btree, whose row ids no FRI may
-    /// have rewritten.
-    async fn assert_btree_answers_every_row(dataset: &Dataset) {
+    /// Every row must be reachable through the named scalar index, whose row
+    /// ids no FRI may have rewritten.
+    async fn assert_id_idx_answers_every_row(dataset: &Dataset, index_name: &str) {
         if !dataset
-            .load_indices_by_name("id_idx")
+            .load_indices_by_name(index_name)
             .await
             .unwrap()
             .is_empty()

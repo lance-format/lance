@@ -1334,7 +1334,7 @@ mod tests {
         (store, tmpdir)
     }
 
-    fn json_update_batch(json_docs: &[&str], row_ids: Vec<u64>) -> RecordBatch {
+    fn json_update_batch(json_docs: &[&str], row_addrs: Vec<u64>) -> RecordBatch {
         use arrow_array::{LargeBinaryArray, UInt64Array};
 
         let jsonb = json_docs
@@ -1343,7 +1343,7 @@ mod tests {
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -1351,16 +1351,16 @@ mod tests {
                 Arc::new(LargeBinaryArray::from_iter_values(
                     jsonb.iter().map(Vec::as_slice),
                 )),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap()
     }
 
-    fn json_update_stream(json_docs: &[&str], row_ids: Vec<u64>) -> SendableRecordBatchStream {
+    fn json_update_stream(json_docs: &[&str], row_addrs: Vec<u64>) -> SendableRecordBatchStream {
         use futures::stream;
 
-        let batch = json_update_batch(json_docs, row_ids);
+        let batch = json_update_batch(json_docs, row_addrs);
         let schema = batch.schema();
         Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1651,7 +1651,9 @@ mod tests {
     #[case::equals_exact_float(SargableQuery::Equals(ScalarValue::Float64(Some(10.5))), vec![0])]
     #[case::range_covers_all(
         SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Float64(Some(100.0)))),
-        vec![0, 1, 2]
+        // Row 2's address is fragment 1, offset 0 (`RowAddress::new_from_parts(1, 0)`),
+        // not the row index 2: `needs_row_addrs` test data is address-domain.
+        vec![0, 1, 1u64 << 32]
     )]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
@@ -1745,13 +1747,16 @@ mod tests {
             SearchResult::exact(RowAddrTreeMap::from_iter([1u64])),
             "IsNull"
         );
+        // Row 3's address is fragment 1, offset 1 (`RowAddress::new_from_parts(1, 1)`),
+        // not the row index 3: `needs_row_addrs` test data is address-domain.
+        let row3_addr = (1u64 << 32) | 1;
         assert_eq!(
             search(SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Float64(Some(0.0))),
                 Bound::Unbounded,
             ))
             .await,
-            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 3]))
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, row3_addr]))
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "> 0"
         );
@@ -1761,13 +1766,14 @@ mod tests {
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "= 40.1"
         );
+        let row2_addr = 1u64 << 32;
         assert_eq!(
             search(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Float64(Some(100.0))),
             ))
             .await,
-            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 2, 3]))
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, row2_addr, row3_addr]))
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "< 100 (null is neither < 100 nor >= 100)"
         );

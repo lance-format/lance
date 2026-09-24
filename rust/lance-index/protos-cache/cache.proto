@@ -112,6 +112,11 @@ message BTreeIndexHeader {
    */
   bool has_ranges_to_files = 2;
   repeated RangeToFile ranges_to_files = 3;
+  /* Whether the `ids` column stores physical row addresses rather than row
+   * ids directly. Absent (default false) on a cache entry rebuilt from a
+   * segment persisted before address-domain support.
+   */
+  bool results_are_row_addresses = 4;
 }
 
 /* One entry of a `BTreeIndexState` page-range -> file mapping. The range is

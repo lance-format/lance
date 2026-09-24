@@ -151,9 +151,17 @@ impl IndexMetadata {
                 .is_some_and(|(_, details_type_name)| {
                     details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
                 });
+            // A BTree segment stores row addresses only from format version 1
+            // onward (`lance_index::scalar::btree::BTREE_ROW_ADDR_DOMAIN_VERSION`,
+            // kept in sync with this literal). A segment persisted before that
+            // by an older Lance version stores row ids directly and must not be
+            // reinterpreted as addresses.
+            let is_btree_addr_domain =
+                details.type_url.ends_with("BTreeIndexDetails") && self.index_version >= 1;
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
+                || is_btree_addr_domain
         })
     }
 
@@ -652,15 +660,37 @@ mod tests {
     #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
     #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
     #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
+    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
     fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
             value: Vec::new(),
         }));
+        metadata.index_version = 0;
 
         assert_eq!(metadata.results_are_row_addrs(), expected);
+    }
+
+    #[test]
+    fn test_results_are_row_addrs_btree_is_version_gated() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+
+        metadata.index_version = 0;
+        assert!(
+            !metadata.results_are_row_addrs(),
+            "a legacy BTree segment stores row ids directly"
+        );
+
+        metadata.index_version = 1;
+        assert!(
+            metadata.results_are_row_addrs(),
+            "a BTree segment built with address-domain support stores row addresses"
+        );
     }
 
     #[rstest]
