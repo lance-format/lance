@@ -410,7 +410,6 @@ struct SessionContextCacheKey {
     mem_pool_size: u64,
     max_temp_directory_size: u64,
     target_partition: Option<usize>,
-    use_spilling: bool,
 }
 
 impl SessionContextCacheKey {
@@ -419,7 +418,6 @@ impl SessionContextCacheKey {
             mem_pool_size: options.mem_pool_size(),
             max_temp_directory_size: options.max_temp_directory_size(),
             target_partition: options.target_partition,
-            use_spilling: options.use_spilling(),
         }
     }
 }
@@ -446,7 +444,13 @@ fn get_max_cache_size() -> usize {
     })
 }
 
+/// Reuses unbounded sessions, while giving each spilling caller a fresh bounded
+/// memory pool so concurrent sorts cannot consume each other's headroom.
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    if options.use_spilling() {
+        return new_session_context(options);
+    }
+
     let key = SessionContextCacheKey::from_options(options);
     let mut cache = get_session_cache()
         .lock()
@@ -1274,9 +1278,9 @@ mod tests {
             assert_eq!(cache_guard.len(), 1);
         }
 
-        // Different options should create new entry
+        // Different non-spilling options should create a new entry.
         let opts2 = LanceExecutionOptions {
-            use_spilling: true,
+            target_partition: Some(1),
             ..Default::default()
         };
         let _ctx2 = get_session_context(&opts2);
@@ -1284,6 +1288,30 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_spilling_executions_have_independent_memory_pools() {
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION),
+            target_partition: Some(1),
+            ..Default::default()
+        };
+        let contexts: Vec<_> = (0..3).map(|_| get_session_context(&options)).collect();
+        let mut reservations = Vec::with_capacity(contexts.len());
+
+        // Each reservation fits its own pool, but any two exceed a shared pool.
+        for context in &contexts {
+            let task_context = context.task_ctx();
+            let pool = task_context.memory_pool();
+            let reservation = MemoryConsumer::new("ExternalSorterMerge[0]").register(pool);
+            reservation.try_grow(100 * 1024 * 1024).unwrap();
+            assert_eq!(pool.reserved(), 100 * 1024 * 1024);
+            reservations.push(reservation);
+        }
+
+        assert_eq!(reservations.len(), 3);
     }
 
     #[test]
