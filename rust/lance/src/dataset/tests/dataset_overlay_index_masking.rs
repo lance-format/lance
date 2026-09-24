@@ -2411,6 +2411,84 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     );
 }
 
+/// A BTree index staged over `age` and then compacted away, ready for whatever
+/// each test does to the fragment the compaction produced. The committed index
+/// sits on `id` so the compaction has one to defer, leaving `age` answered only
+/// by the merged index under test.
+async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::IndexMetadata>, u64)
+{
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = dataset.get_fragments()[0].id() as u64;
+    (dataset, staged, rewritten)
+}
+
+/// Rewrite `column` of `fragment` in place, which lands it in a different file.
+async fn replace_column(
+    dataset: Dataset,
+    fragment: u64,
+    column: &str,
+    values: ArrayRef,
+) -> Dataset {
+    let schema = dataset.schema().project(&[column]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::from(&schema)), vec![values]).unwrap();
+    let replacement = dataset
+        .get_fragment(fragment as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
 /// Every fragment below holds this many rows, so a compaction targeting a
 /// multiple of it rewrites that many fragments as one group.
 #[cfg(feature = "geo")]
@@ -2618,121 +2696,7 @@ async fn test_rtree_merge_keeps_coverage_when_a_materialized_overlay_is_on_anoth
 /// it into and let those rows be scanned.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
-    let mut dataset = create_base_dataset_with(false).await;
-    // On `id`, not `age`: the compaction below needs an index to defer so it
-    // writes a reuse mapping, and this leaves `age` answered only by the merged
-    // index under test.
-    dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 2);
-
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect();
-    let staged = crate::utils::test::stage_index_segments(
-        &mut dataset,
-        "age",
-        IndexType::BTree,
-        &ScalarIndexParams::default(),
-        "age_staged",
-        fragment_ids,
-    )
-    .await;
-
-    let mut dataset = commit_overlay(
-        dataset,
-        "age_overlay",
-        0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
-        vec![i32_array([Some(999)])],
-    )
-    .await;
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 12,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        dataset.get_fragments()[0].metadata().overlays.is_empty(),
-        "the compaction materializes the overlay, leaving none on the fragment"
-    );
-
-    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-    dataset
-        .commit_existing_index_segments("age_staged", "age", vec![merged])
-        .await
-        .unwrap();
-
-    assert_eq!(
-        ids_matching(&dataset, "age = 999").await,
-        vec![0],
-        "the row the overlay set to 999 is missing: the merged index claimed the \
-         fragment the compaction materialized that overlay into, while holding the \
-         value it replaced"
-    );
-}
-
-/// A data replacement rewrites an indexed column into a different file. The
-/// segments describe the fragment as the compaction wrote it, so the merge has
-/// to give the fragment up rather than answer from entries the replacement
-/// superseded.
-#[tokio::test]
-async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
-    let mut dataset = create_base_dataset_with(false).await;
-    dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect();
-    let staged = crate::utils::test::stage_index_segments(
-        &mut dataset,
-        "age",
-        IndexType::BTree,
-        &ScalarIndexParams::default(),
-        "age_staged",
-        fragment_ids,
-    )
-    .await;
-
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 12,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let rewritten = dataset.get_fragments()[0].id() as u32;
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
 
     let age_schema = dataset.schema().project(&["age"]).unwrap();
     let batch = RecordBatch::try_new(
@@ -2786,32 +2750,13 @@ async fn test_rtree_merge_drops_a_fragment_replaced_since_the_compaction() {
     rtree_compact(&mut dataset, 3).await;
     let rewritten = rtree_fragment_ids(&dataset)[0];
 
-    let geometry_schema = dataset.schema().project(&["geometry"]).unwrap();
-    let batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::from(&geometry_schema)),
-        vec![geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT * 3)],
+    let dataset = replace_column(
+        dataset,
+        rewritten as u64,
+        "geometry",
+        geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT * 3),
     )
-    .unwrap();
-    let replacement = dataset
-        .get_fragment(rewritten as usize)
-        .unwrap()
-        .write_columns(futures::stream::iter([Ok(batch)]), &geometry_schema)
-        .await
-        .unwrap();
-    let read_version = dataset.version().version;
-    let dataset = Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataReplacement {
-            replacements: vec![replacement],
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap();
+    .await;
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert!(
@@ -2820,49 +2765,35 @@ async fn test_rtree_merge_drops_a_fragment_replaced_since_the_compaction() {
     );
 }
 
+/// A data replacement rewrites an indexed column into a different file. The
+/// segments describe the fragment as the compaction wrote it, so the merge has to
+/// give the fragment up rather than answer from entries the replacement
+/// superseded.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let replaced = Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef;
+    let mut dataset = replace_column(dataset, rewritten, "age", replaced).await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await.len(),
+        12,
+        "the replaced values are missing: the merged index claimed a fragment whose \
+         indexed column was rewritten after the compaction produced it"
+    );
+}
+
 /// An overlay landing on the fragment after the compaction produced it. RTree
 /// reaches this through its staleness pass; every other scalar family reaches it
 /// only through the comparison against the fragment the compaction wrote.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
-    let mut dataset = create_base_dataset_with(false).await;
-    dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect();
-    let staged = crate::utils::test::stage_index_segments(
-        &mut dataset,
-        "age",
-        IndexType::BTree,
-        &ScalarIndexParams::default(),
-        "age_staged",
-        fragment_ids,
-    )
-    .await;
-
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 12,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let rewritten = dataset.get_fragments()[0].id() as u64;
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
 
     let dataset = commit_overlay(
         dataset,
@@ -2919,32 +2850,13 @@ async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
     let staged = geo::stage_rtree_segments(&mut dataset, &params, source.clone()).await;
     let replaced = source[0];
 
-    let geometry_schema = dataset.schema().project(&["geometry"]).unwrap();
-    let batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::from(&geometry_schema)),
-        vec![geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT)],
+    let mut dataset = replace_column(
+        dataset,
+        replaced as u64,
+        "geometry",
+        geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT),
     )
-    .unwrap();
-    let replacement = dataset
-        .get_fragment(replaced as usize)
-        .unwrap()
-        .write_columns(futures::stream::iter([Ok(batch)]), &geometry_schema)
-        .await
-        .unwrap();
-    let read_version = dataset.version().version;
-    let mut dataset = Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataReplacement {
-            replacements: vec![replacement],
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap();
+    .await;
 
     let before = dataset
         .merge_existing_index_segments(staged.clone())
@@ -2972,44 +2884,7 @@ async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
 /// coverage up instead.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_up() {
-    let mut dataset = create_base_dataset_with(false).await;
-    dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let fragment_ids = dataset
-        .get_fragments()
-        .iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect();
-    let staged = crate::utils::test::stage_index_segments(
-        &mut dataset,
-        "age",
-        IndexType::BTree,
-        &ScalarIndexParams::default(),
-        "age_staged",
-        fragment_ids,
-    )
-    .await;
-
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 12,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let rewritten = dataset.get_fragments()[0].id() as u64;
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
 
     let dataset = commit_overlay(
         dataset,
