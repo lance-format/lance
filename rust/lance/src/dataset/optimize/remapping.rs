@@ -431,12 +431,22 @@ enum TaggedRemapPlan {
     Remap {
         hops: Vec<PlannedHop>,
         coverage: RoaringBitmap,
+        /// Every fragment the segment's rows may sit in along the retained
+        /// lineage: the stored provenance plus the destinations of every
+        /// applied hop, intermediates included. A merged segment keeps its
+        /// sources' provenance while its pages hold the addresses the
+        /// translating loader produced, so its rows can be anywhere on that
+        /// path. A withdrawn source's transition is never applied, so
+        /// nothing past it is admitted.
+        admitted: RoaringBitmap,
     },
     /// A stable-partition hop is only partially covered: no coverage
     /// arithmetic can restamp the bitmap and full-coverage remap does not
     /// apply, so the segment cannot be remapped and is skipped cleanly
     /// (queries keep translating through the ledger; a rebuild catches the
-    /// segment up).
+    /// segment up). Also the verdict for a retired fragment the history once
+    /// recorded but no longer maps: its addresses cannot be translated, and
+    /// they are never treated as deletions.
     Blocked { fragment: u32 },
 }
 
@@ -456,12 +466,27 @@ enum TaggedRemapPlan {
 /// the partition and a later trim could drop the mapping those addresses need.
 /// A remap is published whole or not at all.
 ///
+/// What the walk leaves retired in the coverage was consumed by no recorded
+/// transition. On a tagged table a covered fragment leaves the manifest only
+/// through a recorded transition or a whole-fragment delete, so such a
+/// fragment is gone (deleted, or a destination deleted since; the bitmap
+/// swap narrows to what the reader still serves), unless `lineage` (the
+/// entry's cumulative bitmap) records it while the ledger no longer mentions
+/// it: its mapping was trimmed away, the addresses that need it cannot be
+/// translated, and the plan blocks rather than treating them as deletions.
+///
 /// Iron law (asserted, `Remap` plans): a swapped bitmap only ever claims
 /// destination fragments the segment fully owns -- destinations are added
 /// only by a hop applied with ALL of its sources covered, so no destination
 /// mixing rows from uncovered sources can be claimed.
-fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> TaggedRemapPlan {
+fn plan_tagged_remap(
+    ledger: &FragReuseLedger,
+    provenance: &RoaringBitmap,
+    live: &RoaringBitmap,
+    lineage: &RoaringBitmap,
+) -> TaggedRemapPlan {
     let mut coverage = provenance.clone();
+    let mut admitted = provenance.clone();
     let mut hops: Vec<PlannedHop> = Vec::new();
     let mut applied = vec![false; ledger.transitions().len()];
     let mut changed = false;
@@ -482,12 +507,13 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
         }
         if overlap == sources {
             coverage -= &sources;
-            coverage.extend(
-                transition
-                    .destinations()
-                    .iter()
-                    .map(|digest| digest.id as u32),
-            );
+            let destinations: RoaringBitmap = transition
+                .destinations()
+                .iter()
+                .map(|digest| digest.id as u32)
+                .collect();
+            coverage |= &destinations;
+            admitted |= &destinations;
             hops.push(match transition.mapping() {
                 Mapping::OrderedCompaction(remap) => PlannedHop::Compaction(remap.as_ref().clone()),
                 // Fully covered: the segment owns every source of this
@@ -539,10 +565,26 @@ fn plan_tagged_remap(ledger: &FragReuseLedger, provenance: &RoaringBitmap) -> Ta
             }),
         "a remapped fragment bitmap may only claim destinations the segment fully owns"
     );
+    for fragment in (&coverage - live).iter() {
+        let mentioned = ledger.transitions().iter().any(|transition| {
+            transition
+                .sources()
+                .iter()
+                .chain(transition.destinations())
+                .any(|digest| digest.id as u32 == fragment)
+        });
+        if lineage.contains(fragment) && !mentioned {
+            return TaggedRemapPlan::Blocked { fragment };
+        }
+    }
     if !changed {
         TaggedRemapPlan::Identity
     } else {
-        TaggedRemapPlan::Remap { hops, coverage }
+        TaggedRemapPlan::Remap {
+            hops,
+            coverage,
+            admitted,
+        }
     }
 }
 
@@ -578,8 +620,23 @@ enum HopStep {
 /// source of the hop that produced it, so a bitmap-family segment whose rows
 /// were already translated at load (`V1Translate`) passes through every hop
 /// unchanged.
+///
+/// An address enters the hops only if its fragment is `admitted`: the
+/// segment's stored provenance or a destination of an applied hop, where a
+/// row a merge already translated may sit (a merged segment keeps its
+/// sources' provenance while its pages hold translated addresses). Any
+/// other address, in a fragment the bitmap no longer claims (withdrawn after
+/// an in-place column rewrite) or never covered, is dropped before the first
+/// hop. After the last hop an
+/// address is kept only if its fragment is `claimed`, the coverage the
+/// replacement segment publishes: a row a partial compaction ceded to the
+/// scan, a row a direct sibling took over, or a row in a fragment deleted
+/// since is dropped even though its source was admitted. The remapped file
+/// therefore carries no contribution its bitmap does not claim.
 struct PlannedHopRemapper {
     steps: Vec<HopStep>,
+    admitted: RoaringBitmap,
+    claimed: RoaringBitmap,
 }
 
 impl std::fmt::Debug for PlannedHopRemapper {
@@ -593,7 +650,14 @@ impl std::fmt::Debug for PlannedHopRemapper {
 #[async_trait]
 impl BatchRowIdRemapper for PlannedHopRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        let mut current: Vec<Option<u64>> = row_ids.iter().copied().map(Some).collect();
+        let mut current: Vec<Option<u64>> = row_ids
+            .iter()
+            .map(|&address| {
+                self.admitted
+                    .contains(RowAddress::from(address).fragment_id())
+                    .then_some(address)
+            })
+            .collect();
         for step in &self.steps {
             match step {
                 HopStep::Compaction(remap) => {
@@ -633,6 +697,15 @@ impl BatchRowIdRemapper for PlannedHopRemapper {
                 }
             }
         }
+        for slot in current.iter_mut() {
+            if slot.is_some_and(|address| {
+                !self
+                    .claimed
+                    .contains(RowAddress::from(address).fragment_id())
+            }) {
+                *slot = None;
+            }
+        }
         Ok(current)
     }
 }
@@ -645,6 +718,8 @@ async fn materialize_hops(
     dataset: &Dataset,
     ledger: &FragReuseLedger,
     hops: Vec<PlannedHop>,
+    admitted: RoaringBitmap,
+    claimed: RoaringBitmap,
 ) -> Result<RowAddrTranslator> {
     let mut steps = Vec::with_capacity(hops.len());
     for hop in hops {
@@ -661,6 +736,8 @@ async fn materialize_hops(
     }
     Ok(RowAddrTranslator::Batch(Arc::new(PlannedHopRemapper {
         steps,
+        admitted,
+        claimed,
     })))
 }
 
@@ -709,35 +786,35 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         return Ok(());
     };
 
-    let (remap, mut coverage) = match plan_tagged_remap(&ledger, &provenance) {
+    let lineage = entry.fragment_bitmap.clone().unwrap_or_default();
+    let (hops, mut coverage, admitted) = match plan_tagged_remap(
+        &ledger,
+        &provenance,
+        dataset.fragment_bitmap.as_ref(),
+        &lineage,
+    ) {
         TaggedRemapPlan::Identity => return Ok(()),
         TaggedRemapPlan::Blocked { fragment } => {
             log::info!(
-                "Skipping remap of index {} ({}): its coverage reaches a transition it only \
-                 partially covers at fragment {} (a stable partition, or any hop after a \
-                 stable-partition restamp). Queries keep translating through the reuse \
-                 index; rebuild the index to catch it up",
+                "Skipping remap of index {} ({}): at fragment {} its coverage reaches a \
+                 transition it only partially covers (a stable partition, or any hop after \
+                 a stable-partition restamp) or a retired fragment the history no longer \
+                 maps. Queries keep translating through the reuse index; rebuild the index \
+                 to catch it up",
                 curr_index_meta.name,
                 curr_index_meta.uuid,
                 fragment
             );
             return Ok(());
         }
-        TaggedRemapPlan::Remap { hops, coverage } => {
-            let translator = if hops.is_empty() {
-                None
-            } else {
-                Some(materialize_hops(dataset, &ledger, hops).await?)
-            };
-            (translator, coverage)
-        }
+        TaggedRemapPlan::Remap {
+            hops,
+            coverage,
+            admitted,
+        } => (hops, coverage, admitted),
     };
 
-    // Straddle-only outcome: coverage was dropped but no address moves, so
-    // the index files stay as they are and only the swapped bitmap (plus the
-    // advanced dataset_version) is committed. This also avoids opening the
-    // index, which the query planner may refuse for a straddled segment.
-    let remap_result = if let Some(translator) = remap {
+    if !hops.is_empty() {
         // The rewrite streams the segment through the reader's loading path,
         // and for index types that materialize their state at load (e.g.
         // bitmap) that path applies direct-coverage-wins: rows whose
@@ -747,8 +824,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // bitmap never claims rows the remapped file may not contain -- an
         // over-claim would later let segment pruning remove the sibling that
         // actually holds those rows. (For types that stream raw pages, e.g.
-        // BTree, this under-claims retained rows; safe, the ceding sibling
-        // serves them.)
+        // BTree, the rows the reader cedes are dropped by the translator's
+        // claim filter below, so file and bitmap agree.)
         use crate::index::DatasetIndexExt;
         if let Some(listed) = dataset
             .load_indices()
@@ -759,10 +836,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         {
             coverage &= servable;
         }
-        index::remap_index(dataset, index_id, &translator).await?
-    } else {
-        RemapResult::Keep(*index_id)
-    };
+    }
 
     // Overlays committed after the source index was built are not
     // incorporated by the remap; exclude those fragments so queries scan
@@ -780,6 +854,22 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             coverage.remove(fragment.id as u32);
         }
     }
+
+    // Straddle-only outcome: coverage was dropped but no address moves, so
+    // the index files stay as they are and only the swapped bitmap (plus the
+    // advanced dataset_version) is committed. This also avoids opening the
+    // index, which the query planner may refuse for a straddled segment.
+    let remap_result = if hops.is_empty() {
+        RemapResult::Keep(*index_id)
+    } else {
+        // Addresses enter the hops from anywhere on the retained lineage
+        // (the plan's admitted set: provenance and every applied hop's
+        // destinations); what the hops leave outside the published coverage
+        // is dropped.
+        let translator =
+            materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
+        index::remap_index(dataset, index_id, &translator).await?
+    };
 
     let new_index_meta = match remap_result {
         // The index type cannot be remapped (or the segment is otherwise
@@ -1023,6 +1113,27 @@ mod tests {
             fragments.iter().copied().collect()
         }
 
+        /// Plan against a table where only the ledger retires fragments:
+        /// live is everything named minus every source, the lineage is
+        /// everything the ledger names.
+        fn plan(ledger: &FragReuseLedger, provenance: &[u32]) -> TaggedRemapPlan {
+            let mut lineage = RoaringBitmap::new();
+            let mut sources = RoaringBitmap::new();
+            for transition in ledger.transitions() {
+                sources.extend(transition.sources().iter().map(|digest| digest.id as u32));
+                lineage.extend(
+                    transition
+                        .sources()
+                        .iter()
+                        .chain(transition.destinations())
+                        .map(|digest| digest.id as u32),
+                );
+            }
+            let provenance = coverage(provenance);
+            let live = (&provenance | &lineage) - &sources;
+            plan_tagged_remap(ledger, &provenance, &live, &lineage)
+        }
+
         /// Compose a compaction-only hop list; plan-level tests have no
         /// dataset to materialize stable-partition hops against.
         fn compose(hops: Vec<PlannedHop>) -> RowAddrRemap {
@@ -1038,10 +1149,7 @@ mod tests {
         #[tokio::test]
         async fn all_live_is_identity() {
             let ledger = ledger(vec![ordered(&[1], &[2])]).await;
-            assert!(matches!(
-                plan_tagged_remap(&ledger, &coverage(&[7])),
-                TaggedRemapPlan::Identity
-            ));
+            assert!(matches!(plan(&ledger, &[7]), TaggedRemapPlan::Identity));
         }
 
         /// A2: a single ordered hop with sources within coverage remaps and
@@ -1049,9 +1157,7 @@ mod tests {
         #[tokio::test]
         async fn single_hop_compaction_remaps() {
             let ledger = ledger(vec![ordered(&[1, 2], &[5, 6])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1, 2]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1, 2]) else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([5u32, 6]));
@@ -1065,9 +1171,7 @@ mod tests {
         #[tokio::test]
         async fn multi_hop_compaction_composes() {
             let ledger = ledger(vec![ordered(&[1], &[2]), ordered(&[2], &[3])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1]) else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([3u32]));
@@ -1080,9 +1184,7 @@ mod tests {
         #[tokio::test]
         async fn fully_covered_stable_partition_remaps() {
             let ledger = ledger(vec![partition(&[1], &[2])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1]) else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([2u32]));
@@ -1100,7 +1202,7 @@ mod tests {
         #[tokio::test]
         async fn partially_covered_stable_partition_blocks() {
             let ledger = ledger(vec![partition(&[5, 6], &[7, 8])]).await;
-            let plan = plan_tagged_remap(&ledger, &coverage(&[5]));
+            let plan = plan(&ledger, &[5]);
             assert!(
                 matches!(plan, TaggedRemapPlan::Blocked { fragment: 5 }),
                 "expected Blocked on fragment 5, got {plan:?}"
@@ -1116,7 +1218,7 @@ mod tests {
         #[tokio::test]
         async fn partial_compaction_after_restamp_blocks() {
             let ledger = ledger(vec![partition(&[1, 2], &[3, 4]), ordered(&[3, 5], &[6])]).await;
-            let plan = plan_tagged_remap(&ledger, &coverage(&[1, 2]));
+            let plan = plan(&ledger, &[1, 2]);
             assert!(
                 matches!(plan, TaggedRemapPlan::Blocked { fragment: 3 }),
                 "expected Blocked on fragment 3, got {plan:?}"
@@ -1145,7 +1247,7 @@ mod tests {
                 )),
             };
             let ledger = ledger(vec![ordered(&[1, 5], &[9]), partition_after_compaction]).await;
-            let plan = plan_tagged_remap(&ledger, &coverage(&[1, 2]));
+            let plan = plan(&ledger, &[1, 2]);
             assert!(
                 matches!(plan, TaggedRemapPlan::Blocked { fragment: 2 }),
                 "expected Blocked on fragment 2, got {plan:?}"
@@ -1158,9 +1260,7 @@ mod tests {
         #[tokio::test]
         async fn disconnected_partial_compaction_does_not_block_stable_partition() {
             let ledger = ledger(vec![ordered(&[5, 7], &[8]), partition(&[1, 2], &[3, 4])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1, 2, 5]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1, 2, 5]) else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([3u32, 4]));
@@ -1175,9 +1275,7 @@ mod tests {
         #[tokio::test]
         async fn downstream_stable_partition_composes() {
             let ledger = ledger(vec![ordered(&[1], &[2]), partition(&[2], &[3])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1]) else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([3u32]));
@@ -1198,9 +1296,7 @@ mod tests {
         #[tokio::test]
         async fn straddled_first_hop_drops_group_coverage() {
             let ledger = ledger(vec![ordered(&[3, 4], &[5, 6]), ordered(&[5, 6], &[7, 8])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[3]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[3]) else {
                 panic!("expected a (coverage-only) remap plan");
             };
             assert!(coverage.is_empty());
@@ -1212,11 +1308,8 @@ mod tests {
 
             // The same chain with full coverage composes both hops (A10: the
             // swapped bitmap claims exactly the fully-owned destinations).
-            let full = plan_tagged_remap(
-                &ledger,
-                &[3u32, 4].iter().copied().collect::<RoaringBitmap>(),
-            );
-            let TaggedRemapPlan::Remap { hops, coverage } = full else {
+            let full = plan(&ledger, &[3, 4]);
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = full else {
                 panic!("expected a remap plan");
             };
             assert_eq!(coverage, RoaringBitmap::from_iter([7u32, 8]));
@@ -1228,9 +1321,7 @@ mod tests {
         #[tokio::test]
         async fn straddle_drop_is_per_group() {
             let ledger = ledger(vec![ordered(&[1], &[2]), ordered(&[5, 6], &[7, 8])]).await;
-            let TaggedRemapPlan::Remap { hops, coverage } =
-                plan_tagged_remap(&ledger, &coverage(&[1, 5]))
-            else {
+            let TaggedRemapPlan::Remap { hops, coverage, .. } = plan(&ledger, &[1, 5]) else {
                 panic!("expected a remap plan");
             };
             // Fragment 5's coverage dropped (straddle), fragment 1 remapped.
@@ -1238,6 +1329,73 @@ mod tests {
             let remap = compose(hops);
             assert_eq!(remap.get(addr(1, 0)), Some(Some(addr(2, 0))));
             assert_eq!(remap.get(addr(5, 0)), None);
+        }
+
+        /// A retired fragment the entry's lineage records but the ledger no
+        /// longer mentions has lost its mapping: the segment's addresses
+        /// there can be neither translated nor proven gone, so the plan
+        /// blocks instead of treating them as deletions.
+        #[tokio::test]
+        async fn retired_provenance_without_a_mapping_blocks() {
+            let ledger = ledger(vec![ordered(&[1], &[2])]).await;
+            let plan = plan_tagged_remap(
+                &ledger,
+                &coverage(&[1, 5]),
+                &coverage(&[2]),
+                &coverage(&[1, 2, 5]),
+            );
+            assert!(
+                matches!(plan, TaggedRemapPlan::Blocked { fragment: 5 }),
+                "expected Blocked on fragment 5, got {plan:?}"
+            );
+        }
+
+        /// The admitted set spans the retained lineage: provenance plus the
+        /// destinations of every applied hop, intermediates included, so a
+        /// merged segment's already-translated pages enter the later hops.
+        /// A withdrawn source's transition is never applied, so nothing past
+        /// it is admitted.
+        #[tokio::test]
+        async fn admitted_spans_the_retained_lineage() {
+            let chain = ledger(vec![partition(&[1, 2], &[3, 4]), ordered(&[3, 4], &[5, 6])]).await;
+            let TaggedRemapPlan::Remap {
+                coverage, admitted, ..
+            } = plan(&chain, &[1, 2])
+            else {
+                panic!("expected a remap plan");
+            };
+            assert_eq!(coverage, RoaringBitmap::from_iter([5u32, 6]));
+            assert_eq!(admitted, RoaringBitmap::from_iter([1u32, 2, 3, 4, 5, 6]));
+
+            // Fragment 1's transition was withdrawn from this segment: the
+            // walk never applies it, so 3 and 4 stay out; the other lineage
+            // is admitted whole.
+            let two_lineages = ledger(vec![ordered(&[1], &[3]), ordered(&[7], &[8])]).await;
+            let TaggedRemapPlan::Remap { admitted, .. } = plan(&two_lineages, &[7]) else {
+                panic!("expected a remap plan");
+            };
+            assert_eq!(admitted, RoaringBitmap::from_iter([7u32, 8]));
+        }
+
+        /// A retired fragment the ledger still names (a destination deleted
+        /// wholesale since) or never recorded (deleted before any transition
+        /// touched it) is gone, not unmapped: the walk proceeds and the
+        /// bitmap swap narrows to what the reader still serves.
+        #[tokio::test]
+        async fn deleted_fragments_do_not_block() {
+            let ledger = ledger(vec![partition(&[1], &[2, 3])]).await;
+            let TaggedRemapPlan::Remap {
+                coverage: claimed, ..
+            } = plan_tagged_remap(
+                &ledger,
+                &coverage(&[1, 7]),
+                &coverage(&[3]),
+                &coverage(&[1, 2, 3]),
+            )
+            else {
+                panic!("expected a remap plan");
+            };
+            assert_eq!(claimed, RoaringBitmap::from_iter([2u32, 3, 7]));
         }
     }
 
@@ -1322,6 +1480,8 @@ mod tests {
                     HopStep::Compaction(Arc::new(c2)),
                     partition_hop(&[6], &sp2),
                 ],
+                admitted: RoaringBitmap::from_iter([0u32, 9]),
+                claimed: RoaringBitmap::from_iter(0u32..10),
             };
             let input = vec![addr(0, 0), addr(0, 1), addr(9, 5), addr(0, 0), addr(0, 2)];
             let output = remapper.remap_row_ids(&input).await.unwrap();
@@ -1341,6 +1501,45 @@ mod tests {
             assert_eq!(sp2.batches.lock().unwrap().as_slice(), &[3]);
         }
 
+        /// Only admitted addresses enter the hops: a fragment the segment's
+        /// bitmap no longer claims (withdrawn after an in-place rewrite, or
+        /// never covered) is dropped before any hop, whether the stored
+        /// address is an old source address or an already translated live
+        /// one; admitted addresses outside every hop pass through untouched.
+        /// After the hops only claimed fragments survive: an admitted
+        /// address the hops leave outside the published coverage (a retired
+        /// fragment deleted since, a ceded destination) is dropped too.
+        #[tokio::test]
+        async fn addresses_outside_the_admitted_or_claimed_fragments_are_dropped() {
+            let sp = table((0..4).map(|i| (addr(2, i), Some(addr(4, i)))));
+            let remapper = PlannedHopRemapper {
+                steps: vec![partition_hop(&[2], &sp)],
+                admitted: RoaringBitmap::from_iter([2u32, 4, 7, 8]),
+                claimed: RoaringBitmap::from_iter([4u32, 7]),
+            };
+            let input = vec![
+                addr(2, 1),
+                addr(7, 0),
+                addr(4, 3),
+                addr(0, 0),
+                addr(9, 5),
+                addr(8, 2),
+            ];
+            let output = remapper.remap_row_ids(&input).await.unwrap();
+            assert_eq!(
+                output,
+                vec![
+                    Some(addr(4, 1)),
+                    Some(addr(7, 0)),
+                    Some(addr(4, 3)),
+                    None,
+                    None,
+                    None
+                ]
+            );
+            assert_eq!(sp.batches.lock().unwrap().as_slice(), &[1]);
+        }
+
         /// Driven through the translator, a large request reaches the hops in
         /// batches of at most 64K addresses, and `resolve` builds a map of
         /// exactly one unit of work: nothing sized to the source rows exists.
@@ -1350,6 +1549,8 @@ mod tests {
             let sp = table((0..ROWS).map(|i| (addr(1, i), Some(addr(3, i)))));
             let translator = RowAddrTranslator::Batch(Arc::new(PlannedHopRemapper {
                 steps: vec![partition_hop(&[1], &sp)],
+                admitted: RoaringBitmap::from_iter([1u32]),
+                claimed: RoaringBitmap::from_iter([3u32]),
             }));
             assert!(!translator.is_empty());
             let input: Vec<u64> = (0..ROWS).map(|i| addr(1, i)).collect();
@@ -1387,6 +1588,95 @@ mod tests {
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::transaction::RewriteGroup;
+
+        /// `i` indexed by `i_idx` over every fragment; `w`, an unindexed copy
+        /// of `i`, keys in-place rewrites; `v` is the column a partial-schema
+        /// source leaves alone (RewriteColumns needs one to skip).
+        async fn keyed_dataset(fragments: u32) -> Dataset {
+            use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .col("w", lance_datagen::array::step::<Int32Type>())
+                .col("v", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(fragments), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+        }
+
+        /// Rewrite `i` of the row keyed `w = key` in place (merge-insert
+        /// RewriteColumns): an Update with `fields_modified`, the shape that
+        /// withdraws index coverage on a tagged table.
+        async fn rewrite_in_place(dataset: Dataset, key: i32, value: i32) -> Dataset {
+            use crate::dataset::{
+                MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+            };
+            let schema = Arc::new(arrow_schema::Schema::from(
+                &dataset.schema().project(&["w", "i"]).unwrap(),
+            ));
+            let source = arrow_array::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow_array::Int32Array::from(vec![key])),
+                    Arc::new(arrow_array::Int32Array::from(vec![value])),
+                ],
+            )
+            .unwrap();
+            let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["w".into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap()
+                .execute_batches(vec![source])
+                .await
+                .unwrap();
+            Arc::try_unwrap(dataset).unwrap_or_else(|dataset| dataset.as_ref().clone())
+        }
+
+        /// The fragments whose addresses the stored `i_idx` segment itself
+        /// returns for `i = value`, read straight from its files (no
+        /// planner, no bitmap filter): what the remapped file holds.
+        async fn segment_fragments_for(dataset: &Dataset, value: i32) -> Vec<u32> {
+            use crate::index::DatasetIndexInternalExt;
+            use lance_index::metrics::NoOpMetricsCollector;
+            use lance_index::scalar::{SargableQuery, SearchResult};
+            let segment = stored_index(dataset, "i_idx").await;
+            let index = dataset
+                .open_scalar_index("i", &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let SearchResult::Exact(rows) = index
+                .search(
+                    &SargableQuery::Equals(datafusion::scalar::ScalarValue::Int32(Some(value))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected an exact scalar search result");
+            };
+            let mut fragments: Vec<u32> = rows
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+                .collect();
+            fragments.sort_unstable();
+            fragments.dedup();
+            fragments
+        }
 
         async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
             dataset
@@ -2002,6 +2292,224 @@ mod tests {
                 sorted_values(&dataset, Some("i < 8")).await,
                 (0..8).collect::<Vec<_>>()
             );
+        }
+
+        /// Retired addresses left by a withdrawal: an in-place rewrite of a
+        /// partition destination withdrew that transition's sources from a
+        /// segment with two lineages. The remap translates what the bitmap
+        /// still claims, drops the withdrawn sources' addresses (not
+        /// admitted), claims only the surviving lineage's destination, and
+        /// the rewritten value comes from the scan; trim then releases the
+        /// history nothing pins.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn remap_drops_withdrawn_sources_and_translates_the_rest() {
+            let mut dataset = keyed_dataset(4).await; // i_idx over {0,1,2,3}
+            reserve_fragments(&mut dataset, 40).await;
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let dataset = commit_ordered_compaction(dataset, &[2, 3], 12).await;
+            // i = 3 (w = 3) lives in F11 (the odd rows), a partition destination.
+            let mut dataset = rewrite_in_place(dataset, 3, 333).await;
+            let withdrawn = stored_index(&dataset, "i_idx").await;
+            assert_eq!(
+                withdrawn.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([2u32, 3]),
+                "the partition's sources are withdrawn, the compaction's kept"
+            );
+            let mut expected: Vec<i32> = (0..16).map(|i| if i == 3 { 333 } else { i }).collect();
+            expected.sort_unstable();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after.uuid, withdrawn.uuid);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([12u32])
+            );
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 333")).await, vec![333]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i = 3")).await,
+                Vec::<i32>::new()
+            );
+            assert_eq!(
+                sorted_values(&dataset, Some("i >= 8")).await,
+                (8..16).chain([333]).collect::<Vec<_>>()
+            );
+            let plan = dataset
+                .scan()
+                .filter("i = 9")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 333")).await, vec![333]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i >= 8")).await,
+                (8..16).chain([333]).collect::<Vec<_>>()
+            );
+            // The history is drained, so the segment's files are read as they
+            // are: the withdrawn sources' addresses are gone from them, the
+            // compaction's rows were translated.
+            let entries = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count();
+            assert_eq!(entries, 0, "the drained history is trimmed away");
+            assert_eq!(segment_fragments_for(&dataset, 3).await, Vec::<u32>::new());
+            assert_eq!(segment_fragments_for(&dataset, 0).await, Vec::<u32>::new());
+            assert_eq!(segment_fragments_for(&dataset, 9).await, vec![12]);
+        }
+
+        /// A merged segment keeps its sources' provenance while its pages hold
+        /// the addresses the translating loader produced. Remapping it across
+        /// a later rewrite must admit those intermediate addresses into the
+        /// hops: stable partition, index merge with new data, compaction of
+        /// the partition's destinations, remap. The remapped file holds the
+        /// merged rows at the compaction's destination and every query
+        /// equals the scan.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn remap_admits_a_merged_segment_translated_pages() {
+            use lance_index::optimize::OptimizeOptions;
+            let mut dataset = keyed_dataset(2).await; // i_idx over {0,1}
+            reserve_fragments(&mut dataset, 40).await;
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let mut dataset = append_two_fragments(dataset).await;
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            let merged = stored_index(&dataset, "i_idx").await;
+            let appended: Vec<u32> = dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id as u32)
+                .filter(|id| *id > 11)
+                .collect();
+            assert_eq!(appended.len(), 2);
+            assert_eq!(
+                merged.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1].into_iter().chain(appended.iter().copied())),
+                "the merge keeps the sources' provenance"
+            );
+            assert_eq!(
+                segment_fragments_for(&dataset, 3).await,
+                vec![11],
+                "and its pages hold translated addresses"
+            );
+
+            let mut dataset = commit_ordered_compaction(dataset, &[10, 11], 20).await;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after.uuid, merged.uuid);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([20u32].into_iter().chain(appended.iter().copied()))
+            );
+            let expected: Vec<i32> = (0..16).collect();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 3")).await, vec![3]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i < 8")).await,
+                (0..8).collect::<Vec<_>>()
+            );
+            assert_eq!(sorted_values(&dataset, Some("i = 9")).await, vec![9]);
+            let plan = dataset
+                .scan()
+                .filter("i = 3")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 3")).await, vec![3]);
+            assert_eq!(segment_fragments_for(&dataset, 3).await, vec![20]);
+            assert_eq!(segment_fragments_for(&dataset, 0).await, vec![20]);
+        }
+
+        /// Live addresses left by a withdrawal: a segment restamped by an
+        /// earlier remap holds live addresses; an in-place rewrite of one of
+        /// its fragments withdraws that fragment from the bitmap. The next
+        /// remap (a compaction of the other fragment) drops the withdrawn
+        /// fragment's addresses, live but no longer admitted, and claims
+        /// only the compaction's destination.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn remap_drops_live_addresses_withdrawn_by_a_rewrite() {
+            let mut dataset = keyed_dataset(2).await; // i_idx over {0,1}
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let restamped = stored_index(&dataset, "i_idx").await;
+            assert_eq!(
+                restamped.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10u32, 11])
+            );
+            let dataset = commit_ordered_compaction(dataset, &[11], 20).await;
+            // i = 0 (w = 0) lives in F10 (the even rows).
+            let mut dataset = rewrite_in_place(dataset, 0, 100).await;
+            let withdrawn = stored_index(&dataset, "i_idx").await;
+            assert_eq!(
+                withdrawn.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([11u32])
+            );
+            let expected: Vec<i32> = (1..8).chain([100]).collect();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_ne!(after.uuid, withdrawn.uuid);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([20u32])
+            );
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 100")).await, vec![100]);
+            assert_eq!(
+                sorted_values(&dataset, Some("i = 0")).await,
+                Vec::<i32>::new()
+            );
+            assert_eq!(sorted_values(&dataset, Some("i = 1")).await, vec![1]);
+            let plan = dataset
+                .scan()
+                .filter("i = 1")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(sorted_values(&dataset, None).await, expected);
+            assert_eq!(sorted_values(&dataset, Some("i = 100")).await, vec![100]);
+            assert_eq!(sorted_values(&dataset, Some("i = 1")).await, vec![1]);
+            // Read as they are: the withdrawn fragment's live addresses are
+            // gone from the files, the compaction's rows were translated.
+            assert_eq!(segment_fragments_for(&dataset, 0).await, Vec::<u32>::new());
+            assert_eq!(segment_fragments_for(&dataset, 1).await, vec![20]);
         }
 
         /// A partial direct takeover must not let the remap publish more
