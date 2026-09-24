@@ -34,7 +34,7 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::generation::GenerationRead;
+use super::generation_read::GenerationRead;
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,

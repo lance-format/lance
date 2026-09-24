@@ -8,54 +8,36 @@
 //!
 //! # Limitations
 //!
-//! MemWAL does not track dataset changes made after it is initialized. The set
-//! named by `maintained_indexes` is fixed, so an index created later is not
-//! maintained over the fresh tier; it covers a row once that row reaches the
-//! base table.
-//!
-//! # No upgrade guarantee across the field-id read
-//!
-//! A generation is read by matching the field ids it stores against the table's.
-//! Generations flushed before that was introduced were written under a schema
-//! with the ids dropped, so they carry ids assigned positionally (`0..n`) rather
-//! than the table's own. Where the two disagree -- any table that had evolved
-//! before its MemWAL was initialized, leaving gaps in its ids -- those
-//! generations are mispaired: a column reads as null, or, if the types happen to
-//! agree, one column's values are served under another's name. No schema change
-//! is needed to reach it, and nothing in a generation says which scheme numbered
-//! it. Durable WAL entries are unaffected; they carry no ids, so they take the
-//! name-matching path.
-//!
-//! MemWAL carries no upgrade guarantee: a deployment predating this read must
-//! compact its generations into base before upgrading, and this is a statement
-//! of that requirement rather than a mechanism enforcing it. Closing it properly
-//! means marking generations written under the current scheme and name-matching
-//! the ones without the mark.
+//! The set named by `maintained_indexes` is fixed at initialization: an index
+//! created later is not maintained over the fresh tier, and covers a row once
+//! that row reaches the base table. An index the set names that the dataset no
+//! longer has is skipped when a shard opens, so the table keeps serving without
+//! the fresh tier's copy of it. Naming one that does not exist is rejected at
+//! initialization, the last moment it can be corrected.
 //!
 //! A rename reaches the sealed generations and the replay, but not the active
-//! MemTable: it is created from the schema its writer holds, so it keeps
-//! serving under the names it was created with until the writer reopens. A
-//! reader planning against a schema a MemTable was not created from is outside
-//! the contract.
+//! MemTable, which serves under the names it was created with until its writer
+//! reopens.
 //!
-//! An index the set names but the dataset no longer has -- dropped, replaced, or
-//! carried away with the column it covered -- is skipped when a shard opens, so
-//! the table keeps serving without the fresh tier's copy of it. Naming one that
-//! does not exist is still rejected at initialization, which is the last moment
-//! it can be corrected.
+//! # Upgrading
+//!
+//! A generation is read by matching the field ids it stores against the table's.
+//! Generations flushed before that read existed carry ids assigned positionally,
+//! and mispair against a table whose ids have gaps. Nothing in a generation says
+//! which scheme numbered it, so a deployment predating this read must compact
+//! its generations into base before upgrading. Durable WAL entries are
+//! unaffected: they carry no ids and take the name-matching path.
+//!
+//! # Known gaps
 //!
 //! A schema change begun on a handle opened before a MemWAL was installed
-//! commits past the installation. The refusals below read the MemWAL state from
+//! commits past the installation: the refusals below read the MemWAL state from
 //! the caller's handle, and the conflict resolver treats the two commits as
-//! compatible in either order, so the table ends up holding a change the
-//! refusals exist to prevent. Closing it means giving the resolver the same
-//! MemWAL exception a merge already carries.
+//! compatible in either order.
 //!
 //! Adding a column is not refused the way altering one is, so a transform that
-//! derives a non-nullable column -- a SQL expression over a non-null literal, or
-//! a stream whose schema says so -- puts a column on the table that a generation
-//! written earlier has no values for. Projecting it over one of those rows fails
-//! when the batch is built, because the column admits no nulls to fill.
+//! derives a non-nullable column leaves rows in a generation written earlier
+//! with no value to project for it.
 
 use std::collections::HashMap;
 use std::sync::Arc;

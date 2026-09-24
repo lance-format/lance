@@ -28,7 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::generation::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,

@@ -58,7 +58,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::generation::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{project_to_canonical, validate_projection_names};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
