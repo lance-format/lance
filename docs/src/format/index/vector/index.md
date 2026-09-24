@@ -496,7 +496,8 @@ level with `b` ex bits, let `s_j` be its sign bit, `e_j` its ex code,
 `w_sign_j = scale_sign * (s_j - 1/2)`. Each row stores three nonnegative
 float32 values, rounded upwards: `||w-w_sign||_2`,
 `|add_level-add_sign|`, and `|scale_sign| + 2^b*|scale_level|`.
-Infinite bounds disable pruning; NaN and negative bounds are invalid.
+Nonfinite or negative bound hints disable pruning for the affected row; the
+code and factor columns still determine its score.
 
 For a rotated query `q` and the metric's add-factor multiplier `a`, the
 real-arithmetic score difference is bounded by
@@ -507,7 +508,11 @@ the conservative norm bound. Normal mode applies the native RaBitQ angular
 confidence policy to the norm term, multiplying it by
 `min(1, 1.9 / sqrt(d - 1))` for `d > 1`. This statistical bound can lose
 candidates and must be evaluated together with recall; the add-factor and
-arithmetic margins are not reduced. A reader skips a row when its chosen
+arithmetic margins are not multiplied by the angular confidence factor. When
+the rotated centroid is available, Normal L2/cosine mode may use the equivalent
+centered query `q-c`: the encoder's add-factor difference cancels the centroid dot of
+`w-w_sign`, with a separate floating-point margin for that cancellation.
+Dot and Accurate mode retain the generic norm-plus-add-factor bound. A reader skips a row when its chosen
 lower bound cannot beat the current top-k threshold or falls above the
 query's upper distance bound. The legacy
 `__error_factors` bound relative to the original vector is not a substitute
