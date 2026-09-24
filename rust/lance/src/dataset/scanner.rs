@@ -18445,7 +18445,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     #[rstest]
     #[tokio::test]
     async fn test_full_snapshot_prefilter_4bit_pq_recall(
-        #[values(MetricType::L2, MetricType::Dot)] metric: MetricType,
+        #[values(MetricType::L2, MetricType::Dot, MetricType::Cosine)] metric: MetricType,
         #[values(false, true)] postfilter: bool,
     ) {
         const DIM: usize = 8;
@@ -18476,9 +18476,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let data = dataset.scan().try_into_batch().await.unwrap();
         let vectors = data["vec"].as_fixed_size_list();
 
-        // One 512-row partition and k=10 exceed max(FLAT_NUM_4BIT_PQ=200, k).
-        // Thus bulk scoring quantizes the middle rows; small fixtures or a large
-        // refinement budget would accidentally test only the exact prefix.
+        // Keep more than 200 rows in one partition and a small k: the former
+        // 4-bit bulk scorer quantized only rows beyond max(200, k). Small fixtures
+        // or a large refinement budget would miss its candidate-ordering bug.
         for query_row in [240, 360, 480] {
             let query = vectors.value(query_row);
             let make_scanner = |use_index| {
@@ -18506,6 +18506,15 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             assert!(plan.contains("ANNSubIndex"), "{plan}");
             let actual = scoped.try_into_batch().await.unwrap();
             assert_eq!(actual, implicit);
+            if !postfilter {
+                let mut filtered = make_scanner(true);
+                filtered.filter("id >= 0").unwrap().prefilter(true);
+                let filtered = filtered.try_into_batch().await.unwrap();
+                // An all-row predicate must not change ANN candidates or their
+                // distances by selecting the per-row rather than bulk PQ scorer.
+                assert_eq!(actual, filtered);
+            }
+
             let ids = |batch: &RecordBatch| {
                 batch["id"]
                     .as_primitive::<UInt64Type>()

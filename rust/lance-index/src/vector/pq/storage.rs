@@ -936,14 +936,13 @@ impl DistCalculator for PQDistCalculator {
         }
     }
 
-    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+    fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
         match self.distance_type {
             DistanceType::L2 => compute_pq_distance(
                 &self.distance_table,
                 self.num_bits,
                 self.num_sub_vectors,
                 self.pq_code.values(),
-                k_hint,
             ),
             DistanceType::Cosine => {
                 // it seems we implemented cosine distance at some version,
@@ -960,7 +959,6 @@ impl DistCalculator for PQDistCalculator {
                     self.num_bits,
                     self.num_sub_vectors,
                     self.pq_code.values(),
-                    k_hint,
                 );
                 l2_dists.into_iter().map(|v| v / 2.0).collect()
             }
@@ -970,7 +968,6 @@ impl DistCalculator for PQDistCalculator {
                     self.num_bits,
                     self.num_sub_vectors,
                     self.pq_code.values(),
-                    k_hint,
                 );
                 let diff = self.num_sub_vectors as f32 - 1.0;
                 dot_dists.into_iter().map(|v| v - diff).collect()
@@ -1304,6 +1301,26 @@ mod tests {
             .collect::<Vec<_>>();
         let distances = dist_calc.distance_all(100);
         assert_eq!(distances, expected);
+    }
+
+    #[rstest]
+    fn test_4bit_distance_all_matches_per_row(
+        #[values(DistanceType::L2, DistanceType::Dot)] distance_type: DistanceType,
+        #[values(1, 100, 201, 300)] k_hint: usize,
+    ) {
+        const ROWS: usize = 227;
+        let codes = UInt8Array::from_iter_values((0..ROWS * 2).map(|i| (i * 17 + i / 16) as u8));
+        let calculator = PQDistCalculator {
+            distance_table: (0..64).map(|i| i as f32 / 7.0 - 2.5).collect(),
+            num_sub_vectors: 4,
+            pq_code: Arc::new(transpose(&codes, ROWS, 2)),
+            num_bits: 4,
+            distance_type,
+        };
+        let expected = (0..ROWS)
+            .map(|i| calculator.distance(i as u32))
+            .collect::<Vec<_>>();
+        assert_eq!(calculator.distance_all(k_hint), expected);
     }
 
     #[tokio::test]
