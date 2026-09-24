@@ -3081,3 +3081,41 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
          another group's compaction had advanced the state it was compared against"
     );
 }
+
+/// One commit publishes every group a compaction rewrites, so dating them takes
+/// one search of the version history however many groups there are. A merge that
+/// searched per group would re-read the same snapshots, which on remote storage
+/// is the expensive part of the walk.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 8).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+    rtree_compact(&mut dataset, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 4, "four groups to date");
+
+    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        4,
+        "all four groups are covered whole, so coverage follows the rows"
+    );
+
+    let history = dataset
+        .object_store
+        .as_ref()
+        .io_stats_incremental()
+        .requests
+        .iter()
+        .filter(|request| request.path.to_string().contains("_versions"))
+        .count();
+    assert!(
+        history <= 5,
+        "the merge read version history {history} times for four groups, so it is \
+         searching once per group rather than once per compaction"
+    );
+}

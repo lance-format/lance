@@ -500,23 +500,28 @@ async fn indexed_data_moved_on(
             }
         }
 
+        // One commit published every group in this entry, so one of its fragments
+        // dates them all.
+        let Some(produced) = ours
+            .iter()
+            .find_map(|group| group.new_frags.first().map(|new| new.id as u32))
+        else {
+            continue;
+        };
+        let Some(created) =
+            proven_creation_version(dataset, &retained, version.dataset_version, produced).await?
+        else {
+            return Ok(true);
+        };
+        let created_at = created.manifest.version;
+        read.insert(created_at, created);
+
         // Only the groups this compaction rewrote advance; every other followed
         // fragment stays recorded against the version it already was.
         for group in ours {
             for old in &group.old_frags {
                 following.remove(&(old.id as u32));
             }
-            let Some(produced) = group.new_frags.first().map(|new| new.id as u32) else {
-                continue;
-            };
-            let Some(created) =
-                proven_creation_version(dataset, &retained, version.dataset_version, produced)
-                    .await?
-            else {
-                return Ok(true);
-            };
-            let created_at = created.manifest.version;
-            read.insert(created_at, created);
             for new in &group.new_frags {
                 following.insert(new.id as u32, created_at);
             }
