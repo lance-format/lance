@@ -451,15 +451,19 @@ impl RowMapReader {
         self.block_labels_reusing(block, block, &mut None).await
     }
 
-    /// [`Self::block_labels`] for a caller that visits blocks in order up to
-    /// `last_block` and wants the labels it just loaded to serve the next
-    /// blocks. `held` carries them between calls: a block inside the held
+    /// [`Self::block_labels`] for a caller that visits blocks in order and
+    /// wants the labels it just loaded to serve the next blocks. `last_block`
+    /// is the end of the run of adjacent blocks, starting at `block`, that
+    /// the caller will request next (every block in between included); `held`
+    /// carries the loaded labels between calls, and a block inside the held
     /// span never touches the cache or the file. With a block cache the span
     /// is the block's chunk, so a request performs one read per chunk whether
     /// or not the cache retains it. Without a block cache the span is the
-    /// blocks `block..=last_block` still ahead of the request, bounded to a
-    /// chunk's worth, so a point lookup reads exactly its block and a batch
-    /// reads exactly the blocks it touches, in one range read.
+    /// run `block..=last_block`, bounded to a chunk's worth, so a point
+    /// lookup reads exactly its block, a run of adjacent blocks is read in
+    /// one range read, and a sparse request never reads a block it does not
+    /// touch (its caller passes each run's end, not the request's last
+    /// block).
     pub async fn block_labels_reusing(
         &self,
         block: usize,
@@ -1068,8 +1072,24 @@ mod tests {
         }
         assert_eq!(counting.take(), (num_blocks, total as usize));
 
-        // Without a block cache a request reads the span of blocks it still
-        // needs in one read, bounded to a chunk's worth of blocks.
+        // Without a block cache a run of adjacent blocks is read in one
+        // read, bounded to a chunk's worth of blocks, and a sparse request
+        // reads exactly its blocks: two blocks far apart cost two block
+        // reads, not the span between them.
+        let mut held = None;
+        assert_eq!(
+            &plain.block_labels_reusing(0, 0, &mut held).await.unwrap(),
+            &labels[0]
+        );
+        assert_eq!(
+            &plain.block_labels_reusing(99, 99, &mut held).await.unwrap(),
+            &labels[99]
+        );
+        assert_eq!(
+            counting.take(),
+            (2, 16),
+            "two touched blocks, two block reads"
+        );
         let mut held = None;
         for (block, expected) in labels.iter().enumerate().take(21).skip(5) {
             assert_eq!(

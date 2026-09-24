@@ -186,9 +186,9 @@ impl MappingReader for StablePartitionMapping {
         let mut remaining = requests.as_slice();
         // Blocks are visited in row order, so consecutive blocks reuse the
         // labels loaded for the first of them: one read per cache chunk, or
-        // without a chunk cache one read for the span of blocks this request
-        // touches. The request never pays a read per block.
-        let last_block = reader.counts().block_of(requests.last().unwrap().0);
+        // without a chunk cache one read per run of adjacent blocks the
+        // request touches (bounded to a chunk's worth). A sparse request
+        // never reads a block it does not touch.
         let mut held = None;
         while let Some(&(first, _)) = remaining.first() {
             let counts = reader.counts();
@@ -196,8 +196,21 @@ impl MappingReader for StablePartitionMapping {
             let range = counts.block_range(block);
             let end = remaining.partition_point(|&(row, _)| row < range.end);
             let (batch, rest) = remaining.split_at(end);
+            // The last block of the run of adjacent blocks starting here that
+            // this request still touches.
+            let mut run_end = block;
+            let mut cursor = end;
+            while cursor < remaining.len() {
+                let next = counts.block_of(remaining[cursor].0);
+                if next != run_end + 1 {
+                    break;
+                }
+                run_end = next;
+                let next_range = counts.block_range(next);
+                cursor += remaining[cursor..].partition_point(|&(row, _)| row < next_range.end);
+            }
             let labels = reader
-                .block_labels_reusing(block, last_block, &mut held)
+                .block_labels_reusing(block, run_end, &mut held)
                 .await?;
             if labels.len() as u64 != range.end - range.start {
                 return Err(corrupt(format!(
@@ -257,9 +270,157 @@ mod tests {
     use super::*;
     use crate::frag_reuse::row_map::{RowMapWriter, SourceRows};
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow_array::RecordBatch;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
+    use lance_index_core::scalar::IndexReader;
     use lance_io::object_store::ObjectStore;
+
+    /// Counts the label reads the row-map reader performs and the rows they
+    /// asked for.
+    struct CountingReader {
+        inner: Arc<dyn IndexReader>,
+        reads: std::sync::atomic::AtomicUsize,
+        rows: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingReader {
+        fn new(inner: Arc<dyn IndexReader>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: Default::default(),
+                rows: Default::default(),
+            })
+        }
+
+        /// `(reads, rows)` since the last call.
+        fn take(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.reads.swap(0, Relaxed), self.rows.swap(0, Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IndexReader for CountingReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+            self.inner.read_global_buffer(index).await
+        }
+
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reads.fetch_add(1, Relaxed);
+            self.rows.fetch_add(range.len(), Relaxed);
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn read_ranges(
+            &self,
+            ranges: &[std::ops::Range<usize>],
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reads.fetch_add(1, Relaxed);
+            self.rows
+                .fetch_add(ranges.iter().map(|range| range.len()).sum(), Relaxed);
+            self.inner.read_ranges(ranges, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
+
+    /// Without a block cache a batch reads exactly the blocks it touches: a
+    /// run of adjacent blocks in one read, and nothing between two blocks
+    /// far apart (the request's last block is not a span to read up to).
+    #[tokio::test]
+    async fn sparse_batch_reads_only_touched_blocks_without_cache() {
+        let directory = TempDir::default();
+        let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+            .await
+            .unwrap();
+        let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store,
+            path,
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // One source of 800 rows in 100 blocks of 8, two destinations of 400.
+        let writer = store
+            .new_index_file(MAPPING_FILE, RowMapWriter::schema())
+            .await
+            .unwrap();
+        let mut writer = RowMapWriter::try_new_with_block_rows(
+            writer,
+            vec![SourceRows {
+                physical_rows: 800,
+                deleted: None,
+            }],
+            2,
+            8,
+        )
+        .unwrap();
+        let labels: Vec<u16> = (0..800u16).map(|i| i % 2).collect();
+        writer.append_labels(&labels).await.unwrap();
+        writer.finish().await.unwrap();
+        let counting = CountingReader::new(store.open_index_file(MAPPING_FILE).await.unwrap());
+        let digest = |id, rows| FragmentDigest {
+            id,
+            physical_rows: rows,
+            num_deleted_rows: 0,
+        };
+        let mapping = StablePartitionMapping::try_new(
+            store.clone(),
+            vec![digest(1, 800)],
+            vec![digest(2, 400), digest(3, 400)],
+        )
+        .unwrap();
+        assert!(
+            mapping
+                .reader
+                .set(RowMapReader::open(counting.clone()).await.unwrap())
+                .is_ok()
+        );
+        counting.take();
+        let addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+
+        // Blocks 0 and 99: two block reads of eight rows, not the span.
+        assert_eq!(
+            mapping
+                .remap_row_ids(&[addr(1, 0), addr(1, 799)])
+                .await
+                .unwrap(),
+            vec![Some(addr(2, 0)), Some(addr(3, 399))]
+        );
+        assert_eq!(counting.take(), (2, 16));
+        // An adjacent run (blocks 5, 6, 7) is read once.
+        mapping
+            .remap_row_ids(&[addr(1, 40), addr(1, 48), addr(1, 56)])
+            .await
+            .unwrap();
+        assert_eq!(counting.take(), (1, 24));
+        // A run and then a gap: two reads, only the touched blocks.
+        mapping
+            .remap_row_ids(&[addr(1, 0), addr(1, 8), addr(1, 80)])
+            .await
+            .unwrap();
+        assert_eq!(counting.take(), (2, 24));
+    }
 
     #[tokio::test]
     async fn mapping_single_and_batch_translation_are_lazy() {
