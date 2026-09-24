@@ -29,7 +29,7 @@ use crate::index::{
 
 /// Scoring and output remain bounded even when the encoded partition spills.
 /// A multiple of 32 also matches RQ's packed sign-code group size.
-const VECTOR_BATCH_SIZE: usize = 1024;
+const MAX_VECTOR_BATCH_SIZE: usize = 8192;
 
 // Small SIMD batches do not justify a CPU-pool round trip. Larger distances
 // run on the CPU pool; inline batches yield cooperatively in the scan loop.
@@ -40,7 +40,7 @@ const MIN_OFFLOAD_BYTES: usize = 256 * 1024;
 /// The staging budget is not a process-wide memory limit. It excludes quantizer
 /// models, row masks, spill metadata and in-flight scoring buffers.
 /// With spilled codes, each in-flight job may retain an anchor batch, a
-/// candidate batch and at most one output batch, each bounded to 1,024 rows.
+/// candidate batch and at most one output batch, each bounded to 8,192 rows (smaller batches for wide codes).
 ///
 /// ```
 /// use lance::index::vector::dedup::DuplicatePairsOptions;
@@ -363,15 +363,17 @@ async fn partition_stream(
         .index
         .prepare_pairwise_partition(
             partition.id,
-            VECTOR_BATCH_SIZE,
+            MAX_VECTOR_BATCH_SIZE,
             options.memory_limit,
             session.spill_store(),
         )
         .await?;
+    let batch_size = prepared.vector_batch_size();
     let prepared = Arc::new(prepared);
     let state = PairWork {
         prepared,
         count,
+        batch_size,
         filter: partition.mask,
         threshold,
         schema: schema.clone(),
@@ -399,6 +401,7 @@ async fn partition_stream(
 struct PairWork {
     prepared: Arc<PairwisePartition>,
     count: usize,
+    batch_size: usize,
     filter: Arc<RowAddrMask>,
     threshold: f32,
     schema: SchemaRef,
@@ -418,7 +421,7 @@ impl PairWork {
             if self.anchor.is_none() {
                 self.anchor = Some(
                     self.prepared
-                        .read_vectors(self.anchor_start / VECTOR_BATCH_SIZE)
+                        .read_vectors(self.anchor_start / self.batch_size)
                         .await?,
                 );
                 self.anchor_row = 0;
@@ -443,7 +446,7 @@ impl PairWork {
                 continue;
             }
             let start = self.candidate_start;
-            let end = start.saturating_add(VECTOR_BATCH_SIZE).min(self.count);
+            let end = start.saturating_add(self.batch_size).min(self.count);
             let query = anchor.clone();
             let first = (self.anchor_start + self.anchor_row + 1)
                 .saturating_sub(start)
@@ -458,7 +461,7 @@ impl PairWork {
                 query,
                 query_row: self.anchor_row,
                 first,
-                candidate_batch: start / VECTOR_BATCH_SIZE,
+                candidate_batch: start / self.batch_size,
                 // Reuse the anchor's codes for same-batch comparisons.
                 candidate: (start == self.anchor_start).then(|| anchor.clone()),
                 filter: self.filter.clone(),

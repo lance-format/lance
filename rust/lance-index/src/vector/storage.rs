@@ -50,6 +50,9 @@ use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
 /// Coalesce source-index reads independently of the scoring vector batch size.
 const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
+// Bound each scoring/spill batch in code space; very wide vectors still need
+// at least one aligned group of 32 rows for packed quantizers.
+const PAIRWISE_VECTOR_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
 where
@@ -763,6 +766,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// Prepare invocation-owned compact codes once, coalescing small partitions
     /// into one source read and spilling large partitions in bounded batches.
+    /// `batch_size` is a maximum; wide code rows use smaller power-of-two
+    /// batches targeting 16 MiB, with a minimum packed group of 32 rows.
     pub async fn prepare_pairwise_partition(
         &self,
         partition_id: usize,
@@ -804,6 +809,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let width = field.data_type().byte_width_opt()?;
                 sum.checked_add(width.checked_add(width.div_ceil(8))?.checked_add(8)?)
             });
+        let batch_size = row_bytes
+            .and_then(|width| PAIRWISE_VECTOR_BATCH_BYTES.checked_div(width))
+            .filter(|&rows| rows < batch_size)
+            .map(|rows| 1usize << rows.max(32).ilog2())
+            .unwrap_or(batch_size);
         let fits = row_bytes
             .and_then(|width| width.checked_mul(num_rows))
             .and_then(|bytes| bytes.checked_add(4096))

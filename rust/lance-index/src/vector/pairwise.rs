@@ -192,6 +192,12 @@ pub struct PairwisePartition {
     pub(crate) num_rows: usize,
 }
 impl PairwisePartition {
+    /// Number of rows per scoring batch, possibly smaller than the requested
+    /// maximum to bound wide code arrays. The final batch can contain fewer rows.
+    pub fn vector_batch_size(&self) -> usize {
+        self.batch_size
+    }
+
     /// Read one code batch. Batch boundaries preserve packed RQ group alignment.
     pub async fn read_vectors(&self, batch_id: usize) -> Result<PairwiseVectorBatch> {
         let start = batch_id

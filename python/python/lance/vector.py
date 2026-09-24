@@ -819,9 +819,10 @@ def find_duplicate_pairs(
     are repacked into bit planes once during staging. Staging completes before
     emitting pairs from the partition. This budget excludes quantizer models,
     row masks, spill metadata, preparation and in-flight buffers; it is not a
-    process RSS limit. Scoring uses vector batches of at most 1,024 rows.
+    process RSS limit. Scoring and spill use vector batches of at most 8,192
+    rows, reduced for wide codes to target 16 MiB per batch (at least 32 rows).
     ``max_concurrency`` limits in-flight scoring jobs (positive; defaults to the
-    CPU pool size capped at eight). Each job produces at most 1,024 pairs and,
+    CPU pool size capped at eight). Each job produces at most 8,192 pairs and,
     on the spill path, may retain an anchor batch and a candidate batch.
     Completion is ordered so the pair order is independent of concurrency.
 
