@@ -3,20 +3,16 @@
 
 //! Bringing a batch written under one schema to the schema in force now.
 //!
-//! A MemWAL holds rows written under whatever schema the table had at the time,
-//! and they are read and replayed against the schema it has now. Resolving one
-//! to the other is done once, here, and the result drives both: replay applies
-//! it to a WAL entry, and a scan applies it to a generation's batches.
+//! A MemWAL holds rows written under older schemas, read and replayed against
+//! the current one. That resolution happens once, here, and drives both replay
+//! and scans.
 //!
-//! Columns are matched by **field id**. A rename changes a field's name and
-//! keeps its id, so a name is not identity: a source column of the same name
-//! under a different id is a different column, and reading it would answer with
-//! values the table no longer has. A name is matched only where identity is
-//! absent, as in a batch a caller has just handed in.
+//! Columns match by **field id**. A rename keeps the id and changes the name, so
+//! the same name under a different id is a different column. Names are used only
+//! where no id exists, as in a batch a caller just handed in.
 //!
-//! Nothing here has to tell a cast from a column dropped and replaced, which no
-//! rule can: a table with a MemWAL refuses to change a column's type, so the
-//! only way for an id to disappear is a drop.
+//! A table with a MemWAL refuses type changes, so an id that disappears always
+//! means the column was dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;

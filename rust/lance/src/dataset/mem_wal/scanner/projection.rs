@@ -210,12 +210,10 @@ pub(super) fn force_schema(
 /// Wrap `plan` to emit exactly `target_schema`. Source columns are forwarded by
 /// name; anything the source lacks is filled with typed nulls.
 ///
-/// The null fill is for one caller: a MemWAL generation arm, where a column the
-/// table declares and the generation predates genuinely holds nothing for those
-/// rows. It used to be an internal error, which is the diagnostic a planner bug
-/// would have tripped -- so a caller outside that shape now gets silent null
-/// columns where it would once have been told. Do not reach for this to
-/// normalise a plan whose columns should all be present.
+/// The null fill exists for MemWAL generation arms, where a column the table
+/// declares really does hold nothing for rows written before it. Do not use it
+/// to normalise a plan whose columns should all be present: a missing column is
+/// then silently null instead of an error.
 ///
 /// Reports `target_schema` exactly, nullability included — see [`force_schema`].
 pub fn project_to_canonical(

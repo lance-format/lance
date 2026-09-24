@@ -1604,14 +1604,12 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
 
 /// A batch a caller just handed in, under the storage schema.
 ///
-/// Live input is trusted for its values and not for its identity: it has been
-/// validated against the logical schema, so its columns are the right ones in
-/// the right order, and any field ids it carries are the caller's to claim
-/// rather than the table's to honour. Dropping them leaves the columns matched
-/// by name, which is what a validated batch's order already established.
+/// A live batch has already been validated against the logical schema, so its
+/// columns are the right ones in the right order, and any ids it carries are the
+/// caller's rather than the table's. Dropping them leaves matching by name.
 ///
-/// A replayed entry is the opposite: its ids are the table's, written when the
-/// entry was, and they are the only thing that survives a rename.
+/// A replayed entry is the opposite: its ids are the table's, and they are what
+/// survives a rename.
 fn conform_live_batch(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -1630,18 +1628,13 @@ fn conform_live_batch(
 /// Re-label `batch` to the storage schema, matching columns by **field id**
 /// where both sides carry one, and by **name** otherwise.
 ///
-/// A column the schema declares and the batch does not carry is filled with
-/// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
-/// and the schema does not declare is dropped.
+/// A column the schema declares and the batch lacks is filled with typed nulls,
+/// `_tombstone` with `false`; a column the schema does not declare is dropped.
+/// This is what a replayed entry looks like once the schema has moved on.
 ///
-/// Ids are tried first: a name match would null the new name and drop the old
-/// one, losing the column's values. An entry carrying no ids falls back to the
-/// name match.
-///
-/// Both are what a replayed WAL entry looks like after the table's schema
-/// moved: it predates a column added since, and carries one dropped since. A
-/// live write arrives already checked against the logical schema, so for it
-/// every column is present and this only appends `_tombstone`.
+/// Ids are tried first because a name match across a rename would null the new
+/// name and drop the old one, losing the values. Entries without ids fall back
+/// to names.
 ///
 /// A column whose scalar type has moved is an error rather than a cast: a table
 /// with a MemWAL refuses a retype, so a disagreement here is one to surface.

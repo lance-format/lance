@@ -8,36 +8,29 @@
 //!
 //! # Limitations
 //!
-//! The set named by `maintained_indexes` is fixed at initialization: an index
-//! created later is not maintained over the fresh tier, and covers a row once
-//! that row reaches the base table. An index the set names that the dataset no
-//! longer has is skipped when a shard opens, so the table keeps serving without
-//! the fresh tier's copy of it. Naming one that does not exist is rejected at
-//! initialization, the last moment it can be corrected.
+//! `maintained_indexes` is fixed at initialization. An index created later is
+//! not maintained over the fresh tier. An index in the set that the dataset no
+//! longer has is skipped when a shard opens; naming one that never existed is
+//! rejected at initialization.
 //!
-//! A rename reaches the sealed generations and the replay, but not the active
-//! MemTable, which serves under the names it was created with until its writer
-//! reopens.
+//! A rename reaches sealed generations and replay, but not the active MemTable,
+//! which keeps its original names until its writer reopens.
 //!
 //! # Upgrading
 //!
-//! A generation is read by matching the field ids it stores against the table's.
-//! Generations flushed before that read existed carry ids assigned positionally,
-//! and mispair against a table whose ids have gaps. Nothing in a generation says
-//! which scheme numbered it, so a deployment predating this read must compact
-//! its generations into base before upgrading. Durable WAL entries are
-//! unaffected: they carry no ids and take the name-matching path.
+//! Generations are read by field id. Ones flushed before that carry positional
+//! ids instead, which mispair against a table whose ids have gaps, and nothing
+//! records which scheme a generation used. Compact generations into base before
+//! upgrading. Durable WAL entries are unaffected: they carry no ids.
 //!
 //! # Known gaps
 //!
-//! A schema change begun on a handle opened before a MemWAL was installed
-//! commits past the installation: the refusals below read the MemWAL state from
-//! the caller's handle, and the conflict resolver treats the two commits as
-//! compatible in either order.
+//! A schema change started on a handle opened before the MemWAL was installed
+//! still commits: the refusals below read MemWAL state from the caller's
+//! handle, and the conflict resolver accepts both commits in either order.
 //!
-//! Adding a column is not refused the way altering one is, so a transform that
-//! derives a non-nullable column leaves rows in a generation written earlier
-//! with no value to project for it.
+//! Adding a non-nullable column is not refused, which leaves rows in older
+//! generations with no value for it.
 
 use std::collections::HashMap;
 use std::sync::Arc;

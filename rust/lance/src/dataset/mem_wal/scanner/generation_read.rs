@@ -30,23 +30,18 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
 /// One sealed generation, read under the table's schema.
 ///
-/// Built from the generation's own schema and the table's id-carrying schema.
-/// It answers three questions, in the order a scan needs them: what to project
-/// from the file ([`Self::stored_projection`]), whether a predicate can be
-/// pushed into it and under which names ([`Self::to_stored`]), and how to
-/// bring the result back to the table's names and shapes
-/// ([`Self::reconcile`]).
+/// Answers what to project ([`Self::stored_projection`]), whether a predicate
+/// can be pushed down and under which names ([`Self::to_stored`]), and how to
+/// bring the result back to the table's names ([`Self::reconcile`]).
 ///
-/// # The invariant this rests on
+/// # Invariant
 ///
-/// A field id must identify a column for as long as any generation holds it.
-/// Lance does not enforce it: `max_field_id` is the maximum over the current
-/// schema and the fields the base fragments reference, so dropping a column can
-/// lower it and let the next added column take the id back. Resolving by id
-/// then reads the retired values as the column that took it, which nothing in
-/// either schema tells apart from a rename. Keeping the invariant is the
-/// caller's: a consumer that retains generations must drain them before a
-/// drop/add sequence can reuse an id they still hold.
+/// A field id must keep identifying the same column while any generation holds
+/// it. Lance does not enforce this: `max_field_id` is a maximum over the current
+/// schema and base fragments, so dropping a column can lower it and let the next
+/// added column reuse the id. Reads then serve the dropped column's values as
+/// the new one. Callers that retain generations must drain them before a
+/// drop/add can reuse an id.
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
     stored_schema: Schema,
@@ -129,13 +124,11 @@ impl GenerationRead {
     /// `expr` with each column reference moved to the name this generation
     /// stores it under, so it can be pushed into the generation's own scan.
     ///
-    /// `None` when a referenced column is one this generation does not store,
-    /// or stores under a different shape. A nested reference names the parent
-    /// (`info.a` refers to `info`), and a parent's name does not move when a
-    /// child is renamed — so the parent's whole type is compared, not its name.
-    /// A nested column nothing moved inside is pushed down like any other.
-    /// Otherwise the predicate belongs above the reconciliation, where the
-    /// columns it names exist.
+    /// `None` when the generation does not store a referenced column, or stores
+    /// it under a different shape; the predicate then runs above the
+    /// reconciliation instead. A nested reference names its parent (`info.a`
+    /// refers to `info`), and a child rename does not move the parent's name, so
+    /// the parent's whole type is compared rather than its name.
     pub(super) fn to_stored(&self, expr: &Expr) -> Option<Expr> {
         let pushable = expr
             .column_refs()
@@ -239,14 +232,12 @@ impl GenerationRead {
         Schema::new_with_metadata(fields, source.metadata().clone())
     }
 
-    /// The schema [`Self::reconcile`] produces: the projected columns as the table
-    /// declares them, then whatever else the scan carries.
+    /// The schema [`Self::reconcile`] produces: the projected columns under the
+    /// table's names, then whatever else the scan carries.
     ///
-    /// Nullability comes from the source, not the table: a generation stores
-    /// every non-key column as nullable, which is what lets a strict table hold
-    /// a tombstone. A point lookup carries tombstones through on purpose, so
-    /// those rows have to survive this. The table's own nullability is restored
-    /// by the canonical projection each arm passes through, after the
+    /// Nullability comes from the source, not the table, because generations
+    /// store non-key columns as nullable so a strict table can hold a tombstone.
+    /// Each arm's canonical projection restores the table's nullability once
     /// tombstones are dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
         let mut fields: Vec<Field> = self

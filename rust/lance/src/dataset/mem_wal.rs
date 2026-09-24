@@ -119,17 +119,13 @@ pub fn relax_non_pk_nullability(
 
 /// The schema's Arrow form, with each field's id carried in its metadata.
 ///
-/// `From<&Field> for ArrowField` drops the id, which leaves everything
-/// downstream matching on name alone. That holds until a column is renamed: the
-/// name is the part a rename changes and the id is the part it keeps, so a
-/// name-only match loses the column. Data files have always been addressed by
-/// id (`DataFile.fields` lists them); carrying it into the memtable's storage
-/// schema puts the fresh tier on the same footing, and Arrow IPC keeps field
-/// metadata, so every WAL entry written under this schema carries it too.
+/// `From<&Field> for ArrowField` drops the id, leaving everything downstream
+/// matching on name — which loses a column across a rename. Arrow IPC preserves
+/// field metadata, so entries written under this schema carry the id too.
 ///
-/// Scoped to the memtable path deliberately: emitting the id from the global
-/// Arrow conversion would change every schema Lance hands out, including for
-/// callers that compare schemas for equality.
+/// Scoped to the memtable path on purpose: emitting ids from the global Arrow
+/// conversion would change every schema Lance hands out, including for callers
+/// that compare schemas for equality.
 pub fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
     let arrow: ArrowSchema = schema.into();
     let fields: Vec<ArrowField> = arrow
@@ -210,20 +206,14 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 
 /// `batches`, written under `source_schema`, brought to `target_schema`.
 ///
-/// Columns are matched by field id where both sides carry one, and by name
-/// otherwise. A column `target_schema` declares and the batches do not carry is
-/// filled with typed nulls; `_tombstone` is filled with `false`. A column the
-/// batches carry and `target_schema` does not declare is dropped. A primary key
-/// the batches do not carry is an error, since no value can stand in for it.
+/// Columns match by field id where both sides carry one, by name otherwise, at
+/// every level including inside structs, so a rename is followed. A column the
+/// target declares and the batches lack is filled with typed nulls, `_tombstone`
+/// with `false`; a column the target does not declare is dropped; a missing
+/// primary key is an error.
 ///
-/// This is the same resolution a read of a sealed generation applies, offered
-/// to a caller that reads one for itself. Matching nested children by name
-/// cannot follow a rename: a struct's children carry ids of their own, and only
-/// those relate a generation's copy of a column to the table's.
-///
-/// `batches` must be in `source_schema`'s column order, as a scan of the
-/// dataset it describes returns them. The result is in `target_schema`'s order,
-/// under a schema carrying no field ids.
+/// `batches` must be in `source_schema` order. The result is in `target_schema`
+/// order, without field ids.
 pub fn reconcile_batches(
     source_schema: &ArrowSchema,
     target_schema: &Arc<ArrowSchema>,
