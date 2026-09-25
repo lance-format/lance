@@ -80,8 +80,14 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
 /// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Writer-only protection for provider-neutral clustering metadata.
+///
+/// Reserved, not supported, until writers preserve configuration and maintain
+/// fragment markers across every operation. This is one common capability,
+/// not a bit per provider or layout version. Ordinary readers need no bit.
+pub const FLAG_CLUSTERING_METADATA: u64 = 1 << 12;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 12;
+pub const FLAG_UNKNOWN: u64 = 1 << 13;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -94,6 +100,7 @@ const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_CLUSTERING_METADATA < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 =
     FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX;
@@ -249,6 +256,7 @@ fn supported_flags_when(overlay_enabled: bool, spilled_row_lineage_enabled: bool
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
+    mark_supported(&mut supported, FLAG_CLUSTERING_METADATA, false);
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
@@ -378,6 +386,21 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn test_clustering_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_CLUSTERING_METADATA;
+        ensure_can_read_manifest(&manifest).unwrap();
+        assert!(matches!(
+            ensure_can_write_manifest(&manifest).unwrap_err(),
+            Error::NotSupported { .. }
+        ));
+        assert!(!can_read_dataset(FLAG_CLUSTERING_METADATA));
+        assert!(!can_write_dataset(FLAG_CLUSTERING_METADATA));
+        assert_eq!(FLAG_CLUSTERING_METADATA, 1 << 12);
+        assert_eq!(FLAG_UNKNOWN, 1 << 13);
+    }
 
     /// Reserved ahead of its implementation: refused for reading and writing
     /// until the handling lands, so a build from the gap cannot open the table.

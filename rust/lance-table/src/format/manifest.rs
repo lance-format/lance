@@ -1071,6 +1071,7 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
+            clustering: None,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1185,6 +1186,69 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_proto_retains_provider_versions_and_unknown_metadata() {
+        let markers = [
+            pb::FragmentClustering {
+                provider: "org.example.first".into(),
+                version: 7,
+            },
+            pb::FragmentClustering {
+                provider: "org.example.second".into(),
+                version: 7,
+            },
+        ];
+        let unknown_configuration = HashMap::from([
+            ("schema_version".into(), "1".into()),
+            ("boundaries".into(), "[0, 100, 200]".into()),
+            ("unknown_option".into(), "  opaque value: 東京  ".into()),
+            ("empty_option".into(), String::new()),
+        ]);
+        // Test the wire contract only; runtime state handling is not enabled yet.
+        let manifest = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
+            clustering: Some(pb::Clustering {
+                columns: vec![0],
+                provider: "org.example.first".into(),
+                version: 8,
+                provider_metadata: unknown_configuration,
+            }),
+            fragments: markers
+                .into_iter()
+                .enumerate()
+                .map(|(id, marker)| pb::DataFragment {
+                    id: id as u64,
+                    clustering: Some(marker),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let decoded = pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.reader_feature_flags, 0);
+        let mut empty_metadata = manifest.clone();
+        empty_metadata
+            .clustering
+            .as_mut()
+            .unwrap()
+            .provider_metadata
+            .clear();
+        assert_eq!(
+            pb::Manifest::decode(empty_metadata.encode_to_vec().as_slice()).unwrap(),
+            empty_metadata
+        );
+        // Disabling new clustering work does not erase historical fragment markers.
+        let disabled = pb::Manifest {
+            clustering: None,
+            ..manifest
+        };
+        assert_eq!(
+            pb::Manifest::decode(disabled.encode_to_vec().as_slice()).unwrap(),
+            disabled
+        );
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

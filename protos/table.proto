@@ -32,6 +32,34 @@ message UUID {
   bytes uuid = 1;
 }
 
+// Identifies the provider and layout version that organized a fragment.
+message FragmentClustering {
+  // Non-empty, case-sensitive implementation name. Namespaced names are recommended.
+  string provider = 1;
+  /* Provider-assigned layout identifier. Zero is invalid. This is neither a
+   * dataset version nor the version of the provider's software.
+   */
+  uint64 version = 2;
+}
+
+// Current table-level clustering configuration. History is provider-managed.
+message Clustering {
+  /* Ordered, non-empty list of distinct schema field IDs, not column names.
+   * These identify all columns on which the layout depends.
+   */
+  repeated int32 columns = 1;
+  // Non-empty, case-sensitive implementation name. Namespaced names are recommended.
+  string provider = 2;
+  // Non-zero, provider-assigned layout/configuration version, not a software version.
+  uint64 version = 3;
+  /* Provider-defined configuration, using the same string key-value shape as
+   * Manifest.config. An empty map means no provider-specific configuration.
+   * Unknown keys and values must be preserved without interpretation.
+   * The provider defines value encoding, schema versioning, and compatibility.
+   */
+  map<string, string> provider_metadata = 4;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -146,6 +174,8 @@ message Manifest {
    *
    * The flag identities are the same as for reader_feature_flags, but the values of
    * reader_feature_flags and writer_feature_flags are not required to be identical.
+   * Bit 1 << 12 protects clustering configuration and fragment layout markers.
+   * It is writer-only: readers do not need to interpret clustering metadata.
    */
   uint64 writer_feature_flags = 10;
 
@@ -243,6 +273,11 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  /* Optional current clustering configuration. Absence disables new clustering
+   * work without clearing existing fragment markers. Requires writer flag 1 << 12.
+   */
+  Clustering clustering = 22;
 } // Manifest
 
 // external dataset base path
@@ -457,6 +492,12 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* Optional provider and layout version that organized this fragment.
+   * Absence makes no clustering claim. The version may differ from the current
+   * table configuration; a generic rewrite must not inherit this marker.
+   */
+  FragmentClustering clustering = 15;
 }
 
 message DataFile {
