@@ -529,9 +529,9 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
 /// leaves rows of the same age holding different values, and no later pass
 /// corrects it.
 ///
-/// An expression qualifies by folding to a null literal. Only one that reads no
-/// column and is not volatile folds to a literal at all, so that is the whole
-/// test.
+/// An expression is allowed only if simplifying it gives a null constant. One
+/// that reads a column, or that changes from call to call like `random()`, does
+/// not simplify to a constant at all, so it never qualifies.
 fn adds_only_nulls(dataset: &Dataset, transforms: &NewColumnTransform) -> Result<bool> {
     match transforms {
         NewColumnTransform::AllNulls(_) => Ok(true),
