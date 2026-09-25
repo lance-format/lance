@@ -18,8 +18,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use fst::Streamer;
 use futures::{StreamExt, TryStreamExt};
-use lance_arrow::json::JSON_EXT_NAME;
-use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_arrow::iter_str_array;
+use lance_arrow::json::JsonEncoding;
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
@@ -2401,13 +2401,19 @@ async fn merge_metadata_files(
 /// The input stream must be one of:
 /// 1. Document in Utf8 or LargeUtf8 format.
 /// 2. Document in List(Utf8) or List(LargeUtf8) format.
-/// 3. Json document in LargeBinary format.
+/// 3. Json document, as Lance JSONB or Arrow JSON text.
 pub fn document_input(
     input: SendableRecordBatchStream,
     column: &str,
 ) -> Result<SendableRecordBatchStream> {
     let schema = input.schema();
     let field = schema.column_with_name(column).expect_ok()?.1;
+    if JsonEncoding::of_field(field).is_some() {
+        return Ok(Box::pin(JsonTextStream::try_new(
+            input,
+            column.to_string(),
+        )?));
+    }
     match field.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(input),
         DataType::List(field) | DataType::LargeList(field)
@@ -2415,14 +2421,6 @@ pub fn document_input(
         {
             Ok(input)
         }
-        DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
-            Some(name) if name.as_str() == JSON_EXT_NAME => {
-                Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
-            }
-            _ => Err(Error::invalid_input_source(
-                format!("column {} is not json", column).into(),
-            )),
-        },
         _ => Err(Error::invalid_input_source(
             format!(
                 "column {} has type {}, is not utf8, large utf8 type/list, or large binary",

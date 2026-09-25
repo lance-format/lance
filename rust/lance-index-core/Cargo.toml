@@ -28,6 +28,7 @@ prost-types.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

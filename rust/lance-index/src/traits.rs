@@ -23,6 +23,8 @@ pub struct IndexCriteria<'a> {
     pub fts_document_granularity: Option<DocumentGranularity>,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
+    /// If true, only consider indices that support MinHash similarity search
+    pub must_support_minhash: bool,
 }
 
 impl<'a> IndexCriteria<'a> {
@@ -60,6 +62,12 @@ impl<'a> IndexCriteria<'a> {
     /// or an index like a bloom filter
     pub fn supports_exact_equality(mut self) -> Self {
         self.must_support_exact_equality = true;
+        self
+    }
+
+    /// Only consider MinHash LSH indices
+    pub fn supports_minhash(mut self) -> Self {
+        self.must_support_minhash = true;
         self
     }
 }
@@ -248,6 +256,9 @@ impl Display for FtsPrewarmPartitionStatus {
         if !self.documents.reverse_lookup_ready {
             missing.push("reverse document lookup");
         }
+        if !self.documents.ascending_addresses_ready {
+            missing.push("memoized ascending-address gate");
+        }
         if !self.documents.projection_resident {
             missing.push("resident row-address projection");
         }
@@ -280,6 +291,11 @@ pub struct FtsPrewarmDocumentStatus {
     pub prewarm_complete: bool,
     pub scoring_ready: bool,
     pub reverse_lookup_ready: bool,
+    /// Whether the memoized "are the stored addresses strictly ascending?"
+    /// answer is populated. Cross-field search reads it on every query, so a
+    /// prewarmed partition that left it empty would still pay an O(num_docs)
+    /// address scan on its first query.
+    pub ascending_addresses_ready: bool,
     pub projection_resident: bool,
 }
 
@@ -288,6 +304,7 @@ impl FtsPrewarmDocumentStatus {
         self.prewarm_complete
             && self.scoring_ready
             && self.reverse_lookup_ready
+            && self.ascending_addresses_ready
             && self.projection_resident
     }
 }

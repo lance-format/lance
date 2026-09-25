@@ -542,6 +542,21 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 let op = Operation::Restore { version };
                 Ok(Self(op))
             }
+            "Clone" => {
+                let is_shallow = ob.getattr("is_shallow")?.extract()?;
+                let ref_name = ob.getattr("ref_name")?.extract()?;
+                let ref_version = ob.getattr("ref_version")?.extract()?;
+                let ref_path = ob.getattr("ref_path")?.extract()?;
+                let branch_name = ob.getattr("branch_name")?.extract()?;
+                let op = Operation::Clone {
+                    is_shallow,
+                    ref_name,
+                    ref_version,
+                    ref_path,
+                    branch_name,
+                };
+                Ok(Self(op))
+            }
             "Rewrite" => {
                 let groups = extract_vec(&ob.getattr("groups")?)?;
                 let rewritten_indices = extract_vec(&ob.getattr("rewritten_indices")?)?;
@@ -780,6 +795,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Restore class");
                 cls.call1((version,))
             }
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+                branch_name,
+            } => {
+                let cls = namespace
+                    .getattr("Clone")
+                    .expect("Failed to get Clone class");
+                cls.call1((is_shallow, ref_name, ref_version, ref_path, branch_name))
+            }
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
@@ -866,7 +893,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            _ => todo!(),
+            unsupported => Err(PyValueError::new_err(format!(
+                "Unsupported operation: {}",
+                unsupported.name()
+            ))),
         }
     }
 }

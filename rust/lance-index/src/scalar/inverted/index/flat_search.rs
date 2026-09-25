@@ -62,7 +62,7 @@ pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer);
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -88,7 +88,7 @@ pub(super) fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer);
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -875,7 +875,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
     let pre_await_start = std::time::Instant::now();
-    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
+    let query_tokens = Arc::new(try_collect_query_tokens(&query, &mut tokenizer)?);
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
     // searchable content and matches nothing. Return early rather than

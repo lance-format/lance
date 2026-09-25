@@ -720,7 +720,7 @@ impl LsmScanner {
                 extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
             let mut planner =
-                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)
+                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)?
                     .with_identity_schema(Arc::clone(&self.identity_schema));
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());

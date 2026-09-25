@@ -733,6 +733,7 @@ impl PyLsmPointLookupPlanner {
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
         let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
             .with_identity_schema(identity_schema);
         Ok(Self {
             planner,

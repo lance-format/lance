@@ -22,6 +22,7 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::write::BatchStore;
 
 /// Column name for row address (consistent with base table scanner).
@@ -291,13 +292,21 @@ impl ExecutionPlan for MemTableScanExec {
                     return None;
                 }
 
-                // Apply projection
+                // Apply projection. `indices` name whole top-level columns; a
+                // projected struct leaf is narrowed against `schema`.
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> =
                     if let Some(ref indices) = projection {
-                        indices
-                            .iter()
-                            .map(|&i| filtered_batch.column(i).clone())
-                            .collect()
+                        let batch_schema = filtered_batch.schema();
+                        match take_projected_columns(
+                            filtered_batch.columns(),
+                            batch_schema.fields(),
+                            indices,
+                            schema.as_ref(),
+                            filtered_batch.num_rows(),
+                        ) {
+                            Ok(cols) => cols,
+                            Err(e) => return Some(Err(e)),
+                        }
                     } else {
                         filtered_batch.columns().to_vec()
                     };

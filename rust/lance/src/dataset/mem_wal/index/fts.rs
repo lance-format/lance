@@ -183,6 +183,15 @@ pub enum FtsQueryExpr {
         /// boost query identically. Scores may go negative.
         negative_boost: f32,
     },
+    /// Disjunction scored by the best child: a document's score is the highest
+    /// among the children that match it (`DisjunctionScore::Max`), which is how
+    /// the compound scorer ranks a multi-match over committed data. The
+    /// children are the leaves of an index-level multi-match, each bound to its
+    /// own column, so a tree spanning fields still routes leaf by leaf.
+    MultiMatch {
+        /// The alternatives, scored independently.
+        children: Vec<Self>,
+    },
 }
 
 /// Default maximum number of fuzzy expansions.
@@ -383,9 +392,9 @@ impl FtsQueryExpr {
                 max_expansions,
                 boost,
             },
-            // Boolean and Boost don't carry a top-level boost field today.
+            // Compound nodes don't carry a top-level boost field today.
             // Preserved as-is to keep behavior identical to the previous impl.
-            other @ (Self::Boolean { .. } | Self::Boost { .. }) => other,
+            other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
         }
     }
 
@@ -428,7 +437,7 @@ impl FtsQueryExpr {
                 max_expansions,
                 boost,
             },
-            other @ (Self::Boolean { .. } | Self::Boost { .. }) => other,
+            other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
         }
     }
 
@@ -439,7 +448,7 @@ impl FtsQueryExpr {
             Self::Match { column, .. }
             | Self::Phrase { column, .. }
             | Self::Fuzzy { column, .. } => column.as_deref(),
-            Self::Boolean { .. } | Self::Boost { .. } => None,
+            Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. } => None,
         }
     }
 
@@ -465,6 +474,9 @@ impl FtsQueryExpr {
                 negative: negative.map(|n| Box::new(n.bind_unbound_leaves(column))),
                 negative_boost,
             },
+            Self::MultiMatch { children } => Self::MultiMatch {
+                children: bind_all(children, column),
+            },
             leaf if leaf.column().is_some() => leaf,
             leaf => leaf.with_column(column),
         }
@@ -489,6 +501,7 @@ impl FtsQueryExpr {
                 positive.has_unbound_leaf()
                     || negative.as_ref().is_some_and(|n| n.has_unbound_leaf())
             }
+            Self::MultiMatch { children } => children.iter().any(Self::has_unbound_leaf),
             leaf => leaf.column().is_none(),
         }
     }
@@ -513,6 +526,11 @@ impl FtsQueryExpr {
                     visit(positive, out);
                     if let Some(negative) = negative {
                         visit(negative, out);
+                    }
+                }
+                FtsQueryExpr::MultiMatch { children } => {
+                    for child in children {
+                        visit(child, out);
                     }
                 }
                 leaf => {
@@ -1814,6 +1832,11 @@ impl FtsMemIndex {
                         visit(index, query, terms)?;
                     }
                 }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
+                }
             }
             Ok(())
         }
@@ -1883,6 +1906,11 @@ impl FtsMemIndex {
                     {
                         visit(index, query, scorer, leaves)?;
                     }
+                }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
                 }
             }
             Ok(())
@@ -2481,8 +2509,9 @@ impl FtsMemIndex {
     }
 
     /// `limit` is the caller's top-k, threaded down so a top-level `Match`
-    /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`) need
-    /// their children's full result sets, so they pass `None` downward.
+    /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`/
+    /// `MultiMatch`) need their children's full result sets, so they pass
+    /// `None` downward.
     /// `include_tail` selects read-your-writes vs immutable-only (see
     /// [`SearchOptions::include_tail`]) and is threaded uniformly to every leaf.
     fn search_query_with_state(
@@ -2494,7 +2523,9 @@ impl FtsMemIndex {
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
         match query {
-            FtsQueryExpr::Boolean { .. } | FtsQueryExpr::Boost { .. } => {
+            FtsQueryExpr::Boolean { .. }
+            | FtsQueryExpr::Boost { .. }
+            | FtsQueryExpr::MultiMatch { .. } => {
                 // Every leaf of this subtree searches this index, so the leaf
                 // evaluator ignores the binding and keeps the one snapshot.
                 combine_compound(query, &|leaf| {
@@ -2560,7 +2591,9 @@ impl FtsMemIndex {
             }
             // `combine_compound` routes compound nodes itself and only ever
             // hands a leaf here.
-            FtsQueryExpr::Boolean { .. } | FtsQueryExpr::Boost { .. } => Vec::new(),
+            FtsQueryExpr::Boolean { .. }
+            | FtsQueryExpr::Boost { .. }
+            | FtsQueryExpr::MultiMatch { .. } => Vec::new(),
         }
     }
 
@@ -3395,8 +3428,9 @@ fn relaxed_score_threshold(anchor: f32, factor: f32) -> f32 {
 ///
 /// The clause algebra is the contract the committed compound scorer applies:
 /// MUST intersects and sums (`RequiredConjunctionScorer`), SHOULD sums into the
-/// surviving set (`DisjunctionScore::Sum`), MUST_NOT excludes, and a boost
-/// subtracts `negative_boost * negative_score`. It is the same whether the
+/// surviving set (`DisjunctionScore::Sum`), MUST_NOT excludes, a boost
+/// subtracts `negative_boost * negative_score`, and a multi-match keeps each
+/// document's best child (`DisjunctionScore::Max`). It is the same whether the
 /// leaves all come from one index or from one index per column — only
 /// `eval_leaf` differs.
 fn combine_compound<F>(expr: &FtsQueryExpr, eval_leaf: &F) -> Vec<FtsEntry>
@@ -3414,8 +3448,32 @@ where
             negative,
             negative_boost,
         } => combine_boost(positive, negative.as_deref(), *negative_boost, eval_leaf),
+        FtsQueryExpr::MultiMatch { children } => combine_multi_match(children, eval_leaf),
         leaf => eval_leaf(leaf),
     }
+}
+
+fn combine_multi_match<F>(children: &[FtsQueryExpr], eval_leaf: &F) -> Vec<FtsEntry>
+where
+    F: Fn(&FtsQueryExpr) -> Vec<FtsEntry>,
+{
+    // A document matching several children is in several result sets and
+    // comes back once, at the highest of its scores.
+    let mut best: HashMap<DocumentKey, f32> = HashMap::new();
+    for child in children {
+        for entry in combine_compound(child, eval_leaf) {
+            best.entry(entry.key())
+                .and_modify(|score| *score = score.max(entry.score))
+                .or_insert(entry.score);
+        }
+    }
+    best.into_iter()
+        .map(|(key, score)| FtsEntry {
+            row_position: key.row_position,
+            doc_index: public_doc_index(&key.doc_index),
+            score,
+        })
+        .collect()
 }
 
 fn combine_boost<F>(
@@ -5805,6 +5863,64 @@ mod tests {
         assert!(positions.contains(&1));
         assert!(positions.contains(&2));
         assert!(positions.contains(&3));
+    }
+
+    /// A multi-match keeps each document's best child — the compound scorer's
+    /// `DisjunctionScore::Max` — rather than the sum a SHOULD would give.
+    #[test]
+    fn test_multi_match_scores_best_child() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        index
+            .insert(&create_boolean_test_batch(&schema), 0)
+            .unwrap();
+
+        let rust = FtsQueryExpr::match_query("rust");
+        let programming = FtsQueryExpr::match_query("programming").with_boost(3.0);
+        // Row 0 matches both children; row 2 matches `rust` alone.
+        let rust_at_0 = index
+            .search_query(&rust)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
+        let programming_at_0 = index
+            .search_query(&programming)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
+        let rust_at_2 = index
+            .search_query(&rust)
+            .into_iter()
+            .find(|entry| entry.row_position == 2)
+            .unwrap()
+            .score;
+
+        let query = FtsQueryExpr::MultiMatch {
+            children: vec![rust, programming],
+        };
+        let entries = index.search_query(&query);
+        let mut positions: Vec<_> = entries.iter().map(|e| e.row_position).collect();
+        positions.sort_unstable();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2, 4],
+            "every child's matches, each row once"
+        );
+        let at = |row| {
+            entries
+                .iter()
+                .find(|e| e.row_position == row)
+                .unwrap()
+                .score
+        };
+        assert!(
+            (at(0) - rust_at_0.max(programming_at_0)).abs() < 1e-6,
+            "best child, not the sum: {} vs {rust_at_0} / {programming_at_0}",
+            at(0)
+        );
+        assert!((at(2) - rust_at_2).abs() < 1e-6);
     }
 
     #[test]
