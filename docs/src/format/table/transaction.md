@@ -47,7 +47,7 @@ For detailed conflict detection and resolution mechanisms, see the [Conflict Res
 
 ## Transaction Types
 
-The authoritative specification for transaction types is defined in [`protos/transaction.proto`](https://github.com/lancedb/lance/blob/main/protos/transaction.proto).
+The authoritative specification for transaction types is defined in [`protos/transaction/`](https://github.com/lancedb/lance/tree/main/protos/transaction).
 
 Each transaction contains a `read_version` field indicating the table version from which the transaction was built,
 a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types:
@@ -559,6 +559,97 @@ Adds new base paths to the table, enabling reference to data files in additional
 An UpdateBases operation only modifies the base paths. As a result, it only conflicts with other
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
+
+## Action-Based Transactions (Transaction V2)
+
+!!! warning "Experimental"
+
+    Transaction V2 is an experimental format feature under the process in
+    [Voting](../../community/voting.md). Its protobuf field numbers are not a
+    stable contract, breaking changes may be made without a separate vote, and
+    the feature is removed from the specification and the codebase if its
+    stabilization vote does not pass. Discussion:
+    [#5960](https://github.com/lance-format/lance/discussions/5960).
+
+!!! danger "Writing Transaction V2 breaks compatibility with readers before v12.0.0"
+
+    A table version committed as a `CompositeOperation` **cannot be opened** by
+    Lance before v12.0.0 — not merely read as history. Those releases decode the
+    manifest's inline transaction section while opening the table, and an
+    operation they do not recognize decodes to no operation at all, which fails
+    the open. The fix
+    ([#7740](https://github.com/lance-format/lance/pull/7740)) shipped in
+    v12.0.0 and is not expected to be backported to earlier release lines; see
+    [#9454](https://github.com/lance-format/lance/issues/9454).
+
+    Treat this as durable, not transitional. Writing a `CompositeOperation` is
+    opt-in for exactly this reason, and a table that has one anywhere in its
+    history raises the minimum reader version for that table to v12.0.0.
+
+Every operation above is a single named verb. A transaction may instead carry a
+`CompositeOperation`: an ordered list of granular *actions* that apply
+atomically as one manifest change. This lets one commit express a change no
+single named operation covers, such as appending a fragment and updating an
+index together, and makes the transaction a true diff of the manifest rather
+than a description of intent.
+
+<details>
+<summary>CompositeOperation protobuf message</summary>
+
+```protobuf
+%%% proto.message.CompositeOperation %%%
+```
+
+</details>
+
+A `CompositeOperation` holds `UserAction`s, each a human-recognizable step with
+a description, which in turn hold the granular `Action`s applied to the
+manifest. The two levels exist so the transaction history stays readable when
+several operations are squashed into one: the descriptions survive, while the
+action lists are flattened on apply.
+
+Actions are deltas rather than post-images, and an action that allocates a new
+identifier (a field, fragment, or base id) names it with a local placeholder
+that resolves against the target's counters at apply time. Both properties are
+what let a composite operation be replayed against a newer version, or onto a
+different branch, without rewriting it.
+
+The full action vocabulary and the reasoning behind its shape are defined in
+`protos/transaction/actions.proto`.
+
+One vocabulary detail is a format contract rather than an implementation
+choice. `AddIndexSegment.fields` names only the columns the segment is keyed
+on, and `covering_fields` is an independent declaration of the columns whose
+values it carries, so the segment'''s dependency set is the union of the two.
+This is the contract an index action targets, not the legacy one where
+`IndexMetadata.fields` means keyed columns followed by carried columns. A
+declaration whose two lists overlap can only be represented by a manifest
+declaring `FLAG_INDEPENDENT_COVERING_FIELDS`; until a release implements that
+flag, apply rejects the overlapping form and lowers a disjoint one to the
+legacy subset representation.
+
+### Compatibility
+
+A `CompositeOperation` produces an ordinary manifest, so a reader that scans a
+table whose latest version was written this way needs no knowledge of the
+feature. Readers are affected in two places:
+
+- A reader that decodes the transaction itself — reading the transaction
+  history, or checking a concurrent commit for conflicts — sees an operation it
+  does not recognize. Implementations must reject it rather than treat it as a
+  no-op, so that a concurrent V2 commit aborts an in-flight commit instead of
+  being silently skipped.
+- Transactions are usually inlined into the manifest. A reader that fails when
+  an inline transaction does not decode cannot open such a table at all.
+  Implementations must tolerate an undecodable inline transaction and continue
+  opening the table, because the transaction contents are not needed to read
+  data. In the Rust implementation this has been true only since v12.0.0, which
+  is what makes writing Transaction V2 a compatibility break against earlier
+  releases rather than a graceful degradation.
+
+Conflict resolution between two `CompositeOperation`s is computed from the
+actions themselves. Between a `CompositeOperation` and any named operation it
+fails closed: the commit is rejected as a conflict rather than compared.
 
 ## Conflict Resolution
 
