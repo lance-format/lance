@@ -204,7 +204,7 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<u64>,
+        reference: Option<Ref>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
@@ -253,9 +253,14 @@ impl BlockingDataset {
             builder = builder.with_base_store_params(base_path, store_params);
         }
 
-        if let Some(ver) = version {
-            builder = builder.with_version(ver);
-        }
+        builder = match reference {
+            Some(Ref::VersionNumber(version)) | Some(Ref::Version(None, Some(version))) => {
+                builder.with_version(version)
+            }
+            Some(Ref::Version(Some(branch), version)) => builder.with_branch(&branch, version),
+            Some(Ref::Tag(tag)) => builder.with_tag(&tag),
+            Some(Ref::Version(None, None)) | None => builder,
+        };
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
@@ -1647,6 +1652,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     _obj: JObject,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1664,6 +1670,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             &mut env,
             path,
             version_obj,
+            ref_obj,
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
@@ -1721,6 +1728,7 @@ fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1734,6 +1742,10 @@ fn inner_open_native<'local>(
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
+    // ReadOptions.Builder rejects setting both, so at most one of them is present.
+    let reference = env
+        .get_optional(&ref_obj, |env, jref| transform_jref_to_ref(jref, env))?
+        .or(version.map(Ref::from));
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
@@ -1762,7 +1774,7 @@ fn inner_open_native<'local>(
 
     let dataset = BlockingDataset::open(
         &path_str,
-        version,
+        reference,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,
