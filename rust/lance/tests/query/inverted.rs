@@ -1089,9 +1089,7 @@ async fn test_element_document_nested_lists_use_deepest_boundary() {
     assert_eq!(row.fields, vec![content.id]);
     assert_ne!(row.fields, vec![docs.children[0].id]);
 
-    // A cross-field scan resolves the same path through the row index, and its
-    // flat sibling walks two list levels down to the leaf. Rows 2 and 3 repeat
-    // rows 0 and 1 in a fragment no index covers, so both sides contribute.
+    // A cross-field scan resolves the same nested path through the row index.
     let combined_indexed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
     assert_eq!(
         combined_indexed["id"]
@@ -1106,7 +1104,7 @@ async fn test_element_document_nested_lists_use_deepest_boundary() {
         ("groups", batch.column_by_name("groups").unwrap().clone()),
     ])
     .unwrap();
-    let ds = InsertBuilder::new(Arc::new(ds))
+    let mut ds = InsertBuilder::new(Arc::new(ds))
         .with_params(&WriteParams {
             mode: WriteMode::Append,
             ..Default::default()
@@ -1115,9 +1113,43 @@ async fn test_element_document_nested_lists_use_deepest_boundary() {
         .await
         .unwrap();
 
-    let combined_mixed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    let mut combined_mixed = ds.scan();
+    combined_mixed
+        .full_text_search(combined_fields("alpha", &[path]))
+        .unwrap();
+    let error = combined_mixed.try_into_batch().await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("1 of 2 fragments are not fully covered") && message.contains(path),
+        "{message}"
+    );
+
+    let mut combined_fast = ds.scan();
+    let indexed_only = combined_fast
+        .full_text_search(combined_fields("alpha", &[path]))
+        .unwrap()
+        .fast_search()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
     assert_eq!(
-        combined_mixed["id"]
+        indexed_only["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let combined_indexed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    assert_eq!(
+        combined_indexed["id"]
             .as_primitive::<arrow_array::types::Int32Type>()
             .values(),
         &[0, 1, 2, 3]
