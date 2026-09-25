@@ -49,9 +49,36 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
 /// The default [`BatchRowIdRemapper::materialization_budget_bytes`]: 256 MiB.
 pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Bytes charged per materialized map entry: a `HashMap<u64, Option<u64>>`
-/// slot (8 + 16) plus control metadata and load-factor slack.
-const MATERIALIZED_ENTRY_BYTES: u64 = 32;
+/// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
+/// `HashMap::with_capacity(entries)` reserves.
+///
+/// hashbrown's `capacity_to_buckets` rounds the capacity up to
+/// `next_power_of_two(ceil(entries * 8 / 7))` buckets (4 below four entries, 8
+/// below eight) and lays the table out as one slot of
+/// `size_of::<(u64, Option<u64>)>()` (24) bytes plus one control byte per
+/// bucket, followed by one group width (16) of trailing control bytes. The
+/// rounding is what a flat per-entry charge misses: 7,350,000 entries adjust
+/// to 8,400,000 and round to 16,777,216 buckets, 419,430,416 bytes, where 32
+/// bytes per entry would have charged 235,200,000.
+fn hash_map_bytes(entries: u64) -> u64 {
+    const SLOT_BYTES: u64 = std::mem::size_of::<(u64, Option<u64>)>() as u64;
+    const CTRL_BYTES_PER_BUCKET: u64 = 1;
+    const GROUP_WIDTH: u64 = 16;
+    let buckets = if entries < 4 {
+        4
+    } else if entries < 8 {
+        8
+    } else {
+        entries
+            .saturating_mul(8)
+            .div_ceil(7)
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX)
+    };
+    buckets
+        .saturating_mul(SLOT_BYTES + CTRL_BYTES_PER_BUCKET)
+        .saturating_add(GROUP_WIDTH)
+}
 
 /// Why an index could not be rewritten through a batch translator by the
 /// in-memory fallback of `remap_streaming`, as opposed to an I/O or data
@@ -131,7 +158,8 @@ impl RemapUnavailable {
 ///
 /// The cost is bounded before anything is allocated: the fragments' row
 /// counts (from [`BatchRowIdRemapper::fragment_physical_rows`]) put an upper
-/// bound on the map, and that plus the translation buffers must fit
+/// bound on the map, sized as the hash table really allocates it (see
+/// `hash_map_bytes`), and that plus the translation buffers must fit
 /// [`BatchRowIdRemapper::materialization_budget_bytes`]. The fallback
 /// declines with a [`RemapUnavailable`] when the fragments are unknown, a
 /// fragment cannot be sized or the estimate is over budget; translation
@@ -153,9 +181,7 @@ pub async fn materialize_remap(
         sized.push((fragment, rows));
     }
     let budget_bytes = remapper.materialization_budget_bytes();
-    let estimated_bytes = total_rows
-        .saturating_mul(MATERIALIZED_ENTRY_BYTES)
-        .saturating_add((BATCH_SIZE as u64) * (8 + 16));
+    let estimated_bytes = hash_map_bytes(total_rows).saturating_add((BATCH_SIZE as u64) * (8 + 16));
     if estimated_bytes > budget_bytes {
         return Err(RemapUnavailable::OverBudget {
             estimated_bytes,
@@ -622,6 +648,33 @@ mod tests {
         // None of these touched the translator.
         assert_eq!(remapper.calls.load(Ordering::Relaxed), 0);
         assert_eq!(tight.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn materialize_remap_charges_the_rounded_hash_table() {
+        // 7,350,000 entries adjust to 8,400,000 and round to 16,777,216
+        // buckets of 25 bytes: 419,430,416 bytes, not 32 bytes per entry.
+        assert_eq!(hash_map_bytes(7_350_000), 419_430_416);
+        assert!(hash_map_bytes(7_350_000) >= 400 << 20);
+        assert_eq!(hash_map_bytes(0), 4 * 25 + 16);
+        // Under the default budget that many stored rows are declined before
+        // any translation; the flat charge (235,200,000 plus the slice
+        // buffers) would have fit.
+        let remapper = Sizing::new(&[(1, 7_350_000)], DEFAULT_MATERIALIZATION_BUDGET_BYTES);
+        let stored = RoaringBitmap::from_iter([1u32]);
+        let error = block_on(materialize_remap(&remapper, Some(&stored))).unwrap_err();
+        match RemapUnavailable::from_error(&error) {
+            Some(RemapUnavailable::OverBudget {
+                estimated_bytes,
+                budget_bytes,
+            }) => {
+                assert_eq!(*budget_bytes, DEFAULT_MATERIALIZATION_BUDGET_BYTES);
+                assert!(*estimated_bytes >= 419_430_416, "{estimated_bytes}");
+            }
+            other => panic!("expected OverBudget, got {other:?}"),
+        }
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_eq!(remapper.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
