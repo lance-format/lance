@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::fragment_reuse::MappingReader;
+use lance_core::utils::stable_partition::CountsMatrix;
 use lance_core::{Error, Result};
 use lance_table::format::pb::fragment_reuse_index_details::FragmentDigest;
 use roaring::RoaringBitmap;
@@ -190,27 +191,23 @@ impl MappingReader for StablePartitionMapping {
         // request touches (bounded to a chunk's worth). A sparse request
         // never reads a block it does not touch.
         let mut held = None;
+        // The last block of the run of adjacent blocks the request is
+        // currently walking. It is discovered once, when a run starts, and
+        // reused for every block of the run, so the lookahead over a run of
+        // B blocks costs B steps in total rather than B*(B-1)/2.
+        let mut run_end: Option<usize> = None;
         while let Some(&(first, _)) = remaining.first() {
             let counts = reader.counts();
             let block = counts.block_of(first);
             let range = counts.block_range(block);
             let end = remaining.partition_point(|&(row, _)| row < range.end);
             let (batch, rest) = remaining.split_at(end);
-            // The last block of the run of adjacent blocks starting here that
-            // this request still touches.
-            let mut run_end = block;
-            let mut cursor = end;
-            while cursor < remaining.len() {
-                let next = counts.block_of(remaining[cursor].0);
-                if next != run_end + 1 {
-                    break;
-                }
-                run_end = next;
-                let next_range = counts.block_range(next);
-                cursor += remaining[cursor..].partition_point(|&(row, _)| row < next_range.end);
-            }
+            let run_last = match run_end {
+                Some(last) if block <= last => last,
+                _ => *run_end.insert(contiguous_run_end(counts, block, rest)),
+            };
             let labels = reader
-                .block_labels_reusing(block, run_end, &mut held)
+                .block_labels_reusing(block, run_last, &mut held)
                 .await?;
             if labels.len() as u64 != range.end - range.start {
                 return Err(corrupt(format!(
@@ -261,6 +258,28 @@ impl MappingReader for StablePartitionMapping {
     }
 }
 
+/// The last block of the run of adjacent blocks that starts at `block` and
+/// continues through `ahead`, the sorted requests after `block`'s own: the
+/// run ends at the first block `ahead` skips. Each step advances past one
+/// whole block of requests, so a run of B blocks costs B - 1 steps plus at
+/// most one step to find the gap after it; the caller asks once per run.
+fn contiguous_run_end(counts: &CountsMatrix, block: usize, ahead: &[(u64, usize)]) -> usize {
+    let mut run_end = block;
+    let mut cursor = 0;
+    while cursor < ahead.len() {
+        #[cfg(test)]
+        tests::LOOKAHEAD_STEPS.with(|steps| steps.set(steps.get() + 1));
+        let next = counts.block_of(ahead[cursor].0);
+        if next != run_end + 1 {
+            break;
+        }
+        run_end = next;
+        let next_range = counts.block_range(next);
+        cursor += ahead[cursor..].partition_point(|&(row, _)| row < next_range.end);
+    }
+    run_end
+}
+
 fn corrupt(message: impl Into<String>) -> Error {
     Error::corrupt_file_named(MAPPING_FILE, message)
 }
@@ -275,6 +294,17 @@ mod tests {
     use lance_core::utils::tempfile::TempDir;
     use lance_index_core::scalar::IndexReader;
     use lance_io::object_store::ObjectStore;
+
+    thread_local! {
+        /// Lookahead steps [`contiguous_run_end`] has taken on this thread
+        /// (the tests run on the current-thread runtime).
+        pub(super) static LOOKAHEAD_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The lookahead steps taken since the last call.
+    fn take_lookahead_steps() -> usize {
+        LOOKAHEAD_STEPS.with(|steps| steps.replace(0))
+    }
 
     /// Counts the label reads the row-map reader performs and the rows they
     /// asked for.
@@ -420,6 +450,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counting.take(), (2, 24));
+    }
+
+    /// A long run of consecutive blocks (several chunks) discovers its
+    /// boundary once: the lookahead is linear in the number of blocks, the
+    /// run is read a chunk at a time, and the batch agrees with per-row
+    /// translation (duplicates, a deleted row and request order included).
+    #[tokio::test]
+    async fn long_consecutive_run_lookahead_is_linear() {
+        const BLOCKS: usize = 300;
+        const BLOCK_ROWS: u64 = 8;
+        const ROWS: u64 = BLOCKS as u64 * BLOCK_ROWS;
+        const DELETED: u32 = 5;
+        let directory = TempDir::default();
+        let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
+            .await
+            .unwrap();
+        let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store,
+            path,
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // One source of 2400 rows in 300 blocks of 8 (nine full chunks of 32
+        // blocks and a partial tenth), one row deleted, two destinations.
+        let writer = store
+            .new_index_file(MAPPING_FILE, RowMapWriter::schema())
+            .await
+            .unwrap();
+        let mut writer = RowMapWriter::try_new_with_block_rows(
+            writer,
+            vec![SourceRows {
+                physical_rows: ROWS,
+                deleted: Some([DELETED].into_iter().collect()),
+            }],
+            2,
+            BLOCK_ROWS as u32,
+        )
+        .unwrap();
+        let labels: Vec<u16> = (0..ROWS as u16 - 1).map(|i| i % 2).collect();
+        writer.append_labels(&labels).await.unwrap();
+        writer.finish().await.unwrap();
+        let counting = CountingReader::new(store.open_index_file(MAPPING_FILE).await.unwrap());
+        let digest = |id, rows| FragmentDigest {
+            id,
+            physical_rows: rows,
+            num_deleted_rows: 0,
+        };
+        let mapping = StablePartitionMapping::try_new(
+            store.clone(),
+            vec![digest(1, ROWS)],
+            vec![digest(2, 1200), digest(3, 1199)],
+        )
+        .unwrap();
+        assert!(
+            mapping
+                .reader
+                .set(RowMapReader::open(counting.clone()).await.unwrap())
+                .is_ok()
+        );
+        counting.take();
+        take_lookahead_steps();
+        let addr = |offset| u64::from(RowAddress::new_from_parts(1, offset));
+
+        // One row per block, every block, in reverse order, plus the deleted
+        // row and a duplicate.
+        let mut request: Vec<u64> = (0..BLOCKS as u32)
+            .rev()
+            .map(|block| addr(block * BLOCK_ROWS as u32 + block % BLOCK_ROWS as u32))
+            .collect();
+        request.push(addr(DELETED));
+        request.push(addr(7 * BLOCK_ROWS as u32 + 7));
+        let batch = mapping.remap_row_ids(&request).await.unwrap();
+        // Linear lookahead: one step per block of the run (the old per-block
+        // rediscovery took B * (B - 1) / 2 = 44850 steps for B = 300).
+        let steps = take_lookahead_steps();
+        assert_eq!(steps, BLOCKS - 1);
+        assert!(steps <= 2 * BLOCKS);
+        // The run is read a chunk (32 blocks) at a time, every block once.
+        assert_eq!(counting.take(), (BLOCKS.div_ceil(32), ROWS as usize));
+
+        assert_eq!(batch.len(), request.len());
+        assert_eq!(batch[BLOCKS], None, "the deleted row stays deleted");
+        assert_eq!(batch[BLOCKS + 1], batch[BLOCKS - 1 - 7], "duplicate");
+        for (row_id, translated) in request.iter().zip(&batch) {
+            assert_eq!(mapping.remap_row_id(*row_id).await.unwrap(), *translated);
+        }
+        // Request order is kept: the first entry is block 299's row 2395,
+        // live row 2394 (label 0), the 1198th row of destination 2.
+        assert_eq!(
+            batch[0],
+            Some(u64::from(RowAddress::new_from_parts(2, 1197)))
+        );
+        assert_eq!(
+            batch[BLOCKS - 1],
+            Some(u64::from(RowAddress::new_from_parts(2, 0)))
+        );
     }
 
     #[tokio::test]
