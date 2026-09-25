@@ -1101,3 +1101,802 @@ async fn staged_vector_segments_rewritten_before_the_partition_are_validated_bef
     let (_, indexed) = nearest(&dataset, &query, 8, true).await;
     assert_eq!(indexed, flat);
 }
+
+// ---------------------------------------------------------------------------
+// The maintenance chain after a v0 deferred-remap upgrade.
+//
+// Under the legacy v0 fragment reuse index a deferred compaction leaves the
+// index FILE holding SOURCE row addresses while the listing swaps the
+// segment's bitmap to the destination and the next commit persists that
+// swap. The first stable partition lifts the v0 bytes verbatim into a tagged
+// history, where the legacy version is an ordered-compaction transition. The
+// tests below pin what `optimize_indices` (merge) and
+// `cleanup_frag_reuse_index` (trim) do to such a segment afterwards.
+// ---------------------------------------------------------------------------
+
+/// Reopen `uri` in a fresh session: nothing cached from the writer survives.
+async fn fresh_session(uri: &str) -> Dataset {
+    crate::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(crate::session::Session::default()))
+        .load()
+        .await
+        .unwrap()
+}
+
+/// Append `rows` rows of the scalar fixture's three columns, `i` and `w`
+/// counting up from `start`, as one new fragment.
+async fn append_scalar_rows(dataset: Dataset, start: i32, rows: u64) -> Dataset {
+    let batch = lance_datagen::gen_batch()
+        .col(
+            "i",
+            lance_datagen::array::step_custom::<Int32Type>(start, 1),
+        )
+        .col(
+            "text",
+            lance_datagen::array::fill_utf8("document".to_string()),
+        )
+        .col(
+            "w",
+            lance_datagen::array::step_custom::<Int32Type>(start, 1),
+        )
+        .into_batch_rows(lance_datagen::RowCount::from(rows))
+        .unwrap();
+    crate::dataset::InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+/// Append `rows` rows of the vector fixture's three columns as one new
+/// fragment.
+async fn append_vector_rows(dataset: Dataset, start: i32, rows: u64) -> Dataset {
+    // Every `gen_batch` starts from the same seed: reseed by `start` so no
+    // appended vector duplicates a fixture vector (ties would make top-1
+    // ambiguous).
+    let batch = lance_datagen::gen_batch()
+        .with_seed(lance_datagen::Seed(start as u64))
+        .col(
+            "i",
+            lance_datagen::array::step_custom::<Int32Type>(start, 1),
+        )
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .col(
+            "w",
+            lance_datagen::array::step_custom::<Int32Type>(start, 1),
+        )
+        .into_batch_rows(lance_datagen::RowCount::from(rows))
+        .unwrap();
+    crate::dataset::InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+fn fragment_ids(dataset: &Dataset) -> Vec<u32> {
+    dataset.fragments().iter().map(|f| f.id as u32).collect()
+}
+
+/// The stored segments of the logical index `name`, in manifest order.
+async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
+    crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == name)
+        .cloned()
+        .collect()
+}
+
+async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
+    crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+        .cloned()
+}
+
+/// The legacy (v0) compaction versions the entry still carries, whatever
+/// its index version.
+async fn legacy_versions(
+    dataset: &Dataset,
+) -> Vec<lance_table::format::pb::fragment_reuse_index_details::Version> {
+    match fri_entry(dataset).await {
+        None => Vec::new(),
+        Some(entry) => {
+            crate::index::frag_reuse::load_frag_reuse_records(dataset, &entry)
+                .await
+                .unwrap()
+                .legacy_versions
+        }
+    }
+}
+
+/// The row address of every `i` in the live table.
+async fn row_addrs_by_i(dataset: &Dataset) -> std::collections::HashMap<i32, u64> {
+    let batch = dataset
+        .scan()
+        .project(&["i"])
+        .unwrap()
+        .with_row_address()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["i"].as_primitive::<Int32Type>();
+    let addrs = batch[lance_core::ROW_ADDR].as_primitive::<arrow_array::types::UInt64Type>();
+    ids.values()
+        .iter()
+        .copied()
+        .zip(addrs.values().iter().copied())
+        .collect()
+}
+
+/// The row addresses a BTree segment's FILE stores for `i = value`: the
+/// segment is loaded straight from its store, with no fragment reuse
+/// translation, so this is what is on disk rather than what a query sees.
+async fn raw_segment_row_addrs(dataset: &Dataset, segment: &IndexMetadata, value: i32) -> Vec<u64> {
+    use crate::dataset::index::LanceIndexStoreExt;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::btree::BTreeIndexPlugin;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::registry::ScalarIndexPlugin;
+
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment)
+        .await
+        .unwrap();
+    let index = BTreeIndexPlugin
+        .load_index(
+            Arc::new(store),
+            &prost_types::Any::default(),
+            None,
+            &lance_core::cache::LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+    let SearchResult::Exact(rows) = index
+        .search(
+            &SargableQuery::Equals(ScalarValue::Int32(Some(value))),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected an exact result");
+    };
+    let mut addrs: Vec<u64> = rows
+        .true_rows()
+        .row_addrs()
+        .unwrap()
+        .map(u64::from)
+        .collect();
+    addrs.sort_unstable();
+    addrs
+}
+
+/// The v0 table: the two fixture fragments plus two 2-row appends (`i`
+/// 100..104), `i_idx` over all four, then a real v0 deferred compaction of
+/// the two small fragments into one destination. Stops there: the index is
+/// NOT re-created, so its file still holds the source addresses.
+///
+/// Returns the table and the destination fragment id.
+async fn v0_deferred_scalar_fixture(uri: &str) -> (Dataset, u32) {
+    let dataset = disk_fixture(uri).await;
+    let dataset = append_scalar_rows(dataset, 100, 2).await;
+    let mut dataset = append_scalar_rows(dataset, 102, 2).await;
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2, 3]);
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let built = stored_segment(&dataset, "i_idx").await;
+    assert_eq!(
+        built.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1, 2, 3])
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let destination = *fragment_ids(&dataset)
+        .iter()
+        .find(|id| **id > 3)
+        .expect("the compaction produced a destination");
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, destination]);
+    assert_v0_deferred_state(&dataset, "i_idx", &built, &[2, 3], destination).await;
+    (dataset, destination)
+}
+
+/// The state a v0 deferred compaction of `sources` into `destination`
+/// leaves: a v0 entry with one more legacy version, the segment listed over
+/// the destination (bitmap swapped, file untouched) and still stamped with
+/// its pre-compaction dataset version.
+async fn assert_v0_deferred_state(
+    dataset: &Dataset,
+    name: &str,
+    built: &IndexMetadata,
+    sources: &[u32],
+    destination: u32,
+) {
+    let entry = fri_entry(dataset).await.expect("a v0 entry");
+    assert_eq!(entry.index_version, 0, "a v0 (legacy) entry");
+    let versions = legacy_versions(dataset).await;
+    let version = versions.last().expect("the legacy version");
+    let old_ids: Vec<u64> = version
+        .groups
+        .iter()
+        .flat_map(|g| g.old_fragments.iter().map(|d| d.id))
+        .collect();
+    let new_ids: Vec<u64> = version
+        .groups
+        .iter()
+        .flat_map(|g| g.new_fragments.iter().map(|d| d.id))
+        .collect();
+    assert_eq!(
+        old_ids,
+        sources.iter().map(|id| *id as u64).collect::<Vec<_>>()
+    );
+    assert_eq!(new_ids, vec![destination as u64]);
+    let segment = stored_segment(dataset, name).await;
+    assert_eq!(segment.uuid, built.uuid, "the segment is not rewritten");
+    let bitmap = segment.fragment_bitmap.as_ref().unwrap();
+    assert!(
+        bitmap.contains(destination),
+        "the listed bitmap claims the destination: {bitmap:?}"
+    );
+    assert!(
+        sources.iter().all(|id| !bitmap.contains(*id)),
+        "the listed bitmap no longer names the sources: {bitmap:?}"
+    );
+    assert!(
+        segment.dataset_version < version.dataset_version,
+        "the segment ({}) predates the legacy version ({})",
+        segment.dataset_version,
+        version.dataset_version
+    );
+}
+
+/// Upgrade the table to a tagged history with a stable partition of two
+/// fresh fragments (`i` from `start`, two rows each) that no index covers:
+/// the lift must not touch the index's lineage. Returns the table and the
+/// two destination ids.
+async fn upgrade_by_stable_partition(dataset: Dataset, start: i32) -> (Dataset, Vec<u32>) {
+    let legacy_before = legacy_versions(&dataset).await;
+    let dataset = append_scalar_rows(dataset, start, 2).await;
+    let mut dataset = append_scalar_rows(dataset, start + 2, 2).await;
+    upgrade_appended_pair(&mut dataset, legacy_before.len()).await
+}
+
+async fn upgrade_appended_pair(dataset: &mut Dataset, legacy_count: usize) -> (Dataset, Vec<u32>) {
+    let ids = fragment_ids(dataset);
+    let sources: Vec<u64> = ids[ids.len() - 2..].iter().map(|id| *id as u64).collect();
+    let dest_base = *ids.iter().max().unwrap() as u64 + 1;
+    reserve_fragments(dataset, 20).await;
+    let dataset = commit_stable_partition(dataset.clone(), &sources, dest_base).await;
+    let entry = fri_entry(&dataset).await.unwrap();
+    assert_eq!(entry.index_version, 1, "the lift tags the entry");
+    assert_eq!(
+        legacy_versions(&dataset).await.len(),
+        legacy_count,
+        "the legacy versions are lifted verbatim"
+    );
+    let destinations = vec![dest_base as u32, dest_base as u32 + 1];
+    assert!(
+        destinations
+            .iter()
+            .all(|id| fragment_ids(&dataset).contains(id)),
+        "{:?}",
+        fragment_ids(&dataset)
+    );
+    (dataset, destinations)
+}
+
+/// Every indexed point query of the values `i` takes in the live table
+/// equals the index-disabled scan, by identity and multiplicity, and the
+/// full scan agrees with and without the index.
+async fn assert_scalar_queries_match(dataset: &Dataset) {
+    let live: Vec<i32> = values(dataset, None, false).await;
+    assert_eq!(values(dataset, None, true).await, live);
+    let mut distinct = live.clone();
+    distinct.dedup();
+    for value in distinct {
+        let predicate = format!("i = {value}");
+        let plan = dataset
+            .scan()
+            .filter(&predicate)
+            .unwrap()
+            .use_scalar_index(true)
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+        assert_eq!(
+            values(dataset, Some(&predicate), true).await,
+            values(dataset, Some(&predicate), false).await,
+            "{predicate}"
+        );
+    }
+}
+
+/// (T3) After the upgrade, `optimize_indices` merges the v0-deferred
+/// segment with a newer one. The merge translates the addresses: the
+/// merged FILE holds live addresses (the old file's source addresses are
+/// gone) and indexed queries equal the scan after a fresh reopen. It keeps
+/// the old stamp and provenance, though: the merged segment carries the
+/// OLD segment's dataset version (the minimum of its sources) and the union
+/// of the stored bitmaps, so the trim that follows KEEPS the legacy version
+/// and rebuilds the entry bitmap to the legacy sources and destination. The
+/// legacy version stays pinned until a remap advances the stamp; that is
+/// the conservative side.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
+    let dir = TempStrDir::default();
+    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let old = stored_segment(&dataset, "i_idx").await;
+    // The file still addresses the retired sources.
+    let stale = raw_segment_row_addrs(&dataset, &old, 101).await;
+    assert_eq!(stale.len(), 1);
+    assert_eq!(RowAddress::from(stale[0]).fragment_id(), 2);
+
+    let (dataset, sp_destinations) = upgrade_by_stable_partition(dataset, 300).await;
+    // A newer segment over an appended fragment (and the partition's
+    // destinations, which no segment covers either).
+    let mut dataset = append_scalar_rows(dataset, 400, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    assert_eq!(segments[0].uuid, old.uuid);
+    let newer = segments[1].clone();
+    assert_eq!(
+        newer.fragment_bitmap.as_ref().unwrap(),
+        &sp_destinations
+            .iter()
+            .copied()
+            .chain([appended])
+            .collect::<RoaringBitmap>()
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 1, "one merged segment: {segments:?}");
+    let merged = segments[0].clone();
+    assert_ne!(merged.uuid, old.uuid);
+    assert_ne!(merged.uuid, newer.uuid);
+    // The merged file holds live addresses: the compacted rows now point at
+    // the destination, everything else at its (still live) fragment.
+    let live = row_addrs_by_i(&dataset).await;
+    for (value, addr) in &live {
+        assert_eq!(
+            raw_segment_row_addrs(&dataset, &merged, *value).await,
+            vec![*addr],
+            "i = {value}"
+        );
+    }
+    for value in 100..104 {
+        assert_eq!(RowAddress::from(live[&value]).fragment_id(), destination);
+    }
+    assert_eq!(
+        merged.dataset_version, old.dataset_version,
+        "the merge keeps the oldest source stamp (below the legacy version)"
+    );
+    assert!(merged.dataset_version < legacy_versions(&dataset).await[0].dataset_version);
+    // Provenance union: the old segment's listed bitmap {0, 1, destination}
+    // and the newer segment's fragments (the two partition destinations and
+    // the appended fragment).
+    assert_eq!(
+        old.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1, destination])
+    );
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &(old.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
+        "the merge keeps the provenance union"
+    );
+    assert_scalar_queries_match(&dataset).await;
+
+    // The merged segment is still stamped before the legacy version: the
+    // trim keeps it and rebuilds the entry bitmap to the legacy sources and
+    // destination.
+    let mut dataset = dataset;
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(
+        legacy_versions(&dataset).await.len(),
+        1,
+        "the legacy version stays pinned until a remap advances the stamp"
+    );
+    assert_eq!(
+        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter([2u32, 3, destination])
+    );
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        stored_segments(&dataset, "i_idx").await[0].uuid,
+        merged.uuid
+    );
+    assert_scalar_queries_match(&dataset).await;
+}
+
+/// (Multi-round) Two v0 deferred compactions before the upgrade, the second
+/// consuming the first's destination together with the other indexed
+/// fragments, then the same merge and trim checks: the merged file holds
+/// live addresses two hops away from what the old file stored, while the
+/// merge keeps the old stamp and provenance, so both legacy versions stay
+/// pinned (the conservative side) until a remap advances the stamp.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
+    let dir = TempStrDir::default();
+    let (mut dataset, first_destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let old = stored_segment(&dataset, "i_idx").await;
+    // Round two: every remaining fragment (F0, F1 and the first destination)
+    // is indexed, so the planner bins them together.
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 16,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let ids = fragment_ids(&dataset);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let second_destination = ids[0];
+    assert!(second_destination > first_destination);
+    assert_v0_deferred_state(
+        &dataset,
+        "i_idx",
+        &old,
+        &[0, 1, first_destination],
+        second_destination,
+    )
+    .await;
+    assert_eq!(legacy_versions(&dataset).await.len(), 2);
+    assert_eq!(
+        stored_segment(&dataset, "i_idx")
+            .await
+            .fragment_bitmap
+            .as_ref()
+            .unwrap(),
+        &RoaringBitmap::from_iter([second_destination])
+    );
+    // The file is untouched: still the original source addresses.
+    let stale = raw_segment_row_addrs(&dataset, &old, 101).await;
+    assert_eq!(RowAddress::from(stale[0]).fragment_id(), 2);
+    let stale = raw_segment_row_addrs(&dataset, &old, 5).await;
+    assert_eq!(RowAddress::from(stale[0]).fragment_id(), 1);
+
+    let (dataset, _) = upgrade_by_stable_partition(dataset, 300).await;
+    let mut dataset = append_scalar_rows(dataset, 400, 4).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    let old_listed = segments[0].clone();
+    assert_eq!(old_listed.uuid, old.uuid);
+    assert_eq!(
+        old_listed.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([second_destination])
+    );
+    let newer = segments[1].clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    let merged = segments[0].clone();
+    let live = row_addrs_by_i(&dataset).await;
+    for (value, addr) in &live {
+        assert_eq!(
+            raw_segment_row_addrs(&dataset, &merged, *value).await,
+            vec![*addr],
+            "i = {value}"
+        );
+    }
+    for value in (0..8).chain(100..104) {
+        assert_eq!(
+            RowAddress::from(live[&value]).fragment_id(),
+            second_destination,
+            "i = {value} lives in the second destination"
+        );
+    }
+    assert_eq!(
+        merged.dataset_version, old.dataset_version,
+        "the merge keeps the oldest source stamp"
+    );
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &(old_listed.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
+        "the merge keeps the provenance union"
+    );
+    assert_scalar_queries_match(&dataset).await;
+
+    // Both legacy versions stay pinned; the entry bitmap is rebuilt to the
+    // sources and destinations of both rounds.
+    let mut dataset = dataset;
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(legacy_versions(&dataset).await.len(), 2);
+    assert_eq!(
+        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2, 3, first_destination, second_destination])
+    );
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_scalar_queries_match(&dataset).await;
+}
+
+/// (Mixed catch-up) Next to the v0-deferred segment sits a segment built
+/// after the upgrade over appended fragments. Maintenance that does not
+/// select the caught-up segment (the trim, and a merge that selects only
+/// the trailing segment with nothing new to add) leaves its uuid, bitmap
+/// and dataset version alone; the legacy version stays pinned by the old
+/// segment meanwhile. The full merge then covers both provenances and the
+/// index answers from a fresh session.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
+    let dir = TempStrDir::default();
+    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let old = stored_segment(&dataset, "i_idx").await;
+    let (dataset, sp_destinations) = upgrade_by_stable_partition(dataset, 300).await;
+    let mut dataset = append_scalar_rows(dataset, 400, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    let caught_up = segments[1].clone();
+    assert_ne!(caught_up.uuid, old.uuid);
+    assert_eq!(
+        caught_up.fragment_bitmap.as_ref().unwrap(),
+        &sp_destinations
+            .iter()
+            .copied()
+            .chain([appended])
+            .collect::<RoaringBitmap>()
+    );
+    assert!(
+        caught_up.dataset_version > legacy_versions(&dataset).await[0].dataset_version,
+        "the new segment is caught up past the legacy version"
+    );
+
+    // The trim: the old segment still pins the legacy version; the caught-up
+    // segment is untouched.
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(legacy_versions(&dataset).await.len(), 1);
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    assert_eq!(segments[0].uuid, old.uuid);
+    assert_eq!(segments[0].fragment_bitmap, old.fragment_bitmap);
+    assert_eq!(segments[0].dataset_version, old.dataset_version);
+    assert_eq!(segments[1].uuid, caught_up.uuid);
+    assert_eq!(segments[1].fragment_bitmap, caught_up.fragment_bitmap);
+    assert_eq!(segments[1].dataset_version, caught_up.dataset_version);
+
+    // A merge selecting only the trailing segment with nothing unindexed
+    // rewrites nothing.
+    let version_before = dataset.manifest.version;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(dataset.manifest.version, version_before);
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(
+        segments.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+        vec![old.uuid, caught_up.uuid]
+    );
+
+    // The full merge consumes both: the merged provenance covers the old
+    // segment's live coverage and the caught-up segment's fragments.
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let segments = stored_segments(&dataset, "i_idx").await;
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    let merged = &segments[0];
+    assert_ne!(merged.uuid, caught_up.uuid);
+    let merged_bitmap = merged.fragment_bitmap.as_ref().unwrap();
+    assert!(
+        merged_bitmap.is_superset(caught_up.fragment_bitmap.as_ref().unwrap()),
+        "{merged_bitmap:?}"
+    );
+    assert!(merged_bitmap.contains(destination), "{merged_bitmap:?}");
+    assert!(
+        merged_bitmap.contains(0) && merged_bitmap.contains(1),
+        "{merged_bitmap:?}"
+    );
+    let live = row_addrs_by_i(&dataset).await;
+    for (value, addr) in &live {
+        assert_eq!(
+            raw_segment_row_addrs(&dataset, merged, *value).await,
+            vec![*addr],
+            "i = {value}"
+        );
+    }
+    assert_scalar_queries_match(&dataset).await;
+}
+
+/// (T4') The vector twin over IVF_FLAT: the vector merge copies addresses
+/// as-is with `dataset_version = min(source versions)` and the union of
+/// the stored bitmaps; the trim that follows must KEEP the legacy version
+/// (the merged segment is still stale against it), and the top-1 neighbour
+/// of a compacted row's own vector is that row after a fresh reopen.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
+    let dir = TempStrDir::default();
+    let dataset = vector_fixture(dir.as_str()).await;
+    let dataset = append_vector_rows(dataset, 100, 2).await;
+    let mut dataset = append_vector_rows(dataset, 102, 2).await;
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2, 3]);
+    let centroids = arrow_array::FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(vec![0.0f32; 4]),
+        4,
+    )
+    .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        lance_index::vector::ivf::IvfBuildParams::try_with_centroids(1, Arc::new(centroids))
+            .unwrap(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let old = stored_segment(&dataset, "vec_idx").await;
+    // The query: the vector of a row the compaction moves.
+    let original = dataset
+        .scan()
+        .filter("i = 101")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .clone();
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let destination = *fragment_ids(&dataset).iter().max().unwrap();
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, destination]);
+    assert_v0_deferred_state(&dataset, "vec_idx", &old, &[2, 3], destination).await;
+    let (_, found) = nearest(&dataset, &query, 1, true).await;
+    assert_eq!(found, vec![101], "the v0 window still answers");
+
+    // Upgrade on fragments outside the index's lineage.
+    let dataset = append_vector_rows(dataset, 300, 2).await;
+    let mut dataset = append_vector_rows(dataset, 302, 2).await;
+    let (dataset, sp_destinations) = upgrade_appended_pair(&mut dataset, 1).await;
+    // A newer segment over an appended fragment and the partition's
+    // destinations.
+    let mut dataset = append_vector_rows(dataset, 400, 4).await;
+    let appended = *fragment_ids(&dataset).iter().max().unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let segments = stored_segments(&dataset, "vec_idx").await;
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    assert_eq!(segments[0].uuid, old.uuid);
+    let newer = segments[1].clone();
+    assert_eq!(
+        newer.fragment_bitmap.as_ref().unwrap(),
+        &sp_destinations
+            .iter()
+            .copied()
+            .chain([appended])
+            .collect::<RoaringBitmap>()
+    );
+    let old_listed = segments[0].clone();
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let segments = stored_segments(&dataset, "vec_idx").await;
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    let merged = segments[0].clone();
+    assert_ne!(merged.uuid, old.uuid);
+    assert_eq!(
+        merged.dataset_version,
+        old.dataset_version.min(newer.dataset_version),
+        "the vector merge keeps the oldest source version"
+    );
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &(old_listed.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
+        "the vector merge keeps the union of the stored bitmaps"
+    );
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, vec![101]);
+
+    // The merged segment is still stale against the legacy version: the
+    // trim keeps it.
+    let mut dataset = dataset;
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(
+        legacy_versions(&dataset).await.len(),
+        1,
+        "the legacy version stays pinned"
+    );
+    assert_eq!(
+        stored_segments(&dataset, "vec_idx").await[0].uuid,
+        merged.uuid
+    );
+
+    let dataset = fresh_session(dir.as_str()).await;
+    let (plan, found) = nearest(&dataset, &query, 1, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, vec![101]);
+    let total = dataset.count_rows(None).await.unwrap();
+    let (_, flat) = nearest(&dataset, &query, total, false).await;
+    let (_, indexed) = nearest(&dataset, &query, total, true).await;
+    assert_eq!(flat.len(), total);
+    assert_eq!(indexed, flat, "every row is reachable through the index");
+}

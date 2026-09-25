@@ -1301,7 +1301,9 @@ mod tests {
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::dataset::write::CommitBuilder;
         use crate::index::DatasetIndexExt;
-        use crate::index::frag_reuse::{decode_frag_reuse_ledger, load_raw_frag_reuse_content};
+        use crate::index::frag_reuse::{
+            decode_frag_reuse_ledger, load_frag_reuse_records, load_raw_frag_reuse_content,
+        };
         use crate::index::frag_reuse_reader::tests as reader_tests;
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int32Type;
@@ -2397,6 +2399,190 @@ mod tests {
                 2,
                 "the v0 path must not prune segments"
             );
+        }
+
+        /// Append `rows` rows of `i` counting up from `start` as one fragment.
+        async fn append_rows(dataset: Dataset, start: i32, rows: u64) -> Dataset {
+            let batch = lance_datagen::gen_batch()
+                .col(
+                    "i",
+                    lance_datagen::array::step_custom::<Int32Type>(start, 1),
+                )
+                .into_batch_rows(lance_datagen::RowCount::from(rows))
+                .unwrap();
+            crate::dataset::InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap()
+        }
+
+        /// Sorted `i` under `predicate`, with or without the scalar index.
+        async fn filtered_values(dataset: &Dataset, predicate: &str, use_index: bool) -> Vec<i32> {
+            let mut scan = dataset.scan();
+            scan.filter(predicate).unwrap();
+            scan.use_scalar_index(use_index);
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut values: Vec<i32> = batch["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            values.sort_unstable();
+            values
+        }
+
+        /// (T7, trim half) A v0 deferred compaction (index file left holding
+        /// the source addresses), lifted into a tagged history by a stable
+        /// partition of fragments outside the index's lineage. The first
+        /// tagged trim drops the partition's transition (nothing derives
+        /// through it) but keeps the legacy version the stale segment pins,
+        /// and the rebuilt entry bitmap names the legacy SOURCE ids as well
+        /// as the destination. The table keeps answering from a fresh session.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn first_tagged_trim_records_legacy_sources_in_the_entry_bitmap() {
+            use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+            let dir = lance_core::utils::tempfile::TempStrDir::default();
+            let dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(
+                    dir.as_str(),
+                    FragmentCount::from(2),
+                    FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            let dataset = append_rows(dataset, 100, 2).await;
+            let mut dataset = append_rows(dataset, 102, 2).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::BTree,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let built = stored_segments(&dataset, "i_idx").await[0].clone();
+            // Real v0 deferred compaction of the two small fragments.
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 4,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+            assert_eq!(ids.len(), 3, "{ids:?}");
+            let destination = ids[2];
+            assert!(destination > 3);
+            let entry = fri_entry(&dataset).await.unwrap();
+            assert_eq!(entry.index_version, 0);
+            let records = load_frag_reuse_records(&dataset, &entry).await.unwrap();
+            assert_eq!(records.legacy_versions.len(), 1);
+            assert!(records.transitions.is_empty());
+            let legacy_version = records.legacy_versions[0].dataset_version;
+            let listed = crate::index::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .iter()
+                .find(|idx| idx.name == "i_idx")
+                .cloned()
+                .unwrap();
+            assert_eq!(listed.uuid, built.uuid);
+            assert!(
+                listed
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(destination),
+                "{:?}",
+                listed.fragment_bitmap
+            );
+            assert!(listed.dataset_version < legacy_version);
+
+            // Upgrade: a stable partition of two fresh, unindexed fragments.
+            let dataset = append_rows(dataset, 300, 2).await;
+            let mut dataset = append_rows(dataset, 302, 2).await;
+            let ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let sources = vec![ids[ids.len() - 2], ids[ids.len() - 1]];
+            let dest_base = ids.iter().max().unwrap() + 1;
+            reserve_fragments(&mut dataset, 20).await;
+            let mut dataset = commit_stable_partition(dataset, &sources, dest_base).await;
+            let lifted = fri_entry(&dataset).await.unwrap();
+            assert_eq!(lifted.index_version, 1);
+            let records = load_frag_reuse_records(&dataset, &lifted).await.unwrap();
+            assert_eq!(records.legacy_versions.len(), 1);
+            assert_eq!(records.transitions.len(), 1);
+            // The lift keeps the v0 bitmap (destinations only) plus the
+            // partition's fragments; the legacy sources are not named yet.
+            let lifted_bitmap = lifted.fragment_bitmap.clone().unwrap();
+            assert!(lifted_bitmap.contains(destination), "{lifted_bitmap:?}");
+            assert!(!lifted_bitmap.contains(2), "{lifted_bitmap:?}");
+            assert!(!lifted_bitmap.contains(3), "{lifted_bitmap:?}");
+
+            // The first tagged trim: the transition goes (no index derives
+            // through it), the legacy version stays (the segment is stale
+            // against it) and the entry bitmap is rebuilt from what remains.
+            let version_before = dataset.manifest.version;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset.manifest.version > version_before,
+                "the trim commits"
+            );
+            let trimmed = fri_entry(&dataset).await.expect("the entry is retained");
+            assert_ne!(trimmed.uuid, lifted.uuid);
+            assert_eq!(trimmed.index_version, 1);
+            let records = load_frag_reuse_records(&dataset, &trimmed).await.unwrap();
+            assert_eq!(records.legacy_versions.len(), 1);
+            assert_eq!(records.legacy_versions[0].dataset_version, legacy_version);
+            assert!(records.transitions.is_empty());
+            assert_eq!(
+                trimmed.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([2u32, 3, destination]),
+                "the rebuilt bitmap names the legacy sources and destination"
+            );
+            // The segment is untouched by the trim.
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].uuid, built.uuid);
+            assert_eq!(segments[0].dataset_version, built.dataset_version);
+
+            // A fresh session answers the compacted rows through the index.
+            let dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+                .with_session(Arc::new(crate::session::Session::default()))
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(fri_entry(&dataset).await.unwrap().uuid, trimmed.uuid);
+            for value in [0, 5, 100, 101, 102, 103, 300, 303] {
+                let predicate = format!("i = {value}");
+                let plan = dataset
+                    .scan()
+                    .filter(&predicate)
+                    .unwrap()
+                    .use_scalar_index(true)
+                    .explain_plan(false)
+                    .await
+                    .unwrap();
+                let indexed = filtered_values(&dataset, &predicate, true).await;
+                assert_eq!(indexed, filtered_values(&dataset, &predicate, false).await);
+                if value < 300 {
+                    assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+                    assert_eq!(indexed, vec![value]);
+                }
+            }
         }
     }
 
