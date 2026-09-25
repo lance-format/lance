@@ -325,22 +325,23 @@ mod evolve {
         ))
     }
 
-    /// The dataset's FTS index as a writer index config.
-    async fn fts_config_of(
-        dataset: &Dataset,
-    ) -> Vec<crate::dataset::mem_wal::index::MemIndexConfig> {
+    /// The dataset's FTS index as a writer index spec.
+    async fn fts_config_of(dataset: &Dataset) -> Vec<crate::dataset::mem_wal::index::MemIndexSpec> {
+        use crate::dataset::mem_wal::index::{FtsMemIndexPlugin, MemIndexSpec};
         let meta = dataset
             .load_indices_by_name("text_fts")
             .await
             .unwrap()
             .remove(0);
-        vec![
-            crate::dataset::mem_wal::index::MemIndexConfig::fts_from_metadata(
-                &meta,
-                dataset.schema(),
-            )
-            .unwrap(),
-        ]
+        let resolved =
+            FtsMemIndexPlugin::resolve_from_metadata("text_fts", dataset.schema(), &meta).unwrap();
+        vec![MemIndexSpec {
+            name: "text_fts".to_string(),
+            field_ids: resolved.field_ids.unwrap(),
+            columns: resolved.columns,
+            plugin: Arc::new(FtsMemIndexPlugin),
+            params: resolved.params,
+        }]
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
 use super::{newest_pk_positions, scan_record_batch};
-use crate::dataset::mem_wal::index::{SearchOptions, search_cross_column};
+use crate::dataset::mem_wal::index::{
+    FtsEntry, FtsMemQuery, MemMatches, SearchContext, SearchOptions, search_cross_column,
+};
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -114,18 +116,11 @@ impl FtsIndexExec {
         base_schema: SchemaRef,
         with_row_id: bool,
     ) -> Result<Self> {
-        // Every queried column must resolve an index. A cross-column predicate
-        // is one predicate: a column with no arm is a missing answer rather
-        // than a narrower one.
-        for column in query.columns() {
-            if indexes
-                .get_fts_by_column_and_granularity(column, query.document_granularity)
-                .is_none()
-            {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
-            }
+        if !query.is_answered_by(&indexes) {
+            return Err(Error::invalid_input(format!(
+                "no full-text index answers this search over {:?}",
+                query.columns()
+            )));
         }
         let with_doc_index = query.document_granularity.is_list_element();
 
@@ -227,19 +222,17 @@ impl FtsIndexExec {
     fn query_index(&self) -> Result<Vec<FtsHit>> {
         let columns = self.query.columns();
         if columns.len() > 1 {
-            return self.query_across_columns(&columns);
+            return self.query_across_columns();
         }
-        let Some(&column) = columns.first() else {
+        let Some((column, question)) = self.query.index_questions().into_iter().next() else {
             return Err(Error::invalid_input(
                 "full-text search names no column to search".to_string(),
             ));
         };
-        let Some(index) = self
+        let index = self
             .indexes
-            .get_fts_by_column_and_granularity(column, self.query.document_granularity)
-        else {
-            return Ok(vec![]);
-        };
+            .index_answering(column, &question)
+            .ok_or_else(|| declined(column))?;
 
         // The scanner carries the tree the index evaluates, so there is nothing
         // to translate here.
@@ -263,12 +256,22 @@ impl FtsIndexExec {
                 options = options.with_limit(limit);
             }
         }
-        let entries = index.search_with_options(&query_expr, options);
-
-        // Convert to (row_position, element ordinal, score) tuples.
-        Ok(entries
+        let query = FtsMemQuery {
+            expr: query_expr,
+            options,
+            granularity: self.query.document_granularity,
+        };
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
+        let Some(MemMatches::Ranked(ranked)) =
+            index.search(&query, &SearchContext::new(max_visible))?
+        else {
+            return Err(declined(column));
+        };
+        Ok(ranked
             .into_iter()
-            .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+            .map(|hit| (hit.position, hit.element, hit.score))
             .collect())
     }
 
@@ -279,25 +282,29 @@ impl FtsIndexExec {
     /// visibility ceiling goes *in* rather than being applied after, so leaves
     /// read from indexes whose tails have advanced differently still meet over
     /// one cut.
-    fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
-        let mut indexes = HashMap::with_capacity(columns.len());
-        for &column in columns {
-            let Some(index) = self
-                .indexes
-                .get_fts_by_column_and_granularity(column, self.query.document_granularity)
-            else {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
+    fn query_across_columns(&self) -> Result<Vec<FtsHit>> {
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
+        let options = SearchOptions::new().with_include_tail(self.query.include_tail);
+        let ctx = SearchContext::new(max_visible);
+        Ok(search_cross_column(&self.query.expr, |column, leaf| {
+            let query = FtsMemQuery {
+                expr: leaf.clone(),
+                options: options.clone(),
+                granularity: self.query.document_granularity,
             };
-            indexes.insert(column, index);
-        }
-        Ok(search_cross_column(
-            &self.query.expr,
-            &indexes,
-            self.query.include_tail,
-            self.max_readable_row,
-        )?
+            let index = self
+                .indexes
+                .index_answering(column, &query)
+                .ok_or_else(|| declined(column))?;
+            match index.search(&query, &ctx)? {
+                Some(MemMatches::Ranked(ranked)) => {
+                    Ok(ranked.into_iter().map(FtsEntry::from).collect())
+                }
+                _ => Err(declined(column)),
+            }
+        })?
         .into_iter()
         .map(|entry| (entry.row_position, entry.doc_index, entry.score))
         .collect())
@@ -734,6 +741,14 @@ impl ExecutionPlan for FtsIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+/// The error for a full-text index that declined, while searching, a query it
+/// accepted while planning.
+fn declined(column: &str) -> Error {
+    Error::internal(format!(
+        "the full-text index on '{column}' accepted a search, then did not answer it"
+    ))
 }
 
 #[cfg(test)]

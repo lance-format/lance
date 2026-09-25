@@ -63,7 +63,8 @@ use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
-use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::dataset::mem_wal::index::FtsMemQuery;
+use crate::dataset::mem_wal::memtable::scanner::{MemTableScanner, local_fts_query};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
@@ -300,6 +301,25 @@ fn bind_to_stored_columns(
     }
 }
 
+/// Whether the active memtable's own indexes answer this search, asked the
+/// question each index will receive.
+fn active_source_answers_fts(source: &LsmDataSource, query: &FullTextSearchQuery) -> bool {
+    let LsmDataSource::ActiveMemTable {
+        batch_store,
+        index_store,
+        ..
+    } = source
+    else {
+        return false;
+    };
+    // A row is visible only once every index holds it.
+    batch_store
+        .max_visible_row(index_store.visible_count())
+        .is_some()
+        && local_fts_query(query.clone(), Some(index_store))
+            .is_ok_and(|local| local.is_answered_by(index_store))
+}
+
 fn active_source_can_execute_fts(
     source: &LsmDataSource,
     column: &str,
@@ -312,8 +332,9 @@ fn active_source_can_execute_fts(
             ..
         } => {
             index_store
-                .get_fts_by_column_and_granularity(column, document_granularity)
-                .is_some_and(|index| !index.is_empty())
+                .index_answering(column, &FtsMemQuery::probe(document_granularity))
+                .is_some()
+                // A row is visible only once every index holds it.
                 && batch_store
                     .max_visible_row(index_store.visible_count())
                     .is_some()
@@ -1044,7 +1065,7 @@ impl LsmFtsSearchPlanner {
                     // A memtable created before a schema change indexes the
                     // column under its old name, or not at all if it is newer.
                     if memtable_matches_table(schema, &self.identity_schema) {
-                        index_store.fts_document_granularities_by_column(column)
+                        index_store.fts_granularities_on(column)
                     } else {
                         let generation = GenerationRead::for_memtable(
                             schema,
@@ -1054,9 +1075,7 @@ impl LsmFtsSearchPlanner {
                         );
                         match generation.stored_fts_name(column) {
                             None => Vec::new(),
-                            Some(stored_column) => {
-                                index_store.fts_document_granularities_by_column(stored_column)
-                            }
+                            Some(stored_column) => index_store.fts_granularities_on(stored_column),
                         }
                     }
                 }
@@ -1290,9 +1309,8 @@ impl LsmFtsSearchPlanner {
                 // single store, and re-indexing a maintained column costs one
                 // tokenize pass over a memtable that is already paying for the
                 // missing one.
-                let index_store = if stored_names.iter().all(|column| {
-                    active_source_can_execute_fts(source, column, document_granularity)
-                }) {
+                let asked = bind_to_stored_columns(query, columns, &stored_columns)?;
+                let index_store = if active_source_answers_fts(source, &asked) {
                     index_store.clone()
                 } else {
                     match transient_fts_index_store(
@@ -3112,9 +3130,7 @@ mod tests {
             .unwrap();
         let indexes = Arc::new(indexes);
         assert!(
-            indexes
-                .fts_document_granularities_by_column("text")
-                .is_empty(),
+            indexes.fts_granularities_on("text").is_empty(),
             "precondition: the memtable maintains no FTS index on the column"
         );
 

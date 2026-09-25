@@ -139,12 +139,21 @@ impl<'a> CreateIndexBuilder<'a> {
 
     /// Train from rows already in the B-tree's shape: sorted by value, each
     /// with its row id. An index that trains from another shape is refused.
-    pub fn preprocessed_data(
+    pub fn preprocessed_data(self, reader: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
+        self.preprocessed_stream(
+            reader_to_stream(reader),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        )
+    }
+
+    /// Train a scalar index from rows already prepared in the shape `criteria`
+    /// describes. An index that trains from another shape is refused.
+    pub(crate) fn preprocessed_stream(
         mut self,
-        reader: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        criteria: TrainingCriteria,
     ) -> Self {
-        let criteria = TrainingCriteria::new(TrainingOrdering::Values).with_row_id();
-        self.preprocessed_data = Some((reader_to_stream(reader), criteria));
+        self.preprocessed_data = Some((stream, criteria));
         self
     }
 
