@@ -48,7 +48,7 @@ impl OwnedJsonb {
         RawJsonb::new(self.data.as_slice())
     }
 
-    /// Consumes the OwnedJsonb and returns the underlying Vec<u8>.
+    /// Consumes the OwnedJsonb and returns the underlying `Vec<u8>`.
     ///
     /// # Returns
     ///
