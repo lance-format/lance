@@ -41,6 +41,20 @@
 //! ([`NullableIndexExprResult`], backed by [`NullableRowAddrMask`]) —
 //! the per-endpoint algebra already implements two-valued and SQL
 //! three-valued logic correctly inside each mask type.
+//!
+//! In the nullable form each endpoint gives every row a SQL truth value, and
+//! the endpoints bracket the row's actual value in the order
+//! `FALSE < NULL < TRUE`:
+//!
+//! ```text
+//! lower(row) <= actual(row) <= upper(row)
+//! ```
+//!
+//! `AND` and `OR` preserve this order and `NOT` reverses it, which is what
+//! makes the endpoint-wise algebra sound. It also means a search must report
+//! a row whose predicate is NULL as NULL whenever its result may be negated.
+//! Reporting it as FALSE puts `upper` below the actual value, and `NOT` then
+//! turns the row into a guaranteed match.
 
 use std::sync::{Arc, LazyLock};
 
@@ -56,10 +70,12 @@ use crate::mask::{NullableRowAddrMask, RowAddrMask, RowSetOps};
 /// is a [`NullableRowAddrMask`] carrying SQL three-valued logic info.
 #[derive(Debug, Clone)]
 pub struct NullableIndexExprResult {
-    /// Rows the index *guarantees* are TRUE.
+    /// Lower bound on each row's value. Rows TRUE here are guaranteed TRUE,
+    /// and rows NULL here are NULL or TRUE.
     pub lower: NullableRowAddrMask,
-    /// Rows that may be TRUE. Rows outside `upper` are guaranteed to be
-    /// FALSE / NULL (and so not in a `WHERE` answer set).
+    /// Upper bound on each row's value. Rows FALSE here are guaranteed FALSE,
+    /// and rows NULL here are FALSE or NULL. Either way they are not in a
+    /// `WHERE` answer set.
     pub upper: NullableRowAddrMask,
     // O(1) cache for is_exact(). Set by constructors and propagated
     // elementwise through the boolean algebra.

@@ -1322,12 +1322,14 @@ impl IndexedExpression {
     /// Try and negate the expression
     ///
     /// If the expression contains both an index query and a refine expression then it
-    /// cannot be negated today and None will be returned (we give up trying to use indices)
+    /// cannot be negated today and None will be returned (we give up trying to use indices).
+    /// The same happens when a search needs a recheck or reports NULL rows as FALSE,
+    /// since negating either kind of result would claim rows that do not match.
     fn maybe_not(self) -> Option<Self> {
         match (self.scalar_query, self.refine_expr) {
             (Some(_), Some(_)) => None,
             (Some(scalar_query), None) => {
-                if scalar_query.needs_recheck() {
+                if scalar_query.needs_recheck() || !scalar_query.reports_null_rows() {
                     return None;
                 }
                 Some(Self {
@@ -2031,6 +2033,18 @@ impl ScalarIndexExpr {
             Self::Query(search) => search.needs_recheck,
         }
     }
+
+    /// Whether every search in the expression reports rows where its predicate
+    /// is NULL, see [`AnyQuery::reports_null_rows`].
+    pub fn reports_null_rows(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.reports_null_rows(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.reports_null_rows() && rhs.reports_null_rows()
+            }
+            Self::Query(search) => search.query.reports_null_rows(),
+        }
+    }
 }
 
 // Extract a column from the expression, if it is a column, or None
@@ -2223,6 +2237,11 @@ fn visit_in_list(
     }
 }
 
+/// Index `col IS TRUE` / `col IS FALSE`.
+///
+/// The parser answers `col = value`, which is NULL on NULL rows, while
+/// `col IS value` is FALSE there. Pairing it with `col IS NOT NULL` gives the
+/// `IS` semantics, so the result stays correct when it is negated.
 fn visit_is_bool(
     expr: &Expr,
     index_info: &dyn IndexInformationProvider,
@@ -2230,9 +2249,23 @@ fn visit_is_bool(
 ) -> Option<IndexedExpression> {
     let (column, col_type, query_parser) = maybe_indexed_column(expr, index_info)?;
     if col_type != DataType::Boolean {
-        None
-    } else {
-        query_parser.visit_is_bool(&column, value)
+        return None;
+    }
+    let equals = query_parser.visit_is_bool(&column, value)?;
+    match query_parser
+        .visit_is_null(&column)
+        .and_then(IndexedExpression::maybe_not)
+    {
+        Some(is_not_null) => Some(equals.and(is_not_null)),
+        // A rechecked search is never negated, so `col = value` alone is enough.
+        None if equals
+            .scalar_query
+            .as_ref()
+            .is_some_and(ScalarIndexExpr::needs_recheck) =>
+        {
+            Some(equals)
+        }
+        None => None,
     }
 }
 
@@ -3157,12 +3190,21 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS TRUE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        // `IS TRUE` / `IS FALSE` are FALSE on NULL rows, unlike `= true` / `= false`,
+        // so they also require `IS NOT NULL`.
+        let on_sale_query = |query: SargableQuery| {
+            IndexedExpression::index_query(
+                "on_sale".to_string(),
+                "on_sale_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(query),
+            )
+        };
+        for (expr, value) in [("on_sale IS TRUE", true), ("on_sale IS FALSE", false)] {
+            let expected = on_sale_query(SargableQuery::Equals(ScalarValue::Boolean(Some(value))))
+                .and(on_sale_query(SargableQuery::IsNull()).maybe_not().unwrap());
+            check(&index_info, expr, Some(expected), false);
+        }
         check_simple(
             &index_info,
             "on_sale",
@@ -3174,12 +3216,6 @@ mod tests {
             "NOT on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
-        check_simple(
-            &index_info,
-            "on_sale IS FALSE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
         );
         check_simple_negated(
             &index_info,
@@ -3256,18 +3292,6 @@ mod tests {
                 ScalarValue::UInt32(Some(8)),
                 ScalarValue::UInt32(Some(9)),
             ]),
-        );
-        check_simple(
-            &index_info,
-            "on_sale is false",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
-        check_simple(
-            &index_info,
-            "on_sale is true",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
         check_simple(
             &index_info,

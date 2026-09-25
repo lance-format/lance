@@ -492,6 +492,13 @@ impl AnyQuery for TextQuery {
             None => false,
         }
     }
+
+    fn reports_null_rows(&self) -> bool {
+        // The FM index skips NULL text rows at build time, so it answers
+        // `contains` on a NULL row with FALSE rather than NULL. N-gram searches
+        // are always rechecked, so they are never negated either way.
+        false
+    }
 }
 
 /// A query that a InvertedIndex can satisfy
