@@ -123,13 +123,16 @@ async fn test_ivf_split_reshuffle_memory_stays_bounded() {
 
     let tmp_dir = tempfile::tempdir().unwrap();
     let uri = tmp_dir.path().to_str().unwrap();
-    let batches = (0..num_batches).map(|seed| {
-        Ok(random_vector_batch(
-            &schema,
-            rows_per_batch,
-            dim,
-            seed as u8,
-        ))
+    let batches = (0..num_batches).map({
+        let schema = schema.clone();
+        move |seed| {
+            Ok(random_vector_batch(
+                &schema,
+                rows_per_batch,
+                dim,
+                seed as u8,
+            ))
+        }
     });
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(batches, schema.clone()),
