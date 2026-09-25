@@ -20,9 +20,9 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use lance_arrow::RecordBatchExt;
 
 mod brute_force_vector;
-mod btree;
 mod dedup_scan;
 mod fts;
+mod scalar_index;
 mod scan;
 mod vector;
 
@@ -31,9 +31,9 @@ use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::BatchStore;
 
 pub use brute_force_vector::MemTableBruteForceVectorExec;
-pub use btree::BTreeIndexExec;
 pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
+pub use scalar_index::ScalarIndexExec;
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
 

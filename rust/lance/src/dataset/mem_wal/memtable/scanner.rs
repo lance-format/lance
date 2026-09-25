@@ -38,5 +38,4 @@ mod builder;
 mod exec;
 
 pub use builder::MemTableScanner;
-pub use builder::ScalarPredicate;
-pub use exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+pub use exec::{FtsIndexExec, MemTableScanExec, ScalarIndexExec, VectorIndexExec};

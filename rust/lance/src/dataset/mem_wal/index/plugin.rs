@@ -41,6 +41,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
+use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -470,6 +471,29 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     /// than an index that disagrees with its own data.
     fn training_criteria(&self) -> TrainingCriteria;
 
+    /// How a filter expression reaches this index.
+    ///
+    /// Return the parser the on-disk index of the same kind uses, and every
+    /// expression it already claims — comparisons, ranges, `IN`, `IS NULL`,
+    /// `LIKE`, a scalar function — reaches this index too, producing the same
+    /// [`AnyQuery`](lance_index::scalar::AnyQuery) that
+    /// [`MemIndex::search`] then answers.
+    ///
+    /// The details are the base-table index's, for a kind whose claims depend
+    /// on how it was built. They are absent when a caller configured the
+    /// memtable directly rather than from a base table, so a plugin that needs
+    /// them declines without them.
+    ///
+    /// `None` for a kind no filter expression names: a vector index and a
+    /// full-text index are reached from the scan API instead.
+    fn query_parser(
+        &self,
+        _index_name: String,
+        _index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        None
+    }
+
     /// Resolve this index against the base table: which columns it really
     /// covers, and whatever it needs to build one.
     ///
@@ -589,6 +613,12 @@ pub struct MemIndexSpec {
     pub plugin: Arc<dyn MemIndexPlugin>,
     /// What [`MemIndexPlugin::resolve`] returned.
     pub params: Arc<dyn MemIndexParams>,
+    /// The base-table index's details message.
+    ///
+    /// Carried because the query parser is built from it: the same details the
+    /// on-disk index was written with decide which expressions this index
+    /// claims, so the memtable and the base table claim the same ones.
+    pub details: Option<Arc<prost_types::Any>>,
 }
 
 impl MemIndexSpec {
@@ -613,6 +643,7 @@ impl MemIndexSpec {
             && self.plugin.name() == other.plugin.name()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
+            && self.details == other.details
     }
 
     /// Build the index this spec describes.
@@ -670,6 +701,7 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin,
             params: Arc::new(()),
+            details: None,
         }
     }
 
@@ -681,6 +713,7 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin: Arc::new(super::btree::BTreeMemIndexPlugin),
             params: Arc::new(()),
+            details: None,
         }
     }
 
@@ -717,6 +750,7 @@ impl MemIndexSpec {
                 distance_type,
                 build_params,
             }),
+            details: None,
         }
     }
 
@@ -742,6 +776,7 @@ impl MemIndexSpec {
                 params,
                 resolved_field: None,
             }),
+            details: None,
         }
     }
 }
