@@ -126,6 +126,11 @@ fn requested_query_document_granularity(
                 }
                 Ok(())
             }
+            // BM25F blends the target columns per row, so combined_fields is
+            // row-granular by construction and carries no granularity field.
+            // Merging Row still catches a tree that mixes it with a
+            // list-element leaf.
+            IndexFtsQuery::CombinedFields(_) => merge(current, Some(DocumentGranularity::Row)),
         }
     }
 
@@ -164,6 +169,8 @@ fn set_query_document_granularity(
                 child.document_granularity = Some(document_granularity);
             }
         }
+        // Row-granular by construction, and it carries no field to set.
+        IndexFtsQuery::CombinedFields(_) => {}
     }
 }
 
@@ -247,6 +254,11 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
                 }
                 Ok(())
             }
+            // BM25F needs corpus-wide field statistics that the memtable's
+            // in-memory index does not maintain.
+            IndexFtsQuery::CombinedFields(_) => Err(Error::not_supported(
+                "LSM full-text search does not support combined_fields (BM25F)".to_string(),
+            )),
         }
     }
     visit(&query.query)
@@ -467,6 +479,11 @@ fn collect_query_columns(query: &IndexFtsQuery) -> Vec<String> {
         match query {
             IndexFtsQuery::Match(query) => push(&query.column),
             IndexFtsQuery::Phrase(query) => push(&query.column),
+            IndexFtsQuery::CombinedFields(query) => {
+                for column in query.column_names() {
+                    push(&Some(column.to_string()));
+                }
+            }
             IndexFtsQuery::MultiMatch(query) => {
                 for leaf in &query.match_queries {
                     push(&leaf.column);

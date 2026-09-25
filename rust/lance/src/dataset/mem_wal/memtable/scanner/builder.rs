@@ -354,6 +354,9 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
                 }
                 return Ok(());
             }
+            // BM25F blends the target columns per row, so combined_fields is
+            // row-granular by construction and carries no granularity field.
+            IndexFtsQuery::CombinedFields(_) => Some(DocumentGranularity::Row),
         };
         match (*current, requested) {
             (_, None) => {}
@@ -437,6 +440,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
                 .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
                 .collect::<Result<_>>()?,
         },
+        // BM25F needs corpus-wide field statistics that the in-memory index
+        // does not maintain, so there is no local expression for it.
+        IndexFtsQuery::CombinedFields(_) => {
+            return Err(Error::not_supported(
+                "MemTable full-text search does not support combined_fields (BM25F)".to_string(),
+            ));
+        }
     })
 }
 

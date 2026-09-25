@@ -22,8 +22,8 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{
-    BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, MultiMatchQuery, Occur,
-    Operator, PhraseQuery, collect_query_tokens,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery,
+    MultiMatchQuery, Occur, Operator, PhraseQuery, collect_query_tokens,
 };
 use lance_index::scalar::inverted::{DocumentGranularity, Language};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -83,6 +83,16 @@ fn row_match_node(column: &str, terms: &str) -> MatchQuery {
 
 fn row_match(column: &str, terms: &str) -> FullTextSearchQuery {
     FullTextSearchQuery::new_query(FtsQuery::Match(row_match_node(column, terms)))
+}
+
+fn combined_fields(terms: &str, columns: &[&str]) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+        CombinedFieldsQuery::try_new(
+            terms.to_string(),
+            columns.iter().map(|column| column.to_string()).collect(),
+        )
+        .unwrap(),
+    ))
 }
 
 fn row_phrase(column: &str, terms: &str) -> FullTextSearchQuery {
@@ -246,11 +256,21 @@ fn expected_bm25_score(
     idf * 2.2 / (1.0 + doc_norm)
 }
 
+#[rstest::rstest]
+#[case::match_query(false)]
+#[case::combined_fields(true)]
 #[tokio::test]
-async fn test_invalid_json_fts_query_returns_error() {
+async fn test_invalid_json_fts_query_returns_error(#[case] combined_fields: bool) {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("doc", DataType::Utf8, false).with_metadata(
+            [(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]
+            .into(),
+        ),
+        ArrowField::new("other_doc", DataType::Utf8, false).with_metadata(
             [(
                 ARROW_EXT_NAME_KEY.to_string(),
                 ARROW_JSON_EXT_NAME.to_string(),
@@ -266,6 +286,10 @@ async fn test_invalid_json_fts_query_returns_error() {
                 r#"{"title":"quick brown fox"}"#,
                 r#"{"title":"lazy dog"}"#,
             ])),
+            Arc::new(StringArray::from(vec![
+                r#"{"title":"quick brown fox"}"#,
+                r#"{"title":"lazy dog"}"#,
+            ])),
         ],
     )
     .unwrap();
@@ -277,29 +301,38 @@ async fn test_invalid_json_fts_query_returns_error() {
     )
     .await
     .unwrap();
-    dataset
-        .create_index(
-            &["doc"],
-            IndexType::Inverted,
-            None,
-            &base_inverted_params(false),
-            true,
-        )
-        .await
-        .unwrap();
+    for column in ["doc", "other_doc"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Inverted,
+                None,
+                &base_inverted_params(false),
+                true,
+            )
+            .await
+            .unwrap();
+    }
 
     for (query, expected_message) in [
         ("brown", "Invalid triple format: brown"),
         ("title,string,brown", "Invalid triple type: string"),
     ] {
         let mut scanner = dataset.scan();
-        scanner
-            .full_text_search(
-                FullTextSearchQuery::new(query.to_string())
-                    .with_column("doc".to_string())
-                    .unwrap(),
-            )
-            .unwrap();
+        let query = if combined_fields {
+            FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+                CombinedFieldsQuery::try_new(
+                    query.to_string(),
+                    vec!["doc".to_string(), "other_doc".to_string()],
+                )
+                .unwrap(),
+            ))
+        } else {
+            FullTextSearchQuery::new(query.to_string())
+                .with_column("doc".to_string())
+                .unwrap()
+        };
+        scanner.full_text_search(query).unwrap();
         let error = scanner.try_into_batch().await.unwrap_err();
         let message = error.to_string();
         assert!(message.contains(expected_message), "{message}");
@@ -540,6 +573,20 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         "{err}"
     );
 
+    // BM25F sums each target column's contribution for one row and reports no
+    // element coordinates, so a column that only has a list-element index has to
+    // be rejected rather than silently collapsed to a row score.
+    let mut element_only_combined = ds.scan();
+    element_only_combined
+        .full_text_search(combined_fields("alpha", &["tags"]))
+        .unwrap();
+    let err = element_only_combined.try_into_batch().await.unwrap_err();
+    assert!(
+        err.to_string().contains("combined_fields")
+            && err.to_string().contains("Row document granularity"),
+        "{err}"
+    );
+
     ds.create_index(
         &["tags"],
         IndexType::Inverted,
@@ -549,6 +596,17 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     )
     .await
     .unwrap();
+
+    // With a row index alongside the list-element one, combined_fields picks the
+    // row index and scores whole rows, without a `_doc_index` column.
+    let combined = run_fts(&ds, combined_fields("alpha", &["tags"]), None).await;
+    assert_eq!(
+        combined["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0]
+    );
+    assert!(combined.column_by_name("_doc_index").is_none());
     let names = ds
         .load_indices()
         .await
@@ -1030,6 +1088,72 @@ async fn test_element_document_nested_lists_use_deepest_boundary() {
     assert_eq!(row.fields, elements.fields);
     assert_eq!(row.fields, vec![content.id]);
     assert_ne!(row.fields, vec![docs.children[0].id]);
+
+    // A cross-field scan resolves the same nested path through the row index.
+    let combined_indexed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    assert_eq!(
+        combined_indexed["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+    assert!(combined_indexed.column_by_name("_doc_index").is_none());
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![2, 3])) as ArrayRef),
+        ("groups", batch.column_by_name("groups").unwrap().clone()),
+    ])
+    .unwrap();
+    let mut ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let mut combined_mixed = ds.scan();
+    combined_mixed
+        .full_text_search(combined_fields("alpha", &[path]))
+        .unwrap();
+    let error = combined_mixed.try_into_batch().await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("1 of 2 fragments are not fully covered") && message.contains(path),
+        "{message}"
+    );
+
+    let mut combined_fast = ds.scan();
+    let indexed_only = combined_fast
+        .full_text_search(combined_fields("alpha", &[path]))
+        .unwrap()
+        .fast_search()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed_only["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let combined_indexed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    assert_eq!(
+        combined_indexed["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1, 2, 3]
+    );
 }
 
 #[tokio::test]

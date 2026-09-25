@@ -405,9 +405,9 @@ pub(super) async fn add_columns_to_fragments(
 /// transform enforces at the top level.
 ///
 /// A new node under a non-nullable top-level column claims even when the node
-/// itself is nullable: the reader synthesizes missing subcolumns against the
-/// column's declared nullability, so a stale fragment cannot be read at all
-/// under such a column, nullable child or not.
+/// itself is nullable. The reader can synthesize such a child for stale
+/// fragments, so this is deliberately conservative: it keeps the
+/// conflict-resolution rule independent of how the reader fills the gap.
 pub(super) fn merge_introduces_required_field(old: &Schema, merged: &Schema) -> bool {
     /// (any node in `merged` is new, any first-new node is non-nullable)
     fn subtree_new_nodes(old: &[Field], merged: &[Field]) -> (bool, bool) {
@@ -1189,8 +1189,8 @@ mod test {
         // The first new node on each path decides, at any depth; any new node
         // under a non-nullable top-level column claims regardless.
         for (merged, expected) in [
-            // A nullable new child under a non-nullable top-level column: the
-            // reader cannot synthesize the missing subcolumn, so claim.
+            // A nullable new child under a non-nullable top-level column claims
+            // by design, even though the reader can synthesize it.
             (
                 schema(vec![
                     strukt("s", true, vec![int("a", true)]),
@@ -2710,6 +2710,254 @@ mod test {
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    /// A schema-only child added under a `list<struct>` parent must read back
+    /// with the parent's offsets, validity and siblings intact, without
+    /// weakening the parent's declared nullability, and alongside later
+    /// fragments that do carry the child. A NOT NULL parent, alone or inside
+    /// a NOT NULL struct, used to panic in the placeholder reader.
+    #[rstest]
+    #[case::required_parent(false, false)]
+    #[case::nullable_parent(true, false)]
+    #[case::required_struct_wrapper(false, true)]
+    #[tokio::test]
+    async fn test_add_nested_child_under_parent_nullability(
+        #[case] parent_nullable: bool,
+        #[case] wrap_in_struct: bool,
+    ) -> Result<()> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+
+        fn list_of(item: DataType) -> DataType {
+            DataType::List(Arc::new(ArrowField::new("item", item, true)))
+        }
+        fn top_field(items: ArrowField, wrap: bool, wrapper_nullable: bool) -> ArrowField {
+            if wrap {
+                ArrowField::new(
+                    "wrapper",
+                    DataType::Struct(vec![items].into()),
+                    wrapper_nullable,
+                )
+            } else {
+                items
+            }
+        }
+        fn top_column(items: ArrayRef, items_field: ArrowField, wrap: bool) -> ArrayRef {
+            if wrap {
+                Arc::new(StructArray::new(
+                    vec![items_field].into(),
+                    vec![items],
+                    None,
+                ))
+            } else {
+                items
+            }
+        }
+        fn items_column(batch: &RecordBatch, wrap: bool) -> &ListArray {
+            let column = if wrap {
+                batch
+                    .column_by_name("wrapper")
+                    .unwrap()
+                    .as_struct()
+                    .column_by_name("items")
+                    .unwrap()
+            } else {
+                batch.column_by_name("items").unwrap()
+            };
+            column.as_list::<i32>()
+        }
+
+        let name_fields = ArrowFields::from(vec![ArrowField::new("name", DataType::Utf8, true)]);
+        let old_items_field = ArrowField::new(
+            "items",
+            list_of(DataType::Struct(name_fields.clone())),
+            parent_nullable,
+        );
+        let old_schema = Arc::new(ArrowSchema::new(vec![top_field(
+            old_items_field.clone(),
+            wrap_in_struct,
+            false,
+        )]));
+        // Rows: [{a}, {b}, null], [] and, for a nullable parent, null.
+        let mut offsets = vec![0i32, 3, 3];
+        let mut list_validity = None;
+        if parent_nullable {
+            offsets.push(3);
+            list_validity = Some(NullBuffer::from(vec![true, true, false]));
+        }
+        let old_structs = StructArray::new(
+            name_fields.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef],
+            Some(vec![true, true, false].into()),
+        );
+        let old_items = ListArray::new(
+            Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(name_fields.clone()),
+                true,
+            )),
+            OffsetBuffer::new(offsets.clone().into()),
+            Arc::new(old_structs),
+            list_validity,
+        );
+        let num_old_rows = old_items.len();
+        let batch = RecordBatch::try_new(
+            old_schema.clone(),
+            vec![top_column(
+                Arc::new(old_items),
+                old_items_field,
+                wrap_in_struct,
+            )],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], old_schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                // One fragment per row so the placeholder is exercised per fragment.
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), num_old_rows);
+
+        let collections_field = ArrowField::new("collections", list_of(DataType::Int32), true);
+        let added = ArrowField::new(
+            "items",
+            list_of(DataType::Struct(vec![collections_field.clone()].into())),
+            true,
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![top_field(
+                    added,
+                    wrap_in_struct,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        // Only the placeholder batch is nullable; the dataset schema keeps the
+        // parent's declared nullability.
+        let merged_fields = ArrowFields::from(vec![
+            ArrowField::new("name", DataType::Utf8, true),
+            collections_field,
+        ]);
+        let items_field = ArrowField::new(
+            "items",
+            list_of(DataType::Struct(merged_fields.clone())),
+            parent_nullable,
+        );
+        let expected_schema =
+            ArrowSchema::new(vec![top_field(items_field.clone(), wrap_in_struct, false)]);
+        assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
+
+        let check_old_rows = |items: &ListArray| {
+            assert_eq!(&items.value_offsets()[..offsets.len()], offsets.as_slice());
+            assert_eq!(items.null_count(), usize::from(parent_nullable));
+            if parent_nullable {
+                assert!(items.is_null(2));
+            }
+            let structs = items.values().as_struct();
+            assert!(structs.is_valid(0) && structs.is_valid(1) && structs.is_null(2));
+            let names = structs.column_by_name("name").unwrap().as_string::<i32>();
+            assert_eq!(names.value(0), "a");
+            assert_eq!(names.value(1), "b");
+            let collections = structs.column_by_name("collections").unwrap();
+            assert!(collections.is_null(0) && collections.is_null(1) && collections.is_null(2));
+        };
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), num_old_rows);
+        assert_eq!(data.schema().fields(), expected_schema.fields());
+        check_old_rows(items_column(&data, wrap_in_struct));
+
+        // A fragment written after the addition carries real child values.
+        let new_structs = StructArray::new(
+            merged_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c"])) as ArrayRef,
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1), Some(2)]),
+                ])),
+            ],
+            None,
+        );
+        let new_items = ListArray::new(
+            Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(merged_fields.clone()),
+                true,
+            )),
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(new_structs),
+            None,
+        );
+        let new_batch = RecordBatch::try_new(
+            Arc::new(expected_schema.clone()),
+            vec![top_column(Arc::new(new_items), items_field, wrap_in_struct)],
+        )?;
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![new_batch])
+            .await?;
+        assert_eq!(dataset.get_fragments().len(), num_old_rows + 1);
+
+        let check_new_row = |items: &ListArray, row: usize, element: usize| {
+            assert_eq!(items.value_length(row), 1);
+            let structs = items.values().as_struct();
+            assert_eq!(
+                structs
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_string::<i32>()
+                    .value(element),
+                "c"
+            );
+            let collections = structs
+                .column_by_name("collections")
+                .unwrap()
+                .as_list::<i32>();
+            assert_eq!(
+                collections
+                    .value(element)
+                    .as_primitive::<Int32Type>()
+                    .values(),
+                &[1, 2]
+            );
+        };
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), num_old_rows + 1);
+        assert_eq!(data.schema().fields(), expected_schema.fields());
+        let items = items_column(&data, wrap_in_struct);
+        check_old_rows(items);
+        check_new_row(items, num_old_rows, 3);
+
+        // `take` shares the placeholder builder with the scan path.
+        let taken = dataset
+            .take(&[num_old_rows as u64, 0], dataset.schema().clone())
+            .await?;
+        assert_eq!(taken.schema().fields(), expected_schema.fields());
+        let items = items_column(&taken, wrap_in_struct);
+        assert_eq!(items.value_offsets(), &[0, 1, 4]);
+        check_new_row(items, 0, 0);
+        let collections = items
+            .values()
+            .as_struct()
+            .column_by_name("collections")
+            .unwrap();
+        assert!(collections.is_null(1) && collections.is_null(2) && collections.is_null(3));
         Ok(())
     }
 

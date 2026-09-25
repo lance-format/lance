@@ -625,6 +625,23 @@ impl NullReader {
         Self { schema, num_rows }
     }
 
+    /// The Arrow schema of the placeholder batches for `projection`.
+    ///
+    /// When a nested child is added to an existing parent, the parent lands
+    /// here as well (all-null) even though the dataset schema may declare it
+    /// NOT NULL; the later merge with the data files rebuilds it from the
+    /// parent's real data. Mark the placeholder fields nullable so the batch
+    /// is not rejected for violating a constraint the merged result satisfies.
+    fn nullable_schema(projection: &Schema) -> Arc<ArrowSchema> {
+        let schema = ArrowSchema::from(projection);
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>();
+        Arc::new(ArrowSchema::new_with_metadata(fields, schema.metadata))
+    }
+
     fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
         let columns = projection
             .fields()
@@ -652,7 +669,7 @@ impl GenericFileReader for NullReader {
         projection: Arc<Schema>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
+        let projection = Self::nullable_schema(projection.as_ref());
 
         let task_iter = std::iter::from_fn(move || {
             if remaining_rows == 0 {
