@@ -388,9 +388,9 @@ impl Schema {
     /// Validate a schema before storing it in a dataset manifest.
     ///
     /// System columns are virtual on reads, so [`Self::validate`] permits their
-    /// names in projection schemas. Stored top-level fields may not use those
-    /// names; nested fields may use them because virtual columns are added only
-    /// at the schema root.
+    /// names in projection schemas. Stored top-level fields must have nonempty
+    /// names and may not use system-column names. Nested fields may use system
+    /// names because virtual columns are added only at the schema root.
     ///
     /// ```
     /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -399,6 +399,8 @@ impl Schema {
     /// let arrow = ArrowSchema::new(vec![Field::new("_rowid", DataType::UInt64, false)]);
     /// let schema = Schema::try_from(&arrow)?;
     /// assert!(schema.validate_writable().is_err());
+    /// let empty = ArrowSchema::new(vec![Field::new("", DataType::UInt64, false)]);
+    /// assert!(Schema::try_from(&empty)?.validate_writable().is_err());
     ///
     /// let nested = ArrowSchema::new(vec![Field::new(
     ///     "outer",
@@ -410,7 +412,12 @@ impl Schema {
     /// ```
     pub fn validate_writable(&self) -> Result<()> {
         self.validate()?;
-        for field in &self.fields {
+        for (index, field) in self.fields.iter().enumerate() {
+            if field.name.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "The top-level column at index {index} has an empty name and cannot be stored in a Lance dataset"
+                )));
+            }
             if crate::is_system_column(&field.name) {
                 return Err(Error::invalid_input(format!(
                     "The column '{}' at path '{}' is a reserved name and cannot be stored in a Lance dataset",
@@ -2047,6 +2054,19 @@ mod tests {
         assert!(matches!(&error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains(&format!("path '{name}'")));
         assert!(error.to_string().contains("reserved name"));
+    }
+
+    #[test]
+    fn test_validate_writable_rejects_empty_top_level_name() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("", DataType::Int32, false),
+        ]);
+        let schema = Schema::try_from(&arrow).unwrap();
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("index 1"), "{error}");
+        assert!(error.to_string().contains("empty name"), "{error}");
     }
 
     #[test]
