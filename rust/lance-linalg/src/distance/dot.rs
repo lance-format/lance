@@ -380,7 +380,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })
@@ -404,7 +404,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })

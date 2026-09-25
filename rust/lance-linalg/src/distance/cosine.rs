@@ -421,7 +421,7 @@ mod f32 {
                 let x_values = unsafe { f32x8::load_unaligned(x.as_ptr()) };
                 output
                     .iter_mut()
-                    .zip(batch.chunks_exact(8))
+                    .zip(batch.as_chunks::<8>().0)
                     .for_each(|(distance, y)| {
                         let y_values = unsafe { f32x8::load_unaligned(y.as_ptr()) };
                         let y2 = y_values * y_values;
@@ -431,7 +431,7 @@ mod f32 {
             }
             16 => output
                 .iter_mut()
-                .zip(batch.chunks_exact(16))
+                .zip(batch.as_chunks::<16>().0)
                 .for_each(|(distance, y)| {
                     *distance = unsafe { cosine_once_x86::cosine_once_16_avx_fma(x, x_norm, y) };
                 }),
@@ -457,13 +457,13 @@ mod f32 {
         match dimension {
             8 => output
                 .iter_mut()
-                .zip(batch.chunks_exact(8))
+                .zip(batch.as_chunks::<8>().0)
                 .for_each(|(distance, y)| {
                     *distance = unsafe { cosine_once_x86::cosine_once_8_avx512(x, x_norm, y) };
                 }),
             16 => output
                 .iter_mut()
-                .zip(batch.chunks_exact(16))
+                .zip(batch.as_chunks::<16>().0)
                 .for_each(|(distance, y)| {
                     *distance = unsafe { cosine_once_x86::cosine_once_16_avx512(x, x_norm, y) };
                 }),
@@ -491,7 +491,7 @@ mod f32 {
                 let x_values = unsafe { f32x8::load_unaligned(x.as_ptr()) };
                 output
                     .iter_mut()
-                    .zip(batch.chunks_exact(8))
+                    .zip(batch.as_chunks::<8>().0)
                     .for_each(|(distance, y)| {
                         let y_values = unsafe { f32x8::load_unaligned(y.as_ptr()) };
                         let y2 = y_values * y_values;
@@ -501,7 +501,7 @@ mod f32 {
             }
             16 => output
                 .iter_mut()
-                .zip(batch.chunks_exact(16))
+                .zip(batch.as_chunks::<16>().0)
                 .for_each(|(distance, y)| {
                     *distance = unsafe { cosine_once_x86::cosine_once_16_avx(x, x_norm, y) };
                 }),
@@ -623,12 +623,16 @@ impl Cosine for f32 {
             match dimension {
                 8 => Box::new(
                     batch
-                        .chunks_exact(8)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
                         .map(move |y| f32_baseline::cosine_once_8(x, x_norm, y)),
                 ),
                 16 => Box::new(
                     batch
-                        .chunks_exact(16)
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
                         .map(move |y| f32_baseline::cosine_once_16(x, x_norm, y)),
                 ),
                 _ => {

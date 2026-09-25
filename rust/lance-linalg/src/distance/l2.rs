@@ -411,7 +411,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
@@ -436,7 +436,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
