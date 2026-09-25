@@ -10,7 +10,9 @@ mod tests {
     use crate::testing::FsFixture;
     use crate::version::ConcreteFileVersion;
     use crate::versions;
-    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
+    use crate::writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
+    };
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
@@ -21,6 +23,8 @@ mod tests {
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
@@ -579,6 +583,114 @@ mod tests {
             err.contains("non-null"),
             "expected nullability error, got: {err}"
         );
+    }
+
+    fn field_type_mismatch(error: lance_core::Error) -> FieldTypeMismatch {
+        match error {
+            lance_core::Error::InvalidInput { source, .. } => source
+                .downcast_ref::<FieldTypeMismatch>()
+                .unwrap_or_else(|| panic!("expected a field type mismatch, got: {source}"))
+                .clone(),
+            other => panic!("expected an invalid input error, got: {other}"),
+        }
+    }
+
+    /// Arrow JSON text that skipped conversion to Lance JSONB is rejected
+    /// before anything is encoded, naming the offending field.
+    #[rstest]
+    #[case::top_level(false)]
+    #[case::nested_in_struct(true)]
+    #[tokio::test]
+    async fn test_writer_rejects_unconverted_arrow_json(
+        #[case] nested: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let arrow_json =
+            ArrowField::new("j", DataType::Utf8, true).with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let in_struct = |field: ArrowField| {
+            if nested {
+                ArrowField::new("s", DataType::Struct(vec![field].into()), true)
+            } else {
+                field
+            }
+        };
+        let jsonb: ArrayRef = Arc::new(JsonArray::try_from(text.clone()).unwrap().into_inner());
+        let batch_of = |field: ArrowField, values: ArrayRef| {
+            let field = in_struct(field);
+            let values: ArrayRef = match field.data_type() {
+                DataType::Struct(fields) => {
+                    Arc::new(StructArray::new(fields.clone(), vec![values], None))
+                }
+                _ => values,
+            };
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap()
+        };
+        let converted = batch_of(json_field("j", true), jsonb);
+        let batch = batch_of(arrow_json, text);
+        let file_schema = LanceSchema::try_from(converted.schema().as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        // A batch with an accepted schema must not let a later, different
+        // schema through.
+        writer.write_batch(&converted).await.unwrap();
+        let mismatch = field_type_mismatch(writer.write_batch(&batch).await.unwrap_err());
+        assert_eq!(mismatch.field_path, if nested { "s.j" } else { "j" });
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        assert_eq!(mismatch.expected.extension_type_name(), Some(JSON_EXT_NAME));
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(
+            mismatch.actual.extension_type_name(),
+            Some(ARROW_JSON_EXT_NAME)
+        );
+        // The rejected batch reached no encoder.
+        assert_eq!(writer.finish().await.unwrap().num_rows, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_column_rejects_mismatched_type(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let file_schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![json_field("j", true)])).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let mismatch = field_type_mismatch(writer.write_column(0, text).await.unwrap_err());
+        assert_eq!(mismatch.field_path, "j");
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        // A bare array carries no extension of its own.
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(mismatch.actual.extension_type_name(), None);
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {

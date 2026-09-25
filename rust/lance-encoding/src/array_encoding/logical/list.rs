@@ -26,9 +26,9 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, DrainLimit, FieldScheduler, FilterExpression,
+        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -637,6 +637,51 @@ struct ListDecodeTask {
     offset_type: DataType,
 }
 
+fn oversized_batch_error(
+    items_field: &Field,
+    requested_range: Range<u64>,
+    decodable_prefix_end: u64,
+    num_items: u64,
+) -> Error {
+    let prefix_detail = if decodable_prefix_end > requested_range.start {
+        format!(
+            "rows {}..{} fit, but requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            decodable_prefix_end,
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    } else {
+        format!(
+            "requesting rows {}..{} would require {num_items} {}",
+            requested_range.start,
+            requested_range.end,
+            if items_field.data_type() == &DataType::UInt8 {
+                "bytes"
+            } else {
+                "items"
+            }
+        )
+    };
+    if items_field.data_type() == &DataType::UInt8 {
+        Error::not_supported(format!(
+            "Could not create array with more than 2GiB of string/binary data in a single batch \
+             ({prefix_detail}). Please reduce the batch_size, set LANCE_DEFAULT_BATCH_SIZE to a \
+             smaller value, or convert the column to large_string/large_binary."
+        ))
+    } else {
+        Error::not_supported(format!(
+            "Could not create a list array with more than i32::MAX items in a single batch \
+             ({prefix_detail}). Please reduce the batch_size."
+        ))
+    }
+}
+
 impl DecodeArrayTask for ListDecodeTask {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
         let items = self
@@ -782,11 +827,14 @@ impl LogicalPageDecoder for ListPageDecoder {
             }
         }
         if actual_num_rows < num_rows {
-            // TODO: We should be able to automatically
-            // shrink the read batch size if we detect the batches are going to be huge (maybe
-            // even achieve this with a read_batch_bytes parameter, though some estimation may
-            // still be required)
-            return Err(Error::not_supported_source(format!("loading a batch of {} lists would require creating an array with over i32::MAX items and we don't yet support returning smaller than requested batches", num_rows).into()));
+            let requested_range = self.rows_drained..self.rows_drained + num_rows;
+            let num_items = self.offsets[requested_range.end as usize] - item_start;
+            return Err(oversized_batch_error(
+                self.items_field.as_ref(),
+                requested_range,
+                self.rows_drained + actual_num_rows,
+                num_items,
+            ));
         }
         let offsets = self.offsets
             [self.rows_drained as usize..(self.rows_drained + actual_num_rows + 1) as usize]
@@ -817,6 +865,55 @@ impl LogicalPageDecoder for ListPageDecoder {
                 items: item_decode,
                 offset_type: self.offset_type.clone(),
             }) as Box<dyn DecodeArrayTask>,
+        })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        if num_rows == 0 {
+            return Ok(DrainLimit { rows: 0, bytes: 0 });
+        }
+        let start_index = self.rows_drained as usize;
+        let end_index = start_index + num_rows as usize;
+        let start_offset = self.offsets[start_index];
+        // The list's own offsets buffer counts items; when it is i32, the cumulative
+        // item count of one output array must stay within the budget.  Offsets are
+        // rebased per output batch, so only the delta from `start_offset` counts.
+        let mut safe_rows = num_rows;
+        if self.offset_type != DataType::Int64 {
+            let max_offset = start_offset.saturating_add(byte_budget);
+            safe_rows = self.offsets[start_index + 1..=end_index]
+                .partition_point(|offset| *offset <= max_offset) as u64;
+        }
+
+        // The item array has its own offset buffers with their own budget; shrink to
+        // the largest whole number of lists whose items also fit.
+        let mut item_bytes = 0u64;
+        let mut safe_end_index = start_index + safe_rows as usize;
+        let requested_items = self.offsets[safe_end_index] - start_offset;
+        if requested_items > 0
+            && let Some(item_decoder) = &self.item_decoder
+        {
+            let item_limit = item_decoder.max_rows_to_drain(requested_items, byte_budget)?;
+            item_bytes = item_limit.bytes;
+            if item_limit.rows < requested_items {
+                let max_item_offset = start_offset + item_limit.rows;
+                safe_rows = self.offsets[start_index + 1..=safe_end_index]
+                    .partition_point(|offset| *offset <= max_item_offset)
+                    as u64;
+                safe_end_index = start_index + safe_rows as usize;
+            }
+        }
+        let items_consumed = self.offsets[safe_end_index] - start_offset;
+        let bytes = if self.offset_type != DataType::Int64 {
+            // One shared budget covers both nesting levels conservatively: charge
+            // whichever level consumes more.
+            items_consumed.max(item_bytes)
+        } else {
+            item_bytes
+        };
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
         })
     }
 
@@ -1279,5 +1376,130 @@ impl FieldEncoder for ListFieldEncoder {
             Ok(columns)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_buffer::BooleanBuffer;
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+    use crate::decoder::LogicalPageDecoder;
+
+    #[test]
+    fn oversized_binary_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::UInt8, false),
+            32..160,
+            96,
+            i32::MAX as u64 + 1,
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("more than 2GiB of string/binary data")
+        );
+        assert!(error.to_string().contains("rows 32..96 fit"));
+        assert!(error.to_string().contains("requesting rows 32..160"));
+        assert!(error.to_string().contains("batch_size"));
+        assert!(error.to_string().contains("LANCE_DEFAULT_BATCH_SIZE"));
+        assert!(error.to_string().contains("large_string/large_binary"));
+    }
+
+    #[test]
+    fn oversized_list_batch_error_is_actionable() {
+        let error = oversized_batch_error(
+            &Field::new("item", DataType::Int32, false),
+            8..32,
+            16,
+            i32::MAX as u64 + 1,
+        );
+        let message = error.to_string();
+        assert!(message.contains("list array"));
+        assert!(message.contains("more than i32::MAX items"));
+        assert!(message.contains("rows 8..16 fit"));
+        assert!(message.contains("requesting rows 8..32"));
+    }
+
+    #[test]
+    fn list_decoder_overflow_reports_row_span() {
+        let mut decoder = ListPageDecoder {
+            unloaded: None,
+            offsets: Arc::<[u64]>::from(vec![0_u64, 1, 2, 3, 3 + i32::MAX as u64 + 1]),
+            validity: BooleanBuffer::from_iter([true, true, true, true]),
+            item_decoder: None,
+            num_rows: 4,
+            rows_drained: 2,
+            rows_loaded: 4,
+            items_field: Arc::new(Field::new("item", DataType::UInt8, false)),
+            offset_type: DataType::Int32,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+        };
+
+        let Err(error) = decoder.drain(2) else {
+            panic!("expected overflow error");
+        };
+        let message = error.to_string();
+        assert!(message.contains("rows 2..3 fit"));
+        assert!(message.contains("requesting rows 2..4"));
+        assert!(message.contains(&(i32::MAX as u64 + 2).to_string()));
+        assert!(message.contains("batch_size"));
+    }
+
+    fn list_page_decoder(offsets: Vec<u64>) -> ListPageDecoder {
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        ListPageDecoder {
+            unloaded: None,
+            validity: BooleanBuffer::new_set(offsets.len() - 1),
+            num_rows: offsets.len() as u64 - 1,
+            offsets: offsets.into(),
+            item_decoder: None,
+            rows_drained: 0,
+            rows_loaded: 0,
+            data_type: DataType::List(items_field.clone()),
+            items_field,
+            offset_type: DataType::Int32,
+        }
+    }
+
+    const FULL_BUDGET: u64 = i32::MAX as u64;
+
+    #[test]
+    fn test_list_page_limits_i32_offset_batches() {
+        let mut decoder = list_page_decoder(vec![0, i32::MAX as u64, i32::MAX as u64 + 1]);
+        let limit = decoder.max_rows_to_drain(2, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 1);
+        assert_eq!(limit.bytes, i32::MAX as u64);
+
+        // Offsets are rebased for each output batch, so the following row is safe.
+        decoder.rows_drained = 1;
+        let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 1);
+        assert_eq!(limit.bytes, 1);
+    }
+
+    #[test]
+    fn test_list_page_stays_within_reduced_budget() {
+        // Mid-batch a page sees only the budget the batch has left; splitting is
+        // by actual consumption, not page boundaries.
+        let decoder = list_page_decoder(vec![0, 10, 20, 30, 40]);
+        let limit = decoder.max_rows_to_drain(4, 25).unwrap();
+        assert_eq!(limit.rows, 2);
+        assert_eq!(limit.bytes, 20);
+        let limit = decoder.max_rows_to_drain(4, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 4);
+        assert_eq!(limit.bytes, 40);
+    }
+
+    #[test]
+    fn test_list_page_reports_zero_rows_for_single_row_over_i32_offset_limit() {
+        // The stream root emits a zero-row limit as a single-row batch, letting a
+        // genuinely oversized row fail at the arrow layer as it always did.
+        let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
+        let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
+        assert_eq!(limit.rows, 0);
     }
 }

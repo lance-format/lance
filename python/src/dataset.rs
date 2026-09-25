@@ -6,8 +6,6 @@ use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
@@ -19,6 +17,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
@@ -875,6 +874,7 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         transaction_files_removed: stats.transaction_files_removed,
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
+        failed_deletes: stats.failed_deletes,
     }
 }
 
@@ -1227,7 +1227,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1263,6 +1263,7 @@ impl Dataset {
         substrait_aggregate: Option<Vec<u8>>,
         row_addr_allowlist: Option<Vec<u8>>,
         row_addr_blocklist: Option<Vec<u8>>,
+        minhash_query: Option<&Bound<PyDict>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1543,17 +1544,21 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8
-                    if !matches!(
-                        q.data_type(),
-                        DataType::List(_) | DataType::FixedSizeList(_, _)
-                    ) =>
-                {
-                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                DataType::UInt8 => {
+                    let query_type = match q.data_type() {
+                        DataType::List(field) => DataType::List(Arc::new(
+                            field.as_ref().clone().with_data_type(DataType::UInt8),
+                        )),
+                        DataType::FixedSizeList(field, dimension) => DataType::FixedSizeList(
+                            Arc::new(field.as_ref().clone().with_data_type(DataType::UInt8)),
+                            *dimension,
+                        ),
+                        _ => DataType::UInt8,
+                    };
+                    let q = arrow::compute::cast(&q, &query_type).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
-                    let q = q.as_primitive::<UInt8Type>();
-                    scanner.nearest(&column, q, k)
+                    scanner.nearest(&column, q.as_ref(), k)
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
@@ -1621,6 +1626,25 @@ impl Dataset {
         if let Some(aggregate_bytes) = substrait_aggregate {
             scanner
                 .aggregate(AggregateExpr::substrait(aggregate_bytes))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(minhash_query) = minhash_query {
+            let column: String = minhash_query
+                .get_item("column")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify a column"))?
+                .extract()?;
+            let text: String = minhash_query
+                .get_item("text")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify text"))?
+                .extract()?;
+            if limit.is_none() {
+                // Same default as the vector `nearest` path when no limit is given
+                scanner
+                    .limit(Some(10), offset)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            scanner
+                .minhash_search(MinHashQuery::new(text, column))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
@@ -3354,6 +3378,79 @@ impl Dataset {
             stream,
         )));
         Ok(PyArrowType(reader))
+    }
+
+    #[pyo3(signature = (column, distance_threshold, *, memory_limit=None, max_concurrency=None))]
+    fn find_duplicate_pairs(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        distance_threshold: f32,
+        memory_limit: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
+        }
+        if let Some(concurrency) = max_concurrency {
+            options = options.with_max_concurrency(concurrency);
+        }
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_with_options(
+                    self.ds.clone(),
+                    column,
+                    distance_threshold,
+                    options,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
+    #[pyo3(signature = (column, segment_id, partition_id, distance_threshold, *, memory_limit=None, max_concurrency=None))]
+    // Keep the binding aligned with the Python utility's keyword-only controls.
+    #[allow(clippy::too_many_arguments)]
+    fn find_duplicate_pairs_in_partition(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        segment_id: &str,
+        partition_id: usize,
+        distance_threshold: f32,
+        memory_limit: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
+        }
+        if let Some(concurrency) = max_concurrency {
+            options = options.with_max_concurrency(concurrency);
+        }
+        let segment_id = uuid::Uuid::parse_str(segment_id).map_err(|err| {
+            PyValueError::new_err(format!("invalid segment_id '{segment_id}': {err}"))
+        })?;
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_in_partition_with_options(
+                    self.ds.clone(),
+                    column,
+                    segment_id,
+                    partition_id,
+                    distance_threshold,
+                    options,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
     }
 
     #[pyo3(signature = (*, min_version=None, progress=None))]

@@ -245,7 +245,7 @@ impl LsmScanPlanner {
         // `_memtable_gen` unless the caller opted in.
         plan = project_to_canonical(
             plan,
-            &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
+            &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address)?,
         )?;
 
         // 6. Add limit / offset if specified
@@ -263,13 +263,13 @@ impl LsmScanPlanner {
         projection: Option<&[String]>,
         with_memtable_gen: bool,
         keep_row_address: bool,
-    ) -> SchemaRef {
+    ) -> Result<SchemaRef> {
         let canonical = canonical_output_schema(
             projection,
             &self.base_schema,
             &self.pk_columns,
             false, // no _distance
-        );
+        )?;
         let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
         if keep_row_address && !fields.iter().any(|f| f.name() == ROW_ADDRESS_COLUMN) {
             fields.push(Arc::new(Field::new(
@@ -285,7 +285,7 @@ impl LsmScanPlanner {
                 false,
             )));
         }
-        Arc::new(Schema::new(fields))
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     /// Build scan plan for a single data source.
@@ -304,7 +304,10 @@ impl LsmScanPlanner {
                 // Project columns + _rowaddr (needed for dedup)
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 scanner.with_row_address();
                 // No `with_row_id()`: opting in only for base would mismatch
                 // the union schema against flushed/active. `_rowid` stays NULL
@@ -334,7 +337,10 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
@@ -409,7 +415,7 @@ impl LsmScanPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let schema = self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address);
+        let schema = self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address)?;
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }

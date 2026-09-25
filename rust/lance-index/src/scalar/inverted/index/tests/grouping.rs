@@ -33,7 +33,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
         .modern_doc_id_validations
         .as_ref()
         .expect("modern readers have per-token validation state")[0];
-    assert!(validation.get().is_none());
+    assert!(!validation.load(Ordering::Acquire));
     assert!(!posting_reader.modern_posting_is_validated(0).unwrap());
 
     let mut corrupt_builder = PostingListBuilder::new(false);
@@ -47,7 +47,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
     assert!(matches!(error, Error::Index { .. }));
     assert!(error.to_string().contains("DocId 1"));
     assert!(error.to_string().contains("[0, 1)"));
-    assert!(validation.get().is_none());
+    assert!(!validation.load(Ordering::Acquire));
     assert!(!posting_reader.modern_posting_is_validated(0).unwrap());
 
     let first = posting_reader
@@ -55,7 +55,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
         .await
         .unwrap();
     assert_eq!(posting_entries(&first), vec![(0, 1)]);
-    assert!(validation.get().is_some());
+    assert!(validation.load(Ordering::Acquire));
     assert!(posting_reader.modern_posting_is_validated(0).unwrap());
 
     let second = posting_reader
@@ -63,7 +63,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
         .await
         .unwrap();
     assert_eq!(posting_entries(&second), vec![(0, 1)]);
-    assert!(validation.get().is_some());
+    assert!(validation.load(Ordering::Acquire));
 }
 
 /// Runtime synthetic grouping must return correct posting lists for every

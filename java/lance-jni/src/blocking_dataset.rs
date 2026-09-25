@@ -1198,7 +1198,8 @@ fn inner_create_index<'local>(
         | IndexType::ZoneMap
         | IndexType::BloomFilter
         | IndexType::Fm
-        | IndexType::RTree => {
+        | IndexType::RTree
+        | IndexType::MinHashLsh => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
@@ -3758,7 +3759,7 @@ fn cleanup_stats_to_java<'local>(
 ) -> Result<JObject<'local>> {
     Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJJJJJ)V",
+        "(JJJJJJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
@@ -3766,6 +3767,7 @@ fn cleanup_stats_to_java<'local>(
             JValue::Long(stats.transaction_files_removed as i64),
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
+            JValue::Long(stats.failed_deletes as i64),
         ],
     )?)
 }
@@ -3985,6 +3987,7 @@ fn inner_describe_indices<'local>(
             must_support_fts,
             fts_document_granularity: None,
             must_support_exact_equality,
+            must_support_minhash: false,
         })
     })?;
 
@@ -4163,6 +4166,7 @@ fn inner_get_zonemap_stats<'local>(
                     must_support_fts: false,
                     fts_document_granularity: None,
                     must_support_exact_equality: false,
+                    must_support_minhash: false,
                 }))
                 .await
                 .map_err(Error::from)?;
