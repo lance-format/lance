@@ -213,7 +213,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -233,6 +233,7 @@ impl FileFragment {
         include_deleted_rows: Option<bool>,
         batch_size_bytes: Option<u64>,
         strict_batch_size: Option<bool>,
+        substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -259,9 +260,17 @@ impl FileFragment {
             scanner.batch_size(batch_size);
         }
         if let Some(f) = filter {
+            if substrait_filter.is_some() {
+                return Err(PyValueError::new_err(
+                    "cannot specify both a string filter and a substrait filter",
+                ));
+            }
             scanner
                 .filter(&f)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = substrait_filter {
+            scanner.filter_substrait(&f).infer_error()?;
         }
 
         scanner

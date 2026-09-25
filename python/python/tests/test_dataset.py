@@ -2662,6 +2662,38 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() == 0
 
 
+@pytest.mark.parametrize(
+    "predicate, remaining_ids",
+    [
+        pytest.param(pc.field("s") != "C:\\temp", [0, 3], id="escaped_string"),
+        pytest.param(
+            pc.field("s").isin(["C:\\temp", 'say "hi"']),
+            [2, 3],
+            id="isin_and_quote",
+        ),
+        pytest.param(~(pc.field("s") == "plain"), [2, 3], id="negation"),
+        pytest.param(pc.field("s").is_null(), [0, 1, 2], id="is_null"),
+    ],
+)
+def test_delete_pyarrow_expression(tmp_path: Path, predicate, remaining_ids):
+    data = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "vec": pa.array(
+                [[0.0], [1.0], [2.0], [3.0]], type=pa.list_(pa.float32(), 1)
+            ),
+            "s": ["C:\\temp", 'say "hi"', "plain", None],
+        }
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    deleted_rows = len(data) - len(remaining_ids)
+    assert dataset.count_rows(filter=predicate) == deleted_rows
+    assert dataset.delete(predicate) == {"num_deleted_rows": deleted_rows}
+    assert sorted(dataset.to_table()["id"].to_pylist()) == remaining_ids
+
+
 def check_merge_stats(merge_dict, expected):
     assert (
         merge_dict["num_inserted_rows"],
@@ -3983,6 +4015,24 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        pytest.param(pc.field("p") == "C:\\data\\a.csv", id="escaped_string"),
+        pytest.param(pc.field("p").isin(["C:\\data\\a.csv"]), id="isin"),
+    ],
+)
+def test_update_pyarrow_expression(tmp_path: Path, where):
+    data = pa.table(
+        {"id": [0, 1, 2], "p": ["C:\\data\\a.csv", "x", "y"], "n": [0, 0, 0]}
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    assert dataset.update({"n": "1"}, where=where) == {"num_rows_updated": 1}
+    assert dataset.to_table().sort_by("id")["n"].to_pylist() == [1, 0, 0]
 
 
 def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
