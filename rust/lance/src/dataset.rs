@@ -4236,7 +4236,17 @@ pub(crate) async fn write_manifest_file(
             use_stable_row_ids,
             config.disable_transaction_file,
         )?;
+        crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag(
+            manifest,
+            indices.as_deref().unwrap_or_default(),
+        );
     }
+    // After the flag reset, which restores the stable-row-id flag a shallow clone
+    // masks. Here rather than in `build_manifest`, which restore and clone bypass.
+    crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
+        manifest,
+        indices.as_deref().unwrap_or_default(),
+    )?;
 
     versions::finalize_manifest_storage_version(manifest)?;
 

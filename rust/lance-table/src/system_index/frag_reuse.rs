@@ -13,15 +13,30 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::row_addr_remap::{GroupInputWithLayout, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
+use prost::Name;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::format::pb::fragment_reuse_index_details::InlineContent;
-use crate::format::{ExternalFile, Fragment, pb};
+use crate::format::{ExternalFile, Fragment, IndexMetadata, pb};
 
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
+
+/// Whether `index` is the fragment reuse index itself, not a user index that
+/// borrows its name.
+pub fn is_frag_reuse_index_entry(index: &IndexMetadata) -> bool {
+    index.name == FRAG_REUSE_INDEX_NAME
+        && index.index_details.as_ref().is_some_and(|details| {
+            details
+                .type_url
+                .rsplit_once('/')
+                .is_some_and(|(_, type_name)| {
+                    type_name.eq_ignore_ascii_case(&pb::FragmentReuseIndexDetails::full_name())
+                })
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FragDigest {

@@ -313,6 +313,11 @@ pub(super) async fn open_row_id_remapping_with_plan(
     else {
         return Ok(None);
     };
+    super::frag_reuse_with_stable_row_ids::ensure_frag_reuse_applies(
+        &dataset.manifest,
+        &stored,
+        index,
+    )?;
     if fri.index_version == 0 {
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
