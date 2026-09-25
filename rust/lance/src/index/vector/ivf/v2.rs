@@ -6221,7 +6221,8 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist, recall_requirement).await;
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6284,7 +6285,8 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_delete_all_rows_lifecycle() {
         let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6501,7 +6503,8 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params.clone()).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
         test_remap(params, nlist, recall_requirement).await;
     }
 
