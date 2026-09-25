@@ -160,10 +160,7 @@ impl IoQueueState {
         });
         let head_task_blocked_by_iops = head_task.map(|_| self.iops_avail == 0);
         let head_task_blocked_by_bytes = head_task.map(|task| {
-            let bypasses_bytes = self.no_backpressure
-                || task.bypass_backpressure
-                || task.priority <= self.priorities_in_flight.min_in_flight();
-            !bypasses_bytes && task.num_bytes() as i64 > self.bytes_avail
+            !self.can_bypass_byte_budget(task) && task.num_bytes() as i64 > self.bytes_avail
         });
         let head_task_can_deliver = head_task.map(|task| self.can_deliver_without_warning(task));
         let head_task_bytes = head_task.map(IoTask::num_bytes);
@@ -216,32 +213,30 @@ impl IoQueueState {
 
     fn can_deliver(&self, task: &IoTask) -> bool {
         let can_deliver = self.can_deliver_without_warning(task);
-        if !can_deliver
-            && self.iops_avail > 0
-            && !(self.no_backpressure
-                || task.bypass_backpressure
-                || task.priority <= self.priorities_in_flight.min_in_flight())
-            && task.num_bytes() as i64 > self.bytes_avail
-        {
+        if !can_deliver && self.iops_avail > 0 {
             self.warn_if_needed();
         }
         can_deliver
     }
 
+    fn can_bypass_byte_budget(&self, task: &IoTask) -> bool {
+        self.no_backpressure
+            || task.bypass_backpressure
+            || task.priority <= self.priorities_in_flight.min_in_flight()
+            // Chunks from an admitted logical request must keep moving. A
+            // higher-priority request may remain unconsumed while the caller
+            // awaits this request.
+            || self.priorities_in_flight.contains(task.priority)
+            // When no I/O is running, only the caller can release reservations.
+            // It may need this read before it can consume earlier results.
+            || self.iops_avail == self.io_capacity
+    }
+
     fn can_deliver_without_warning(&self, task: &IoTask) -> bool {
         if self.iops_avail == 0 {
             false
-        } else if self.no_backpressure
-            || task.bypass_backpressure
-            || task.priority <= self.priorities_in_flight.min_in_flight()
-            // Chunks from an admitted logical request must keep moving.  A
-            // higher-priority request may be scheduled later and remain
-            // unconsumed while the caller awaits this request.
-            || self.priorities_in_flight.contains(task.priority)
-        {
-            true
         } else {
-            task.num_bytes() as i64 <= self.bytes_avail
+            self.can_bypass_byte_budget(task) || task.num_bytes() as i64 <= self.bytes_avail
         }
     }
 
@@ -2247,6 +2242,67 @@ mod tests {
         assert_eq!(high_priority[0].len(), 4);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_idle_io_delivers_read_needed_after_unconsumed_reads() {
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(4096),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        let scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 10,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        let first_buffered = scheduler.submit_request(reader.clone(), vec![0..5], 0, false);
+        let second_buffered = scheduler.submit_request(reader.clone(), vec![5..10], 0, false);
+        let io_queue = match &scheduler.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue,
+            IoQueueType::Lite(_) => unreachable!("test forces the standard scheduler"),
+        };
+        timeout(Duration::from_millis(500), async {
+            loop {
+                let is_idle_with_full_buffer = {
+                    let state = io_queue.state.lock().unwrap();
+                    state.iops_avail == state.io_capacity
+                        && state.bytes_avail == 0
+                        && state.priorities_in_flight.len() == 2
+                };
+                if is_idle_with_full_buffer {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // The caller still holds the earlier result while it waits for this read.
+        let needed = scheduler.submit_request(reader, vec![10..15], 1, false);
+        let needed = timeout(Duration::from_millis(500), needed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(needed[0].len(), 5);
+        assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+        assert_eq!(first_buffered.await.unwrap()[0].len(), 5);
+        assert_eq!(second_buffered.await.unwrap()[0].len(), 5);
+    }
+
     /// A Reader that tracks how many times get_range has been called.
     #[derive(Debug)]
     struct TrackingReader {
@@ -2453,20 +2509,29 @@ mod tests {
             .unwrap();
 
         let bytes_dispatched = Arc::new(AtomicU64::from(0));
+        let blocker_release = Arc::new(tokio::sync::Semaphore::new(0));
         let mut obj_store = MockObjectStore::default();
         let bytes_dispatched_copy = bytes_dispatched.clone();
+        let blocker_release_copy = blocker_release.clone();
         obj_store
             .expect_get_opts()
             .returning(move |location, options| {
                 let range = options.range.as_ref().unwrap();
-                let num_bytes = match range {
-                    GetRange::Bounded(bounded) => bounded.end - bounded.start,
+                let (num_bytes, is_blocker) = match range {
+                    GetRange::Bounded(bounded) => (bounded.end - bounded.start, bounded.start == 0),
                     _ => panic!(),
                 };
                 bytes_dispatched_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
-                async move { base_store.get_opts(&location, options).await }.boxed()
+                let blocker_release = blocker_release_copy.clone();
+                async move {
+                    if is_blocker {
+                        blocker_release.acquire().await.unwrap().forget();
+                    }
+                    base_store.get_opts(&location, options).await
+                }
+                .boxed()
             });
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
@@ -2475,7 +2540,7 @@ mod tests {
             None,
             false,
             false,
-            1,
+            2,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
             None,
         ));
@@ -2498,10 +2563,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // A normal read at priority 2 is blocked: budget = 0, priority 2 > min-in-flight 0.
-        // A bypass read at priority 1 (higher priority in the queue) bypasses the budget check.
-        let normal_fut = file_scheduler.submit_single(0..10, 2);
-        let bypass_fut = bypass_scheduler.submit_single(0..10, 1);
+        // While the first read is still running, a normal read at priority 2
+        // is blocked by the exhausted budget. A bypass read at priority 1 can run.
+        let normal_fut = file_scheduler.submit_single(20..30, 2);
+        let bypass_fut = bypass_scheduler.submit_single(10..20, 1);
 
         // Bypass read is dispatched; normal read is still blocked.
         while bytes_dispatched.load(Ordering::Acquire) < 20 {
@@ -2514,7 +2579,8 @@ mod tests {
             "normal read should still be blocked while budget is exhausted"
         );
 
-        // Consuming the blocker releases its 10-byte budget → normal read can proceed.
+        // Once the blocker finishes, the normal read can proceed.
+        blocker_release.add_permits(1);
         timeout(Duration::from_secs(5), blocker_fut)
             .await
             .unwrap()
