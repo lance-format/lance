@@ -441,7 +441,7 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
 /// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
 /// current-row preparation atomically. Until then, recursively rewrite AUTO to
 /// exact while preserving explicit positive fuzziness.
-fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+pub(crate) fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
     match query {
         FtsQuery::Match(query) => {
             query.fuzziness.get_or_insert(0);
