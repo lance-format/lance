@@ -2671,7 +2671,9 @@ async fn rewrite_files(
     })
 }
 
-async fn rechunk_stable_row_ids(
+/// Visible to the crate so tests that assemble an [`Operation::Rewrite`] by hand
+/// can transfer row ids the way compaction does, rather than reimplementing it.
+pub(crate) async fn rechunk_stable_row_ids(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
