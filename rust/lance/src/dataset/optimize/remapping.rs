@@ -3477,7 +3477,8 @@ mod tests {
         /// The upgraded T1 table: the v0 destination, the legacy stamp and
         /// the segment as stored before any tagged remap.
         async fn upgraded_deferred_table(uri: &str) -> (Dataset, u32, u64, IndexMetadata) {
-            let dataset = v0_compacted_fixture(uri, true).await;
+            // Boxed for CI clippy `large_futures`: the fixture future grew past 16 KiB.
+            let dataset = Box::pin(v0_compacted_fixture(uri, true)).await;
             let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
             assert_eq!(entry.index_version, 0);
             let legacy = legacy_versions(&dataset).await;
@@ -3663,7 +3664,8 @@ mod tests {
         async fn two_v0_deferred_rounds_are_unwound_before_a_later_partition() {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap();
-            let mut dataset = v0_compacted_fixture(uri, true).await;
+            // Boxed for CI clippy `large_futures`: the fixture future grew past 16 KiB.
+            let mut dataset = Box::pin(v0_compacted_fixture(uri, true)).await;
             let first = v0_destination(&legacy_versions(&dataset).await[0]);
             // Round two: {0, 1, first} -> one fragment of 12 rows.
             compact_files(
@@ -3758,7 +3760,8 @@ mod tests {
             // destination, the bitmap is the truth.
             let eager_dir = tempfile::tempdir().unwrap();
             let eager_uri = eager_dir.path().to_str().unwrap();
-            let dataset = v0_compacted_fixture(eager_uri, false).await;
+            // Boxed for CI clippy `large_futures`: the fixture future grew past 16 KiB.
+            let dataset = Box::pin(v0_compacted_fixture(eager_uri, false)).await;
             let destination = dataset.fragments().last().unwrap().id as u32;
             let before = stored_index(&dataset, "i_idx").await;
             assert_eq!(
