@@ -1018,6 +1018,17 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    if dataset.manifest.writer_feature_flags & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
+        != 0
+        && crate::index::load_all_indices(dataset)
+            .await?
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        return Err(Error::not_supported(
+            "Compaction of FRI index_version 1 requires an upgraded writer",
+        ));
+    }
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // If nothing to compact, don't make a commit.
@@ -2739,7 +2750,7 @@ async fn recalc_versions_for_rewritten_fragments(
         let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
             match row_id_meta {
                 RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+                RowIdMeta::Column => frag.physical_rows.unwrap_or(0) as u64,
             }
         } else {
             frag.physical_rows.unwrap_or(0) as u64

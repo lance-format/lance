@@ -19,12 +19,18 @@ import org.lance.cleanup.RemovalStats;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -239,5 +245,75 @@ public class CleanupTest {
         assertTrue(elapsed >= Duration.ofSeconds(2).toNanos());
       }
     }
+  }
+
+  @Test
+  public void testFailedDeletesReachesJavaAcrossJni(@TempDir Path tempDir) throws Exception {
+    // Best-effort deletion makes failedDeletes the only programmatic signal that cleanup
+    // returned normally without removing everything it identified. Asserting it is zero on
+    // a successful run would prove nothing: the six-argument constructor defaults it to
+    // zero, so a JNI projection that dropped the field would still pass. The value has to
+    // be non-zero, which means a delete has to genuinely fail.
+    //
+    // Removing a file needs write permission on its parent, so making _transactions
+    // read-only fails exactly those deletes while the manifest deletes still succeed.
+    String datasetPath = tempDir.resolve("test_dataset_for_failed_deletes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+
+      Path transactions = Path.of(datasetPath, "_transactions");
+      assertTrue(Files.isDirectory(transactions), "expected a _transactions directory");
+      Set<PosixFilePermission> original = Files.getPosixFilePermissions(transactions);
+
+      // Every write lands a transaction file, so the directory stays writable until the
+      // last version is committed and only then becomes read-only.
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        Files.setPosixFilePermissions(
+            transactions,
+            EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_EXECUTE));
+        try {
+          // Root ignores these bits, so confirm deletion is really blocked before relying
+          // on it; otherwise this asserts nothing and should skip rather than fail.
+          Path probe = transactions.resolve("permission-probe");
+          boolean blocked;
+          try {
+            Files.createFile(probe);
+            Files.deleteIfExists(probe);
+            blocked = false;
+          } catch (IOException expected) {
+            blocked = true;
+          }
+          Assumptions.assumeTrue(blocked, "filesystem permissions do not block deletion here");
+
+          RemovalStats stats =
+              dataset.cleanupWithPolicy(CleanupPolicy.builder().withBeforeVersion(3L).build());
+
+          // The call returns normally rather than throwing, and reports what it could not
+          // remove. Both halves matter: the old behaviour discarded the whole sweep.
+          assertTrue(
+              stats.getFailedDeletes() > 0,
+              "expected the blocked transaction deletes to be counted, got "
+                  + stats.getFailedDeletes());
+          assertTrue(stats.getOldVersions() > 0, "the sweep must continue past a failed delete");
+        } finally {
+          Files.setPosixFilePermissions(transactions, original);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testRemovalStatsCarriesFailedDeletes() {
+    RemovalStats stats = new RemovalStats(1L, 2L, 3L, 4L, 5L, 6L, 7L);
+    assertEquals(7L, stats.getFailedDeletes());
+
+    // The pre-existing six-argument constructor stays source compatible and defaults to
+    // zero, so callers that predate best-effort deletion keep compiling.
+    assertEquals(0L, new RemovalStats(1L, 2L, 3L, 4L, 5L, 6L).getFailedDeletes());
   }
 }

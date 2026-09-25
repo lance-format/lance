@@ -54,7 +54,7 @@ use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
-    collect_query_tokens, has_query_token, uses_fuzzy_expansion,
+    has_query_token, try_collect_query_tokens, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
@@ -790,6 +790,32 @@ impl CompoundQueryExec {
         self.base_scorer.as_ref()
     }
 
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_match: self.prepared_match.clone(),
+            segment_selection: self.segment_selection.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     /// See [`MatchQueryExec::explicit_segment_uuids`].
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
@@ -1090,6 +1116,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
@@ -1160,6 +1187,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     overlay_block: None,
                     external_mask: None,
                 },
+                &metrics_set,
             )?;
             let indexed_search = compound_search_with_base_scorer(
                 &indices,
@@ -1384,6 +1412,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1426,8 +1455,8 @@ impl ExecutionPlan for CompoundQueryExec {
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
             if let Some(first_index) = indices.first() {
-                tokenized_query
-                    .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
+                let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
+                tokenized_query.get_or_init(|| snapshot);
             }
             let mut prefilter = build_prefilter(
                 context,
@@ -1439,6 +1468,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -1510,7 +1540,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     })?;
                     let mut tokenizer =
                         tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
-                    let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&match_query.terms, &mut tokenizer)?;
                     let scorer_start = std::time::Instant::now();
                     let prepared = Arc::new(
                         PreparedMatch::new(
@@ -1828,6 +1858,30 @@ impl CrossColumnCompoundQueryExec {
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
     }
+
+    /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
+    /// scorers and masks.
+    ///
+    /// The FTS top-k lives in `FtsSearchParams`, not in an enclosing fetch
+    /// node, so a caller that needs more candidates than the user asked for —
+    /// over-fetching to survive a later dedup, say — has no other way to raise
+    /// it. Everything that decides *which* rows are eligible is carried over
+    /// untouched, so this widens the cut without widening the domain.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            columns: self.columns.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl DisplayAs for CrossColumnCompoundQueryExec {
@@ -1912,6 +1966,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1945,6 +2000,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2085,12 +2141,19 @@ fn tokenizer_for_match_query(
     }
 }
 
-fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> TokenizedCompoundQuery {
-    fn visit(query: &FtsQuery, index: &InvertedIndex, leaves: &mut Vec<TokenizedQueryLeaf>) {
+fn tokenize_compound_query(
+    query: &FtsQuery,
+    index: &InvertedIndex,
+) -> Result<TokenizedCompoundQuery> {
+    fn visit(
+        query: &FtsQuery,
+        index: &InvertedIndex,
+        leaves: &mut Vec<TokenizedQueryLeaf>,
+    ) -> Result<()> {
         match query {
             FtsQuery::Match(query) => {
                 let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Match,
                     column: query.column.clone(),
@@ -2099,7 +2162,7 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
             }
             FtsQuery::Phrase(query) => {
                 let mut tokenizer = index.tokenizer();
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Phrase,
                     column: query.column.clone(),
@@ -2107,13 +2170,13 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
                 });
             }
             FtsQuery::Boost(query) => {
-                visit(&query.positive, index, leaves);
-                visit(&query.negative, index, leaves);
+                visit(&query.positive, index, leaves)?;
+                visit(&query.negative, index, leaves)?;
             }
             FtsQuery::MultiMatch(query) => {
                 for query in &query.match_queries {
                     let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                     leaves.push(TokenizedQueryLeaf {
                         kind: TokenizedLeafKind::Match,
                         column: query.column.clone(),
@@ -2128,15 +2191,16 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
                     .chain(&query.must)
                     .chain(&query.must_not)
                 {
-                    visit(query, index, leaves);
+                    visit(query, index, leaves)?;
                 }
             }
         }
+        Ok(())
     }
 
     let mut leaves = Vec::with_capacity(count_fts_leaves(query));
-    visit(query, index, &mut leaves);
-    TokenizedCompoundQuery(leaves)
+    visit(query, index, &mut leaves)?;
+    Ok(TokenizedCompoundQuery(leaves))
 }
 
 fn tokenize_cross_column_compound_query(
@@ -2170,7 +2234,7 @@ fn tokenize_cross_column_compound_query(
             FtsQuery::Match(query) => {
                 let (index, column) = index_for_leaf(query.column.as_deref(), "Match", indices)?;
                 let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Match,
                     column: Some(column),
@@ -2180,7 +2244,7 @@ fn tokenize_cross_column_compound_query(
             FtsQuery::Phrase(query) => {
                 let (index, column) = index_for_leaf(query.column.as_deref(), "Phrase", indices)?;
                 let mut tokenizer = index.tokenizer();
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Phrase,
                     column: Some(column),
@@ -2196,7 +2260,7 @@ fn tokenize_cross_column_compound_query(
                     let (index, column) =
                         index_for_leaf(query.column.as_deref(), "MultiMatch", indices)?;
                     let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                     leaves.push(TokenizedQueryLeaf {
                         kind: TokenizedLeafKind::Match,
                         column: Some(column),
@@ -2897,6 +2961,7 @@ impl ExecutionPlan for MatchQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -2935,6 +3000,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -2956,7 +3022,7 @@ impl ExecutionPlan for MatchQueryExec {
                 column
             )))?;
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
@@ -3317,7 +3383,7 @@ impl FlatMatchFilterExec {
                 .await?
             }
         };
-        let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        let query_tokens = Arc::new(try_collect_query_tokens(&query.terms, &mut tokenizer)?);
         record_tokenized_query(&tokenized_query, &query_tokens);
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
@@ -3761,7 +3827,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             format!("FTS index for column {} has no segments", column),
                         ))?;
                         let mut tokenizer = first_index.tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         let base_scorer = match preset_base_scorer {
                             Some(scorer) => (*scorer).clone(),
@@ -3783,7 +3849,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     }
                     None => {
                         let mut tokenizer = default_text_tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
                     }
@@ -4206,6 +4272,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -4234,6 +4301,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -4255,7 +4323,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 column
             )))?;
             let mut tokenizer = first_index.tokenizer();
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
             let base_scorer = match (preset_base_scorer, shared_scorer) {
                 (Some(scorer), _) => scorer,
@@ -4851,7 +4919,7 @@ mod tests {
     use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
-        PhraseQuery, collect_query_tokens, has_query_token,
+        PhraseQuery, collect_query_tokens, has_query_token, try_collect_query_tokens,
     };
     use lance_index::scalar::inverted::{
         DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
@@ -5171,7 +5239,7 @@ mod tests {
     #[test]
     fn document_match_filter_respects_document_boundary() {
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("alpha", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("alpha", &mut tokenizer).unwrap();
         assert!(super::document_matches_query(
             "alpha beta",
             &mut tokenizer,
@@ -5180,7 +5248,7 @@ mod tests {
         ));
 
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("alpha beta", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("alpha beta", &mut tokenizer).unwrap();
         assert!(!super::document_matches_query(
             "alpha",
             &mut tokenizer,
@@ -5316,7 +5384,7 @@ mod tests {
         use super::default_text_tokenizer;
 
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("hello", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("hello", &mut tokenizer).unwrap();
 
         let text_col =
             LargeStringArray::from(vec!["hello world", "no match here", "say hello there"]);
@@ -5386,7 +5454,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let query_tokens = collect_query_tokens("hello", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("hello", &mut tokenizer).unwrap();
 
         let mut tokenizer = FlatMatchFilterExec::load_tokenizer(
             &dataset,
@@ -6174,7 +6242,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+        let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer).unwrap();
         let global_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &tokens, &search_params, None)
                 .await
@@ -6434,7 +6502,7 @@ mod tests {
         let baseline_results = execute_results(&baseline).await.unwrap();
 
         let mut tokenizer = indices[0].tokenizer();
-        let complete_tokens = collect_query_tokens("quick brown", &mut tokenizer);
+        let complete_tokens = try_collect_query_tokens("quick brown", &mut tokenizer).unwrap();
         let complete_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &complete_tokens, &search_params, None)
                 .await
@@ -6454,7 +6522,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let incomplete_tokens = collect_query_tokens("quick", &mut tokenizer);
+        let incomplete_tokens = try_collect_query_tokens("quick", &mut tokenizer).unwrap();
         let incomplete_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &incomplete_tokens, &search_params, None)
                 .await
@@ -6478,7 +6546,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let brown_tokens = collect_query_tokens("brown", &mut tokenizer);
+        let brown_tokens = try_collect_query_tokens("brown", &mut tokenizer).unwrap();
         let scorer_without_fuzzy_expansion = Arc::new(
             build_global_bm25_scorer(&indices, &brown_tokens, &search_params, None)
                 .await

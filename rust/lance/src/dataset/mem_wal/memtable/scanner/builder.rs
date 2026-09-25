@@ -13,11 +13,12 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::TryStreamExt;
+use lance_core::datatypes::{Schema as LanceSchema, parse_field_path};
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, FtsQueryNode, Operator};
+use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
 use lance_linalg::distance::DistanceType;
 
@@ -62,13 +63,14 @@ pub struct VectorQuery {
 /// inverted index evaluates — so every shape the index supports (nested
 /// boolean, boost with a negative clause, phrase, fuzzy) reaches it without a
 /// lossy intermediate form. Everything outside the tree here is execution
-/// policy rather than the query: which column, which document unit, and the
-/// recall/latency knobs.
+/// policy rather than the query: which document unit and the recall/latency
+/// knobs. The columns searched live on the tree's leaves — [`Self::columns`]
+/// reads them back out — so there is no second copy to fall out of step with it.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
-    /// Column name to search.
-    pub column: String,
     /// The query tree, evaluated as given by the memtable's inverted index.
+    /// Every leaf names the column it searches; the memtable routes each leaf
+    /// to that column's index.
     pub expr: FtsQueryExpr,
     /// Logical document unit. Defaults to one document per dataset row.
     pub document_granularity: DocumentGranularity,
@@ -88,16 +90,48 @@ pub struct FtsQuery {
 pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
-    /// Wrap an already-built query tree.
+    /// Wrap an already-built query tree, binding every unbound leaf to
+    /// `column`. Leaves that already name a column keep it.
     pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
         Self {
-            column: column.into(),
-            expr,
+            expr: expr.bind_unbound_leaves(&column.into()),
             document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
         }
+    }
+
+    /// Wrap a tree whose leaves name several columns. Every leaf must already
+    /// carry its binding — there is no single column to fall back to.
+    pub fn cross_column(expr: FtsQueryExpr) -> Result<Self> {
+        let num_columns = expr.columns().len();
+        if num_columns < 2 {
+            return Err(Error::invalid_input(format!(
+                "cross-column MemTable full-text search needs at least two bound columns, \
+                 got {num_columns}"
+            )));
+        }
+        if expr.has_unbound_leaf() {
+            return Err(Error::invalid_input(
+                "cross-column MemTable full-text search needs every leaf bound to a column; \
+                 there is no single index to fall back to"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            expr,
+            document_granularity: DocumentGranularity::Row,
+            wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
+            include_tail: true,
+        })
+    }
+
+    /// Distinct columns this query's leaves name, in tree order. A tree with
+    /// no leaves at all (an empty boolean) names none.
+    pub fn columns(&self) -> Vec<&str> {
+        self.expr.columns()
     }
 
     /// Create a simple term match query.
@@ -208,9 +242,10 @@ impl FtsQuery {
 /// entry type.
 ///
 /// Every shape the in-memory inverted index can evaluate is carried across:
-/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth.
-/// Multi-match is the exception — it spans columns, and the memtable's indexes
-/// are per-column, so it has no single tree to evaluate and is refused.
+/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth, and
+/// over one column or several. Multi-match is the exception — its fields are
+/// scored independently and fused by max, which the LSM planner decomposes
+/// above this layer rather than expressing as one tree.
 fn resolve_memtable_document_granularity(
     column: &str,
     requested: Option<DocumentGranularity>,
@@ -257,33 +292,43 @@ fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> 
             )
         })
     };
-    let column = require_column(single_query_column(&query.query)?)?;
-    let document_granularity = resolve_memtable_document_granularity(
-        &column,
-        requested_document_granularity(&query.query)?,
-        indexes,
-    )?;
+    let requested = requested_document_granularity(&query.query)?;
     let expr = to_local_expr(&query.query)?;
-    Ok(FtsQuery::new(column, expr)
-        .with_document_granularity(document_granularity)
-        .with_wand_factor(wand_factor)
-        .with_limit(limit))
-}
-
-/// The single column the query targets, or `None` when it binds none. A query
-/// spanning several columns is refused before this — the memtable holds one
-/// inverted index per column, so there is no single index to evaluate against.
-fn single_query_column(query: &IndexFtsQuery) -> Result<Option<String>> {
-    let mut columns = query.columns().into_iter();
-    let first = columns.next();
-    if columns.next().is_some() {
-        return Err(Error::not_supported(
-            "MemTable full-text search is single-column; a query spanning several \
-             columns has no single in-memory index to evaluate against"
-                .to_string(),
-        ));
-    }
-    Ok(first)
+    // Taken from the mapped tree rather than the index-level query: it is what
+    // the arm evaluates, and its order is the tree's rather than a hash set's.
+    let columns = expr
+        .columns()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let local = if columns.len() > 1 {
+        // Each column resolves its granularity against its own index, and they
+        // have to agree: the arm emits one schema, and `_doc_index` is present
+        // or absent for the whole batch.
+        let mut resolved = None;
+        for column in &columns {
+            let granularity = resolve_memtable_document_granularity(column, requested, indexes)?;
+            match resolved {
+                None => resolved = Some(granularity),
+                Some(previous) if previous != granularity => {
+                    return Err(Error::invalid_input(format!(
+                        "cross-column full-text search resolved {previous:?} document \
+                         granularity for an earlier column and {granularity:?} for \
+                         '{column}'; they must agree"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let document_granularity = resolved.unwrap_or(DocumentGranularity::Row);
+        FtsQuery::cross_column(expr)?.with_document_granularity(document_granularity)
+    } else {
+        let column = require_column(columns.into_iter().next())?;
+        let document_granularity =
+            resolve_memtable_document_granularity(&column, requested, indexes)?;
+        FtsQuery::new(column, expr).with_document_granularity(document_granularity)
+    };
+    Ok(local.with_wand_factor(wand_factor).with_limit(limit))
 }
 
 /// The document granularity the query asks for, erroring if its leaves disagree
@@ -303,10 +348,11 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
                 }
                 return Ok(());
             }
-            IndexFtsQuery::MultiMatch(_) => {
-                return Err(Error::not_supported(
-                    "MemTable full-text search does not support multi-match queries".to_string(),
-                ));
+            IndexFtsQuery::MultiMatch(m) => {
+                for leaf in &m.match_queries {
+                    visit(&IndexFtsQuery::Match(leaf.clone()), current)?;
+                }
+                return Ok(());
             }
         };
         match (*current, requested) {
@@ -328,30 +374,44 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
 
 /// Map an index-level query onto the tree the in-memory index evaluates.
 ///
-/// Structural only — the column and document granularity are resolved once for
-/// the whole query by the caller, because the memtable searches a single index.
+/// Each leaf keeps the column the planner bound it to, so a tree spanning
+/// several fields stays routable. Document granularity is still resolved once
+/// for the whole query by the caller: the arm emits one schema.
 fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+    fn bind(expr: FtsQueryExpr, column: Option<&String>) -> FtsQueryExpr {
+        match column {
+            Some(column) => expr.with_column(column.clone()),
+            None => expr,
+        }
+    }
     Ok(match query {
-        IndexFtsQuery::Match(m) => match m.fuzziness {
-            // `Some(0)` is an exact match in the index model.
-            Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
+        IndexFtsQuery::Match(m) => bind(
+            match m.fuzziness {
+                // `Some(0)` is an exact match in the index model.
+                Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
+                    .with_boost(m.boost),
+                // The fuzzy path expands each term independently and unions the
+                // expansions, so it cannot also require every term to match.
+                _ if m.operator != Operator::Or => {
+                    return Err(Error::not_supported(
+                        "MemTable fuzzy full-text search only supports OR match operators"
+                            .to_string(),
+                    ));
+                }
+                fuzziness => FtsQueryExpr::fuzzy_with_options(
+                    m.terms.clone(),
+                    fuzziness,
+                    m.prefix_length,
+                    m.max_expansions,
+                )
                 .with_boost(m.boost),
-            // The fuzzy path expands each term independently and unions the
-            // expansions, so it cannot also require every term to match.
-            _ if m.operator != Operator::Or => {
-                return Err(Error::not_supported(
-                    "MemTable fuzzy full-text search only supports OR match operators".to_string(),
-                ));
-            }
-            fuzziness => FtsQueryExpr::fuzzy_with_options(
-                m.terms.clone(),
-                fuzziness,
-                m.prefix_length,
-                m.max_expansions,
-            )
-            .with_boost(m.boost),
-        },
-        IndexFtsQuery::Phrase(p) => FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+            },
+            m.column.as_ref(),
+        ),
+        IndexFtsQuery::Phrase(p) => bind(
+            FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+            p.column.as_ref(),
+        ),
         IndexFtsQuery::Boost(b) => FtsQueryExpr::boosting_with_negative(
             to_local_expr(&b.positive)?,
             to_local_expr(&b.negative)?,
@@ -370,11 +430,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
             }
             builder.build()
         }
-        IndexFtsQuery::MultiMatch(_) => {
-            return Err(Error::not_supported(
-                "MemTable full-text search does not support multi-match queries".to_string(),
-            ));
-        }
+        IndexFtsQuery::MultiMatch(m) => FtsQueryExpr::MultiMatch {
+            children: m
+                .match_queries
+                .iter()
+                .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
+                .collect::<Result<_>>()?,
+        },
     })
 }
 
@@ -918,21 +980,10 @@ impl MemTableScanner {
     ///
     /// If `with_row_id` is true, adds `_rowid` column at the end.
     /// If `with_row_address` is true, adds `_rowaddr` column at the end.
-    pub fn output_schema(&self) -> SchemaRef {
+    pub fn output_schema(&self) -> Result<SchemaRef> {
         use super::exec::ROW_ADDRESS_COLUMN;
 
-        let mut fields: Vec<Field> = if let Some(ref projection) = self.projection {
-            projection
-                .iter()
-                .filter_map(|name| self.schema.field_with_name(name).ok().cloned())
-                .collect()
-        } else {
-            self.schema
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect()
-        };
+        let mut fields: Vec<Field> = self.projected_data_fields()?;
 
         // Add _rowid column if requested
         if self.with_row_id {
@@ -944,25 +995,36 @@ impl MemTableScanner {
             fields.push(Field::new(ROW_ADDRESS_COLUMN, DataType::UInt64, true));
         }
 
-        Arc::new(arrow_schema::Schema::new(fields))
+        Ok(Arc::new(arrow_schema::Schema::new(fields)))
     }
 
     /// Get the base output schema after projection, WITHOUT special columns like _rowid.
     /// This is used by index execs that add their own special columns.
-    fn base_output_schema(&self) -> SchemaRef {
-        let fields: Vec<Field> = if let Some(ref projection) = self.projection {
-            projection
-                .iter()
-                .filter_map(|name| self.schema.field_with_name(name).ok().cloned())
-                .collect()
-        } else {
-            self.schema
+    fn base_output_schema(&self) -> Result<SchemaRef> {
+        Ok(Arc::new(arrow_schema::Schema::new(
+            self.projected_data_fields()?,
+        )))
+    }
+
+    /// Data columns this scan emits, with nested paths narrowed to the leaves
+    /// they select — a projected `meta.a` yields `meta: Struct<a>`.
+    ///
+    /// An unresolvable column is an error here, matching
+    /// [`Self::compute_projection_indices`]; both used to disagree, one
+    /// silently dropping what the other rejected.
+    fn projected_data_fields(&self) -> Result<Vec<Field>> {
+        let Some(ref projection) = self.projection else {
+            return Ok(self
+                .schema
                 .fields()
                 .iter()
                 .map(|f| f.as_ref().clone())
-                .collect()
+                .collect());
         };
-        Arc::new(arrow_schema::Schema::new(fields))
+        let lance_schema = LanceSchema::try_from(self.schema.as_ref())?;
+        let projected = lance_schema.project(projection)?;
+        let arrow = arrow_schema::Schema::from(&projected);
+        Ok(arrow.fields().iter().map(|f| f.as_ref().clone()).collect())
     }
 
     /// Create the execution plan based on the query configuration.
@@ -1014,7 +1076,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.readable_count,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             self.schema.clone(),
             self.with_row_id,
             self.with_row_address,
@@ -1076,7 +1138,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.readable_count,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             pk_indices,
             self.with_row_id,
             self.with_row_address,
@@ -1106,7 +1168,7 @@ impl MemTableScanner {
             predicate.clone(),
             max_readable,
             projection_indices,
-            self.output_schema(),
+            self.output_schema()?,
             self.with_row_id,
             self.with_row_address,
         )?;
@@ -1138,7 +1200,7 @@ impl MemTableScanner {
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
-        let base_schema = self.base_output_schema();
+        let base_schema = self.base_output_schema()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
             validate_pk_types(&self.schema, pk_columns)?;
@@ -1199,7 +1261,13 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_fts_index(&query.column, query.document_granularity) {
+        // Every queried column needs an index: a cross-column predicate is one
+        // predicate, so a missing arm is a missing answer, not a smaller one.
+        if !query
+            .columns()
+            .into_iter()
+            .all(|column| self.has_fts_index(column, query.document_granularity))
+        {
             return self.empty_fts_plan(query.document_granularity);
         }
 
@@ -1216,7 +1284,7 @@ impl MemTableScanner {
             query.clone(),
             max_readable,
             projection_indices,
-            self.base_output_schema(),
+            self.base_output_schema()?,
             self.with_row_id,
         )?
         .with_filter(filter_predicate)
@@ -1231,7 +1299,7 @@ impl MemTableScanner {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let mut fields: Vec<Field> = self
-            .base_output_schema()
+            .base_output_schema()?
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
@@ -1266,23 +1334,30 @@ impl MemTableScanner {
     }
 
     /// Compute column indices for projection.
+    /// Top-level column indices this scan must materialize.
+    ///
+    /// A nested path contributes its *parent* index — the memtable batch stores
+    /// whole columns, so `meta.a` is served by taking `meta` and narrowing it
+    /// to [`Self::projected_data_fields`] downstream. Sibling leaves of one
+    /// parent therefore collapse to a single index.
     fn compute_projection_indices(&self) -> Result<Option<Vec<usize>>> {
-        if let Some(ref columns) = self.projection {
-            let indices: Result<Vec<usize>> = columns
-                .iter()
-                .map(|name| {
-                    self.schema
-                        .column_with_name(name)
-                        .map(|(idx, _)| idx)
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!("Column '{}' not found in schema", name))
-                        })
-                })
-                .collect();
-            Ok(Some(indices?))
-        } else {
-            Ok(None)
+        let Some(ref columns) = self.projection else {
+            return Ok(None);
+        };
+        let mut indices: Vec<usize> = Vec::with_capacity(columns.len());
+        for name in columns {
+            let top = parse_field_path(name)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::invalid_input(format!("empty projection name: {}", name)))?;
+            let (idx, _) = self.schema.column_with_name(&top).ok_or_else(|| {
+                Error::invalid_input(format!("Column '{}' not found in schema", name))
+            })?;
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
         }
+        Ok(Some(indices))
     }
 
     /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
@@ -1607,6 +1682,76 @@ mod tests {
         assert_eq!(result.schema().field(0).name(), "id");
     }
 
+    /// `meta: Struct<a, b>` beside a flat column, for nested projection.
+    fn nested_test_schema() -> SchemaRef {
+        use arrow_schema::Fields;
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "meta",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int64, true),
+                    Field::new("b", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn projecting_a_struct_leaf_narrows_the_memtable_output() {
+        use arrow_array::{Int64Array, StructArray};
+        use arrow_schema::Fields;
+
+        let schema = nested_test_schema();
+        let meta_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StructArray::new(
+                    meta_fields,
+                    vec![
+                        Arc::new(Int64Array::from(vec![10, 20])),
+                        Arc::new(StringArray::from(vec!["x", "y"])),
+                    ],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        batch_store.append(batch.clone()).unwrap();
+        // Publishing through the index store is what makes the batch readable.
+        let index_store = IndexStore::new();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(index_store);
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        scanner.project(&["meta.a"]).unwrap();
+        let result = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 1);
+        let field = result.schema().field(0).clone();
+        assert_eq!(field.name(), "meta");
+        let DataType::Struct(children) = field.data_type() else {
+            panic!("meta is not a struct: {:?}", field.data_type());
+        };
+        let names: Vec<&str> = children.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "sibling `b` must not survive the projection"
+        );
+    }
+
     /// The index fast path is chosen from the filter the caller set, which has not
     /// been through `optimize_expr`. Running it there is what keeps a float zero
     /// from getting a bit-exact lookup while the full scan beside it answers per
@@ -1867,7 +2012,7 @@ mod tests {
             .with_column("text".to_string())
             .unwrap();
         let local = local_fts_query(q, None).unwrap();
-        assert_eq!(local.column, "text");
+        assert_eq!(local.columns(), ["text"]);
         assert!(
             matches!(local.expr, FtsQueryExpr::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
@@ -1928,7 +2073,7 @@ mod tests {
         ));
         let local = local_fts_query(exact_and, None).unwrap();
         assert!(
-            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost, .. }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
         );
 
@@ -2032,8 +2177,8 @@ mod tests {
             "nesting flattened: {must:?}"
         );
 
-        // Multi-match spans columns -> still refused; the memtable holds one
-        // inverted index per column.
+        // Multi-match maps to a best-child node whose leaves keep their own
+        // columns, so a tree spanning fields still routes leaf by leaf.
         let multi = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
             MultiMatchQuery::try_new(
                 "x".to_string(),
@@ -2041,10 +2186,18 @@ mod tests {
             )
             .unwrap(),
         ));
-        assert!(
-            local_fts_query(multi, None).is_err(),
-            "multi-match must be rejected"
+        let local = local_fts_query(multi, None).unwrap();
+        let FtsQueryExpr::MultiMatch { children } = &local.expr else {
+            panic!("expected a MultiMatch expr, got {:?}", local.expr);
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.column())
+                .collect::<Vec<_>>(),
+            [Some("text"), Some("other")]
         );
+        assert_eq!(local.columns(), ["text", "other"]);
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());
@@ -2462,7 +2615,7 @@ mod tests {
         scanner.with_row_id();
 
         // Verify output schema includes _rowid
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "name");
@@ -2498,7 +2651,7 @@ mod tests {
         scanner.project(&["id", "_rowid"]).unwrap();
 
         // Verify output schema
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "_rowid");
@@ -2545,13 +2698,13 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
 
         // Without with_row_id, schema should not include _rowid
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert!(output_schema.field_with_name("_rowid").is_err());
 
         // With with_row_id, schema should include _rowid
         scanner.with_row_id();
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert!(output_schema.field_with_name("_rowid").is_ok());
     }
@@ -2574,7 +2727,7 @@ mod tests {
         assert_eq!(scanner.projection, Some(vec!["id".to_string()]));
 
         // Output schema should include _rowid at the end
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "_rowid");
@@ -2657,13 +2810,13 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
 
         // Without with_row_address, schema should not include _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 2);
         assert!(output_schema.field_with_name("_rowaddr").is_err());
 
         // With with_row_address, schema should include _rowaddr
         scanner.with_row_address();
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert!(output_schema.field_with_name("_rowaddr").is_ok());
     }
@@ -2679,7 +2832,7 @@ mod tests {
         scanner.with_row_address();
 
         // Verify output schema includes _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 3);
         assert_eq!(output_schema.field(0).name(), "id");
         assert_eq!(output_schema.field(1).name(), "name");
@@ -2738,7 +2891,7 @@ mod tests {
         scanner.with_row_address();
 
         // Verify output schema includes both _rowid and _rowaddr
-        let output_schema = scanner.output_schema();
+        let output_schema = scanner.output_schema().unwrap();
         assert_eq!(output_schema.fields().len(), 4);
         assert_eq!(output_schema.field(2).name(), "_rowid");
         assert_eq!(output_schema.field(3).name(), "_rowaddr");

@@ -146,7 +146,7 @@ impl DatasetPreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn do_create_deletion_mask_row_id(
+    pub(super) async fn do_create_deletion_mask_row_id(
         dataset: Arc<Dataset>,
         restrict_to: Option<RoaringBitmap>,
     ) -> Result<Arc<RowAddrMask>> {

@@ -727,7 +727,8 @@ impl PyLsmPointLookupPlanner {
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
-        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone());
+        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
             planner,
             dataset_schema: base_schema,

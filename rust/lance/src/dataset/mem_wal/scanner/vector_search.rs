@@ -283,7 +283,7 @@ impl LsmVectorSearchPlanner {
             &self.base_schema,
             &self.pk_columns,
             true, // include _distance — KNN always produces it
-        );
+        )?;
 
         // Refine the base table when explicitly requested, or whenever the base
         // is blocked (it then over-fetches its approximate-index candidates, so
@@ -451,7 +451,10 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // Native scanner prefilter: the ANN runs over rows matching
                     // the predicate, so the top-k holds only matching rows.
@@ -497,7 +500,10 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
@@ -555,7 +561,8 @@ impl LsmVectorSearchPlanner {
     fn empty_plan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let schema = canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true);
+        let schema =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true)?;
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }

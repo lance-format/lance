@@ -327,6 +327,11 @@ impl FragmentScanner {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
+        let batch_size_bytes = self
+            .config
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
 
         let scanner = Arc::new(self);
 
@@ -362,6 +367,21 @@ impl FragmentScanner {
                 .buffer_unordered(batch_readahead)
                 .try_filter_map(|res| futures::future::ready(Ok(res)))
                 .boxed()
+        };
+
+        let stream = if let Some(budget) = batch_size_bytes {
+            stream
+                .and_then(move |batch| {
+                    futures::future::ready(
+                        crate::dataset::blob::split_batch_by_bytes(batch, (budget * 2) as usize)
+                            .map_err(DataFusionError::from),
+                    )
+                })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
+                .boxed()
+        } else {
+            stream
         };
 
         Ok(stream)

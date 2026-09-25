@@ -24,17 +24,15 @@ use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
-// Named tiers are only matched on x86_64, or by the fp16 kernels on the other
-// architectures; without either, nothing below names a `SimdSupport` variant.
-#[cfg(any(feature = "fp16kernels", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
 #[cfg(feature = "fp16kernels")]
 use crate::distance::HalfBackend;
 use crate::distance::{
-    HALF_KERNELS_COMPILED, HalfType, assert_batch_layout, assert_equal_lengths, half_backend,
-    int8_query_to_f32, x86_half_features,
+    HALF_KERNELS_COMPILED, HalfType, U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout,
+    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
 };
 
 #[cfg(all(
@@ -96,9 +94,24 @@ pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
-    key.iter()
-        .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u64).pow(2))
+    // Keep the common path on a u32 accumulator so LLVM can auto-vectorize it
+    // efficiently. Longer inputs are widened between overflow-safe chunks.
+    if key.len() <= U8_U32_ACCUMULATOR_MAX_LEN {
+        return key
+            .iter()
+            .zip(target.iter())
+            .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+            .sum::<u32>() as f32;
+    }
+
+    key.chunks(U8_U32_ACCUMULATOR_MAX_LEN)
+        .zip(target.chunks(U8_U32_ACCUMULATOR_MAX_LEN))
+        .map(|(key, target)| {
+            key.iter()
+                .zip(target.iter())
+                .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+                .sum::<u32>() as u64
+        })
         .sum::<u64>() as f32
 }
 

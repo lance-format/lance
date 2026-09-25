@@ -14,7 +14,11 @@ use prost_types::Any;
 
 use crate::{format::pbfile, versions};
 
+mod field_types;
 pub(crate) mod structural;
+
+pub(crate) use field_types::ExpectedTypes;
+pub use field_types::FieldTypeMismatch;
 
 /// Page buffers in current Lance files are aligned to 64 bytes.
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;

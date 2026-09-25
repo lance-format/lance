@@ -30,7 +30,26 @@ use crate::{
 
 use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
-use lance_core::Result;
+use lance_core::{Error, Result};
+
+fn oversized_binary_batch_error(num_rows: u64, num_bytes: u64) -> Error {
+    Error::not_supported(format!(
+        "Could not create array with more than 2GiB of string/binary data in a single batch \
+         ({} rows would require {} bytes). Please reduce the batch_size, set \
+         LANCE_DEFAULT_BATCH_SIZE to a smaller value, or convert the column to \
+         large_string/large_binary.",
+        num_rows, num_bytes
+    ))
+}
+
+fn oversized_large_binary_batch_error(num_rows: u64, num_bytes: u64) -> Error {
+    Error::not_supported(format!(
+        "Could not create large_string/large_binary array in a single batch because {} rows \
+         would require {} bytes, which exceeds i64::MAX. Please reduce the batch_size or set \
+         LANCE_DEFAULT_BATCH_SIZE to a smaller value.",
+        num_rows, num_bytes
+    ))
+}
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -263,6 +282,21 @@ struct BinaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for BinaryPageDecoder {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        if num_rows == 0 {
+            return Ok(Some(0));
+        }
+        // `decoded_indices` holds one cumulative byte offset per row plus a final
+        // sentinel, so the value bytes for the requested rows are the difference
+        // between the bounding entries.  Only value bytes count: Arrow's i32
+        // limit constrains the final offset value, not the offset buffer size.
+        let value_bytes = self
+            .decoded_indices
+            .value((rows_to_skip + num_rows) as usize)
+            - self.decoded_indices.value(rows_to_skip as usize);
+        Ok(Some(value_bytes))
+    }
+
     // Continuing the example from BinaryPageScheduler
     // Suppose batch_size = 2. Then first, rows_to_skip=0, num_rows=2
     // Need to scan 2 rows
@@ -315,14 +349,25 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
         // Normalize and cast (TODO: could fuse these into one pass for micro-optimization)
         let target_vec = target_offsets.values();
         let start = target_vec[0];
-        let offsets_buffer =
-            match bytes_per_offset {
-                4 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i32))
-                    .into_inner(),
-                8 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i64))
-                    .into_inner(),
-                _ => panic!("Unsupported offsets type"),
-            };
+        let end = *target_vec.last().unwrap();
+        let num_bytes = end - start;
+        let offsets_buffer = match bytes_per_offset {
+            4 => {
+                if num_bytes > i32::MAX as u64 {
+                    return Err(oversized_binary_batch_error(num_rows, num_bytes));
+                }
+                ScalarBuffer::from_iter(target_vec.iter().map(|&offset| (offset - start) as i32))
+                    .into_inner()
+            }
+            8 => {
+                if num_bytes > i64::MAX as u64 {
+                    return Err(oversized_large_binary_batch_error(num_rows, num_bytes));
+                }
+                ScalarBuffer::from_iter(target_vec.iter().map(|&offset| (offset - start) as i64))
+                    .into_inner()
+            }
+            _ => panic!("Unsupported offsets type"),
+        };
 
         let bytes_to_skip = self.decoded_indices.value(rows_to_skip as usize);
         let num_bytes = self
@@ -538,6 +583,38 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct EmptyBytesDecoder;
+
+    impl PrimitivePageDecoder for EmptyBytesDecoder {
+        fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 8,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BytesDecoder {
+        bytes: Vec<u8>,
+    }
+
+    impl PrimitivePageDecoder for BytesDecoder {
+        fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+            let start = rows_to_skip as usize;
+            let end = start + num_rows as usize;
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 8,
+                data: LanceBuffer::from(self.bytes[start..end].to_vec()),
+                num_values: num_rows,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
     #[test]
     fn test_encode_indices_adjusts_nulls() {
         // Null entries in string arrays should be adjusted
@@ -567,5 +644,230 @@ mod tests {
             LanceBuffer::reinterpret_vec(vec![7_u64, 3, 6, 13, 13, 13])
         );
         assert_eq!(null_adjustment, 7);
+    }
+
+    #[test]
+    fn test_binary_overflow_error_is_actionable() {
+        let num_rows = 1;
+        let start = 100_u64;
+        let end = start + i32::MAX as u64 + 1;
+        let decoded_indices = UInt64Array::from(vec![start, end]);
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true]),
+            offsets_type: DataType::Int32,
+            bytes_decoder: Box::new(EmptyBytesDecoder),
+        };
+
+        let error = decoder.decode(0, num_rows).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains("more than 2GiB of string/binary data"));
+        assert!(message.contains("batch_size"));
+        assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
+        assert!(message.contains("large_string/large_binary"));
+    }
+
+    #[test]
+    fn test_large_binary_overflow_error_is_actionable() {
+        let num_rows = 1;
+        let start = 100_u64;
+        let end = start + i64::MAX as u64 + 1;
+        let decoded_indices = UInt64Array::from(vec![start, end]);
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true]),
+            offsets_type: DataType::Int64,
+            bytes_decoder: Box::new(EmptyBytesDecoder),
+        };
+
+        let error = decoder.decode(0, num_rows).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains("large_string/large_binary"));
+        assert!(message.contains("exceeds i64::MAX"));
+        assert!(message.contains("batch_size"));
+        assert!(message.contains("LANCE_DEFAULT_BATCH_SIZE"));
+    }
+
+    #[test]
+    fn test_large_binary_decode_success_path() {
+        let decoded_indices = UInt64Array::from(vec![100_u64, 102, 105]);
+        let mut bytes = vec![0_u8; 100];
+        bytes.extend_from_slice(b"abcde");
+        let decoder = BinaryPageDecoder {
+            decoded_indices,
+            validity: BooleanBuffer::from_iter([true, true]),
+            offsets_type: DataType::Int64,
+            bytes_decoder: Box::new(BytesDecoder { bytes }),
+        };
+
+        let data = decoder.decode(0, 2).unwrap();
+        let variable = data.as_variable_width().unwrap();
+        assert_eq!(variable.bits_per_offset, 64);
+        assert_eq!(variable.data.as_ref(), b"abcde");
+        assert_eq!(
+            variable.offsets.borrow_to_typed_slice::<i64>().as_ref(),
+            &[0_i64, 2, 5]
+        );
+    }
+
+    #[derive(Debug)]
+    struct NeverDecodedStub;
+
+    impl PrimitivePageDecoder for NeverDecodedStub {
+        fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+            unreachable!("byte accounting must not decode any values")
+        }
+    }
+
+    /// A real physical binary page over strings of the given byte lengths.
+    fn binary_page(value_lens: &[u64]) -> BinaryPageDecoder {
+        let mut indices = vec![0u64];
+        for len in value_lens {
+            indices.push(indices.last().unwrap() + len);
+        }
+        BinaryPageDecoder {
+            decoded_indices: UInt64Array::from(indices),
+            offsets_type: DataType::Int32,
+            validity: BooleanBuffer::new_set(value_lens.len()),
+            bytes_decoder: Box::new(NeverDecodedStub),
+        }
+    }
+
+    /// Variable-width value bytes of `n` rows starting at `skip` (what the
+    /// output array's i32 offsets index into).
+    fn expected_bytes(value_lens: &[u64], skip: usize, n: usize) -> u64 {
+        value_lens[skip..skip + n].iter().sum::<u64>()
+    }
+
+    #[test]
+    fn test_unknown_size_pages_split_at_page_boundaries() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use std::collections::VecDeque;
+
+        /// A variable-width page that cannot report sizes (default
+        /// `variable_width_bytes` returns `None`).
+        #[derive(Debug)]
+        struct UnknownSizeStub;
+
+        impl PrimitivePageDecoder for UnknownSizeStub {
+            fn decode(&self, _rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+                Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                    bits_per_offset: 32,
+                    data: LanceBuffer::empty(),
+                    offsets: LanceBuffer::reinterpret_vec(vec![0_i32; num_rows as usize + 1]),
+                    num_values: num_rows,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+        }
+
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(UnknownSizeStub),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Each page's size is unknown, so pages must not stack in one batch:
+        // the batch takes the first page alone and stops at its boundary.
+        let limit = root.max_rows_to_drain(6, I32_OFFSET_BYTE_BUDGET).unwrap();
+        assert_eq!(limit.rows, 3);
+    }
+
+    #[test]
+    fn test_physical_binary_page_reports_variable_width_bytes() {
+        let page = binary_page(&[4, 4, 5]);
+        assert_eq!(
+            page.variable_width_bytes(0, 3).unwrap(),
+            Some(expected_bytes(&[4, 4, 5], 0, 3))
+        );
+        assert_eq!(
+            page.variable_width_bytes(1, 2).unwrap(),
+            Some(expected_bytes(&[4, 4, 5], 1, 2))
+        );
+        assert_eq!(page.variable_width_bytes(0, 0).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_primitive_field_decoder_truncates_to_byte_budget() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::decoder::LogicalPageDecoder;
+
+        let lens = [4u64, 4, 5];
+        let decoder = PrimitiveFieldDecoder::new_from_data(
+            Arc::new(binary_page(&lens)),
+            DataType::Utf8,
+            3,
+            false,
+        );
+        let full = expected_bytes(&lens, 0, 3);
+
+        let limit = decoder.max_rows_to_drain(3, full).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (3, full));
+
+        // One byte short of the full request: only two rows fit.
+        let limit = decoder.max_rows_to_drain(3, full - 1).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (2, expected_bytes(&lens, 0, 2)));
+
+        // Nothing fits: zero rows, so the stream root can raise an error.
+        let limit = decoder.max_rows_to_drain(3, 0).unwrap();
+        assert_eq!(limit.rows, 0);
+    }
+
+    #[test]
+    fn test_physical_binary_pages_accumulate_budget_across_pages() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use std::collections::VecDeque;
+
+        let lens = [4u64, 4, 5];
+        let page_bytes = expected_bytes(&lens, 0, 3);
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(binary_page(&lens)),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Both pages fit: the batch spans the page boundary.
+        let limit = root.max_rows_to_drain(6, page_bytes * 2).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (6, page_bytes * 2));
+
+        // Page 1 plus the first two rows of page 2 fit.
+        let second_page_prefix = expected_bytes(&lens, 0, 2);
+        let limit = root
+            .max_rows_to_drain(6, page_bytes + second_page_prefix)
+            .unwrap();
+        assert_eq!(
+            (limit.rows, limit.bytes),
+            (5, page_bytes + second_page_prefix)
+        );
+
+        // Budget for page 1 only: the batch stops at the page boundary.
+        let limit = root.max_rows_to_drain(6, page_bytes).unwrap();
+        assert_eq!((limit.rows, limit.bytes), (3, page_bytes));
     }
 }

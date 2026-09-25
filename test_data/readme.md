@@ -43,3 +43,6 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 * `v8.0.0/decimal_zonemap`: This dataset has a Decimal128 ZoneMap whose non-null
   values have null min/max statistics because Decimal extrema were not computed
   by Lance 8.0.0.
+* `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
+  columns containing a payload, null, and empty bytes. These fixtures cover
+  reading released files alongside newly appended Blob v2 files.

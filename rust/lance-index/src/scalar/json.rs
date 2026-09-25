@@ -22,6 +22,7 @@ use datafusion_physical_expr::{
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
+use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion::exec::{
     LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
@@ -511,12 +512,40 @@ impl JsonIndexPlugin {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
     }
 
+    /// Present the indexed JSON column as JSONB, the encoding the JSON path
+    /// functions read, whichever encoding it arrives in.
+    fn jsonb_values(data: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
+        let schema = data.schema();
+        let (value_idx, value_field) = schema.column_with_name(VALUE_COLUMN_NAME).expect_ok()?;
+        if JsonEncoding::of_field(value_field) != Some(JsonEncoding::Text) {
+            return Ok(data);
+        }
+        let value_field = value_field.clone();
+        let mut fields = schema.fields().to_vec();
+        fields[value_idx] = Arc::new(json_field(VALUE_COLUMN_NAME, value_field.is_nullable()));
+        let jsonb_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let output_schema = jsonb_schema.clone();
+        let stream = data.map(move |batch| {
+            let batch = batch?;
+            let values = JsonValues::try_new(&value_field, batch.column(value_idx))
+                .expect("the value field holds JSON text")
+                .to_jsonb()?;
+            let mut columns = batch.columns().to_vec();
+            columns[value_idx] = Arc::new(values);
+            Ok(RecordBatch::try_new(jsonb_schema.clone(), columns)?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+
     /// Extract a JSON path and its type tag while preserving all row-location columns.
     fn extract_json(
         data: SendableRecordBatchStream,
         path: String,
     ) -> Result<SendableRecordBatchStream> {
-        let input = Arc::new(OneShotExec::new(data));
+        let input = Arc::new(OneShotExec::new(Self::jsonb_values(data)?));
         let input_schema = input.schema();
         let value_column_idx = input_schema
             .column_with_name(VALUE_COLUMN_NAME)
@@ -893,9 +922,11 @@ impl BasicTrainer for JsonIndexPlugin {
         params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+        if JsonEncoding::of_field(field).is_none()
+            && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+        {
             return Err(Error::invalid_input_source(
-                "A JSON index can only be created on a Binary or LargeBinary field.".into(),
+                "A JSON index can only be created on a JSON, Binary or LargeBinary field.".into(),
             ));
         }
 
@@ -908,6 +939,12 @@ impl BasicTrainer for JsonIndexPlugin {
             .unwrap_or(DataType::Utf8);
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
+        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+            return Err(Error::not_supported(format!(
+                "JSON-path indexes do not support target index type '{}'; create an INVERTED index directly on the JSON column instead",
+                params.target_index_type
+            )));
+        }
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.target_index_type).into(),
@@ -1038,8 +1075,14 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        // Older JSON-wrapped inverted indexes were never routable. Current training rejects this
+        // combination, so keep legacy metadata inert instead of enabling only part of its
+        // unsupported query path.
+        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+            return None;
+        }
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
+        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
         Some(Box::new(JsonQueryParser::new(
             json_details.path.clone(),
             target_parser,
@@ -1096,6 +1139,84 @@ mod tests {
     #[case::accessor_array_index("0", false)]
     fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
+
+    #[test]
+    fn test_json_index_rejects_inverted_target() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let error = trainer
+            .new_training_request(
+                r#"{"target_index_type":"inverted","path":"$.title"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .err()
+            .expect("an inverted target should be rejected");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("JSON-path indexes do not support target index type 'inverted'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_json_query_parser_forwards_target_details() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let target_details = prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails {
+            rows_per_zone: Some(128),
+            use_seeds: Some(false),
+            has_null_bitmap: Some(true),
+        })
+        .unwrap();
+        let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+        })
+        .unwrap();
+
+        let parser = plugin
+            .new_query_parser("json_value".to_string(), &index_details)
+            .expect("zone map target should provide a query parser");
+        let expression = parser
+            .visit_is_null("doc")
+            .expect("zone map target should parse IS NULL");
+        let Some(ScalarIndexExpr::Query(search)) = expression.scalar_query else {
+            panic!("JSON parser should wrap the target index query");
+        };
+        assert_eq!(search.index_type, "ZoneMap");
+        assert!(
+            !search.needs_recheck,
+            "the target's exact null-tracking detail should reach its query parser"
+        );
+    }
+
+    #[test]
+    fn test_json_query_parser_keeps_inverted_target_inert() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let target_details = prost_types::Any::from_msg(&crate::pbold::InvertedIndexDetails {
+            base_tokenizer: Some("simple".to_string()),
+            language: serde_json::to_string(&crate::scalar::inverted::Language::English).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+        })
+        .unwrap();
+
+        assert!(
+            plugin
+                .new_query_parser("json_value".to_string(), &index_details)
+                .is_none(),
+            "legacy JSON-wrapped inverted indexes must remain unroutable"
+        );
     }
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
@@ -1434,6 +1555,61 @@ mod tests {
             result,
             SearchResult::exact(RowAddrTreeMap::from_iter(expected_row_ids))
         );
+    }
+
+    /// JSON text input is indexed from the same values as stored JSONB.
+    #[tokio::test]
+    async fn test_json_text_input_extracts_like_jsonb() {
+        use arrow_array::{Int64Array, StringArray};
+        use futures::{TryStreamExt, stream};
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+        let docs = [r#"{"v": 1}"#, r#"{"v": 2}"#];
+        let jsonb = json_update_batch(&docs, vec![0, 1]);
+        let text_field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let text_schema = Arc::new(Schema::new(vec![
+            text_field,
+            jsonb.schema().field(1).clone(),
+        ]));
+        let text = RecordBatch::try_new(
+            text_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(docs.to_vec())),
+                jsonb.column(1).clone(),
+            ],
+        )
+        .unwrap();
+
+        let mut extracted = Vec::new();
+        for batch in [jsonb, text] {
+            let schema = batch.schema();
+            let raw_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter([Ok(batch)]),
+            )) as SendableRecordBatchStream;
+            let converted = JsonIndexPlugin::convert_stream_by_type(
+                JsonIndexPlugin::extract_json(raw_stream, "v".to_string()).unwrap(),
+                DataType::Int64,
+                "v".to_string(),
+            )
+            .unwrap();
+            let batches = converted.try_collect::<Vec<_>>().await.unwrap();
+            extracted.push(
+                batches[0][VALUE_COLUMN_NAME]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        assert_eq!(extracted[0], Int64Array::from(vec![1, 2]));
+        assert_eq!(extracted[1], extracted[0]);
     }
 
     #[tokio::test]
