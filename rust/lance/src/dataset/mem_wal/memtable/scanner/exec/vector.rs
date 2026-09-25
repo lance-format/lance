@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::index::{MemMatches, SearchContext, VectorMemQuery};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -87,7 +88,10 @@ impl VectorIndexExec {
         with_row_id: bool,
     ) -> Result<Self> {
         let column = &query.column;
-        if indexes.get_hnsw_by_column(column).is_none() {
+        if indexes
+            .index_answering(column, &VectorMemQuery::probe(query.distance_type))
+            .is_none()
+        {
             return Err(Error::invalid_input(format!(
                 "No HNSW vector index found for column '{}'",
                 column
@@ -152,7 +156,10 @@ impl VectorIndexExec {
     /// Distances are exact because the in-memory HNSW is backed by FLAT
     /// (uncompressed) vectors; no refine step is needed.
     fn query_index(&self) -> Result<Vec<(f32, u64)>> {
-        let Some(index) = self.indexes.get_hnsw_by_column(&self.query.column) else {
+        let Some(index) = self.indexes.index_answering(
+            &self.query.column,
+            &VectorMemQuery::probe(self.query.distance_type),
+        ) else {
             return Ok(vec![]);
         };
 
@@ -176,7 +183,21 @@ impl VectorIndexExec {
             })?
         };
 
-        let mut results = index.search(&fsl, self.query.k, self.query.ef, max_readable_row)?;
+        let query = VectorMemQuery {
+            vector: fsl,
+            k: self.query.k,
+            ef: self.query.ef,
+            distance_type: self.query.distance_type,
+        };
+        let ctx = SearchContext::new(max_readable_row);
+        let mut results: Vec<(f32, u64)> = index
+            .search(&query, &ctx)?
+            .as_ref()
+            .and_then(MemMatches::as_ranked)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| (m.score, m.position))
+            .collect();
 
         if self.query.distance_lower_bound.is_some() || self.query.distance_upper_bound.is_some() {
             results.retain(|&(dist, _)| {

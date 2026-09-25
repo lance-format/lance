@@ -63,6 +63,7 @@ use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::index::FtsMemQuery;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
@@ -276,9 +277,11 @@ fn active_source_can_execute_fts(
             index_store,
             ..
         } => {
+            // Rows become visible only after every index holds them, so an
+            // index that answers plus a visible row means it has something.
             index_store
-                .get_fts_by_column_and_granularity(column, document_granularity)
-                .is_some_and(|index| !index.is_empty())
+                .index_answering(column, &FtsMemQuery::probe(document_granularity))
+                .is_some()
                 && batch_store
                     .max_visible_row(index_store.visible_count())
                     .is_some()
@@ -1002,7 +1005,7 @@ impl LsmFtsSearchPlanner {
                     }
                 }
                 LsmDataSource::ActiveMemTable { index_store, .. } => {
-                    index_store.fts_document_granularities_by_column(column)
+                    index_store.fts_granularities_on(column)
                 }
             };
             available.extend(granularities.iter().copied());
@@ -3032,9 +3035,7 @@ mod tests {
             .unwrap();
         let indexes = Arc::new(indexes);
         assert!(
-            indexes
-                .fts_document_granularities_by_column("text")
-                .is_empty(),
+            indexes.fts_granularities_on("text").is_empty(),
             "precondition: the memtable maintains no FTS index on the column"
         );
 

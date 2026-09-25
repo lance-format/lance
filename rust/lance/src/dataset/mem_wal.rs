@@ -315,8 +315,11 @@ pub fn reconcile_batches(
     batches.iter().map(|batch| plan.apply(batch)).collect()
 }
 
-pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
-pub use index::{MemIndexKind, MemTableVisibility};
+pub use api::{
+    DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes,
+    validate_maintained_indexes_with,
+};
+pub use index::{MemIndexRegistry, MemIndexSpec, MemTableVisibility};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};

@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::ScalarPredicate;
+use crate::dataset::mem_wal::index::{MemMatches, MemQuery, SearchContext};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -80,11 +81,14 @@ impl BTreeIndexExec {
         with_row_id: bool,
         with_row_address: bool,
     ) -> Result<Self> {
-        // Verify the index exists for this column
+        // Verify some index covers this column and can answer the predicate.
         let column = predicate.column().to_string();
-        if indexes.get_btree_by_column(&column).is_none() {
+        if indexes
+            .index_answering(&column, predicate_ref(&predicate))
+            .is_none()
+        {
             return Err(Error::invalid_input(format!(
-                "No BTree index found for column '{}'",
+                "No scalar index found for column '{}'",
                 column
             )));
         }
@@ -133,51 +137,28 @@ impl BTreeIndexExec {
     }
 
     /// Query the index and return matching row positions filtered by visibility.
+    /// Ask whichever index covers the column, and return the positions a
+    /// reader may see.
+    ///
+    /// The node does not know which kind answered. Resolving by what an index
+    /// can answer rather than by which type it is is what lets a registered
+    /// plugin serve a column here.
     fn query_index(&self) -> Vec<u64> {
-        let Some(index) = self.indexes.get_btree_by_column(&self.column) else {
-            return vec![];
-        };
-
         let Some(max_readable_row) = self.compute_max_readable_row() else {
             return vec![];
         };
-
-        let positions = match &self.predicate {
-            ScalarPredicate::Eq { value, .. } => index.get(value),
-            ScalarPredicate::Range { lower, upper, .. } => {
-                // For range queries, use a range scan approach
-                // This is simplified - in production we'd need proper range iteration
-                let mut results = Vec::new();
-                let snapshot = index.snapshot();
-
-                for (key, positions) in snapshot {
-                    let in_range = match (lower, upper) {
-                        (Some(l), Some(u)) => &key.0 >= l && &key.0 < u,
-                        (Some(l), None) => &key.0 >= l,
-                        (None, Some(u)) => &key.0 < u,
-                        (None, None) => true,
-                    };
-
-                    if in_range {
-                        results.extend(positions);
-                    }
-                }
-                results
-            }
-            ScalarPredicate::In { values, .. } => {
-                let mut results = Vec::new();
-                for value in values {
-                    results.extend(index.get(value));
-                }
-                results
-            }
+        let Some(index) = self.indexes.index_answering(&self.column, &self.predicate) else {
+            return vec![];
         };
-
-        // Filter by visibility
-        positions
-            .into_iter()
-            .filter(|&pos| pos <= max_readable_row)
-            .collect()
+        // An index that fails must not silently answer "no rows"; returning
+        // nothing here keeps the caller's own behaviour rather than dropping
+        // rows that do match.
+        let Ok(Some(MemMatches::Filter(result))) =
+            index.search(&self.predicate, &SearchContext::new(max_readable_row))
+        else {
+            return vec![];
+        };
+        result.possible.iter().collect()
     }
 
     /// Convert row positions to batch_id, row_within_batch, and original row_position tuples.
@@ -377,6 +358,11 @@ impl ExecutionPlan for BTreeIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+/// A predicate as the query an index is asked.
+fn predicate_ref(predicate: &ScalarPredicate) -> &dyn MemQuery {
+    predicate
 }
 
 #[cfg(test)]

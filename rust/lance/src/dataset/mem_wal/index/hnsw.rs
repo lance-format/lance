@@ -21,6 +21,15 @@ use lance_linalg::distance::DistanceType;
 
 use super::super::hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams};
 use super::super::memtable::batch_store::StoredBatch;
+use super::plugin::{
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, ParamsContext,
+    ResolvedIndex,
+};
+use super::query::{MemMatches, MemQuery, RankedMatch, SearchContext, VectorMemQuery};
+use crate::index::vector::details::vector_index_details_default;
+use lance_index::IndexType;
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_table::format::IndexMetadata;
 
 pub use super::RowPosition;
 
@@ -41,38 +50,12 @@ pub fn mem_wal_hnsw_default() -> HnswBuildParams {
         .ef_construction(100)
 }
 
-/// Configuration for an in-memory HNSW index.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HnswIndexConfig {
-    pub name: String,
-    pub field_id: i32,
-    /// Vector column name for batch lookups.
-    pub column: String,
-    pub distance_type: DistanceType,
-    pub build_params: HnswBuildParams,
-}
-
-impl HnswIndexConfig {
-    pub fn new(name: String, field_id: i32, column: String, distance_type: DistanceType) -> Self {
-        Self {
-            name,
-            field_id,
-            column,
-            distance_type,
-            build_params: mem_wal_hnsw_default(),
-        }
-    }
-
-    pub fn with_build_params(mut self, params: HnswBuildParams) -> Self {
-        self.build_params = params;
-        self
-    }
-}
-
 /// In-memory HNSW index queryable while building.
 pub struct HnswMemIndex {
     field_id: i32,
-    column: String,
+    /// The covered column, held as a slice because that is the shape
+    /// [`MemIndex::columns`] returns.
+    columns: Vec<String>,
     distance_type: DistanceType,
     /// Vector dimension (lazy-initialized on first insert).
     dim: AtomicUsize,
@@ -93,7 +76,7 @@ impl std::fmt::Debug for HnswMemIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HnswMemIndex")
             .field("field_id", &self.field_id)
-            .field("column", &self.column)
+            .field("column", &self.column())
             .field("distance_type", &self.distance_type)
             .field("dim", &self.dim.load(Ordering::Acquire))
             .field("capacity", &self.capacity)
@@ -113,7 +96,7 @@ impl HnswMemIndex {
     ) -> Self {
         Self {
             field_id,
-            column,
+            columns: vec![column],
             distance_type,
             dim: AtomicUsize::new(MEM_HNSW_DIM_PLACEHOLDER),
             capacity,
@@ -128,7 +111,12 @@ impl HnswMemIndex {
     }
 
     pub fn column_name(&self) -> &str {
-        &self.column
+        &self.columns[0]
+    }
+
+    /// The covered column.
+    fn column(&self) -> &str {
+        &self.columns[0]
     }
 
     pub fn distance_type(&self) -> DistanceType {
@@ -184,7 +172,7 @@ impl HnswMemIndex {
             if state.storage.dim() != dim {
                 return Err(Error::invalid_input(format!(
                     "HNSW index column '{}' dimension changed: expected {}, got {}",
-                    self.column,
+                    self.column(),
                     state.storage.dim(),
                     dim
                 )));
@@ -214,7 +202,7 @@ impl HnswMemIndex {
             if state.storage.dim() != dim {
                 return Err(Error::invalid_input(format!(
                     "HNSW index column '{}' dimension changed: expected {}, got {}",
-                    self.column,
+                    self.column(),
                     state.storage.dim(),
                     dim
                 )));
@@ -235,18 +223,18 @@ impl HnswMemIndex {
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         let (col_idx, _) = batch
             .schema()
-            .column_with_name(&self.column)
+            .column_with_name(self.column())
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "HNSW index column '{}' is not in the inserted batch schema",
-                    self.column
+                    self.column()
                 ))
             })?;
         let column = batch.column(col_idx);
         let fsl_ref = column.as_fixed_size_list_opt().ok_or_else(|| {
             Error::invalid_input(format!(
                 "Column '{}' is not a FixedSizeList, got {:?}",
-                self.column,
+                self.column(),
                 column.data_type()
             ))
         })?;
@@ -256,7 +244,7 @@ impl HnswMemIndex {
         if fsl_ref.values().as_primitive_opt::<Float32Type>().is_none() {
             return Err(Error::invalid_input(format!(
                 "Column '{}' must be FixedSizeList<Float32>, got values type {:?}",
-                self.column,
+                self.column(),
                 fsl_ref.values().data_type()
             )));
         }
@@ -282,18 +270,18 @@ impl HnswMemIndex {
             let (col_idx, _) = stored
                 .data
                 .schema()
-                .column_with_name(&self.column)
+                .column_with_name(self.column())
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "HNSW index column '{}' is not in the inserted batch schema",
-                        self.column
+                        self.column()
                     ))
                 })?;
             let column = stored.data.column(col_idx);
             let fsl_ref = column.as_fixed_size_list_opt().ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Column '{}' is not a FixedSizeList, got {:?}",
-                    self.column,
+                    self.column(),
                     column.data_type()
                 ))
             })?;
@@ -303,7 +291,7 @@ impl HnswMemIndex {
             if fsl_ref.values().as_primitive_opt::<Float32Type>().is_none() {
                 return Err(Error::invalid_input(format!(
                     "Column '{}' must be FixedSizeList<Float32>, got values type {:?}",
-                    self.column,
+                    self.column(),
                     fsl_ref.values().data_type()
                 )));
             }
@@ -316,7 +304,7 @@ impl HnswMemIndex {
                     if state.storage.dim() != dim {
                         return Err(Error::invalid_input(format!(
                             "HNSW index column '{}' dimension changed: expected {}, got {}",
-                            self.column,
+                            self.column(),
                             state.storage.dim(),
                             dim
                         )));
@@ -466,6 +454,283 @@ fn build_params_of(params: &HnswBuildParams) -> BuildParams {
         ef_construction: params.ef_construction,
         prefetch_distance: params.prefetch_distance,
         ..BuildParams::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl super::plugin::MemIndex for HnswMemIndex {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// A graph's metric is baked into its structure, so a search asking for a
+    /// different one is declined and brute-forced instead.
+    fn can_answer(&self, query: &dyn MemQuery) -> bool {
+        query
+            .as_any()
+            .downcast_ref::<VectorMemQuery>()
+            .is_some_and(|query| {
+                query
+                    .distance_type
+                    .is_none_or(|wanted| wanted == self.distance_type())
+            })
+    }
+
+    fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        Self::insert(self, batch, row_offset)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        Self::resident_bytes(self)
+    }
+
+    fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+        if !self.can_answer(query) {
+            return Ok(None);
+        }
+        let Some(query) = query.as_any().downcast_ref::<VectorMemQuery>() else {
+            return Ok(None);
+        };
+        let neighbours = Self::search(self, &query.vector, query.k, query.ef, ctx.max_visible)?;
+        Ok(Some(MemMatches::ranked(
+            neighbours
+                .into_iter()
+                .map(|(distance, position)| RankedMatch::new(position, distance))
+                .collect(),
+        )))
+    }
+
+    /// A vector index does not train from a value stream: its flush writes the
+    /// graph and its storage directly.
+    async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+        let generation = ctx.generation(self.column_name())?;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch as ArrowRecordBatch};
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_core::ROW_ID;
+        use lance_file::versions as file_versions;
+        use lance_file::writer::FileWriterOptions;
+        use lance_index::pb;
+        use lance_index::vector::DISTANCE_TYPE_KEY;
+        use lance_index::vector::SQ_CODE_COLUMN;
+        use lance_index::vector::hnsw::HNSW;
+        use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+        use lance_index::vector::sq::ScalarQuantizer;
+        use lance_index::vector::storage::STORAGE_METADATA_KEY;
+        use lance_index::vector::v3::subindex::IvfSubIndex;
+        use lance_index::{
+            INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+            IndexMetadata as IndexMetaSchema,
+        };
+        use prost::Message;
+        use std::ops::Range;
+        use std::sync::Arc;
+
+        // Write the index files at the base dataset's storage version (matches
+        // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
+        let storage_version = generation.storage_version;
+
+        let index_uuid = uuid::Uuid::new_v4();
+        let index_dir = generation
+            .path
+            .clone()
+            .join("_indices")
+            .join(index_uuid.to_string());
+
+        let distance_type = self.distance_type();
+        let dim = self.dim();
+        if dim == 0 {
+            // No vector was ever inserted (e.g. an all-tombstone generation):
+            // skip the index, keep the data flush.
+            return Ok(FlushOutcome::BuildFromGeneration);
+        }
+        // Forward-written data: HNSW row ids line up 1:1 with the data file, so
+        // no position reversal (pass `None`).
+        let Some((hnsw, flat_storage_batch)) = self.to_lance_hnsw(None)? else {
+            // Every vector in the generation is null → empty graph; skip the
+            // index rather than failing the flush.
+            return Ok(FlushOutcome::BuildFromGeneration);
+        };
+
+        // Train SQ8 on the full memtable in one pass: learn global min/max
+        // from every flushed vector, then quantize all rows in one shot.
+        let row_id_col = flat_storage_batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| Error::invalid_input("_rowid missing from HNSW storage batch"))?
+            .clone();
+        let flat_col = flat_storage_batch
+            .column_by_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+            .ok_or_else(|| Error::invalid_input("flat column missing from HNSW storage batch"))?
+            .clone();
+        let flat_fsl = flat_col.as_fixed_size_list();
+        let mut sq = ScalarQuantizer::new(8, dim);
+        let bounds: Range<f64> = sq.update_bounds::<Float32Type>(flat_fsl)?;
+        let sq_codes = sq.transform::<Float32Type>(flat_fsl as &dyn arrow_array::Array)?;
+
+        let storage_schema = ArrowSchema::new(vec![
+            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(
+                SQ_CODE_COLUMN,
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new(
+                        "item",
+                        arrow_schema::DataType::UInt8,
+                        true,
+                    )),
+                    dim as i32,
+                ),
+                true,
+            ),
+        ]);
+        let storage_batch = ArrowRecordBatch::try_new(
+            Arc::new(storage_schema.clone()),
+            vec![row_id_col, sq_codes],
+        )?;
+
+        // Single-partition IVF for both the storage and graph files. We need
+        // *some* centroid because the on-disk read path routes every query
+        // through `IvfModel::find_partitions` before HNSW search; that call
+        // unwraps `centroids`. With one partition the centroid value is
+        // irrelevant for routing — every query goes to partition 0 — so use
+        // a zero vector.
+        let zero_centroid_values = Float32Array::from(vec![0.0f32; dim]);
+        let zero_centroid_fsl =
+            FixedSizeListArray::try_new_from_values(zero_centroid_values, dim as i32)?;
+        let mut storage_ivf =
+            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
+        storage_ivf.add_partition(storage_batch.num_rows() as u32);
+
+        let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let mut storage_writer = file_versions::create_writer(
+            storage_version,
+            generation.object_store.create(&storage_path).await?,
+            (&storage_schema).try_into()?,
+            FileWriterOptions::default(),
+        )?;
+        storage_writer.write_batch(&storage_batch).await?;
+
+        let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
+        storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
+        let ivf_buffer_pos = storage_writer
+            .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
+            .await?;
+        storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+
+        // The reader needs the SQ metadata in two forms: a single
+        // ScalarQuantizationMetadata under SQ_METADATA_KEY (whole-file path),
+        // and a JSON array of per-partition ScalarQuantizationMetadata strings
+        // under STORAGE_METADATA_KEY (per-partition path). With one partition
+        // we serialize the same value twice.
+        let sq_meta = lance_index::vector::sq::storage::ScalarQuantizationMetadata {
+            dim,
+            num_bits: 8,
+            bounds,
+        };
+        let sq_meta_json = serde_json::to_string(&sq_meta)?;
+        storage_writer.add_schema_metadata(
+            STORAGE_METADATA_KEY,
+            serde_json::to_string(&[&sq_meta_json])?,
+        );
+        storage_writer.add_schema_metadata(
+            lance_index::vector::sq::storage::SQ_METADATA_KEY,
+            sq_meta_json,
+        );
+        storage_writer.finish().await?;
+
+        // Write the HNSW graph batch to index.idx. The graph file uses the
+        // same single-partition IVF model with zero centroid for the same
+        // reason as the storage file.
+        let hnsw_batch = hnsw.to_batch()?;
+        let hnsw_metadata_json = hnsw_batch
+            .schema_ref()
+            .metadata()
+            .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
+            .cloned()
+            .unwrap_or_default();
+        // Force fullzip structural encoding for the graph's List<u32>/List<f32>
+        // columns. The HNSW graph has dense level-0 neighbor lists followed by
+        // many empty higher-level lists; the v2.x miniblock List codec decodes
+        // the row count incorrectly for that shape at scale (the locally-sparse
+        // empty block is not captured by the global levels-per-value average),
+        // and at 2.1 it also overflows the 32 KiB miniblock cap. Fullzip
+        // round-trips it correctly.
+        let fullzip_meta = std::collections::HashMap::from([(
+            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
+            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let index_schema: ArrowSchema = {
+            let base = HNSW::schema();
+            let fields = base
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), arrow_schema::DataType::List(_)) {
+                        Arc::new(f.as_ref().clone().with_metadata(fullzip_meta.clone()))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            ArrowSchema::new(fields)
+        };
+        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
+        let mut index_writer = file_versions::create_writer(
+            storage_version,
+            generation.object_store.create(&index_path).await?,
+            (&index_schema).try_into()?,
+            FileWriterOptions::default(),
+        )?;
+        index_writer.write_batch(&hnsw_batch).await?;
+
+        let mut index_ivf =
+            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl, None);
+        index_ivf.add_partition(hnsw_batch.num_rows() as u32);
+        let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
+        // The on-disk type string matches Lance's index loader vocabulary —
+        // an HNSW sub-index over SQ8-quantized vector storage, registered
+        // under the same name as the standard IVF_HNSW_SQ path even though
+        // our IVF layer is a single-partition placeholder.
+        let index_metadata = IndexMetaSchema {
+            index_type: "IVF_HNSW_SQ".to_string(),
+            distance_type: distance_type.to_string(),
+        };
+        index_writer.add_schema_metadata(
+            INDEX_METADATA_SCHEMA_KEY,
+            serde_json::to_string(&index_metadata)?,
+        );
+        let ivf_buffer_pos = index_writer
+            .add_global_buffer(index_ivf_pb.encode_to_vec().into())
+            .await?;
+        index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        // Per-partition HNSW metadata: a JSON array with one entry.
+        index_writer.add_schema_metadata(
+            HNSW::metadata_key(),
+            serde_json::to_string(&[hnsw_metadata_json])?,
+        );
+        index_writer.finish().await?;
+
+        // Packed the same way index creation does; hand-building the `Any` here
+        // produced a `type.googleapis.com/` url no other writer in lance emits.
+        let index_details = Some(Arc::new(vector_index_details_default()));
+        // The generation is committed by now, so the index records itself
+        // against the fragments and version it actually covers.
+        let index_meta = IndexMetadata {
+            uuid: index_uuid,
+            name: generation.name.to_string(),
+            fields: vec![self.field_id],
+            covering_fields: vec![],
+            dataset_version: generation.dataset.version().version,
+            fragment_bitmap: Some(generation.dataset.fragment_bitmap.as_ref().clone()),
+            index_details,
+            base_id: None,
+            created_at: Some(chrono::Utc::now()),
+            index_version: 1,
+            files: None,
+        };
+
+        Ok(FlushOutcome::Wrote(Box::new(index_meta)))
     }
 }
 
@@ -949,5 +1214,144 @@ mod tests {
         .unwrap();
         index.insert(&batch, 0).unwrap();
         assert_eq!(index.len(), 0, "no nodes for an all-null batch");
+    }
+}
+
+/// What an in-memory HNSW index needs before it takes a row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HnswParams {
+    /// The metric the base index was built with, so the memtable and the base
+    /// table produce comparable distances.
+    pub distance_type: DistanceType,
+    /// Graph parameters, defaulted unless the writer overrode them.
+    pub build_params: HnswBuildParams,
+}
+
+/// Declares the built-in HNSW memtable index.
+#[derive(Debug, Default)]
+pub struct HnswMemIndexPlugin;
+
+#[async_trait::async_trait]
+impl MemIndexPlugin for HnswMemIndexPlugin {
+    fn name(&self) -> &str {
+        "Hnsw"
+    }
+
+    fn details_suffix(&self) -> &str {
+        "VectorIndexDetails"
+    }
+
+    fn flush_index_type(&self) -> IndexType {
+        IndexType::IvfHnswSq
+    }
+
+    fn training_criteria(&self) -> TrainingCriteria {
+        // Never consulted: the flush writes the graph itself rather than
+        // handing rows to a trainer.
+        TrainingCriteria::new(TrainingOrdering::None)
+    }
+
+    async fn resolve(&self, ctx: &ParamsContext<'_>) -> Result<ResolvedIndex> {
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let [column] = ctx.columns else {
+            return Err(Error::invalid_input(format!(
+                "vector index '{}' must cover exactly one column",
+                ctx.name
+            )));
+        };
+
+        // Inherit the base table's metric so the in-memory index and the base
+        // index produce comparable distances. The recorded details state it,
+        // and for an index that covers nothing they are the only source: it
+        // carries its settings with no file to open. Opening the index is the
+        // fallback for an entry whose details do not decode. Surface the
+        // failure rather than defaulting to L2 — flushed `IVF_HNSW_SQ` files
+        // bake the metric into their metadata, so a wrong default would be
+        // durable corruption.
+        let recorded = ctx
+            .index_meta
+            .index_details
+            .as_deref()
+            .and_then(crate::index::vector::details::vector_params_from_details)
+            .map(|params| params.metric_type);
+        let distance_type = match recorded {
+            Some(distance_type) => distance_type,
+            None => ctx
+                .dataset
+                .open_vector_index(column, &ctx.index_meta.uuid, &NoOpMetricsCollector)
+                .await
+                .map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Failed to open base vector index '{}' to inherit distance type: {}",
+                        ctx.name, e
+                    ))
+                })?
+                .metric_type(),
+        };
+
+        Ok(ResolvedIndex::with_params(
+            ctx.columns.to_vec(),
+            HnswParams {
+                distance_type,
+                build_params: ctx
+                    .overrides::<HnswBuildParams>()
+                    .cloned()
+                    .unwrap_or_else(mem_wal_hnsw_default),
+            },
+        ))
+    }
+
+    fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+        use arrow_schema::DataType;
+
+        let (column, _) = ctx.single_column()?;
+        ctx.check_columns_resolve()?;
+        let field = ctx
+            .schema
+            .field(column)
+            .expect("check_columns_resolve accepted the column");
+        match field.data_type() {
+            DataType::FixedSizeList(item, dim) => {
+                if item.data_type() != &DataType::Float32 {
+                    return Err(Error::invalid_input(format!(
+                        "HNSW index '{}' requires a FixedSizeList<Float32> column; column \
+                         '{column}' has item type {:?}",
+                        ctx.name,
+                        item.data_type()
+                    )));
+                }
+                // `HnswMemIndex.dim` is a placeholder until the first batch
+                // pins it, so a zero-width vector would otherwise only surface
+                // at insert time — on already-durable data.
+                if dim <= 0 {
+                    return Err(Error::invalid_input(format!(
+                        "HNSW index '{}' requires a vector dimension > 0; column '{column}' has \
+                         dimension {dim}",
+                        ctx.name,
+                    )));
+                }
+                Ok(())
+            }
+            other => Err(Error::invalid_input(format!(
+                "HNSW index '{}' requires a FixedSizeList<Float32> column; column '{column}' is \
+                 {other:?}",
+                ctx.name
+            ))),
+        }
+    }
+
+    fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+        let (column, field_id) = ctx.single_column()?;
+        let params = ctx.params::<HnswParams>()?;
+        Ok(Arc::new(HnswMemIndex::with_capacity(
+            field_id,
+            column.to_string(),
+            params.distance_type,
+            params.build_params.clone(),
+            ctx.capacity_rows,
+            ctx.capacity_batches,
+        )))
     }
 }

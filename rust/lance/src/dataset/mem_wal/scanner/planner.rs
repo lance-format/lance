@@ -1507,7 +1507,7 @@ mod integration_tests {
             "Active memtable should use the fused dedup scan"
         );
         assert!(
-            !plan_str.contains("BTreeIndexExec"),
+            !plan_str.contains("ScalarIndexExec"),
             "Active filtered read no longer uses the BTree skip"
         );
 

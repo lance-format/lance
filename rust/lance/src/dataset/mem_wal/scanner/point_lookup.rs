@@ -430,7 +430,6 @@ impl LsmPointLookupPlanner {
                         match probe_memtable(
                             &m.batch_store,
                             &m.index_store,
-                            &self.pk_columns[0],
                             &pk_values[0],
                             target,
                             self.visibility,
@@ -533,7 +532,6 @@ impl LsmPointLookupPlanner {
                 .await;
         }
 
-        let pk_col = &self.pk_columns[0];
         let refs = self.collector.in_memory_refs_newest_first();
         // Hits grouped by (memtable index, batch index) so each source batch is
         // gathered with a single `take`.
@@ -542,8 +540,7 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
-                {
+                match probe_position(&m.batch_store, &m.index_store, key, self.visibility)? {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -959,7 +956,6 @@ enum ProbePos {
 fn probe_position(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
@@ -985,14 +981,16 @@ fn probe_position(
     }
     let max_visible_row = visible_end - 1;
 
-    // A single-column primary key always has a value-keyed BTree (reused or
-    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
-    // seek yields the answer with no re-check. Absent only when the table has no
-    // PK index, where the caller falls back to the plan path.
-    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
+    // Callers only take this path for a single-column key, whose index is
+    // value-keyed and collision-free: one seek, no re-check. Asked through the
+    // store's primary key rather than found as a B-tree, so whichever index
+    // serves as the key answers. Absent only without a primary key, where the
+    // caller falls back to the plan path.
+    if !index_store.has_pk_index() {
         return Ok(ProbePos::NoIndex);
-    };
-    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
+    }
+    let Some(pos) = index_store.pk_newest_visible(std::slice::from_ref(pk_value), max_visible_row)
+    else {
         return Ok(ProbePos::Miss);
     };
     let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
@@ -1094,12 +1092,11 @@ fn gather_rows(
 fn probe_memtable(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
     visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
+    match probe_position(batch_store, index_store, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -2333,20 +2330,18 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_against_from_configs_built_index() {
         // A point lookup against an index built the production way
-        // (`IndexStore::from_configs`) resolves correctly via the seek-and-stop
+        // (`IndexStore::from_specs`) resolves correctly via the seek-and-stop
         // skiplist probe.
-        use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
+        use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
 
         let schema = create_pk_schema();
         let batch = create_test_batch(&schema, &[10, 20, 30], "v");
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let index_store = IndexStore::from_configs(
-            &[MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "id_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            })],
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &lance_schema,
             1000,
             100,
         )
