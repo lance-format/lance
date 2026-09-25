@@ -1305,6 +1305,16 @@ mod test {
         let cases: &[(&str, bool, &str)] = &[
             ("cast(NULL as bigint)", true, "a typed null"),
             (
+                "cast(NULL as timestamp)",
+                true,
+                "a typed null whose type carries a unit",
+            ),
+            (
+                "arrow_cast(NULL, 'Timestamp(Microsecond, None)')",
+                true,
+                "the arrow_cast spelling of the same",
+            ),
+            (
                 "cast(cast(NULL as int) as bigint)",
                 true,
                 "nested casts still fold to a null",
