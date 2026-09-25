@@ -66,6 +66,63 @@ fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarInd
     Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
 }
 
+/// Refuse a row-id-domain index while a fragment-reuse index is live on a
+/// stable-row-id dataset.
+///
+/// The FRI, stable row ids, and row-id-domain indexes are an invalid
+/// combination.  If we are creating a new index and all three of these
+/// things are present then we need to reject the creation.
+///
+/// Drops out once every index stores row addresses.
+async fn reject_row_id_domain_index_under_frag_reuse(
+    dataset: &Dataset,
+    index_type: IndexType,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(());
+    }
+
+    // Hard-coded list of row-id-domain indexes.  As we migrate away from
+    // row-id domain indexes this list will shrink and then vanish.
+    match index_type {
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::Inverted
+        | IndexType::IvfFlat
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfPq
+        | IndexType::IvfRq
+        | IndexType::IvfSq
+        | IndexType::LabelList
+        | IndexType::NGram
+        | IndexType::RTree
+        | IndexType::Vector
+        // For now, err on disallowing.  Easier than digging through params.
+        // Can relax once a majority of scalar indexes support addresses.
+        | IndexType::Scalar => {}
+        _ => {
+            return Ok(());
+        }
+    };
+
+    let Some(frag_reuse) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
+        return Ok(());
+    };
+    // A drained FRI remaps nothing, so it cannot corrupt anything.
+    if frag_reuse.is_empty() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "cannot create a {index_type} index on a dataset with stable row IDs while a \
+         fragment-reuse index is present: that index reports matches as row ids, which a rewrite \
+         leaves valid, but the fragment-reuse index remaps row addresses and would be applied to \
+         it. Drain the fragment-reuse index first (merge the address-domain index segments, then \
+         clean it up), or create this index before compacting with defer_index_remap."
+    )))
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -160,6 +217,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
         async move {
+        reject_row_id_domain_index_under_frag_reuse(self.dataset, self.index_type).await?;
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),
