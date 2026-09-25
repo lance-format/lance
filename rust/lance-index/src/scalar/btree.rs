@@ -2265,6 +2265,108 @@ impl Index for BTreeIndex {
     }
 }
 
+impl BTreeIndex {
+    /// The one remap implementation behind the legacy `remap` and
+    /// `remap_streaming`: retrains each part from its pages, translating one
+    /// page's addresses at a time.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // (part_id, path)
+        // The part_id is None for a basic index
+        // For a range-based index we use Some(0), Some(1), ...
+        //   even if those weren't the original part ids
+        let part_page_files: Vec<(Option<u32>, &str)> =
+            if let Some(ranges_to_files) = &self.ranges_to_files {
+                // Range-based Index: Directly collect references to the file paths.
+                ranges_to_files
+                    .iter()
+                    .enumerate()
+                    .map(|(part_id, (_, (path, _)))| (Some(part_id as u32), path.as_str()))
+                    .collect()
+            } else {
+                // Basic Index: There is only one source page file.
+                vec![(None, BTREE_PAGES_NAME)]
+            };
+
+        let mapping = mapping.clone();
+        let train_schema = Arc::new(self.train_schema());
+        let mut remapped_files = Vec::new();
+
+        // TODO: Could potentially parallelize this across parts, unclear it would be worth it
+        for (part_id, page_file) in part_page_files {
+            // Retrain on the remapped pages
+            let sub_index_reader = self.store.open_index_file(page_file).await?;
+            let mapping = mapping.clone();
+
+            let train_schema_clone = train_schema.clone();
+            let train_schema = train_schema.clone();
+
+            let remapped_stream = Self::page_stream(
+                sub_index_reader,
+                self.batch_size,
+                self.store.io_parallelism(),
+            )
+            .await?
+            .map_ok(|(_, batch)| batch)
+            .map_err(DataFusionError::from)
+            .and_then(move |batch| {
+                let mapping = mapping.clone();
+                let train_schema = train_schema.clone();
+                async move {
+                    // Translate one page's addresses, then convert from the
+                    // serialized schema to the training input schema.
+                    let remapped = FlatIndex::remap_batch_with(batch, &mapping)
+                        .await
+                        .map_err(DataFusionError::from)?;
+                    RecordBatch::try_new(train_schema, remapped.columns().to_vec())
+                        .map_err(DataFusionError::from)
+                }
+            });
+
+            let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
+                train_schema_clone,
+                remapped_stream,
+            ));
+
+            let mut files =
+                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
+                    .await?;
+            remapped_files.append(&mut files);
+        }
+
+        if let Some(ranges_to_files) = &self.ranges_to_files {
+            let num_parts = ranges_to_files.len();
+            // Merge the lookups if we are a range-based index
+            let page_files = (0..num_parts)
+                .map(|part_id| part_page_data_file_path((part_id as u64) << 32))
+                .collect::<Vec<_>>();
+            let lookup_files = (0..num_parts)
+                .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
+                .collect::<Vec<_>>();
+            let merged_files = merge_metadata_files(
+                dest_store,
+                &page_files,
+                &lookup_files,
+                None,
+                noop_progress(),
+            )
+            .await?;
+            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
+            remapped_files.extend(merged_files);
+        }
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+            files: remapped_files,
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
     async fn search(
@@ -2424,99 +2526,21 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // (part_id, path)
-        // The part_id is None for a basic index
-        // For a range-based index we use Some(0), Some(1), ...
-        //   even if those weren't the original part ids
-        let part_page_files: Vec<(Option<u32>, &str)> =
-            if let Some(ranges_to_files) = &self.ranges_to_files {
-                // Range-based Index: Directly collect references to the file paths.
-                ranges_to_files
-                    .iter()
-                    .enumerate()
-                    .map(|(part_id, (_, (path, _)))| (Some(part_id as u32), path.as_str()))
-                    .collect()
-            } else {
-                // Basic Index: There is only one source page file.
-                vec![(None, BTREE_PAGES_NAME)]
-            };
+        // The page streams are `'static`, so the map is shared through an
+        // owned translator (the same clone this method always made).
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()), dest_store)
+            .await
+    }
 
-        let mapping = mapping.clone();
-        let train_schema = Arc::new(self.train_schema());
-        let mut remapped_files = Vec::new();
-
-        // TODO: Could potentially parallelize this across parts, unclear it would be worth it
-        for (part_id, page_file) in part_page_files {
-            // Retrain on the remapped pages
-            let sub_index_reader = self.store.open_index_file(page_file).await?;
-            let mapping = mapping.clone();
-
-            let train_schema_clone = train_schema.clone();
-            let train_schema = train_schema.clone();
-
-            let remapped_stream = Self::page_stream(
-                sub_index_reader,
-                self.batch_size,
-                self.store.io_parallelism(),
-            )
-            .await?
-            .map_ok(|(_, batch)| batch)
-            .map_err(DataFusionError::from)
-            .and_then(move |batch| {
-                let mapping = mapping.clone();
-                let train_schema = train_schema.clone();
-                async move {
-                    // Translate one page's addresses, then convert from the
-                    // serialized schema to the training input schema.
-                    let remapped = FlatIndex::remap_batch_with(batch, &mapping)
-                        .await
-                        .map_err(DataFusionError::from)?;
-                    RecordBatch::try_new(train_schema, remapped.columns().to_vec())
-                        .map_err(DataFusionError::from)
-                }
-            });
-
-            let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
-                train_schema_clone,
-                remapped_stream,
-            ));
-
-            let mut files =
-                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
-                    .await?;
-            remapped_files.append(&mut files);
-        }
-
-        if let Some(ranges_to_files) = &self.ranges_to_files {
-            let num_parts = ranges_to_files.len();
-            // Merge the lookups if we are a range-based index
-            let page_files = (0..num_parts)
-                .map(|part_id| part_page_data_file_path((part_id as u64) << 32))
-                .collect::<Vec<_>>();
-            let lookup_files = (0..num_parts)
-                .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
-                .collect::<Vec<_>>();
-            let merged_files = merge_metadata_files(
-                dest_store,
-                &page_files,
-                &lookup_files,
-                None,
-                noop_progress(),
-            )
-            .await?;
-            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
-            remapped_files.extend(merged_files);
-        }
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
-                .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
-            files: remapped_files,
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.clone(), dest_store).await
     }
 
     async fn update(
@@ -3540,7 +3564,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
-    use lance_index_core::remapping::RowAddrTranslator;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, ops::Bound, sync::Arc};
 
@@ -3692,10 +3715,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         index
-            .remap(
-                &RowAddrTranslator::sync(RowAddrRemap::empty()),
-                remap_store.as_ref(),
-            )
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -5253,10 +5273,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         ranged_index
-            .remap(
-                &RowAddrTranslator::sync(RowAddrRemap::empty()),
-                remap_store.as_ref(),
-            )
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -5585,10 +5602,7 @@ mod tests {
 
         // Remap the index with our deletion mapping
         index
-            .remap(
-                &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
-                remap_store.as_ref(),
-            )
+            .remap(&RowAddrRemap::direct(mapping), remap_store.as_ref())
             .await
             .unwrap();
 

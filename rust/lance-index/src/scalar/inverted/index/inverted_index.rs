@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::RowAddrTranslatorRef;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
 #[derive(Debug, Default)]
@@ -916,6 +918,30 @@ impl InvertedIndex {
     }
 }
 
+impl InvertedIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let files = self
+            .to_builder()
+            .remap_with(mapping, self.store.clone(), dest_store)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: self.index_version(),
+            files,
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
@@ -947,21 +973,18 @@ impl ScalarIndex for InvertedIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
-            .remap(mapping, self.store.clone(), dest_store)
-            .await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     async fn update(

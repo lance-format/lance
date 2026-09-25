@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::scalar::RowAddrTranslator;
+use lance_index::scalar::RowAddrTranslatorRef;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -252,6 +254,48 @@ impl Index for PQIndex {
     }
 }
 
+impl PQIndex {
+    /// The one remap implementation behind the legacy `remap` and
+    /// `remap_streaming`: this page's addresses are the unit of translation.
+    async fn remap_with(&mut self, mapping: RowAddrTranslatorRef<'_>) -> Result<()> {
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
+        // One page's addresses are the unit of translation.
+        let mapping = mapping
+            .resolve(self.row_ids.as_ref().unwrap().values().iter().copied())
+            .await?;
+        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let transposed_codes = self.code.as_ref().unwrap();
+        let remapped = row_ids
+            .enumerate()
+            .filter_map(|(vec_idx, old_row_id)| {
+                let new_row_id = mapping.get(*old_row_id);
+                // If the row id is not in the mapping then this row is not remapped and we keep as is
+                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
+                new_row_id.map(|new_row_id| {
+                    (
+                        new_row_id,
+                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+            remapped.iter().map(|(row_id, _)| *row_id),
+        )));
+
+        let pq_codes =
+            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+        let transposed_codes = transpose(
+            &pq_codes,
+            self.row_ids.as_ref().unwrap().len(),
+            self.pq.num_sub_vectors,
+        );
+        self.code = Some(Arc::new(transposed_codes));
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
@@ -466,42 +510,12 @@ impl VectorIndex for PQIndex {
         }
     }
 
-    async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
-        let num_vectors = self.row_ids.as_ref().unwrap().len();
-        // One page's addresses are the unit of translation.
-        let mapping = mapping
-            .resolve(self.row_ids.as_ref().unwrap().values().iter().copied())
-            .await?;
-        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
-        let transposed_codes = self.code.as_ref().unwrap();
-        let remapped = row_ids
-            .enumerate()
-            .filter_map(|(vec_idx, old_row_id)| {
-                let new_row_id = mapping.get(*old_row_id);
-                // If the row id is not in the mapping then this row is not remapped and we keep as is
-                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
-                new_row_id.map(|new_row_id| {
-                    (
-                        new_row_id,
-                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
+        self.remap_with(mapping.into()).await
+    }
 
-        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
-            remapped.iter().map(|(row_id, _)| *row_id),
-        )));
-
-        let pq_codes =
-            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
-        let transposed_codes = transpose(
-            &pq_codes,
-            self.row_ids.as_ref().unwrap().len(),
-            self.pq.num_sub_vectors,
-        );
-        self.code = Some(Arc::new(transposed_codes));
-        Ok(())
+    async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
+        self.remap_with(translator.as_ref()).await
     }
 
     fn ivf_model(&self) -> &IvfModel {

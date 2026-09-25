@@ -3,7 +3,7 @@
 
 use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 #[derive(Debug)]
 struct ControlledPostingReads {
@@ -1476,10 +1476,7 @@ async fn test_remap_to_empty_posting_list() {
     let mut builder = index.into_builder().await.unwrap();
 
     let mapping = HashMap::from([(0, None), (2, Some(3))]);
-    builder
-        .remap(&RowAddrTranslator::sync(RowAddrRemap::direct(mapping)))
-        .await
-        .unwrap();
+    builder.remap(&RowAddrRemap::direct(mapping)).await.unwrap();
 
     // after remap, the doc 0 is removed, and the doc 2 is updated to 3
     assert_eq!(builder.tokens.len(), 1);
@@ -1494,10 +1491,7 @@ async fn test_remap_to_empty_posting_list() {
 
     // remap to delete all docs
     let mapping = HashMap::from([(1, None), (3, None)]);
-    builder
-        .remap(&RowAddrTranslator::sync(RowAddrRemap::direct(mapping)))
-        .await
-        .unwrap();
+    builder.remap(&RowAddrRemap::direct(mapping)).await.unwrap();
 
     assert_eq!(builder.tokens.len(), 0);
     assert_eq!(builder.posting_lists.len(), 0);

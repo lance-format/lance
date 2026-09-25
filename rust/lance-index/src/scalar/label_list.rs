@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
@@ -200,6 +202,40 @@ impl LabelListIndex {
     }
 }
 
+impl LabelListIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
+        let mut writer = new_bitmap_batch_writer(
+            dest_store,
+            BITMAP_LOOKUP_NAME,
+            self.values_index.value_type(),
+        )
+        .await?;
+        writer
+            .add_global_buffer(
+                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+                serialize_list_nulls(&remapped_nulls)?,
+            )
+            .await?;
+        remap_index_map(&self.values_index, mapping, &mut writer).await?;
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
     #[instrument(skip_all, level = "debug")]
@@ -238,31 +274,18 @@ impl ScalarIndex for LabelListIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
-        let mut writer = new_bitmap_batch_writer(
-            dest_store,
-            BITMAP_LOOKUP_NAME,
-            self.values_index.value_type(),
-        )
-        .await?;
-        writer
-            .add_global_buffer(
-                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-                serialize_list_nulls(&remapped_nulls)?,
-            )
-            .await?;
-        remap_index_map(&self.values_index, mapping, &mut writer).await?;
-        let file = writer.finish().await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-                .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -1559,13 +1582,7 @@ mod tests {
         );
 
         let (_dest_dir, dest_store) = test_util::index_store();
-        index
-            .remap(
-                &RowAddrTranslator::sync(mapping.clone()),
-                dest_store.as_ref(),
-            )
-            .await
-            .unwrap();
+        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
         let after = read_index_contents(dest_store.as_ref()).await;
 
         let remapped = |addrs: &[u64]| -> Vec<u64> {
@@ -2043,13 +2060,7 @@ mod tests {
                 let (_dest_dir, dest_store) = test_util::index_store();
                 let mapping =
                     RowAddrRemap::direct((0..4u64).map(|addr| (addr, Some(addr))).collect());
-                index
-                    .remap(
-                        &RowAddrTranslator::sync(mapping.clone()),
-                        dest_store.as_ref(),
-                    )
-                    .await
-                    .unwrap();
+                index.remap(&mapping, dest_store.as_ref()).await.unwrap();
                 read_index_contents(dest_store.as_ref()).await
             }
             other => panic!("unknown path {other}"),

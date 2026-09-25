@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::RowAddrTranslator;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     fmt::{Debug, Formatter},
@@ -306,7 +307,14 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
 
-    async fn remap(&mut self, _mapping: &RowAddrTranslator) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        Err(Error::index(
+            "Remapping HNSW in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::index(
             "Remapping HNSW in this way not supported".to_string(),
         ))

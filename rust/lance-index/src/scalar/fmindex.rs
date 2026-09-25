@@ -20,6 +20,7 @@
 //!   - Row IDs and doc_start_positions in metadata
 //!   - File metadata: c_table, huffman_codes, tree topology
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1650,7 +1651,15 @@ impl ScalarIndex for FMIndexScalarIndex {
     fn can_remap(&self) -> bool {
         false
     }
-    async fn remap(&self, _: &RowAddrTranslator, _: &dyn IndexStore) -> Result<CreatedIndex> {
+    async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+        Err(Error::not_supported("Fm does not support remap"))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _: &RowAddrTranslator,
+        _: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(

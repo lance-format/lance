@@ -6,6 +6,8 @@
 //! prewarming, and the rebuilds that update, remap or merge segments.
 
 use super::*;
+use crate::scalar::RowAddrTranslatorRef;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use std::collections::VecDeque;
 
@@ -1232,6 +1234,26 @@ impl Index for MinHashLshIndex {
     }
 }
 
+impl MinHashLshIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let files = MinHashLshIndexBuilder::try_new(self.params.clone())?
+            .rebuild_from(
+                vec![self.signature_source(RowIdTransform::Remap(mapping))],
+                None,
+                dest_store,
+            )
+            .await?;
+        self.created_index(files)
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for MinHashLshIndex {
     async fn search(
@@ -1250,17 +1272,18 @@ impl ScalarIndex for MinHashLshIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let files = MinHashLshIndexBuilder::try_new(self.params.clone())?
-            .rebuild_from(
-                vec![self.signature_source(RowIdTransform::Remap(mapping))],
-                None,
-                dest_store,
-            )
-            .await?;
-        self.created_index(files)
+        self.remap_with(mapping.into(), dest_store).await
+    }
+
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     async fn update(

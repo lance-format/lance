@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
+use crate::scalar::RowAddrTranslatorRef;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
@@ -545,9 +546,31 @@ impl InvertedIndexBuilder {
         index_build.await
     }
 
+    /// Remap through an in-memory mapping (the legacy entry point).
     pub async fn remap(
         &mut self,
+        mapping: &RowAddrRemap,
+        src_store: Arc<dyn IndexStore>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.into(), src_store, dest_store).await
+    }
+
+    /// Remap through a translator whose payload may need reads, one
+    /// partition's documents at a time.
+    pub async fn remap_streaming(
+        &mut self,
         mapping: &RowAddrTranslator,
+        src_store: Arc<dyn IndexStore>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.as_ref(), src_store, dest_store)
+            .await
+    }
+
+    pub(crate) async fn remap_with(
+        &mut self,
+        mapping: RowAddrTranslatorRef<'_>,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
@@ -562,7 +585,7 @@ impl InvertedIndexBuilder {
             )
             .await?;
             let mut builder = part.into_builder().await?;
-            builder.remap(mapping).await?;
+            builder.remap_with(mapping).await?;
             files.extend(
                 builder
                     .write_to(dest_store, self.partition_write_target())
@@ -966,7 +989,17 @@ impl InnerBuilder {
         self.posting_lists = posting_lists;
     }
 
-    pub async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
+    /// Remap through an in-memory mapping (the legacy entry point).
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
+        self.remap_with(mapping.into()).await
+    }
+
+    /// Remap through a translator whose payload may need reads.
+    pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
+        self.remap_with(mapping.as_ref()).await
+    }
+
+    pub(crate) async fn remap_with(&mut self, mapping: RowAddrTranslatorRef<'_>) -> Result<()> {
         // One partition's documents are the unit of translation.
         let mapping = mapping.resolve(self.docs.row_ids().iter().copied()).await?;
         // for the docs, we need to remove the rows that are removed from the doc set,
@@ -1007,8 +1040,7 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
-        self.remap(&RowAddrTranslator::sync(RowAddrRemap::direct(mapping)))
-            .await
+        self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -5080,10 +5112,7 @@ mod tests {
         use crate::scalar::ScalarIndex;
         let mapping = HashMap::from([(0u64, Some(50 << 32))]);
         index
-            .remap(
-                &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
-                dest_store.as_ref(),
-            )
+            .remap(&RowAddrRemap::direct(mapping), dest_store.as_ref())
             .await
             .unwrap();
 

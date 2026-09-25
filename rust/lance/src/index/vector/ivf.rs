@@ -49,6 +49,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
@@ -1545,13 +1546,20 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, _mapping: &RowAddrTranslator) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
 
         // Currently, remapping for IVF is implemented in remap_index_file which
         // mirrors some of the other IVF routines like build_ivf_pq_index
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize: see `remap`.
         Err(Error::index(
             "Remapping IVF in this way not supported".to_string(),
         ))
@@ -2026,7 +2034,7 @@ impl RemapPageTask {
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping).await?;
+        page.remap_streaming(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2091,7 +2099,7 @@ where
     S: IvfSubIndex + 'static,
     Q: Quantization + 'static,
 {
-    Box::pin(async move { builder.remap(mapping).await })
+    Box::pin(async move { builder.remap_streaming(mapping).await })
 }
 
 #[allow(clippy::too_many_arguments)]

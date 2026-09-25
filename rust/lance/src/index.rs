@@ -1647,10 +1647,10 @@ pub(crate) async fn remap_index(
                         )
                         .await?
                     } else {
-                        scalar_index.remap(row_id_map, &new_store).await?
+                        scalar_index.remap_streaming(row_id_map, &new_store).await?
                     }
                 }
-                _ => scalar_index.remap(row_id_map, &new_store).await?,
+                _ => scalar_index.remap_streaming(row_id_map, &new_store).await?,
             }
         }
         it if it.is_vector() => {

@@ -4,7 +4,8 @@
 //! Vector Index
 //!
 
-use crate::scalar::RowAddrTranslator;
+use crate::scalar::{RowAddrTranslator, materialize_remap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use quantizer::{QuantizationType, Quantizer};
+use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
@@ -481,9 +483,44 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If an old row id is not in the mapping then it should be
     /// left alone.
     ///
-    /// Implementations translate their own row ids as one unit of work (a
-    /// page or a partition) through the translator.
-    async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<()>;
+    /// Legacy remapping API using an in-memory mapping. Retained for existing
+    /// callers and plugins; new tagged fragment reuse maintenance goes through
+    /// [`Self::remap_streaming`].
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
+
+    /// The fragments whose row addresses this index holds, or `None` when the
+    /// index cannot tell. Read only by the in-memory fallback of
+    /// [`Self::remap_streaming`], which maps every address of every listed
+    /// fragment explicitly and declines when the list is unknown; see
+    /// `ScalarIndex::stored_fragments` for the contract.
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        None
+    }
+
+    /// Remap the row ids through a translator whose payload may need reads.
+    ///
+    /// The default implementation hands a synchronous translator to
+    /// [`Self::remap`] as it is, and materializes a batch translator into a
+    /// complete in-memory mapping first (`materialize_remap`, bounded by the
+    /// translator's budget and requiring [`Self::stored_fragments`]), then
+    /// calls [`Self::remap`] once. It declines with a
+    /// [`RemapUnavailable`](crate::scalar::RemapUnavailable) when it cannot
+    /// prove a complete mapping within budget. Built-in indices translate one
+    /// unit of work at a time instead.
+    async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
+        match translator {
+            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref()).await,
+            RowAddrTranslator::Batch(remapper) => {
+                let mapping =
+                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
+                self.remap(&mapping).await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::not_supported(
+                "this build does not know how to translate through this row address translator",
+            )),
+        }
+    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

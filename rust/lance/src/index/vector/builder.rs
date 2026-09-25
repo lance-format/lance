@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -529,7 +530,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    pub async fn remap(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
+    /// Remap through an in-memory mapping (the legacy entry point). The
+    /// per-partition tasks are `'static`, so the map is shared through an
+    /// owned translator (the same clone this method always made).
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()))
+            .await
+    }
+
+    /// Remap through a translator whose payload may need reads, one
+    /// partition's addresses at a time.
+    pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.clone()).await
+    }
+
+    async fn remap_with(&mut self, mapping: RowAddrTranslator) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -541,7 +556,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
-        let mapping = mapping.clone();
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();

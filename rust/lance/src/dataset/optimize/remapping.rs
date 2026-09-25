@@ -18,7 +18,9 @@ use lance_core::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
-use lance_index::scalar::{BatchRowIdRemapper, RowAddrTranslator};
+use lance_index::scalar::{
+    BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable, RowAddrTranslator,
+};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
@@ -638,6 +640,13 @@ struct PlannedHopRemapper {
     steps: Vec<HopStep>,
     admitted: RoaringBitmap,
     claimed: RoaringBitmap,
+    /// Physical row counts of every fragment the history or the manifest
+    /// knows (live fragments from the manifest, retired and produced ones
+    /// from the transitions' digests): what an index whose `remap` predates
+    /// batch translation needs to enumerate the addresses it stores.
+    fragment_rows: HashMap<u32, u64>,
+    /// What that index's in-memory fallback may allocate.
+    materialization_budget_bytes: u64,
 }
 
 impl std::fmt::Debug for PlannedHopRemapper {
@@ -650,6 +659,14 @@ impl std::fmt::Debug for PlannedHopRemapper {
 
 #[async_trait]
 impl BatchRowIdRemapper for PlannedHopRemapper {
+    fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
+        self.fragment_rows.get(&fragment).copied()
+    }
+
+    fn materialization_budget_bytes(&self) -> u64 {
+        self.materialization_budget_bytes
+    }
+
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
         let mut current: Vec<Option<u64>> = row_ids
             .iter()
@@ -739,7 +756,35 @@ async fn materialize_hops(
         steps,
         admitted,
         claimed,
+        fragment_rows: known_fragment_rows(dataset, ledger),
+        materialization_budget_bytes: DEFAULT_MATERIALIZATION_BUDGET_BYTES,
     })))
+}
+
+/// The physical row count of every fragment the manifest or the history
+/// knows: live fragments from the manifest, retired sources and produced
+/// destinations from the transitions' digests. A digest records the count
+/// at the transition, which is the physical size the fragment keeps.
+fn known_fragment_rows(dataset: &Dataset, ledger: &FragReuseLedger) -> HashMap<u32, u64> {
+    let mut rows = HashMap::new();
+    for transition in ledger.transitions() {
+        for digest in transition
+            .sources()
+            .iter()
+            .chain(transition.destinations().iter())
+        {
+            if let Ok(id) = u32::try_from(digest.id) {
+                rows.insert(id, digest.physical_rows);
+            }
+        }
+    }
+    for fragment in dataset.fragments().iter() {
+        if let (Ok(id), Some(physical_rows)) = (u32::try_from(fragment.id), fragment.physical_rows)
+        {
+            rows.insert(id, physical_rows as u64);
+        }
+    }
+    rows
 }
 
 /// Remap one segment of a user index through a tagged history's
@@ -897,7 +942,27 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // is dropped.
         let translator =
             materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
-        index::remap_index(dataset, index_id, &translator).await?
+        match index::remap_index(dataset, index_id, &translator).await {
+            Ok(result) => result,
+            // The index only knows the legacy in-memory remap and this build
+            // cannot prepare a complete mapping for it within budget: not an
+            // error in the index or the history. The segment stays as it is,
+            // with the history it translates through, and the rest of the
+            // maintenance proceeds. Any other error (I/O, corrupt data, a
+            // translation failure) propagates and nothing is published.
+            Err(error) => match RemapUnavailable::from_error(&error) {
+                Some(reason) => {
+                    log::info!(
+                        "Skipping remap of index {} ({}): {reason}. The segment keeps translating \
+                         through the reuse index; rebuild the index to catch it up",
+                        curr_index_meta.name,
+                        curr_index_meta.uuid
+                    );
+                    return Ok(());
+                }
+                None => return Err(error),
+            },
+        }
     };
 
     let new_index_meta = match remap_result {
@@ -1511,6 +1576,8 @@ mod tests {
                 ],
                 admitted: RoaringBitmap::from_iter([0u32, 9]),
                 claimed: RoaringBitmap::from_iter(0u32..10),
+                fragment_rows: HashMap::new(),
+                materialization_budget_bytes: DEFAULT_MATERIALIZATION_BUDGET_BYTES,
             };
             let input = vec![addr(0, 0), addr(0, 1), addr(9, 5), addr(0, 0), addr(0, 2)];
             let output = remapper.remap_row_ids(&input).await.unwrap();
@@ -1545,6 +1612,8 @@ mod tests {
                 steps: vec![partition_hop(&[2], &sp)],
                 admitted: RoaringBitmap::from_iter([2u32, 4, 7, 8]),
                 claimed: RoaringBitmap::from_iter([4u32, 7]),
+                fragment_rows: HashMap::new(),
+                materialization_budget_bytes: DEFAULT_MATERIALIZATION_BUDGET_BYTES,
             };
             let input = vec![
                 addr(2, 1),
@@ -1580,6 +1649,8 @@ mod tests {
                 steps: vec![partition_hop(&[1], &sp)],
                 admitted: RoaringBitmap::from_iter([1u32]),
                 claimed: RoaringBitmap::from_iter([3u32]),
+                fragment_rows: HashMap::new(),
+                materialization_budget_bytes: DEFAULT_MATERIALIZATION_BUDGET_BYTES,
             }));
             assert!(!translator.is_empty());
             let input: Vec<u64> = (0..ROWS).map(|i| addr(1, i)).collect();

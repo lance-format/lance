@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_roaring_tree_map_async};
 use std::any::Any;
@@ -390,7 +392,7 @@ impl NGramIndex {
     async fn remap_state(
         &self,
         state: NGramIndexSpillState,
-        mapping: &RowAddrTranslator,
+        mapping: RowAddrTranslatorRef<'_>,
     ) -> Result<Vec<RecordBatch>> {
         // A spill batch is bounded in serialized bytes, not in cardinality: a
         // common n-gram in a large full-coverage index decodes into millions
@@ -399,7 +401,7 @@ impl NGramIndex {
         // storage is bounded by the slice, never by the posting.
         const TRANSLATION_SLICE: usize = 64 * 1024;
         async fn translate_slice(
-            mapping: &RowAddrTranslator,
+            mapping: RowAddrTranslatorRef<'_>,
             slice: &mut Vec<u64>,
             translated: &mut RoaringTreemap,
         ) -> Result<()> {
@@ -567,6 +569,38 @@ impl Index for NGramIndex {
     }
 }
 
+impl NGramIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let reader = self.store.open_index_file(POSTINGS_FILENAME).await?;
+        let mut writer = dest_store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await?;
+
+        let mut spill_stream =
+            NGramIndexBuilder::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?;
+        while let Some(state) = spill_stream.try_next().await? {
+            for batch in self.remap_state(state, mapping).await? {
+                writer.write_record_batch(batch).await?;
+            }
+        }
+
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
+            index_version: NGRAM_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for NGramIndex {
     async fn search(
@@ -669,29 +703,18 @@ impl ScalarIndex for NGramIndex {
 
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let reader = self.store.open_index_file(POSTINGS_FILENAME).await?;
-        let mut writer = dest_store
-            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
-            .await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        let mut spill_stream =
-            NGramIndexBuilder::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?;
-        while let Some(state) = spill_stream.try_next().await? {
-            for batch in self.remap_state(state, mapping).await? {
-                writer.write_record_batch(batch).await?;
-            }
-        }
-
-        let file = writer.finish().await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
-            index_version: NGRAM_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     async fn update(
@@ -2387,10 +2410,7 @@ mod tests {
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index
-            .remap(
-                &RowAddrTranslator::sync(RowAddrRemap::direct(remapping)),
-                test_store.as_ref(),
-            )
+            .remap(&RowAddrRemap::direct(remapping), test_store.as_ref())
             .await
             .unwrap();
 
@@ -2453,7 +2473,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         index
-            .remap(
+            .remap_streaming(
                 &RowAddrTranslator::Batch(recording.clone()),
                 test_store.as_ref(),
             )
@@ -2516,10 +2536,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index
-            .remap(&RowAddrTranslator::sync(remap.clone()), test_store.as_ref())
-            .await
-            .unwrap();
+        index.remap(&remap, test_store.as_ref()).await.unwrap();
 
         let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
@@ -754,6 +755,29 @@ impl Index for BitmapIndex {
     }
 }
 
+impl BitmapIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let mut writer =
+            new_bitmap_batch_writer(dest_store, BITMAP_LOOKUP_NAME, &self.value_type).await?;
+        remap_index_map(self, mapping, &mut writer).await?;
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
+                .unwrap(),
+            index_version: BITMAP_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
     #[instrument(name = "bitmap_search", level = "debug", skip_all)]
@@ -921,20 +945,18 @@ impl ScalarIndex for BitmapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &RowAddrTranslator,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let mut writer =
-            new_bitmap_batch_writer(dest_store, BITMAP_LOOKUP_NAME, &self.value_type).await?;
-        remap_index_map(self, mapping, &mut writer).await?;
-        let file = writer.finish().await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
-                .unwrap(),
-            index_version: BITMAP_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -1751,7 +1773,7 @@ pub(crate) async fn build_index_map(
 /// row per source key.
 pub(crate) async fn remap_index_map(
     index: &BitmapIndex,
-    mapping: &RowAddrTranslator,
+    mapping: RowAddrTranslatorRef<'_>,
     writer: &mut BitmapBatchWriter,
 ) -> Result<()> {
     if !index.null_map.is_empty() {
@@ -1784,13 +1806,17 @@ pub(crate) async fn remap_index_map(
 /// map, so one posting list is the unit of work here.
 pub(crate) async fn remap_row_addrs_with(
     bitmap: &RowAddrTreeMap,
-    translator: &RowAddrTranslator,
+    translator: RowAddrTranslatorRef<'_>,
 ) -> Result<RowAddrTreeMap> {
     match translator {
-        RowAddrTranslator::Sync(mapping) => remap_row_addrs(bitmap, mapping),
-        RowAddrTranslator::Batch(remapper) => {
-            remap_row_addrs_tree_map_async(remapper.as_ref(), bitmap).await
+        RowAddrTranslatorRef::Sync(mapping) => remap_row_addrs(bitmap, mapping),
+        RowAddrTranslatorRef::Batch(remapper) => {
+            remap_row_addrs_tree_map_async(remapper, bitmap).await
         }
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::not_supported(
+            "this build does not know how to translate through this row address translator",
+        )),
     }
 }
 
@@ -3062,10 +3088,7 @@ mod tests {
         assert!(!index.null_map.is_empty()); // Should have null values
 
         // Perform remap
-        index
-            .remap(&RowAddrTranslator::sync(remap.clone()), test_store.as_ref())
-            .await
-            .unwrap();
+        index.remap(&remap, test_store.as_ref()).await.unwrap();
 
         // Reload and check
         let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
@@ -3192,13 +3215,7 @@ mod tests {
         ]));
 
         let (_dest_dir, dest_store) = test_util::index_store();
-        index
-            .remap(
-                &RowAddrTranslator::sync(mapping.clone()),
-                dest_store.as_ref(),
-            )
-            .await
-            .unwrap();
+        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
 
         // Read in file order, so this pins the emitted order as well as the
         // contents: the null key first, then keys ascending. The old path wrote
@@ -3227,6 +3244,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reloaded.index_map.len(), 3);
+    }
+
+    /// A built-in index streams through a batch translator itself: it never
+    /// asks the translator for fragment sizes or a budget (the in-memory
+    /// fallback of `remap_streaming` is for indices that only implement the
+    /// legacy `remap`), and it writes what the legacy `remap` writes for the
+    /// same translation.
+    #[tokio::test]
+    async fn test_bitmap_remap_streaming_never_enters_the_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Fragment 1 rows move to fragment 3 (offset 1 deleted); fragment 2
+        /// is dropped whole.
+        #[derive(Debug)]
+        struct Hops {
+            translations: AtomicUsize,
+            sizings: AtomicUsize,
+        }
+        #[async_trait]
+        impl BatchRowIdRemapper for Hops {
+            async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
+                self.translations.fetch_add(1, Ordering::Relaxed);
+                Ok(ids
+                    .iter()
+                    .map(|&address| {
+                        let address = RowAddress::from(address);
+                        match (address.fragment_id(), address.row_offset()) {
+                            (1, 1) => None,
+                            (1, offset) => Some(RowAddress::new_from_parts(3, offset).into()),
+                            _ => None,
+                        }
+                    })
+                    .collect())
+            }
+            fn fragment_physical_rows(&self, _: u32) -> Option<u64> {
+                self.sizings.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            fn materialization_budget_bytes(&self) -> u64 {
+                0
+            }
+        }
+
+        let addrs: Vec<u64> = [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1)]
+            .into_iter()
+            .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
+            .collect();
+        let values = [Some("a"), Some("a"), None, Some("b"), Some("a")];
+        let (_src_dir, src_store) = test_util::index_store();
+        BitmapIndexPlugin::train_bitmap_index(
+            utf8_value_stream(values, addrs.clone()),
+            src_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let index = BitmapIndex::load(src_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let hops = Arc::new(Hops {
+            translations: AtomicUsize::new(0),
+            sizings: AtomicUsize::new(0),
+        });
+        let (_streamed_dir, streamed_store) = test_util::index_store();
+        index
+            .remap_streaming(
+                &RowAddrTranslator::Batch(hops.clone()),
+                streamed_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hops.sizings.load(Ordering::Relaxed), 0, "no fallback");
+        assert!(hops.translations.load(Ordering::Relaxed) > 0);
+
+        let legacy = RowAddrRemap::direct(HashMap::from([
+            (addrs[0], Some(RowAddress::new_from_parts(3, 0).into())),
+            (addrs[1], None),
+            (addrs[2], Some(RowAddress::new_from_parts(3, 2).into())),
+            (addrs[3], None),
+            (addrs[4], None),
+        ]));
+        let (_legacy_dir, legacy_store) = test_util::index_store();
+        index.remap(&legacy, legacy_store.as_ref()).await.unwrap();
+
+        async fn written(store: &dyn IndexStore) -> Vec<(Option<String>, Vec<u64>)> {
+            test_util::read_key_bitmaps(store, BITMAP_LOOKUP_NAME)
+                .await
+                .into_iter()
+                .map(|(key, bitmap)| (key, test_util::row_addrs(&bitmap)))
+                .collect()
+        }
+        let streamed = written(streamed_store.as_ref()).await;
+        assert_eq!(streamed, written(legacy_store.as_ref()).await);
+        let frag_3 =
+            |offset: u32| -> Vec<u64> { vec![RowAddress::new_from_parts(3, offset).into()] };
+        assert_eq!(
+            streamed,
+            vec![
+                (None, frag_3(2)),
+                (Some("a".to_string()), frag_3(0)),
+                (Some("b".to_string()), Vec::new()),
+            ]
+        );
     }
 
     #[tokio::test]

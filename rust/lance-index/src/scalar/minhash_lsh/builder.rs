@@ -5,6 +5,7 @@
 //! `signatures.lance`, and sorting the (band key, doc id) records into
 //! `bands.lance` with an external sort that spills to local temporary files.
 
+use crate::scalar::RowAddrTranslatorRef;
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
@@ -80,7 +81,7 @@ pub(super) enum RowIdTransform<'a> {
     /// Keep only the rows the filter selects.
     Filter(&'a OldIndexDataFilter),
     /// Rewrite row ids through the translator, dropping rows it deletes.
-    Remap(&'a RowAddrTranslator),
+    Remap(RowAddrTranslatorRef<'a>),
 }
 
 impl RowIdTransform<'_> {
