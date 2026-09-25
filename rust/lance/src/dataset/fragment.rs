@@ -52,7 +52,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, Fragment, RowDatasetVersionMeta};
+use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
@@ -65,7 +65,7 @@ use roaring::RoaringBitmap;
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
-use super::rowids::load_row_id_sequence;
+use super::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use super::scanner::Scanner;
 
 use super::updater::Updater;
@@ -1155,33 +1155,44 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
-        // The reader builders below decode version sequences from the manifest
-        // and fall back to version 1 when they cannot; a spilled sequence must
-        // not fall through to that.
-        for (wanted, meta) in [
-            (
-                read_config.with_row_created_at_version,
-                &self.metadata.created_at_version_meta,
-            ),
-            (
-                read_config.with_row_last_updated_at_version,
-                &self.metadata.last_updated_at_version_meta,
-            ),
-        ] {
-            if wanted && matches!(meta, Some(RowDatasetVersionMeta::Column)) {
-                return Err(Error::not_supported(format!(
-                    "row versions of fragment {} are spilled to a data file column, which \
-                     this build cannot read",
-                    self.id()
-                )));
+        let version_load = |kind: RowVersionKind, wanted: bool| {
+            if wanted {
+                futures::future::Either::Left(load_row_version_sequence(
+                    &self.dataset,
+                    &self.metadata,
+                    kind,
+                ))
+            } else {
+                futures::future::Either::Right(futures::future::ready(Ok(None)))
             }
-        }
+        };
+        let last_updated_at_load = version_load(
+            RowVersionKind::LastUpdatedAt,
+            read_config.with_row_last_updated_at_version,
+        );
+        let created_at_load = version_load(
+            RowVersionKind::CreatedAt,
+            read_config.with_row_created_at_version,
+        );
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
+        let (
+            opened_files,
+            deletion_vec,
+            row_id_sequence,
+            last_updated_at_sequence,
+            created_at_sequence,
+        ) = join!(
+            open_files,
+            deletion_vec_load,
+            row_id_load,
+            last_updated_at_load,
+            created_at_load
+        );
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
+        let last_updated_at_sequence = last_updated_at_sequence?;
+        let created_at_sequence = created_at_sequence?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -1224,10 +1235,10 @@ impl FileFragment {
             reader.with_row_address();
         }
         if read_config.with_row_last_updated_at_version {
-            reader.with_row_last_updated_at_version();
+            reader.with_row_last_updated_at_version(last_updated_at_sequence);
         }
         if read_config.with_row_created_at_version {
-            reader.with_row_created_at_version();
+            reader.with_row_created_at_version(created_at_sequence);
         }
 
         Ok(reader)
@@ -1793,7 +1804,15 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
-        let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+        // A file holding only row lineage columns has no dataset field to open
+        // it by; its length is checked against `physical_rows` when the
+        // sequences it carries are validated.
+        let user_data_files = self
+            .metadata
+            .files
+            .iter()
+            .filter(|data_file| data_file.fields.iter().any(|field| *field >= 0));
+        let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
@@ -1814,7 +1833,7 @@ impl FileFragment {
 
         let get_lengths = get_lengths?;
         let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
+        for (length, data_file) in get_lengths.iter().zip(user_data_files) {
             if length != expected_length {
                 let path = self
                     .dataset
@@ -3447,17 +3466,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_last_updated_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_last_updated_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_last_updated_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.last_updated_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.last_updated_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.last_updated_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -3468,17 +3485,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_created_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_created_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_created_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.created_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.created_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.created_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self

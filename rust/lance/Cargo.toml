@@ -34,6 +34,7 @@ lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-bitpacking = { workspace = true }
+blake3 = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }

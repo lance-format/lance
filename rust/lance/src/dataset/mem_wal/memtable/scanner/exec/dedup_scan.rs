@@ -36,6 +36,7 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -247,8 +248,21 @@ impl ExecutionPlan for MemTableDedupScanExec {
                 vec![]
             };
 
+            let emitted_schema = emitted.schema();
             let mut columns: Vec<Arc<dyn Array>> = if let Some(ref indices) = projection {
-                indices.iter().map(|&i| emitted.column(i).clone()).collect()
+                match take_projected_columns(
+                    emitted.columns(),
+                    emitted_schema.fields(),
+                    indices,
+                    schema.as_ref(),
+                    emitted.num_rows(),
+                ) {
+                    Ok(cols) => cols,
+                    Err(e) => {
+                        out.push(Err(e));
+                        continue;
+                    }
+                }
             } else {
                 emitted.columns().to_vec()
             };

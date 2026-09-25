@@ -278,16 +278,16 @@ fn unpack_group(ex_bits: u8, group_codes: &[u8], out: &mut [u8; 64]) {
     }
 }
 
-/// Decode a validated blocked row for index-side vector reconstruction.
-pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize) -> Vec<u8> {
-    let mut values = Vec::with_capacity(padded_query_len(dim));
+/// Decode a validated blocked row into per-dim values, reusing `values`.
+pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize, values: &mut Vec<u8>) {
+    values.clear();
+    values.reserve(padded_query_len(dim));
     let mut group = [0; EX_DOT_BLOCK_DIMS];
     for codes in codes.chunks_exact(group_bytes(ex_bits)) {
         unpack_group(ex_bits, codes, &mut group);
         values.extend_from_slice(&group[..group_dims(ex_bits)]);
     }
     values.truncate(dim);
-    values
 }
 
 /// `sum_d query[d] * code[d]` for one row of blocked-layout codes.
@@ -999,7 +999,9 @@ mod tests {
             .map(|_| rng.random_range(0..=max_code))
             .collect::<Vec<_>>();
         let codes = kernel_codes(&values, EX_DOT_BLOCK_DIMS, ex_bits);
-        assert_eq!(unpack_blocked_row(&codes, ex_bits, values.len()), values);
+        let mut unpacked_row = vec![u8::MAX; 3];
+        unpack_blocked_row(&codes, ex_bits, values.len(), &mut unpacked_row);
+        assert_eq!(unpacked_row, values);
 
         // Unpacking each kernel group must reproduce the values in natural
         // dim order.

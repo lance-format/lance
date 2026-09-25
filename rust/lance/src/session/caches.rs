@@ -19,7 +19,9 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DataFile, DeletionFile, DeletionFileType, Manifest, RowIdMeta},
+    format::{
+        DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
+    },
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -299,6 +301,45 @@ impl CacheKey for RowIdSequenceKey<'_> {
                 }
             }
         }
+    }
+}
+
+/// Cache key for one of a fragment's per-row version sequences that is spilled
+/// to a data file column.
+///
+/// Inline sequences are not cached: they decode straight from the manifest
+/// bytes the fragment already holds.
+#[derive(Debug)]
+pub struct RowVersionSequenceKey<'a> {
+    pub fragment_id: u64,
+    /// Which sequence this is, by the reserved field id of its column.
+    pub field_id: i32,
+    /// The data file carrying the column, named freshly per rewrite, so its
+    /// path identifies the contents the way an inline sequence's digest does.
+    pub data_file: &'a DataFile,
+}
+
+impl CacheKey for RowVersionSequenceKey<'_> {
+    type ValueType = RowDatasetVersionSequence;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_version_sequence/{}/{}",
+            self.fragment_id, self.field_id
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowDatasetVersionSequence"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-version-sequence-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.field_id as u64);
+        builder.write_str(&self.data_file.path);
+        builder.write_u64(self.data_file.base_id.map_or(u64::MAX, u64::from));
     }
 }
 

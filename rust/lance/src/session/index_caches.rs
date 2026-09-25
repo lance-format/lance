@@ -176,6 +176,14 @@ impl CacheKey for IndexMetadataKey<'_> {
 /// (`version`), or any index add/replace (which commits a new manifest and bumps
 /// `version`/`e_tag`) yields a different key, so a stale derived listing is never
 /// reused.
+///
+/// This cache is MEMORY-ONLY (no `codec`): the derived listing depends on the
+/// READER's translation capability, not only on the snapshot. Different builds
+/// admit different segments for the same snapshot (a build that cannot translate
+/// a segment excludes it; one that can includes it), so a persisted entry
+/// reused across builds could serve a listing the current reader must not use.
+/// Snapshot identity does not capture reader capability, so we never persist
+/// this value; it is cheap to recompute per process.
 #[derive(Clone, Copy, Debug)]
 pub struct DerivedIndexListingKey<'a> {
     pub version: u64,
@@ -216,9 +224,8 @@ impl CacheKey for DerivedIndexListingKey<'_> {
         }
     }
 
-    fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_table::format::index_metadata_codec())
-    }
+    // No `codec`: memory-only. See the type doc: the derived listing is
+    // reader-capability dependent and must not be persisted across builds.
 }
 
 pub struct ProstAny(pub Arc<prost_types::Any>);

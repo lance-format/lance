@@ -1565,6 +1565,28 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Projection by a (possibly partial) schema.
+    ///
+    /// Unlike [`Self::project`], which routes through expressions, this can
+    /// select *part* of a nested field — `meta` narrowed to just its `a` child.
+    /// Expressions cannot express that, so a nested projection must come
+    /// through here.
+    pub(crate) fn project_with_schema(
+        &mut self,
+        projection: &lance_core::datatypes::Schema,
+    ) -> Result<&mut Self> {
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_schema(self.dataset.clone(), projection)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
+        self.apply_blob_handling();
+        Ok(self)
+    }
+
     /// Should the filter run before the vector index is applied
     ///
     /// If true then the filter will be applied before the vector index.  This
@@ -5680,7 +5702,7 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        let index_and_segments = if use_index {
+        let mut index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
                     requested_segments.iter().copied().collect::<HashSet<_>>();
@@ -5817,6 +5839,31 @@ impl Scanner {
         } else {
             None
         };
+
+        // Explicit segment selection may remove a contributor to FRI-derived coverage.
+        // When fragments are requested, they must still be searched completely.
+        // Segment-only search intentionally permits partial results and is unchanged.
+        if self.index_segments.is_some()
+            && self.fragments.is_some()
+            && indices
+                .iter()
+                .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+            && let Some((name, segments, _)) = &index_and_segments
+        {
+            let selected: HashSet<_> = segments.iter().map(|segment| segment.uuid).collect();
+            let covered = self.get_indexed_frags(segments);
+            let missing_contributor = indices.iter().any(|index| {
+                index.name == *name
+                    && !selected.contains(&index.uuid)
+                    && index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| !bitmap.is_disjoint(&covered))
+            });
+            if missing_contributor {
+                index_and_segments = None;
+            }
+        }
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
             if self.is_batch_nearest {
@@ -7704,7 +7751,7 @@ pub mod test_dataset {
     use uuid::Uuid;
 
     use crate::dataset::WriteParams;
-    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::{StageParams, VectorIndexParams};
 
     // Creates a dataset with 5 batches where each batch has 80 rows
     //
@@ -7803,7 +7850,13 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
+            let mut params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
+            // Two partitions over 400 vectors only holds at a sample rate this
+            // fixture can cover: the trained count is capped at the vectors
+            // available per centroid.
+            if let Some(StageParams::Ivf(ivf)) = params.stages.first_mut() {
+                ivf.sample_rate = 200;
+            }
             self.dataset
                 .create_index(
                     &["vec"],
@@ -12850,10 +12903,16 @@ mod test {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
+        const PARTITIONS: usize = 4;
+        // A partition is trained only when the data can give it a codebook's
+        // worth of vectors, so the fixture has to cover every partition it asks
+        // for; the cached-entry count below counts per partition.
+        const ROWS: usize = PARTITIONS * 256;
+
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(PARTITIONS, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
             use lance_arrow::FixedSizeListArrayExt;
@@ -12876,14 +12935,14 @@ mod test {
 
             // vectors are [1, 1, 1, ...] [2, 2, 2, ...]
             let vector_values: Float32Array =
-                (0..32 * 512).map(|v| (v / 32) as f32 + 1.0).collect();
+                (0..32 * ROWS).map(|v| (v / 32) as f32 + 1.0).collect();
             let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
 
             let batches = vec![
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from_iter_values(0..512)),
+                        Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
                         Arc::new(vectors.clone()),
                     ],
                 )
@@ -12985,7 +13044,7 @@ mod test {
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from_iter_values(512..1024)),
+                        Arc::new(Int32Array::from_iter_values(ROWS as i32..2 * ROWS as i32)),
                         Arc::new(vectors),
                     ],
                 )
@@ -13015,7 +13074,7 @@ mod test {
                 .await
                 .unwrap();
 
-            dataset.delete("i < 512").await.unwrap();
+            dataset.delete(&format!("i < {ROWS}")).await.unwrap();
 
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
@@ -13034,7 +13093,9 @@ mod test {
             let batch = &results[0];
 
             // It should not pick up any results from the first fragment
-            let expected_i = BTreeSet::from_iter(vec![512, 513, 514, 515, 516]);
+            let first = ROWS as i32;
+            let expected_i =
+                BTreeSet::from_iter(vec![first, first + 1, first + 2, first + 3, first + 4]);
             let column_i = batch.column_by_name("i").unwrap();
             let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
                 .values()
