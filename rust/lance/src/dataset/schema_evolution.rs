@@ -22,6 +22,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::Expr;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
@@ -239,6 +240,11 @@ pub(super) async fn add_columns_to_fragments(
     fragments: &[FileFragment],
     batch_size: Option<u32>,
 ) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool)> {
+    // Every add_columns route reaches here -- the dataset's and the one a caller
+    // drives a fragment at a time -- so the MemWAL rule is checked once, here.
+    let only_nulls = adds_only_nulls(dataset, &transforms)?;
+    reject_partial_add_on_mem_wal(dataset, only_nulls).await?;
+
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_format();
@@ -515,6 +521,58 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
              not there to be checked. Drop the MemWAL first."
         }
     }))
+}
+
+/// Whether `transforms` gives every row the same null.
+///
+/// The value is computed over the committed fragments, and a row still in the
+/// MemWAL is not among them: it takes a null when it merges down. A transform
+/// that writes nulls everywhere agrees with that. One that writes anything else
+/// leaves rows of the same age holding different values, and no later pass
+/// corrects it.
+///
+/// An expression qualifies only by folding to a null literal. Folding to a
+/// literal at all is what proves it reads no column and is not volatile; a
+/// non-null one is a value the WAL's rows would not get.
+fn adds_only_nulls(dataset: &Dataset, transforms: &NewColumnTransform) -> Result<bool> {
+    match transforms {
+        NewColumnTransform::AllNulls(_) => Ok(true),
+        NewColumnTransform::SqlExpressions(expressions) => {
+            let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+            for (_, expression) in expressions {
+                let expr = planner.optimize_expr(planner.parse_expr(expression)?)?;
+                if !matches!(&expr, Expr::Literal(value, _) if value.is_null()) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Refuse an `add_columns` that would leave the MemWAL's rows behind.
+///
+/// A table without a MemWAL is unaffected: its presence is the only thing this
+/// looks at. Having drained the WAL first is not an exemption, because nothing
+/// here can see that: the sealed generations are in the manifest but the active
+/// memtable is in its writer's memory. Drop the MemWAL to add a computed column.
+///
+/// Takes the decision already made rather than the transform: a reference to it
+/// held across the await would have to be `Sync`, which its boxed reader is not.
+async fn reject_partial_add_on_mem_wal(dataset: &Dataset, only_nulls: bool) -> Result<()> {
+    if only_nulls {
+        return Ok(());
+    }
+    if dataset.mem_wal_index_details().await?.is_none() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(
+        "cannot add a column with a computed value to a table with a MemWAL attached: the \
+         value is computed over the base table, and rows still in the WAL are not there to be \
+         computed, so they would keep a null the base table's rows do not have. Add the column \
+         as all-nulls and backfill it, or drop the MemWAL first.",
+    ))
 }
 
 async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
@@ -1232,6 +1290,131 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+
+    /// What the `add_columns` guard refuses, and what it lets through.
+    ///
+    /// Only a value that is null for every row is allowed: the WAL's rows are
+    /// not there to be computed and take a null when they merge down, so
+    /// anything else would leave them differing from the base table's rows.
+    /// Folding decides it — an expression that reads a column or is volatile
+    /// does not fold, and one that folds to a non-null literal is a value the
+    /// WAL's rows would not get.
+    #[tokio::test]
+    async fn add_columns_on_a_mem_wal_table_allows_only_an_always_null_value() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+
+        // (expression, allowed, what the case is)
+        let cases: &[(&str, bool, &str)] = &[
+            ("cast(NULL as bigint)", true, "a typed null"),
+            (
+                "cast(cast(NULL as int) as bigint)",
+                true,
+                "nested casts still fold to a null",
+            ),
+            ("NULL + 1", true, "arithmetic over a null folds to a null"),
+            (
+                "cast(true as boolean)",
+                false,
+                "a non-null constant: the base table's rows would get `true` and \
+                 the WAL's rows a null",
+            ),
+            ("coalesce(NULL, 5)", false, "reads as null but folds to 5"),
+            ("NULL IS NULL", false, "reads as null but folds to true"),
+            ("value * 2", false, "reads a column, so it is per-row"),
+            ("random()", false, "volatile, so it does not fold"),
+            ("now()", false, "folds, but to a non-null timestamp"),
+        ];
+
+        for (expression, allowed, case) in cases {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int64, false),
+                ArrowField::new("value", DataType::Int64, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64])),
+                    Arc::new(Int64Array::from(vec![Some(10i64)])),
+                ],
+            )
+            .unwrap();
+            let uri = format!("memory://mem_wal_add_guard_{}", uuid::Uuid::new_v4());
+            let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+            let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap();
+            dataset
+                .initialize_mem_wal()
+                .unsharded()
+                .execute()
+                .await
+                .unwrap();
+
+            let result = dataset
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".into(),
+                        (*expression).to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await;
+
+            if *allowed {
+                result.unwrap_or_else(|e| panic!("`{expression}` ({case}) must be allowed: {e}"));
+            } else {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("`{expression}` ({case}) must be refused"));
+                assert!(
+                    err.to_string()
+                        .contains("cannot add a column with a computed value"),
+                    "`{expression}` ({case}) refused for the wrong reason: {err}"
+                );
+            }
+        }
+    }
+
+    /// The guard reads nothing but the MemWAL's presence: every expression it
+    /// refuses above is still allowed on a table without one.
+    #[tokio::test]
+    async fn add_columns_without_a_mem_wal_is_untouched_by_the_guard() {
+        use arrow_array::Int64Array;
+
+        for expression in ["cast(true as boolean)", "coalesce(NULL, 5)", "value * 2"] {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int64, false),
+                ArrowField::new("value", DataType::Int64, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64])),
+                    Arc::new(Int64Array::from(vec![Some(10i64)])),
+                ],
+            )
+            .unwrap();
+            let uri = format!("memory://no_mem_wal_add_{}", uuid::Uuid::new_v4());
+            let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+            let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap();
+
+            dataset
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".into(),
+                        expression.to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("`{expression}` must be unaffected: {e}"));
+        }
+    }
 
     /// What the MemWAL guard refuses, and what it lets through.
     ///
