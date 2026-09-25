@@ -581,9 +581,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         });
 
-        // Heap-pin the merge stage: at opt-level 0 its state machine is the bulk of
-        // this future, and this future is embedded in every caller up to
-        // `compact_files` (see `remap_boxed` in ivf.rs).
+        // `merge_partitions` is the bulk of this future; `remap_streaming`/`remap`
+        // and the 11-arm v3 dispatch (`remap_index_file_v3`) each carry a copy
+        // otherwise. The eager compaction remap polls that chain under Python's
+        // `block_on` on the calling thread, which overflowed the Windows
+        // main-thread stack in CI (dev-profile wheel, opt-level 0, where every
+        // awaited future is also a separate stack temporary of its caller).
         let files = Box::pin(
             self.merge_partitions(
                 stream::iter(build_iter)
