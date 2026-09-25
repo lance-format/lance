@@ -396,6 +396,9 @@ pub struct MemWalIndexDetails {
     pub inline_snapshots: Option<Vec<u8>>,
     pub sharding_specs: Vec<ShardingSpec>,
     pub maintained_indexes: Vec<String>,
+    /// Maintain every index the MemTable can mirror instead of
+    /// `maintained_indexes`, resolved afresh each time a MemTable is built.
+    pub maintain_all_indexes: bool,
     pub compacted_sstables: Vec<CompactedSsTable>,
     pub index_catchup: Vec<IndexCatchupProgress>,
     /// Default `ShardWriter` configuration values for this MemWAL index.
@@ -415,6 +418,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
             inline_snapshots: details.inline_snapshots.clone(),
             sharding_specs: details.sharding_specs.iter().map(|rs| rs.into()).collect(),
             maintained_indexes: details.maintained_indexes.clone(),
+            maintain_all_indexes: Some(details.maintain_all_indexes),
             compacted_sstables: details
                 .compacted_sstables
                 .iter()
@@ -440,6 +444,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .map(ShardingSpec::from)
                 .collect(),
             maintained_indexes: details.maintained_indexes,
+            maintain_all_indexes: details.maintain_all_indexes.unwrap_or(false),
             compacted_sstables: details
                 .compacted_sstables
                 .into_iter()

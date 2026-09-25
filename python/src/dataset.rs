@@ -3839,7 +3839,6 @@ impl Dataset {
             stats_log_interval_ms,
             hnsw_params,
         )?;
-        let maintained_indexes = maintained_indexes.unwrap_or_default();
 
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
@@ -3853,7 +3852,12 @@ impl Dataset {
                 } else if unsharded {
                     builder = builder.unsharded();
                 }
-                builder = builder.maintained_indexes(maintained_indexes);
+                // Left unset, the builder maintains every index the table has,
+                // which is what `maintained_indexes=None` asks for. Flattening
+                // it to an empty list here would ask for none instead.
+                if let Some(maintained_indexes) = maintained_indexes {
+                    builder = builder.maintained_indexes(maintained_indexes);
+                }
                 if let Some(config) = writer_config {
                     builder = builder.writer_config_defaults(config);
                 }
@@ -3869,7 +3873,11 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    ///
+    /// `maintain_all_indexes` is what distinguishes maintaining every index
+    /// the table has from maintaining none: both leave `maintained_indexes`
+    /// empty.
     fn mem_wal_index_details<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3884,6 +3892,7 @@ impl Dataset {
         let dict = PyDict::new(py);
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
+        dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
 
         let specs = PyList::empty(py);
