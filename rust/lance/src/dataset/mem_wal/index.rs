@@ -14,12 +14,27 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::type_complexity)]
 
-mod arena_skiplist;
+/// The concurrent structure the built-in scalar index is built on, and the one
+/// a plugin should reach for before inventing another: single writer, readers
+/// that take no lock, and nothing reclaimed until the whole index is dropped.
+pub mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
 mod pk_key;
+mod plugin;
+mod query;
 
+pub use plugin::{
+    FlushContext, FlushOutcome, GenerationWrite, MemIndex, MemIndexBuildContext, MemIndexPlugin,
+    MemIndexRegistry, MemIndexSpec, ParamsContext, PrimaryKeyIndex, ResolvedIndex,
+};
+pub use query::{
+    FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, ScalarQuery,
+    SearchContext, VectorMemQuery,
+};
+
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,12 +48,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
-use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
-use lance_table::format::IndexMetadata;
-use prost::Message as _;
 use tracing::instrument;
 
 /// Row position in MemTable.
@@ -48,10 +60,13 @@ use tracing::instrument;
 pub type RowPosition = u64;
 
 // Re-export public types used externally
-pub use btree::{BTreeIndexConfig, BTreeMemIndex};
-pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions, search_cross_column};
+pub use btree::{BTreeMemIndex, BTreeMemIndexPlugin};
+pub use fts::{
+    FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr, SearchOptions,
+    search_cross_column,
+};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats};
-pub use hnsw::{HnswIndexConfig, HnswMemIndex};
+pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
 pub use pk_key::encode_pk_tuple;
 
 use pk_key::encode_pk_batch;
@@ -80,14 +95,14 @@ const PARALLEL_INDEX_MIN_ROWS: usize = 64;
 /// the order-preserving encoded tuple ([`encode_pk_tuple`]) instead. Either way
 /// the lookup is a single seek on one `BTreeMemIndex`.
 enum PkIndex {
-    /// Arity 1: aliases a `btree_indexes` entry, so the insert loop maintains it.
-    Single(Arc<BTreeMemIndex>),
-    /// Arity >= 2: a `BTreeMemIndex` over the encoded-tuple `Binary` key,
-    /// maintained explicitly in the insert paths (the original batch lacks the
-    /// synthetic key column). `columns` are the PK columns in order, resolved
-    /// against each batch's schema at insert time.
+    /// Arity 1: aliases an entry in `indexes`, so the insert loop maintains it.
+    Single(Arc<dyn PrimaryKeyIndex>),
+    /// Arity >= 2: an index over the encoded-tuple `Binary` key, maintained
+    /// explicitly in the insert paths (the original batch lacks the synthetic
+    /// key column). `columns` are the PK columns in order, resolved against
+    /// each batch's schema at insert time.
     Composite {
-        index: Arc<BTreeMemIndex>,
+        index: Arc<dyn PrimaryKeyIndex>,
         columns: Vec<String>,
     },
 }
@@ -118,117 +133,39 @@ enum PkIndex {
 /// could be bound under the wrong identity, serving stale reads and flushing the
 /// wrong column into the durable PK sidecar. `lance_schema` supplies the
 /// authoritative name→id mapping.
-pub fn validate_index_configs(
-    configs: &[MemIndexConfig],
+pub fn validate_index_specs(
+    specs: &[MemIndexSpec],
     schema: &ArrowSchema,
     lance_schema: &LanceSchema,
     pk_columns: &[String],
 ) -> Result<()> {
-    for config in configs {
-        let column = config.column();
-        if let MemIndexConfig::Fts(config) = config {
-            let resolved = crate::index::scalar::inverted::resolve_fts_field(
-                lance_schema,
-                column,
-                config.params.get_document_granularity(),
-            )
-            .map_err(|error| {
-                Error::invalid_input(format!(
-                    "FTS index '{}' is invalid for field path '{}': {error}",
-                    config.name, column
-                ))
-            })?;
-            if resolved.final_field_id != config.field_id {
-                return Err(Error::invalid_input(format!(
-                    "index '{}' is configured with field_id {} but its field path '{}' has \
-                     final field_id {} in the shard schema",
-                    config.name, config.field_id, column, resolved.final_field_id,
-                )));
-            }
-            continue;
-        }
-
-        let field = schema.field_with_name(column).map_err(|_| {
-            Error::invalid_input(format!(
-                "index '{}' is configured on column '{}', which is not in the shard schema; \
-                 available columns: [{}]",
-                config.name(),
-                column,
-                schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })?;
-
-        match config {
-            // BTree falls back to per-row `ScalarValue` extraction, so it
-            // accepts any column type the schema can hold. Existence is the
-            // only precondition.
-            MemIndexConfig::BTree(_) => {}
-            MemIndexConfig::Fts(_) => unreachable!("FTS configs are validated by schema path"),
-            MemIndexConfig::Hnsw(_) => match field.data_type() {
-                DataType::FixedSizeList(item, dim) => {
-                    if item.data_type() != &DataType::Float32 {
-                        return Err(Error::invalid_input(format!(
-                            "HNSW index '{}' requires a FixedSizeList<Float32> column; \
-                             column '{}' has item type {:?}",
-                            config.name(),
-                            column,
-                            item.data_type()
-                        )));
-                    }
-                    // `HnswMemIndex.dim` is a placeholder until the first batch
-                    // pins it (`hnsw.rs`), so a zero-width vector would only
-                    // surface at insert time — i.e. on already-durable data.
-                    if *dim <= 0 {
-                        return Err(Error::invalid_input(format!(
-                            "HNSW index '{}' requires a vector dimension > 0; column '{}' has \
-                             dimension {dim}",
-                            config.name(),
-                            column,
-                        )));
-                    }
-                }
-                other => {
-                    return Err(Error::invalid_input(format!(
-                        "HNSW index '{}' requires a FixedSizeList<Float32> column; \
-                         column '{}' is {:?}",
-                        config.name(),
-                        column,
-                        other
-                    )));
-                }
-            },
-        }
-
-        // The column resolves, but index selection keys off `field_id`, not name.
-        // A config whose `field_id` identifies a *different* column would be bound
-        // under the wrong identity (e.g. reused as the single-column PK index), so
-        // reject any `field_id` that does not name the resolved column.
-        let resolved_field_id = lance_schema
-            .field(column)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "index '{}' is configured on column '{}', which is present in the Arrow \
-                     schema but absent from the Lance schema",
-                    config.name(),
-                    column,
-                ))
-            })?
-            .id;
-        if resolved_field_id != config.field_id() {
+    for spec in specs {
+        if spec.columns.len() != spec.field_ids.len() {
             return Err(Error::invalid_input(format!(
-                "index '{}' is configured with field_id {} but its column '{}' has field_id {} \
-                 in the shard schema",
-                config.name(),
-                config.field_id(),
-                column,
-                resolved_field_id,
+                "index '{}' names {} columns and {} fields",
+                spec.name,
+                spec.columns.len(),
+                spec.field_ids.len()
             )));
         }
+
+        // Everything about a column is the kind's own rule, down to whether the
+        // column is a plain schema path at all: a full-text index covers a path
+        // through list elements that a schema walk does not follow. So the
+        // plugin decides, with
+        // [`MemIndexBuildContext::check_columns_resolve`] for the common case.
+        // Nothing here knows what a vector column or a text column is.
+        spec.plugin.validate(&MemIndexBuildContext {
+            name: &spec.name,
+            schema: lance_schema,
+            field_ids: &spec.field_ids,
+            columns: &spec.columns,
+            // Sizes the structure an index would allocate, which validation
+            // never builds; any value validates the same.
+            capacity_rows: 0,
+            capacity_batches: 0,
+            params: spec.params.as_ref(),
+        })?;
     }
 
     // Every PK column must exist in the schema. A single-column PK aliases a
@@ -275,198 +212,42 @@ fn is_encodable_pk_type(data_type: &DataType) -> bool {
     )
 }
 
-/// The index kinds a MemTable can maintain — the registry of MemWAL index
-/// support. Data-free because indexes are identified by type url before any
-/// [`MemIndexConfig`] exists.
+/// The plugins Lance registers for the kinds it builds in.
 ///
-/// Adding a variant is a compile error in [`details_suffix`](Self::details_suffix),
-/// `MemIndexConfig::kind`, and `Dataset::mem_wal_writer` until each handles it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemIndexKind {
-    /// BTree index for scalar fields (point lookups, range queries).
-    BTree,
-    /// HNSW vector index built incrementally, queryable while building.
-    Hnsw,
-    /// Full-text search index.
-    Fts,
-}
-
-impl MemIndexKind {
-    /// Every maintainable kind. A kind missing here is never detected, so it
-    /// goes unmaintained rather than reaching a memtable that cannot build it.
-    pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts];
-
-    /// Suffix of the protobuf details message identifying this kind.
-    ///
-    /// Only the suffix: the prefix varies by dataset version
-    /// (`/lance.table.`, `/lance.index.pb.`, and the `type.googleapis.com/`
-    /// form MemWAL flush once wrote), and all must resolve.
-    pub const fn details_suffix(self) -> &'static str {
-        match self {
-            Self::BTree => "BTreeIndexDetails",
-            Self::Hnsw => "VectorIndexDetails",
-            Self::Fts => "InvertedIndexDetails",
-        }
+/// A deployment starts from this and adds its own, or replaces one of these
+/// with its own implementation of the same kind.
+pub fn builtin_plugins() -> MemIndexRegistry {
+    let mut registry = MemIndexRegistry::new();
+    for plugin in [
+        Arc::new(BTreeMemIndexPlugin) as Arc<dyn MemIndexPlugin>,
+        Arc::new(HnswMemIndexPlugin),
+        Arc::new(FtsMemIndexPlugin),
+    ] {
+        registry
+            .add_plugin(plugin)
+            .expect("the built-in plugins claim distinct index kinds");
     }
-
-    /// The kind a base-table index of this protobuf type maps to, or `None`
-    /// when a memtable cannot maintain it.
-    pub fn from_type_url(type_url: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|kind| type_url.ends_with(kind.details_suffix()))
-    }
-}
-
-/// Configuration for an index in MemWAL. Pairs 1:1 with [`MemIndexKind`] via
-/// [`kind`](Self::kind).
-///
-/// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
-/// grow with future config (e.g. shard-specific tuning).
-#[derive(Debug, Clone)]
-pub enum MemIndexConfig {
-    /// BTree index for scalar fields (point lookups, range queries).
-    BTree(BTreeIndexConfig),
-    /// HNSW vector index built incrementally, queryable while building.
-    Hnsw(Box<HnswIndexConfig>),
-    /// Full-text search index.
-    Fts(FtsIndexConfig),
-}
-
-impl MemIndexConfig {
-    /// The kind this config builds. Links the config enum to the registry, so
-    /// a new variant must declare its kind.
-    pub const fn kind(&self) -> MemIndexKind {
-        match self {
-            Self::BTree(_) => MemIndexKind::BTree,
-            Self::Hnsw(_) => MemIndexKind::Hnsw,
-            Self::Fts(_) => MemIndexKind::Fts,
-        }
-    }
-
-    /// Get the index name.
-    pub fn name(&self) -> &str {
-        match self {
-            Self::BTree(c) => &c.name,
-            Self::Hnsw(c) => &c.name,
-            Self::Fts(c) => &c.name,
-        }
-    }
-
-    /// Get the field ID.
-    pub fn field_id(&self) -> i32 {
-        match self {
-            Self::BTree(c) => c.field_id,
-            Self::Hnsw(c) => c.field_id,
-            Self::Fts(c) => c.field_id,
-        }
-    }
-
-    /// Get the column name.
-    pub fn column(&self) -> &str {
-        match self {
-            Self::BTree(c) => &c.column,
-            Self::Hnsw(c) => &c.column,
-            Self::Fts(c) => &c.column,
-        }
-    }
-
-    /// Create a BTree index config from base table IndexMetadata.
-    pub fn btree_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
-        let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
-        Ok(Self::BTree(BTreeIndexConfig {
-            name: index_meta.name.clone(),
-            field_id,
-            column,
-        }))
-    }
-
-    /// Create an FTS index config from base table IndexMetadata.
-    pub fn fts_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
-        let (field_id, _) = Self::extract_field_info(index_meta, schema)?;
-
-        // Extract InvertedIndexParams from index_details if available
-        let details = if let Some(details_any) = &index_meta.index_details {
-            pbold::InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
-                Error::io(format!(
-                    "failed to decode InvertedIndexDetails for MemWAL FTS index '{}': {}",
-                    index_meta.name, err
-                ))
-            })?
-        } else {
-            pbold::InvertedIndexDetails::default()
-        };
-        let details =
-            crate::index::scalar::inverted::normalize_inverted_details(index_meta, details)?;
-        let params = InvertedIndexParams::try_from(&details)?;
-        let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
-            schema,
-            field_id,
-            params.get_document_granularity(),
-        )?;
-
-        Ok(Self::Fts(
-            FtsIndexConfig::try_with_params(
-                index_meta.name.clone(),
-                field_id,
-                resolved.canonical_path.clone(),
-                params,
-            )?
-            .with_resolved_field(resolved),
-        ))
-    }
-
-    /// Create an HNSW vector index config.
-    pub fn hnsw(name: String, field_id: i32, column: String, distance_type: DistanceType) -> Self {
-        Self::Hnsw(Box::new(HnswIndexConfig::new(
-            name,
-            field_id,
-            column,
-            distance_type,
-        )))
-    }
-
-    /// Create an HNSW vector index config with explicit build parameters.
-    pub fn hnsw_with_params(
-        name: String,
-        field_id: i32,
-        column: String,
-        distance_type: DistanceType,
-        build_params: HnswBuildParams,
-    ) -> Self {
-        Self::Hnsw(Box::new(
-            HnswIndexConfig::new(name, field_id, column, distance_type)
-                .with_build_params(build_params),
-        ))
-    }
-
-    /// Extract field ID and column name from index metadata.
-    fn extract_field_info(
-        index_meta: &IndexMetadata,
-        schema: &LanceSchema,
-    ) -> Result<(i32, String)> {
-        let field_id = index_meta.fields.first().ok_or_else(|| {
-            Error::invalid_input(format!("Index '{}' has no fields", index_meta.name))
-        })?;
-
-        let column = schema
-            .field_by_id(*field_id)
-            .map(|f| f.name.clone())
-            .ok_or_else(|| {
-                Error::invalid_input(format!("Field with id {} not found in schema", field_id))
-            })?;
-
-        Ok((*field_id, column))
-    }
+    registry
 }
 
 /// Names the index, not just its type: a caller validating a maintained set
 /// needs to know which one to drop.
-pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error {
+pub(crate) fn unsupported_index_type(
+    index_name: &str,
+    type_url: &str,
+    registry: &MemIndexRegistry,
+) -> Error {
+    // Listed from the registry so the message names what this writer can
+    // actually maintain, which a deployment changes by registering plugins.
+    let supported = registry
+        .plugins()
+        .iter()
+        .map(|plugin| plugin.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     Error::invalid_input(format!(
-        "index '{}' has type {}, which the MemWAL cannot maintain. Supported: BTree, Inverted, Vector",
-        index_name, type_url
+        "index '{index_name}' has type {type_url}, which no registered plugin maintains. \
+         Registered: [{supported}]"
     ))
 }
 
@@ -499,11 +280,13 @@ pub enum MemTableVisibility {
 pub struct IndexStore {
     /// BTree indexes keyed by index name. `Arc` so the primary-key BTrees can be
     /// shared into [`Self::pk_btrees`] without a second copy or a second insert.
-    btree_indexes: HashMap<String, Arc<BTreeMemIndex>>,
-    /// HNSW vector indexes keyed by index name.
-    hnsw_indexes: HashMap<String, HnswMemIndex>,
-    /// FTS indexes keyed by index name.
-    fts_indexes: HashMap<String, FtsMemIndex>,
+    /// Every index this memtable maintains, by name.
+    ///
+    /// One collection rather than one per kind. Three separate bugs came from
+    /// the previous shape — a kind wired into one write path and not the
+    /// other, left out of the memory total, and missed by the flush — and each
+    /// was a collection someone forgot. There is nothing left to forget.
+    indexes: HashMap<String, Arc<dyn MemIndex>>,
     /// The primary-key index (single-column or composite), or `None` without a
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
@@ -535,9 +318,8 @@ pub struct IndexStore {
 impl Default for IndexStore {
     fn default() -> Self {
         Self {
-            btree_indexes: HashMap::new(),
-            hnsw_indexes: HashMap::new(),
-            fts_indexes: HashMap::new(),
+            indexes: HashMap::new(),
+
             pk_index: None,
             indexed_count: AtomicUsize::new(0),
             durability: None,
@@ -549,20 +331,14 @@ impl Default for IndexStore {
 impl std::fmt::Debug for IndexStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexStore")
-            .field(
-                "btree_indexes",
-                &self.btree_indexes.keys().collect::<Vec<_>>(),
-            )
-            .field(
-                "hnsw_indexes",
-                &self.hnsw_indexes.keys().collect::<Vec<_>>(),
-            )
-            .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
+            .field("indexes", &self.indexes.keys().collect::<Vec<_>>())
             .field(
                 "pk_index",
                 &match &self.pk_index {
                     None => "none".to_string(),
-                    Some(PkIndex::Single(b)) => format!("single({})", b.column_name()),
+                    Some(PkIndex::Single(index)) => {
+                        format!("single({})", index.columns().join(", "))
+                    }
                     Some(PkIndex::Composite { columns, .. }) => {
                         format!("composite({})", columns.join(", "))
                     }
@@ -583,67 +359,44 @@ impl IndexStore {
         Self::default()
     }
 
-    /// Create an index registry from index configurations.
+    /// Build every index a memtable is to maintain.
+    ///
+    /// There is no match over kinds here: each spec names the plugin that
+    /// builds it, so adding a kind adds nothing to this function.
     ///
     /// # Arguments
     ///
-    /// * `configs` - Index configurations
-    /// * `max_rows` - Maximum vectors / rows in memtable. Used to size the
-    ///   pre-allocated HNSW graph and storage capacity.
-    /// * `max_batches` - Maximum number of write batches the HNSW storage
-    ///   can hold by reference (matches the writer's
-    ///   `ShardWriterConfig::max_memtable_batches`).
-    pub fn from_configs(
-        configs: &[MemIndexConfig],
+    /// * `specs` - What to maintain, resolved against the base table
+    /// * `schema` - The shard schema, for an index that resolves a nested path
+    /// * `max_rows` - Most rows the memtable holds before it flushes, which
+    ///   sizes a pre-allocated structure such as the HNSW graph
+    /// * `max_batches` - Most write batches the memtable holds (matches the
+    ///   writer's `ShardWriterConfig::max_memtable_batches`)
+    pub fn from_specs(
+        specs: &[MemIndexSpec],
+        schema: &LanceSchema,
         max_rows: usize,
         max_batches: usize,
     ) -> Result<Self> {
         let mut registry = Self::new();
-
-        for config in configs {
-            match config {
-                MemIndexConfig::BTree(c) => {
-                    let index = Arc::new(BTreeMemIndex::new(c.field_id, c.column.clone()));
-                    registry.btree_indexes.insert(c.name.clone(), index);
-                }
-                MemIndexConfig::Hnsw(c) => {
-                    let index = HnswMemIndex::with_capacity(
-                        c.field_id,
-                        c.column.clone(),
-                        c.distance_type,
-                        c.build_params.clone(),
-                        max_rows,
-                        max_batches,
-                    );
-                    registry.hnsw_indexes.insert(c.name.clone(), index);
-                }
-                MemIndexConfig::Fts(c) => {
-                    let index = match c.resolved_field.as_deref() {
-                        Some(resolved) => FtsMemIndex::try_with_resolved_field(
-                            c.field_id,
-                            c.column.clone(),
-                            c.params.clone(),
-                            resolved.clone(),
-                        )?,
-                        None => FtsMemIndex::try_with_params(
-                            c.field_id,
-                            c.column.clone(),
-                            c.params.clone(),
-                        )?,
-                    };
-                    registry.fts_indexes.insert(c.name.clone(), index);
-                }
-            }
+        for spec in specs {
+            let index = spec.build(schema, max_rows, max_batches)?;
+            registry.indexes.insert(spec.name.clone(), index);
         }
-
         Ok(registry)
     }
 
     /// Add a BTree/scalar index (skip-list backed). Low-level / test helper;
-    /// the production memtable path goes through [`Self::from_configs`].
+    /// the production memtable path goes through [`Self::from_specs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
-        self.btree_indexes
+        self.indexes
             .insert(name, Arc::new(BTreeMemIndex::new(field_id, column)));
+    }
+
+    /// Add an already-built index. Low-level / test helper; the production
+    /// memtable path goes through [`Self::from_specs`].
+    pub fn add_index(&mut self, name: String, index: Arc<dyn MemIndex>) {
+        self.indexes.insert(name, index);
     }
 
     /// Add an HNSW vector index with default build parameters.
@@ -664,16 +417,16 @@ impl IndexStore {
             self.pk_index.is_none() || self.pk_is_empty(),
             "HNSW indexes must be configured before inserting rows into a PK memtable"
         );
-        self.hnsw_indexes.insert(
+        self.indexes.insert(
             name,
-            HnswMemIndex::with_capacity(
+            Arc::new(HnswMemIndex::with_capacity(
                 field_id,
                 column,
                 distance_type,
                 HnswBuildParams::default(),
                 capacity,
                 max_batches,
-            ),
+            )),
         );
     }
 
@@ -695,16 +448,16 @@ impl IndexStore {
             self.pk_index.is_none() || self.pk_is_empty(),
             "HNSW indexes must be configured before inserting rows into a PK memtable"
         );
-        self.hnsw_indexes.insert(
+        self.indexes.insert(
             name,
-            HnswMemIndex::with_capacity(
+            Arc::new(HnswMemIndex::with_capacity(
                 field_id,
                 column,
                 distance_type,
                 build_params,
                 capacity,
                 max_batches,
-            ),
+            )),
         );
     }
 
@@ -718,8 +471,8 @@ impl IndexStore {
             self.pk_index.is_none() || self.pk_is_empty(),
             "FTS indexes must be configured before inserting rows into a PK memtable"
         );
-        self.fts_indexes
-            .insert(name, FtsMemIndex::new(field_id, column));
+        self.indexes
+            .insert(name, Arc::new(FtsMemIndex::new(field_id, column)));
     }
 
     /// Add an FTS index with custom tokenizer parameters.
@@ -734,9 +487,9 @@ impl IndexStore {
             self.pk_index.is_none() || self.pk_is_empty(),
             "FTS indexes must be configured before inserting rows into a PK memtable"
         );
-        self.fts_indexes.insert(
+        self.indexes.insert(
             name,
-            FtsMemIndex::try_with_params(field_id, column, params)?,
+            Arc::new(FtsMemIndex::try_with_params(field_id, column, params)?),
         );
         Ok(())
     }
@@ -749,34 +502,38 @@ impl IndexStore {
     /// second copy). Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
     /// order-preserving encoded tuple (synthetic `PK_KEY_COLUMN`), maintained
     /// explicitly in the insert paths. Call once at construction, after
-    /// [`Self::from_configs`] and before any inserts; a no-op when `pk_columns`
+    /// [`Self::from_specs`] and before any inserts; a no-op when `pk_columns`
     /// is empty. Search indexes (HNSW/FTS) must also still be empty so every
     /// search-visible row participates in PK override tracking.
     pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
         if !pk_columns.is_empty() {
             assert!(
-                self.hnsw_indexes.values().all(|idx| idx.is_empty())
-                    && self.fts_indexes.values().all(|idx| idx.is_empty()),
+                self.typed_iter::<HnswMemIndex>().all(|idx| idx.is_empty())
+                    && self.typed_iter::<FtsMemIndex>().all(|idx| idx.is_empty()),
                 "Primary-key indexes must be configured before inserting rows into a search-indexed memtable"
             );
         }
         self.pk_index = match pk_columns {
             [] => None,
             [(column, field_id)] => {
-                let btree = match self
-                    .btree_indexes
+                // Reuse a user B-tree on the same column when there is one: the
+                // primary-key lookup wants exactly what it already holds, and a
+                // second copy would double both the memory and the insert work.
+                let existing = self
+                    .indexes
                     .values()
-                    .find(|b| b.field_id() == *field_id)
-                {
-                    Some(existing) => existing.clone(),
+                    .filter(|index| index.columns().iter().any(|c| c == column))
+                    .find_map(|index| index.clone().as_primary_key());
+                let pk = match existing {
+                    Some(index) => index,
                     None => {
                         let btree = Arc::new(BTreeMemIndex::new(*field_id, column.clone()));
-                        self.btree_indexes
+                        self.indexes
                             .insert(format!("__pk__{column}"), btree.clone());
                         btree
                     }
                 };
-                Some(PkIndex::Single(btree))
+                Some(PkIndex::Single(pk))
             }
             multi => Some(PkIndex::Composite {
                 // Synthetic field id (-1): the composite index is held directly,
@@ -800,8 +557,9 @@ impl IndexStore {
     pub fn pk_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
         match &self.pk_index {
             None => Ok(Vec::new()),
-            Some(PkIndex::Single(btree)) => btree.to_training_batches(batch_size),
-            Some(PkIndex::Composite { index, .. }) => index.to_training_batches(batch_size),
+            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+                index.training_batches(batch_size)
+            }
         }
     }
 
@@ -859,13 +617,13 @@ impl IndexStore {
     ) -> Option<RowPosition> {
         match &self.pk_index {
             None => None,
-            Some(PkIndex::Single(btree)) => btree.get_newest_visible(&values[0], max_visible_row),
+            Some(PkIndex::Single(index)) => index.newest_visible(&values[0], max_visible_row),
             Some(PkIndex::Composite { index, .. }) => {
                 // An unsupported PK type would have failed at insert, so the
                 // index can't hold a tuple this fails to encode. The probe key is
                 // the same `Binary`-encoded tuple the insert path indexed.
                 let key = encode_pk_tuple(values).ok()?;
-                index.get_newest_visible(&ScalarValue::Binary(Some(key)), max_visible_row)
+                index.newest_visible(&ScalarValue::Binary(Some(key)), max_visible_row)
             }
         }
     }
@@ -894,8 +652,8 @@ impl IndexStore {
     pub fn pk_contains_key(&self, key: &ScalarValue, max_visible_row: RowPosition) -> bool {
         match &self.pk_index {
             None => false,
-            Some(PkIndex::Single(btree)) | Some(PkIndex::Composite { index: btree, .. }) => {
-                btree.get_newest_visible(key, max_visible_row).is_some()
+            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+                index.newest_visible(key, max_visible_row).is_some()
             }
         }
     }
@@ -904,8 +662,9 @@ impl IndexStore {
     pub fn pk_is_empty(&self) -> bool {
         match &self.pk_index {
             None => true,
-            Some(PkIndex::Single(btree)) => btree.is_empty(),
-            Some(PkIndex::Composite { index, .. }) => index.is_empty(),
+            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+                index.is_empty()
+            }
         }
     }
 
@@ -922,11 +681,26 @@ impl IndexStore {
     }
 
     fn should_track_pk_overrides(&self) -> bool {
-        (!self.hnsw_indexes.is_empty() || !self.fts_indexes.is_empty()) && !self.pk_has_overrides()
+        (self.typed_iter::<HnswMemIndex>().next().is_some()
+            || self.typed_iter::<FtsMemIndex>().next().is_some())
+            && !self.pk_has_overrides()
     }
 
-    fn is_single_pk_btree(&self, index: &Arc<BTreeMemIndex>) -> bool {
-        matches!(&self.pk_index, Some(PkIndex::Single(pk)) if Arc::ptr_eq(pk, index))
+    /// The single-column primary-key index, if `name` is the entry it shares.
+    ///
+    /// It shares its entry with a user index on the same column when there is
+    /// one, so this compares the handle rather than the name's shape.
+    fn single_pk_at(&self, name: &str) -> Option<&Arc<dyn PrimaryKeyIndex>> {
+        let Some(PkIndex::Single(pk)) = &self.pk_index else {
+            return None;
+        };
+        let shared = self
+            .indexes
+            .get(name)?
+            .clone()
+            .as_primary_key()
+            .is_some_and(|index| Arc::ptr_eq(pk, &index));
+        shared.then_some(pk)
     }
 
     fn mark_pk_overrides_if_needed(&self, had_existing_pk: bool) {
@@ -949,19 +723,17 @@ impl IndexStore {
         batch_position: Option<usize>,
     ) -> Result<()> {
         let track_pk_overrides = self.should_track_pk_overrides();
-        for index in self.btree_indexes.values() {
-            if track_pk_overrides && self.is_single_pk_btree(index) {
-                let had_existing = index.insert_and_report_existing(batch, row_offset)?;
-                self.mark_pk_overrides_if_needed(had_existing);
-            } else {
-                index.insert(batch, row_offset)?;
+        for (name, index) in &self.indexes {
+            match track_pk_overrides
+                .then(|| self.single_pk_at(name))
+                .flatten()
+            {
+                Some(pk) => {
+                    let had_existing = pk.insert_and_report_existing(batch, row_offset)?;
+                    self.mark_pk_overrides_if_needed(had_existing);
+                }
+                None => index.insert(batch, row_offset)?,
             }
-        }
-        for index in self.hnsw_indexes.values() {
-            index.insert(batch, row_offset)?;
-        }
-        for index in self.fts_indexes.values() {
-            index.insert(batch, row_offset)?;
         }
         // Single-column PK aliases a `btree_indexes` entry (maintained above);
         // a composite PK has its own index, maintained here.
@@ -1020,40 +792,24 @@ impl IndexStore {
         type IndexTask<'a> = Box<dyn Fn() -> Result<bool> + Send + Sync + 'a>;
         let mut tasks: Vec<(&str, IndexTask<'_>)> = Vec::new();
 
-        for (name, index) in &self.btree_indexes {
-            let track_this_index = track_pk_overrides && self.is_single_pk_btree(index);
+        for (name, index) in &self.indexes {
+            let pk = track_pk_overrides
+                .then(|| self.single_pk_at(name))
+                .flatten();
             tasks.push((
                 name.as_str(),
                 Box::new(move || {
                     let mut had_existing = false;
                     for stored in batches {
-                        if track_this_index {
-                            had_existing |= index
-                                .insert_and_report_existing(&stored.data, stored.row_offset)?;
-                        } else {
-                            index.insert(&stored.data, stored.row_offset)?;
+                        match pk {
+                            Some(pk) => {
+                                had_existing |=
+                                    pk.insert_and_report_existing(&stored.data, stored.row_offset)?;
+                            }
+                            None => index.insert(&stored.data, stored.row_offset)?,
                         }
                     }
                     Ok(had_existing)
-                }),
-            ));
-        }
-
-        for (name, index) in &self.hnsw_indexes {
-            tasks.push((
-                name.as_str(),
-                Box::new(move || index.insert_batches(batches).map(|_| false)),
-            ));
-        }
-
-        for (name, index) in &self.fts_indexes {
-            tasks.push((
-                name.as_str(),
-                Box::new(move || {
-                    for stored in batches {
-                        index.insert(&stored.data, stored.row_offset)?;
-                    }
-                    Ok(false)
                 }),
             ));
         }
@@ -1141,17 +897,81 @@ impl IndexStore {
 
     /// Get a BTree index by name.
     pub fn get_btree(&self, name: &str) -> Option<&BTreeMemIndex> {
-        self.btree_indexes.get(name).map(Arc::as_ref)
+        self.typed::<BTreeMemIndex>(name)
     }
 
     /// Get an HNSW vector index by name.
     pub fn get_hnsw(&self, name: &str) -> Option<&HnswMemIndex> {
-        self.hnsw_indexes.get(name)
+        self.typed::<HnswMemIndex>(name)
+    }
+
+    /// Get a plugin-maintained index by name.
+    pub fn get_plugin_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
+        self.indexes.get(name)
+    }
+
+    /// The index named `name`, if it is of kind `T`.
+    ///
+    /// For a caller that needs one implementation's own API — the hybrid
+    /// search path materializing features from the inverted index — never for
+    /// routing. Routing goes through [`Self::index_answering`], which asks what
+    /// an index can do rather than what it is.
+    fn typed<T: 'static>(&self, name: &str) -> Option<&T> {
+        (self.indexes.get(name)?.as_ref() as &dyn Any).downcast_ref::<T>()
+    }
+
+    /// Every index of kind `T`.
+    fn typed_iter<T: 'static>(&self) -> impl Iterator<Item = &T> {
+        self.indexes
+            .values()
+            .filter_map(|index| (index.as_ref() as &dyn Any).downcast_ref::<T>())
+    }
+
+    /// The index named `name`, whatever kind maintains it.
+    pub fn get_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
+        self.indexes.get(name)
+    }
+
+    /// Every index in the store, by name.
+    ///
+    /// The flush walks this rather than asking for one kind at a time, so a
+    /// kind that writes its own file is never one the flush has to know about.
+    pub fn all_indexes(&self) -> Vec<(&str, Arc<dyn MemIndex>)> {
+        self.indexes
+            .iter()
+            .map(|(name, index)| (name.as_str(), index.clone()))
+            .collect()
+    }
+
+    /// The index covering `column` that can answer `query`.
+    ///
+    /// The one way a query finds an index. Keyed on what an index covers and
+    /// what it can answer, never on which type it is, so a plugin standing in
+    /// for a kind Lance also builds in is found the same way — and two indexes
+    /// on one column are told apart by the question rather than by a label.
+    pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
+        self.indexes
+            .values()
+            .find(|index| {
+                index.columns().iter().any(|covered| covered == column) && index.can_answer(query)
+            })
+            .cloned()
+    }
+
+    /// Every index covering `column`, whatever it can answer.
+    pub fn indexes_on_column(
+        &self,
+        column: &str,
+    ) -> impl Iterator<Item = (&str, &Arc<dyn MemIndex>)> {
+        self.indexes
+            .iter()
+            .filter(move |(_, index)| index.columns().iter().any(|covered| covered == column))
+            .map(|(name, index)| (name.as_str(), index))
     }
 
     /// Get an FTS index by name.
     pub fn get_fts(&self, name: &str) -> Option<&FtsMemIndex> {
-        self.fts_indexes.get(name)
+        self.typed::<FtsMemIndex>(name)
     }
 
     /// Get a BTree index by field ID.
@@ -1159,16 +979,7 @@ impl IndexStore {
     /// Searches through all BTree indexes to find one matching the field_id.
     /// Use this for column-to-index resolution (column → field_id → index).
     pub fn get_btree_by_field_id(&self, field_id: i32) -> Option<&BTreeMemIndex> {
-        self.btree_indexes
-            .values()
-            .find(|idx| idx.field_id() == field_id)
-            .map(Arc::as_ref)
-    }
-
-    /// Get an HNSW vector index by field ID.
-    pub fn get_hnsw_by_field_id(&self, field_id: i32) -> Option<&HnswMemIndex> {
-        self.hnsw_indexes
-            .values()
+        self.typed_iter::<BTreeMemIndex>()
             .find(|idx| idx.field_id() == field_id)
     }
 
@@ -1188,23 +999,20 @@ impl IndexStore {
         field_id: i32,
         document_granularity: lance_index::scalar::inverted::DocumentGranularity,
     ) -> Option<&FtsMemIndex> {
-        self.fts_indexes.values().find(|idx| {
+        self.typed_iter::<FtsMemIndex>().find(|idx| {
             idx.field_id() == field_id && idx.document_granularity() == document_granularity
         })
     }
 
     /// Get a BTree index by column name.
     pub fn get_btree_by_column(&self, column: &str) -> Option<&BTreeMemIndex> {
-        self.btree_indexes
-            .values()
+        self.typed_iter::<BTreeMemIndex>()
             .find(|idx| idx.column_name() == column)
-            .map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by column name.
     pub fn get_hnsw_by_column(&self, column: &str) -> Option<&HnswMemIndex> {
-        self.hnsw_indexes
-            .values()
+        self.typed_iter::<HnswMemIndex>()
             .find(|idx| idx.column_name() == column)
     }
 
@@ -1221,7 +1029,7 @@ impl IndexStore {
         column: &str,
         document_granularity: lance_index::scalar::inverted::DocumentGranularity,
     ) -> Option<&FtsMemIndex> {
-        self.fts_indexes.values().find(|idx| {
+        self.typed_iter::<FtsMemIndex>().find(|idx| {
             idx.column_name() == column && idx.document_granularity() == document_granularity
         })
     }
@@ -1233,8 +1041,7 @@ impl IndexStore {
         column: &str,
     ) -> Vec<lance_index::scalar::inverted::DocumentGranularity> {
         let mut granularities = self
-            .fts_indexes
-            .values()
+            .typed_iter::<FtsMemIndex>()
             .filter(|index| index.column_name() == column)
             .map(|index| index.document_granularity())
             .collect::<Vec<_>>();
@@ -1248,7 +1055,7 @@ impl IndexStore {
 
     /// Check if the registry has any indexes.
     pub fn is_empty(&self) -> bool {
-        self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
+        self.indexes.is_empty()
     }
 
     /// Name every index this memtable carries, for diagnostics.
@@ -1258,20 +1065,14 @@ impl IndexStore {
     /// from outside. Sorted so repeated calls compare cleanly; `HashMap`
     /// iteration order alone would not.
     pub fn index_names(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .btree_indexes
-            .keys()
-            .chain(self.hnsw_indexes.keys())
-            .chain(self.fts_indexes.keys())
-            .cloned()
-            .collect();
+        let mut out: Vec<String> = self.indexes.keys().cloned().collect();
         out.sort();
         out
     }
 
     /// Get the total number of indexes.
     pub fn len(&self) -> usize {
-        self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
+        self.indexes.len()
     }
 
     /// Heap bytes held by every index in the registry.
@@ -1283,20 +1084,18 @@ impl IndexStore {
     /// `HnswMemIndex::resident_bytes`), so it can dwarf a memtable's row bytes
     /// while `row_bytes` still reads zero.
     pub fn resident_bytes(&self) -> usize {
-        let btrees: usize = self
-            .btree_indexes
+        let indexes: usize = self
+            .indexes
             .values()
-            .map(|b| b.resident_bytes())
+            .map(|index| index.resident_bytes())
             .sum();
-        let hnsw: usize = self.hnsw_indexes.values().map(|h| h.resident_bytes()).sum();
-        let fts: usize = self.fts_indexes.values().map(|f| f.resident_bytes()).sum();
-        // A `Single` PK aliases a `btree_indexes` entry, already counted above.
+        // A single-column PK shares an entry in the map above, already counted.
         // A composite PK's index is held only here.
         let pk = match &self.pk_index {
             Some(PkIndex::Composite { index, .. }) => index.resident_bytes(),
             Some(PkIndex::Single(_)) | None => 0,
         };
-        btrees + hnsw + fts + pk
+        indexes + pk
     }
 
     /// How many batches of this memtable have been fully indexed (exclusive
@@ -1342,6 +1141,155 @@ impl IndexStore {
 
 #[cfg(test)]
 mod tests {
+    use super::plugin::{
+        FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin,
+    };
+    use super::query::{MemMatches, MemQuery, SearchContext};
+    use crate::dataset::mem_wal::memtable::scanner::ScalarPredicate;
+    use lance_index::IndexType;
+    use lance_index::pbold;
+    use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+    use lance_table::format::IndexMetadata;
+    use prost::Message as _;
+    use std::collections::BTreeMap;
+    use std::sync::RwLock as StdRwLock;
+
+    /// A minimal value-to-positions index, standing in for any registered
+    /// plugin. Lance ships no plugin of its own, so the plugin paths would
+    /// otherwise be untested here.
+    ///
+    /// It is also the shortest complete example of the interface: take rows,
+    /// answer the queries you recognise, say what you cost, hand something to
+    /// the flush.
+    #[derive(Debug, Default)]
+    struct StubMemIndex {
+        columns: Vec<String>,
+        postings: StdRwLock<BTreeMap<String, Vec<RowPosition>>>,
+    }
+
+    impl StubMemIndex {
+        fn new(column: String) -> Self {
+            Self {
+                columns: vec![column],
+                postings: StdRwLock::new(BTreeMap::new()),
+            }
+        }
+
+        fn key(array: &dyn arrow_array::Array, row: usize) -> Option<String> {
+            (!array.is_null(row))
+                .then(|| ScalarValue::try_from_array(array, row).ok())
+                .flatten()
+                .map(|value| value.to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemIndex for StubMemIndex {
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+
+        fn can_answer(&self, query: &dyn MemQuery) -> bool {
+            matches!(
+                query.as_any().downcast_ref::<ScalarPredicate>(),
+                Some(ScalarPredicate::Eq { .. } | ScalarPredicate::In { .. })
+            )
+        }
+
+        fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
+            let Some(array) = batch.column_by_name(&self.columns[0]) else {
+                return Ok(());
+            };
+            let mut postings = self.postings.write().unwrap();
+            for row in 0..array.len() {
+                if let Some(key) = Self::key(array.as_ref(), row) {
+                    postings
+                        .entry(key)
+                        .or_default()
+                        .push(row_offset + row as u64);
+                }
+            }
+            Ok(())
+        }
+
+        fn resident_bytes(&self) -> usize {
+            let postings = self.postings.read().unwrap();
+            postings
+                .iter()
+                .map(|(key, positions)| {
+                    key.len() + positions.len() * std::mem::size_of::<RowPosition>()
+                })
+                .sum()
+        }
+
+        fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+            let Some(query) = query.as_any().downcast_ref::<ScalarPredicate>() else {
+                return Ok(None);
+            };
+            let postings = self.postings.read().unwrap();
+            let hits: Vec<RowPosition> = match query {
+                ScalarPredicate::Eq { value, .. } => postings
+                    .get(&value.to_string())
+                    .cloned()
+                    .unwrap_or_default(),
+                ScalarPredicate::In { values, .. } => values
+                    .iter()
+                    .filter_map(|value| postings.get(&value.to_string()))
+                    .flatten()
+                    .copied()
+                    .collect(),
+                _ => return Ok(None),
+            };
+            Ok(Some(MemMatches::exact(
+                hits.into_iter().filter(|p| *p <= ctx.max_visible),
+            )))
+        }
+
+        async fn flush(&self, _ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+            Ok(FlushOutcome::BuildFromGeneration)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubPlugin;
+
+    #[async_trait::async_trait]
+    impl MemIndexPlugin for StubPlugin {
+        fn name(&self) -> &str {
+            "Stub"
+        }
+        fn details_suffix(&self) -> &str {
+            "StubIndexDetails"
+        }
+        fn flush_index_type(&self) -> IndexType {
+            IndexType::Bitmap
+        }
+        fn training_criteria(&self) -> TrainingCriteria {
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+        }
+        fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+            ctx.single_column().map(|_| ())
+        }
+        fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+            let (column, _) = ctx.single_column()?;
+            Ok(Arc::new(StubMemIndex::new(column.to_string())))
+        }
+    }
+
+    fn add_stub(registry: &mut IndexStore, name: &str, column: &str) {
+        let spec = MemIndexSpec {
+            name: name.to_string(),
+            field_ids: vec![0],
+            columns: vec![column.to_string()],
+            plugin: Arc::new(StubPlugin),
+            params: Arc::new(()),
+        };
+        registry.add_index(
+            name.to_string(),
+            spec.build(&LanceSchema::default(), 1_000, 16).unwrap(),
+        );
+    }
+
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -1355,15 +1303,14 @@ mod tests {
     /// used to hand-write a `type.googleapis.com/` url that existing datasets
     /// still carry.
     #[rstest]
-    #[case::btree("/lance.table.BTreeIndexDetails", Some(MemIndexKind::BTree))]
-    #[case::fts("/lance.table.InvertedIndexDetails", Some(MemIndexKind::Fts))]
-    #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some(MemIndexKind::Fts))]
-    #[case::vector("/lance.index.pb.VectorIndexDetails", Some(MemIndexKind::Hnsw))]
+    #[case::btree("/lance.table.BTreeIndexDetails", Some("BTree"))]
+    #[case::fts("/lance.table.InvertedIndexDetails", Some("Inverted"))]
+    #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some("Inverted"))]
+    #[case::vector("/lance.index.pb.VectorIndexDetails", Some("Hnsw"))]
     // What MemWAL flush wrote before it switched to `Any::from_msg`.
-    #[case::vector_legacy_flush(
-        "type.googleapis.com/lance.index.VectorIndexDetails",
-        Some(MemIndexKind::Hnsw)
-    )]
+    #[case::vector_legacy_flush("type.googleapis.com/lance.index.VectorIndexDetails", Some("Hnsw"))]
+    // Kinds Lance builds on disk but ships no memtable plugin for. A
+    // deployment that registers one gets it maintained without changing Lance.
     #[case::bitmap("/lance.table.BitmapIndexDetails", None)]
     #[case::label_list("/lance.table.LabelListIndexDetails", None)]
     #[case::ngram("/lance.table.NGramIndexDetails", None)]
@@ -1372,31 +1319,206 @@ mod tests {
     #[case::json("/lance.index.pb.JsonIndexDetails", None)]
     #[case::fm("/lance.index.pb.FMIndexDetails", None)]
     #[case::absent("", None)]
-    fn type_urls_resolve_to_the_kind_the_writer_builds(
+    fn type_urls_resolve_to_the_plugin_that_maintains_them(
         #[case] type_url: &str,
-        #[case] expected: Option<MemIndexKind>,
+        #[case] expected: Option<&str>,
     ) {
-        assert_eq!(MemIndexKind::from_type_url(type_url), expected);
+        let registry = builtin_plugins();
+        let found = registry
+            .plugin_for_details_url(type_url)
+            .map(|plugin| plugin.name());
+        assert_eq!(found, expected);
     }
 
-    /// `ALL` is hand-maintained, so a kind left out of it stops resolving.
+    /// Registering is what makes a kind maintainable, so a plugin claiming a
+    /// suffix another already claims is a configuration error rather than a
+    /// silent override.
     #[test]
-    fn every_kind_is_registered_and_uniquely_identified() {
-        for kind in MemIndexKind::ALL {
+    fn a_registry_refuses_two_plugins_for_one_kind() {
+        let mut registry = builtin_plugins();
+        let error = registry
+            .add_plugin(Arc::new(BTreeMemIndexPlugin))
+            .expect_err("BTreeIndexDetails is already claimed");
+        assert!(
+            error.to_string().contains("BTreeIndexDetails"),
+            "the error must name the contested kind: {error}"
+        );
+    }
+
+    /// Replacing is the deliberate form of the same thing: a deployment
+    /// substituting its own implementation for one Lance builds in.
+    #[test]
+    fn a_registry_replaces_a_builtin_on_request() {
+        #[derive(Debug)]
+        struct OtherBTree;
+
+        #[async_trait::async_trait]
+        impl MemIndexPlugin for OtherBTree {
+            fn name(&self) -> &str {
+                "BTreeV2"
+            }
+            fn details_suffix(&self) -> &str {
+                "BTreeIndexDetails"
+            }
+            fn flush_index_type(&self) -> IndexType {
+                IndexType::BTree
+            }
+            fn training_criteria(&self) -> TrainingCriteria {
+                TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+            }
+            fn validate(&self, _ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+                let (column, _) = ctx.single_column()?;
+                Ok(Arc::new(StubMemIndex::new(column.to_string())))
+            }
+        }
+
+        let mut registry = builtin_plugins();
+        registry.replace_plugin(Arc::new(OtherBTree));
+        assert_eq!(
+            registry
+                .plugin_for_details_url("/lance.table.BTreeIndexDetails")
+                .map(|plugin| plugin.name()),
+            Some("BTreeV2"),
+            "the replacement answers for the kind it claimed"
+        );
+        assert_eq!(
+            registry.plugins().len(),
+            builtin_plugins().plugins().len(),
+            "replacing adds no second claimant"
+        );
+    }
+
+    /// Every registered plugin must resolve from its own suffix, or it is
+    /// registered and never reached.
+    #[test]
+    fn every_registered_plugin_resolves_from_its_own_suffix() {
+        let registry = builtin_plugins();
+        for plugin in registry.plugins() {
+            let url = format!("/lance.table.{}", plugin.details_suffix());
             assert_eq!(
-                MemIndexKind::from_type_url(&format!("/lance.table.{}", kind.details_suffix())),
-                Some(*kind),
-                "{kind:?} does not resolve from its own suffix",
+                registry
+                    .plugin_for_details_url(&url)
+                    .map(|found| found.name()),
+                Some(plugin.name()),
+                "{} does not resolve from its own suffix",
+                plugin.name(),
             );
         }
-        let suffixes: std::collections::HashSet<_> = MemIndexKind::ALL
-            .iter()
-            .map(|k| k.details_suffix())
-            .collect();
-        assert_eq!(
-            suffixes.len(),
-            MemIndexKind::ALL.len(),
-            "two kinds share a details suffix, so one can never be resolved",
+    }
+
+    /// The shard schema these tests build their memtables against.
+    ///
+    /// A plugin resolves nested paths against this; the built-in kinds take
+    /// their columns from the spec, so the tests below only need it to exist.
+    fn test_lance_schema() -> LanceSchema {
+        LanceSchema::try_from(create_test_schema().as_ref()).unwrap()
+    }
+
+    /// Routing asks an index what it can answer, never what type it is. This
+    /// is what lets a plugin stand in for a kind Lance builds in, and what
+    /// tells two indexes on one column apart.
+    #[test]
+    fn an_index_is_found_by_the_question_not_by_its_type() {
+        use lance_index::scalar::inverted::DocumentGranularity;
+
+        let arrow = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("description", DataType::Utf8, true),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+        let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
+        let specs = vec![
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            MemIndexSpec::fts("text_idx", 1, "description"),
+            MemIndexSpec::hnsw("vec_idx", 2, "vector", DistanceType::L2),
+        ];
+        let store = IndexStore::from_specs(&specs, &lance, 1_000, 16).unwrap();
+
+        let equality = ScalarPredicate::Eq {
+            column: "id".to_string(),
+            value: ScalarValue::Int32(Some(1)),
+        };
+        assert!(
+            store.index_answering("id", &equality).is_some(),
+            "the B-tree answers equality on its column"
+        );
+        assert!(
+            store.index_answering("description", &equality).is_none(),
+            "a full-text index does not answer equality"
+        );
+
+        let knn = VectorMemQuery::probe(Some(DistanceType::L2));
+        assert!(store.index_answering("vector", &knn).is_some());
+        assert!(
+            store
+                .index_answering("vector", &VectorMemQuery::probe(Some(DistanceType::Cosine)))
+                .is_none(),
+            "a graph built for L2 cannot answer in another metric"
+        );
+
+        let fts = FtsMemQuery::probe(DocumentGranularity::Row);
+        assert!(store.index_answering("description", &fts).is_some());
+        assert!(
+            store
+                .index_answering(
+                    "description",
+                    &FtsMemQuery::probe(DocumentGranularity::ListElement)
+                )
+                .is_none(),
+            "a whole-row index cannot say which list element matched"
+        );
+        assert!(
+            store.index_answering("id", &fts).is_none(),
+            "a B-tree does not answer a text query"
+        );
+    }
+
+    /// A vector and a full-text index have nothing to hand a value-stream
+    /// trainer, and say so rather than handing over an empty stream that would
+    /// train an empty index.
+    #[tokio::test]
+    async fn an_index_that_writes_its_own_file_offers_no_training_data() {
+        let arrow = create_test_schema();
+        let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
+        let specs = vec![
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            MemIndexSpec::fts("text_idx", 2, "description"),
+        ];
+        let store = IndexStore::from_specs(&specs, &lance, 1_000, 16).unwrap();
+
+        let batch = create_test_batch(&arrow, 1);
+        store.insert(&batch, 0).unwrap();
+
+        // The B-tree holds its rows sorted, which is exactly what its trainer
+        // wants, so it hands them over.
+        let btree = store.get_index("id_idx").unwrap();
+        let outcome = btree
+            .flush(&FlushContext::training_only(4096))
+            .await
+            .expect("a B-tree can always answer");
+        assert!(
+            matches!(outcome, FlushOutcome::TrainingData(_)),
+            "a B-tree saves the flush a sort"
+        );
+
+        // A full-text index assembles its file from the partitions it holds and
+        // has nothing for a value-stream trainer, so asking without a
+        // generation to write into is an error naming the index rather than an
+        // empty stream that would train an empty index.
+        let fts = store.get_index("text_idx").unwrap();
+        let Err(error) = fts.flush(&FlushContext::training_only(4096)).await else {
+            panic!("a full-text index has no training data to give");
+        };
+        assert!(
+            error.to_string().contains("description"),
+            "the error must name the index: {error}"
         );
     }
 
@@ -1800,19 +1922,18 @@ mod tests {
             (2, InvertedListFormatVersion::V2),
             (3, InvertedListFormatVersion::V3),
         ] {
-            let config =
-                MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
-                    .unwrap();
+            let config = FtsMemIndexPlugin::resolve_from_metadata(
+                "fts_idx",
+                &schema,
+                &fts_index_metadata(index_version),
+            )
+            .unwrap();
 
-            match config {
-                MemIndexConfig::Fts(config) => {
-                    assert_eq!(
-                        config.params.resolved_format_version(),
-                        expected_format_version
-                    );
-                }
-                _ => unreachable!("fts metadata should create an FTS config"),
-            }
+            let config = config.params.downcast_ref::<FtsParams>().unwrap();
+            assert_eq!(
+                config.params.resolved_format_version(),
+                expected_format_version
+            );
         }
     }
 
@@ -1821,7 +1942,9 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
+        let err =
+            FtsMemIndexPlugin::resolve_from_metadata("fts_idx", &schema, &fts_index_metadata(4))
+                .unwrap_err();
         assert!(
             err.to_string().contains("unsupported index_version 4"),
             "{err}"
@@ -1854,13 +1977,11 @@ mod tests {
             let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
             let mut metadata = fts_index_metadata_with_details(3, Some(details));
             metadata.fields = vec![tags.id];
-            let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
+            let config =
+                FtsMemIndexPlugin::resolve_from_metadata("fts_idx", &schema, &metadata).unwrap();
 
-            let MemIndexConfig::Fts(config) = config else {
-                unreachable!("fts metadata should create an FTS config")
-            };
-            assert_eq!(config.field_id, tags.id);
-            assert_eq!(config.column, "tags");
+            assert_eq!(config.columns, vec!["tags".to_string()]);
+            let config = config.params.downcast_ref::<FtsParams>().unwrap();
             assert_eq!(
                 config.params.get_document_granularity(),
                 lance_index::scalar::inverted::DocumentGranularity::ListElement
@@ -1884,8 +2005,13 @@ mod tests {
             fts_index_metadata(3),
             fts_index_metadata_with_details(3, Some(legacy_details)),
         ] {
-            let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
-            let MemIndexConfig::Fts(config) = config else {
+            let config =
+                FtsMemIndexPlugin::resolve_from_metadata("fts_idx", &schema, &metadata).unwrap();
+            let config = {
+                let c: &FtsParams = config.params.downcast_ref().unwrap();
+                c
+            };
+            if false {
                 unreachable!("FTS metadata should create an FTS config");
             };
             assert_eq!(
@@ -1903,40 +2029,30 @@ mod tests {
         let params = InvertedIndexParams::default().block_size(256).unwrap();
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
 
-        let config = MemIndexConfig::fts_from_metadata(
-            &fts_index_metadata_with_details(3, Some(details)),
+        let config = FtsMemIndexPlugin::resolve_from_metadata(
+            "fts_idx",
             &schema,
+            &fts_index_metadata_with_details(3, Some(details)),
         )
         .unwrap();
 
-        match config {
-            MemIndexConfig::Fts(config) => {
-                assert_eq!(
-                    config.params.resolved_format_version(),
-                    InvertedListFormatVersion::V3
-                );
-                assert_eq!(config.params.posting_block_size(), 256);
-            }
-            _ => unreachable!("fts metadata should create an FTS config"),
-        }
+        let config = config.params.downcast_ref::<FtsParams>().unwrap();
+        assert_eq!(
+            config.params.resolved_format_version(),
+            InvertedListFormatVersion::V3
+        );
+        assert_eq!(config.params.posting_block_size(), 256);
     }
 
     #[test]
     fn test_from_configs() {
         let configs = vec![
-            MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "pk_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            }),
-            MemIndexConfig::Fts(FtsIndexConfig::new(
-                "search_idx".to_string(),
-                2,
-                "description".to_string(),
-            )),
+            MemIndexSpec::btree("pk_idx", 0, "id"),
+            MemIndexSpec::fts("search_idx", 2, "description"),
         ];
 
-        let registry = IndexStore::from_configs(&configs, 100_000, 1_000).unwrap();
+        let lance_schema = LanceSchema::try_from(create_test_schema().as_ref()).unwrap();
+        let registry = IndexStore::from_specs(&configs, &lance_schema, 100_000, 1_000).unwrap();
         assert_eq!(registry.len(), 2);
         assert!(registry.get_btree("pk_idx").is_some());
         assert!(registry.get_fts("search_idx").is_some());
@@ -1952,12 +2068,9 @@ mod tests {
     #[test]
     fn test_resident_bytes_charges_hnsw_before_first_insert() {
         let max_rows = 100_000;
-        let btree_only = IndexStore::from_configs(
-            &[MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "pk_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            })],
+        let btree_only = IndexStore::from_specs(
+            &[MemIndexSpec::btree("pk_idx", 0, "id")],
+            &test_lance_schema(),
             max_rows,
             1_000,
         )
@@ -1968,13 +2081,9 @@ mod tests {
             "a BTree index allocates per row, so an untouched one holds nothing"
         );
 
-        let with_hnsw = IndexStore::from_configs(
-            &[MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-                "vec_idx".to_string(),
-                2,
-                "vector".to_string(),
-                DistanceType::L2,
-            )))],
+        let with_hnsw = IndexStore::from_specs(
+            &[MemIndexSpec::hnsw("vec_idx", 2, "vector", DistanceType::L2)],
+            &test_lance_schema(),
             max_rows,
             1_000,
         )
@@ -1983,6 +2092,37 @@ mod tests {
             with_hnsw.resident_bytes() > max_rows * 128,
             "the graph is sized from capacity and owed from configuration, got {}",
             with_hnsw.resident_bytes()
+        );
+    }
+
+    /// A plugin index grows as rows arrive, and the admission controller
+    /// budgets from `IndexStore::resident_bytes`. Leaving plugin indexes out of
+    /// the sum would hide that growth from the flush decision entirely.
+    #[test]
+    fn test_resident_bytes_includes_plugin_growth() {
+        let mut registry = IndexStore::new();
+        add_stub(&mut registry, "id_stub", "id");
+        assert_eq!(
+            registry.resident_bytes(),
+            0,
+            "an untouched plugin index holds nothing"
+        );
+
+        let schema = create_test_schema();
+        let batch = create_sized_batch(&schema, 0, 512);
+        registry.insert(&batch, 0).unwrap();
+
+        assert!(
+            registry.resident_bytes() > 0,
+            "indexed rows must be charged to the registry total"
+        );
+        assert_eq!(
+            registry.resident_bytes(),
+            registry
+                .get_plugin_index("id_stub")
+                .unwrap()
+                .resident_bytes(),
+            "the registry total must account for plugin indexes"
         );
     }
 
@@ -2008,44 +2148,45 @@ mod tests {
     /// a row is durable the shard could never reopen — poison-and-replay would
     /// not terminate.
     #[rstest]
-    #[case::btree_ok(MemIndexConfig::BTree(BTreeIndexConfig {
-        name: "idx".into(), field_id: 0, column: "id".into(),
-    }), None)]
-    #[case::btree_missing_column(MemIndexConfig::BTree(BTreeIndexConfig {
-        name: "idx".into(), field_id: 9, column: "nope".into(),
-    }), Some("not in the shard schema"))]
+    #[case::btree_ok(MemIndexSpec::btree("idx", 0, "id"), None)]
+    #[case::btree_missing_column(
+        MemIndexSpec::btree("idx", 9, "nope"),
+        Some("not in the shard schema")
+    )]
     // Column exists, but its field_id names a *different* column ("id" is 0, not 1).
-    #[case::btree_field_id_column_mismatch(MemIndexConfig::BTree(BTreeIndexConfig {
-        name: "idx".into(), field_id: 1, column: "id".into(),
-    }), Some("has field_id 0"))]
-    #[case::fts_ok(MemIndexConfig::Fts(FtsIndexConfig::new(
-        "idx".into(), 1, "description".into(),
-    )), None)]
-    #[case::fts_non_utf8(MemIndexConfig::Fts(FtsIndexConfig::new(
-        "idx".into(), 0, "id".into(),
-    )), Some("must resolve to Utf8, LargeUtf8, Utf8View, or JSON"))]
-    #[case::fts_missing_column(MemIndexConfig::Fts(FtsIndexConfig::new(
-        "idx".into(), 9, "nope".into(),
-    )), Some("does not exist in the dataset schema"))]
-    #[case::hnsw_ok(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-        "idx".into(), 2, "vector".into(), DistanceType::L2,
-    ))), None)]
-    #[case::hnsw_not_a_vector(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-        "idx".into(), 0, "id".into(), DistanceType::L2,
-    ))), Some("requires a FixedSizeList<Float32> column"))]
-    #[case::hnsw_wrong_item_type(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-        "idx".into(), 3, "f64_vector".into(), DistanceType::L2,
-    ))), Some("item type Float64"))]
-    #[case::hnsw_missing_column(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-        "idx".into(), 9, "nope".into(), DistanceType::L2,
-    ))), Some("not in the shard schema"))]
-    fn test_validate_index_configs(
-        #[case] config: MemIndexConfig,
+    #[case::btree_field_id_column_mismatch(
+        MemIndexSpec::btree("idx", 1, "id"),
+        Some("has field_id 0")
+    )]
+    #[case::fts_ok(MemIndexSpec::fts("idx", 1, "description"), None)]
+    #[case::fts_non_utf8(
+        MemIndexSpec::fts("idx", 0, "id"),
+        Some("must resolve to Utf8, LargeUtf8, Utf8View, or JSON")
+    )]
+    #[case::fts_missing_column(
+        MemIndexSpec::fts("idx", 9, "nope"),
+        Some("does not exist in the dataset schema")
+    )]
+    #[case::hnsw_ok(MemIndexSpec::hnsw("idx", 2, "vector", DistanceType::L2), None)]
+    #[case::hnsw_not_a_vector(
+        MemIndexSpec::hnsw("idx", 0, "id", DistanceType::L2),
+        Some("requires a FixedSizeList<Float32> column")
+    )]
+    #[case::hnsw_wrong_item_type(
+        MemIndexSpec::hnsw("idx", 3, "f64_vector", DistanceType::L2),
+        Some("item type Float64")
+    )]
+    #[case::hnsw_missing_column(
+        MemIndexSpec::hnsw("idx", 9, "nope", DistanceType::L2),
+        Some("not in the shard schema")
+    )]
+    fn test_validate_index_specs(
+        #[case] config: MemIndexSpec,
         #[case] expected_error: Option<&str>,
     ) {
         let schema = vector_schema();
         let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let result = validate_index_configs(&[config], &schema, &lance_schema, &[]);
+        let result = validate_index_specs(&[config], &schema, &lance_schema, &[]);
         match expected_error {
             None => result.expect("valid config must pass validation"),
             Some(fragment) => {
@@ -2081,27 +2222,27 @@ mod tests {
 
         let params = InvertedIndexParams::default()
             .document_granularity(lance_index::scalar::inverted::DocumentGranularity::ListElement);
-        let config = MemIndexConfig::Fts(FtsIndexConfig::with_params(
-            "idx".into(),
+        let config = MemIndexSpec::fts_with_params(
+            "idx",
             resolved.final_field_id,
-            "groups.docs.content".into(),
+            "groups.docs.content",
             params.clone(),
-        ));
-        validate_index_configs(&[config], &schema, &lance_schema, &[]).unwrap();
+        );
+        validate_index_specs(&[config], &schema, &lance_schema, &[]).unwrap();
 
-        let wrong_field_id = MemIndexConfig::Fts(FtsIndexConfig::with_params(
-            "idx".into(),
+        let wrong_field_id = MemIndexSpec::fts_with_params(
+            "idx",
             resolved.final_field_id + 1,
-            "groups.docs.content".into(),
+            "groups.docs.content",
             params,
-        ));
+        );
         let error =
-            validate_index_configs(&[wrong_field_id], &schema, &lance_schema, &[]).unwrap_err();
+            validate_index_specs(&[wrong_field_id], &schema, &lance_schema, &[]).unwrap_err();
         assert!(error.to_string().contains("final field_id"), "{error}");
     }
 
     #[test]
-    fn test_validate_index_configs_rejects_diverged_lance_schema() {
+    fn test_validate_index_specs_rejects_diverged_lance_schema() {
         let arrow_schema = ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
         let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![Field::new(
             "other",
@@ -2109,13 +2250,9 @@ mod tests {
             false,
         )]))
         .expect("test Lance schema must be valid");
-        let config = MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "idx".into(),
-            field_id: 0,
-            column: "id".into(),
-        });
+        let config = MemIndexSpec::btree("idx", 0, "id");
 
-        let error = validate_index_configs(&[config], &arrow_schema, &lance_schema, &[])
+        let error = validate_index_specs(&[config], &arrow_schema, &lance_schema, &[])
             .expect_err("diverged Arrow and Lance schemas must be rejected");
         assert!(
             matches!(error, Error::InvalidInput { .. }),
@@ -2131,8 +2268,9 @@ mod tests {
             "error must name the column: {message}"
         );
         assert!(
-            message.contains("absent from the Lance schema"),
-            "error must explain the schema divergence: {message}"
+            message.contains("available columns: [other]"),
+            "error must show what the schema does hold, which is what makes the \
+             divergence visible: {message}"
         );
     }
 
@@ -2152,11 +2290,11 @@ mod tests {
         ]));
         let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
 
-        validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "name".into()])
+        validate_index_specs(&[], &schema, &lance_schema, &["id".into(), "name".into()])
             .expect("Int32 + Utf8 composite PK must be encodable");
 
         let err =
-            validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "coords".into()])
+            validate_index_specs(&[], &schema, &lance_schema, &["id".into(), "coords".into()])
                 .expect_err("a FixedSizeList PK column has no order-preserving encoding");
         assert!(
             err.to_string().contains("order-preserving key encoding"),
@@ -2164,13 +2302,13 @@ mod tests {
         );
 
         // A single-column PK of the same type is fine: it aliases a BTree.
-        validate_index_configs(&[], &schema, &lance_schema, &["coords".into()])
+        validate_index_specs(&[], &schema, &lance_schema, &["coords".into()])
             .expect("single-column PK aliases a BTree and accepts any type");
 
         // But every PK column must exist. A single-column PK naming an absent
         // column is rejected here, not left to fail deterministically on every
         // later index build and WAL replay.
-        let err = validate_index_configs(&[], &schema, &lance_schema, &["missing".into()])
+        let err = validate_index_specs(&[], &schema, &lance_schema, &["missing".into()])
             .expect_err("a single-column PK on an absent column must be rejected");
         assert!(
             err.to_string().contains("not in the shard schema"),
@@ -2223,15 +2361,17 @@ mod tests {
         let mut registry = IndexStore::new();
         registry.add_btree("id_idx".to_string(), 0, "id".to_string());
         registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
+        add_stub(&mut registry, "id_stub", "id");
 
         let batch = create_sized_batch(&schema, 0, num_rows);
         let durations = registry
             .insert_batches(&[StoredBatch::new(batch, 0, 2)])
             .unwrap();
 
-        assert_eq!(durations.len(), 2, "expected one timing per index");
+        assert_eq!(durations.len(), 3, "expected one timing per index");
         assert!(durations.contains_key("id_idx"));
         assert!(durations.contains_key("desc_idx"));
+        assert!(durations.contains_key("id_stub"));
 
         let btree = registry.get_btree("id_idx").unwrap();
         for id in 0..num_rows as i32 {
@@ -2243,6 +2383,23 @@ mod tests {
             );
         }
         assert_eq!(registry.get_fts("desc_idx").unwrap().doc_count(), num_rows);
+
+        let stub = registry.get_plugin_index("id_stub").unwrap();
+        for id in 0..num_rows as i32 {
+            let query = ScalarPredicate::Eq {
+                column: "id".to_string(),
+                value: ScalarValue::Int32(Some(id)),
+            };
+            let found = stub
+                .search(&query, &SearchContext::new(u64::MAX))
+                .unwrap()
+                .expect("the stub answers equality");
+            let positions = found.as_filter().expect("a filter answer").possible.len();
+            assert_eq!(
+                positions, 1,
+                "id={id} should be indexed exactly once, got {positions}"
+            );
+        }
         assert_eq!(registry.indexed_count(), 3);
     }
 

@@ -2333,20 +2333,18 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_against_from_configs_built_index() {
         // A point lookup against an index built the production way
-        // (`IndexStore::from_configs`) resolves correctly via the seek-and-stop
+        // (`IndexStore::from_specs`) resolves correctly via the seek-and-stop
         // skiplist probe.
-        use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
+        use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
 
         let schema = create_pk_schema();
         let batch = create_test_batch(&schema, &[10, 20, 30], "v");
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let index_store = IndexStore::from_configs(
-            &[MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "id_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            })],
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &lance_schema,
             1000,
             100,
         )

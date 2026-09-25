@@ -26,6 +26,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
+use crate::dataset::mem_wal::index::{FtsMemQuery, MemQuery, VectorMemQuery};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -466,6 +467,12 @@ pub enum ScalarPredicate {
         column: String,
         values: Vec<ScalarValue>,
     },
+}
+
+impl crate::dataset::mem_wal::index::MemQuery for ScalarPredicate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ScalarPredicate {
@@ -1056,7 +1063,7 @@ impl MemTableScanner {
         // Check if we can use a BTree index for the filter
         if self.use_index
             && let Some(predicate) = self.extract_btree_predicate()
-            && self.has_btree_index(predicate.column())
+            && self.has_btree_index(predicate.column(), &predicate)
         {
             return self.plan_btree_query(&predicate).await;
         }
@@ -1164,7 +1171,7 @@ impl MemTableScanner {
         &self,
         predicate: &ScalarPredicate,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_btree_index(predicate.column()) {
+        if !self.has_btree_index(predicate.column(), predicate) {
             return self.plan_full_scan().await;
         }
 
@@ -1549,30 +1556,35 @@ impl MemTableScanner {
         safe_coerce_scalar(lit, target_type)
     }
 
-    /// Check if a BTree index exists for a column.
-    fn has_btree_index(&self, column: &str) -> bool {
-        self.indexes.get_btree_by_column(column).is_some()
+    /// Whether some index on `column` can answer `query`.
+    ///
+    /// One check for every family: planning hands an index the shape of the
+    /// question and takes its answer, rather than asking what type it is.
+    fn has_index_for(&self, column: &str, query: &dyn MemQuery) -> bool {
+        self.indexes.index_answering(column, query).is_some()
     }
 
-    /// Check if a vector index exists for a column.
-    /// Whether an HNSW index on `column` can answer a query in `distance_type`.
+    /// Whether some index on `column` can answer this predicate.
+    fn has_btree_index(&self, column: &str, predicate: &ScalarPredicate) -> bool {
+        self.has_index_for(column, predicate)
+    }
+
+    /// Whether an index on `column` can answer a vector search in
+    /// `distance_type`.
     ///
-    /// The graph's metric is baked into its structure, so a query asking for a
+    /// A graph's metric is baked into its structure, so a query asking for a
     /// different one has to brute-force instead — the same fallback
     /// `Scanner::vector_search` applies when a requested metric disagrees with
     /// a base index. `None` means "use the index's metric", which always
     /// matches.
     fn has_vector_index(&self, column: &str, distance_type: Option<DistanceType>) -> bool {
-        self.indexes
-            .get_hnsw_by_column(column)
-            .is_some_and(|hnsw| distance_type.is_none_or(|dt| dt == hnsw.distance_type()))
+        self.has_index_for(column, &VectorMemQuery::probe(distance_type))
     }
 
-    /// Check if an FTS index exists for a column.
+    /// Whether an index on `column` can answer a full-text search at this
+    /// document granularity.
     fn has_fts_index(&self, column: &str, document_granularity: DocumentGranularity) -> bool {
-        self.indexes
-            .get_fts_by_column_and_granularity(column, document_granularity)
-            .is_some()
+        self.has_index_for(column, &FtsMemQuery::probe(document_granularity))
     }
 }
 
