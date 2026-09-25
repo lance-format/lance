@@ -23,6 +23,7 @@
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -34,16 +35,16 @@ use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::scalar::btree::OrderableScalarValue;
+use lance_index::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_index::scalar::{SargableQuery, compute_next_prefix};
 
 use super::RowPosition;
 use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
-use crate::dataset::mem_wal::memtable::scanner::ScalarPredicate;
-
 use super::plugin::{
     FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, PrimaryKeyIndex,
 };
-use super::query::{MemMatches, MemQuery, SearchContext};
+use super::query::{MemMatches, MemQuery, MemSearchResult, PositionSet, SearchContext};
 
 /// Composite key for the scalar (fallback) backend.
 ///
@@ -1232,7 +1233,16 @@ impl super::plugin::MemIndex for BTreeMemIndex {
     }
 
     fn can_answer(&self, query: &dyn MemQuery) -> bool {
-        query.as_any().downcast_ref::<ScalarPredicate>().is_some()
+        matches!(
+            query.as_any().downcast_ref::<SargableQuery>(),
+            Some(
+                SargableQuery::Equals(_)
+                    | SargableQuery::IsIn(_)
+                    | SargableQuery::Range(_, _)
+                    | SargableQuery::IsNull()
+                    | SargableQuery::LikePrefix(_)
+            )
+        )
     }
 
     fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
@@ -1243,30 +1253,36 @@ impl super::plugin::MemIndex for BTreeMemIndex {
         Self::resident_bytes(self)
     }
 
-    /// Resolve a scalar predicate to visible positions.
-    ///
-    /// This used to live in the execution-plan node, which is why a range
-    /// walked a whole snapshot: the node had no way to ask the backend for a
-    /// range. Here it can, so a range visits only the matching keys.
     fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
-        let Some(predicate) = query.as_any().downcast_ref::<ScalarPredicate>() else {
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
             return Ok(None);
         };
 
-        let mut positions = match predicate {
-            ScalarPredicate::Eq { value, .. } => self.get(value),
-            ScalarPredicate::In { values, .. } => {
+        let positions = match query {
+            SargableQuery::Equals(value) => self.get(value),
+            SargableQuery::IsIn(values) => {
                 values.iter().flat_map(|value| self.get(value)).collect()
             }
-            ScalarPredicate::Range { lower, upper, .. } => {
-                self.range(lower.as_ref(), upper.as_ref())
-            }
+            SargableQuery::Range(lower, upper) => self.bounded_range(lower, upper),
+            SargableQuery::IsNull() => match self.null_value() {
+                Some(null) => self.get(&null),
+                // Nothing has been inserted, so nothing is null.
+                None => Vec::new(),
+            },
+            SargableQuery::LikePrefix(prefix) => match self.prefix_range(prefix) {
+                Some(positions) => positions,
+                // Not a string prefix this index can turn into a range.
+                None => return Ok(None),
+            },
+            // A sorted map of whole values cannot score a text query.
+            SargableQuery::FullTextSearch(_) => return Ok(None),
         };
 
-        positions.retain(|position| *position <= ctx.max_visible);
-        positions.sort_unstable();
-        positions.dedup();
-        Ok(Some(MemMatches::exact(positions)))
+        let visible: PositionSet = positions
+            .into_iter()
+            .filter(|position| *position <= ctx.max_visible)
+            .collect();
+        Ok(Some(MemMatches::Filter(MemSearchResult::exact(visible))))
     }
 
     async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
@@ -1299,7 +1315,65 @@ impl PrimaryKeyIndex for BTreeMemIndex {
     }
 }
 
-impl BTreeMemIndex {}
+impl BTreeMemIndex {
+    /// Positions whose value falls between `lower` and `upper`, honouring
+    /// whether each bound is inclusive.
+    ///
+    /// The backing walk is half-open, so an inclusive upper bound adds that
+    /// key's positions and an exclusive lower bound removes them. Both are one
+    /// extra point lookup, which is what the ordered structure is good at.
+    fn bounded_range(
+        &self,
+        lower: &Bound<ScalarValue>,
+        upper: &Bound<ScalarValue>,
+    ) -> Vec<RowPosition> {
+        let lower_value = match lower {
+            Bound::Included(value) | Bound::Excluded(value) => Some(value),
+            Bound::Unbounded => None,
+        };
+        let upper_value = match upper {
+            Bound::Included(value) | Bound::Excluded(value) => Some(value),
+            Bound::Unbounded => None,
+        };
+
+        let mut positions = self.range(lower_value, upper_value);
+        if let Bound::Excluded(value) = lower {
+            let excluded = self.get(value);
+            positions.retain(|position| !excluded.contains(position));
+        }
+        if let Bound::Included(value) = upper {
+            positions.extend(self.get(value));
+        }
+        positions
+    }
+
+    /// Positions whose value starts with `prefix`, or `None` when the prefix is
+    /// not a string this index can turn into a range.
+    fn prefix_range(&self, prefix: &ScalarValue) -> Option<Vec<RowPosition>> {
+        let (ScalarValue::Utf8(Some(text))
+        | ScalarValue::LargeUtf8(Some(text))
+        | ScalarValue::Utf8View(Some(text))) = prefix
+        else {
+            return None;
+        };
+        // Everything with the prefix sorts in `[prefix, next_prefix)`. Without
+        // a next prefix — the prefix is all maximal code points — everything
+        // from the prefix onwards is a match.
+        let lower = Bound::Included(prefix.clone());
+        let upper = match compute_next_prefix(text) {
+            Some(next) => Bound::Excluded(ScalarValue::Utf8(Some(next))),
+            None => Bound::Unbounded,
+        };
+        Some(self.bounded_range(&lower, &upper))
+    }
+
+    /// The typed null for this index's column, or `None` before the first
+    /// insert settles the type.
+    fn null_value(&self) -> Option<ScalarValue> {
+        let data_type = self.data_type()?;
+        ScalarValue::try_from(&data_type).ok()
+    }
+}
 
 /// Declares the built-in B-tree memtable index.
 #[derive(Debug, Default)]
@@ -1323,6 +1397,22 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
         TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
     }
 
+    fn query_parser(
+        &self,
+        index_name: String,
+        _index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // The parser the on-disk B-tree uses, so the two claim the same
+        // expressions and a filter cannot reach one without the other.
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            "BTree".to_string(),
+            false,
+        )))
+    }
+
+    /// A B-tree falls back to per-row `ScalarValue` extraction, so it accepts
+    /// any column type the schema can hold. Existence is the only rule.
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
         ctx.single_column()?;
         ctx.check_columns_resolve()

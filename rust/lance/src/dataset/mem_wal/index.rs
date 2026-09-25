@@ -19,12 +19,14 @@
 /// that take no lock, and nothing reclaimed until the whole index is dropped.
 pub mod arena_skiplist;
 mod btree;
+mod filter;
 mod fts;
 mod hnsw;
 mod pk_key;
 mod plugin;
 mod query;
 
+pub use filter::{MemIndexInfo, evaluate as evaluate_index_filter, plan_filter, positions};
 pub use plugin::{
     FlushContext, FlushOutcome, GenerationWrite, MemIndex, MemIndexBuildContext, MemIndexPlugin,
     MemIndexRegistry, MemIndexSpec, ParamsContext, PrimaryKeyIndex, ResolvedIndex,
@@ -287,6 +289,11 @@ pub struct IndexStore {
     /// other, left out of the memory total, and missed by the flush — and each
     /// was a collection someone forgot. There is nothing left to forget.
     indexes: HashMap<String, Arc<dyn MemIndex>>,
+    /// How a filter expression reaches these indexes.
+    ///
+    /// Built once, from the plugins, because a query parser is settled by the
+    /// base-table index's details and never changes for a memtable's lifetime.
+    filter_info: Arc<MemIndexInfo>,
     /// The primary-key index (single-column or composite), or `None` without a
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
@@ -319,6 +326,7 @@ impl Default for IndexStore {
     fn default() -> Self {
         Self {
             indexes: HashMap::new(),
+            filter_info: Arc::new(MemIndexInfo::default()),
 
             pk_index: None,
             indexed_count: AtomicUsize::new(0),
@@ -383,6 +391,7 @@ impl IndexStore {
             let index = spec.build(schema, max_rows, max_batches)?;
             registry.indexes.insert(spec.name.clone(), index);
         }
+        registry.filter_info = MemIndexInfo::for_specs(specs, schema);
         Ok(registry)
     }
 
@@ -927,6 +936,11 @@ impl IndexStore {
             .filter_map(|index| (index.as_ref() as &dyn Any).downcast_ref::<T>())
     }
 
+    /// How a filter expression reaches these indexes.
+    pub fn filter_info(&self) -> &MemIndexInfo {
+        &self.filter_info
+    }
+
     /// The index named `name`, whatever kind maintains it.
     pub fn get_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
         self.indexes.get(name)
@@ -1145,9 +1159,9 @@ mod tests {
         FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin,
     };
     use super::query::{MemMatches, MemQuery, SearchContext};
-    use crate::dataset::mem_wal::memtable::scanner::ScalarPredicate;
     use lance_index::IndexType;
     use lance_index::pbold;
+    use lance_index::scalar::SargableQuery;
     use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
     use lance_table::format::IndexMetadata;
     use prost::Message as _;
@@ -1191,8 +1205,8 @@ mod tests {
 
         fn can_answer(&self, query: &dyn MemQuery) -> bool {
             matches!(
-                query.as_any().downcast_ref::<ScalarPredicate>(),
-                Some(ScalarPredicate::Eq { .. } | ScalarPredicate::In { .. })
+                query.as_any().downcast_ref::<SargableQuery>(),
+                Some(SargableQuery::Equals(_) | SargableQuery::IsIn(_))
             )
         }
 
@@ -1223,16 +1237,16 @@ mod tests {
         }
 
         fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
-            let Some(query) = query.as_any().downcast_ref::<ScalarPredicate>() else {
+            let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
                 return Ok(None);
             };
             let postings = self.postings.read().unwrap();
             let hits: Vec<RowPosition> = match query {
-                ScalarPredicate::Eq { value, .. } => postings
+                SargableQuery::Equals(value) => postings
                     .get(&value.to_string())
                     .cloned()
                     .unwrap_or_default(),
-                ScalarPredicate::In { values, .. } => values
+                SargableQuery::IsIn(values) => values
                     .iter()
                     .filter_map(|value| postings.get(&value.to_string()))
                     .flatten()
@@ -1267,6 +1281,19 @@ mod tests {
         fn training_criteria(&self) -> TrainingCriteria {
             TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
         }
+        fn query_parser(
+            &self,
+            index_name: String,
+            _index_details: Option<&prost_types::Any>,
+        ) -> Option<Box<dyn lance_index::scalar::expression::ScalarQueryParser>> {
+            Some(Box::new(
+                lance_index::scalar::expression::SargableQueryParser::new(
+                    index_name,
+                    "Stub".to_string(),
+                    false,
+                ),
+            ))
+        }
         fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
             ctx.single_column().map(|_| ())
         }
@@ -1283,6 +1310,7 @@ mod tests {
             columns: vec![column.to_string()],
             plugin: Arc::new(StubPlugin),
             params: Arc::new(()),
+            details: None,
         };
         registry.add_index(
             name.to_string(),
@@ -1441,10 +1469,7 @@ mod tests {
         ];
         let store = IndexStore::from_specs(&specs, &lance, 1_000, 16).unwrap();
 
-        let equality = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(1)),
-        };
+        let equality = SargableQuery::Equals(ScalarValue::Int32(Some(1)));
         assert!(
             store.index_answering("id", &equality).is_some(),
             "the B-tree answers equality on its column"
@@ -2386,10 +2411,7 @@ mod tests {
 
         let stub = registry.get_plugin_index("id_stub").unwrap();
         for id in 0..num_rows as i32 {
-            let query = ScalarPredicate::Eq {
-                column: "id".to_string(),
-                value: ScalarValue::Int32(Some(id)),
-            };
+            let query = SargableQuery::Equals(ScalarValue::Int32(Some(id)));
             let found = stub
                 .search(&query, &SearchContext::new(u64::MAX))
                 .unwrap()

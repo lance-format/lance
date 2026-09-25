@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! BTreeIndexExec - BTree index queries with MVCC visibility.
+//! `ScalarIndexExec` — scalar-index queries over a memtable, with MVCC visibility.
+//!
+//! Serves the built-in B-tree and any index a registered plugin maintains: the
+//! predicate resolves to row positions, and everything after that — position to
+//! batch, projection, row id and row address — is the same work either way.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -18,53 +22,64 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
-use lance_core::{Error, Result};
+use lance_core::Result;
 
-use super::super::builder::ScalarPredicate;
-use crate::dataset::mem_wal::index::{MemMatches, MemQuery, SearchContext};
+use lance_index::scalar::expression::ScalarIndexExpr;
+
+use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter, positions};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
-/// ExecutionPlan node that queries BTree index with visibility filtering.
-pub struct BTreeIndexExec {
+/// Execution-plan node answering a filter from the memtable's indexes,
+/// filtered by visibility.
+pub struct ScalarIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
-    predicate: ScalarPredicate,
+    /// The index searches the filter was split into: a tree of `AND`/`OR` over
+    /// per-index queries, built by the same pass the base table's scan uses.
+    index_expr: ScalarIndexExpr,
+    /// The whole filter, compiled.
+    ///
+    /// Applied to the rows the indexes narrowed to. It is the filter itself
+    /// rather than a re-reading of the queries, because the two are not always
+    /// the same question — an R-tree narrows a spatial relation down to a
+    /// bounding box, and only the filter knows the relation that box stands in
+    /// for. `None` when the indexes answered exactly and nothing is left.
+    recheck: Option<PhysicalExprRef>,
     readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    /// Column name of the indexed field.
-    column: String,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
     /// Whether to include _rowaddr column (same as row position) in output.
     with_row_address: bool,
 }
 
-impl Debug for BTreeIndexExec {
+impl Debug for ScalarIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BTreeIndexExec")
-            .field("predicate", &self.predicate)
+        f.debug_struct("ScalarIndexExec")
+            .field("index_expr", &self.index_expr)
+            .field("rechecked", &self.recheck.is_some())
             .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_address", &self.with_row_address)
-            .field("column", &self.column)
             .finish()
     }
 }
 
-impl BTreeIndexExec {
-    /// Create a new BTreeIndexExec.
+impl ScalarIndexExec {
+    /// Create a new ScalarIndexExec.
     ///
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `indexes` - Index registry with BTree indexes
-    /// * `predicate` - Scalar predicate to apply
+    /// * `indexes` - Index registry holding the scalar index for the column
+    /// * `index_expr` - The index searches the filter was split into
+    /// * `recheck` - The whole filter, compiled, for rows an index only narrowed
     /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
@@ -74,25 +89,14 @@ impl BTreeIndexExec {
     pub fn new(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
-        predicate: ScalarPredicate,
+        index_expr: ScalarIndexExpr,
+        recheck: Option<PhysicalExprRef>,
         readable_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         with_row_id: bool,
         with_row_address: bool,
     ) -> Result<Self> {
-        // Verify some index covers this column and can answer the predicate.
-        let column = predicate.column().to_string();
-        if indexes
-            .index_answering(&column, predicate_ref(&predicate))
-            .is_none()
-        {
-            return Err(Error::invalid_input(format!(
-                "No scalar index found for column '{}'",
-                column
-            )));
-        }
-
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -103,13 +107,13 @@ impl BTreeIndexExec {
         Ok(Self {
             batch_store,
             indexes,
-            predicate,
+            index_expr,
+            recheck,
             readable_count,
             projection,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            column,
             with_row_id,
             with_row_address,
         })
@@ -136,29 +140,61 @@ impl BTreeIndexExec {
         }
     }
 
-    /// Query the index and return matching row positions filtered by visibility.
-    /// Ask whichever index covers the column, and return the positions a
-    /// reader may see.
-    ///
-    /// The node does not know which kind answered. Resolving by what an index
-    /// can answer rather than by which type it is is what lets a registered
-    /// plugin serve a column here.
-    fn query_index(&self) -> Vec<u64> {
+    /// Evaluate the index searches and return matching row positions, filtered
+    /// by visibility, with whether the answer still needs the filter applied.
+    fn query_index(&self) -> (Vec<u64>, bool) {
         let Some(max_readable_row) = self.compute_max_readable_row() else {
-            return vec![];
+            return (vec![], true);
         };
-        let Some(index) = self.indexes.index_answering(&self.column, &self.predicate) else {
-            return vec![];
-        };
-        // An index that fails must not silently answer "no rows"; returning
-        // nothing here keeps the caller's own behaviour rather than dropping
-        // rows that do match.
-        let Ok(Some(MemMatches::Filter(result))) =
-            index.search(&self.predicate, &SearchContext::new(max_readable_row))
-        else {
-            return vec![];
-        };
-        result.possible.iter().collect()
+        let ctx = SearchContext::new(max_readable_row);
+        match evaluate_index_filter(&self.index_expr, &self.indexes, &ctx) {
+            Ok(result) => positions(result),
+            // A failing index must not silently answer "no rows". Hand back
+            // every visible row and let the filter decide, which is a scan
+            // done in place.
+            Err(_) => ((0..=max_readable_row).collect(), false),
+        }
+    }
+
+    /// Keep only the candidate rows the filter accepts.
+    ///
+    /// Evaluated once per stored batch rather than once per row: the candidates
+    /// from one batch arrive together, and a spatial or string predicate costs
+    /// far more per call than the mask does per row.
+    fn retain_matching_rows(
+        &self,
+        batch_rows: Vec<(usize, usize, u64)>,
+        recheck: &PhysicalExprRef,
+    ) -> DataFusionResult<Vec<(usize, usize, u64)>> {
+        let mut kept = Vec::with_capacity(batch_rows.len());
+        let mut current: Option<(usize, BooleanArray)> = None;
+        for (batch_id, row_in_batch, position) in batch_rows {
+            if current.as_ref().is_none_or(|(id, _)| *id != batch_id) {
+                let Some(stored) = self.batch_store.get(batch_id) else {
+                    continue;
+                };
+                let evaluated = recheck.evaluate(&stored.data)?;
+                let mask = evaluated.into_array(stored.data.num_rows())?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(
+                            "a filter must evaluate to a boolean".to_string(),
+                        )
+                    })?
+                    .clone();
+                current = Some((batch_id, mask));
+            }
+            // A null result is not a match, as it is not in a full scan.
+            if current
+                .as_ref()
+                .is_some_and(|(_, mask)| mask.is_valid(row_in_batch) && mask.value(row_in_batch))
+            {
+                kept.push((batch_id, row_in_batch, position));
+            }
+        }
+        Ok(kept)
     }
 
     /// Convert row positions to batch_id, row_within_batch, and original row_position tuples.
@@ -174,15 +210,20 @@ impl BTreeIndexExec {
             current_row = batch_end;
         }
 
-        // Convert positions to (batch_id, row_in_batch, original_row_position) tuples
-        let mut result = Vec::new();
+        // Batch ranges are contiguous and ascending, so the owning batch is a
+        // binary search rather than a walk. A linear scan here cost one pass
+        // over every batch for every matching row.
+        let mut result = Vec::with_capacity(positions.len());
         for &pos in positions {
             let pos_usize = pos as usize;
-            for (batch_id, &(start, end)) in batch_ranges.iter().enumerate() {
-                if pos_usize >= start && pos_usize < end {
-                    result.push((batch_id, pos_usize - start, pos));
-                    break;
-                }
+            let found = batch_ranges.partition_point(|(start, _)| *start <= pos_usize);
+            if found == 0 {
+                continue;
+            }
+            let batch_id = found - 1;
+            let (start, end) = batch_ranges[batch_id];
+            if pos_usize < end {
+                result.push((batch_id, pos_usize - start, pos));
             }
         }
         result
@@ -270,30 +311,36 @@ impl BTreeIndexExec {
     }
 }
 
-impl DisplayAs for BTreeIndexExec {
+impl DisplayAs for ScalarIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "BTreeIndexExec: predicate={:?}, column={}, with_row_id={}, with_row_address={}",
-                    self.predicate, self.column, self.with_row_id, self.with_row_address
+                    "ScalarIndexExec: query={}, rechecked={}, with_row_id={}, with_row_address={}",
+                    self.index_expr.to_expr(),
+                    self.recheck.is_some(),
+                    self.with_row_id,
+                    self.with_row_address
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "BTreeIndexExec\npredicate={:?}\ncolumn={}\nwith_row_id={}\nwith_row_address={}",
-                    self.predicate, self.column, self.with_row_id, self.with_row_address
+                    "ScalarIndexExec\nquery={}\nrechecked={}\nwith_row_id={}\nwith_row_address={}",
+                    self.index_expr.to_expr(),
+                    self.recheck.is_some(),
+                    self.with_row_id,
+                    self.with_row_address
                 )
             }
         }
     }
 }
 
-impl ExecutionPlan for BTreeIndexExec {
+impl ExecutionPlan for ScalarIndexExec {
     fn name(&self) -> &str {
-        "BTreeIndexExec"
+        "ScalarIndexExec"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -310,7 +357,7 @@ impl ExecutionPlan for BTreeIndexExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
-                "BTreeIndexExec does not have children".to_string(),
+                "ScalarIndexExec does not have children".to_string(),
             ));
         }
         Ok(self)
@@ -322,10 +369,22 @@ impl ExecutionPlan for BTreeIndexExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Query the index
-        let positions = self.query_index();
+        let (positions, exact) = self.query_index();
 
         // Convert positions to batch/row pairs with visibility filtering
-        let batch_rows = self.positions_to_batch_rows(&positions);
+        let mut batch_rows = self.positions_to_batch_rows(&positions);
+
+        // An index that only narrows hands back candidates, so the filter
+        // decides here. Dropping this would surface rows that do not match.
+        if !exact {
+            let Some(recheck) = &self.recheck else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "an index narrowed without deciding, but no filter was given to re-check with"
+                        .to_string(),
+                ));
+            };
+            batch_rows = self.retain_matching_rows(batch_rows, recheck)?;
+        }
 
         // Materialize the rows
         let batches = self.materialize_rows(&batch_rows)?;
@@ -360,11 +419,6 @@ impl ExecutionPlan for BTreeIndexExec {
     }
 }
 
-/// A predicate as the query an index is asked.
-fn predicate_ref(predicate: &ScalarPredicate) -> &dyn MemQuery {
-    predicate
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +426,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::ScalarValue;
     use futures::TryStreamExt;
+    use lance_index::scalar::SargableQuery;
+    use lance_index::scalar::expression::ScalarIndexSearch;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -394,6 +450,18 @@ mod tests {
         .unwrap()
     }
 
+    /// One index search, the way the expression pass produces it.
+    fn search(index_name: &str, column: &str, query: SargableQuery) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(query),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
     #[tokio::test]
     async fn test_btree_index_eq_query() {
         let schema = create_test_schema();
@@ -410,15 +478,17 @@ mod tests {
 
         let indexes = Arc::new(registry);
 
-        let predicate = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(5)),
-        };
+        let index_expr = search(
+            "id_idx",
+            "id",
+            SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+        );
 
-        let exec = BTreeIndexExec::new(
+        let exec = ScalarIndexExec::new(
             batch_store,
             indexes,
-            predicate,
+            index_expr,
+            None,
             1, // readable_count (batch at position 0)
             None,
             schema,
@@ -450,19 +520,21 @@ mod tests {
 
         let indexes = Arc::new(registry);
 
-        let predicate = ScalarPredicate::In {
-            column: "id".to_string(),
-            values: vec![
+        let index_expr = search(
+            "id_idx",
+            "id",
+            SargableQuery::IsIn(vec![
                 ScalarValue::Int32(Some(2)),
                 ScalarValue::Int32(Some(5)),
                 ScalarValue::Int32(Some(8)),
-            ],
-        };
+            ]),
+        );
 
-        let exec = BTreeIndexExec::new(
+        let exec = ScalarIndexExec::new(
             batch_store,
             indexes,
-            predicate,
+            index_expr,
+            None,
             1,
             None,
             schema,
@@ -498,16 +570,18 @@ mod tests {
 
         let indexes = Arc::new(registry);
 
-        let predicate = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(15)),
-        };
+        let index_expr = search(
+            "id_idx",
+            "id",
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
+        );
 
         // Query with max_readable=0 should not see batch at position 1
-        let exec = BTreeIndexExec::new(
+        let exec = ScalarIndexExec::new(
             batch_store.clone(),
             indexes.clone(),
-            predicate.clone(),
+            index_expr.clone(),
+            None,
             1,
             None,
             schema.clone(),
@@ -524,10 +598,11 @@ mod tests {
         assert_eq!(total_rows, 0);
 
         // Query with max_readable=1 should see both batches
-        let exec = BTreeIndexExec::new(
+        let exec = ScalarIndexExec::new(
             batch_store,
             indexes,
-            predicate,
+            index_expr,
+            None,
             2,
             None,
             schema,
@@ -568,15 +643,17 @@ mod tests {
             Field::new("_rowid", DataType::UInt64, true),
         ]));
 
-        let predicate = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(5)),
-        };
+        let index_expr = search(
+            "id_idx",
+            "id",
+            SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+        );
 
-        let exec = BTreeIndexExec::new(
+        let exec = ScalarIndexExec::new(
             batch_store,
             indexes,
-            predicate,
+            index_expr,
+            None,
             1,
             None,
             schema_with_rowid.clone(),
@@ -630,17 +707,19 @@ mod tests {
 
         let indexes = Arc::new(indexes);
 
-        let predicate = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(5)),
-        };
+        let index_expr = search(
+            "id_idx",
+            "id",
+            SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+        );
 
         // Test plan display without _rowid
         let exec: Arc<dyn ExecutionPlan> = Arc::new(
-            BTreeIndexExec::new(
+            ScalarIndexExec::new(
                 batch_store.clone(),
                 indexes.clone(),
-                predicate.clone(),
+                index_expr.clone(),
+                None,
                 1,
                 None,
                 schema.clone(),
@@ -652,7 +731,7 @@ mod tests {
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=false, with_row_address=false",
+            "ScalarIndexExec: query=id = Int32(5), rechecked=false, with_row_id=false, with_row_address=false",
         )
         .await
         .unwrap();
@@ -665,10 +744,11 @@ mod tests {
         ]));
 
         let exec: Arc<dyn ExecutionPlan> = Arc::new(
-            BTreeIndexExec::new(
+            ScalarIndexExec::new(
                 batch_store,
                 indexes,
-                predicate,
+                index_expr,
+                None,
                 1,
                 None,
                 schema_with_rowid,
@@ -680,7 +760,7 @@ mod tests {
 
         assert_plan_node_equals(
             exec,
-            "BTreeIndexExec: predicate=Eq { column: \"id\", value: Int32(5) }, column=id, with_row_id=true, with_row_address=false",
+            "ScalarIndexExec: query=id = Int32(5), rechecked=false, with_row_id=true, with_row_address=false",
         )
         .await
         .unwrap();
