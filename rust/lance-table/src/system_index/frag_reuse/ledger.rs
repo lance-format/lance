@@ -94,6 +94,29 @@ pub struct FragReuseLedger {
     has_unsupported_transitions: bool,
 }
 
+/// The single content field of FRI details: `(1, inline history)` or
+/// `(2, external file reference)`, as raw bytes.
+fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
+    if details.type_url.rsplit('/').next() != Some("lance.table.FragmentReuseIndexDetails") {
+        return Err(corrupt(format!(
+            "unexpected FRI details type {:?}",
+            details.type_url
+        )));
+    }
+    let mut wire = Bytes::copy_from_slice(&details.value);
+    let mut content = None;
+    while wire.has_remaining() {
+        let (tag, payload) = next_field(&mut wire)?;
+        if matches!(tag, 1 | 2) {
+            let payload = require_message(tag, payload)?;
+            if content.replace((tag, payload)).is_some() {
+                return Err(corrupt("multiple FRI content fields"));
+            }
+        }
+    }
+    content.ok_or_else(|| corrupt("missing FRI content"))
+}
+
 impl FragReuseLedger {
     /// Decode FRI details, resolving external history through `read_external`.
     /// The callback reads the exact byte range described by the external reference;
@@ -109,24 +132,7 @@ impl FragReuseLedger {
         Fut: Future<Output = Result<Bytes>>,
     {
         validate_index_version(index_version)?;
-        if details.type_url.rsplit('/').next() != Some("lance.table.FragmentReuseIndexDetails") {
-            return Err(corrupt(format!(
-                "unexpected FRI details type {:?}",
-                details.type_url
-            )));
-        }
-        let mut wire = Bytes::copy_from_slice(&details.value);
-        let mut content = None;
-        while wire.has_remaining() {
-            let (tag, payload) = next_field(&mut wire)?;
-            if matches!(tag, 1 | 2) {
-                let payload = require_message(tag, payload)?;
-                if content.replace((tag, payload)).is_some() {
-                    return Err(corrupt("multiple FRI content fields"));
-                }
-            }
-        }
-        let (tag, content) = content.ok_or_else(|| corrupt("missing FRI content"))?;
+        let (tag, content) = content_field(details)?;
         let content = if tag == 1 {
             content
         } else {
@@ -147,6 +153,19 @@ impl FragReuseLedger {
             bytes
         };
         Self::decode_content(index_version, content)
+    }
+
+    /// Decode FRI details whose history is stored inline, without any I/O.
+    /// `Ok(None)` when the history lives in an external file, which only
+    /// [`Self::decode`] can resolve.
+    pub fn decode_inline(index_version: i32, details: &prost_types::Any) -> Result<Option<Self>> {
+        validate_index_version(index_version)?;
+        let (tag, content) = content_field(details)?;
+        if tag == 1 {
+            Self::decode_content(index_version, content).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     // Each legacy group owns a compaction remap. Address resolution follows its
