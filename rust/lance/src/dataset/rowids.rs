@@ -1,21 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod spill;
 mod validate;
 
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
+use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{
+        Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
+    },
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
 
+pub use spill::{
+    DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
+    PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
+    place_row_lineage, read_spilled_row_ids, read_spilled_versions,
+};
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -29,6 +39,7 @@ pub async fn load_row_id_sequence(
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
         .metadata_cache
@@ -41,18 +52,78 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => read_row_ids(data),
-        Some(RowIdMeta::External(file_slice)) => {
-            let path = dataset.base.clone().join(file_slice.path.as_str());
-            let range =
-                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
-            let data = dataset
-                .object_store
-                .open(&path)
-                .await?
-                .get_range(range)
-                .await?;
-            read_row_ids(&data)
+        Some(RowIdMeta::Column) => spill::read_spilled_row_ids(dataset, fragment).await,
+    }
+}
+
+/// Which of a fragment's two per-row version sequences is meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowVersionKind {
+    /// The dataset version each row first appeared at.
+    CreatedAt,
+    /// The dataset version each row was last written at.
+    LastUpdatedAt,
+}
+
+impl RowVersionKind {
+    fn meta(self, fragment: &Fragment) -> Option<&RowDatasetVersionMeta> {
+        match self {
+            Self::CreatedAt => fragment.created_at_version_meta.as_ref(),
+            Self::LastUpdatedAt => fragment.last_updated_at_version_meta.as_ref(),
         }
+    }
+
+    /// The reserved field id of the hidden column a spilled sequence lives in.
+    pub fn field_id(self) -> i32 {
+        match self {
+            Self::CreatedAt => ROW_CREATED_AT_VERSION_FIELD_ID,
+            Self::LastUpdatedAt => ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        }
+    }
+}
+
+/// Load one of `fragment`'s per-row version sequences, wherever it is stored.
+///
+/// `None` when the fragment carries no such metadata, which readers treat as
+/// every row being at version 1. A sequence spilled to a data file is cached
+/// per fragment and file; an inline one is decoded from the manifest bytes.
+pub async fn load_row_version_sequence(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    kind: RowVersionKind,
+) -> Result<Option<Arc<RowDatasetVersionSequence>>> {
+    let Some(meta) = kind.meta(fragment) else {
+        return Ok(None);
+    };
+    match meta {
+        RowDatasetVersionMeta::Column => {
+            let data_file = fragment.row_lineage_file(kind.field_id())?.ok_or_else(|| {
+                Error::corrupt_file(
+                    dataset.base.clone(),
+                    format!(
+                        "fragment {} marks its {kind:?} versions as spilled but none of its \
+                         data files carries field {}",
+                        fragment.id,
+                        kind.field_id()
+                    ),
+                )
+            })?;
+            let key = RowVersionSequenceKey {
+                fragment_id: fragment.id,
+                field_id: kind.field_id(),
+                data_file,
+            };
+            dataset
+                .metadata_cache
+                .get_or_insert_with_key(key, || {
+                    spill::read_spilled_versions(dataset, fragment, kind.field_id())
+                })
+                .await
+                .map(Some)
+        }
+        RowDatasetVersionMeta::Inline(_) => meta
+            .load_sequence()
+            .map(|sequence| Some(Arc::new(sequence))),
     }
 }
 
@@ -277,7 +348,8 @@ mod test {
     use std::ops::Range;
 
     use crate::dataset::{
-        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+        ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+        builder::DatasetBuilder,
     };
 
     use super::*;
@@ -296,6 +368,7 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -992,6 +1065,117 @@ mod test {
 
     pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_range_segments_are_opt_in() {
+        use lance_table::format::pb;
+        use lance_table::transaction::RANGE_SEGMENTS_CONFIG_KEY;
+        use prost::Message;
+
+        /// Wire-level segment kinds of every fragment, and whether the decoded
+        /// form folded any of them into a compact `Ranges` segment.
+        fn segment_shapes(dataset: &Dataset) -> (Vec<&'static str>, bool) {
+            let mut kinds = Vec::new();
+            let mut folded = false;
+            for fragment in dataset.manifest.fragments.iter() {
+                let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+                    panic!("expected inline row ids, got {:?}", fragment.row_id_meta);
+                };
+                let wire = pb::RowIdSequence::decode(&data[..]).unwrap();
+                kinds.extend(wire.segments.iter().map(|segment| match segment.segment {
+                    Some(pb::u64_segment::Segment::Range(_)) => "range",
+                    Some(pb::u64_segment::Segment::RangeWithBitmap(_)) => "bitmap",
+                    _ => "other",
+                }));
+                folded |= read_row_ids(&data[..])
+                    .unwrap()
+                    .segments()
+                    .iter()
+                    .any(|segment| matches!(segment, U64Segment::Ranges { .. }));
+            }
+            (kinds, folded)
+        }
+
+        // Deleting a contiguous block inside every fragment leaves each row id
+        // sequence as a range with one long run of holes, which `delete`
+        // encodes as a bitmap segment; compaction carries those segments over.
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(500),
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        delete(&mut dataset, "i % 500 >= 100 and i % 500 < 400").await;
+        compact(&mut dataset, 5000).await;
+        let map_before = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before.len(), 800);
+
+        // Without the opt-in the bitmaps stay.
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.contains(&"bitmap") && !folded, "{kinds:?}");
+
+        // Opting in re-encodes every eligible fragment in the same commit: on
+        // the wire only plain `Range` segments, folded back when decoded.
+        dataset
+            .update_config([(RANGE_SEGMENTS_CONFIG_KEY, "true")])
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.iter().all(|kind| *kind == "range"), "{kinds:?}");
+        assert!(
+            folded,
+            "fragments with 300 contiguous holes each should fold into Ranges"
+        );
+        assert_eq!(
+            dataset.manifest().reader_feature_flags,
+            lance_table::feature_flags::FLAG_STABLE_ROW_IDS,
+            "the wire format did not change, so no new reader flag"
+        );
+
+        // Reads see the same row ids; a take by row id resolves through the
+        // compact segments.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
+        let mut sample: Vec<u64> = map_before.keys().copied().collect();
+        sample.sort_unstable();
+        let sample: Vec<u64> = sample.into_iter().step_by(97).collect();
+        let taken = dataset
+            .take_rows(
+                &sample,
+                ProjectionRequest::from_columns(["i"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), sample.len());
+        let index = get_row_id_index(&Arc::new(dataset.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        for row_id in &sample {
+            assert!(index.get(*row_id).unwrap().is_some(), "row id {row_id}");
+        }
+
+        // Later commits keep re-encoding only what changed, and the manifest
+        // re-read from storage folds the same way.
+        delete(&mut dataset, "i = 10").await;
+        let reopened = dataset
+            .checkout_version(dataset.manifest().version)
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&reopened);
+        assert!(
+            kinds.iter().all(|kind| *kind == "range") && folded,
+            "{kinds:?}"
+        );
+        assert_eq!(scan_rowid_map(&reopened).await.len(), 799);
     }
 
     #[tokio::test]

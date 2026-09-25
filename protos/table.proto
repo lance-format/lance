@@ -134,6 +134,7 @@ message Manifest {
    *   exact versions. Readers and writers must use each DataFile's version
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
+   * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
    */
   uint64 reader_feature_flags = 9;
 
@@ -411,27 +412,45 @@ message DataFragment {
   oneof row_id_sequence {
     // Current Lance writers store row ids inline regardless of encoded size.
     bytes inline_row_ids = 5;
-    // Supported by current Lance readers, but not emitted by current Lance writers.
-    ExternalFile external_row_ids = 6;
+    /* The row ids are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -3. See RowLineageColumn.
+     *
+     * A writer MUST set the spilled row lineage feature flag (2048) when any
+     * fragment uses this arm or either of the other column arms below. A
+     * reader that does not understand the flag would see an unset oneof and
+     * treat the fragment as having no row ids at all.
+     */
+    RowLineageColumn column_row_ids = 12;
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {
     // Current Lance writers store last-updated versions inline regardless of encoded size.
     bytes inline_last_updated_at_versions = 7;
-    /* Valid external alternative. Current Lance writers do not emit this field,
-     * and current Lance readers cannot load it.
+    /* The versions are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -5. Gated like
+     * `column_row_ids`.
      */
-    ExternalFile external_last_updated_at_versions = 8;
+    RowLineageColumn column_last_updated_at_versions = 13;
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
     // Current Lance writers store created-at versions inline regardless of encoded size.
     bytes inline_created_at_versions = 9;
-    /* Valid external alternative. Current Lance writers do not emit this field,
-     * and current Lance readers cannot load it.
+    /* The versions are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -4. Gated like
+     * `column_row_ids`.
      */
-    ExternalFile external_created_at_versions = 10;
+    RowLineageColumn column_created_at_versions = 14;
   } // created_at_version_sequence
+
+  /* The `external_*` arms of the three sequence oneofs above: an opaque byte
+   * range in a file, holding the same encoding as the inline arm. No Lance
+   * writer ever emitted them; the column arms replace that design. Reserved so
+   * a reader never has to interpret them.
+   */
+  reserved 6, 8, 10;
+  reserved "external_row_ids", "external_last_updated_at_versions",
+      "external_created_at_versions";
 
   /* Number of original rows in the fragment, this includes rows that are now marked with
    * deletion tombstones. To compute the current number of rows, subtract
@@ -449,6 +468,11 @@ message DataFile {
    * default. An object with a value in fields of -1 must not be stored to disk. -2 is
    * used for "tombstoned", meaning a field that is no longer in use. This is often
    * because the original field id was reassigned to a different data file.
+   *
+   * Every negative value is reserved for system use and never names a field of the
+   * dataset schema. -3, -4 and -5 are the hidden row lineage columns (see
+   * RowLineageColumn); a reader projecting the dataset schema onto a file skips
+   * them, and any other negative value, rather than reject the file.
    *
    * In Lance v1 IDs are assigned based on position in the file, offset by the max
    * existing field id in the table (if any already). So when a fragment is first created
@@ -633,6 +657,26 @@ message DeletionFile {
   optional uint32 base_id = 7;
 } // DeletionFile
 
+/* Marks a row lineage sequence that is stored as a hidden column of one of the
+ * fragment's `files` rather than inline: `_rowid` under the reserved field id
+ * -3, `_row_created_at_version` under -4, `_row_last_updated_at_version` under
+ * -5. Exactly one entry of `DataFragment.files` carries that id in its
+ * `fields`, and its `column_indices` locates the column the way it does for a
+ * user column, so the column may share a file with the user columns or with the
+ * other lineage columns, or sit in a file that holds nothing else. The column is
+ * a non-nullable uint64 with exactly `physical_rows` values, in physical row
+ * order; see the table format documentation for the schema.
+ *
+ * Carries no fields: the file is found by its field id, so the file's metadata
+ * lives in `files` alone.
+ *
+ * Valid only in a fragment whose data files are Lance v2 files. A legacy v1
+ * data file has no `column_indices` to locate the column by, so a writer on a
+ * dataset that stores v1 files leaves every sequence inline.
+ */
+message RowLineageColumn {}
+
+// A byte range of a file. Used by the fragment reuse index details.
 message ExternalFile {
   // Path to the file, relative to the root of the table.
   string path = 1;

@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::json::JsonEncoding;
 use lance_tokenizer::{BoxTokenStream, TextAnalyzer, Token, TokenStream};
 use serde_json::Value;
 
@@ -27,6 +26,10 @@ impl TryFrom<&Field> for DocType {
     type Error = lance_core::Error;
 
     fn try_from(field: &Field) -> Result<Self, Self::Error> {
+        // JSON text is also `Utf8`, so it must be recognized before plain text.
+        if JsonEncoding::of_field(field).is_some() {
+            return Ok(Self::Json);
+        }
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => Ok(Self::Text),
             DataType::List(field) | DataType::LargeList(field)
@@ -34,12 +37,6 @@ impl TryFrom<&Field> for DocType {
             {
                 Ok(Self::Text)
             }
-            DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
-                Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
-                _ => Err(lance_core::Error::invalid_input_source(
-                    format!("field {} is not json", field.name()).into(),
-                )),
-            },
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("field {} is not json", field.name()).into(),
             )),
@@ -144,8 +141,14 @@ impl std::fmt::Debug for JsonTokenizer {
 
 impl LanceTokenizer for JsonTokenizer {
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
-        let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap();
-        BoxTokenStream::new(TTStream { tokens, index: 0 })
+        match flatten_triplet(query_text, &mut self.tokenizer) {
+            Ok(tokens) => BoxTokenStream::new(TTStream { tokens, index: 0 }),
+            Err(error) => BoxTokenStream::new(TTStream {
+                tokens: Vec::new(),
+                index: 0,
+            })
+            .with_error(error),
+        }
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
@@ -170,16 +173,14 @@ impl LanceTokenizer for JsonTokenizer {
     }
 }
 
-fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> lance_core::Result<Vec<Token>> {
+fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> Result<Vec<Token>, String> {
     let mut token_vec = Vec::new();
     let mut idx = 0;
 
     for triple in text.split(';') {
         let parts: Vec<&str> = triple.splitn(3, ',').collect();
         if parts.len() != 3 {
-            return Err(lance_core::Error::invalid_input_source(
-                format!("Invalid triple format: {}", triple).into(),
-            ));
+            return Err(format!("Invalid triple format: {}", triple));
         }
         let field = parts[0];
         let v_type = parts[1];
@@ -211,9 +212,7 @@ fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> lance_core::Resu
                 }
             }
             _ => {
-                return Err(lance_core::Error::invalid_input_source(
-                    format!("Invalid triple type: {}", v_type).into(),
-                ));
+                return Err(format!("Invalid triple type: {}", v_type));
             }
         }
     }
@@ -303,11 +302,34 @@ impl TokenStream for TTStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::inverted::query::try_collect_query_tokens;
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
-        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
+        DocType, JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use arrow_schema::{DataType, Field};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, json_field};
+    use lance_core::Error;
     use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use rstest::rstest;
     use serde_json::Value;
+    use std::collections::HashMap;
+
+    /// A JSON column is tokenized as JSON whether it holds stored JSONB or
+    /// Arrow JSON text; plain strings stay text.
+    #[rstest]
+    #[case::jsonb(json_field("doc", true), "json")]
+    #[case::arrow_json_text(
+        Field::new("doc", DataType::Utf8, true).with_metadata(HashMap::from([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        )])),
+        "json"
+    )]
+    #[case::plain_text(Field::new("doc", DataType::Utf8, true), "text")]
+    fn test_doc_type_of_field(#[case] field: Field, #[case] expected: &str) {
+        assert_eq!(DocType::try_from(&field).unwrap().as_ref(), expected);
+    }
 
     #[test]
     fn test_json_tokenizer() {
@@ -377,6 +399,21 @@ mod tests {
         assert_token(&tokens[3], 3, "d,str,hello");
         assert_token(&tokens[4], 4, "d,str,world");
         assert_token(&tokens[5], 5, "e,number,1.0");
+    }
+
+    #[rstest]
+    #[case::missing_type("brown", "Invalid triple format: brown")]
+    #[case::invalid_type("title,string,brown", "Invalid triple type: string")]
+    fn test_invalid_json_search_query(#[case] query: &str, #[case] expected_message: &str) {
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(JsonTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+        let error = try_collect_query_tokens(query, &mut tokenizer)
+            .err()
+            .expect("invalid JSON search query should fail");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message), "{error}");
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {

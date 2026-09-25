@@ -2410,6 +2410,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "datasketches"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46c4cf71a36b46dcfc00e5014c0c20ccad2b1b6a008304d7d57d2749b2d41b3d"
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2722,6 +2728,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "foyer-common"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "643b47d510032a01e5af70dca288b0c5ec531646c1a8392e793fb5b0c13bef30"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cfg-if 1.0.4",
+ "foyer-tokio",
+ "mixtrics",
+ "parking_lot",
+ "pin-project",
+ "twox-hash",
+]
+
+[[package]]
+name = "foyer-intrusive-collections"
+version = "0.10.0-dev"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e4fee46bea69e0596130e3210e65d3424e0ac1e6df3bde6636304bdf1ca4a3b"
+dependencies = [
+ "memoffset",
+]
+
+[[package]]
+name = "foyer-memory"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae51f5089f3d9025ae77f17ea66d2489ac0f82fbb1d91462807bea174d486d82"
+dependencies = [
+ "anyhow",
+ "asyncband",
+ "bitflags 2.13.0",
+ "datasketches",
+ "equivalent",
+ "foyer-common",
+ "foyer-intrusive-collections",
+ "foyer-tokio",
+ "futures-util",
+ "hashbrown 0.17.1",
+ "itertools 0.15.0",
+ "mixtrics",
+ "parking_lot",
+ "paste",
+ "pin-project",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "foyer-tokio"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6741d1133dfaab64d3f8a9290bbfed3685084add28f8b6ee7a6264aa4dc26918"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "frostem"
 version = "1.20260804.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2735,7 +2800,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3080,18 +3145,23 @@ dependencies = [
 
 [[package]]
 name = "goosefs-sdk"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f521e3beacc809ced36a8aff4a468b1bf61302c8f4dca41c3f21ac0557c22ed"
+checksum = "1e471f7bce40936cf2023855c7350e31e11b3f703eb7cb2ce73c9ffc451f87d2"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
  "dashmap",
  "fastrand",
+ "foyer-common",
+ "foyer-memory",
  "futures",
  "hostname",
+ "io-uring",
  "itoa",
+ "libc",
+ "lru",
  "prost",
  "rand 0.9.5",
  "serde",
@@ -3944,7 +4014,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3961,6 +4031,7 @@ dependencies = [
  "async-trait",
  "async_cell",
  "aws-sdk-dynamodb",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -4016,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4059,7 +4130,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4069,7 +4140,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4106,7 +4177,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4138,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4155,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4164,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4197,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4229,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4243,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4270,6 +4341,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hex",
  "itertools 0.14.0",
  "jieba-rs",
  "jsonb",
@@ -4307,11 +4379,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
 name = "lance-index-core"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4329,11 +4402,12 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "lance-io"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4345,6 +4419,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "goosefs-sdk",
  "http 1.4.2",
  "io-uring",
  "lance-core",
@@ -4355,6 +4430,7 @@ dependencies = [
  "object_store 0.14.1",
  "object_store_opendal",
  "opendal",
+ "opendal-service-goosefs",
  "path_abs",
  "pin-project",
  "prost",
@@ -4373,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4387,7 +4463,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4401,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4449,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4463,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4503,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -4727,6 +4803,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4823,6 +4908,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4887,6 +4981,16 @@ dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mixtrics"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c46b5adfb7a3ae4996d327a5bdc90e78fec025806dd312bdbe6f07a755e0ec9"
+dependencies = [
+ "itertools 0.15.0",
+ "parking_lot",
 ]
 
 [[package]]
@@ -6035,7 +6139,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "13.0.0-beta.4"
+version = "13.0.0-beta.14"
 dependencies = [
  "alloc-stdlib",
  "arrow",

@@ -30,6 +30,7 @@ These options apply to all object stores.
 | Key                          | Description                                                                                                                                                                                                                                                                                             |
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
+| `block_size`                 | Gap in bytes below which two reads of one file are merged into a single request. Default, `4096` for local files and `65536` for object stores. Larger values cut the request count of scattered reads (for example a `take` of rows spread across a file) at the cost of reading the bytes in between.                                                                                                     |
 | `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
@@ -431,9 +432,15 @@ ds = lance.dataset(
 ## GooseFS Configuration
 
 [GooseFS](https://cloud.tencent.com/product/goosefs) is a distributed caching
-filesystem. Lance accesses GooseFS through its Master gRPC service. The URL format
-is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
-(default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
+filesystem. Lance accesses GooseFS through its Master gRPC service. The URL
+format is either:
+
+- `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
+  (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`)
+- `goosefs:///path`, with an empty authority, when the master address comes
+  from `goosefs_master_addr`, `GOOSEFS_MASTER_ADDR`, or
+  `goosefs-site.properties`
+
 `/path` is the filesystem path within GooseFS.
 
 Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
@@ -573,11 +580,25 @@ versioned manifests.
     For writes, the same `storageOptions(...)` setter is available on
     `WriteDatasetBuilder` and `WriteFragmentBuilder`.
 
-The Master address can be resolved from (in priority order):
+The Master address is resolved at OpenDAL build time (highest priority first):
 
-1. The `goosefs_master_addr` storage option (supports HA: `"addr1:port,addr2:port"`).
-2. The `GOOSEFS_MASTER_ADDR` environment variable.
-3. The host and port from the URL authority.
+1. The `GOOSEFS_MASTER_ADDR` environment variable.
+2. `goosefs.master.rpc.addresses` or `goosefs.master.hostname` in
+   `goosefs-site.properties` (discovered via `$GOOSEFS_CONFIG_FILE`,
+   `$GOOSEFS_CONF_DIR`, `$GOOSEFS_HOME/conf`, `~/.goosefs`, and
+   `/etc/goosefs`). This is the same file the GooseFS SDK already loads;
+   a Hadoop-style `goosefs:///path` URL relies on it.
+3. The `goosefs_master_addr` storage option (supports HA:
+   `"addr1:port,addr2:port"`).
+4. The host and port from the URL authority.
+
+Lance forwards `goosefs_master_addr` and the URL authority as OpenDAL's
+`master_addr`. It does **not** require a host in the URL, so
+`goosefs:///path` can rely on `goosefs-site.properties`. OpenDAL fails the
+store build only when none of the sources above supply an address.
+
+A site file that declares masters outranks the URL authority because the file
+can carry a full HA master list, which a single URI host cannot express.
 
 `storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
 such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
@@ -586,7 +607,7 @@ Environment variables keep the `GOOSEFS_*` form.
 
 | storage_options key | env var | Description |
 |---------------------|---------|-------------|
-| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL, `GOOSEFS_MASTER_ADDR`, or `goosefs-site.properties`. |
 | `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
 | `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
 | `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |

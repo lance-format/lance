@@ -10,6 +10,7 @@ use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
+use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
@@ -52,6 +53,7 @@ pub enum BuiltinIndexType {
     RTree,
     Inverted,
     Fm,
+    MinHashLsh,
 }
 
 impl BuiltinIndexType {
@@ -66,6 +68,7 @@ impl BuiltinIndexType {
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
             Self::Fm => "fm",
+            Self::MinHashLsh => "minhashlsh",
         }
     }
 }
@@ -84,6 +87,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
             IndexType::Fm => Ok(Self::Fm),
+            IndexType::MinHashLsh => Ok(Self::MinHashLsh),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -209,19 +213,60 @@ pub trait IndexReader: Send + Sync {
     /// This allows the caller to process rows incrementally without loading the
     /// entire range into memory at once.
     ///
-    /// The default implementation falls back to [`Self::read_range`] and wraps
-    /// the result in a single-item stream.
+    /// Every batch except the last holds exactly `batch_size` rows; the last one
+    /// holds the remainder. `batch_readahead` bounds how many batches may be
+    /// decoded ahead of the consumer.
+    ///
+    /// The default implementation falls back to [`Self::read_range`] and slices
+    /// the result into `batch_size` chunks.
     async fn read_range_stream(
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
+        batch_size: u64,
+        _batch_readahead: u32,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let batch = self.read_range(range, projection).await?;
         let schema = batch.schema();
+        let batch_size = (batch_size as usize).max(1);
+        let chunks = (0..batch.num_rows())
+            .step_by(batch_size)
+            .map(move |start| Ok(batch.slice(start, batch_size.min(batch.num_rows() - start))))
+            .collect::<Vec<_>>();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            futures::stream::once(async move { Ok(batch) }),
+            futures::stream::iter(chunks),
         )))
+    }
+    /// Stream every record batch of the file in order, sized like
+    /// [`Self::read_record_batch`].
+    ///
+    /// The `n`-th item of the returned stream is identical to
+    /// `read_record_batch(n, batch_size)`, so callers that need every batch
+    /// (index updates, remaps, prewarming) get one sequential pass over the file
+    /// instead of one random read per batch. `batch_readahead` bounds how many
+    /// batches may be read ahead of the consumer.
+    ///
+    /// The default implementation issues one `read_record_batch` per batch,
+    /// `batch_readahead` at a time.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>>
+    where
+        Self: 'static,
+    {
+        let num_batches = self.num_batches(batch_size).await;
+        let schema: Arc<Schema> = Arc::new(self.schema().into());
+        let reader = self.clone();
+        let stream = futures::stream::iter(0..num_batches as u64)
+            .map(move |n| {
+                let reader = reader.clone();
+                async move { reader.read_record_batch(n, batch_size).await }
+            })
+            .buffered(batch_readahead.max(1) as usize);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;

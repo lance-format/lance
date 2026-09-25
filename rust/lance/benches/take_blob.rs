@@ -48,6 +48,68 @@ fn bench_take_blob(c: &mut Criterion) {
         bench_take_id_column(&runtime, c, dataset.clone(), label, 1);
         bench_take_id_column(&runtime, c, dataset, label, 16);
     }
+
+    bench_sequential_8k_reads(c, &runtime);
+}
+
+fn bench_sequential_8k_reads(c: &mut Criterion, runtime: &Runtime) {
+    let dataset = Arc::new(runtime.block_on(prepare_sequential_blob_dataset()));
+    c.bench_function("V2_2 sequential read_up_to 8KiB", |b| {
+        let dataset = dataset.clone();
+        b.to_async(runtime).iter(move || {
+            let dataset = dataset.clone();
+            async move {
+                let blobs = dataset
+                    .take_blobs_by_indices(&[0], BLOB_COLUMN)
+                    .await
+                    .expect("take_blobs_by_indices failed");
+                let blob = blobs[0].as_ref().expect("blob");
+                loop {
+                    let chunk = blob.read_up_to(8192).await.expect("read_up_to failed");
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    black_box(chunk.len());
+                }
+            }
+        });
+    });
+}
+
+async fn prepare_sequential_blob_dataset() -> Dataset {
+    let uri = std::env::temp_dir()
+        .join(format!("lance-bench-seq-blob-{}", Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        blob_field(BLOB_COLUMN, true),
+    ]));
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs
+        .push_bytes(vec![0xABu8; 2 * 1024 * 1024])
+        .expect("failed to append sequential blob payload");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64])),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .expect("failed to build sequential blob batch");
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("failed to write sequential blob dataset")
 }
 
 fn bench_take_blobs_by_indices(

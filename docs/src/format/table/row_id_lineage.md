@@ -185,14 +185,81 @@ The implementation selects the most compact encoding based on the value range, c
 
 </details>
 
-#### Inline and External Storage
+#### Inline and Spilled Storage
 
-`DataFragment` defines inline and external metadata fields as valid wire alternatives for row ID sequences and row version sequences.
-These fields do not currently imply a size-based switching threshold.
-Current Lance writers store all three sequence types inline in the fragment metadata regardless of their encoded size and do not emit the external alternatives.
+`DataFragment` defines inline and column alternatives for row ID sequences and row
+version sequences. This allows small sequences to stay in the manifest (fewer
+IOPS) while larger sequences (resulting from frequent updates) move outside the
+manifest.
 
-Current Lance readers can load externally stored row ID sequences.
-The format also permits external created-at and last-updated-at version sequences, but current Lance readers cannot load them; this is an implementation limitation, not an invalid encoding.
+Sequences small enough (~200KB encoded and under) are stored inline in the fragment
+metadata to avoid additional I/O. An inline sequence is rewritten into every manifest
+version.
+
+A larger sequence is **spilled to a hidden column of one of the fragment's data
+files**. The column arm of the oneof (`column_row_ids`, `column_created_at_versions`
+or `column_last_updated_at_versions`) is an empty `RowLineageColumn` marker: it carries
+no file reference, because the file is one of the fragment's `files` and is found by a
+reserved negative field id in that entry's `fields`. Exactly one file of the fragment
+carries each reserved field; zero or more than one is corruption. The `column_indices`
+entry paired with the field id locates the column the way it does for a user column, so
+a lineage column
+may share a file with the user columns or with the other lineage columns, or sit in a
+file that holds nothing else. Reading it uses the ordinary data file reader and its
+encodings.
+
+The marker is valid only in a fragment whose data files are Lance v2 files. A legacy
+v1 data file has no `column_indices` to locate the column by, and a fragment cannot
+mix v1 and v2 files, so a writer on a dataset that stores v1 files MUST leave every
+sequence inline; a marker in a fragment with a v1 data file is corruption.
+
+The columns have this schema, with the field ids `-3`, `-4` and `-5` respectively.
+The three names are reserved: a writer MUST reject a user column with any of them
+(every Lance write path does), so a hidden column never collides with a field of the
+dataset schema.
+
+```python
+import pyarrow as pa
+
+row_lineage_columns = pa.schema([
+    pa.field("_rowid", pa.uint64(), nullable=False),
+    pa.field("_row_created_at_version", pa.uint64(), nullable=False),
+    pa.field("_row_last_updated_at_version", pa.uint64(), nullable=False),
+])
+```
+
+Each column present holds exactly `physical_rows` values, one per physical row in
+physical row order, deleted rows included; the value at offset `i` is the row id or
+version of the row at offset `i`, the same thing the inline encoding's `i`-th entry
+would be. A null value, or a column whose length differs from `physical_rows`, is
+corruption and MUST be rejected rather than read as a default. A file may carry any
+subset of the three columns; a sequence whose arm is not the column marker is not read
+from any file, whatever the file holds.
+
+Which sequences may leave the manifest follows from when their values are known.
+A value the commit assigns -- an appended fragment's row ids, an inserted row's
+created-at version, every row's last-updated-at version -- can change when a commit
+conflict is retried, so it stays inline where the retry can rewrite it; those
+sequences are single runs and cost a few bytes. A value carried over from existing
+rows -- the row ids and created-at versions that compaction or a row rewrite
+preserves -- is fixed before the commit and may be written to a data file.
+A writer spills only on a table that opts in through the `lance.row_lineage.spill`
+config key; a table that never sets it is unchanged.
+
+A writer that emits any column arm MUST set the spilled row lineage feature flag
+(bit 11, value 2048) in both the reader and writer flag words. A reader without that
+bit sees an unset oneof and would take the fragment to have no row IDs at all, on a
+table whose manifest says every fragment has them.
+
+Field numbers 6, 8 and 10 of `DataFragment` (`external_row_ids`,
+`external_last_updated_at_versions`, `external_created_at_versions`) once named an
+opaque byte range in a file holding the same encoding as the inline arm. No Lance
+writer ever emitted them; the column arms replace that design, and the numbers and
+names are reserved.
+
+!!! note
+    Spilled row lineage sequences are not yet a released feature. A released build
+    treats bit 11 as an unknown feature flag and refuses the dataset.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
@@ -201,7 +268,7 @@ The format also permits external created-at and last-updated-at version sequence
 message DataFragment {
   oneof row_id_sequence {
     bytes inline_row_ids = 5;
-    ExternalFile external_row_ids = 6;
+    RowLineageColumn column_row_ids = 12;
   }
 }
 ```
@@ -288,7 +355,7 @@ RowDatasetVersionSequence {
 message DataFragment {
   oneof created_at_version_sequence {
     bytes inline_created_at_versions = 9;
-    ExternalFile external_created_at_versions = 10;
+    RowLineageColumn column_created_at_versions = 14;
   }
 }
 ```
@@ -331,7 +398,7 @@ New physical row (current):
 message DataFragment {
   oneof last_updated_at_version_sequence {
     bytes inline_last_updated_at_versions = 7;
-    ExternalFile external_last_updated_at_versions = 8;
+    RowLineageColumn column_last_updated_at_versions = 13;
   }
 }
 ```

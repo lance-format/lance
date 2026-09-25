@@ -23,6 +23,7 @@ use tracing::instrument;
 
 pub mod builder;
 pub mod distance;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;

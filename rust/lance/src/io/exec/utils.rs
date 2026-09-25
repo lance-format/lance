@@ -16,13 +16,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, Time,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
@@ -335,7 +335,9 @@ fn shared_prefilter_future(
                                 if is_scalar_index_query {
                                     Box::new(SelectionVectorToPrefilter(stream)).load().await
                                 } else {
-                                    Box::new(FilteredRowIdsToPrefilter(stream)).load().await
+                                    Box::new(FilteredRowIdsToPrefilter::new(stream))
+                                        .load()
+                                        .await
                                 }
                             }
                             .await;
@@ -372,6 +374,7 @@ pub(crate) fn build_prefilter(
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
     masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<DatasetPreFilter>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -387,7 +390,11 @@ pub(crate) fn build_prefilter(
                 None
             } else {
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+                // Attribute physical materialization to this FTS node. Shared loaders
+                // need a separate owner so racing consumers do not receive arbitrary metrics.
+                Some(Box::new(
+                    FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
@@ -437,23 +444,89 @@ pub(crate) fn build_prefilter(
     Ok(Arc::new(prefilter))
 }
 
-// Utility to convert an input (containing row ids) into a prefilter
-pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
+struct RowIdPrefilterMetrics {
+    loads: Count,
+    input_rows: Count,
+    input_batches: Count,
+    row_ids: Count,
+    load_time: Time,
+    input_time: Time,
+    build_time: Time,
+}
+
+// Utility to convert an input (containing row ids) into a prefilter.
+pub(crate) struct FilteredRowIdsToPrefilter {
+    stream: SendableRecordBatchStream,
+    metrics: Option<RowIdPrefilterMetrics>,
+}
+
+impl FilteredRowIdsToPrefilter {
+    pub(crate) fn new(stream: SendableRecordBatchStream) -> Self {
+        Self {
+            stream,
+            metrics: None,
+        }
+    }
+
+    // Count physical loader executions: batch ANN shares one loader, whereas
+    // multi-vector ANN can materialize one per query node.
+    pub(crate) fn with_metrics(
+        mut self,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Self {
+        self.metrics = Some(RowIdPrefilterMetrics {
+            loads: metrics.new_count("prefilter_loads", partition),
+            input_rows: metrics.new_count("prefilter_input_rows", partition),
+            input_batches: metrics.new_count("prefilter_input_batches", partition),
+            row_ids: metrics.new_count("prefilter_row_ids", partition),
+            load_time: metrics.new_time("prefilter_load_time", partition),
+            input_time: metrics.new_time("prefilter_input_time", partition),
+            build_time: metrics.new_time("prefilter_build_time", partition),
+        });
+        self
+    }
+}
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+        let metrics = self.metrics.as_ref();
+        let _load_timer = metrics.map(|m| m.load_time.timer());
+        if let Some(metrics) = metrics {
+            metrics.loads.add(1);
+        }
         let mut allow_list = RowAddrTreeMap::new();
-        while let Some(batch) = self.0.next().await {
+        loop {
+            // Input polling can include I/O, decoding and scheduling. Keep it separate
+            // from set insertion, and time batches rather than individual row IDs.
+            let batch = {
+                let _input_timer = metrics.map(|m| m.input_time.timer());
+                self.stream.next().await
+            };
+            let Some(batch) = batch else { break };
             let batch = batch?;
             let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::internal("input batch missing row id column even though it is in the schema for the stream"))?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
+                .ok_or_else(|| {
+                    Error::internal("row id column in prefilter input must be UInt64")
+                })?;
+            if let Some(metrics) = metrics {
+                metrics.input_batches.add(1);
+                metrics.input_rows.add(row_ids.len() - row_ids.null_count());
+            }
+            let _build_timer = metrics.map(|m| m.build_time.timer());
+            allow_list.extend(row_ids.iter().flatten());
         }
-        Ok(RowAddrMask::from_allowed(allow_list))
+        let mask = RowAddrMask::from_allowed(allow_list);
+        if let Some(metrics) = metrics
+            && let Some(row_ids) = mask.max_len()
+        {
+            metrics.row_ids.add(row_ids as usize);
+        }
+        Ok(mask)
     }
 }
 
@@ -940,10 +1013,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
+    use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
     use arrow_schema::{DataType, Field, Schema, SortOptions};
     use datafusion::common::NullEquality;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -955,15 +1029,51 @@ mod tests {
     use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use super::{
-        InstrumentedChildInputStream, PreFilterSource, ReplayExec, SharedPreFilterExec,
-        SharedPreFilterMaterialization, shared_prefilter_future,
+        FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
+        SharedPreFilterExec, SharedPreFilterMaterialization, shared_prefilter_future,
     };
+
+    #[tokio::test]
+    async fn test_row_id_prefilter_metrics() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "_rowid",
+            Arc::new(UInt64Array::from(vec![Some(1), None, Some(2), Some(1)])) as ArrayRef,
+        )])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let loader = FilteredRowIdsToPrefilter::new(stream).with_metrics(&metrics, 0);
+        let mask = Box::new(loader).load().await.unwrap();
+        assert_eq!(mask.max_len(), Some(2));
+        assert!(mask.selected(1));
+        assert!(!mask.selected(3));
+        let collected = metrics.clone_inner();
+        for (name, expected) in [
+            ("prefilter_loads", 1),
+            ("prefilter_input_rows", 3),
+            ("prefilter_input_batches", 1),
+            ("prefilter_row_ids", 2),
+        ] {
+            assert_eq!(collected.sum_by_name(name).unwrap().as_usize(), expected);
+        }
+        for name in [
+            "prefilter_load_time",
+            "prefilter_input_time",
+            "prefilter_build_time",
+        ] {
+            assert!(collected.sum_by_name(name).unwrap().as_usize() > 0);
+        }
+    }
 
     fn prefilter_source(is_scalar_index_query: bool, is_empty: bool) -> PreFilterSource {
         let mask = if is_empty {

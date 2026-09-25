@@ -25,7 +25,8 @@ use super::{
     index::{DocSet, InvertedPartition},
     prepare_bm25_query,
     query::{
-        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
+        try_collect_query_tokens,
     },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
@@ -3783,7 +3784,7 @@ pub(super) fn tokenize_leaf(
     index: &InvertedIndex,
     leaf: &LeafQuery,
     params: &FtsSearchParams,
-) -> Tokens {
+) -> Result<Tokens> {
     // Keep the legacy explicit-fuzzy rewrite independent of index analysis.
     // AUTO fuzziness still expands later, but its source terms must first use
     // the same normalization and filtering as the indexed vocabulary.
@@ -3798,7 +3799,7 @@ pub(super) fn tokenize_leaf(
     } else {
         index.tokenizer()
     };
-    collect_query_tokens(leaf.terms(), &mut tokenizer)
+    try_collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
 async fn prepare_compound_query(
@@ -3831,7 +3832,7 @@ async fn prepare_compound_query(
     }
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
         let prepared = match &prepared_match {
             Some(prepared) => prepared.clone(),
             None => Arc::new(

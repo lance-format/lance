@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// The streaming IVF training tests await the whole training stack, whose future
-// type nests past the default 128 in the lib test build. benches/streaming_ivf_training.rs
-// raises the limit for the same stack.
-#![cfg_attr(test, recursion_limit = "256")]
+// The streaming IVF training stack (see index::vector::ivf), awaited whole by
+// its training tests, has a future type that nests past the default limit of
+// 128. `recursion_limit` is a crate-level inner attribute, so it necessarily
+// applies to every build of this crate, not only the test build that currently
+// exercises that future. benches/streaming_ivf_training.rs raises the limit for
+// the same stack.
+#![recursion_limit = "256"]
 
 //! Lance Columnar Data Format
 //!
