@@ -4332,6 +4332,7 @@ dependencies = [
 name = "lance-namespace-impls"
 version = "13.0.0-beta.15"
 dependencies = [
+ "arc-swap",
  "arrow",
  "arrow-ipc",
  "arrow-schema",
