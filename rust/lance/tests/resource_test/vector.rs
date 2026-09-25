@@ -197,11 +197,12 @@ async fn test_ivf_split_reshuffle_memory_stays_bounded() {
         "the optimize must split the oversized partitions"
     );
 
-    // Holding every re-read row at once needs 512 MiB. Keep the ceiling well
-    // below that so a regression to unbounded re-reads fails.
+    // Re-reading every row at once holds up to 512 MiB of vectors, which this
+    // tracker sees as ~265 MiB since it misses allocations on untracked tasks;
+    // a bounded re-read peaks near 40 MiB. Keep the ceiling far from both.
     assert_le!(
         stats.max_bytes_allocated,
-        256 * 1024 * 1024,
+        128 * 1024 * 1024,
         "split reshuffle allocated too much memory: {:?}",
         stats
     );
