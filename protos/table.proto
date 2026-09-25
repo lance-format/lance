@@ -664,6 +664,18 @@ message MemWalIndexDetails {
    */
   repeated string maintained_indexes = 8;
 
+  /* Maintain every index the MemTable can mirror, rather than the named set.
+   *
+   * Set, `maintained_indexes` is ignored and the set is resolved from the
+   * table's indexes each time a MemTable is built, so an index created later is
+   * picked up and a dropped one falls out. An index kind the writer cannot
+   * mirror is skipped, so introducing one does not make the table unwritable.
+   *
+   * Absent, `maintained_indexes` is the set verbatim and a name in it that the
+   * writer cannot mirror is an error: the caller asked for that index.
+   */
+  optional bool maintain_all_indexes = 12;
+
   /* Latest SSTable compacted into the base table for each shard.
    * This is updated atomically with merge-insert data commits, enabling
    * conflict resolution when multiple compactors operate concurrently.

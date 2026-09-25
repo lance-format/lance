@@ -215,7 +215,10 @@ public class MemWalTest {
 
       Optional<MemWalIndexDetails> details = dataset.memWalIndexDetails();
       assertTrue(details.isPresent());
+      // Naming no index is how "every index the table has" is expressed, so the
+      // flag is the only thing separating it from maintaining nothing.
       assertEquals(Collections.emptyList(), details.get().maintainedIndexes());
+      assertTrue(details.get().maintainAllIndexes());
     }
   }
 

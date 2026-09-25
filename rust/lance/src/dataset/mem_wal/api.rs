@@ -8,11 +8,18 @@
 //!
 //! # Limitations
 //!
-//! MemWAL does not track dataset changes made after it is initialized: dropping
-//! or replacing a maintained index, or projecting away its column, leaves
-//! `maintained_indexes` naming something the writer cannot build. A change that
-//! races the initialization commit lands the same way. Both surface as a failing
-//! `mem_wal_writer`; handling them is follow-up work.
+//! MemWAL does not track dataset changes made after it is initialized. An index
+//! created later is not maintained over the fresh tier until the set names it --
+//! until then it covers a row once that row reaches the base table. The set is
+//! replaceable on a live MemWAL through
+//! [`DatasetMemWalExt::update_mem_wal_maintained_indexes`], which takes effect
+//! for MemTables opened after the commit; the sharding spec is not, because the
+//! generations already written were homed under it. An index in the set that the
+//! dataset no longer has is skipped when a shard opens; naming one that never
+//! existed is rejected.
+//!
+//! A rename reaches sealed generations and replay, but not the active MemTable,
+//! which keeps its original names until its writer reopens.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +39,6 @@ use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
-use super::ShardWriterConfig;
 use super::index::{MemIndexKind, unsupported_index_type, validate_index_configs};
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
@@ -40,6 +46,7 @@ use super::schema_with_tombstone;
 use super::util::derived_store_params;
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
+use super::{SealFence, ShardWriterConfig};
 
 /// Spec id of the sole sharding spec installed by [`InitializeMemWalBuilder`].
 const SHARDING_SPEC_ID: u32 = 1;
@@ -131,7 +138,9 @@ enum Sharding {
 pub struct InitializeMemWalBuilder<'a> {
     dataset: &'a mut Dataset,
     sharding: Sharding,
-    maintained_indexes: Vec<String>,
+    /// `None` maintains every index the MemTable can mirror, re-resolved as the
+    /// table's indexes change. `Some` is that set verbatim.
+    maintained_indexes: Option<Vec<String>>,
     writer_config_defaults: HashMap<String, String>,
 }
 
@@ -140,7 +149,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
         Self {
             dataset,
             sharding: Sharding::Manual,
-            maintained_indexes: Vec::new(),
+            maintained_indexes: None,
             writer_config_defaults: HashMap::new(),
         }
     }
@@ -189,7 +198,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.maintained_indexes = indexes.into_iter().map(Into::into).collect();
+        self.maintained_indexes = Some(indexes.into_iter().map(Into::into).collect());
         self
     }
 
@@ -253,12 +262,20 @@ impl<'a> InitializeMemWalBuilder<'a> {
 
         // Gate the commit, not just a preflight a caller may skip: a set the
         // writer cannot open leaves the table unwritable.
-        validate_maintained_indexes(dataset, &maintained_indexes).await?;
+        // Only a named set is validated: "every index" is whatever the table
+        // has, so there is nothing for the caller to have got wrong, and a kind
+        // this writer cannot mirror is skipped rather than refused.
+        let maintain_all_indexes = maintained_indexes.is_none();
+        let maintained_indexes = maintained_indexes.unwrap_or_default();
+        if !maintain_all_indexes {
+            validate_maintained_indexes(dataset, &maintained_indexes).await?;
+        }
 
         let details = MemWalIndexDetails {
             num_shards,
             sharding_specs,
             maintained_indexes,
+            maintain_all_indexes,
             writer_config_defaults,
             ..Default::default()
         };
@@ -514,6 +531,41 @@ pub trait DatasetMemWalExt {
         Ok(None)
     }
 
+    /// Replace the set of base-table indexes the MemTables maintain.
+    ///
+    /// Everything else the MemWAL index carries -- the sharding specs, the
+    /// writer config defaults, the shard snapshots, and the compaction and
+    /// catch-up progress -- is preserved: this is the maintained set alone, not
+    /// a re-initialization. Sharding is deliberately not changeable, because the
+    /// generations already written were assigned to shards under the current
+    /// spec and nothing re-homes them.
+    ///
+    /// Validated before the commit, the same way initialization validates it: a
+    /// set the writer cannot open leaves the table unwritable, so a name that
+    /// does not resolve to an index on this table is refused rather than
+    /// persisted.
+    ///
+    /// Takes effect for MemTables opened after the commit. A generation already
+    /// sealed keeps whatever it was written with, and a reader meeting one that
+    /// lacks the index it wants still answers from it: a full-text search builds
+    /// a transient index for the query, a vector search falls back to exact
+    /// brute force, and a predicate scans. So the two sets coexist without a
+    /// drain, at the cost of the slower path over the generations written
+    /// before the change.
+    ///
+    /// The catch-up progress an index must earn before its SSTables can be
+    /// trimmed is derived per commit from the indexes the table actually has,
+    /// so a newly maintained index starts with none and holds the trim until it
+    /// proves coverage.
+    async fn update_mem_wal_maintained_indexes(
+        &mut self,
+        _indexes: Option<Vec<String>>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "update_mem_wal_maintained_indexes on this dataset type",
+        ))
+    }
+
     /// List current MemWAL shard IDs from object storage directory listing.
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         Ok(Vec::new())
@@ -568,6 +620,21 @@ pub trait DatasetMemWalExt {
         shard_id: Uuid,
         config: ShardWriterConfig,
     ) -> Result<ShardWriter>;
+
+    /// Re-resolve the maintained set from this dataset and install it on
+    /// `writer`, sealing so the next MemTable carries it.
+    ///
+    /// This is how a change reaches a writer that is already open: a replaced
+    /// `maintained_indexes`, or, for a table that maintains all of them, an
+    /// index created since the claim. Read the dataset at the version to pick
+    /// up -- a stale handle resolves the set it was already holding.
+    ///
+    /// `Ok(None)` when the set is unchanged, which is every tick that finds
+    /// nothing new.
+    async fn refresh_mem_wal_index_configs(
+        &self,
+        writer: &ShardWriter,
+    ) -> Result<Option<SealFence>>;
 }
 
 /// Prewarm every index of `dataset` into its session caches. A no-op when the
@@ -595,6 +662,53 @@ impl DatasetMemWalExt for Dataset {
         };
 
         load_mem_wal_index_details(index_meta).map(Some)
+    }
+
+    async fn update_mem_wal_maintained_indexes(
+        &mut self,
+        indexes: Option<Vec<String>>,
+    ) -> Result<()> {
+        let Some(existing_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? else {
+            return Err(Error::invalid_input(
+                "MemWAL is not initialized on this dataset.",
+            ));
+        };
+        let details = load_mem_wal_index_details(existing_meta.clone())?;
+        let maintain_all_indexes = indexes.is_none();
+        let indexes = indexes.unwrap_or_default();
+        if details.maintain_all_indexes == maintain_all_indexes
+            && details.maintained_indexes == indexes
+        {
+            return Ok(());
+        }
+
+        // Gate the commit, not just a preflight a caller may skip: a set the
+        // writer cannot open leaves the table unwritable.
+        if !maintain_all_indexes {
+            validate_maintained_indexes(self, &indexes).await?;
+        }
+
+        let details = MemWalIndexDetails {
+            maintained_indexes: indexes,
+            maintain_all_indexes,
+            ..details
+        };
+        let index_meta = new_mem_wal_index_meta(self.manifest.version, details)?;
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_meta],
+                removed_indices: vec![existing_meta],
+            },
+            None,
+        );
+
+        let new_dataset = CommitBuilder::new(Arc::new(self.clone()))
+            .execute(transaction)
+            .await?;
+        *self = new_dataset;
+
+        Ok(())
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
@@ -675,11 +789,17 @@ impl DatasetMemWalExt for Dataset {
         config.shard_spec_id =
             resolve_writer_shard_spec_id(&mem_wal_index.details, config.shard_spec_id)?;
 
-        // Get maintained_indexes from the MemWalIndex details
-        let maintained_indexes = &mem_wal_index.details.maintained_indexes;
+        let (maintained_indexes, on_unsupported) =
+            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
 
-        let index_configs =
-            build_index_configs(self, maintained_indexes, &config.hnsw_params).await?;
+        let index_configs = build_index_configs(
+            self,
+            &maintained_indexes,
+            &config.hnsw_params,
+            OnMissingIndex::Skip,
+            on_unsupported,
+        )
+        .await?;
 
         // Set shard_id in config
         config.shard_id = shard_id;
@@ -707,6 +827,58 @@ impl DatasetMemWalExt for Dataset {
         )
         .await
     }
+
+    async fn refresh_mem_wal_index_configs(
+        &self,
+        writer: &ShardWriter,
+    ) -> Result<Option<SealFence>> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let mem_wal_index = self
+            .open_mem_wal_index(&NoOpMetricsCollector)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
+                )
+            })?;
+        let (maintained_indexes, on_unsupported) =
+            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
+        let index_configs = build_index_configs(
+            self,
+            &maintained_indexes,
+            &writer.config().hnsw_params,
+            OnMissingIndex::Skip,
+            on_unsupported,
+        )
+        .await?;
+        writer.replace_index_configs(index_configs).await
+    }
+}
+
+/// Whether an index kind this writer cannot mirror is fatal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnUnsupportedIndex {
+    /// The caller named this index, so refusing is the only honest answer: it
+    /// asked for something the fresh tier cannot give it.
+    Reject,
+    /// The set is "every index on the table", so this one arrived by existing.
+    /// Skipping keeps the table writable when a kind the writer cannot mirror
+    /// is introduced.
+    Skip,
+}
+
+/// Whether an index the set names but the dataset does not have is fatal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnMissingIndex {
+    /// Validating a set before it is installed: a name that resolves to nothing
+    /// is the operator's mistake, and the only moment it can still be corrected.
+    Reject,
+    /// Opening a shard against a set installed earlier: the index may have been
+    /// dropped since, or carried away with the column it covered. The set
+    /// cannot be edited, so rejecting here refuses every read on the table for
+    /// something that costs only the fresh tier's copy of one index.
+    Skip,
 }
 
 /// Build the in-memory index configurations for `index_names`.
@@ -714,10 +886,41 @@ impl DatasetMemWalExt for Dataset {
 /// Shared by [`DatasetMemWalExt::mem_wal_writer`] and
 /// [`validate_maintained_indexes`], so a set that validates is one the writer
 /// can build.
+/// The indexes a MemTable should carry, and how to treat one this writer cannot
+/// mirror.
+///
+/// `maintain_all_indexes` resolves against the table's indexes every time this
+/// runs, so an index created after the spec was written is picked up and a
+/// dropped one falls out. System indexes are not table data and are never
+/// mirrored.
+async fn resolve_maintained_indexes(
+    dataset: &Dataset,
+    details: &MemWalIndexDetails,
+) -> Result<(Vec<String>, OnUnsupportedIndex)> {
+    if !details.maintain_all_indexes {
+        return Ok((
+            details.maintained_indexes.clone(),
+            OnUnsupportedIndex::Reject,
+        ));
+    }
+    let names = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .filter(|index| !lance_index::is_system_index(index))
+        .map(|index| index.name.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok((names, OnUnsupportedIndex::Skip))
+}
+
 async fn build_index_configs(
     dataset: &Dataset,
     index_names: &[String],
     hnsw_params: &HashMap<String, HnswBuildParams>,
+    on_missing: OnMissingIndex,
+    on_unsupported: OnUnsupportedIndex,
 ) -> Result<Vec<MemIndexConfig>> {
     let mut index_configs = Vec::with_capacity(index_names.len());
     for index_name in index_names {
@@ -729,13 +932,26 @@ async fn build_index_configs(
             .load_indices_by_name(index_name)
             .await?
             .into_iter()
-            .next()
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
+            .next();
+
+        // An index the maintained set names and the dataset does not have:
+        // dropped outright, or carried away with the column it covered. Serve
+        // without it -- the base index is gone for everyone, so the fresh tier
+        // has nothing to keep in step with. See `OnMissingIndex::Skip`.
+        let Some(index_meta) = index_meta else {
+            if on_missing == OnMissingIndex::Reject {
+                return Err(Error::invalid_input(format!(
                     "Index '{}' from maintained_indexes not found on dataset",
                     index_name
-                ))
-            })?;
+                )));
+            }
+            log::warn!(
+                "index '{}' is named by maintained_indexes but is not on the dataset; \
+                 the fresh tier will not maintain it",
+                index_name
+            );
+            continue;
+        };
 
         // Detect index kind and create appropriate config
         let type_url = index_meta
@@ -744,8 +960,22 @@ async fn build_index_configs(
             .map(|d| d.type_url.as_str())
             .unwrap_or("");
 
-        let kind = MemIndexKind::from_type_url(type_url)
-            .ok_or_else(|| unsupported_index_type(index_name, type_url))?;
+        let Some(kind) = MemIndexKind::from_type_url(type_url) else {
+            // Nobody named this index: it arrived because the table has it and
+            // the set is "everything". A kind this writer cannot mirror must not
+            // make the table unwritable, or introducing one upstream would break
+            // every table maintaining all of them.
+            if on_unsupported == OnUnsupportedIndex::Skip {
+                log::warn!(
+                    "index '{}' has a type this writer cannot mirror ({}); \
+                     the fresh tier will not maintain it",
+                    index_name,
+                    type_url
+                );
+                continue;
+            }
+            return Err(unsupported_index_type(index_name, type_url));
+        };
 
         // Exhaustive: a new kind must be built here, or a maintained set could
         // name an index this writer cannot open, failing every memtable claim.
@@ -782,7 +1012,14 @@ async fn build_index_configs(
 pub async fn validate_maintained_indexes(dataset: &Dataset, index_names: &[String]) -> Result<()> {
     // Validation reads an index's name, column, and field id, never its HNSW
     // tuning, so the writer's build params are not needed here.
-    let index_configs = build_index_configs(dataset, index_names, &HashMap::new()).await?;
+    let index_configs = build_index_configs(
+        dataset,
+        index_names,
+        &HashMap::new(),
+        OnMissingIndex::Reject,
+        OnUnsupportedIndex::Reject,
+    )
+    .await?;
 
     // The shard schema is base + `_tombstone`, as `ShardWriter::open` extends
     // it; field ids and the primary key resolve against that, not the base.
@@ -1212,6 +1449,275 @@ mod tests {
         );
     }
 
+    /// The maintained set can be replaced on a live MemWAL, and only that: the
+    /// sharding spec and the progress the index carries survive untouched,
+    /// because the generations already written were homed under that spec and
+    /// nothing re-homes them.
+    /// "Maintain everything" is an intent, not a list: an index built after the
+    /// spec is maintained without anyone updating it, and a dropped one falls
+    /// out. The set is resolved from the table each time it is asked for.
+    #[tokio::test]
+    async fn test_maintain_all_picks_up_an_index_built_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        // Installed with no indexes on the table at all.
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+        assert!(
+            details.maintain_all_indexes,
+            "an unnamed set is the intent to maintain everything"
+        );
+        assert!(
+            details.maintained_indexes.is_empty(),
+            "the intent is persisted, not a snapshot of the table's indexes"
+        );
+        let (resolved, _) = resolve_maintained_indexes(&dataset, &details)
+            .await
+            .unwrap();
+        assert!(resolved.is_empty(), "the table has no indexes yet");
+
+        // An index built afterwards is maintained with no further call.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (resolved, on_unsupported) = resolve_maintained_indexes(&dataset, &details)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            vec!["id_idx".to_string()],
+            "an index built after the spec is maintained without updating it"
+        );
+        assert_eq!(
+            on_unsupported,
+            OnUnsupportedIndex::Skip,
+            "nobody named these, so a kind the writer cannot mirror is skipped"
+        );
+
+        // A named set is the opposite on both counts.
+        dataset
+            .update_mem_wal_maintained_indexes(Some(Vec::new()))
+            .await
+            .unwrap();
+        let named = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+        assert!(!named.maintain_all_indexes);
+        let (resolved, on_unsupported) =
+            resolve_maintained_indexes(&dataset, &named).await.unwrap();
+        assert!(
+            resolved.is_empty(),
+            "an empty named set maintains nothing, even though the table has an index"
+        );
+        assert_eq!(on_unsupported, OnUnsupportedIndex::Reject);
+    }
+
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_replaces_only_that_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Installed maintaining nothing, which is the state a table is in when
+        // an index is built after the MemWAL.
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(Vec::<String>::new())
+            .execute()
+            .await
+            .unwrap();
+        let before = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+        assert!(before.maintained_indexes.is_empty());
+
+        dataset
+            .update_mem_wal_maintained_indexes(Some(vec!["id_idx".to_string()]))
+            .await
+            .expect("an index that exists is maintainable");
+
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized");
+        assert_eq!(after.maintained_indexes, vec!["id_idx".to_string()]);
+        assert_eq!(
+            after.sharding_specs, before.sharding_specs,
+            "the sharding spec must survive the update"
+        );
+        assert_eq!(
+            after.num_shards, before.num_shards,
+            "the shard count must survive the update"
+        );
+
+        // Idempotent: the same set again is a no-op rather than a commit.
+        let version = dataset.manifest.version;
+        dataset
+            .update_mem_wal_maintained_indexes(Some(vec!["id_idx".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.version, version,
+            "an unchanged set must not commit"
+        );
+
+        // And a name that resolves to nothing is refused before the commit.
+        let error = dataset
+            .update_mem_wal_maintained_indexes(Some(vec!["nope".to_string()]))
+            .await
+            .expect_err("an unknown index must be refused");
+        assert!(error.to_string().contains("nope"), "unexpected: {error}");
+        assert_eq!(
+            dataset
+                .mem_wal_index_details()
+                .await
+                .unwrap()
+                .expect("still initialized")
+                .maintained_indexes,
+            vec!["id_idx".to_string()],
+            "a rejected set must leave the committed one alone"
+        );
+    }
+
+    /// The set shrinks as well as grows, and the progress the index carries --
+    /// what has been compacted, and what each index has caught up to -- is not
+    /// what this call is about, so it survives untouched.
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_narrows_without_losing_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        for (columns, name) in [(&["id"][..], "id_idx"), (&["v"][..], "v_idx")] {
+            dataset
+                .create_index(
+                    columns,
+                    IndexType::BTree,
+                    Some(name.to_string()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["id_idx", "v_idx"])
+            .execute()
+            .await
+            .unwrap();
+        let before = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("initialized");
+
+        dataset
+            .update_mem_wal_maintained_indexes(Some(vec!["id_idx".to_string()]))
+            .await
+            .expect("dropping one from the set is allowed");
+
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized");
+        assert_eq!(after.maintained_indexes, vec!["id_idx".to_string()]);
+        assert_eq!(
+            after.compacted_sstables, before.compacted_sstables,
+            "what has been compacted is not the maintained set"
+        );
+        assert_eq!(
+            after.writer_config_defaults, before.writer_config_defaults,
+            "the writer defaults are not the maintained set"
+        );
+        assert_eq!(
+            after.num_shards, before.num_shards,
+            "the shard count is not the maintained set"
+        );
+
+        // Emptying it is a legitimate set, not a request to uninstall.
+        dataset
+            .update_mem_wal_maintained_indexes(Some(Vec::new()))
+            .await
+            .expect("an empty set is allowed");
+        let after = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("still initialized after emptying the set");
+        assert!(after.maintained_indexes.is_empty());
+    }
+
+    /// Updating before initializing is a caller error, not a silent install.
+    #[tokio::test]
+    async fn test_update_mem_wal_maintained_indexes_requires_an_initialized_mem_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let error = dataset
+            .update_mem_wal_maintained_indexes(Some(vec!["id_idx".to_string()]))
+            .await
+            .expect_err("no MemWAL to update");
+        assert!(
+            error.to_string().contains("not initialized"),
+            "unexpected: {error}"
+        );
+        assert!(dataset.mem_wal_index_details().await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn test_initialize_mem_wal_rejects_unknown_index_name() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1333,6 +1839,74 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().unwrap();
 
         assert_eq!(manifest.shard_spec_id, SHARDING_SPEC_ID);
+        writer.close().await.unwrap();
+    }
+
+    /// An index created after the claim reaches a writer that is already open.
+    ///
+    /// This is the whole point of persisting the intent rather than a resolved
+    /// list: nobody has to name the index, and nobody has to reopen the writer.
+    #[tokio::test]
+    async fn test_refresh_installs_an_index_created_after_the_writer_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1]))], schema.clone());
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .refresh_mem_wal_index_configs(&writer)
+                .await
+                .unwrap()
+                .is_none(),
+            "the table has no indexes, so there is nothing to install"
+        );
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .refresh_mem_wal_index_configs(&writer)
+            .await
+            .unwrap()
+            .expect("the new index changes the set");
+
+        writer.put(vec![id_v_batch(&schema, &[2])]).await.unwrap();
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.active.index_store.get_btree("id_idx").is_some(),
+            "the memtable opened after the refresh carries the new index"
+        );
+
+        assert!(
+            dataset
+                .refresh_mem_wal_index_configs(&writer)
+                .await
+                .unwrap()
+                .is_none(),
+            "a second pass over an unchanged table seals nothing"
+        );
         writer.close().await.unwrap();
     }
 }
