@@ -1845,7 +1845,7 @@ mod tests {
         );
 
         let error = RestNamespaceBuilder::from_properties(properties)
-            .expect_err("an unparseable interval should be rejected")
+            .expect_err("an unparsable interval should be rejected")
             .to_string();
         assert!(
             error.contains("tls.reload_interval_seconds") && error.contains("5 minutes"),
