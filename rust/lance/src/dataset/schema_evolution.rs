@@ -240,8 +240,6 @@ pub(super) async fn add_columns_to_fragments(
     fragments: &[FileFragment],
     batch_size: Option<u32>,
 ) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>, bool)> {
-    // Every add_columns route reaches here -- the dataset's and the one a caller
-    // drives a fragment at a time -- so the MemWAL rule is checked once, here.
     let only_nulls = adds_only_nulls(dataset, &transforms)?;
     reject_partial_add_on_mem_wal(dataset, only_nulls).await?;
 
@@ -531,9 +529,9 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
 /// leaves rows of the same age holding different values, and no later pass
 /// corrects it.
 ///
-/// An expression qualifies only by folding to a null literal. Folding to a
-/// literal at all is what proves it reads no column and is not volatile; a
-/// non-null one is a value the WAL's rows would not get.
+/// An expression qualifies by folding to a null literal. Only one that reads no
+/// column and is not volatile folds to a literal at all, so that is the whole
+/// test.
 fn adds_only_nulls(dataset: &Dataset, transforms: &NewColumnTransform) -> Result<bool> {
     match transforms {
         NewColumnTransform::AllNulls(_) => Ok(true),
@@ -551,7 +549,8 @@ fn adds_only_nulls(dataset: &Dataset, transforms: &NewColumnTransform) -> Result
     }
 }
 
-/// Refuse an `add_columns` that would leave the MemWAL's rows behind.
+/// Refuse an `add_columns` that would leave the MemWAL's rows behind, whether it
+/// names the dataset or one fragment.
 ///
 /// A table without a MemWAL is unaffected: its presence is the only thing this
 /// looks at. Having drained the WAL first is not an exemption, because nothing
@@ -568,10 +567,8 @@ async fn reject_partial_add_on_mem_wal(dataset: &Dataset, only_nulls: bool) -> R
         return Ok(());
     }
     Err(Error::invalid_input(
-        "cannot add a column with a computed value to a table with a MemWAL attached: the \
-         value is computed over the base table, and rows still in the WAL are not there to be \
-         computed, so they would keep a null the base table's rows do not have. Add the column \
-         as all-nulls and backfill it, or drop the MemWAL first.",
+        "cannot add a computed column to a table with a MemWAL attached: rows still in the \
+         WAL would read null for it. Add it as all-nulls, or drop the MemWAL first.",
     ))
 }
 
@@ -1369,12 +1366,78 @@ mod test {
                     .err()
                     .unwrap_or_else(|| panic!("`{expression}` ({case}) must be refused"));
                 assert!(
-                    err.to_string()
-                        .contains("cannot add a column with a computed value"),
+                    err.to_string().contains("cannot add a computed column"),
                     "`{expression}` ({case}) refused for the wrong reason: {err}"
                 );
             }
         }
+    }
+
+    /// The fragment-level route is guarded too.
+    ///
+    /// It reaches `add_columns_to_fragments` without passing through
+    /// `Dataset::add_columns`, so a guard on the dataset alone would let a
+    /// caller compute the column a fragment at a time and commit the results
+    /// as a `Merge` — the same wrong value by a longer road.
+    #[tokio::test]
+    async fn add_columns_on_a_fragment_of_a_mem_wal_table_is_refused() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![Some(10i64)])),
+            ],
+        )
+        .unwrap();
+        let uri = format!("memory://mem_wal_frag_guard_{}", uuid::Uuid::new_v4());
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .next()
+            .expect("fragment");
+        let err = fragment
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("doubled".into(), "value * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the fragment route must be refused too");
+        assert!(
+            err.to_string().contains("cannot add a computed column"),
+            "unexpected error: {err}"
+        );
+
+        // The all-null case is allowed here as well.
+        fragment
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "empty".into(),
+                    "cast(NULL as bigint)".into(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .expect("an always-null value must be allowed on a fragment too");
     }
 
     /// The guard reads nothing but the MemWAL's presence: every expression it
