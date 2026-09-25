@@ -546,7 +546,7 @@ async fn prepare_column_leaves(
 
     for (leaf_ordinal, leaf) in leaf_queries {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, leaf, &effective_params);
+        let tokens = tokenize_leaf(first_index, leaf, &effective_params)?;
         let final_tokens = Arc::new(final_query_tokens(indices, &tokens, &effective_params)?);
         for token in final_tokens.as_ref() {
             if seen_terms.insert(token.clone()) {
