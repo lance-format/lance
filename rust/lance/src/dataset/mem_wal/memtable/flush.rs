@@ -13,6 +13,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::mem_wal::{ShardManifest, SsTable};
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
@@ -691,6 +692,14 @@ impl MemTableFlusher {
         })
     }
 
+    /// The shape the B-tree's `to_training_batches` produces, which is what the
+    /// on-disk B-tree trainer asks for. Declared rather than assumed, so a
+    /// mismatch is an error naming both sides instead of a panic at training
+    /// time.
+    fn btree_training_criteria() -> TrainingCriteria {
+        TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+    }
+
     /// Create BTree indexes on the SSTable dataset (uncommitted).
     ///
     /// Returns index metadata without committing to the dataset manifest.
@@ -740,7 +749,8 @@ impl MemTableFlusher {
                     let schema = training_batches[0].schema();
                     let reader =
                         RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
-                    builder = builder.preprocessed_data(Box::new(reader));
+                    builder = builder
+                        .preprocessed_data(Box::new(reader), Self::btree_training_criteria());
                 }
             }
 
