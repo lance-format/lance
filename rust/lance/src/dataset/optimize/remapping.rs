@@ -591,6 +591,72 @@ fn plan_tagged_remap(
     }
 }
 
+/// The fragments a segment's FILE still addresses, recovered from its
+/// stored bitmap.
+///
+/// Under the v0 reuse index a deferred compaction left an index file holding
+/// SOURCE addresses while `load_all_indices` swapped the segment's stored
+/// `fragment_bitmap` to the group's DESTINATIONS and the next commit
+/// persisted that swap; the v0 remap planner compensates with its
+/// `data_predates_version` rule (`index.dataset_version <
+/// version.dataset_version` means the data still needs the group). A tagged
+/// table lifts the v0 bytes verbatim and treats the stored bitmap as
+/// provenance, so a segment that predates a lifted compaction would either
+/// be skipped as already caught up, or, once a later transition consumes the
+/// destinations, enter the remap with an `admitted` set that rejects every
+/// address its file actually holds.
+///
+/// This walks the lifted legacy transitions in REVERSE lineage order and,
+/// for each transition stamped `v_t` (`legacy_dataset_version`) where
+/// `segment_dataset_version < v_t`, whose destinations are all in the bitmap
+/// and whose sources are absent from it, replaces the destinations by the
+/// sources (`B = (B - destinations) | sources`). A segment stamped at or
+/// after `v_t` is left alone (it was remapped, or built, after that
+/// compaction), so nothing is reversed blindly. Reverse order unwinds
+/// multi-round chains: with v1 `{2,3} -> D`, v2 `{0,1,D} -> X` and a stored
+/// `{X}`, the v2 transition first yields `{0,1,D}`, then the v1 transition
+/// `{0,1,2,3}`.
+///
+/// The result only seeds the plan; nothing about the stored bitmap is
+/// persisted from it, the plan's `coverage` is what gets committed. Should a
+/// file already hold destination addresses despite the stamp, a compaction
+/// hop passes an address already in its destination through unchanged
+/// (`remap.get(addr).unwrap_or(Some(addr))`), so it cannot be damaged.
+fn effective_provenance(
+    ledger: &FragReuseLedger,
+    stored: &RoaringBitmap,
+    segment_dataset_version: u64,
+) -> RoaringBitmap {
+    let mut bitmap = stored.clone();
+    for transition in ledger.transitions().iter().rev() {
+        let Some(legacy_version) = transition.legacy_dataset_version() else {
+            continue;
+        };
+        if segment_dataset_version >= legacy_version {
+            continue;
+        }
+        let destinations: RoaringBitmap = transition
+            .destinations()
+            .iter()
+            .map(|digest| digest.id as u32)
+            .collect();
+        let sources: RoaringBitmap = transition
+            .sources()
+            .iter()
+            .map(|digest| digest.id as u32)
+            .collect();
+        if destinations.is_empty()
+            || !destinations.is_subset(&bitmap)
+            || !(&sources & &bitmap).is_empty()
+        {
+            continue;
+        }
+        bitmap -= &destinations;
+        bitmap |= &sources;
+    }
+    bitmap
+}
+
 /// One hop of a planned tagged remap, applied to a batch of addresses.
 enum HopStep {
     /// A compaction's compact remap: an address it does not cover passes
@@ -850,7 +916,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             )));
         }
     }
-    let Some(provenance) = curr_index_meta.fragment_bitmap.clone() else {
+    let Some(stored_bitmap) = curr_index_meta.fragment_bitmap.clone() else {
         log::warn!(
             "Index {} ({}) has no stored fragment bitmap; its lineage through the tagged \
              history cannot be determined, skipping remap. Consider rebuilding the index",
@@ -859,6 +925,10 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         );
         return Ok(());
     };
+    // A segment that predates a lifted v0 deferred compaction still holds
+    // the group's source addresses behind a bitmap v0 swapped to the
+    // destinations; plan from the fragments the file really addresses.
+    let provenance = effective_provenance(&ledger, &stored_bitmap, curr_index_meta.dataset_version);
 
     let lineage = entry.fragment_bitmap.clone().unwrap_or_default();
     let (hops, mut coverage, admitted) = match plan_tagged_remap(
@@ -1237,6 +1307,147 @@ mod tests {
                     panic!("hop {position} needs row-map IO; not composable in a plan test")
                 }
             }))
+        }
+
+        fn digests(fragments: &[(u64, u64)]) -> Vec<pb_fri::FragmentDigest> {
+            fragments
+                .iter()
+                .map(|&(id, rows)| digest(id, rows, 0))
+                .collect()
+        }
+
+        /// The serialized changed-row bitmap of a compaction moving every
+        /// row of `sources` (`(id, rows)` pairs).
+        fn changed_rows(sources: &[(u64, u64)]) -> Vec<u8> {
+            let mut addrs = RoaringTreemap::new();
+            for &(id, rows) in sources {
+                for offset in 0..rows as u32 {
+                    addrs.insert(addr(id as u32, offset));
+                }
+            }
+            let mut bytes = Vec::new();
+            addrs.serialize_into(&mut bytes).unwrap();
+            bytes
+        }
+
+        /// A v0 reuse version stamped `dataset_version` with one compaction
+        /// group; fragments are `(id, rows)` pairs.
+        fn legacy_version(
+            dataset_version: u64,
+            sources: &[(u64, u64)],
+            destinations: &[(u64, u64)],
+        ) -> pb_fri::Version {
+            pb_fri::Version {
+                dataset_version,
+                groups: vec![pb_fri::Group {
+                    changed_row_addrs: changed_rows(sources),
+                    old_fragments: digests(sources),
+                    new_fragments: digests(destinations),
+                }],
+            }
+        }
+
+        /// A stable partition with explicit `(id, rows)` fragments.
+        fn partition_rows(
+            sources: &[(u64, u64)],
+            destinations: &[(u64, u64)],
+        ) -> pb_fri::Transition {
+            pb_fri::Transition {
+                sources: digests(sources),
+                destinations: digests(destinations),
+                mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                    pb_fri::StablePartition {
+                        map_id: Uuid::new_v4().to_string(),
+                        map_size_bytes: 1,
+                        base_id: None,
+                    },
+                )),
+            }
+        }
+
+        /// A tagged ledger lifting v0 `legacy_versions` beside its own
+        /// `transitions`.
+        async fn ledger_with_legacy(
+            legacy_versions: Vec<pb_fri::Version>,
+            transitions: Vec<pb_fri::Transition>,
+        ) -> FragReuseLedger {
+            let content = pb_fri::InlineContent {
+                legacy_versions,
+                transitions,
+            }
+            .encode_to_vec();
+            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
+                .await
+                .unwrap()
+        }
+
+        /// Two lifted v0 rounds (v10 `{2,3} -> D`, v12 `{0,1,D} -> X`) and a
+        /// tagged partition of X: the effective provenance of a segment whose
+        /// bitmap v0 swapped to `{X}` depends on which rounds its stamp
+        /// predates, unwound newest first.
+        #[tokio::test]
+        async fn effective_provenance_unwinds_legacy_swaps_by_stamp() {
+            const D: u64 = 20;
+            const X: u64 = 30;
+            const Y: u64 = 40;
+            let ledger = ledger_with_legacy(
+                vec![
+                    legacy_version(10, &[(2, 4), (3, 4)], &[(D, 8)]),
+                    legacy_version(12, &[(0, 4), (1, 4), (D, 8)], &[(X, 16)]),
+                ],
+                vec![partition_rows(&[(X, 16)], &[(Y, 16)])],
+            )
+            .await;
+            assert_eq!(
+                ledger
+                    .transitions()
+                    .iter()
+                    .map(|transition| transition.legacy_dataset_version())
+                    .collect::<Vec<_>>(),
+                vec![Some(10), Some(12), None]
+            );
+            let stored = coverage(&[X as u32]);
+            // Built before both rounds: the file holds the original
+            // fragments' addresses.
+            assert_eq!(
+                effective_provenance(&ledger, &stored, 5),
+                coverage(&[0, 1, 2, 3])
+            );
+            // Built after the second round: the bitmap is the truth.
+            assert_eq!(effective_provenance(&ledger, &stored, 12), stored);
+            assert_eq!(effective_provenance(&ledger, &stored, 13), stored);
+            // Built between the rounds: only the second swap is unwound.
+            assert_eq!(
+                effective_provenance(&ledger, &stored, 11),
+                coverage(&[0, 1, D as u32])
+            );
+            // A bitmap that already names the sources is left alone.
+            let sources = coverage(&[0, 1, 2, 3]);
+            assert_eq!(effective_provenance(&ledger, &sources, 5), sources);
+            // The tagged partition is never unwound, whatever the stamp.
+            let restamped = coverage(&[Y as u32]);
+            assert_eq!(effective_provenance(&ledger, &restamped, 0), restamped);
+        }
+
+        /// A segment stamped at or after the lifted version was remapped (or
+        /// built) after that compaction: its destination bitmap is kept.
+        #[tokio::test]
+        async fn caught_up_destination_bitmap_is_left_alone() {
+            const D: u64 = 20;
+            let ledger = ledger_with_legacy(
+                vec![legacy_version(10, &[(2, 4), (3, 4)], &[(D, 8)])],
+                vec![],
+            )
+            .await;
+            let stored = coverage(&[D as u32]);
+            assert_eq!(effective_provenance(&ledger, &stored, 10), stored);
+            assert_eq!(effective_provenance(&ledger, &stored, 11), stored);
+            // A bitmap naming only part of the destinations, or one of the
+            // sources beside them, is not a v0 swap and is kept too.
+            let mixed = coverage(&[2, D as u32]);
+            assert_eq!(effective_provenance(&ledger, &mixed, 5), mixed);
+            // The swap itself is unwound for a predating segment.
+            assert_eq!(effective_provenance(&ledger, &stored, 9), coverage(&[2, 3]));
         }
 
         /// A1: coverage disjoint from the ledger is already current.
