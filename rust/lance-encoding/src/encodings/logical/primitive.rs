@@ -6520,7 +6520,7 @@ impl PrimitiveStructuralEncoder {
 
             if let Some(rep_index) = rep_index {
                 let view = rep_index.borrow_to_typed_slice::<u64>();
-                let total = view.chunks_exact(2).map(|c| c[0]).sum::<u64>();
+                let total = view.as_chunks::<2>().0.iter().map(|c| c[0]).sum::<u64>();
                 debug_assert_eq!(total, num_rows);
 
                 data.push(rep_index);

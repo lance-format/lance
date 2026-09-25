@@ -278,8 +278,8 @@ impl CountsMatrix {
             })?;
         let mut cumulative =
             Vec::with_capacity((num_blocks * u64::from(num_destinations)) as usize);
-        for chunk in buf[COUNTS_HEADER_BYTES..].chunks_exact(4) {
-            cumulative.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in buf[COUNTS_HEADER_BYTES..].as_chunks::<4>().0 {
+            cumulative.push(u32::from_le_bytes(*chunk));
         }
         Ok(Self {
             num_destinations,

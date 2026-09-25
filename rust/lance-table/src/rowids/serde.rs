@@ -181,8 +181,10 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
             Some(U16Array(pb_arr::U16Array { base, offsets })) => {
                 validate_packed_array_length("u16", offsets.len(), 2)?;
                 let offsets = offsets
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
                     .collect::<Vec<_>>();
                 if let Some(max_offset) = offsets.iter().copied().max()
                     && base.checked_add(u64::from(max_offset)).is_none()
@@ -196,8 +198,10 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
             Some(U32Array(pb_arr::U32Array { base, offsets })) => {
                 validate_packed_array_length("u32", offsets.len(), 4)?;
                 let offsets = offsets
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_le_bytes(*chunk))
                     .collect::<Vec<_>>();
                 if let Some(max_offset) = offsets.iter().copied().max()
                     && base.checked_add(u64::from(max_offset)).is_none()
@@ -211,13 +215,10 @@ impl TryFrom<pb::EncodedU64Array> for EncodedU64Array {
             Some(U64Array(pb_arr::U64Array { values })) => {
                 validate_packed_array_length("u64", values.len(), 8)?;
                 let values = values
-                    .chunks_exact(8)
-                    .map(|chunk| {
-                        u64::from_le_bytes([
-                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                            chunk[7],
-                        ])
-                    })
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk))
                     .collect();
                 Ok(Self::U64(values))
             }

@@ -130,14 +130,13 @@ pub fn l2_scalar<
     to: &[T],
 ) -> Output {
     assert_equal_lengths(from.len(), to.len());
-    let x_chunks = from.chunks_exact(LANES);
-    let y_chunks = to.chunks_exact(LANES);
+    let (x_chunks, x_remainder) = from.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = to.as_chunks::<LANES>();
 
-    let s = if !x_chunks.remainder().is_empty() {
-        x_chunks
-            .remainder()
+    let s = if !x_remainder.is_empty() {
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder())
+            .zip(y_remainder)
             .map(|(&x, &y)| {
                 let diff = x.as_() - y.as_();
                 diff * diff
@@ -148,7 +147,7 @@ pub fn l2_scalar<
     };
 
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;

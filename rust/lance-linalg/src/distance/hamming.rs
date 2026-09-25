@@ -56,16 +56,16 @@ pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
 
 #[inline]
 fn hamming_autovec<const L: usize>(x: &[u8], y: &[u8]) -> f32 {
-    let x_chunk = x.chunks_exact(L);
-    let y_chunk = y.chunks_exact(L);
-    let sum = x_chunk
-        .remainder()
+    let (x_chunks, x_remainder) = x.as_chunks::<L>();
+    let (y_chunks, y_remainder) = y.as_chunks::<L>();
+    let sum = x_remainder
         .iter()
-        .zip(y_chunk.remainder())
+        .zip(y_remainder)
         .map(|(&a, &b)| (a ^ b).count_ones())
         .sum::<u32>();
-    (sum + x_chunk
-        .zip(y_chunk)
+    (sum + x_chunks
+        .iter()
+        .zip(y_chunks)
         .map(|(x, y)| {
             x.iter()
                 .zip(y.iter())

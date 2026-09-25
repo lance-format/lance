@@ -54,21 +54,20 @@ fn dot_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
-    let x_chunks = to.chunks_exact(LANES);
-    let y_chunks = from.chunks_exact(LANES);
-    let sum = if x_chunks.remainder().is_empty() {
+    let (x_chunks, x_remainder) = to.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = from.as_chunks::<LANES>();
+    let sum = if x_remainder.is_empty() {
         Output::zero()
     } else {
-        x_chunks
-            .remainder()
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder().iter())
+            .zip(y_remainder.iter())
             .map(|(&x, &y)| x.as_() * y.as_())
             .sum::<Output>()
     };
     // Use known size to allow LLVM to kick in auto-vectorization.
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             sums[i] += x[i].as_() * y[i].as_();
         }

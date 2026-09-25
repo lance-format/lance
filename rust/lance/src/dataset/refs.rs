@@ -867,7 +867,9 @@ impl BranchIdentifier {
         }
 
         let version_mapping = parts
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
                     message: format!("Invalid version number '{}': {}", chunk[0], e),

@@ -391,15 +391,11 @@ pub fn norm_l2_impl<
 >(
     vector: &[T],
 ) -> Output {
-    let chunks = vector.chunks_exact(LANES);
-    let sum = if chunks.remainder().is_empty() {
+    let (chunks, remainder) = vector.as_chunks::<LANES>();
+    let sum = if remainder.is_empty() {
         Output::zero()
     } else {
-        chunks
-            .remainder()
-            .iter()
-            .map(|&v| v.as_().powi(2))
-            .sum::<Output>()
+        remainder.iter().map(|&v| v.as_().powi(2)).sum::<Output>()
     };
     let mut sums = [Output::zero(); LANES];
     for chunk in chunks {
