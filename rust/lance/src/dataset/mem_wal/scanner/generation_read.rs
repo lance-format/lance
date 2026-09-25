@@ -428,11 +428,8 @@ mod tests {
         )
     }
 
-    /// A predicate naming a struct can only be pushed down when the generation
-    /// stores that struct exactly as the table declares it. A nested reference
-    /// names the parent, and a parent's name does not move when one of its
-    /// children does, so the parent's name alone cannot say whether pushing
-    /// down is safe.
+    /// A predicate on a struct reaches the stored data only where the whole
+    /// struct still matches, child names included.
     #[test]
     fn a_struct_predicate_is_pushed_down_only_when_its_children_did_not_move() {
         // The child as the generation stored it, as the table now declares it,

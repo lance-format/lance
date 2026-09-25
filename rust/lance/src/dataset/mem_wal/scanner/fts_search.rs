@@ -58,7 +58,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::generation_read::{filter_above, GenerationRead};
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
@@ -1137,10 +1137,8 @@ impl LsmFtsSearchPlanner {
                     &self.pk_columns,
                     asked_for,
                 );
-                // The index is on this generation's own columns, under the
-                // names they had when it was sealed. Every queried column has
-                // to be resolved: a rename moved the table's name while the
-                // file still holds the old one.
+                // Every queried column has to be resolved: a rename moved the
+                // table's name while the file still holds the old one.
                 let mut stored_columns = Vec::with_capacity(columns.len());
                 for column in columns {
                     let Some(stored) = generation.stored_name(column) else {
@@ -1152,9 +1150,6 @@ impl LsmFtsSearchPlanner {
                 }
                 // A predicate this generation cannot answer as written runs
                 // above the reconciliation, where the columns it names exist.
-                // The BM25 top-k has already run by then, so the arm can come
-                // back short — which is right: those rows have no value for a
-                // column sealed before it existed.
                 let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
@@ -1168,11 +1163,6 @@ impl LsmFtsSearchPlanner {
                     scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                // A generation that stores every queried column under the name
-                // the table still uses needs no rebinding, so the tree reaches
-                // the scanner exactly as the other arms get it -- including a
-                // cross-column predicate, whose leaves carry their own bindings
-                // and must not be collapsed onto one column.
                 // Bound here, limited below: this arm's limit rule is not the
                 // one `bind` applies, so only the column binding is taken from
                 // the shape of the set.
@@ -2210,12 +2200,8 @@ mod tests {
         );
     }
 
-    /// A cross-column predicate meets on rows, so every leaf has to reach its
-    /// own index. When a sealed generation stores one of those columns under an
-    /// older name, each leaf would need a different name -- and `with_column`
-    /// rebinds the whole tree, which would collapse the predicate onto one
-    /// field and answer a different question. Refused rather than ranked on the
-    /// wrong column.
+    /// Refused rather than ranked on the wrong column: rebinding the tree to
+    /// one name would answer a different question.
     #[tokio::test]
     async fn a_cross_column_predicate_over_a_renamed_generation_is_refused() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;

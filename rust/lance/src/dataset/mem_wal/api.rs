@@ -3,9 +3,6 @@
 
 //! Dataset API extensions for MemWAL.
 //!
-//! This module provides the user-facing API for initializing and using MemWAL
-//! on a Dataset.
-//!
 //! # Limitations
 //!
 //! `maintained_indexes` is fixed at initialization. An index created later is

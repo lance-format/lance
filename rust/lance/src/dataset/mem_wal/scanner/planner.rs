@@ -394,8 +394,9 @@ impl LsmScanPlanner {
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner
-                    .project_with_schema(&dataset.schema().project(&generation.stored_projection())?)?;
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so

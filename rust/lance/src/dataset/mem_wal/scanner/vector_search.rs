@@ -569,9 +569,8 @@ impl LsmVectorSearchPlanner {
                         // Logged because it is invisible otherwise: the query
                         // is correct and simply slow, and the cause -- one
                         // column this generation cannot be asked about under
-                        // its current name -- is not something an operator can
-                        // read off the query. It clears when compaction folds
-                        // the generation into base.
+                        // its current name -- cannot be read off the query. It
+                        // clears when compaction folds the generation into base.
                         log::warn!(
                             "mem_wal vector search: ranking all {all} rows of a generation                              because a predicate could not be translated against it;                              requested k was {k}"
                         );
