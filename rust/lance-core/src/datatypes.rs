@@ -352,13 +352,21 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Duration(tu) => format!("duration:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
             DataType::Dictionary(key_type, value_type) => {
-                format!(
-                    "dict:{}:{}:{}",
-                    Self::try_from(value_type.as_ref())?.0,
-                    Self::try_from(key_type.as_ref())?.0,
-                    // Arrow C++ Dictionary has "ordered:bool" field, but it does not exist in `arrow-rs`.
-                    false
-                )
+                let value_logical = Self::try_from(value_type.as_ref())?.0;
+                let index_logical = Self::try_from(key_type.as_ref())?.0;
+                let logical_type = format!("dict:{value_logical}:{index_logical}:false");
+                // `dict:{value}:{index}:false` inlines both component strings, but
+                // the parser splits on ':', requires exactly four segments, and
+                // resolves only leaf types - so a component carrying ':' of its own
+                // (decimal, timestamp, ...) or a struct/list value composes a string
+                // it can never parse back. `Field::data_type` unwraps that parse, so
+                // without this check `Schema::try_from` panics instead of erroring.
+                if DataType::try_from(&Self::from(logical_type.as_str())).is_err() {
+                    return Err(Error::schema(format!(
+                        "Cannot encode dictionary type {dt:?}: the logical type \"{logical_type}\" does not parse back"
+                    )));
+                }
+                logical_type
             }
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
@@ -716,6 +724,112 @@ mod tests {
             DataType::try_from(&logical_type).unwrap(),
             data_type,
             "logical type: {logical_type}"
+        );
+    }
+
+    /// The `dict:{value}:{index}:false` encoding inlines both component logical
+    /// strings, but the parser splits on ':' and requires exactly four segments.
+    /// These value types keep the count at four, so they must keep working.
+    #[rstest]
+    #[case::string(DataType::Utf8, DataType::Utf8)]
+    #[case::large_string(DataType::LargeUtf8, DataType::LargeUtf8)]
+    #[case::binary(DataType::Binary, DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary, DataType::LargeBinary)]
+    #[case::int32(DataType::Int32, DataType::Int32)]
+    #[case::double(DataType::Float64, DataType::Float64)]
+    // The View variants share the `string` and `binary` logical types, so they
+    // parse back as their non-View counterparts. That normalization is why the
+    // encoder checks whether the composed string parses, not whether it round
+    // trips to the same `DataType`.
+    #[case::utf8_view(DataType::Utf8View, DataType::Utf8)]
+    #[case::binary_view(DataType::BinaryView, DataType::Binary)]
+    fn test_dictionary_logical_type_round_trip(
+        #[case] value_type: DataType,
+        #[case] parsed_value_type: DataType,
+    ) {
+        let key = Box::new(DataType::UInt8);
+        let logical_type =
+            LogicalType::try_from(&DataType::Dictionary(key.clone(), Box::new(value_type)))
+                .unwrap();
+        assert_eq!(
+            DataType::try_from(&logical_type).unwrap(),
+            DataType::Dictionary(key, Box::new(parsed_value_type)),
+            "logical type: {logical_type}"
+        );
+    }
+
+    /// Every integer index type has a colon-free logical string, so none of them
+    /// may be caught by the rejection above.
+    #[rstest]
+    fn test_dictionary_logical_type_accepts_every_integer_index(
+        #[values(
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64
+        )]
+        key_type: DataType,
+    ) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(DataType::try_from(&logical_type).unwrap(), data_type);
+    }
+
+    #[rstest]
+    #[case::decimal(DataType::Decimal128(10, 2))]
+    #[case::date32(DataType::Date32)]
+    #[case::time32(DataType::Time32(TimeUnit::Second))]
+    #[case::timestamp(DataType::Timestamp(TimeUnit::Microsecond, None))]
+    #[case::timestamp_with_zone(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some(Arc::from("+08:00"))
+    ))]
+    #[case::duration(DataType::Duration(TimeUnit::Second))]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(16))]
+    #[case::nested_dict(DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)))]
+    // `struct` and `list` keep the segment count at four, but the parser has no
+    // arm for them: they only become a `DataType` through a field's children,
+    // which this encoding cannot carry.
+    #[case::struct_value(DataType::Struct(Fields::from(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        true
+    )])))]
+    #[case::list_value(DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))))]
+    fn test_dictionary_logical_type_rejects_unparsable_value(#[case] value_type: DataType) {
+        let data_type = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(value_type));
+        let err = LogicalType::try_from(&data_type)
+            .expect_err("a dictionary whose logical type cannot parse back must not encode");
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The index type is inlined in the same string, so an index type carrying
+    /// ':' is just as unparsable as such a value type.
+    #[rstest]
+    #[case::decimal_index(DataType::Decimal128(10, 2))]
+    #[case::dict_index(DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)))]
+    fn test_dictionary_logical_type_rejects_unparsable_index(#[case] key_type: DataType) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        let err = LogicalType::try_from(&data_type)
+            .expect_err("a dictionary whose logical type cannot parse back must not encode");
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
         );
     }
 
