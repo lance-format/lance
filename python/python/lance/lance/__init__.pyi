@@ -493,11 +493,11 @@ class _Dataset:
     ) -> pa.RecordBatchReader: ...
     def alter_columns(self, alterations: List[AlterColumn]): ...
     def merge(self, reader: pa.RecordBatchReader, left_on: str, right_on: str): ...
-    def delete(self, predicate: str): ...
+    def delete(self, predicate: str | bytes): ...
     def update(
         self,
         updates: Dict[str, str],
-        predicate: Optional[str] = None,
+        predicate: Optional[str | bytes] = None,
         conflict_retries: Optional[int] = None,
         retry_timeout: Optional[timedelta] = None,
         data_storage_version: Optional[str] = None,
@@ -771,6 +771,7 @@ class _Fragment:
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        substrait_filter: Optional[bytes] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,

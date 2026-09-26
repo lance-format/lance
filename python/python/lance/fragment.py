@@ -586,7 +586,14 @@ class LanceFragment(pa.dataset.Fragment):
         strict_batch_size: Optional[bool] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
-        filter_str = str(filter) if filter is not None else None
+        from .dataset import LanceScanner, _serialize_expression
+
+        if isinstance(filter, pa.compute.Expression):
+            filter_str = None
+            substrait_filter = _serialize_expression(filter, self._ds._ds.schema)
+        else:
+            filter_str = str(filter) if filter is not None else None
+            substrait_filter = None
 
         columns_arg = {}
         if isinstance(columns, dict):
@@ -598,6 +605,7 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             batch_size=batch_size,
             filter=filter_str,
+            substrait_filter=substrait_filter,
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
@@ -613,13 +621,11 @@ class LanceFragment(pa.dataset.Fragment):
             strict_batch_size=strict_batch_size,
             **columns_arg,
         )
-        from .dataset import LanceScanner
-
         snapshot = {
             "_limit": limit,
             "_filter": filter_str,
             "_search_filter": None,
-            "_substrait_filter": None,
+            "_substrait_filter": substrait_filter,
             "_prefilter": False,
             "_late_materialization": late_materialization,
             "_blob_handling": blob_handling,

@@ -2933,9 +2933,12 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
         {'num_deleted_rows': 2}
         """
-        if isinstance(predicate, pa.compute.Expression):
-            predicate = str(predicate)
-        return self._ds.delete(predicate, conflict_retries, retry_timeout)
+        encoded_predicate = (
+            _serialize_expression(predicate, self._ds.schema)
+            if isinstance(predicate, pa.compute.Expression)
+            else predicate
+        )
+        return self._ds.delete(encoded_predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -3092,7 +3095,7 @@ class LanceDataset(pa.dataset.Dataset):
     def update(
         self,
         updates: Dict[str, str],
-        where: Optional[str] = None,
+        where: Optional[Union[str, Expression]] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
         data_storage_version: Optional[str] = None,
@@ -3104,8 +3107,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         updates : dict of str to str
             A mapping of column names to a SQL expression.
-        where : str, optional
-            A SQL predicate indicating which rows should be updated.
+        where : str or pa.compute.Expression, optional
+            A SQL predicate or pyarrow Expression indicating which rows should
+            be updated.
         conflict_retries : int, optional
             Number of times to retry the operation if there is contention.
             Default is 10.
@@ -3138,11 +3142,14 @@ class LanceDataset(pa.dataset.Dataset):
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression):
-            where = str(where)
+        encoded_where = (
+            _serialize_expression(where, self._ds.schema)
+            if isinstance(where, pa.compute.Expression)
+            else where
+        )
         return self._ds.update(
             updates,
-            where,
+            encoded_where,
             conflict_retries,
             retry_timeout,
             data_storage_version,
@@ -6797,6 +6804,34 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def _serialize_expression(
+    expression: pa.compute.Expression, schema: pa.Schema
+) -> bytes:
+    from pyarrow.substrait import serialize_expressions
+
+    # Keep each field's position so Substrait references still resolve against
+    # the stored schema when PyArrow cannot serialize an unrelated field's type.
+    scalar_schema = pa.schema(
+        [
+            (
+                pa.field(f"__unlikely_name_placeholder_{i}", pa.int8())
+                if _needs_substrait_placeholder(field.type)
+                else field
+            )
+            for i, field in enumerate(schema)
+        ]
+    )
+    serialized = serialize_expressions([expression], ["my_filter"], scalar_schema)
+    if isinstance(serialized, memoryview):
+        return serialized.tobytes()
+    try:
+        return serialized.to_pybytes()
+    except AttributeError:
+        raise TypeError(
+            f"serialize_expressions returned unexpected type {type(serialized)}"
+        )
+
+
 def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
     """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
 
@@ -6983,49 +7018,7 @@ class ScannerBuilder:
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
-            try:
-                from pyarrow.substrait import serialize_expressions
-
-                fields_without_lists = []
-                counter = 0
-                # Pyarrow cannot handle certain types when converting to
-                # Substrait (e.g. fixed_size_list at any nesting depth, or
-                # struct fields with non-None metadata left by extension types
-                # after a lance round-trip).  We replace any top-level field
-                # whose type tree contains such a type with an int8 placeholder
-                # so that ordinal field references in the filter remain correct.
-                # Filters are evaluated against the stored dataset fields.  The
-                # public schema may also contain scan-time fields such as _rowid.
-                for field in self.ds._ds.schema:
-                    if _needs_substrait_placeholder(field.type):
-                        pos = counter
-                        counter += 1
-                        fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
-                        )
-                    else:
-                        fields_without_lists.append(field)
-                        # Serialize the pyarrow compute expression toSubstrait and use
-                        # that as a filter.
-                        counter += 1
-                scalar_schema = pa.schema(fields_without_lists)
-                substrait_filter = serialize_expressions(
-                    [filter], ["my_filter"], scalar_schema
-                )
-                if isinstance(substrait_filter, memoryview):
-                    self._substrait_filter = substrait_filter.tobytes()
-                else:
-                    try:
-                        self._substrait_filter = substrait_filter.to_pybytes()
-                    except AttributeError:
-                        raise TypeError(
-                            "serialize_expressions returned unexpected"
-                            f"type {type(substrait_filter)}"
-                        )
-            except ImportError:
-                # serialize_expressions was introduced in pyarrow 14.  Fallback to
-                # stringifying the expression if pyarrow is too old
-                self._filter = str(filter)
+            self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
         else:
             expr_filter = filter.get("expr_filter")
             if expr_filter is not None:
