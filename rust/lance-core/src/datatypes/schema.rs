@@ -2303,6 +2303,38 @@ mod tests {
             .intersection_ignore_types(&schema_with_list_struct)
             .unwrap();
         assert_eq!(intersection, with_missing_field);
+
+        // LargeList must narrow its item children the same way List does.
+        let schema_with_large_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_large_list_struct =
+            Schema::try_from(&schema_with_large_list_struct).unwrap();
+
+        let with_missing_field = schema_with_large_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_large_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_large_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        // Strict mode must narrow as well: item child types are shared here,
+        // so the recursion is not gated behind ignore_types.
+        let intersection = schema_with_large_list_struct
+            .intersection(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]
