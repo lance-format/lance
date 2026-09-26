@@ -276,6 +276,59 @@ result = sift1m.to_table(
 print(result.to_pandas())
 ```
 
+## Refine Using Another Vector Column
+
+If a dataset stores two vector representations of each row, you can generate
+candidates with one column and rerank them with the other. For example, index a
+128-dimensional projection and compute final distances with the original
+1024-dimensional vectors. Both columns must be `FixedSizeList<Float32>`.
+
+Given a dataset `ds` with `short_vector` and `full_vector` columns, and a query
+represented in both spaces:
+
+```python
+results = ds.to_table(
+    columns=["_distance"],
+    with_row_id=True,
+    nearest={
+        "column": "short_vector",
+        "q": short_query,
+        "metric": "l2",
+        "k": 10,
+        "nprobes": 4,
+        "refine_factor": 2,
+        "refine_column": "full_vector",
+        "refine_q": full_query,
+        "refine_metric": "cosine",
+    },
+)
+```
+
+Lance selects up to 20 coarse candidates, reads their `full_vector` values from
+the same dataset snapshot, computes cosine distances, and returns the best 10.
+The refinement column does not need an index. The final `_distance` and
+`distance_range` refer to the refinement metric. Supply all three new parameters
+together and set a positive `refine_factor`; omitting them preserves ordinary
+same-column refinement. Batched queries must have matching query counts.
+
+For a fully indexed coarse search, quantized candidates are selected using the
+index's approximate distances. Cross-column refinement replaces the ordinary
+same-column exact refinement step. If appended or updated coarse vectors must be
+merged with index results, Lance's existing merge path may read and rescore coarse
+vectors before selecting the final coarse TopM.
+With `use_index=False`, Lance selects exact coarse TopM before refinement, which
+is still different from a full scan in the final vector space.
+
+Scalar prefilters restrict candidates before selection. Postfilters run after
+the final TopK and may return fewer than `k` rows. Vector and full-text query
+filters cannot be combined with cross-column refinement. Null or invalid
+refinement vectors can also reduce the result count.
+
+Produce both query representations before calling Lance. For a PCA projection,
+apply the same fitted transform and preprocessing used for the stored short
+vectors. Increasing the candidate budget can improve recall, but increases
+random reads of the refinement column, especially on remote storage.
+
 ## Next Steps
 
 Check out **[Full-text Search](../quickstart/full-text-search.md)**, where we show how to create and query a BM25 index for keyword-based search in Lance.
