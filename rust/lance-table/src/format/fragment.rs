@@ -166,7 +166,73 @@ impl DataFile {
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
-        full_schema.project_by_ids(&self.fields, false)
+        // Structural field IDs describe physical headers in V2.0 and may also
+        // appear with column_index=-1 in older V2.1+ manifests. They do not, by
+        // themselves, mean that every child in the current dataset schema is
+        // present in this file. In particular, a struct can retain its ID while
+        // schema evolution replaces its last old child with a new one.
+        fn project_field(
+            field: &lance_core::datatypes::Field,
+            mapped_columns: &HashMap<i32, i32>,
+            is_v2_0: bool,
+        ) -> Option<lance_core::datatypes::Field> {
+            if field.is_blob() || field.is_packed_struct() {
+                return mapped_columns
+                    .contains_key(&field.id)
+                    .then(|| field.clone());
+            }
+
+            let children = field
+                .children
+                .iter()
+                .filter_map(|child| project_field(child, mapped_columns, is_v2_0))
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                return Some(lance_core::datatypes::Field {
+                    children,
+                    ..field.clone()
+                });
+            }
+
+            if field.children.is_empty() && mapped_columns.contains_key(&field.id) {
+                return Some(field.clone());
+            }
+
+            // V2.0 stores a physical header for structural fields. Keep that
+            // header to preserve the parent's row count and validity, but leave
+            // its children empty so missing descendants are null-filled by the
+            // fragment reader instead of being added to this file's projection.
+            if is_v2_0 && mapped_columns.contains_key(&field.id) {
+                return Some(lance_core::datatypes::Field {
+                    children: Vec::new(),
+                    ..field.clone()
+                });
+            }
+            None
+        }
+
+        if self.uses_v1_data_file_encoding() {
+            return full_schema.project_by_ids(&self.fields, false);
+        }
+        let mapped_columns = self
+            .fields
+            .iter()
+            .copied()
+            .zip(self.column_indices.iter().copied())
+            .filter(|(_, column_index)| *column_index >= 0)
+            .collect::<HashMap<_, _>>();
+        let is_v2_0 = matches!(
+            (self.file_major_version, self.file_minor_version),
+            (0, 3) | (2, 0)
+        );
+        Schema {
+            fields: full_schema
+                .fields
+                .iter()
+                .filter_map(|field| project_field(field, &mapped_columns, is_v2_0))
+                .collect(),
+            metadata: full_schema.metadata.clone(),
+        }
     }
 
     fn uses_v1_data_file_encoding(&self) -> bool {
@@ -1007,6 +1073,70 @@ mod tests {
         assert!(message.contains("All data files must have the same version"));
         assert!(message.contains("2.0"));
         assert!(message.contains("2.1"));
+    }
+
+    #[test]
+    fn data_file_schema_does_not_substitute_evolved_struct_children() {
+        let mut schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "values",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "later",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]))
+        .unwrap();
+        schema.set_field_id(None);
+        let parent_id = schema.fields[0].id;
+        let later_id = schema.fields[0].children[0].id;
+        let id_field_id = schema.fields[1].id;
+        schema.fields[0].children[0].id = later_id + 2;
+
+        let stale_file = DataFile::new(
+            "stale.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let stale_schema = stale_file.schema(&schema);
+        assert_eq!(
+            stale_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["values", "id"]
+        );
+        assert!(stale_schema.fields[0].children.is_empty());
+
+        let stale_v2_1_file = DataFile::new(
+            "stale-v2-1.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![-1, 0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        assert_eq!(
+            stale_v2_1_file.schema(&schema).fields,
+            vec![schema.fields[1].clone()]
+        );
+
+        let current_file = DataFile::new(
+            "current.lance",
+            vec![parent_id, later_id + 2, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        assert_eq!(current_file.schema(&schema), schema);
     }
 
     #[test]

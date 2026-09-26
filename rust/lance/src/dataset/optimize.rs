@@ -3352,6 +3352,82 @@ mod tests {
         assert_eq!(dataset.manifest.version, 1);
     }
 
+    #[tokio::test]
+    async fn test_compact_v2_0_file_missing_evolved_struct_child() {
+        let old_child = Arc::new(Field::new("old", DataType::Int32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "values",
+                DataType::Struct(vec![old_child.clone()].into()),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StructArray::from(vec![(
+                    old_child,
+                    Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+                )])),
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Model a snapshot whose nullable struct retained its field ID while its
+        // old child was replaced by a later-added child. Existing V2.0 files
+        // still record the struct header and old child IDs.
+        let mut evolved_schema = dataset.schema().clone();
+        let parent_id = evolved_schema.fields[0].id;
+        let mut later_child = LanceField::new_arrow("later", DataType::Int32, true).unwrap();
+        later_child.id = evolved_schema.max_field_id().unwrap() + 1;
+        later_child.parent_id = parent_id;
+        evolved_schema.fields[0].children = vec![later_child];
+        let read_version = dataset.version().version;
+        dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::Project {
+                schema: evolved_schema,
+                preserves_nullability: true,
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let compacted = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(compacted.num_rows(), 4);
+        assert_eq!(
+            compacted["id"].as_ref(),
+            &Int32Array::from(vec![0, 1, 2, 3])
+        );
+        let values = compacted["values"].as_struct();
+        assert_eq!(values.null_count(), 0);
+        assert_eq!(values.column_by_name("later").unwrap().null_count(), 4);
+    }
+
     #[rstest]
     #[case::default(None, LanceFileVersion::V2_0)]
     #[case::stable(Some(LanceFileVersion::Stable), LanceFileVersion::V2_2)]
