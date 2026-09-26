@@ -102,6 +102,13 @@ pub struct NullableDataBlock {
 
 impl NullableDataBlock {
     fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        if data_type == DataType::Null {
+            // Every slot of a Null array is null, and arrow-rs rejects a validity buffer on it.
+            return Ok(ArrayData::new_null(
+                &data_type,
+                self.data.num_values() as usize,
+            ));
+        }
         let nulls = self.nulls.into_buffer();
         let data = self.data.into_arrow_impl(data_type, true)?.into_builder();
         let data = data.null_bit_buffer(Some(nulls));
