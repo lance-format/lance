@@ -307,6 +307,8 @@ impl std::fmt::Debug for LanceExecutionOptions {
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
+/// Maximum headroom reserved for one external sort's non-spillable merge phase.
+const MAX_SORT_SPILL_RESERVATION_BYTES: u64 = 40 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -380,7 +382,7 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         // to leave room for input batches in small pools. This reservation comes
         // out of the same pool; it does not guarantee that every batch will fit.
         let sort_spill_reservation_bytes =
-            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+            (options.mem_pool_size() / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES) as usize;
         session_config =
             session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
@@ -408,7 +410,6 @@ struct SessionContextCacheKey {
     mem_pool_size: u64,
     max_temp_directory_size: u64,
     target_partition: Option<usize>,
-    use_spilling: bool,
 }
 
 impl SessionContextCacheKey {
@@ -417,7 +418,6 @@ impl SessionContextCacheKey {
             mem_pool_size: options.mem_pool_size(),
             max_temp_directory_size: options.max_temp_directory_size(),
             target_partition: options.target_partition,
-            use_spilling: options.use_spilling(),
         }
     }
 }
@@ -444,7 +444,13 @@ fn get_max_cache_size() -> usize {
     })
 }
 
+/// Reuses unbounded sessions, while giving each spilling caller a fresh bounded
+/// memory pool so concurrent sorts cannot consume each other's headroom.
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    if options.use_spilling() {
+        return new_session_context(options);
+    }
+
     let key = SessionContextCacheKey::from_options(options);
     let mut cache = get_session_cache()
         .lock()
@@ -1243,6 +1249,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::execution::memory_pool::MemoryConsumer;
 
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1271,9 +1278,9 @@ mod tests {
             assert_eq!(cache_guard.len(), 1);
         }
 
-        // Different options should create new entry
+        // Different non-spilling options should create a new entry.
         let opts2 = LanceExecutionOptions {
-            use_spilling: true,
+            target_partition: Some(1),
             ..Default::default()
         };
         let _ctx2 = get_session_context(&opts2);
@@ -1281,6 +1288,30 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_spilling_executions_have_independent_memory_pools() {
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION),
+            target_partition: Some(1),
+            ..Default::default()
+        };
+        let contexts: Vec<_> = (0..3).map(|_| get_session_context(&options)).collect();
+        let mut reservations = Vec::with_capacity(contexts.len());
+
+        // Each reservation fits its own pool, but any two exceed a shared pool.
+        for context in &contexts {
+            let task_context = context.task_ctx();
+            let pool = task_context.memory_pool();
+            let reservation = MemoryConsumer::new("ExternalSorterMerge[0]").register(pool);
+            reservation.try_grow(100 * 1024 * 1024).unwrap();
+            assert_eq!(pool.reserved(), 100 * 1024 * 1024);
+            reservations.push(reservation);
+        }
+
+        assert_eq!(reservations.len(), 3);
     }
 
     #[test]
@@ -1381,6 +1412,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_default_pool_fits_sort_merge_reservations_per_partition() {
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        };
+        let num_partitions = options.effective_target_partition() as usize;
+        let session_ctx = new_session_context(&options);
+        let task_ctx = session_ctx.task_ctx();
+        let pool = task_ctx.memory_pool();
+
+        // External sort merges cannot spill their own reservations. Keep three
+        // merge reservations per execution partition while leaving 30 MiB per
+        // partition for input batches and other operators. Before the default
+        // pool followed the effective partition count, the fourth reservation
+        // exhausted the single 150 MiB pool on machines with multiple cores.
+        let num_reservations = num_partitions * 3;
+        let mut reservations = Vec::with_capacity(num_reservations);
+        for _ in 0..num_reservations {
+            let reservation = MemoryConsumer::new("ExternalSorterMerge[0]").register(pool);
+            reservation
+                .try_grow(MAX_SORT_SPILL_RESERVATION_BYTES as usize)
+                .unwrap();
+            reservations.push(reservation);
+        }
+
+        assert_eq!(
+            pool.reserved(),
+            num_reservations * MAX_SORT_SPILL_RESERVATION_BYTES as usize
+        );
     }
 
     /// A marker a node reads from the session-config extensions at execute time.
