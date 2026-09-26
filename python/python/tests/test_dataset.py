@@ -502,6 +502,20 @@ def test_version_id(tmp_path: Path):
     assert historical_ds.checkout_version(historical_ds.latest_version).version == 2
 
 
+def test_version_info_uses_checked_out_manifest(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+    first_version_info = dataset.version_info
+
+    assert first_version_info["version"] == 1
+    assert isinstance(first_version_info["timestamp"], datetime)
+    assert isinstance(first_version_info["metadata"], dict)
+
+    lance.write_dataset(pa.table({"a": [2]}), tmp_path, mode="append")
+
+    assert dataset.version_info == first_version_info
+    assert lance.dataset(tmp_path).version_info["version"] == 2
+
+
 def test_checkout(tmp_path: Path):
     tab = pa.table({"a": range(3)})
     ds1 = lance.write_dataset(tab, tmp_path)
