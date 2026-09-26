@@ -3224,14 +3224,13 @@ def test_nan_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
-    # So the best we can do here is make sure that the presence of NAN / INF
-    # doesn't interfere with normal operation of the btree.
+    # NaNs sort above finite values regardless of their sign bit, both with and
+    # without an index. Infinities retain their usual ordering.
     def check(has_index: bool):
         assert dataset.to_table(filter="x IS NULL").num_rows == 0
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
-        assert dataset.to_table(filter="x > 0").num_rows == 5
-        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x > 0").num_rows == 6
+        assert dataset.to_table(filter="x < 5").num_rows == 4
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
 
     check(False)

@@ -1,37 +1,202 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Rewrites of comparisons against a floating point zero literal.
+//! Rewrites for signed-zero literals and NaN sign bits in comparisons.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
+
+use arrow_array::ArrayRef;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
+use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
+use datafusion::logical_expr::{
+    BinaryExpr, ColumnarValue, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
+use datafusion_common::DFSchema;
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use half::f16;
 use lance_core::Result;
 
-/// Rewrite every comparison against a floating point zero literal into the form
-/// that Arrow's total-order kernels answer the way IEEE 754 and SQL define it.
+const NORMALIZE_NAN_SIGN_NAME: &str = "_lance_normalize_nan_sign";
+const RAW_FLOAT_LITERAL_MARKER: &str = "lance:raw-float-comparison";
+
+/// Clears the sign bit only when a comparison operand is NaN.
+///
+/// Comparisons against non-NaN literals are rewritten into indexable ranges
+/// instead. This UDF is reserved for column-to-column, computed, and NaN-bound
+/// comparisons where ranges cannot normalize an operand without changing its
+/// payload ordering.
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct NormalizeNanSign {
+    signature: Signature,
+}
+
+impl NormalizeNanSign {
+    fn new() -> Self {
+        Self {
+            signature: Signature::uniform(
+                1,
+                vec![DataType::Float16, DataType::Float32, DataType::Float64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for NormalizeNanSign {
+    fn name(&self) -> &str {
+        NORMALIZE_NAN_SIGN_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        match arg_types {
+            [data_type @ (DataType::Float16 | DataType::Float32 | DataType::Float64)] => {
+                Ok(data_type.clone())
+            }
+            _ => Err(datafusion::error::DataFusionError::Execution(format!(
+                "{NORMALIZE_NAN_SIGN_NAME} expected one floating-point argument, got {arg_types:?}"
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let mut args = func_args.args.into_iter();
+        let Some(value) = args.next() else {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "{NORMALIZE_NAN_SIGN_NAME} expected one argument, got none"
+            )));
+        };
+        if args.next().is_some() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "{NORMALIZE_NAN_SIGN_NAME} expected one argument, got more than one"
+            )));
+        }
+        match value {
+            ColumnarValue::Array(array) => normalize_nan_array(array).map(ColumnarValue::Array),
+            ColumnarValue::Scalar(value) => normalize_nan_scalar(value).map(ColumnarValue::Scalar),
+        }
+    }
+}
+
+fn normalize_nan_array(array: ArrayRef) -> DFResult<ArrayRef> {
+    match array.data_type() {
+        DataType::Float16 => {
+            let values = array.as_primitive::<Float16Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.is_nan() && value.is_sign_negative())
+            {
+                return Ok(array);
+            }
+            Ok(Arc::new(values.unary::<_, Float16Type>(|value| {
+                if value.is_nan() {
+                    f16::from_bits(value.to_bits() & 0x7fff)
+                } else {
+                    value
+                }
+            })))
+        }
+        DataType::Float32 => {
+            let values = array.as_primitive::<Float32Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.is_nan() && value.is_sign_negative())
+            {
+                return Ok(array);
+            }
+            Ok(Arc::new(values.unary::<_, Float32Type>(|value| {
+                if value.is_nan() {
+                    f32::from_bits(value.to_bits() & 0x7fff_ffff)
+                } else {
+                    value
+                }
+            })))
+        }
+        DataType::Float64 => {
+            let values = array.as_primitive::<Float64Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.is_nan() && value.is_sign_negative())
+            {
+                return Ok(array);
+            }
+            Ok(Arc::new(values.unary::<_, Float64Type>(|value| {
+                if value.is_nan() {
+                    f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff)
+                } else {
+                    value
+                }
+            })))
+        }
+        data_type => Err(datafusion::error::DataFusionError::Execution(format!(
+            "{NORMALIZE_NAN_SIGN_NAME} expected a floating-point array, got {data_type}"
+        ))),
+    }
+}
+
+fn normalize_nan_scalar(value: ScalarValue) -> DFResult<ScalarValue> {
+    match value {
+        Float16(Some(value)) if value.is_nan() => {
+            Ok(Float16(Some(f16::from_bits(value.to_bits() & 0x7fff))))
+        }
+        Float32(Some(value)) if value.is_nan() => {
+            Ok(Float32(Some(f32::from_bits(value.to_bits() & 0x7fff_ffff))))
+        }
+        Float64(Some(value)) if value.is_nan() => Ok(Float64(Some(f64::from_bits(
+            value.to_bits() & 0x7fff_ffff_ffff_ffff,
+        )))),
+        value @ (Float16(_) | Float32(_) | Float64(_)) => Ok(value),
+        value => Err(datafusion::error::DataFusionError::Execution(format!(
+            "{NORMALIZE_NAN_SIGN_NAME} expected a floating-point scalar, got {value:?}"
+        ))),
+    }
+}
+
+fn normalize_nan_expr(expr: &Expr) -> Expr {
+    if matches!(expr, Expr::ScalarFunction(function) if function.name() == NORMALIZE_NAN_SIGN_NAME)
+    {
+        return expr.clone();
+    }
+    static UDF: LazyLock<Arc<ScalarUDF>> =
+        LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeNanSign::new())));
+    Expr::ScalarFunction(ScalarFunction::new_udf(UDF.clone(), vec![expr.clone()]))
+}
+
+/// Rewrite floating-point comparisons so sign-only encodings have value semantics.
 ///
 /// Arrow sorts `-0.0` strictly below `+0.0` and compares the two encodings for
-/// equality by bit pattern, while IEEE 754 and SQL treat them as one number.
-/// Each comparison against a zero literal has an equivalent total-order form:
+/// equality by bit pattern. It also sorts a NaN with its sign bit set below
+/// negative infinity, while the same NaN without that bit sorts above positive
+/// infinity. IEEE 754 and SQL do not make either value depend on its sign bit.
+/// Literal comparisons have indexable equivalent total-order forms:
 ///
-/// | written                      | evaluated                    |
-/// |------------------------------|------------------------------|
-/// | `x < 0`, `x >= 0`            | literal becomes `-0.0`       |
-/// | `x <= 0`, `x > 0`            | literal becomes `+0.0`       |
-/// | `x = 0`                      | `x IN (-0.0, 0.0)`           |
-/// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
-/// | `x IN (0, ..)`               | the missing encoding is added |
-/// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
-/// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
-/// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
+/// | written                    | evaluated                                      |
+/// |----------------------------|------------------------------------------------|
+/// | `x < 0`, `x >= 0`          | zero bound uses `-0.0`                          |
+/// | `x <= 0`, `x > 0`          | zero bound uses `+0.0`                          |
+/// | `x < c`, `x <= c`          | for non-NaN `c`, comparison plus `x >= -inf`    |
+/// | `x > c`, `x >= c`          | for non-NaN `c`, comparison plus `x < -inf`     |
+/// | `x = 0` / `x = NaN`        | `IN` both sign encodings                        |
+/// | `x IN (0, NaN, ..)`        | missing sign encodings are added                |
 ///
-/// Equality has to name both encodings because a scalar index keys on the bit
-/// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
-/// bloom filter hashes the value.
+/// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
+/// Equality names both encodings because scalar indices key on the bit pattern.
+/// A comparison without a literal normalizes NaN operands through an internal
+/// physical expression, preserving payload bits and evaluating each operand once.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -39,13 +204,10 @@ use lance_core::Result;
 /// update expressions all compile through there, which is what keeps a filter and
 /// a projected copy of the same predicate in agreement.
 ///
-/// NaN is out of scope. Arrow sorts it above every other value, so `x >= -0.0`
-/// admits NaN where IEEE would not, and that holds for every comparison rather
-/// than only the ones against zero.
-pub fn rewrite_signed_zero_comparisons(expr: Expr) -> Result<Expr> {
+pub fn rewrite_float_comparisons(expr: Expr, schema: &DFSchema) -> Result<Expr> {
     Ok(expr
         .transform_up(|node| {
-            Ok(match rewrite_node(&node) {
+            Ok(match rewrite_node(&node, schema) {
                 Some(rewritten) => Transformed::yes(rewritten),
                 None => Transformed::no(node),
             })
@@ -54,7 +216,7 @@ pub fn rewrite_signed_zero_comparisons(expr: Expr) -> Result<Expr> {
 }
 
 /// Whether the rewrite acts on comparisons under `op`.
-fn is_zero_sensitive(op: Operator) -> bool {
+fn is_float_comparison(op: Operator) -> bool {
     matches!(
         op,
         Operator::Lt
@@ -68,11 +230,11 @@ fn is_zero_sensitive(op: Operator) -> bool {
     )
 }
 
-/// Fold each zero-sensitive comparison's own operands and rewrite it, bottom-up,
+/// Fold each sign-sensitive comparison's own operands and rewrite it, bottom-up,
 /// before anything above it has a chance to fold.
 ///
-/// [`rewrite_signed_zero_comparisons`] alone cannot reach a comparison whose zero
-/// does not exist yet. `ExprSimplifier::simplify` folds an operand and everything
+/// [`rewrite_float_comparisons`] alone cannot reach a comparison whose special
+/// value does not exist yet. `ExprSimplifier::simplify` folds an operand and everything
 /// above it in one pass, so `-1.0 * 0.0 < (1.0 - 1.0)` goes straight to a boolean
 /// decided by Arrow's total order, and a wrapper like `IS TRUE` or a `CAST` around
 /// it does the same to the comparison's own result.
@@ -83,9 +245,10 @@ fn is_zero_sensitive(op: Operator) -> bool {
 /// which containers are allowed above a comparison. Enumerating them is what left
 /// `IS TRUE`, `IS FALSE`, `= TRUE`, `CAST(.. AS BOOLEAN)` and `IN (TRUE)` exposed,
 /// and any list would keep missing the next spelling.
-pub fn normalize_zero_comparisons(
+pub fn normalize_float_comparisons(
     expr: Expr,
     simplify: &dyn Fn(Expr) -> DFResult<Expr>,
+    schema: &DFSchema,
 ) -> Result<Expr> {
     // A literal is already folded, and an `IN` list can hold hundreds of them.
     // Handing each one to the simplifier anyway roughly doubled planning time on
@@ -99,7 +262,7 @@ pub fn normalize_zero_comparisons(
     Ok(expr
         .transform_up(|node| {
             let folded = match node {
-                Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_zero_sensitive(op) => {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_float_comparison(op) => {
                     Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(fold(*left)?),
                         op,
@@ -123,7 +286,7 @@ pub fn normalize_zero_comparisons(
                 }),
                 other => return Ok(Transformed::no(other)),
             };
-            Ok(match rewrite_node(&folded) {
+            Ok(match rewrite_node(&folded, schema) {
                 Some(rewritten) => Transformed::yes(rewritten),
                 // The operands were still folded, so this is a change either way.
                 None => Transformed::yes(folded),
@@ -132,18 +295,71 @@ pub fn normalize_zero_comparisons(
         .data)
 }
 
-/// Both encodings of a floating point zero, negative first.
+/// The two sign encodings of zero or NaN, negative first.
 ///
-/// Returns `None` for anything else, including NULL, NaN, and integer zero.
-fn zero_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+/// NaN payload bits are preserved. Distinct payloads therefore remain distinct;
+/// only the sign bit, which does not change the logical value, is ignored.
+fn equivalent_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
     match value {
         Float16(Some(v)) if *v == f16::ZERO => {
             Some((Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO))))
         }
+        Float16(Some(v)) if v.is_nan() => Some((
+            Float16(Some(f16::from_bits(v.to_bits() | 0x8000))),
+            Float16(Some(f16::from_bits(v.to_bits() & 0x7fff))),
+        )),
         Float32(Some(v)) if *v == 0.0 => Some((Float32(Some(-0.0)), Float32(Some(0.0)))),
+        Float32(Some(v)) if v.is_nan() => Some((
+            Float32(Some(f32::from_bits(v.to_bits() | 0x8000_0000))),
+            Float32(Some(f32::from_bits(v.to_bits() & 0x7fff_ffff))),
+        )),
         Float64(Some(v)) if *v == 0.0 => Some((Float64(Some(-0.0)), Float64(Some(0.0)))),
+        Float64(Some(v)) if v.is_nan() => Some((
+            Float64(Some(f64::from_bits(v.to_bits() | 0x8000_0000_0000_0000))),
+            Float64(Some(f64::from_bits(v.to_bits() & 0x7fff_ffff_ffff_ffff))),
+        )),
         _ => None,
     }
+}
+
+fn is_nan(value: &ScalarValue) -> bool {
+    matches!(value, Float16(Some(value)) if value.is_nan())
+        || matches!(value, Float32(Some(value)) if value.is_nan())
+        || matches!(value, Float64(Some(value)) if value.is_nan())
+}
+
+fn negative_infinity(value: &ScalarValue) -> Option<ScalarValue> {
+    match value {
+        Float16(Some(_)) => Some(Float16(Some(f16::NEG_INFINITY))),
+        Float32(Some(_)) => Some(Float32(Some(f32::NEG_INFINITY))),
+        Float64(Some(_)) => Some(Float64(Some(f64::NEG_INFINITY))),
+        _ => None,
+    }
+}
+
+fn is_float_expr(expr: &Expr, schema: &DFSchema) -> bool {
+    matches!(
+        expr.get_type(schema),
+        Ok(DataType::Float16 | DataType::Float32 | DataType::Float64)
+    )
+}
+
+/// Mark a literal that intentionally relies on Arrow's raw total order.
+///
+/// The range rewrite emits ordinary comparisons so scalar indices can consume
+/// them. The marker keeps a later optimizer pass from recursively normalizing
+/// those implementation-level comparisons while remaining invisible to the
+/// physical literal value and index query.
+fn raw_float_literal(value: ScalarValue, metadata: Option<&FieldMetadata>) -> Expr {
+    let mut inner: BTreeMap<String, String> = metadata
+        .map(|metadata| metadata.inner().clone())
+        .unwrap_or_default();
+    inner.insert(RAW_FLOAT_LITERAL_MARKER.to_string(), "1".to_string());
+    Expr::Literal(value, Some(FieldMetadata::new(inner)))
+}
+
+fn is_raw_float_literal(metadata: Option<&FieldMetadata>) -> bool {
+    metadata.is_some_and(|metadata| metadata.inner().contains_key(RAW_FLOAT_LITERAL_MARKER))
 }
 
 /// Collect the terms of an `AND`/`OR` chain, in order, ignoring nesting.
@@ -163,9 +379,10 @@ fn flatten_chain<'a>(expr: &'a Expr, op: Operator, terms: &mut Vec<&'a Expr>) {
 }
 
 /// True for the shape this rewrite emits for `=` and `!=`: a column tested
-/// against both encodings of a floating point zero, negated or not. Only these
-/// terms are deduplicated, so an expression the caller wrote twice is left alone.
-fn is_zero_pair_over_column(expr: &Expr) -> bool {
+/// against both sign encodings of a floating point zero or NaN, negated or not.
+/// Only these terms are deduplicated, so an expression the caller wrote twice is
+/// left alone.
+fn is_equivalent_pair_over_column(expr: &Expr) -> bool {
     let Expr::InList(InList { expr, list, .. }) = expr else {
         return false;
     };
@@ -175,11 +392,11 @@ fn is_zero_pair_over_column(expr: &Expr) -> bool {
     let [Expr::Literal(first, _), ..] = list.as_slice() else {
         return false;
     };
-    zero_encodings(first)
+    equivalent_encodings(first)
         .is_some_and(|(negative, positive)| list_is_pair(list, &negative, &positive))
 }
 
-/// True when `list` is exactly the two encodings of a zero, negative first.
+/// True when `list` is exactly two sign encodings, negative first.
 fn list_is_pair(list: &[Expr], negative: &ScalarValue, positive: &ScalarValue) -> bool {
     let [Expr::Literal(first, _), Expr::Literal(second, _)] = list else {
         return false;
@@ -187,24 +404,156 @@ fn list_is_pair(list: &[Expr], negative: &ScalarValue, positive: &ScalarValue) -
     first == negative && second == positive
 }
 
-/// The rewritten expression, or `None` when `expr` is not a comparison against a
-/// floating point zero.
 /// The encoding a zero bound needs to answer `op` correctly, or `None` when the
-/// expression is not a zero literal.
+/// expression is not a floating-point literal that needs canonicalization.
 fn rewrite_bound(bound: &Expr, op: Operator) -> Option<Expr> {
     let Expr::Literal(value, metadata) = bound else {
         return None;
     };
-    let (negative, positive) = zero_encodings(value)?;
-    let encoding = match op {
-        Operator::GtEq => negative,
-        Operator::LtEq => positive,
-        _ => return None,
+    let (negative, positive) = equivalent_encodings(value)?;
+    let encoding = if is_nan(value) {
+        positive
+    } else {
+        match op {
+            Operator::GtEq => negative,
+            Operator::LtEq => positive,
+            _ => return None,
+        }
     };
     Some(Expr::Literal(encoding, metadata.clone()))
 }
 
-fn rewrite_node(expr: &Expr) -> Option<Expr> {
+fn comparison(left: Expr, op: Operator, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    })
+}
+
+fn paired_comparison(
+    other: &Expr,
+    op: Operator,
+    negative: ScalarValue,
+    positive: ScalarValue,
+    metadata: Option<&FieldMetadata>,
+) -> Option<Expr> {
+    match op {
+        Operator::Eq | Operator::NotEq => Some(Expr::InList(InList {
+            expr: Box::new(other.clone()),
+            list: vec![
+                Expr::Literal(negative, metadata.cloned()),
+                Expr::Literal(positive, metadata.cloned()),
+            ],
+            negated: op == Operator::NotEq,
+        })),
+        Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
+            // The list names `other` once and `IS [NOT] TRUE` keeps the null case
+            // decided: `NULL IN (..)` is NULL, and `NULL IS TRUE` is false.
+            let covered = Expr::InList(InList {
+                expr: Box::new(other.clone()),
+                list: vec![
+                    Expr::Literal(negative, metadata.cloned()),
+                    Expr::Literal(positive, metadata.cloned()),
+                ],
+                negated: false,
+            });
+            Some(if op == Operator::IsDistinctFrom {
+                covered.is_not_true()
+            } else {
+                covered.is_true()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_literal_comparison(
+    other: &Expr,
+    op: Operator,
+    value: &ScalarValue,
+    metadata: Option<&FieldMetadata>,
+) -> Option<Expr> {
+    if is_raw_float_literal(metadata) {
+        return None;
+    }
+
+    if let Some((negative, positive)) = equivalent_encodings(value) {
+        if let Some(rewritten) =
+            paired_comparison(other, op, negative.clone(), positive.clone(), metadata)
+        {
+            return Some(rewritten);
+        }
+        if is_nan(value) {
+            return matches!(
+                op,
+                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            )
+            .then(|| {
+                comparison(
+                    normalize_nan_expr(other),
+                    op,
+                    Expr::Literal(positive, metadata.cloned()),
+                )
+            });
+        }
+
+        let bound = match op {
+            Operator::Lt | Operator::GtEq => negative,
+            Operator::LtEq | Operator::Gt => positive,
+            _ => return None,
+        };
+        return Some(rewrite_ordered_comparison(other, op, bound, metadata));
+    }
+
+    if negative_infinity(value).is_some()
+        && matches!(
+            op,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        )
+    {
+        return Some(rewrite_ordered_comparison(
+            other,
+            op,
+            value.clone(),
+            metadata,
+        ));
+    }
+
+    None
+}
+
+/// Express a comparison against a non-NaN bound using raw total-order ranges.
+///
+/// Positive NaNs already sort above the bound. The extra range moves negative
+/// NaNs to that same side while leaving the primary comparison available to the
+/// scalar-index planner.
+fn rewrite_ordered_comparison(
+    other: &Expr,
+    op: Operator,
+    bound: ScalarValue,
+    metadata: Option<&FieldMetadata>,
+) -> Expr {
+    let Some(negative_infinity) = negative_infinity(&bound) else {
+        return comparison(other.clone(), op, raw_float_literal(bound, metadata));
+    };
+    let primary = comparison(other.clone(), op, raw_float_literal(bound, metadata));
+    match op {
+        Operator::Lt | Operator::LtEq => primary.and(comparison(
+            other.clone(),
+            Operator::GtEq,
+            raw_float_literal(negative_infinity, None),
+        )),
+        Operator::Gt | Operator::GtEq => primary.or(comparison(
+            other.clone(),
+            Operator::Lt,
+            raw_float_literal(negative_infinity, None),
+        )),
+        _ => primary,
+    }
+}
+
+fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
     match expr {
         // DataFusion's simplifier expands an `IN` list of three or fewer values
         // over a bare column back into an OR chain of equalities, so a second
@@ -216,7 +565,7 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             flatten_chain(expr, *op, &mut kept);
             let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
             for term in kept.iter() {
-                if is_zero_pair_over_column(term) && deduped.contains(term) {
+                if is_equivalent_pair_over_column(term) && deduped.contains(term) {
                     continue;
                 }
                 deduped.push(term);
@@ -232,65 +581,26 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             // `resolve_expr` accepts the literal on either side, and the
             // operator mirrors when it sits on the left.
-            let (literal, other, op) = match (left.as_ref(), right.as_ref()) {
-                (_, Expr::Literal(..)) => (right.as_ref(), left.as_ref(), *op),
-                (Expr::Literal(..), _) => (left.as_ref(), right.as_ref(), op.swap()?),
-                _ => return None,
-            };
-            let Expr::Literal(value, metadata) = literal else {
-                return None;
-            };
-            let (negative, positive) = zero_encodings(value)?;
-            let zero = match op {
-                Operator::Lt | Operator::GtEq => negative,
-                Operator::LtEq | Operator::Gt => positive,
-                Operator::Eq | Operator::NotEq => {
-                    return Some(Expr::InList(InList {
-                        expr: Box::new(other.clone()),
-                        list: vec![
-                            Expr::Literal(negative, metadata.clone()),
-                            Expr::Literal(positive, metadata.clone()),
-                        ],
-                        negated: op == Operator::NotEq,
-                    }));
+            let rewritten = match (left.as_ref(), right.as_ref()) {
+                (_, Expr::Literal(value, metadata)) => {
+                    rewrite_literal_comparison(left, *op, value, metadata.as_ref())
                 }
-                Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
-                    // Both encodings have to be listed, and the null case has to
-                    // stay decided rather than becoming NULL, so this pairs the
-                    // list with `IS [NOT] TRUE`. `NULL IN (..)` is NULL, and
-                    // `NULL IS TRUE` is false, which is what distinctness means
-                    // for a null against a non-null literal.
-                    //
-                    // The list carries `other` once. An earlier version guarded
-                    // this arm to a bare column so it could name `other` twice as
-                    // `IS NOT NULL AND IN (..)`, but bailing out left the
-                    // `filter_expr` path answering computed operands on Arrow's
-                    // sign-sensitive order, which is wrong rows rather than an
-                    // unsupported spelling.
-                    //
-                    // Always the non-negated list, so a second pass sees the same
-                    // complete pair it would leave alone anywhere else.
-                    let covered = Expr::InList(InList {
-                        expr: Box::new(other.clone()),
-                        list: vec![
-                            Expr::Literal(negative, metadata.clone()),
-                            Expr::Literal(positive, metadata.clone()),
-                        ],
-                        negated: false,
-                    });
-                    return Some(if op == Operator::IsDistinctFrom {
-                        covered.is_not_true()
-                    } else {
-                        covered.is_true()
-                    });
+                (Expr::Literal(value, metadata), _) => {
+                    rewrite_literal_comparison(right, op.swap()?, value, metadata.as_ref())
                 }
-                _ => return None,
-            };
-            Some(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(other.clone()),
-                op,
-                right: Box::new(Expr::Literal(zero, metadata.clone())),
-            }))
+                _ if is_float_comparison(*op)
+                    && is_float_expr(left, schema)
+                    && is_float_expr(right, schema) =>
+                {
+                    Some(comparison(
+                        normalize_nan_expr(left),
+                        *op,
+                        normalize_nan_expr(right),
+                    ))
+                }
+                _ => None,
+            }?;
+            (rewritten != *expr).then_some(rewritten)
         }
         // `BETWEEN` normally reaches this rewrite already expanded into `>=` and
         // `<=` by the simplifier. It survives unexpanded when every operand is
@@ -299,13 +609,20 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
         // the encodings their expanded operators would: `low` is a `>=` bound and
         // `high` is a `<=` bound.
         Expr::Between(between) => {
+            let normalized_expr = match between.expr.as_ref() {
+                Expr::Literal(value, metadata) if is_nan(value) => {
+                    let (_, positive) = equivalent_encodings(value)?;
+                    Some(Expr::Literal(positive, metadata.clone()))
+                }
+                _ => None,
+            };
             let low = rewrite_bound(&between.low, Operator::GtEq);
             let high = rewrite_bound(&between.high, Operator::LtEq);
-            if low.is_none() && high.is_none() {
+            if normalized_expr.is_none() && low.is_none() && high.is_none() {
                 return None;
             }
             Some(Expr::Between(Between {
-                expr: between.expr.clone(),
+                expr: Box::new(normalized_expr.unwrap_or_else(|| (*between.expr).clone())),
                 negated: between.negated,
                 low: Box::new(low.unwrap_or_else(|| (*between.low).clone())),
                 high: Box::new(high.unwrap_or_else(|| (*between.high).clone())),
@@ -316,14 +633,14 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             list,
             negated,
         }) => {
-            // A zero literal on the probe side needs the same treatment. The list
-            // elements are arbitrary expressions there, so expand into the
+            // A zero or NaN literal on the probe side needs the same treatment.
+            // The list elements are arbitrary expressions there, so expand into the
             // equality form the binary arm already covers. A literal probe that is
-            // not a zero compares the same way against either encoding, so it
+            // not sign-sensitive compares the same way against either encoding, so it
             // needs no widening either.
             if let Expr::Literal(value, metadata) = expr.as_ref() {
-                let (negative, positive) = zero_encodings(value)?;
-                // The expansion below puts a zero literal in front of exactly this
+                let (negative, positive) = equivalent_encodings(value)?;
+                // The expansion below puts a paired literal in front of exactly this
                 // list, so stop rather than expanding that term again.
                 if list_is_pair(list, &negative, &positive) {
                     return None;
@@ -349,7 +666,7 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             }
             Some(Expr::InList(InList {
                 expr: expr.clone(),
-                list: widen_zero_list(list)?,
+                list: widen_equivalent_list(list)?,
                 negated: *negated,
             }))
         }
@@ -357,18 +674,19 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
     }
 }
 
-/// Add the missing encoding next to every floating point zero in an `IN` list.
+/// Add the missing sign encoding for each zero or NaN in an `IN` list.
 ///
-/// Returns `None` when the list holds no zero, or already spells out both
-/// encodings of each zero it holds.
-fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
-    // Most lists hold no zero, so collect what is missing before copying anything.
+/// Returns `None` when the list holds no sign-sensitive value, or already spells
+/// out both encodings of each value it holds.
+fn widen_equivalent_list(list: &[Expr]) -> Option<Vec<Expr>> {
+    // Most lists hold neither value, so collect what is missing before copying
+    // anything.
     let mut missing: Vec<Expr> = Vec::new();
     for item in list {
         let Expr::Literal(value, metadata) = item else {
             continue;
         };
-        let Some((negative, positive)) = zero_encodings(value) else {
+        let Some((negative, positive)) = equivalent_encodings(value) else {
             continue;
         };
         let counterpart = if *value == negative {
@@ -396,13 +714,24 @@ fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Float64Array};
+    use arrow_schema::{Field, Schema};
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
 
     use super::*;
 
     fn rewrite(expr: Expr) -> Expr {
-        rewrite_signed_zero_comparisons(expr).unwrap()
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]))
+        .unwrap();
+        rewrite_float_comparisons(expr, &schema).unwrap()
     }
 
     fn compare(left: Expr, op: Operator, right: Expr) -> Expr {
@@ -411,6 +740,31 @@ mod tests {
             op,
             right: Box::new(right),
         })
+    }
+
+    fn raw(value: ScalarValue) -> Expr {
+        raw_float_literal(value, None)
+    }
+
+    fn expected_ordered(column: &str, op: Operator, bound: ScalarValue) -> Expr {
+        let primary = compare(col(column), op, raw(bound.clone()));
+        let guard = match op {
+            Operator::Lt | Operator::LtEq => compare(
+                col(column),
+                Operator::GtEq,
+                raw(negative_infinity(&bound).unwrap()),
+            ),
+            Operator::Gt | Operator::GtEq => compare(
+                col(column),
+                Operator::Lt,
+                raw(negative_infinity(&bound).unwrap()),
+            ),
+            _ => unreachable!(),
+        };
+        match op {
+            Operator::Lt | Operator::LtEq => primary.and(guard),
+            _ => primary.or(guard),
+        }
     }
 
     #[rstest]
@@ -429,8 +783,79 @@ mod tests {
     ) {
         assert_eq!(
             rewrite(compare(col("x"), op, lit(written))),
-            compare(col("x"), op, lit(evaluated))
+            expected_ordered("x", op, Float64(Some(evaluated)))
         );
+    }
+
+    #[test]
+    fn finite_range_moves_both_nan_signs_above_the_bound() {
+        assert_eq!(
+            rewrite(col("x").gt(lit(1.0))),
+            expected_ordered("x", Operator::Gt, Float64(Some(1.0)))
+        );
+        assert_eq!(
+            rewrite(col("x").lt_eq(lit(1.0))),
+            expected_ordered("x", Operator::LtEq, Float64(Some(1.0)))
+        );
+    }
+
+    #[test]
+    fn computed_literal_comparison_uses_indexable_ranges() {
+        let computed = col("x") * lit(2.0);
+        let primary = compare(computed.clone(), Operator::Gt, raw(Float64(Some(1.0))));
+        let negative_nan_range = compare(
+            computed.clone(),
+            Operator::Lt,
+            raw(Float64(Some(f64::NEG_INFINITY))),
+        );
+        assert_eq!(
+            rewrite(computed.gt(lit(1.0))),
+            primary.or(negative_nan_range)
+        );
+    }
+
+    #[test]
+    fn nan_equality_covers_both_sign_encodings() {
+        let positive = f64::from_bits(0x7ff8_0000_0000_0042);
+        let negative = f64::from_bits(0xfff8_0000_0000_0042);
+        assert_eq!(
+            rewrite(col("x").eq(lit(negative))),
+            Expr::InList(InList {
+                expr: Box::new(col("x")),
+                list: vec![lit(negative), lit(positive)],
+                negated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn column_comparison_normalizes_each_nan_operand_once() {
+        let rewritten = rewrite(col("x").lt(col("y")));
+        let expected = compare(
+            normalize_nan_expr(&col("x")),
+            Operator::Lt,
+            normalize_nan_expr(&col("y")),
+        );
+        assert_eq!(rewritten, expected);
+        assert_eq!(rewrite(rewritten.clone()), rewritten);
+    }
+
+    #[test]
+    fn nan_array_normalization_preserves_payload_and_non_nan_values() {
+        let negative = f64::from_bits(0xfff8_0000_0000_0042);
+        let positive = f64::from_bits(0x7ff8_0000_0000_0042);
+        let input = Arc::new(Float64Array::from(vec![
+            Some(negative),
+            Some(-1.0),
+            Some(positive),
+            None,
+        ])) as ArrayRef;
+        let normalized = normalize_nan_array(input).unwrap();
+        let normalized = normalized.as_primitive::<Float64Type>();
+        assert_eq!(normalized.value(0).to_bits(), positive.to_bits());
+        assert_eq!(normalized.value(1).to_bits(), (-1.0_f64).to_bits());
+        assert_eq!(normalized.value(2).to_bits(), positive.to_bits());
+        assert!(normalized.is_null(3));
     }
 
     #[rstest]
@@ -452,7 +877,7 @@ mod tests {
         // `0.0 > x` is `x < 0.0`, which evaluates against the negative encoding.
         assert_eq!(
             rewrite(compare(lit(0.0), Operator::Gt, col("x"))),
-            compare(col("x"), Operator::Lt, lit(-0.0))
+            expected_ordered("x", Operator::Lt, Float64(Some(-0.0)))
         );
     }
 
@@ -469,7 +894,7 @@ mod tests {
                 Operator::LtEq,
                 Expr::Literal(written, None)
             )),
-            compare(col("x"), Operator::LtEq, Expr::Literal(evaluated, None))
+            expected_ordered("x", Operator::LtEq, evaluated)
         );
     }
 
@@ -493,16 +918,14 @@ mod tests {
     fn only_the_zero_comparison_in_a_conjunction_changes() {
         assert_eq!(
             rewrite(col("x").lt(lit(0.0)).and(col("y").eq(lit(1.0)))),
-            col("x").lt(lit(-0.0)).and(col("y").eq(lit(1.0)))
+            expected_ordered("x", Operator::Lt, Float64(Some(-0.0))).and(col("y").eq(lit(1.0)))
         );
     }
 
     #[rstest]
-    #[case::non_zero(col("x").lt(lit(1.0)))]
     #[case::integer_zero(col("x").eq(lit(0_i64)))]
-    #[case::null(compare(col("x"), Operator::Eq, Expr::Literal(Float64(None), None)))]
-    #[case::nan(col("x").lt(lit(f64::NAN)))]
-    #[case::column_on_both_sides(col("x").lt(col("y")))]
+    #[case::null_equality(compare(col("x"), Operator::Eq, Expr::Literal(Float64(None), None)))]
+    #[case::null_range(compare(col("x"), Operator::Lt, Expr::Literal(Float64(None), None)))]
     #[case::both_encodings_listed(Expr::InList(InList {
         expr: Box::new(col("x")),
         list: vec![lit(-0.0), lit(0.0)],

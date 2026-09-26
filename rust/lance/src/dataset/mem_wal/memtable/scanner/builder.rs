@@ -1441,6 +1441,31 @@ impl MemTableScanner {
         }
     }
 
+    /// Extract one inclusive lower or exclusive upper BTree range bound.
+    fn extract_btree_range_bound(
+        &self,
+        expr: &Expr,
+    ) -> Option<(String, Option<ScalarValue>, Option<ScalarValue>)> {
+        let Expr::BinaryExpr(binary) = expr else {
+            return None;
+        };
+        let (Expr::Column(column), Expr::Literal(literal, _)) =
+            (binary.left.as_ref(), binary.right.as_ref())
+        else {
+            return None;
+        };
+        let literal = self.coerce_literal_to_column(&column.name, literal)?;
+        match binary.op {
+            datafusion::logical_expr::Operator::Lt => {
+                Some((column.name.clone(), None, Some(literal)))
+            }
+            datafusion::logical_expr::Operator::GtEq => {
+                Some((column.name.clone(), Some(literal), None))
+            }
+            _ => None,
+        }
+    }
+
     /// Extract a BTree-compatible predicate from the filter.
     ///
     /// This method also coerces literal values to match the column's data type
@@ -1463,6 +1488,33 @@ impl MemTableScanner {
 
         // Simple pattern matching for common predicates
         match &filter {
+            // A normalized floating-point `<` is an exact half-open range:
+            // `x < bound AND x >= -inf`. Combining both bounds keeps negative
+            // NaNs out of the memtable fast path without needing a refinement
+            // filter after the index lookup.
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::And => {
+                if let (
+                    Some((left_column, left_lower, left_upper)),
+                    Some((right_column, right_lower, right_upper)),
+                ) = (
+                    self.extract_btree_range_bound(&binary.left),
+                    self.extract_btree_range_bound(&binary.right),
+                ) && left_column == right_column
+                {
+                    let bounds = match (left_lower, left_upper, right_lower, right_upper) {
+                        (Some(lower), None, None, Some(upper))
+                        | (None, Some(upper), Some(lower), None) => Some((lower, upper)),
+                        _ => None,
+                    };
+                    if let Some((lower, upper)) = bounds {
+                        return Some(ScalarPredicate::Range {
+                            column: left_column,
+                            lower: Some(lower),
+                            upper: Some(upper),
+                        });
+                    }
+                }
+            }
             // `simplify` turns an `IN` list of three or fewer values back into an
             // OR chain of equalities, and the signed-zero rewrite then turns any
             // zero among them into a two-element list of its own, so the fast path
@@ -1476,35 +1528,23 @@ impl MemTableScanner {
                 }
             }
             Expr::BinaryExpr(binary) => {
-                if let (Expr::Column(col), Expr::Literal(lit, _)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
+                if let Some((column, lower, upper)) = self.extract_btree_range_bound(&filter) {
+                    return Some(ScalarPredicate::Range {
+                        column,
+                        lower,
+                        upper,
+                    });
+                }
+                if binary.op == datafusion::logical_expr::Operator::Eq
+                    && let (Expr::Column(col), Expr::Literal(lit, _)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
                 {
                     // Coerce literal to match column type
                     let coerced_lit = self.coerce_literal_to_column(&col.name, lit)?;
-
-                    match binary.op {
-                        datafusion::logical_expr::Operator::Eq => {
-                            return Some(ScalarPredicate::Eq {
-                                column: col.name.clone(),
-                                value: coerced_lit,
-                            });
-                        }
-                        datafusion::logical_expr::Operator::Lt => {
-                            return Some(ScalarPredicate::Range {
-                                column: col.name.clone(),
-                                lower: None,
-                                upper: Some(coerced_lit),
-                            });
-                        }
-                        datafusion::logical_expr::Operator::GtEq => {
-                            return Some(ScalarPredicate::Range {
-                                column: col.name.clone(),
-                                lower: Some(coerced_lit),
-                                upper: None,
-                            });
-                        }
-                        _ => {}
-                    }
+                    return Some(ScalarPredicate::Eq {
+                        column: col.name.clone(),
+                        value: coerced_lit,
+                    });
                 }
             }
             Expr::InList(in_list) if !in_list.negated => {
@@ -1854,7 +1894,8 @@ mod tests {
         // row the predicate excludes.
         scanner.filter("value < 0.0").unwrap();
         match scanner.extract_btree_predicate() {
-            Some(ScalarPredicate::Range { upper, .. }) => {
+            Some(ScalarPredicate::Range { lower, upper, .. }) => {
+                assert_eq!(lower, Some(ScalarValue::Float64(Some(f64::NEG_INFINITY))));
                 assert_eq!(upper, Some(ScalarValue::Float64(Some(-0.0))));
             }
             other => panic!("expected a Range predicate, got {other:?}"),
