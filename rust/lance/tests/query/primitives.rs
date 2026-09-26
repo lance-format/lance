@@ -83,6 +83,8 @@ async fn test_query_integer(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value > 20").await;
             test_filter(&original, &ds, "NOT (value > 20)").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 20").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM NULL").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "(value != 0) OR (value < 20)").await;
@@ -299,6 +301,15 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                // Null-safe: the NULL row 9 is distinct rather than unknown.
+                assert_filter_ids(&ds, &format!("value IS NOT DISTINCT FROM {zero}"), &[0, 1])
+                    .await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value IS DISTINCT FROM {zero}"),
+                    &[2, 3, 4, 5, 6, 7, 8, 9],
+                )
+                .await;
                 assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
                 // NaN is row 4. Arrow sorts it above every other value, so it
                 // survives `>` and `>=`, which IEEE would reject. That gap is
@@ -543,6 +554,8 @@ async fn test_query_string(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value = 'hello'").await;
             test_filter(&original, &ds, "value != 'hello'").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 'hello'").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM 'hello'").await;
             test_filter(&original, &ds, "value = ''").await;
             test_filter(&original, &ds, "value > 'hello'").await;
             test_filter(&original, &ds, "value is null").await;
