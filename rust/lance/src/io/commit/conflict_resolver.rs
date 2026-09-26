@@ -308,6 +308,16 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
+        // A restore replaces the manifest with an older one, schema and field
+        // metadata included. Rebasing a metadata update over it reinstates
+        // metadata the restore discarded, and re-reading cannot help: the
+        // update was computed against a schema the table no longer has.
+        if (matches!(ours, Operation::Restore { .. }) && updates_schema_or_field_metadata(theirs))
+            || (updates_schema_or_field_metadata(ours)
+                && matches!(theirs, Operation::Restore { .. }))
+        {
+            return Err(self.incompatible_conflict_err(other_transaction, other_version));
+        }
 
         let op = &self.transaction.operation;
         match op {
@@ -4313,6 +4323,44 @@ mod tests {
             new_indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter(expected_fragment_ids)
         );
+    }
+
+    /// A restore rewinds schema and field metadata with the rest of the
+    /// manifest, so a metadata update must not rebase over it; a plain config
+    /// upsert carries no metadata and still rebases.
+    #[rstest::rstest]
+    #[case::field_metadata(Some(HashMap::from([(0, HashMap::from([("fresh".to_string(), "{}".to_string())]))])), None, true)]
+    #[case::schema_metadata(None, Some(HashMap::from([("owner".to_string(), "refresh".to_string())])), true)]
+    #[case::config_only(None, None, false)]
+    fn test_update_config_conflicts_with_restore(
+        #[case] field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+        #[case] schema_metadata: Option<HashMap<String, String>>,
+        #[case] conflicts: bool,
+    ) {
+        let restore = Transaction::new(0, Operation::Restore { version: 1 }, None);
+        let update = create_update_config_for_test(
+            Some(HashMap::from([("key".to_string(), "value".to_string())])),
+            None,
+            schema_metadata,
+            field_metadata,
+        );
+        // Either commit order: the metadata the restore discarded must not
+        // come back, whichever transaction rebases.
+        for (ours, theirs) in [
+            (update.clone(), restore.operation.clone()),
+            (restore.operation, update),
+        ] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, ours, None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
+            assert_eq!(result.is_err(), conflicts, "{result:?}");
+        }
     }
 
     #[test]
