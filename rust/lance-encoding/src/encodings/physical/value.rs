@@ -828,8 +828,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
-        make_array, new_null_array, types::UInt32Type,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, NullArray,
+        UInt8Array, make_array, new_null_array, types::UInt32Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -1190,6 +1190,22 @@ mod tests {
         let list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
+
+        let test_cases = TestCases::default().with_structural_encodings();
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    // A FixedSizeList of the Null type wrote fine but failed to read back, because the
+    // decoder gave the Null child a validity buffer, which arrow-rs rejects.
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_of_null_type(#[values(false, true)] has_outer_nulls: bool) {
+        let items_field = Arc::new(Field::new("item", DataType::Null, true));
+        let outer_nulls = has_outer_nulls.then(|| NullBuffer::from(vec![true, false, true]));
+        let list_array =
+            FixedSizeListArray::new(items_field, 2, Arc::new(NullArray::new(6)), outer_nulls);
 
         let test_cases = TestCases::default().with_structural_encodings();
 
