@@ -72,6 +72,7 @@ pub mod cleanup;
 mod data_file;
 mod data_file_part;
 pub mod delta;
+pub mod expire;
 pub mod files;
 pub mod fragment;
 mod hash_joiner;
@@ -113,6 +114,7 @@ pub mod transaction {
 pub mod udtf;
 pub mod updater;
 mod utils;
+pub mod version_retention;
 pub(crate) mod versions;
 pub mod write;
 

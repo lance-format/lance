@@ -1438,7 +1438,7 @@ async fn expired_manifest_size(
 /// rate. Scaling it by a bulk-delete batch size would only be correct if a permit
 /// covered a whole batch; nothing coalesces paths into a single request, so doing so
 /// lets the limiter issue `batch_size` times the configured rate.
-fn calculate_duration(rate: u64) -> Duration {
+pub(crate) fn calculate_duration(rate: u64) -> Duration {
     let effective_rate = rate.max(1);
     info!(
         "delete_rate_limit enabled: limit {} delete requests/sec",
@@ -5258,6 +5258,7 @@ mod tests {
                 naming_scheme: ManifestNamingScheme::V2,
                 e_tag: None,
                 identity: Some(row.2),
+                last_modified: None,
             })
         }
 

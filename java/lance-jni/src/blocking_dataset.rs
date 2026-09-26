@@ -33,6 +33,10 @@ use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
     CleanupReferencedBranch, RemovalStats,
 };
+use lance::dataset::expire::{
+    ExpireVersionsPlan, ExpireVersionsPolicy, ExpireVersionsStats, expire_versions,
+    explain_expire_versions,
+};
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -480,6 +484,17 @@ impl BlockingDataset {
 
     pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
         Ok(block_on(self.inner.cleanup_with_policy(policy))?)
+    }
+
+    pub fn expire_versions(&mut self, policy: ExpireVersionsPolicy) -> Result<ExpireVersionsStats> {
+        Ok(block_on(expire_versions(&self.inner, policy))?)
+    }
+
+    pub fn explain_expire_versions(
+        &self,
+        policy: ExpireVersionsPolicy,
+    ) -> Result<ExpireVersionsPlan> {
+        Ok(block_on(explain_expire_versions(&self.inner, &policy))?)
     }
 
     pub fn explain_cleanup_with_policy(
@@ -3703,6 +3718,134 @@ fn inner_explain_cleanup_with_policy<'local>(
     }?;
 
     cleanup_explanation_to_java(env, explanation)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeExpireVersions<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_expire_versions(&mut env, jdataset, jpolicy))
+}
+
+fn inner_expire_versions<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> Result<JObject<'local>> {
+    let policy = extract_expire_versions_policy(env, &jpolicy)?;
+
+    let stats = {
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.expire_versions(policy)
+    }?;
+
+    expire_versions_stats_to_java(env, stats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeExplainExpireVersions<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_explain_expire_versions(&mut env, jdataset, jpolicy)
+    )
+}
+
+fn inner_explain_expire_versions<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+) -> Result<JObject<'local>> {
+    let policy = extract_expire_versions_policy(env, &jpolicy)?;
+
+    let plan = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.explain_expire_versions(policy)
+    }?;
+
+    expire_versions_plan_to_java(env, plan)
+}
+
+fn long_list_to_java<'local>(env: &mut JNIEnv<'local>, values: &[u64]) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for value in values {
+        let boxed = env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*value as i64)])?;
+        env.call_method(
+            &list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&boxed)],
+        )?;
+    }
+    Ok(list)
+}
+
+fn expire_versions_plan_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    plan: ExpireVersionsPlan,
+) -> Result<JObject<'local>> {
+    let versions = long_list_to_java(env, &plan.versions)?;
+    let tagged_but_kept = long_list_to_java(env, &plan.tagged_but_kept)?;
+    let stats = expire_versions_stats_to_java(env, plan.stats)?;
+    Ok(env.new_object(
+        "org/lance/expire/ExpireVersionsPlan",
+        "(Ljava/util/List;Lorg/lance/expire/ExpireVersionsStats;Ljava/util/List;)V",
+        &[
+            JValue::Object(&versions),
+            JValue::Object(&stats),
+            JValue::Object(&tagged_but_kept),
+        ],
+    )?)
+}
+
+fn extract_expire_versions_policy(
+    env: &mut JNIEnv<'_>,
+    jpolicy: &JObject,
+) -> Result<ExpireVersionsPolicy> {
+    let before_timestamp = env
+        .get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?
+        .map(|millis| DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_millis(millis)));
+    let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
+    let keep_one_per = env
+        .get_optional_u64_from_method(jpolicy, "getKeepOnePerMicros")?
+        .map(Duration::from_micros);
+    let error_if_tagged_old_versions = env
+        .get_optional_from_method(jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(true);
+    let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
+
+    Ok(ExpireVersionsPolicy {
+        before_timestamp,
+        before_version,
+        keep_one_per,
+        error_if_tagged_old_versions,
+        delete_rate_limit,
+    })
+}
+
+fn expire_versions_stats_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    stats: ExpireVersionsStats,
+) -> Result<JObject<'local>> {
+    Ok(env.new_object(
+        "org/lance/expire/ExpireVersionsStats",
+        "(JJJJ)V",
+        &[
+            JValue::Long(stats.versions_removed as i64),
+            JValue::Long(stats.versions_retained as i64),
+            JValue::Long(stats.bytes_removed as i64),
+            JValue::Long(stats.failed_deletes as i64),
+        ],
+    )?)
 }
 
 fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {

@@ -112,6 +112,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    ExpireVersionsPlan, ExpireVersionsStats,
 };
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
@@ -875,6 +876,58 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
         failed_deletes: stats.failed_deletes,
+    }
+}
+
+/// Build an `ExpireVersionsPolicy` from the Python-facing arguments.
+///
+/// `keep_one_per_micros` is microseconds rather than seconds: `timedelta` resolves to
+/// microseconds, so this is lossless, whereas truncating to seconds would silently widen a
+/// sub-second width and delete more history than asked for.
+fn expire_versions_policy(
+    before_micros: Option<i64>,
+    before_version: Option<u64>,
+    keep_one_per_micros: Option<u64>,
+    error_if_tagged_old_versions: Option<bool>,
+    delete_rate_limit: Option<u64>,
+) -> PyResult<lance::dataset::expire::ExpireVersionsPolicy> {
+    let mut builder = lance::dataset::expire::ExpireVersionsPolicyBuilder::default();
+    if let Some(micros) = before_micros {
+        // A duration, not an absolute time, matching `cleanup_policy`: the caller says
+        // "older than this" and the cutoff is computed here against one clock.
+        builder = builder.before_timestamp(Utc::now() - Duration::microseconds(micros));
+    }
+    if let Some(version) = before_version {
+        builder = builder.before_version(version);
+    }
+    if let Some(micros) = keep_one_per_micros {
+        builder = builder.keep_one_per(std::time::Duration::from_micros(micros));
+    }
+    if let Some(error) = error_if_tagged_old_versions {
+        builder = builder.error_if_tagged_old_versions(error);
+    }
+    if let Some(rate) = delete_rate_limit {
+        builder = builder.delete_rate_limit(rate);
+    }
+    Ok(builder.build())
+}
+
+fn expire_versions_stats(
+    stats: lance::dataset::expire::ExpireVersionsStats,
+) -> ExpireVersionsStats {
+    ExpireVersionsStats {
+        versions_removed: stats.versions_removed,
+        versions_retained: stats.versions_retained,
+        bytes_removed: stats.bytes_removed,
+        failed_deletes: stats.failed_deletes,
+    }
+}
+
+fn expire_versions_plan(plan: lance::dataset::expire::ExpireVersionsPlan) -> ExpireVersionsPlan {
+    ExpireVersionsPlan {
+        versions: plan.versions,
+        stats: expire_versions_stats(plan.stats),
+        tagged_but_kept: plan.tagged_but_kept,
     }
 }
 
@@ -2297,6 +2350,59 @@ impl Dataset {
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(cleanup_stats(stats))
+    }
+
+    /// Remove version history without deleting any data files.
+    ///
+    /// Data files that only an expired version referenced are left behind for
+    /// `cleanup_old_versions` to reclaim.
+    #[pyo3(signature = (before_micros = None, before_version = None, keep_one_per_micros = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    fn expire_versions(
+        &self,
+        before_micros: Option<i64>,
+        before_version: Option<u64>,
+        keep_one_per_micros: Option<u64>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> PyResult<ExpireVersionsStats> {
+        let policy = expire_versions_policy(
+            before_micros,
+            before_version,
+            keep_one_per_micros,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )?;
+        let stats = rt()
+            .block_on(None, async {
+                lance::dataset::expire::expire_versions(self.ds.as_ref(), policy).await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        Ok(expire_versions_stats(stats))
+    }
+
+    /// Report what `expire_versions` would remove, without removing it.
+    #[pyo3(signature = (before_micros = None, before_version = None, keep_one_per_micros = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    fn explain_expire_versions(
+        &self,
+        before_micros: Option<i64>,
+        before_version: Option<u64>,
+        keep_one_per_micros: Option<u64>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> PyResult<ExpireVersionsPlan> {
+        let policy = expire_versions_policy(
+            before_micros,
+            before_version,
+            keep_one_per_micros,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )?;
+        let plan = rt()
+            .block_on(None, async {
+                lance::dataset::expire::explain_expire_versions(self.ds.as_ref(), &policy).await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        Ok(expire_versions_plan(plan))
     }
 
     /// Explain cleanup old versions from the dataset without deleting files

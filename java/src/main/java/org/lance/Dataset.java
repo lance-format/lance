@@ -18,6 +18,9 @@ import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.expire.ExpireVersionsPlan;
+import org.lance.expire.ExpireVersionsPolicy;
+import org.lance.expire.ExpireVersionsStats;
 import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexBuildProgress;
@@ -2563,6 +2566,49 @@ public class Dataset implements Closeable {
   }
 
   private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+
+  /**
+   * Remove version history without deleting any data files.
+   *
+   * <p>Unlike {@link #cleanupWithPolicy}, this does not compute the set of live data files, so it
+   * does not read the manifests it expires. Data files that only an expired version referenced are
+   * left behind as unreferenced; the next cleanup reclaims them, and is cheaper for having fewer
+   * manifests to read. The intended order is expire, then clean up.
+   *
+   * <p>The newest version, tags on the current branch, and versions a branch is rooted at are never
+   * removed.
+   *
+   * @param policy expiry policy
+   * @return expiry stats; a non-zero {@code failedDeletes} means the run completed without removing
+   *     everything it selected
+   */
+  public ExpireVersionsStats expireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsStats nativeExpireVersions(ExpireVersionsPolicy policy);
+
+  /**
+   * Report what {@link #expireVersions} would remove, without removing it.
+   *
+   * <p>A dry run: no manifest is deleted to produce this.
+   *
+   * @param policy expiry policy, the same one you would pass to {@link #expireVersions}
+   * @return the versions that would be removed and the stats that would result
+   */
+  public ExpireVersionsPlan explainExpireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsPlan nativeExplainExpireVersions(ExpireVersionsPolicy policy);
 
   CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
