@@ -6,7 +6,10 @@
 //! housekeeping. Used for the session index and metadata caches; the index
 //! cache sees thousands of cache reads per query.
 
+use super::PriorityEntries;
 use std::pin::Pin;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures::Future;
@@ -34,6 +37,10 @@ impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
 }
 
 pub struct QuickCacheBackend {
+    capacity: usize,
+    generation: AtomicU64,
+    priority_active: AtomicBool,
+    priority: Mutex<PriorityEntries<QuickEntry>>,
     cache: quick_cache::sync::Cache<InternalCacheKey, QuickEntry, EntryWeighter>,
 }
 
@@ -92,13 +99,76 @@ impl QuickCacheBackend {
             Default::default(),
             Default::default(),
         );
-        Self { cache }
+        Self {
+            cache,
+            capacity,
+            generation: AtomicU64::new(0),
+            priority_active: AtomicBool::new(false),
+            priority: Mutex::new(PriorityEntries::default()),
+        }
+    }
+    fn admit_priority(
+        &self,
+        key: InternalCacheKey,
+        item: QuickEntry,
+        priority: u8,
+        generation: u64,
+    ) {
+        self.cache.remove(&key);
+        let dropped = {
+            let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
+            if self.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let mut dropped = Vec::new();
+            if !self.priority_active.swap(true, Ordering::AcqRel) {
+                // Metadata and existing entries compete with signs, ahead of ex planes.
+                // Reserving the whole budget for planes would otherwise evict the IVF model.
+                let existing: Vec<_> = self.cache.iter().collect();
+                for (key, value) in existing {
+                    let size = key_footprint(&key).saturating_add(value.size_bytes);
+                    dropped.extend(entries.insert(key, value, size, 3, self.capacity));
+                }
+                // Evict resident values without invalidating single-flight
+                // placeholders: their loaders still belong to this generation.
+                self.cache.set_capacity(0);
+            }
+            let size = key_footprint(&key).saturating_add(item.size_bytes);
+            dropped.extend(entries.insert(
+                key,
+                item,
+                size,
+                if priority == 0 { 3 } else { priority },
+                self.capacity,
+            ));
+            dropped
+        };
+        drop(dropped);
     }
 }
 
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
-    async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
+    async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.priority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .or_else(|| self.cache.get(key))
+            .map(|r| r.entry)
+    }
+
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        if (self.priority_active.load(Ordering::Acquire)
+            || codec.is_some_and(|c| c.memory_priority() > 0))
+            && let Some(value) = self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+        {
+            return Some(value.entry);
+        }
         self.cache.get(key).map(|v| v.entry)
     }
 
@@ -107,48 +177,104 @@ impl CacheBackend for QuickCacheBackend {
         key: &InternalCacheKey,
         entry: CacheEntry,
         size_bytes: usize,
-        _codec: Option<CacheCodec>,
+        codec: Option<CacheCodec>,
     ) {
-        self.cache.insert(*key, QuickEntry { entry, size_bytes });
+        let priority = codec.map(|c| c.memory_priority()).unwrap_or(0);
+        let item = QuickEntry { entry, size_bytes };
+        if priority > 0 || self.priority_active.load(Ordering::Acquire) {
+            self.admit_priority(
+                *key,
+                item,
+                priority,
+                self.generation.load(Ordering::Acquire),
+            );
+        } else {
+            self.cache.insert(*key, item);
+        }
     }
 
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-        _codec: Option<CacheCodec>,
+        codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
+        let priority = codec.map(|c| c.memory_priority()).unwrap_or(0);
+        if (priority > 0 || self.priority_active.load(Ordering::Acquire))
+            && let Some(value) = self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+        {
+            return Ok((value.entry, true));
+        }
+        let generation = self.generation.load(Ordering::Acquire);
         match self.cache.get_value_or_guard_async(key).await {
             Ok(value) => Ok((value.entry, true)),
             Err(guard) => {
                 let (entry, size_bytes) = loader.await?;
-                let _ = guard.insert(QuickEntry {
+                let item = QuickEntry {
                     entry: entry.clone(),
                     size_bytes,
-                });
+                };
+                if guard.insert(item.clone()).is_ok()
+                    && (priority > 0 || self.priority_active.load(Ordering::Acquire))
+                {
+                    self.admit_priority(*key, item, priority, generation);
+                }
                 Ok((entry, false))
             }
         }
     }
 
     async fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let dropped = {
+            let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
+            let dropped = entries.clear();
+            self.priority_active.store(false, Ordering::Release);
+            self.cache.set_capacity(self.capacity as u64);
+            dropped
+        };
+        drop(dropped);
         self.cache.clear();
     }
 
     async fn num_entries(&self) -> usize {
         self.cache.len()
+            + self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
     }
 
     async fn size_bytes(&self) -> usize {
         self.cache.weight() as usize
+            + self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bytes()
     }
 
     fn approx_num_entries(&self) -> usize {
         self.cache.len()
+            + self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
     }
 
     fn approx_size_bytes(&self) -> usize {
         self.cache.weight() as usize
+            + self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bytes()
     }
 
     fn deep_size_of_entries(
@@ -156,14 +282,27 @@ impl CacheBackend for QuickCacheBackend {
         context: &mut Context,
         size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
     ) -> Option<usize> {
+        let prioritized: usize = self
+            .priority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot()
+            .into_iter()
+            .map(|(key, _, value)| {
+                key_footprint(&key)
+                    + size_of_entry(&value.entry, context).unwrap_or(value.size_bytes)
+            })
+            .sum();
         Some(
-            self.cache
-                .iter()
-                .map(|(key, record)| {
-                    key_footprint(&key)
-                        + size_of_entry(&record.entry, context).unwrap_or(record.size_bytes)
-                })
-                .sum(),
+            prioritized
+                + self
+                    .cache
+                    .iter()
+                    .map(|(key, record)| {
+                        key_footprint(&key)
+                            + size_of_entry(&record.entry, context).unwrap_or(record.size_bytes)
+                    })
+                    .sum::<usize>(),
         )
     }
 }
@@ -199,6 +338,83 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    #[tokio::test]
+    async fn priority_transition_preserves_inflight_loads() {
+        let cache = Arc::new(QuickCacheBackend::with_capacity(1024));
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+            .with_memory_priority(3);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let loading_cache = cache.clone();
+        let loading = tokio::spawn(async move {
+            loading_cache
+                .get_or_insert(
+                    &key(1),
+                    Box::pin(async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Ok((Arc::new(1u64) as CacheEntry, 32))
+                    }),
+                    Some(codec),
+                )
+                .await
+                .unwrap()
+        });
+        started_rx.await.unwrap();
+        cache.insert(&key(2), Arc::new(2u64), 32, Some(codec)).await;
+        release_tx.send(()).unwrap();
+        loading.await.unwrap();
+        assert!(cache.get_resident(&key(1)).await.is_some());
+        assert!(cache.get_resident(&key(2)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn priority_budget_retains_metadata_and_singleflight_entries() {
+        let cache = QuickCacheBackend::with_capacity(160);
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())));
+        cache.insert(&key(0), Arc::new(0u64), 32, None).await;
+        for (id, priority) in [(1, 3), (2, 2), (3, 1)] {
+            cache
+                .insert(
+                    &key(id),
+                    Arc::new(id),
+                    32,
+                    Some(codec.with_memory_priority(priority)),
+                )
+                .await;
+        }
+        assert!(cache.get_resident(&key(0)).await.is_some());
+        assert!(cache.get_resident(&key(1)).await.is_some());
+        assert!(cache.get_resident(&key(2)).await.is_some());
+        assert!(cache.get_resident(&key(3)).await.is_none());
+        let (_, hit) = cache
+            .get_or_insert(
+                &key(4),
+                Box::pin(async { Ok((Arc::new(4u64) as CacheEntry, 32)) }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!hit);
+        let (_, hit) = cache
+            .get_or_insert(
+                &key(4),
+                Box::pin(async { panic!("resident entry reloaded") }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(hit);
+        assert!(cache.get_resident(&key(2)).await.is_none());
+        assert!(cache.size_bytes().await <= 160);
+        cache.clear().await;
+        assert_eq!(cache.num_entries().await, 0);
+        cache.insert(&key(0), Arc::new(0u64), 32, None).await;
+        assert!(cache.get_resident(&key(0)).await.is_some());
     }
 
     #[test]

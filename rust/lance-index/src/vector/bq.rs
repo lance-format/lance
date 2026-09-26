@@ -20,6 +20,8 @@ use crate::vector::quantizer::QuantizerBuildParams;
 pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
+pub mod layered;
+mod plane_cache;
 pub mod prune;
 pub mod rotation;
 pub mod storage;
@@ -121,6 +123,8 @@ pub struct RQBuildParams {
     /// rotates vectors identically. This is transient build-time state and is never
     /// persisted to the `RabitQuantization` params proto.
     pub rotation: Option<RabitQuantizationMetadata>,
+    /// Store prefix code planes; supported for 5, 7 and 9 bits. Default off.
+    pub layered: bool,
 }
 
 pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
@@ -157,11 +161,18 @@ pub fn rabit_ex_code_bytes(rotated_dim: usize, ex_bits: u8) -> Result<usize> {
 }
 
 impl RQBuildParams {
+    /// Opt into the layered format. Requires a reader with layered RQ support.
+    pub fn with_layered(mut self, layered: bool) -> Self {
+        self.layered = layered;
+        self
+    }
+
     pub fn new(num_bits: u8) -> Self {
         Self {
             num_bits,
             rotation_type: RQRotationType::default(),
             rotation: None,
+            layered: false,
         }
     }
 
@@ -170,6 +181,7 @@ impl RQBuildParams {
             num_bits,
             rotation_type,
             rotation: None,
+            layered: false,
         }
     }
 }
@@ -179,7 +191,7 @@ impl From<&RQBuildParams> for RabitQuantization {
         use crate::pb::vector_index_details::rabit_quantization::RotationType;
         Self {
             num_bits: value.num_bits as u32,
-            layered: false,
+            layered: value.layered,
             rotation_type: match value.rotation_type {
                 RQRotationType::Fast => RotationType::Fast as i32,
                 RQRotationType::Matrix => RotationType::Matrix as i32,
@@ -200,6 +212,7 @@ impl Default for RQBuildParams {
             num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
             rotation: None,
+            layered: false,
         }
     }
 }

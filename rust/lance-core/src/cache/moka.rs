@@ -105,6 +105,10 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
+    async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.cache.get(key).await.map(|r| r.entry)
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }

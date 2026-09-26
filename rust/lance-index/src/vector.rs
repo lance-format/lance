@@ -166,6 +166,10 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+    /// Precision of a layered RaBitQ query; defaults to full.
+    pub rq_precision: bq::layered::RQPrecision,
+    /// Candidate oversampling for a high-to-full cascade. None scans full codes.
+    pub rq_cascade_factor: Option<u32>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
