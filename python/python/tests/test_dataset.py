@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
+from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
@@ -6551,6 +6552,288 @@ def test_data_overlay_accepts_any_offset_order(
     # rank 0 (offset 1) -> value row 0 (100); rank 1 (offset 2) -> value row 1 (200)
     assert result[1] == 100
     assert result[2] == 200
+
+
+def _overlay_writer_dataset(base_dir: Path):
+    """Two 5-row fragments of `id`, `val` and nullable `tag`."""
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+            "tag": pa.array([f"t{i}" for i in range(10)]),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir, max_rows_per_file=5)
+    assert len(dataset.get_fragments()) == 2
+    return dataset
+
+
+def _rowaddrs(fragment, offsets: List[int]) -> pa.Array:
+    """The `_rowaddr` of the given physical offsets within `fragment`."""
+    addrs = fragment.to_table(columns=[], with_row_address=True)["_rowaddr"]
+    return pa.array([addrs[o].as_py() for o in offsets], pa.uint64())
+
+
+def _overlay_files_on_disk(base_dir: Path, dataset) -> set:
+    base_files = {
+        os.path.basename(f.path)
+        for frag in dataset.get_fragments()
+        for f in frag.metadata.files
+    }
+    return {p.name for p in (base_dir / "data").iterdir()} - base_files
+
+
+def test_overlay_writer_sparse_across_fragments(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    """One writer per fragment stages a sparse overlay (different rows per
+    column, one written to NULL); both groups commit in a single DataOverlay
+    operation and resolve on scan, filter and take."""
+    base_dir = tmp_path / "test"
+    dataset = _overlay_writer_dataset(base_dir)
+    read_version = dataset.version
+
+    groups = []
+    for fragment in dataset.get_fragments():
+        with fragment.write_overlay(["val", "tag"]) as writer:
+            # `val` at offsets 1 and 3, spread over two batches; `tag` at 3 -> NULL.
+            writer.write_batch(
+                pa.table(
+                    {
+                        "_rowaddr": _rowaddrs(fragment, [1]),
+                        "val": pa.array([-1], pa.int32()),
+                    }
+                )
+            )
+            writer.write_batch(
+                pa.table(
+                    {
+                        "_rowaddr": _rowaddrs(fragment, [3]),
+                        "val": pa.array([-3], pa.int32()),
+                        "tag": pa.array([None], pa.string()),
+                    }
+                )
+            )
+            group = writer.finish()
+        assert isinstance(group, lance.LanceOperation.DataOverlayGroup)
+        assert group.fragment_id == fragment.fragment_id
+        # Coverage differs per field, so the writer emitted sparse coverage.
+        (overlay,) = group.overlays
+        assert [list(bm) for bm in overlay.offsets] == [[1, 3], [3]]
+        assert overlay.data_file.fields == [1, 2]
+        groups.append(group)
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.DataOverlay(groups), read_version=read_version
+    )
+
+    expected_val = [
+        -1 if i % 5 == 1 else -3 if i % 5 == 3 else i * 10 for i in range(10)
+    ]
+    expected_tag = [None if i % 5 == 3 else f"t{i}" for i in range(10)]
+    result = dataset.to_table()
+    assert result.column("id").to_pylist() == list(range(10))
+    assert result.column("val").to_pylist() == expected_val
+    assert result.column("tag").to_pylist() == expected_tag
+    assert dataset.to_table(filter="val < 0").column("id").to_pylist() == [1, 3, 6, 8]
+    assert dataset.take([3, 8], columns=["val", "tag"]).to_pydict() == {
+        "val": [-3, -3],
+        "tag": [None, None],
+    }
+    for fragment in dataset.get_fragments():
+        assert len(fragment.metadata.overlays) == 1
+    # The only extra files in data/ are the two committed overlays.
+    assert len(_overlay_files_on_disk(base_dir, dataset)) == 2
+
+
+def test_overlay_writer_dense_when_columns_share_rows(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    base_dir = tmp_path / "test"
+    dataset = _overlay_writer_dataset(base_dir)
+    fragment = dataset.get_fragment(1)
+
+    writer = fragment.write_overlay(["tag", "val"])
+    writer.write_batch(
+        pa.record_batch(
+            {
+                "_rowaddr": _rowaddrs(fragment, [0, 4]),
+                "val": pa.array([100, 400], pa.int32()),
+                "tag": pa.array(["a", "e"]),
+            }
+        )
+    )
+    group = writer.finish()
+    (overlay,) = group.overlays
+    # Identical coverage collapses into one shared (dense) offset set.
+    assert isinstance(overlay.offsets, Bitmap)
+    assert list(overlay.offsets) == [0, 4]
+    # Columns follow the declared order, not the batch order.
+    assert overlay.data_file.fields == [2, 1]
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.DataOverlay([group]), read_version=dataset.version
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist()[5:] == [100, 60, 70, 80, 400]
+    assert result.column("tag").to_pylist()[5:] == ["a", "t6", "t7", "t8", "e"]
+
+
+def test_overlay_writer_finish_without_writes_returns_none(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    base_dir = tmp_path / "test"
+    dataset = _overlay_writer_dataset(base_dir)
+    writer = dataset.get_fragment(0).write_overlay(["val"])
+    assert writer.finish() is None
+    assert _overlay_files_on_disk(base_dir, dataset) == set()
+    with pytest.raises(RuntimeError, match="already been finished"):
+        writer.finish()
+
+
+def test_overlay_writer_abort_discards_staged_file(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    base_dir = tmp_path / "test"
+    dataset = _overlay_writer_dataset(base_dir)
+    fragment = dataset.get_fragment(0)
+
+    with pytest.raises(ZeroDivisionError):
+        with fragment.write_overlay(["val"]) as writer:
+            writer.write_batch(
+                pa.record_batch(
+                    {
+                        "_rowaddr": _rowaddrs(fragment, [2]),
+                        "val": pa.array([222], pa.int32()),
+                    }
+                )
+            )
+            1 / 0
+    assert _overlay_files_on_disk(base_dir, dataset) == set()
+    with pytest.raises(RuntimeError, match="already been finished or aborted"):
+        writer.write_batch(
+            pa.record_batch(
+                {
+                    "_rowaddr": _rowaddrs(fragment, [2]),
+                    "val": pa.array([222], pa.int32()),
+                }
+            )
+        )
+    # Leaving the block without finish() also discards the staged file.
+    with fragment.write_overlay(["val"]) as writer:
+        writer.write_batch(
+            pa.record_batch(
+                {
+                    "_rowaddr": _rowaddrs(fragment, [2]),
+                    "val": pa.array([222], pa.int32()),
+                }
+            )
+        )
+    assert _overlay_files_on_disk(base_dir, dataset) == set()
+    writer.abort()  # no-op once aborted
+
+
+@pytest.mark.parametrize(
+    "columns, match",
+    [
+        ([], "at least one column"),
+        (["missing"], "missing"),
+        (["_rowaddr"], "system column '_rowaddr'"),
+    ],
+)
+def test_overlay_writer_rejects_unknown_columns(
+    tmp_path: Path, columns, match, enable_unstable_data_overlay_files
+):
+    dataset = _overlay_writer_dataset(tmp_path / "test")
+    with pytest.raises(ValueError, match=match):
+        dataset.get_fragment(0).write_overlay(columns)
+
+
+def _bad_overlay_batch(case: str, fragment, other_fragment) -> pa.RecordBatch:
+    """A batch violating one writer invariant; the writer declared only `val`."""
+    val = pa.array([1], pa.int32())
+    first = _rowaddrs(fragment, [0])
+    if case == "missing_rowaddr":
+        return pa.record_batch({"val": val})
+    if case == "rowaddr_not_uint64":
+        return pa.record_batch({"_rowaddr": pa.array([1], pa.int64()), "val": val})
+    if case == "null_rowaddr":
+        return pa.record_batch({"_rowaddr": pa.array([None], pa.uint64()), "val": val})
+    if case == "foreign_fragment":
+        return pa.record_batch({"_rowaddr": _rowaddrs(other_fragment, [0]), "val": val})
+    if case == "out_of_range_offset":
+        past_end = pa.array([first[0].as_py() + fragment.physical_rows], pa.uint64())
+        return pa.record_batch({"_rowaddr": past_end, "val": val})
+    if case == "descending_rowaddrs":
+        return pa.record_batch(
+            {
+                "_rowaddr": _rowaddrs(fragment, [3, 1]),
+                "val": pa.array([3, 1], pa.int32()),
+            }
+        )
+    if case == "undeclared_column":
+        return pa.record_batch({"_rowaddr": first, "val": val, "tag": pa.array(["x"])})
+    if case == "wrong_type":
+        return pa.record_batch({"_rowaddr": first, "val": pa.array([1], pa.int64())})
+    raise AssertionError(f"unknown case {case}")
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("missing_rowaddr", "_rowaddr"),
+        ("rowaddr_not_uint64", "UInt64"),
+        ("null_rowaddr", "null"),
+        ("foreign_fragment", "fragment"),
+        ("out_of_range_offset", "physical rows"),
+        ("descending_rowaddrs", "strictly ascend"),
+        ("undeclared_column", "tag"),
+        ("wrong_type", "val"),
+    ],
+)
+def test_overlay_writer_rejects_invalid_batches(
+    tmp_path: Path, case, match, enable_unstable_data_overlay_files
+):
+    """Every invariant the Rust writer enforces surfaces as a ValueError, and a
+    rejected batch leaves the writer usable."""
+    base_dir = tmp_path / "test"
+    dataset = _overlay_writer_dataset(base_dir)
+    fragment, other_fragment = dataset.get_fragments()
+    writer = fragment.write_overlay(["val"])
+
+    with pytest.raises(ValueError, match=match):
+        writer.write_batch(_bad_overlay_batch(case, fragment, other_fragment))
+
+    writer.write_batch(
+        pa.record_batch(
+            {"_rowaddr": _rowaddrs(fragment, [2]), "val": pa.array([2], pa.int32())}
+        )
+    )
+    group = writer.finish()
+    assert list(group.overlays[0].offsets) == [2]
+    assert _overlay_files_on_disk(base_dir, dataset) == {
+        os.path.basename(group.overlays[0].data_file.path)
+    }
+
+
+def test_overlay_writer_rejects_offsets_descending_across_batches(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    dataset = _overlay_writer_dataset(tmp_path / "test")
+    fragment = dataset.get_fragment(0)
+    writer = fragment.write_overlay(["val"])
+    writer.write_batch(
+        pa.record_batch(
+            {"_rowaddr": _rowaddrs(fragment, [2]), "val": pa.array([2], pa.int32())}
+        )
+    )
+    with pytest.raises(ValueError, match="strictly ascend"):
+        writer.write_batch(
+            pa.record_batch(
+                {"_rowaddr": _rowaddrs(fragment, [2]), "val": pa.array([2], pa.int32())}
+            )
+        )
+    writer.abort()
 
 
 def test_schema_project_drop_column(tmp_path: Path):

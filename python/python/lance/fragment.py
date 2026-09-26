@@ -39,7 +39,12 @@ from .lance import (
 from .lance import (
     RowIdSequence as RowIdSequence,
 )
-from .lance import _Fragment, _write_fragments, _write_fragments_transaction
+from .lance import (
+    _Fragment,
+    _OverlayWriter,
+    _write_fragments,
+    _write_fragments_transaction,
+)
 from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -1072,6 +1077,76 @@ class LanceFragment(pa.dataset.Fragment):
 
         return metadata, schema
 
+    def write_overlay(self, columns: List[str]) -> OverlayWriter:
+        """Stage a data overlay supplying new values for cells of this fragment.
+
+        A data overlay replaces the values of selected ``(row, column)`` cells
+        without rewriting the fragment's base data files. The returned writer
+        stages one overlay file; commit its result with
+        :class:`lance.dataset.LanceOperation.DataOverlay` against the dataset
+        version this fragment was opened on.
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+
+        Parameters
+        ----------
+        columns : List[str]
+            Names of the dataset columns the overlay may cover. Each batch fed
+            to the writer must carry ``_rowaddr`` plus a subset of these
+            columns, with the same type and nullability as in the dataset. A
+            struct column must be declared and written as a whole.
+
+        Returns
+        -------
+        OverlayWriter
+
+        Examples
+        --------
+        Replace ``val`` at two rows and ``tag`` at one row of fragment 0 with a
+        single sparse overlay. Release builds refuse datasets with overlays
+        unless ``LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES`` is set:
+
+        >>> import os
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> os.environ["LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES"] = "1"
+        >>> table = pa.table({"val": [0, 10, 20, 30], "tag": ["a", "b", "c", "d"]})
+        >>> dataset = lance.write_dataset(table, "overlay_example")
+        >>> fragment = dataset.get_fragment(0)
+        >>> addrs = fragment.to_table(with_row_address=True)["_rowaddr"].to_pylist()
+        >>> with fragment.write_overlay(["val", "tag"]) as writer:
+        ...     writer.write_batch(
+        ...         pa.table(
+        ...             {
+        ...                 "_rowaddr": pa.array([addrs[1], addrs[3]], pa.uint64()),
+        ...                 "val": [11, 33],
+        ...             }
+        ...         )
+        ...     )
+        ...     writer.write_batch(
+        ...         pa.table(
+        ...             {"_rowaddr": pa.array([addrs[2]], pa.uint64()), "tag": ["C"]}
+        ...         )
+        ...     )
+        ...     group = writer.finish()
+        >>> group.fragment_id
+        0
+        >>> op = lance.LanceOperation.DataOverlay([group])
+        >>> dataset = lance.LanceDataset.commit(
+        ...     dataset, op, read_version=dataset.version
+        ... )
+        >>> dataset.to_table().to_pydict()
+        {'val': [0, 11, 20, 33], 'tag': ['a', 'b', 'C', 'd']}
+
+        See Also
+        --------
+        lance.dataset.LanceOperation.DataOverlay :
+            The operation used to commit the staged overlay.
+        """
+        return OverlayWriter(self._fragment.write_overlay(list(columns)))
+
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
 
@@ -1158,6 +1233,80 @@ class LanceFragment(pa.dataset.Fragment):
         FragmentMetadata
         """
         return self._fragment.metadata()
+
+
+class OverlayWriter:
+    """Stages one data overlay file for one fragment.
+
+    Obtain one from :meth:`LanceFragment.write_overlay`. Feed it batches with
+    :meth:`write_batch`, then call :meth:`finish` to close the staged file and
+    obtain the :class:`~lance.dataset.LanceOperation.DataOverlayGroup` to
+    commit. Used as a context manager, leaving the block without having called
+    :meth:`finish` (including by an exception) aborts the writer and discards
+    the staged file.
+
+    .. warning::
+
+        Internal API. This class is not intended to be used by end users.
+
+    Every batch must contain a non-null ``uint64`` ``_rowaddr`` column that
+    addresses rows of the writer's fragment in strictly ascending order, plus
+    one or more of the columns declared when the writer was opened. Row
+    addresses must also keep ascending across batches for each column.
+
+    Coverage is independent from the value itself: a null value overwrites the
+    covered cell with null, whereas a row address that is never written leaves
+    the base value in place. Columns written for different subsets of rows
+    produce a sparse overlay; a column never written is left untouched.
+
+    The staged overlay is bound to the dataset version the fragment was opened
+    on, so pass that version as ``read_version`` when committing.
+    """
+
+    def __init__(self, writer: _OverlayWriter):
+        self._writer = writer
+        self._finished = False
+
+    def __enter__(self) -> OverlayWriter:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if not self._finished:
+            self.abort()
+
+    def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
+        """Stage the values of ``batch``.
+
+        Parameters
+        ----------
+        batch : pa.RecordBatch or pa.Table
+            ``_rowaddr`` plus a subset of the declared overlay columns. A table
+            is written one record batch at a time.
+        """
+        if isinstance(batch, pa.Table):
+            for record_batch in batch.to_batches():
+                self._writer.write_batch(record_batch)
+        else:
+            self._writer.write_batch(batch)
+
+    def finish(self) -> Optional[LanceOperation.DataOverlayGroup]:
+        """Close the staged file and describe it for a ``DataOverlay`` commit.
+
+        Returns
+        -------
+        Optional[LanceOperation.DataOverlayGroup]
+            The group to include in
+            :class:`~lance.dataset.LanceOperation.DataOverlay`, or ``None``
+            when no cells were written (the empty file is removed).
+        """
+        group = self._writer.finish()
+        self._finished = True
+        return group
+
+    def abort(self) -> None:
+        """Discard the staged file. A no-op once finished or aborted."""
+        self._writer.abort()
+        self._finished = True
 
 
 if TYPE_CHECKING:
