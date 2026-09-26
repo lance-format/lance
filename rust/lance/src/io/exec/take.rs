@@ -458,6 +458,10 @@ impl TakeStream {
     }
 }
 
+/// Deprecation: This node is replaced by a FilteredReadExec with a RowSelector.
+/// It may be used on a few legacy paths but is no longer part of regular queries.
+///
+/// Unless fixing a critical defect we should not be making changes to this node.
 #[derive(Debug)]
 pub struct TakeExec {
     // The dataset to take from

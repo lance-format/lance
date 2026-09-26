@@ -626,6 +626,12 @@ impl Default for LanceScanConfig {
 }
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
+///
+/// Deprecation: This node is replaced by FilteredReadExec.  It is only kept for
+/// compatibility with v1 files since v1 files have stricter rules about how they
+/// need to be read.
+///
+/// Unless fixing a critical defect this node should not be modified.
 #[derive(Debug)]
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,

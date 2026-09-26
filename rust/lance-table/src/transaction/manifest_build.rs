@@ -47,7 +47,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
-use lance_file::version::ConcreteFileVersion;
+use lance_file::version::{ConcreteFileVersion, warn_if_legacy_storage_version};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -1466,6 +1466,7 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
+            warn_if_legacy_storage_version(data_storage_format.lance_file_format());
             Manifest::new(
                 schema,
                 Arc::new(final_fragments),
