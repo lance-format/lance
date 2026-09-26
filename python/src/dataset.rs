@@ -217,7 +217,7 @@ fn writer_config_from_kwargs(
     max_memtable_rows: Option<usize>,
     max_memtable_batches: Option<usize>,
     max_unflushed_memtable_bytes: Option<usize>,
-    manifest_scan_batch_size: Option<usize>,
+    _manifest_scan_batch_size: Option<usize>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
     hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -252,10 +252,6 @@ fn writer_config_from_kwargs(
     }
     if let Some(v) = max_unflushed_memtable_bytes {
         config = config.with_max_unflushed_memtable_bytes(v);
-        any = true;
-    }
-    if let Some(v) = manifest_scan_batch_size {
-        config = config.with_manifest_scan_batch_size(v);
         any = true;
     }
     if let Some(v) = backpressure_log_interval_ms {
