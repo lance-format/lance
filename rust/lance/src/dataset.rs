@@ -3186,9 +3186,9 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them,
-    /// contiguously from `start`, and return the resulting `next_row_id`
-    /// high-water mark.
+    /// Assign a stable row ID sequence to every fragment, contiguously from
+    /// `start`, and return the resulting `next_row_id` high-water mark. Only
+    /// reached when the feature is off, so no fragment has a sequence yet.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
         let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
@@ -3210,9 +3210,15 @@ impl Dataset {
 
     /// Migrate a table to use stable row IDs.
     ///
-    /// Stable row IDs assign a persistent identifier to each row that remains
-    /// stable across compaction operations. This enables more efficient updates
-    /// to secondary indices.
+    /// Afterwards a row keeps the same id for its lifetime: compaction, update
+    /// and merge insert relocate or rewrite the row without changing its id,
+    /// which enables more efficient updates to secondary indices.
+    ///
+    /// Migration assigns a fresh id to every physical row position, in fragment
+    /// order, starting from the dataset's `next_row_id` high-water mark. Before
+    /// migration `_rowid` is a row address, a different namespace from the ids
+    /// assigned here, so a `_rowid` recorded beforehand must not be reused as a
+    /// row id afterwards.
     ///
     /// A single Merge commit assigns row ID sequences to all fragments and
     /// activates the stable row ID feature flag atomically. Because `Merge`
