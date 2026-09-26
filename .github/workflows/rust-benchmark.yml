@@ -50,7 +50,7 @@ jobs:
         working-directory: ./rust/lance-index
         run: |
           # TODO: a few benchmarks are failing. Re-enable everything once they are fixed.
-          cargo bench --bench sq --bench hnsw --bench inverted --bench pq_dist_table --bench pq_assignment -- --output-format bencher | tee -a ../../output.txt
+          cargo bench --bench sq --bench hnsw --bench inverted --bench pq_dist_table --bench pq_assignment --bench kmeans_recompute -- --output-format bencher | tee -a ../../output.txt
       - name: Store benchmark result
         if: github.event_name != 'pull_request'
         uses: benchmark-action/github-action-benchmark@a7bc2366eda11037936ea57d811a43b3418d3073 # v1.21.0
