@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 mod cache;
-use cache::CachedMapping;
+pub(crate) use cache::{CachedMapping, open_mapping};
 
 #[cfg(test)]
 tokio::task_local! {

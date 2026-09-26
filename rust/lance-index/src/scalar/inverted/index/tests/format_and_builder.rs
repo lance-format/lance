@@ -3,6 +3,7 @@
 
 use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 #[derive(Debug)]
 struct ControlledPostingReads {

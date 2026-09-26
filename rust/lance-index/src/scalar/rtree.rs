@@ -38,6 +38,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
 };
@@ -805,6 +806,17 @@ impl ScalarIndex for RTreeIndex {
         _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "RTree does not support remap".into(),
+        ))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::invalid_input_source(
             "RTree does not support remap".into(),
         ))
