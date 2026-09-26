@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
-use arrow::array::Float32Array;
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
@@ -381,9 +381,33 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        scanner
-            .nearest(&column, &key, k)
-            .map_err(|err| Error::input_error(err.to_string()))?;
+        let query_vector_dim = env
+            .call_method(&java_obj, "getQueryVectorDim", "()I", &[])?
+            .i()?;
+        if query_vector_dim > 0 {
+            // Batch nearest-neighbor search: the flat buffer packs multiple query
+            // vectors of `query_vector_dim` values each. Wrapping it in a FixedSizeList
+            // makes the core scanner run a shared partition scan across the batch and
+            // emit a `query_index` column tagging each result row with its query.
+            let batch_keys = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                query_vector_dim,
+                Arc::new(key) as ArrayRef,
+                None,
+            )
+            .map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to construct FixedSizeListArray for batch query: {e}"
+                ))
+            })?;
+            scanner
+                .nearest(&column, &batch_keys, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        } else {
+            scanner
+                .nearest(&column, &key, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        }
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
