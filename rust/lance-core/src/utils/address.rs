@@ -51,9 +51,20 @@ impl RowAddress {
     /// let range = RowAddress::address_range(2);
     /// assert_eq!(range.start, 2 * RowAddress::FRAGMENT_SIZE);
     /// assert_eq!(range.end, 3 * RowAddress::FRAGMENT_SIZE);
+    ///
+    /// // The final fragment's one-past-the-end address would leave the u64
+    /// // space, and its last address (u64::MAX) is the reserved tombstone.
+    /// let range = RowAddress::address_range(RowAddress::TOMBSTONE_FRAG);
+    /// assert_eq!(range.start, u64::from(RowAddress::TOMBSTONE_FRAG) * RowAddress::FRAGMENT_SIZE);
+    /// assert_eq!(range.end, u64::MAX);
     /// ```
     pub fn address_range(fragment_id: u32) -> Range<u64> {
-        u64::from(Self::first_row(fragment_id))..u64::from(Self::first_row(fragment_id + 1))
+        // `fragment_id + 1` would overflow u32 for the final fragment; the
+        // saturating product yields u64::MAX there, which is the correct
+        // exclusive end: u64::MAX itself is the reserved tombstone row.
+        let start = u64::from(Self::first_row(fragment_id));
+        let end = (u64::from(fragment_id) + 1).saturating_mul(Self::FRAGMENT_SIZE);
+        start..end
     }
 
     pub fn fragment_id(&self) -> u32 {
@@ -103,6 +114,16 @@ mod tests {
         // address_range uses first_row internally (coverage)
         let range = RowAddress::address_range(3);
         assert_eq!(range.start, 3 * RowAddress::FRAGMENT_SIZE);
+
+        // The final fragment's one-past-the-end address leaves the u64 space.
+        // Only the linux-arm job runs doc tests, so this branch needs a unit
+        // test to be seen by the others and by coverage.
+        let range = RowAddress::address_range(RowAddress::TOMBSTONE_FRAG);
+        assert_eq!(
+            range.start,
+            u64::from(RowAddress::TOMBSTONE_FRAG) * RowAddress::FRAGMENT_SIZE
+        );
+        assert_eq!(range.end, u64::MAX);
 
         // From impls with different values than doctest
         let addr2 = RowAddress::new_from_parts(7, 8);
