@@ -883,6 +883,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: Literal[False] = False,
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, List[int]]: ...
 
     @overload
@@ -894,6 +899,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: Literal[True],
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, List[int], bytes]: ...
 
     def update_columns(
@@ -904,6 +914,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: bool = False,
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Union[
         Tuple[FragmentMetadata, List[int]],
         Tuple[FragmentMetadata, List[int], bytes],
@@ -911,7 +926,7 @@ class LanceFragment(pa.dataset.Fragment):
         """
         Update existing columns in this fragment.
 
-        This operation performs a left-outer-hash-join with the right table (new data)
+        This operation performs a left-outer join with the right table (new data)
         on the column specified by left_on and right_on. For every row in the current
         fragment, the updated column value is:
 
@@ -941,6 +956,23 @@ class LanceFragment(pa.dataset.Fragment):
             ``updated_fragment_offsets`` with ``update_mode="rewrite_columns"``
             so a commit over stable row ids refreshes row-level version
             metadata for the matched rows only.
+        strategy: {"auto", "hash", "sort_merge"}, default "auto"
+            The update join algorithm. ``auto`` selects an algorithm using the row and
+            estimated-memory thresholds.
+        max_hash_rows: int, optional
+            The largest right-side row count eligible for the hash path in ``auto``
+            mode. Must be specified together with ``max_hash_bytes``. The default is
+            250,000 rows.
+        max_hash_bytes: int, optional
+            The largest estimated right-side allocation eligible for the hash path in
+            ``auto`` mode. Must be specified together with ``max_hash_rows``. The
+            default is 1 GiB.
+        external_memory_pool_bytes: int, optional
+            The DataFusion memory-pool size for the spillable sort-merge path. This does
+            not bound total process memory. If unset, the operation uses the
+            ``LANCE_MEM_POOL_SIZE`` environment variable or defaults to 256 MiB.
+        max_temp_directory_bytes: int, optional
+            The maximum temporary spill-directory usage for the sort-merge path.
 
         Returns
         -------
@@ -1002,6 +1034,7 @@ class LanceFragment(pa.dataset.Fragment):
         - The columns to update must already exist in the fragment
         - The join column (left_on/right_on) will not be updated
         - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - Large update inputs may use temporary spill storage
         - This is a low-level API; for most use cases, use Dataset.update() instead
         """
         if right_on is None:
@@ -1009,7 +1042,15 @@ class LanceFragment(pa.dataset.Fragment):
 
         reader = _coerce_reader(data_obj, schema)
         metadata, fields_modified, matched_offsets = self._fragment.update_columns(
-            reader, left_on, right_on, with_offsets
+            reader,
+            left_on,
+            right_on,
+            with_offsets,
+            strategy,
+            max_hash_rows,
+            max_hash_bytes,
+            external_memory_pool_bytes,
+            max_temp_directory_bytes,
         )
         if matched_offsets is not None:
             return metadata, fields_modified, matched_offsets

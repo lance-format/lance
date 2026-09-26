@@ -23,7 +23,9 @@ use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
+use lance::dataset::{
+    InsertBuilder, NewColumnTransform, UpdateJoinOptions, UpdateJoinStrategy, WriteParams,
+};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
@@ -399,18 +401,54 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None))]
     fn update_columns(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
         with_offsets: bool,
+        strategy: &str,
+        max_hash_rows: Option<usize>,
+        max_hash_bytes: Option<usize>,
+        external_memory_pool_bytes: Option<u64>,
+        max_temp_directory_bytes: Option<u64>,
     ) -> PyResult<UpdateColumnsResult> {
+        let strategy = match strategy {
+            "auto" => UpdateJoinStrategy::Auto,
+            "hash" => UpdateJoinStrategy::Hash,
+            "sort_merge" => UpdateJoinStrategy::SortMerge,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "strategy must be one of 'auto', 'hash', or 'sort_merge', got '{value}'"
+                )));
+            }
+        };
+        let mut options = UpdateJoinOptions::default().with_strategy(strategy);
+        match (max_hash_rows, max_hash_bytes) {
+            (Some(max_rows), Some(max_bytes)) => {
+                options = options.with_hash_thresholds(max_rows, max_bytes);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(
+                    "max_hash_rows and max_hash_bytes must be specified together",
+                ));
+            }
+        }
+        if let Some(bytes) = external_memory_pool_bytes {
+            options = options.with_external_memory_pool_bytes(bytes);
+        }
+        if let Some(bytes) = max_temp_directory_bytes {
+            options = options.with_max_temp_directory_bytes(bytes);
+        }
+
         let mut fragment = self.fragment.clone();
         let result = rt()
             .spawn(None, async move {
                 fragment
-                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .update_columns_with_options(reader.0, &left_on, &right_on, options)
                     .await
             })?
             .infer_error()?;

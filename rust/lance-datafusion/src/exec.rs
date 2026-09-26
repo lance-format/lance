@@ -323,6 +323,24 @@ impl LanceExecutionOptions {
     }
 
     pub fn mem_pool_size(&self) -> u64 {
+        self.mem_pool_size_with_default(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION)
+    }
+
+    /// Resolves the memory-pool size, using `default_per_partition` when neither an explicit
+    /// value nor `LANCE_MEM_POOL_SIZE` is configured.
+    ///
+    /// An explicit value always takes precedence over the supplied fallback:
+    ///
+    /// ```
+    /// use lance_datafusion::exec::LanceExecutionOptions;
+    ///
+    /// let options = LanceExecutionOptions {
+    ///     mem_pool_size: Some(64 * 1024 * 1024),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(options.mem_pool_size_with_default(256 * 1024 * 1024), 64 * 1024 * 1024);
+    /// ```
+    pub fn mem_pool_size_with_default(&self, default_per_partition: u64) -> u64 {
         let num_partitions = self.effective_target_partition();
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
@@ -330,10 +348,10 @@ impl LanceExecutionOptions {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
+                        default_per_partition * num_partitions
                     }
                 })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
+                .unwrap_or(default_per_partition * num_partitions)
         })
     }
 
@@ -1355,9 +1373,14 @@ mod tests {
         // target_partitions (available parallelism), so the pool must be sized
         // for that effective partition count.
         let opts = LanceExecutionOptions::default();
+        let effective_partitions = get_available_parallelism() as u64;
         assert_eq!(
             opts.mem_pool_size(),
-            default_per_partition * get_available_parallelism() as u64
+            default_per_partition * effective_partitions
+        );
+        assert_eq!(
+            opts.mem_pool_size_with_default(256),
+            256 * effective_partitions
         );
 
         // 4 partitions → 4x the per-partition size
@@ -1366,6 +1389,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), default_per_partition * 4);
+        assert_eq!(opts.mem_pool_size_with_default(256), 256 * 4);
 
         // 8 partitions → 8x the per-partition size
         let opts = LanceExecutionOptions {

@@ -639,6 +639,44 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
 
 
+@pytest.mark.parametrize("strategy", ["auto", "hash", "sort_merge"])
+def test_fragment_update_columns_join_options(tmp_path, strategy):
+    data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset = lance.write_dataset(data, tmp_path / strategy)
+    updates = pa.table({"id": [1, 3], "value": [100, 300]})
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        updates,
+        left_on="id",
+        right_on="id",
+        strategy=strategy,
+        max_hash_rows=1,
+        max_hash_bytes=1,
+        external_memory_pool_bytes=16 * 1024 * 1024,
+        max_temp_directory_bytes=64 * 1024 * 1024,
+    )
+
+    assert updated_fragment.id == fragment.fragment_id
+    assert fields_modified
+
+
+def test_fragment_update_columns_rejects_invalid_join_options(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1], "value": [10]}), tmp_path / "invalid_options"
+    )
+    updates = pa.table({"id": [1], "value": [100]})
+    fragment = dataset.get_fragment(0)
+
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        fragment.update_columns(
+            updates, left_on="id", right_on="id", strategy="nested_loop"
+        )
+
+    with pytest.raises(ValueError, match="must be specified together"):
+        fragment.update_columns(updates, left_on="id", right_on="id", max_hash_rows=1)
+
+
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
     """Test fragment update columns with custom join key."""
     # Create initial dataset
