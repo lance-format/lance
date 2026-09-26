@@ -2,6 +2,7 @@
 Generate test data with Lance 0.29.0 to create an index without created_at field.
 This tests backward compatibility for the created_at field added in 0.30.0.
 """
+
 import lance
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -13,12 +14,14 @@ assert lance.__version__ == "0.29.0", f"Expected lance 0.29.0, got {lance.__vers
 ndims = 16
 nvecs = 256
 
-data = pa.table({
-    "id": pa.array(range(nvecs)),
-    "vec": pa.FixedSizeListArray.from_arrays(
-        pc.random(ndims * nvecs).cast(pa.float32()), ndims
-    ),
-})
+data = pa.table(
+    {
+        "id": pa.array(range(nvecs)),
+        "vec": pa.FixedSizeListArray.from_arrays(
+            pc.random(ndims * nvecs).cast(pa.float32()), ndims
+        ),
+    }
+)
 
 # Write dataset
 dataset = lance.write_dataset(data, "index_without_created_at")
