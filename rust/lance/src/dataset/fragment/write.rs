@@ -367,7 +367,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::InsertBuilder;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{CommitBuilder, InsertBuilder};
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -473,6 +474,35 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_commit_rejects_system_column() {
+        let tmp_dir = TempStrDir::default();
+        let batch = record_batch!(("_rowid", UInt64, [1])).unwrap();
+        let arrow_schema = batch.schema();
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write(RecordBatchIterator::new([Ok(batch)], arrow_schema), None)
+            .await
+            .unwrap();
+
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                schema,
+                fragments: vec![fragment],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        let error = CommitBuilder::new(tmp_dir.as_str())
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("reserved name"), "{error}");
     }
 
     #[tokio::test]

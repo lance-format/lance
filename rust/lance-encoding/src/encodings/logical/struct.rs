@@ -1117,8 +1117,8 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
         let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
         let fields = vec![
-            Field::new("", list_array.data_type().clone(), true),
-            Field::new("", int_array.data_type().clone(), true),
+            Field::new("list", list_array.data_type().clone(), true),
+            Field::new("scalar", int_array.data_type().clone(), true),
         ];
         let struct_array = Arc::new(StructArray::new(
             Fields::from(fields),

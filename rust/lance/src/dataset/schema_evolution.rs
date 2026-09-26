@@ -247,6 +247,9 @@ pub(super) async fn add_columns_to_fragments(
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_format();
     let check_names = |output_schema: &ArrowSchema| {
+        // Invalid output names can fail field-path resolution while staging
+        // columns, before the manifest write boundary validates the full schema.
+        Schema::try_from(output_schema)?.validate_writable()?;
         for field in &dataset.schema().fields {
             if let Ok(out_field) = output_schema.field_with_name(&field.name) {
                 let ds_field = ArrowField::from(field);
@@ -1639,6 +1642,7 @@ mod test {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
+        record_batch,
     };
 
     use super::*;
@@ -1730,6 +1734,36 @@ mod test {
         // (Quick validation that the future is Send)
         let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        let version = dataset.version().version;
+        let reserved_batch = record_batch!(("_rowid", Int32, [0, 1, 2, 3, 4]))?;
+        let reserved_schema = reserved_batch.schema();
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(reserved_batch)],
+                    reserved_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.version().version, version);
+
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("".into(), "id + 1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("empty name"), "{err}");
+        assert_eq!(dataset.version().version, version);
 
         // Can add a column that is independent of any existing ones
         dataset
@@ -3759,6 +3793,45 @@ mod test {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("_rowid".into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.manifest.version, 3);
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("".into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("empty name"), "{err}");
+        assert_eq!(dataset.manifest.version, 3);
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.d".into()).rename("_rowid".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 4);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 5);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b._rowid".into()).rename("d".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 6);
+
+        let mut restored = dataset.checkout_version(5).await?;
+        restored.restore().await?;
+        assert_eq!(restored.manifest.version, 7);
+        assert!(restored.schema().field("b._rowid").is_some());
+        assert!(restored.schema().field("y").is_some());
 
         Ok(())
     }

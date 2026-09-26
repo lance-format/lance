@@ -848,18 +848,16 @@ mod test {
     #[case::row_offset("_rowoffset")]
     #[case::row_created_at_version("_row_created_at_version")]
     #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[case::empty_name("")]
     #[tokio::test]
-    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+    async fn rejects_unwritable_top_level_column_names(#[case] name: &str) {
         // Every system column name must be rejected on write. The row-version
         // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
         // computed at read time and appended by `Projection::to_schema`; a user
         // data column sharing one of those names would otherwise pass ingest and
-        // later collide with the appended field.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            reserved_name,
-            DataType::Int32,
-            false,
-        )]));
+        // later collide with the appended field. An empty top-level name cannot
+        // be addressed as a field path after the dataset is written.
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
 
@@ -867,10 +865,16 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = result.expect_err("writing a reserved system column name should fail");
+        let err = result.expect_err("writing an unwritable top-level column name should fail");
+        assert!(matches!(&err, crate::Error::InvalidInput { .. }), "{err}");
+        let expected_message = if name.is_empty() {
+            "empty name"
+        } else {
+            "reserved name"
+        };
         assert!(
-            err.to_string().contains("reserved name"),
-            "unexpected error for {reserved_name}: {err}"
+            err.to_string().contains(expected_message),
+            "unexpected error for {name:?}: {err}"
         );
     }
 
