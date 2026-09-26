@@ -66,7 +66,11 @@ impl Transformer for NormalizeTransformer {
             ))
         })?;
 
-        let data = arr.as_fixed_size_list();
+        let data = arr.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "Normalize Transform: column {} is not a fixed size list: {}",
+            self.input_column,
+            arr.data_type()
+        )))?;
         let norm = normalize_fsl(data)?;
         let transformed = Arc::new(norm);
 
@@ -235,6 +239,32 @@ mod tests {
     use half::f16;
     use lance_arrow::*;
     use lance_linalg::distance::L2;
+
+    /// The transformer is public and its column is named by string, so the
+    /// column can be any type. `as_fixed_size_list` panics on the wrong one,
+    /// which is the same situation the missing-column branch above already
+    /// reports as an error.
+    #[test]
+    fn test_normalize_transformer_rejects_non_fsl_column() {
+        let schema = Schema::new(vec![Field::new("v", DataType::Float32, true)]);
+        let batch = RecordBatch::try_new(
+            schema.into(),
+            vec![Arc::new(Float32Array::from_iter_values([1.0, 2.0]))],
+        )
+        .unwrap();
+
+        let err = NormalizeTransformer::new("v")
+            .transform(&batch)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "expected an Index error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not a fixed size list"),
+            "unexpected message: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {
