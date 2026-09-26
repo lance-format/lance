@@ -183,7 +183,7 @@ mod tests {
     use super::super::super::index::InvertedListFormatVersion;
     use super::super::super::scorer::idf;
     use super::super::super::tokenizer::document_tokenizer::DocType;
-    use super::super::stats::build_combined_bm25_scorer;
+    use super::super::stats::{CombinedCorpusStats, build_combined_bm25_scorer};
     use super::super::testing::{
         ElementRows, as_row_documents, combined_columns, combined_top_k, element_document_index,
     };
@@ -242,7 +242,7 @@ mod tests {
         );
         assert_eq!(
             title_index
-                .bm25_row_stats_for_terms(&terms, None)
+                .bm25_row_stats_for_terms(&terms, None, None)
                 .await
                 .unwrap(),
             (19, 10, vec![1, 1]),
@@ -389,11 +389,17 @@ mod tests {
             "the fixture must still be element-per-document",
         );
         assert_eq!(
-            legacy.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            legacy
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap(),
             (9, 4, vec![1, 3]),
         );
         assert_eq!(
-            modern.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            modern
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap(),
             modern.bm25_stats_for_terms(&terms, None).await.unwrap(),
             "a row-per-document index must be untouched",
         );
@@ -404,6 +410,7 @@ mod tests {
         let scorer = build_combined_bm25_scorer(
             &columns,
             &Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+            CombinedCorpusStats::IndexOnly,
             None,
         )
         .await
