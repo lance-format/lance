@@ -272,15 +272,8 @@ impl ScalarIndex for LabelListIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Not applied, matching every other derived-key scalar index (ngram,
-        // fmindex, bloomfilter, zonemap, rtree). Only btree and bitmap -- one
-        // key per row -- prune retired rows here. The cost is real: postings for
-        // retired rows survive, so an update that rewrites rows in place can
-        // leave this index returning them. Preserved as-is rather than fixed,
-        // since changing it is a correctness change this memory work should not
-        // carry.
-        let _ = old_data_filter;
-        let file = update_label_list_index(self, new_data, dest_store).await?;
+        let file =
+            update_label_list_index(self, new_data, dest_store, old_data_filter.as_ref()).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
@@ -605,11 +598,11 @@ async fn write_label_list_index(
     value_type: &DataType,
     sorted_labels: SendableRecordBatchStream,
     old_index: Option<&BitmapIndex>,
+    old_data_filter: Option<&OldIndexDataFilter>,
     list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    // `None`: LabelList does not apply the old-data filter. See `update`.
-    build_index_map(sorted_labels, old_index, None, &mut writer).await?;
+    build_index_map(sorted_labels, old_index, old_data_filter, &mut writer).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -644,7 +637,7 @@ async fn train_label_list_index_with_plan(
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
 
-    let file = write_label_list_index(index_store, &value_type, sorted, None, || {
+    let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
@@ -673,6 +666,7 @@ async fn update_label_list_index(
     existing: &LabelListIndex,
     new_data: SendableRecordBatchStream,
     dest_store: &dyn IndexStore,
+    old_data_filter: Option<&OldIndexDataFilter>,
 ) -> Result<IndexFile> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
     let new_data = track_list_nulls(new_data, list_nulls.clone());
@@ -699,8 +693,13 @@ async fn update_label_list_index(
         &value_type,
         sorted,
         Some(&existing.values_index),
+        old_data_filter,
         || {
             let mut merged = (*existing_nulls).clone();
+            // Prune old state before adding replacements, which may reuse row IDs.
+            if let Some(filter) = old_data_filter {
+                filter.retain_old_rows(&mut merged);
+            }
             merged |= &*list_nulls.lock().unwrap();
             Ok(merged)
         },
@@ -1810,6 +1809,60 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::row_addresses(false)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_update_applies_old_data_filter(#[case] stable_row_ids: bool) {
+        const KEPT: u64 = 1 << 32;
+        let initial = vec![
+            (
+                0,
+                Some(vec![Some("old".into()), Some("shared".into()), None]),
+            ),
+            (1, None),
+            (2, Some(vec![Some("old".into())])),
+            (3, None),
+            (KEPT, Some(vec![Some("kept".into())])),
+            (KEPT + 1, None),
+        ];
+        let updated_start = if stable_row_ids { 0 } else { 2 << 32 };
+        let replacements = vec![
+            (
+                updated_start,
+                Some(vec![Some("new".into()), Some("shared".into())]),
+            ),
+            (updated_start + 1, Some(vec![Some("new".into())])),
+            (updated_start + 2, None),
+            (updated_start + 3, Some(vec![])),
+        ];
+        let filter = if stable_row_ids {
+            OldIndexDataFilter::RowIds([KEPT, KEPT + 1].into_iter().collect())
+        } else {
+            OldIndexDataFilter::Fragments {
+                to_keep: RoaringBitmap::from_iter([1]),
+                to_remove: RoaringBitmap::from_iter([0]),
+            }
+        };
+        let (_src_dir, index) = build_label_list_segment(&initial).await;
+        let (_dest_dir, dest_store) = test_util::index_store();
+        index
+            .update(
+                sample_rows_to_stream(&replacements),
+                dest_store.as_ref(),
+                Some(filter),
+            )
+            .await
+            .unwrap();
+
+        let mut actual = read_index_contents(dest_store.as_ref()).await;
+        // Bitmap updates retain empty keys; compare the surviving memberships.
+        actual.labels.retain(|(_, rows)| !rows.is_empty());
+        let expected_rows = [initial[4..].to_vec(), replacements].concat();
+        assert_eq!(build_label_list_index(&expected_rows).await, actual);
+    }
+
     /// The spill and destination file schemas are declared from the existing
     /// index while the keys come from the new stream, so a disagreement must be
     /// rejected rather than written as a file whose schema lies about its keys.
@@ -1842,7 +1895,7 @@ mod tests {
             futures::stream::iter(vec![Ok(batch)]),
         ));
 
-        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref())
+        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref(), None)
             .await
             .expect_err("a value-type mismatch must be rejected");
         let message = error.to_string();
@@ -1922,6 +1975,7 @@ mod tests {
             legacy.as_ref(),
             sample_rows_to_stream(&additional),
             updated_store.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -2000,6 +2054,7 @@ mod tests {
                     index.as_ref(),
                     sample_rows_to_stream(second),
                     dest_store.as_ref(),
+                    None,
                 )
                 .await
                 .unwrap();
