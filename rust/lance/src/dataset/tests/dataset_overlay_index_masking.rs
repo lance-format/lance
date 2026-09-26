@@ -41,6 +41,10 @@ use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
+#[cfg(feature = "geo")]
+use crate::utils::test::geo;
+#[cfg(feature = "geo")]
+use lance_core::utils::tempfile::TempStrDir;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -2404,5 +2408,677 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     assert_eq!(
         minhash_ids(&dataset, "mango sorbet", true).await.unwrap()[0],
         6
+    );
+}
+
+/// A BTree index staged over `age` and then compacted away, ready for whatever
+/// each test does to the fragment the compaction produced. The committed index
+/// sits on `id` so the compaction has one to defer, leaving `age` answered only
+/// by the merged index under test.
+async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::IndexMetadata>, u64)
+{
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = dataset.get_fragments()[0].id() as u64;
+    (dataset, staged, rewritten)
+}
+
+/// Rewrite `column` of `fragment` in place, which lands it in a different file.
+async fn replace_column(
+    dataset: Dataset,
+    fragment: u64,
+    column: &str,
+    values: ArrayRef,
+) -> Dataset {
+    let schema = dataset.schema().project(&[column]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::from(&schema)), vec![values]).unwrap();
+    let replacement = dataset
+        .get_fragment(fragment as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// Every fragment below holds this many rows, so a compaction targeting a
+/// multiple of it rewrites that many fragments as one group.
+#[cfg(feature = "geo")]
+const RTREE_ROWS_PER_FRAGMENT: i32 = 10;
+
+#[cfg(feature = "geo")]
+fn rtree_fragment_ids(dataset: &Dataset) -> Vec<u32> {
+    dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect()
+}
+
+#[cfg(feature = "geo")]
+async fn rtree_compact(dataset: &mut Dataset, fragments_per_group: i32) {
+    compact_files(
+        dataset,
+        geo::deferred_compaction(RTREE_ROWS_PER_FRAGMENT, fragments_per_group),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// Replaces the geometry of one row of `fragment_id`, over the field the RTree
+/// index is built on.
+#[cfg(feature = "geo")]
+async fn rtree_overlay_geometry(dataset: Dataset, field_id: i32, fragment_id: u64) -> Dataset {
+    commit_overlay(
+        dataset,
+        "geometry_overlay",
+        fragment_id,
+        &[field_id],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![geo::line_strings(9_999, 1)],
+    )
+    .await
+}
+
+/// The merged index must cover nothing, so its rows are rescanned rather than
+/// answered from values an overlay has replaced.
+#[cfg(feature = "geo")]
+async fn assert_merge_covers_nothing(
+    dataset: &Dataset,
+    staged: Vec<lance_table::format::IndexMetadata>,
+    what: &str,
+) {
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert!(
+        coverage.is_empty(),
+        "the merged index claimed a fragment {what}, so its superseded entries \
+         would be served instead of rescanned"
+    );
+}
+
+/// A merged RTree index may cover the fragment compaction produced: the remap
+/// puts it there, and no segment has it in its history for the staleness pass to
+/// judge. An overlay on the indexed column is a separate question and takes that
+/// coverage away, because the segments hold the old values for those rows.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0] as u64;
+    let dataset = rtree_overlay_geometry(dataset, geometry, rewritten).await;
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "whose indexed column an overlay has moved past",
+    )
+    .await;
+}
+
+/// Compacting a fragment that has an overlay materializes the overlay's values
+/// into the new fragment and drops the overlay, so the new fragment carries none
+/// of its own. Segments built before the overlay hold the old values.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 3).await;
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "a compaction materialized an overlay into",
+    )
+    .await;
+}
+
+/// The same overlay across two compactions. The fragment that materialized it is
+/// itself compacted away, so it appears in neither the staged coverage nor the
+/// final one, and the old values reach the final fragment all the same.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_two_compactions_carried_a_materialized_overlay_to() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 2).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "two compactions carried a materialized overlay to",
+    )
+    .await;
+}
+
+/// An overlay that lands on a fragment one compaction produced and is
+/// materialized by the next. The fragment it overlaid is named by neither the
+/// staged coverage nor the final one, so it is found only by following what the
+/// covered fragments become at each compaction.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_on_its_own_output()
+{
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    rtree_compact(&mut dataset, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let intermediate = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, intermediate).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    assert_merge_covers_nothing(
+        &dataset,
+        staged,
+        "a compaction materialized an overlay on its own output",
+    )
+    .await;
+}
+
+/// One compaction can rewrite several groups at once. An overlay materialized
+/// into one group says nothing about the rows a segment covering a different
+/// group holds, and refusing that segment its coverage costs a flat scan for
+/// nothing.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_coverage_when_a_materialized_overlay_is_on_another_group() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    // Only the pair that the overlay below leaves alone.
+    let ours = rtree_fragment_ids(&dataset).split_off(2);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, ours).await;
+
+    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
+    rtree_compact(&mut dataset, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert_eq!(
+        coverage.len(),
+        1,
+        "the merged index gave up coverage over an overlay materialized into a \
+         rewrite group its segments never covered, costing a flat scan for nothing"
+    );
+}
+
+/// The rule is not RTree's: every scalar family resolves staged coverage through
+/// the same remap. A BTree index built before the overlay holds the value it
+/// replaced, so the merge must give up the fragment the compaction materialized
+/// it into and let those rows be scanned.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+
+    let age_schema = dataset.schema().project(&["age"]).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::from(&age_schema)),
+        vec![Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef],
+    )
+    .unwrap();
+    let replacement = dataset
+        .get_fragment(rewritten as usize)
+        .unwrap()
+        .write_columns(futures::stream::iter([Ok(batch)]), &age_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version().version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await.len(),
+        12,
+        "the replaced values are missing: the merged index claimed a fragment whose \
+         indexed column was rewritten after the compaction produced it"
+    );
+}
+
+/// The same rule for RTree, which reaches the remap through the same path.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_replaced_since_the_compaction() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0];
+
+    let dataset = replace_column(
+        dataset,
+        rewritten as u64,
+        "geometry",
+        geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT * 3),
+    )
+    .await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        !merged.fragment_bitmap.as_ref().unwrap().contains(rewritten),
+        "the merged index claimed a remapped fragment whose geometry file was replaced"
+    );
+}
+
+/// A data replacement rewrites an indexed column into a different file. The
+/// segments describe the fragment as the compaction wrote it, so the merge has to
+/// give the fragment up rather than answer from entries the replacement
+/// superseded.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    let replaced = Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef;
+    let mut dataset = replace_column(dataset, rewritten, "age", replaced).await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await.len(),
+        12,
+        "the replaced values are missing: the merged index claimed a fragment whose \
+         indexed column was rewritten after the compaction produced it"
+    );
+}
+
+/// An overlay landing on the fragment after the compaction produced it. RTree
+/// reaches this through its staleness pass; every other scalar family reaches it
+/// only through the comparison against the fragment the compaction wrote.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        rewritten,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        merged.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "the merged index claimed a fragment an overlay has changed since the \
+         compaction produced it"
+    );
+}
+
+/// A replacement on a source the compaction then reads. The compaction carries
+/// the new values into the fragment it produces, so the segments -- built before
+/// the replacement -- describe rows that fragment no longer holds.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
+    let dir = TempStrDir::default();
+    let (schema, batches) = geo::batches(RTREE_ROWS_PER_FRAGMENT, 3);
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: RTREE_ROWS_PER_FRAGMENT as usize,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // On `id`, so the compaction has an index to defer while `geometry` is left
+    // to the segments under test.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("committed_id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+    let source = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, source.clone()).await;
+    let replaced = source[0];
+
+    let mut dataset = replace_column(
+        dataset,
+        replaced as u64,
+        "geometry",
+        geo::line_strings(9_999, RTREE_ROWS_PER_FRAGMENT),
+    )
+    .await;
+
+    let before = dataset
+        .merge_existing_index_segments(staged.clone())
+        .await
+        .unwrap();
+    assert!(
+        !before.fragment_bitmap.as_ref().unwrap().contains(replaced),
+        "a merge before the compaction must already refuse the replaced source"
+    );
+
+    rtree_compact(&mut dataset, 3).await;
+    let rewritten = rtree_fragment_ids(&dataset)[0];
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        !merged.fragment_bitmap.as_ref().unwrap().contains(rewritten),
+        "the merged index claimed a fragment the compaction wrote replacement \
+         geometry into"
+    );
+}
+
+/// The comparison against the fragment the compaction wrote needs the manifest
+/// that wrote it, and cleanup deletes old manifests. With that one gone, the
+/// earliest surviving version holding the fragment is a later commit, which
+/// would compare equal to itself and prove nothing, so the merge gives the
+/// coverage up instead.
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_up() {
+    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        rewritten,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Everything up to and including the compaction's own commit.
+    dataset
+        .cleanup_old_versions(chrono::Duration::zero(), None, None)
+        .await
+        .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(
+        merged.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "the merged index claimed a fragment it can no longer prove anything about: \
+         the manifest the compaction wrote has been cleaned up"
+    );
+}
+
+/// Two groups compacted by separate commits, with an overlay landing on the one
+/// that goes second before either runs. Each followed fragment is recorded
+/// against its own version, so the first compaction advancing its own output
+/// does not vouch for inputs the second one had yet to read.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let geometry = dataset.schema().field("geometry").unwrap().id;
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids.clone()).await;
+
+    // The overlay lands on the second group before either compaction runs.
+    let held_back = [fragment_ids[2], fragment_ids[3]];
+    let mut dataset = rtree_overlay_geometry(dataset, geometry, held_back[0] as u64).await;
+
+    let pair = CompactionOptions {
+        target_rows_per_fragment: (RTREE_ROWS_PER_FRAGMENT * 2) as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            excluded_fragment_ids: held_back.to_vec(),
+            ..pair.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    compact_files(&mut dataset, pair, None).await.unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let coverage = merged
+        .fragment_bitmap
+        .as_ref()
+        .expect("a merged segment records what it covers");
+    assert!(
+        coverage.is_empty(),
+        "the merged index kept coverage over a group an overlay changed, because \
+         another group's compaction had advanced the state it was compared against"
+    );
+}
+
+/// How many times a merge over `fragments` fragments, compacted into pairs,
+/// reads version history.
+#[cfg(feature = "geo")]
+async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, fragments)
+            .await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+    rtree_compact(&mut dataset, 2).await;
+    let groups = fragments / 2;
+    assert_eq!(dataset.get_fragments().len(), groups as usize);
+
+    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len() as i32,
+        groups,
+        "every group is covered whole, so coverage follows the rows"
+    );
+    dataset
+        .object_store
+        .as_ref()
+        .io_stats_incremental()
+        .requests
+        .iter()
+        .filter(|request| request.path.to_string().contains("_versions"))
+        .count()
+}
+
+/// One commit publishes every group a compaction rewrites, so dating them takes
+/// one search of the version history however many groups there are. A merge that
+/// searched per group would re-read the same snapshots once for each, which on
+/// remote storage is the expensive part of the walk.
+///
+/// The count itself is platform-specific, so what is asserted is that it does not
+/// grow with the number of groups. Both datasets have the same version history,
+/// and differ only in how many groups the compaction produced.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_dates_every_group_of_a_compaction_together() {
+    let two = TempStrDir::default();
+    let four = TempStrDir::default();
+    let two_groups = rtree_merge_history_reads(&two, 4).await;
+    let four_groups = rtree_merge_history_reads(&four, 8).await;
+    assert_eq!(
+        four_groups, two_groups,
+        "doubling the groups took the merge from {two_groups} reads of version \
+         history to {four_groups}, so it is searching once per group rather than \
+         once per compaction"
+    );
+}
+
+/// A fragment is present from its creation until a compaction retires it, so
+/// dating one has to search within that span. Searching to the end of history
+/// reads the retirement of an intermediate output as absence, and unrelated
+/// commits afterwards are enough to lose coverage the geometry never left.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_coverage_when_later_commits_follow_a_retired_output() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+
+    // Two compactions, so the first one's outputs are retired by the second.
+    rtree_compact(&mut dataset, 2).await;
+    rtree_compact(&mut dataset, 4).await;
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    // Commits that touch no fragment at all.
+    for setting in 0..10 {
+        dataset
+            .update_config([("unrelated".to_string(), setting.to_string())])
+            .await
+            .unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        1,
+        "coverage was given up over commits that changed no geometry, because \
+         dating the rewritten fragment searched past the retirement of the \
+         intermediate one it came from"
+    );
+}
+
+/// A compaction that leaves no reuse mapping simply retires the fragments it
+/// rewrote, and coverage of them is intersected away. That says nothing about a
+/// group whose mapping is intact, which keeps its coverage.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_keeps_a_mapped_group_when_another_was_retired_unmapped() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
+    let fragment_ids = rtree_fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids.clone()).await;
+
+    let pair = |excluded: Vec<u32>, defer: bool| CompactionOptions {
+        target_rows_per_fragment: (RTREE_ROWS_PER_FRAGMENT * 2) as usize,
+        defer_index_remap: defer,
+        excluded_fragment_ids: excluded,
+        ..Default::default()
+    };
+    // One pair rewritten with its index remapped inline, so it leaves no mapping
+    // and those staged fragments simply vanish from the manifest.
+    compact_files(&mut dataset, pair(fragment_ids[2..].to_vec(), false), None)
+        .await
+        .unwrap();
+    // The other pair deferred, so its coverage has a mapping to follow.
+    compact_files(&mut dataset, pair(fragment_ids[..2].to_vec(), true), None)
+        .await
+        .unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        1,
+        "the deferred pair's coverage was given up because an unrelated pair was \
+         retired without a reuse mapping"
     );
 }
