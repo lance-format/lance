@@ -18,7 +18,7 @@ use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
-use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection, TypeComparison};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -2735,6 +2735,11 @@ impl Dataset {
     /// Get the schema of the dataset
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    /// How this dataset compares field types for schema compatibility.
+    pub fn type_comparison(&self) -> TypeComparison {
+        self.manifest.type_comparison()
     }
 
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns

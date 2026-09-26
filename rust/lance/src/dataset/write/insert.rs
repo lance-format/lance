@@ -331,6 +331,7 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
             schema_cmp_opts.allow_missing_if_nullable = true;
             schema_cmp_opts.ignore_field_order = true;
+            schema_cmp_opts.type_comparison = dataset.type_comparison();
 
             let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
             if normalized_data_schema

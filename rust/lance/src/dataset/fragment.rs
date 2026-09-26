@@ -1068,9 +1068,13 @@ impl FileFragment {
         )
         .await?;
         // If the schemas are not compatible we can't calculate field id offsets
-        reader
-            .schema()
-            .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
+        reader.schema().check_compatible(
+            dataset.schema(),
+            &SchemaCompareOptions {
+                type_comparison: dataset.type_comparison(),
+                ..Default::default()
+            },
+        )?;
         let projection = file_versions::reader_projection_from_whole_schema(
             dataset.schema(),
             reader.metadata().version(),
