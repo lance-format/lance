@@ -688,6 +688,7 @@ async fn convert_v3_metadata_to_details(
                         }
                     };
                     Some(Compression::Rq(RabitQuantization {
+                        layered: false,
                         num_bits: rq.num_bits as u32,
                         rotation_type: rotation_type.into(),
                     }))
@@ -774,6 +775,7 @@ mod tests {
             ),
             (
                 Some(Compression::Rq(RabitQuantization {
+                    layered: false,
                     num_bits: 1,
                     rotation_type: 0,
                 })),
@@ -866,6 +868,7 @@ mod tests {
             VectorMetricType::Dot,
             None,
             Some(Compression::Rq(RabitQuantization {
+                layered: false,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Matrix as i32,
             })),
@@ -882,6 +885,7 @@ mod tests {
             VectorMetricType::L2,
             None,
             Some(Compression::Rq(RabitQuantization {
+                layered: false,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Fast as i32,
             })),
