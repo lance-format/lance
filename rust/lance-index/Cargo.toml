@@ -120,6 +120,10 @@ name = "4bitpq_dist_table"
 harness = false
 
 [[bench]]
+name = "pq4_topk"
+harness = false
+
+[[bench]]
 name = "pq_assignment"
 harness = false
 

@@ -110,6 +110,20 @@ pub trait DistCalculator {
 
     fn prefetch(&self, _id: u32) {}
 
+    /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
+    /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
+    ///
+    /// When this returns true, `accumulate_topk_with_scratch` into an empty heap
+    /// must, for any `lower_bound` and `upper_bound`, select the same rows (up
+    /// to ties at the k-th distance), with bit-identical distances, as pushing
+    /// every `distance_all` score that lies in `[lower_bound, upper_bound)`, or
+    /// every score when both bounds are `None`. Since the accumulator treats a
+    /// missing bound as `f32::MIN` or `f32::MAX`, every score must lie in
+    /// `[f32::MIN, f32::MAX)`.
+    fn has_exact_topk_scan(&self) -> bool {
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_topk_with_scratch(
         &self,
@@ -128,26 +142,7 @@ pub trait DistCalculator {
         }
 
         self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
-        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
-        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
-        let mut max_dist = res.peek().map(|node| node.dist);
-
-        for (id, dist) in dists.iter().copied().enumerate() {
-            let dist = OrderedFloat(dist);
-            if dist < lower_bound || dist >= upper_bound {
-                continue;
-            }
-            if res.len() < k {
-                res.push(OrderedNode::new(row_id(id as u32), dist));
-                if res.len() == k {
-                    max_dist = res.peek().map(|node| node.dist);
-                }
-            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-                res.pop();
-                res.push(OrderedNode::new(row_id(id as u32), dist));
-                max_dist = res.peek().map(|node| node.dist);
-            }
-        }
+        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -190,6 +185,38 @@ pub trait DistCalculator {
                 res.push(OrderedNode::new(row_id, dist));
                 max_dist = res.peek().map(|node| node.dist);
             }
+        }
+    }
+}
+
+/// Push rows `0..dists.len()` whose distance lies in `[lower_bound,
+/// upper_bound)` into the top-`k` heap `res`.
+pub(crate) fn accumulate_distances_into_heap(
+    k: usize,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+    row_id: impl Fn(u32) -> u64,
+    res: &mut BinaryHeap<OrderedNode<u64>>,
+    dists: &[f32],
+) {
+    let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+    let mut max_dist = res.peek().map(|node| node.dist);
+
+    for (id, dist) in dists.iter().copied().enumerate() {
+        let dist = OrderedFloat(dist);
+        if dist < lower_bound || dist >= upper_bound {
+            continue;
+        }
+        if res.len() < k {
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            if res.len() == k {
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            res.pop();
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            max_dist = res.peek().map(|node| node.dist);
         }
     }
 }
