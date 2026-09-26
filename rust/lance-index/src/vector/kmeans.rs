@@ -298,6 +298,14 @@ fn compute_cluster_sizes(
         }
     });
 
+    if max_cluster_size == 0 {
+        // Nothing was assigned (every membership is `None`, which is what an
+        // all-non-finite batch produces), so the division below would be by
+        // zero and the caller's `min` would silently drop the NaN. Say "no
+        // balancing" instead.
+        return 0.0;
+    }
+
     (radius[max_cluster_id] - losses[max_cluster_id] as f32 / cluster_sizes[max_cluster_id] as f32)
         / membership.len() as f32
 }
@@ -2835,6 +2843,25 @@ mod tests {
         assert_eq!(allocate_quotas(&[1, 10_000], 10), vec![0, 10]);
         // A sub-cluster never gets more centroids than vectors.
         assert_eq!(allocate_quotas(&[2, 2], 10), vec![2, 2]);
+    }
+
+    /// With every row unassigned (all-NaN input leaves membership `None`), the
+    /// largest cluster holds zero rows, so the balance factor divided by that
+    /// size is NaN. The NaN used to survive until `adjusted_balance_factor.min(
+    /// params.balance_factor)` quietly dropped it, which means the schedule
+    /// depended on `f32::min`'s NaN handling rather than on a decision.
+    #[test]
+    fn test_compute_cluster_sizes_without_any_assignment() {
+        let membership = vec![None, None, None];
+        let radius = vec![0.0f32; 2];
+        let losses = vec![0.0f64; 2];
+        let mut cluster_sizes = vec![7usize, 9];
+
+        let factor = compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
+
+        assert_eq!(factor, 0.0, "expected no balance factor, got {factor}");
+        assert!(factor.is_finite());
+        assert_eq!(cluster_sizes, vec![0, 0]);
     }
 
     #[test]
