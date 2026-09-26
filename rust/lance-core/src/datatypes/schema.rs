@@ -350,7 +350,10 @@ impl Schema {
         // Check for duplicate field ids
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
-            if field.id < 0 {
+            // A negative id is reserved for system use; the only ones a schema
+            // may carry are the hidden row lineage columns a data file stores
+            // next to the user columns, and only under their own names.
+            if field.id < 0 && crate::row_lineage_field_id(&field.name) != Some(field.id) {
                 return Err(Error::schema(format!(
                     "Field {} has a negative id {}",
                     field.name, field.id
