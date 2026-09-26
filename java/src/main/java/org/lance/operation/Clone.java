@@ -18,7 +18,12 @@ import com.google.common.base.MoreObjects;
 import java.util.Objects;
 import java.util.Optional;
 
-/** Clone a dataset version into a new dataset. */
+/**
+ * Clone a dataset version into a new dataset.
+ *
+ * <p>Only a shallow clone can be committed directly. A deep clone must copy the source files first,
+ * so committing one throws {@link IllegalArgumentException}.
+ */
 public final class Clone implements Operation {
   private final boolean shallow;
   private final Optional<String> refName;

@@ -54,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Set only by `Dataset::deep_clone`, after it has copied the source files.
+    deep_clone_files_copied: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -78,6 +80,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            deep_clone_files_copied: false,
         }
     }
 
@@ -277,6 +280,17 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Mark this commit as the last step of [`Dataset::deep_clone`], which has
+    /// already copied the source's data, deletion and index files to the
+    /// destination.
+    ///
+    /// A deep `Operation::Clone` points every file at the destination but the
+    /// commit itself copies nothing, so it is rejected unless this is set.
+    pub(crate) fn with_deep_clone_files_copied(mut self) -> Self {
+        self.deep_clone_files_copied = true;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -304,6 +318,21 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        if matches!(
+            transaction.operation,
+            Operation::Clone {
+                is_shallow: false,
+                ..
+            }
+        ) && !self.deep_clone_files_copied
+        {
+            return Err(Error::invalid_input(
+                "A deep Clone cannot be committed directly: the commit does not copy the \
+                 source files, so the new dataset would reference files that do not exist. \
+                 Use deep_clone instead.",
+            ));
+        }
+
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -596,6 +625,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_table::format::{
@@ -921,6 +951,61 @@ mod tests {
         assert!(
             matches!(res, Err(Error::InvalidInput { .. })),
             "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_deep_clone_requires_deep_clone_api() {
+        let source_dir = TempStrDir::default();
+        let source = InsertBuilder::new(source_dir.as_str())
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let clone_txn = |is_shallow| {
+            Transaction::new(
+                source.manifest.version,
+                Operation::Clone {
+                    is_shallow,
+                    ref_name: None,
+                    ref_version: source.manifest.version,
+                    ref_path: source.uri().to_string(),
+                    branch_name: None,
+                },
+                None,
+            )
+        };
+
+        // Committed directly, a deep clone would reference files never copied
+        // to the destination.
+        let deep_dir = TempStrDir::default();
+        let res = CommitBuilder::new(deep_dir.as_str())
+            .execute(clone_txn(false))
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { .. })),
+            "got {res:?}"
+        );
+        assert!(Dataset::open(deep_dir.as_str()).await.is_err());
+
+        // A shallow clone reads the source files in place, so it stays allowed.
+        let shallow_dir = TempStrDir::default();
+        let shallow = CommitBuilder::new(shallow_dir.as_str())
+            .execute(clone_txn(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            shallow.scan().try_into_batch().await.unwrap().num_rows(),
+            10
         );
     }
 

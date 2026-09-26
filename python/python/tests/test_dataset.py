@@ -6946,6 +6946,22 @@ def test_get_transactions_on_branch(tmp_path):
     assert clone.branch_name == "dev"
 
 
+def test_commit_deep_clone_rejected(tmp_path: Path):
+    source = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "source")
+    clone = lance.LanceOperation.Clone(
+        is_shallow=False,
+        ref_name=None,
+        ref_version=source.version,
+        ref_path=source.uri,
+        branch_name=None,
+    )
+
+    # Committed directly, a deep clone would reference files never copied to
+    # the target; LanceDataset.deep_clone copies them first.
+    with pytest.raises(OSError, match="deep Clone cannot be committed directly"):
+        lance.LanceDataset.commit(tmp_path / "target", clone, read_version=0)
+
+
 def test_commit_with_stable_row_ids(tmp_path: Path):
     """Test that commit() with enable_stable_row_ids creates stable row IDs."""
     base_uri = str(tmp_path)

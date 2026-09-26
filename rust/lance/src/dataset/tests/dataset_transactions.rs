@@ -937,7 +937,9 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     .transaction_properties(large_props("payload"))
     .build();
     let clone_uri = TempStrDir::default();
+    // Only the manifest is checked here, so skipping the file copy is fine.
     CommitBuilder::new(&clone_uri)
+        .with_deep_clone_files_copied()
         .execute(clone_tx.clone())
         .await
         .unwrap();
