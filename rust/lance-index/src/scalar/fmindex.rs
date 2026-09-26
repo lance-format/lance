@@ -551,8 +551,10 @@ impl LazyRankBitVec {
     }
 
     fn decode_words(raw: &[u8]) -> Vec<u64> {
-        raw.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect()
     }
 
@@ -1078,8 +1080,10 @@ impl FMIndex {
     }
 
     fn deserialize_c_table(data: &[u8]) -> Vec<usize> {
-        data.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as usize)
+        data.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c) as usize)
             .collect()
     }
 
@@ -1383,8 +1387,8 @@ impl LazyFMIndex {
             .unwrap();
         for i in 0..sa_batch.num_rows() {
             let raw = words_col.value(i);
-            for chunk in raw.chunks_exact(8) {
-                sa_samples.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in raw.as_chunks::<8>().0 {
+                sa_samples.push(u64::from_le_bytes(*chunk));
             }
         }
         sa_samples.truncate(sa_samples_len);
@@ -1470,8 +1474,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing row_ids"))?;
         let row_ids_bytes = hex_decode(row_ids_hex)?;
         let row_ids: Vec<u64> = row_ids_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let doc_starts_hex = md
@@ -1479,8 +1485,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing doc_start_positions"))?;
         let doc_starts_bytes = hex_decode(doc_starts_hex)?;
         let doc_start_positions: Vec<u64> = doc_starts_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let fm = Box::pin(LazyFMIndex::from_reader(

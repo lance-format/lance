@@ -368,8 +368,10 @@ mod tests {
         // Verify
         let result_bytes = decompressed_fixed.data.as_ref();
         let result_values: Vec<f32> = result_bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
 
         assert_eq!(values, result_values);
@@ -416,8 +418,10 @@ mod tests {
         // Verify
         let result_bytes = decompressed_fixed.data.as_ref();
         let result_values: Vec<f64> = result_bytes
-            .chunks_exact(8)
-            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| f64::from_le_bytes(*chunk))
             .collect();
 
         assert_eq!(values, result_values);

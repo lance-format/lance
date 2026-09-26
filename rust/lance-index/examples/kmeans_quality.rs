@@ -174,8 +174,11 @@ impl Base {
                 while start < *rows {
                     let take = STREAM_CHUNK_ROWS.min(rows - start);
                     file.read_exact(&mut bytes[..take * dim * 4]).unwrap();
-                    for (v, b) in values[..take * dim].iter_mut().zip(bytes.chunks_exact(4)) {
-                        *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    for (v, b) in values[..take * dim]
+                        .iter_mut()
+                        .zip(bytes.as_chunks::<4>().0)
+                    {
+                        *v = f32::from_le_bytes(*b);
                     }
                     f(start, &values[..take * dim]);
                     start += take;
@@ -235,8 +238,10 @@ fn read_fbin(path: &Path, limit: Option<usize>) -> (Vec<f32>, usize, usize) {
         file.read_exact(&mut chunk[..take]).unwrap();
         values.extend(
             chunk[..take]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
         );
         remaining -= take;
     }
@@ -255,8 +260,10 @@ fn ground_truth(args: &Args, base: &Base, rows: usize, d: usize, queries: &[f32]
         file.read_to_end(&mut bytes).unwrap();
         if bytes.len() == args.num_queries * TOP_K * 4 {
             return bytes
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect();
         }
     }

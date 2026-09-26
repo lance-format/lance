@@ -2150,7 +2150,7 @@ mod tests {
             0.0,
         );
         let centroids = model.centroids.as_primitive::<Float32Type>().values();
-        for centroid in centroids.chunks_exact(2) {
+        for centroid in centroids.as_chunks::<2>().0 {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
         assert_ne!(&centroids[..2], &centroids[2..]);
@@ -2179,7 +2179,8 @@ mod tests {
             .centroids
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
         {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }

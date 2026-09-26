@@ -232,12 +232,10 @@ impl MinHashLshIndex {
             )));
         }
         let page_max_keys: Vec<u64> = page_table
-            .chunks_exact(8)
-            .map(|bytes| {
-                u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                ])
-            })
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_le_bytes(*bytes))
             .collect();
         let expected_pages = bands.num_rows().div_ceil(page_rows);
         if page_max_keys.len() != expected_pages {

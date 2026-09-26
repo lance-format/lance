@@ -242,7 +242,9 @@ impl ProductQuantizer {
                         .collect();
                     if NUM_BITS == 4 {
                         sub_vec_code
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|v| (v[1] << 4) | v[0])
                             .collect::<Vec<_>>()
                     } else {
@@ -751,7 +753,10 @@ mod tests {
         // indexes even though current writers reject this configuration.
         let indexed_vector = (1..=DIM).map(|value| value as f32).collect::<Vec<_>>();
         let mut codebook = Vec::with_capacity(NUM_SUB_VECTORS * NUM_CENTROIDS * SUB_VECTOR_DIM);
-        for sub_vector in indexed_vector[..PERSISTED_DIM].chunks_exact(SUB_VECTOR_DIM) {
+        for sub_vector in indexed_vector[..PERSISTED_DIM]
+            .as_chunks::<SUB_VECTOR_DIM>()
+            .0
+        {
             for _ in 0..NUM_CENTROIDS {
                 codebook.extend_from_slice(sub_vector);
             }
@@ -845,16 +850,23 @@ mod tests {
         let pq_code = pq.quantize(&fsl).unwrap();
 
         let mut expected = Vec::with_capacity(TOTAL * 4);
-        vectors.values().chunks_exact(DIM).for_each(|vec| {
-            vec.chunks_exact(DIM / 4)
-                .enumerate()
-                .for_each(|(sub_idx, sub_vec)| {
-                    let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
-                    let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
-                    let code = argmin(dists).unwrap() as u8;
-                    expected.push(code);
-                });
-        });
+        vectors
+            .values()
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .for_each(|vec| {
+                vec.as_chunks::<{ DIM / 4 }>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .for_each(|(sub_idx, sub_vec)| {
+                        let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
+                        let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
+                        let code = argmin(dists).unwrap() as u8;
+                        expected.push(code);
+                    });
+            });
 
         assert_eq!(pq_code.len(), TOTAL);
         assert_eq!(

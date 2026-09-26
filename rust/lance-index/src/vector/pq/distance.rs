@@ -420,7 +420,9 @@ mod tests {
             compute_pq_distance(&distance_table, 4, NUM_SUB_VECTORS, transposed.values(), 10);
         let expected = packed_codes
             .values()
-            .chunks_exact(NUM_PACKED_CODES)
+            .as_chunks::<NUM_PACKED_CODES>()
+            .0
+            .iter()
             .map(|codes| {
                 codes
                     .iter()

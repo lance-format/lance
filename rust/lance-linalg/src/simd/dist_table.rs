@@ -196,7 +196,7 @@ pub fn sum_4bit_dist_table_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
             let next_dist_table =
                 &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
@@ -422,7 +422,7 @@ pub fn sum_4bit_hacc_dist_table_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let table_offset = sub_vec_idx * 64;
             let current_low = &hacc_dist_table[table_offset..table_offset + 16];
             let next_low = &hacc_dist_table[table_offset + 16..table_offset + 32];
@@ -462,7 +462,7 @@ pub fn sum_4bit_dist_table_u16_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
             let next_dist_table =
                 &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
