@@ -2363,7 +2363,10 @@ public class Dataset implements Closeable {
    * @return MergeInsertResult containing the new merged Dataset.
    */
   public MergeInsertResult mergeInsert(MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    Preconditions.checkNotNull(mergeInsert, "mergeInsert must not be null");
+    Preconditions.checkNotNull(source, "source must not be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
 
       Dataset newDataset = result.dataset();
