@@ -175,11 +175,24 @@ message Manifest {
    */
   string transaction_file = 12;
 
+  /* Deprecated location of the inline transaction section. Never written by
+   * current writers, but still read for versions written before field 22.
+   *
+   * Lance v1.0 through v11.0 eagerly decode the transaction at this offset when
+   * loading the manifest and fail if it does not decode. A transaction whose
+   * operation is newer than the reader would make the whole version
+   * unopenable, so the section moved to field 22, which those readers ignore.
+   */
+  optional uint64 transaction_section_deprecated = 21;
+
   /* The file position of the transaction content. None if transaction is empty
    * This transaction content begins with the transaction content length as u32
    * If the transaction proto message has a length of `len`, the message ends at `len` + 4
+   *
+   * The offset is inert: a reader must never fail to open the manifest because
+   * it cannot decode the transaction it points at.
    */
-  optional uint64 transaction_section = 21;
+  optional uint64 transaction_section = 22;
 
   /* The next unused row id. If zero, then the table does not have any rows.
    *

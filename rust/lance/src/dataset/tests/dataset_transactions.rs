@@ -232,26 +232,220 @@ fn test_decode_inline_transaction_tolerates_unknown_operations() {
     use prost::Message;
 
     // A transaction written by a newer version of Lance may carry an operation
-    // this version cannot decode; prost surfaces it as a missing oneof. This
-    // must not fail (it would prevent opening the dataset), only skip caching.
+    // this version cannot decode; prost surfaces it as a missing oneof. It
+    // decodes as `Operation::Unknown` rather than failing.
     let unknown_operation = pb::Transaction {
         read_version: 1,
         uuid: "test".to_string(),
         ..Default::default()
     };
-    assert!(decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).is_none());
+    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
 
     // Corrupt bytes are likewise tolerated.
     assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
 
     // A decodable transaction is returned.
-    let known = pb::Transaction::from(&Transaction::new(
+    let known = pb::Transaction::try_from(&Transaction::new(
         1,
         Operation::Append { fragments: vec![] },
         None,
-    ));
+    ))
+    .unwrap();
     let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
     assert!(matches!(decoded.operation, Operation::Append { .. }));
+}
+
+/// A transaction as a future Lance might write it: the `operation` oneof holds
+/// a field number this version does not know. 199 is the top of the reserved
+/// operation range, the number least likely to be assigned; if it ever is, the
+/// `Unknown` assertions in these tests fail and a new number must be picked.
+#[derive(Clone, PartialEq, prost::Message)]
+struct FutureTransaction {
+    #[prost(uint64, tag = "1")]
+    read_version: u64,
+    #[prost(string, tag = "2")]
+    uuid: String,
+    #[prost(message, optional, tag = "199")]
+    future_operation: Option<()>,
+}
+
+fn future_transaction(uuid: &str) -> FutureTransaction {
+    FutureTransaction {
+        read_version: 1,
+        uuid: uuid.to_string(),
+        future_operation: Some(()),
+    }
+}
+
+/// Rewrite the latest manifest of `dataset` in place so its inline transaction
+/// section holds `inline_tx`, stored in the deprecated field 21 if
+/// `deprecated_field` is set and in field 22 otherwise.
+async fn rewrite_inline_transaction(
+    dataset: &Dataset,
+    inline_tx: &impl prost::Message,
+    deprecated_field: bool,
+) {
+    use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+    use lance_io::object_writer::ObjectWriter;
+    use lance_io::traits::{WriteExt, Writer};
+    use lance_table::format::pb;
+
+    assert!(dataset.manifest.index_section.is_none());
+    let path = &dataset.manifest_location().path;
+    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+        .await
+        .unwrap();
+    let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
+    let mut manifest = pb::Manifest::from(dataset.manifest.as_ref());
+    if deprecated_field {
+        manifest.transaction_section = None;
+        manifest.transaction_section_deprecated = Some(tx_pos);
+    } else {
+        manifest.transaction_section = Some(tx_pos);
+        manifest.transaction_section_deprecated = None;
+    }
+    let pos = writer.write_protobuf(&manifest).await.unwrap();
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await
+        .unwrap();
+    Writer::shutdown(&mut writer).await.unwrap();
+}
+
+async fn two_version_dataset(uri: &str) -> Dataset {
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let dataset = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    let batch = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_open_version_with_unknown_operation() {
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    rewrite_inline_transaction(&dataset, &future_transaction("future"), false).await;
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(tx.operation, Operation::Unknown { .. }));
+    assert_eq!(tx.uuid, "future");
+
+    // It can be neither re-encoded nor committed.
+    assert!(lance_table::format::pb::Transaction::try_from(&tx).is_err());
+    assert!(
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(tx)
+            .await
+            .is_err()
+    );
+
+    // A concurrent writer cannot tell what the unknown operation touched, so
+    // it must not commit over it.
+    let stale = dataset.checkout_version(1).await.unwrap();
+    let append = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+    let err = CommitBuilder::new(Arc::new(stale))
+        .execute(append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::IncompatibleTransaction { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_inline_transaction_written_to_new_field() {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // Lance v1.0-v11.0 fail to open a version whose field 21 holds an
+    // operation they don't know, so it must never be written again.
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let bytes = dataset
+        .object_store
+        .read_one_all(&dataset.manifest_location().path)
+        .await
+        .unwrap();
+    let footer = &bytes[bytes.len() - 16..];
+    let pos = u64::from_le_bytes(footer[..8].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    let manifest = pb::Manifest::decode(&bytes[pos + 4..pos + 4 + len]).unwrap();
+    assert!(manifest.transaction_section_deprecated.is_none());
+    assert!(manifest.transaction_section.is_some());
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_deprecated_field() {
+    use lance_table::format::pb;
+
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let expected = dataset.read_transaction().await.unwrap().unwrap();
+    rewrite_inline_transaction(
+        &dataset,
+        &pb::Transaction::try_from(&expected).unwrap(),
+        true,
+    )
+    .await;
+    // Remove the external copy so only field 21 can supply the transaction.
+    let tx_path = dataset
+        .base
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(dataset.manifest.transaction_file.as_deref().unwrap());
+    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    assert_eq!(dataset.read_transaction().await.unwrap().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_released_deprecated_field() {
+    use crate::utils::test::copy_test_data_to_tmp;
+
+    // Written by Lance v1.0.1, which stores the inline transaction in field 21.
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance").unwrap();
+    // Remove the external copies so only field 21 can supply the transactions.
+    std::fs::remove_dir_all(test_dir.std_path().join(TRANSACTIONS_DIR)).unwrap();
+
+    let dataset = Dataset::open(test_dir.path_str().as_str()).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert_eq!(tx.uuid, "87766aea-beb2-4942-8830-df51d2f17492");
+    assert_eq!(tx.read_version, 1);
+}
+
+#[test]
+fn test_distinct_unknown_transactions_are_not_equal() {
+    use crate::dataset::decode_inline_transaction;
+    use prost::Message;
+
+    // Commit-outcome detection compares transactions for equality; two
+    // unknown operations must not be mistaken for the same commit.
+    let decode = |uuid: &str| {
+        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+    };
+    assert_eq!(decode("a"), decode("a"));
+    assert_ne!(decode("a"), decode("b"));
 }
 
 #[tokio::test]
@@ -431,7 +625,7 @@ async fn test_inline_transaction() {
     let tx_file = crate::io::commit::write_transaction_file(
         ds.object_store.as_ref(),
         &ds.base,
-        &lance_table::format::pb::Transaction::from(&tx),
+        &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
     )
     .await
     .unwrap();

@@ -394,7 +394,7 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1174,7 +1174,7 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1305,7 +1305,11 @@ pub(crate) async fn do_commit_detached_transaction(
                 }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
-                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
+                inline_tx = if inline_transaction {
+                    Some(pb::Transaction::try_from(transaction)?.into())
+                } else {
+                    None
+                };
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1532,7 +1536,7 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::from(&transaction);
+        let pb_transaction = pb::Transaction::try_from(&transaction)?;
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
@@ -1954,7 +1958,7 @@ mod tests {
         let file_name = write_transaction_file(
             &object_store,
             &base_path,
-            &pb::Transaction::from(&transaction),
+            &pb::Transaction::try_from(&transaction).unwrap(),
         )
         .await
         .unwrap();

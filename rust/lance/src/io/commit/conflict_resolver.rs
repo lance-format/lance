@@ -222,6 +222,12 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
+            // An unrecognized operation cannot be rebased: we don't know what it touches.
+            Operation::Unknown { .. } => Err(Error::not_supported(format!(
+                "Transaction {} has an operation written by a newer version of Lance \
+                 and cannot be rebased by this version",
+                transaction.uuid
+            ))),
         }
     }
 
@@ -343,6 +349,10 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            // An unrecognized operation cannot be checked: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -444,6 +454,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -699,6 +711,10 @@ impl<'a> TransactionRebase<'a> {
                     other_transaction,
                     other_version,
                 ),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -938,6 +954,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1134,6 +1152,10 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1186,6 +1208,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1215,6 +1241,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1377,6 +1407,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1493,6 +1525,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1530,6 +1566,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1555,6 +1595,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
             Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1583,6 +1627,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1611,6 +1659,10 @@ impl<'a> TransactionRebase<'a> {
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1672,6 +1724,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1746,6 +1802,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
                 | Operation::Project { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -1845,6 +1905,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
+            Operation::Unknown { .. } => Err(Error::not_supported(format!(
+                "Transaction {} has an operation written by a newer version of Lance \
+                 and cannot be committed by this version",
+                self.transaction.uuid
+            ))),
         }
     }
 
@@ -3556,6 +3621,15 @@ mod tests {
             ),
         ];
 
+        // An operation written by a newer Lance may touch anything, so every
+        // known operation must treat it as a conflict.
+        let unknown = Transaction::try_from(lance_table::format::pb::Transaction {
+            uuid: "unknown".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(unknown.operation, Operation::Unknown { .. }));
+
         for (operation, expected_conflicts) in &cases {
             let transaction = Transaction::new(0, operation.clone(), None);
             let mut rebase = TransactionRebase {
@@ -3566,6 +3640,14 @@ mod tests {
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
+
+            let result = rebase.check_txn(&unknown, 1);
+            assert!(
+                matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                "Transaction {:?} should be incompatible with an unknown operation, but was {:?}",
+                operation,
+                result
+            );
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
                 match expected_conflict {
@@ -5086,6 +5168,7 @@ mod tests {
                 Box::new(replacements.iter().map(|r| r.0))
             }
             Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
+            Operation::Unknown { .. } => unimplemented!("modified_fragment_ids for {operation}"),
         }
     }
 

@@ -862,6 +862,8 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::Unknown {}, Self::Unknown {}) => true,
+            (Self::Unknown {}, _) | (_, Self::Unknown {}) => false,
         }
     }
 }

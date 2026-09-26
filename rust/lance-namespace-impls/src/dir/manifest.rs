@@ -1858,6 +1858,8 @@ impl ManifestNamespace {
             .map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
+        let inline_transaction =
+            lance_table::format::Transaction::try_from(&transaction).map_err(CommitError::from)?;
         commit_handler
             .commit(
                 manifest,
@@ -1866,7 +1868,7 @@ impl ManifestNamespace {
                 &object_store,
                 write_manifest_file_to_path,
                 naming_scheme,
-                Some((&transaction).into()),
+                Some(inline_transaction),
             )
             .await
             .map(|_location| ())

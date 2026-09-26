@@ -645,6 +645,13 @@ impl Transaction {
                     "Clone operation should not enter build_manifest.".to_string(),
                 ));
             }
+            Operation::Unknown { .. } => {
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be committed by this version",
+                    self.uuid
+                )));
+            }
             Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -2339,7 +2346,7 @@ mod tests {
             None,
         );
 
-        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let pb_tx: pb::Transaction = pb::Transaction::try_from(&tx).unwrap();
 
         // Field 9 must be empty; field 10 must be populated.
         if let Some(pb::transaction::Operation::Update(ref update)) = pb_tx.operation {

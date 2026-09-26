@@ -407,7 +407,12 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
-  // The operation of this transaction.
+  /* The operation of this transaction.
+   *
+   * Field numbers 100-199 are reserved for operations. A reader that sees a
+   * number in this range it does not recognize is looking at an operation from
+   * a newer writer, and must treat it as unknown rather than fail.
+   */
   oneof operation {
     Append append = 100;
     Delete delete = 101;
