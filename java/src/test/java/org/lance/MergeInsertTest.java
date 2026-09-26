@@ -134,6 +134,28 @@ public class MergeInsertTest {
   }
 
   @Test
+  public void testMergeInsertParamsValidation() {
+    // Null join keys, negative retries, and negative timeout must be rejected up
+    // front, matching sibling UpdateParams. An empty `on` stays valid (the core
+    // falls back to the primary key), so it is deliberately not rejected.
+    NullPointerException nullOn =
+        Assertions.assertThrows(NullPointerException.class, () -> new MergeInsertParams(null));
+    Assertions.assertTrue(nullOn.getMessage().contains("on must not be null"));
+
+    MergeInsertParams params = new MergeInsertParams(Collections.singletonList("id"));
+    IllegalArgumentException negativeRetries =
+        Assertions.assertThrows(
+            IllegalArgumentException.class, () -> params.withConflictRetries(-1));
+    Assertions.assertTrue(negativeRetries.getMessage().contains("non-negative"));
+    IllegalArgumentException negativeTimeout =
+        Assertions.assertThrows(
+            IllegalArgumentException.class, () -> params.withRetryTimeoutMs(-1L));
+    Assertions.assertTrue(negativeTimeout.getMessage().contains("non-negative"));
+
+    Assertions.assertTrue(new MergeInsertParams(Collections.emptyList()).on().isEmpty());
+  }
+
+  @Test
   public void testWhenNotMatchedDoNothing() throws Exception {
     // Test ignore unmatched source rows
 

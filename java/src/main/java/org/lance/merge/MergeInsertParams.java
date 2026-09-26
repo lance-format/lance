@@ -45,6 +45,10 @@ public class MergeInsertParams {
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
+    // Only reject null: an empty `on` is a valid request that the core resolves
+    // against the dataset's primary key (see MergeInsertBuilder::try_new),
+    // unlike UpdateParams' required non-empty map.
+    Preconditions.checkNotNull(on, "on must not be null");
     this.on = on;
   }
 
@@ -196,6 +200,7 @@ public class MergeInsertParams {
    * @return This MergeInsertParams instance
    */
   public MergeInsertParams withConflictRetries(int retries) {
+    Preconditions.checkArgument(retries >= 0, "retries must be non-negative");
     this.conflictRetries = retries;
     return this;
   }
@@ -214,6 +219,7 @@ public class MergeInsertParams {
    * @return This MergeInsertParams instance
    */
   public MergeInsertParams withRetryTimeoutMs(long timeoutMs) {
+    Preconditions.checkArgument(timeoutMs >= 0, "timeoutMs must be non-negative");
     this.retryTimeoutMs = timeoutMs;
     return this;
   }
