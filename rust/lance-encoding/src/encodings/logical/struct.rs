@@ -665,7 +665,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, NullArray, StringArray,
+        StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -772,6 +773,28 @@ mod tests {
             outer_fields,
             vec![Arc::new(scores), Arc::new(locations)],
             Some(rows_validity),
+        );
+
+        let test_cases = TestCases::default().with_structural_encodings();
+
+        check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nullable_struct_with_null_typed_child() {
+        // A field that is null in every input row is inferred as the Null type, e.g.
+        // `pa.Table.from_pylist([{"s": {"a": 1, "b": None}}, {"s": None}])`.
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Null, true),
+        ]);
+        let rows = StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])),
+                Arc::new(NullArray::new(4)),
+            ],
+            Some(NullBuffer::from(vec![true, false, true, true])),
         );
 
         let test_cases = TestCases::default().with_structural_encodings();
