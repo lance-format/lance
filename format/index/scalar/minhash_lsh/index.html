@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>MinHash LSH (experimental) — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/index/scalar/minhash_lsh/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../../">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../../file/">Specification</a>
+    <a href="../../../file/encoding/">Encoding Strategy</a>
+    <a href="../../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../../../table/">Lance Table Format</a>
+    <a href="../../../table/schema/">Schema</a>
+    <a href="../../../table/versioning/">Versioning</a>
+    <a href="../../../table/transaction/">Transactions</a>
+    <a href="../../../table/layout/">Layout</a>
+    <a href="../../../table/branch_tag/">Branch & Tag</a>
+    <a href="../../../table/row_id_lineage/">Row ID & Lineage</a>
+    <a href="../../../table/data_overlay_file/">Data Overlay Files</a>
+    <a href="../../../table/fragment_metadata/">Fragment Metadata Tree</a>
+    <a href="../../../table/mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../btree/">BTree</a>
+    <a href="../bitmap/">Bitmap</a>
+    <a href="../label_list/">Label List</a>
+    <a href="../zonemap/">Zone Map</a>
+    <a href="../bloom_filter/">Bloom Filter</a>
+    <a href="../fts/">Full Text Search</a>
+    <a href="../ngram/">N-gram</a>
+    <a class="active" href="./">MinHash LSH (experimental)</a>
+    <a href="../fmindex/">FM-Index</a>
+    <a href="../rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../../namespace/">Overview</a>
+    <a href="../../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../namespace/operations/">Overview</a>
+    <a href="../../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../../namespace/operations/models/">Operation Models</a>
+    <a href="../../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Index Formats</span>
+        <span>/</span><span>Scalar Indices</span>
+        <span>/</span><b>MinHash LSH (experimental)</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="minhash-lsh-index-near-duplicate-search">MinHash LSH Index (Near-Duplicate Search)<a class="headerlink" href="#minhash-lsh-index-near-duplicate-search" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Experimental</p>
+<p>This index is an experimental format feature. Its details message and
+its files may change incompatibly without a separate vote; after such a
+change the index must be rebuilt, the data itself is never rewritten.
+The feature is removed if its stabilization vote does not pass. Design
+discussion: <a href="https://github.com/lance-format/lance/discussions/8820">lance#8820</a>.</p>
+</div>
+<p>The MinHash LSH index finds near duplicates of a text: rows whose content is
+essentially the same as the query with a few edits, such as reposts with a
+different footer, mirror pages, or copy-pasted records with small changes. It
+scores rows by the <strong>estimated Jaccard similarity</strong> of their token shingle
+sets, a literal measure of overlap that needs no model. Unlike the Full-Text
+Search index, which ranks rows by term relevance, and unlike a vector index,
+which finds rows that mean the same thing, this index answers "which rows are
+copies of this one".</p>
+<p>The index is approximate: candidates are found with locality sensitive hashing
+(LSH) over MinHash signatures and ranked by comparing signatures, so the
+reported similarity is an estimate, and rows whose similarity is below the
+index's threshold are usually not found.</p>
+<h2 id="high-level-architecture">High-Level Architecture<a class="headerlink" href="#high-level-architecture" title="Permanent link">&para;</a></h2>
+<p>Every indexed text is turned into a fixed-length <strong>signature</strong> of <code>num_hashes</code>
+values, and the signature is split into <code>num_bands</code> <strong>bands</strong> whose hashes are
+the lookup keys. Two rows become candidates for each other when they share at
+least one band key; candidates are then ranked by the fraction of equal
+signature values.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>              text
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>               |  tokenize, shingle, hash
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>               v
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>   +-----------------------------------------+
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>   |   signature: num_hashes 16-bit values   |   1 - (fraction of equal values)
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>   +-----------------------------------------+   = Jaccard distance
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>       |  split into num_bands bands, hash each
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>       v
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>   band keys ------------&gt; bands table   (candidate lookup: rows sharing a key)
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>   signature ------------&gt; signature table  (ranking the candidates)
+</span></code></pre></div>
+<p>The index uses Lance's <strong>Segmented Index</strong> architecture: each segment covers a
+disjoint group of fragments and holds its own bands table and signature table.
+Scores depend only on the two signatures being compared, never on corpus
+statistics, so results from different segments merge exactly.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>                     +----------------------------------------+
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>                     |            Lance Dataset               |
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>                     |   (Disjoint groups of Fragments 0..N)  |
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>                     +----------------------------------------+
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>                                         |
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>                                         v
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>                     +----------------------------------------+
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>                     |            Segmented Index             |
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>                     |  +-----------+ +-----------+ +-------+ |
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>                     |  | Segment 1 | | Segment 2 | | ...   | |
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>                     |  | bands +   | | bands +   | |       | |
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>                     |  | signatures| | signatures| |       | |
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>                     |  +-----------+ +-----------+ +-------+ |
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>                     +----------------------------------------+
+</span></code></pre></div>
+<h2 id="index-details">Index Details<a class="headerlink" href="#index-details" title="Permanent link">&para;</a></h2>
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">MinHashLshIndexDetails</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="cm">/* Number of MinHash values per signature (k): in [1, 4096] and a multiple</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="cm">   * of `num_bands`.</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="cm">   */</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_hashes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="cm">/* Number of LSH bands (b), in [1, 256]. Each band covers</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="cm">   * `num_hashes / num_bands` consecutive signature values.</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="cm">   */</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">num_bands</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">  </span><span class="cm">/* Number of consecutive tokens joined into one shingle; at least 1. A text</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="cm">   * with fewer tokens forms one shingle of all of them.</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="cm">   */</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">shingle_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">  </span><span class="cm">/* The tokenizer, recorded as a full text search index records it and</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="cm">   * rebuilt from this message alone at query time. Required. Fields that only</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="cm">   * shape full text search postings (`with_position`, `block_size`,</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="cm">   * `posting_format_version`, `document_granularity`) are carried unchanged</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="cm">   * and ignored. The details must identify the tokenizer completely, so</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="cm">   * settings the message cannot record (custom stop words, document-level</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="cm">   * text extraction) and tokenizers that load data from outside Lance (the</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="cm">   * jieba and lindera dictionaries) are rejected.</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="cm">   */</span>
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="w">  </span><span class="n">lance.table.InvertedIndexDetails</span><span class="w"> </span><span class="na">tokenizer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-2-27"><a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a>
+</span><span id="__span-2-28"><a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a><span class="w">  </span><span class="cm">/* Version of the signature procedure: the token streams of the tokenizers</span>
+</span><span id="__span-2-29"><a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a><span class="cm">   * that ship with Lance, shingling, hashing, the permutation coefficients</span>
+</span><span id="__span-2-30"><a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a><span class="cm">   * and their seed, compression and band keys. Bumped whenever any of them</span>
+</span><span id="__span-2-31"><a id="__codelineno-2-31" name="__codelineno-2-31" href="#__codelineno-2-31"></a><span class="cm">   * changes in a way that makes old and new signatures incomparable; a reader</span>
+</span><span id="__span-2-32"><a id="__codelineno-2-32" name="__codelineno-2-32" href="#__codelineno-2-32"></a><span class="cm">   * rejects a version it does not implement. Independent of the index file</span>
+</span><span id="__span-2-33"><a id="__codelineno-2-33" name="__codelineno-2-33" href="#__codelineno-2-33"></a><span class="cm">   * format version.</span>
+</span><span id="__span-2-34"><a id="__codelineno-2-34" name="__codelineno-2-34" href="#__codelineno-2-34"></a><span class="cm">   */</span>
+</span><span id="__span-2-35"><a id="__codelineno-2-35" name="__codelineno-2-35" href="#__codelineno-2-35"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">signature_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-2-36"><a id="__codelineno-2-36" name="__codelineno-2-36" href="#__codelineno-2-36"></a>
+</span><span id="__span-2-37"><a id="__codelineno-2-37" name="__codelineno-2-37" href="#__codelineno-2-37"></a><span class="p">}</span>
+</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Parameter</th>
+<th style="text-align: left;">Default</th>
+<th style="text-align: left;">Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>num_hashes</code></td>
+<td style="text-align: left;">128</td>
+<td style="text-align: left;">Signature length, 1 to 4096 and a multiple of <code>num_bands</code>. More hashes make the similarity estimate more precise (error about <code>1 / sqrt(num_hashes)</code>) and the signature table larger (<code>8 + 2 * num_hashes</code> bytes per row).</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>num_bands</code></td>
+<td style="text-align: left;">16</td>
+<td style="text-align: left;">Number of bands, 1 to 256. With <code>num_hashes</code> it sets the similarity threshold <code>(1 / num_bands) ^ (num_bands / num_hashes)</code>. The bands table costs <code>12 * num_bands</code> bytes per row.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>shingle_size</code></td>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;">Tokens per shingle. Shorter shingles tolerate more edits but let unrelated texts that share common phrases look alike; 5 suits long documents, 2 very short texts.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>tokenizer</code></td>
+<td style="text-align: left;">full text search default, without stemming and stop-word removal</td>
+<td style="text-align: left;">The tokenizer, recorded as the Full-Text Search index records it. Stemming and stop-word removal are off by default because merging different words inflates similarity.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>signature_version</code></td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">Version of the signature procedure, including its hash seed. Managed by Lance, not a user parameter.</td>
+</tr>
+</tbody>
+</table>
+<p>Reference points: the probability that a row with true Jaccard similarity <code>J</code>
+becomes a candidate is <code>1 - (1 - J^r)^b</code> with <code>b = num_bands</code> and
+<code>r = num_hashes / num_bands</code>.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"><code>num_hashes</code> / <code>num_bands</code></th>
+<th style="text-align: left;">Threshold</th>
+<th style="text-align: left;">Found at J = 0.9</th>
+<th style="text-align: left;">Found at J = 0.7</th>
+<th style="text-align: left;">Bytes per row</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">64 / 8</td>
+<td style="text-align: left;">0.77</td>
+<td style="text-align: left;">99%</td>
+<td style="text-align: left;">38%</td>
+<td style="text-align: left;">232</td>
+</tr>
+<tr>
+<td style="text-align: left;">128 / 16 (default)</td>
+<td style="text-align: left;">0.71</td>
+<td style="text-align: left;">99.99%</td>
+<td style="text-align: left;">61%</td>
+<td style="text-align: left;">456</td>
+</tr>
+<tr>
+<td style="text-align: left;">96 / 16</td>
+<td style="text-align: left;">0.63</td>
+<td style="text-align: left;">100%</td>
+<td style="text-align: left;">87%</td>
+<td style="text-align: left;">392</td>
+</tr>
+</tbody>
+</table>
+<p>Bands of fewer than six values admit a noticeable share of unrelated rows into
+the candidate set on tables of billions of rows and are better left to offline
+use.</p>
+<p>A query is tokenized from the details alone, so the details must identify the
+tokenizer completely: settings the Full-Text Search details cannot record
+(custom stop words, document-level text extraction) and tokenizers that load
+dictionaries from the deployment (<code>jieba/*</code>, <code>lindera/*</code>) are rejected. For
+CJK text, <code>ngram</code> or <code>icu</code> gives deterministic shingles.</p>
+<h2 id="signature-generation">Signature Generation<a class="headerlink" href="#signature-generation" title="Permanent link">&para;</a></h2>
+<p>The build side and the query side run the same procedure, so a query is
+comparable with every stored row. The exact procedure, its constants and
+known-answer vectors are in <a href="#version-0-reference">Version 0 Reference</a>:</p>
+<ol>
+<li>Tokenize the text with the configured tokenizer.</li>
+<li>Form shingles of <code>shingle_size</code> consecutive tokens. A text with fewer
+   tokens than <code>shingle_size</code> forms one shingle of all its tokens; a text with
+   no tokens (NULL, empty, whitespace only) has no signature, is not indexed,
+   and never appears in results.</li>
+<li>Hash every shingle to 64 bits with a fixed seed.</li>
+<li>Apply <code>num_hashes</code> fixed permutations and keep the minimum of each over
+   all shingles of the text.</li>
+<li>Store each minimum as a 16-bit value. A minimum shrinks as the text grows,
+   so its raw high bits would agree between any two long texts; the stored
+   value is a multiply-shift hash of the minimum, which keeps the chance that
+   two different minima collide negligible against the <code>1 / num_hashes</code>
+   resolution of the estimate.</li>
+</ol>
+<p>Band keys are hashes of the <code>num_hashes / num_bands</code> consecutive values of a
+band, prefixed with the band number so that the keys of one band are
+contiguous.</p>
+<p>The estimated Jaccard similarity of two signatures is the fraction of
+positions whose values are equal; the reported <code>_distance</code> is
+<code>1 - estimated similarity</code>. Every constant of the procedure is fixed by
+<code>signature_version</code>, and every segment of an index must carry identical
+details, so signatures written by different segments or at query time are
+always comparable. Changing a parameter requires rebuilding the index.</p>
+<h2 id="storage-layout">Storage Layout<a class="headerlink" href="#storage-layout" title="Permanent link">&para;</a></h2>
+<p>Each segment consists of two Lance files:</p>
+<ul>
+<li><code>signatures.lance</code> — one row per indexed document: its <code>_rowid</code> and its
+  signature as a fixed-size list of <code>num_hashes</code> 16-bit values. The row number
+  is the segment-local document id, so a segment holds at most <code>2^32</code>
+  documents; larger tables use several segments. Rows are fixed width and
+  stored without compression, so one document's signature is a single ranged
+  read at a known offset.</li>
+<li><code>bands.lance</code> — one row per (band key, document id) pair, sorted by band key
+  and then document id. A bucket is the run of rows sharing a key. The file is
+  divided into logical pages of a fixed number of rows recorded in the file
+  (4096 as written), and a page table holding the largest key of every page
+  is stored in a global buffer of the file and kept in memory when the index
+  is open, so the pages of any bucket are known without reading the file.</li>
+</ul>
+<p>Both files repeat the serialized index details and the file format version as
+schema metadata; a segment is opened only when both files match the details of
+the index. The file schemas, metadata keys and the page table encoding are in
+<a href="#version-0-reference">Version 0 Reference</a>.</p>
+<h2 id="segments-appends-and-merging">Segments, Appends and Merging<a class="headerlink" href="#segments-appends-and-merging" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Building</strong>: <code>create_index</code> reads the text column, signs every row and
+  writes one segment. Distributed builds create one uncommitted segment per
+  worker over disjoint fragment sets and commit them together; the commit
+  rejects segments whose details differ.</li>
+<li><strong>Unindexed appends</strong>: fragments appended after the build are not covered
+  by any segment. <code>optimize_indices</code> adds a segment over them. Until then a
+  query still searches those rows, signing them on the fly with the index
+  parameters, unless the scan asks for indexed rows only (<code>fast_search</code>).</li>
+<li><strong>Segment merging</strong>: merging segments rebuilds one segment from the stored
+  signatures without tokenizing the text again — the signatures of the
+  surviving rows are concatenated, band keys are recomputed and the bands
+  table is rewritten. A merge whose result would exceed <code>2^32</code> documents is
+  rejected and the segments stay separate.</li>
+<li><strong>Deletes and compaction</strong>: deleted rows are filtered at query time; after a
+  compaction the stored row ids are remapped like those of every other scalar
+  index.</li>
+</ul>
+<h2 id="query-evaluation">Query Evaluation<a class="headerlink" href="#query-evaluation" title="Permanent link">&para;</a></h2>
+<p>When a search is submitted (<code>nearest = MinHashQuery(text, column)</code>):</p>
+<ol>
+<li>The query text is signed with the parameters recorded in the index, and its
+   band keys are computed.</li>
+<li>In every segment, each band key is looked up through the page table, which
+   yields the pages of the key's bucket; the pages of all buckets are fetched
+   through the page cache, the missing ones with bounded scattered reads. The
+   document ids in the buckets form the candidate set.</li>
+<li>The candidates' signatures are read — from memory when resident, otherwise
+   with scattered reads, or with a sequential scan when the candidates cover a
+   large share of the segment — and each candidate's Jaccard distance to the
+   query is computed. Rows removed by filters or deletions are skipped.</li>
+<li>Each segment keeps its <code>limit</code> closest rows; rows not covered by any
+   segment are scored the same way by the query engine.</li>
+<li>The per-segment results are merged by distance, and the <code>limit</code> closest
+   rows are returned with their <code>_distance</code>.</li>
+</ol>
+<h2 id="compatibility">Compatibility<a class="headerlink" href="#compatibility" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A reader that does not know this index opens a dataset that has one
+  normally: the index is listed under a name derived from the type URL of
+  its details and is not used by queries. Creating the index sets no reader
+  or writer feature flag.</li>
+<li>A writer that does not create the index changes nothing for readers that
+  know it.</li>
+<li>Dropping the feature is dropping the index: its files live only under the
+  index's own <code>_indices/{uuid}/</code> directory, and no data file, manifest field
+  or other index is rewritten.</li>
+</ul>
+<h2 id="version-0-reference">Version 0 Reference<a class="headerlink" href="#version-0-reference" title="Permanent link">&para;</a></h2>
+<p>This section is normative for <code>signature_version = 0</code> and
+<code>minhash_lsh_index_version = 0</code>: an independent implementation must reproduce
+the signatures, band keys and files defined here exactly. All arithmetic is on
+unsigned 64-bit integers modulo <code>2^64</code>, and every multi-byte value is
+little-endian.</p>
+<h3 id="signature-procedure">Signature Procedure<a class="headerlink" href="#signature-procedure" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>Tokenize</strong> the text with the configured tokenizer. A token is the UTF-8
+   bytes of the token text the tokenizer emits, in emission order.</li>
+<li><strong>Shingle</strong>: a shingle is <code>shingle_size</code> consecutive tokens joined with the
+   single byte <code>0x1F</code>; a text of <code>n</code> tokens has <code>n - shingle_size + 1</code>
+   shingles, one starting at every token position. A text with fewer tokens
+   than <code>shingle_size</code> but at least one token forms one shingle of all its
+   tokens. A text with no tokens (NULL, empty, whitespace only, or every token
+   discarded by the tokenizer) has no signature.</li>
+<li><strong>Hash</strong> every shingle to 64 bits: <code>x = XXH64(shingle bytes, seed = 42)</code>.</li>
+<li><strong>Coefficients</strong> come from a SplitMix64 generator whose state <code>s</code> starts at</li>
+<li>
+<p>One draw is:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>s    = s + 0x9E3779B97F4A7C15
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>z    = s
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>z    = (z ^ (z &gt;&gt; 30)) * 0xBF58476D1CE4E5B9
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>z    = (z ^ (z &gt;&gt; 27)) * 0x94D049BB133111EB
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>draw = z ^ (z &gt;&gt; 31)
+</span></code></pre></div>
+<p>The draws are consumed in this order: for <code>i = 0 .. num_hashes - 1</code>,
+<code>a_i = draw() | 1</code> and then <code>b_i = draw()</code>; after all pairs, for
+<code>i = 0 .. num_hashes - 1</code>, <code>c_i = draw() | 1</code>. The coefficients depend on
+<code>num_hashes</code> only.
+5. <strong>Permute and take the minima</strong>: <code>m_i = min over all shingles x of
+   (a_i * x + b_i)</code>, comparing the full 64-bit values.
+6. <strong>Compress</strong> each minimum to 16 bits: <code>signature[i] = (c_i * m_i) &gt;&gt; 48</code>.
+7. <strong>Band keys</strong>: the signature is split into <code>num_bands</code> bands of
+   <code>r = num_hashes / num_bands</code> consecutive values; band <code>j</code> holds
+   <code>signature[j * r .. (j + 1) * r)</code> and its key is</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>band_key_j = (j &lt;&lt; 56) | (XXH64(band bytes, seed = 42) &amp; 0x00FFFFFFFFFFFFFF)
+</span></code></pre></div>
+<p>where the band bytes are the band's <code>r</code> values, each written as 2
+little-endian bytes, in signature order.</p>
+</li>
+</ol>
+<p>The estimated Jaccard similarity of two signatures is the number of positions
+<code>i</code> with equal <code>signature[i]</code> divided by <code>num_hashes</code>; <code>_distance</code> is
+<code>1 - estimated similarity</code>, and rows at equal distance are ordered by row id.</p>
+<h3 id="known-answer-vectors">Known-Answer Vectors<a class="headerlink" href="#known-answer-vectors" title="Permanent link">&para;</a></h3>
+<p>An implementation must reproduce these values, computed with
+<code>num_hashes = 4</code>, <code>num_bands = 2</code>, <code>shingle_size = 2</code>, the default tokenizer
+and <code>signature_version = 0</code>.</p>
+<p>Coefficients:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"><code>i</code></th>
+<th style="text-align: left;"><code>a_i</code></th>
+<th style="text-align: left;"><code>b_i</code></th>
+<th style="text-align: left;"><code>c_i</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;"><code>0xbdd732262feb6e95</code></td>
+<td style="text-align: left;"><code>0x28efe333b266f103</code></td>
+<td style="text-align: left;"><code>0x5705b8770b3d7dd5</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;"><code>0x47526757130f9f53</code></td>
+<td style="text-align: left;"><code>0x581ce1ff0e4ae394</code></td>
+<td style="text-align: left;"><code>0x9e54d738297f77af</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;"><code>0x09bc585a244823f3</code></td>
+<td style="text-align: left;"><code>0xde4431fa3c80db06</code></td>
+<td style="text-align: left;"><code>0x3474724a775b19bf</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;"><code>0x37e9671c45376d5d</code></td>
+<td style="text-align: left;"><code>0xccf635ee9e9e2fa4</code></td>
+<td style="text-align: left;"><code>0x7e348a0e451650bf</code></td>
+</tr>
+</tbody>
+</table>
+<p>Text <code>"The quick brown fox"</code> tokenizes to <code>the</code>, <code>quick</code>, <code>brown</code>, <code>fox</code>:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Shingle bytes</th>
+<th style="text-align: left;"><code>XXH64</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>the</code> <code>0x1F</code> <code>quick</code></td>
+<td style="text-align: left;"><code>0x4c0b0d36203ce55f</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>quick</code> <code>0x1F</code> <code>brown</code></td>
+<td style="text-align: left;"><code>0x09c7ae895d82b184</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>brown</code> <code>0x1F</code> <code>fox</code></td>
+<td style="text-align: left;"><code>0x68e7f4b1be7b4c1f</code></td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"><code>i</code></th>
+<th style="text-align: left;"><code>m_i</code></th>
+<th style="text-align: left;"><code>signature[i]</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;"><code>0x0959767d77eafad7</code></td>
+<td style="text-align: left;"><code>0xb00f</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;"><code>0x464e4457275cd2a1</code></td>
+<td style="text-align: left;"><code>0x59d6</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;"><code>0x50f41804abaa5973</code></td>
+<td style="text-align: left;"><code>0x511a</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;"><code>0x8944bd01067b09e7</code></td>
+<td style="text-align: left;"><code>0xcd2c</code></td>
+</tr>
+</tbody>
+</table>
+<p>Band keys: <code>0x00f30f3501d458ea</code> (band 0), <code>0x01aec5df28d04915</code> (band 1).</p>
+<p>Text <code>"Fox"</code> has one token, fewer than <code>shingle_size</code>, so its only shingle is
+<code>fox</code> with <code>XXH64</code> <code>0x07c0130ab04388d5</code>; the minima are <code>0x2bb8ade505081afc</code>,
+<code>0x0a273c6ff9a78ba3</code>, <code>0x802f20573838dc35</code>, <code>0x1ef46a8d372c9605</code>, the
+signature is <code>0x2970 0xd6db 0x65f8 0xadfc</code>, and the band keys are
+<code>0x003cf6e803312eca</code> and <code>0x017c5504fbc83f36</code>.</p>
+<p>The texts <code>""</code> and <code>"  \n"</code> have no tokens and therefore no signature.</p>
+<h3 id="signature-file-schema">Signature File Schema<a class="headerlink" href="#signature-file-schema" title="Permanent link">&para;</a></h3>
+<p><code>signatures.lance</code> holds one row per indexed document. Row <code>i</code> is document
+<code>i</code> of the segment; rows are written in document id order and never
+reordered.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">(</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="p">[</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>        <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"_rowid"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>        <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>            <span class="s2">"signature"</span><span class="p">,</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>            <span class="n">pa</span><span class="o">.</span><span class="n">list_</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"item"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint16</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span> <span class="n">num_hashes</span><span class="p">),</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>            <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>            <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>                <span class="s2">"lance-encoding:structural-encoding"</span><span class="p">:</span> <span class="s2">"fullzip"</span><span class="p">,</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>                <span class="s2">"lance-encoding:compression"</span><span class="p">:</span> <span class="s2">"none"</span><span class="p">,</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>            <span class="p">},</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>        <span class="p">),</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="p">],</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>    <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>        <span class="s2">"minhash_lsh_details"</span><span class="p">:</span> <span class="s2">"&lt;hexadecimal serialized MinHashLshIndexDetails&gt;"</span><span class="p">,</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>        <span class="s2">"minhash_lsh_index_version"</span><span class="p">:</span> <span class="s2">"0"</span><span class="p">,</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>    <span class="p">},</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="p">)</span>
+</span></code></pre></div>
+<p><code>_rowid</code> is the row id of the indexed row as the dataset hands it to the
+index: the row address, or the stable row id when the dataset has stable row
+ids enabled, like every scalar index. <code>signature</code> is the signature of the
+<a href="#signature-procedure">Signature Procedure</a>; its values are never null (the
+Lance schema does not record the nullability of a fixed-size list item, so a
+reader treats a null value as corruption of the file). The field metadata of
+<code>signature</code> selects the full-zip structural encoding without compression, so
+every row occupies the same <code>2 * num_hashes</code> bytes and a reader fetches the
+signature of document <code>i</code> by row number as one ranged read.</p>
+<h3 id="bands-file-schema">Bands File Schema<a class="headerlink" href="#bands-file-schema" title="Permanent link">&para;</a></h3>
+<p><code>bands.lance</code> holds one row per (band key, document id) pair, sorted by
+<code>band_key</code> and then <code>doc_id</code>, ascending.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">(</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="p">[</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>        <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>            <span class="s2">"band_key"</span><span class="p">,</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>            <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">(),</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>            <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>            <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"lance-encoding:compression"</span><span class="p">:</span> <span class="s2">"none"</span><span class="p">},</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>        <span class="p">),</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>        <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>            <span class="s2">"doc_id"</span><span class="p">,</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>            <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>            <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>            <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"lance-encoding:compression"</span><span class="p">:</span> <span class="s2">"none"</span><span class="p">},</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>        <span class="p">),</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a>    <span class="p">],</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a>    <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>        <span class="s2">"minhash_lsh_details"</span><span class="p">:</span> <span class="s2">"&lt;hexadecimal serialized MinHashLshIndexDetails&gt;"</span><span class="p">,</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a>        <span class="s2">"minhash_lsh_index_version"</span><span class="p">:</span> <span class="s2">"0"</span><span class="p">,</span>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a>        <span class="s2">"minhash_lsh_num_docs"</span><span class="p">:</span> <span class="s2">"&lt;decimal document count&gt;"</span><span class="p">,</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>        <span class="s2">"minhash_lsh_page_rows"</span><span class="p">:</span> <span class="s2">"4096"</span><span class="p">,</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a>        <span class="s2">"minhash_lsh_page_table_buffer"</span><span class="p">:</span> <span class="s2">"&lt;decimal global buffer index&gt;"</span><span class="p">,</span>
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a>    <span class="p">},</span>
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="p">)</span>
+</span></code></pre></div>
+<p><code>band_key</code> is the key of step 7 of the <a href="#signature-procedure">Signature Procedure</a>;
+<code>doc_id</code> is the segment-local document id, the row number in
+<code>signatures.lance</code>. Both columns are stored without compression, so any run
+of rows is one ranged read per column. The file is divided into logical pages
+of <code>minhash_lsh_page_rows</code> rows: page <code>p</code> holds rows
+<code>[p * page_rows, (p + 1) * page_rows)</code>, and the last page may be shorter. A
+bucket may span any number of pages.</p>
+<h3 id="schema-metadata">Schema Metadata<a class="headerlink" href="#schema-metadata" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Key</th>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>minhash_lsh_details</code></td>
+<td style="text-align: left;">both</td>
+<td style="text-align: left;">Lower-case hexadecimal encoding of the serialized <code>MinHashLshIndexDetails</code> the segment was built from. A reader decodes it and requires it to describe, field by field, the same details as the index metadata.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>minhash_lsh_index_version</code></td>
+<td style="text-align: left;">both</td>
+<td style="text-align: left;">Decimal file layout version; <code>0</code> for the layout described here. Independent of <code>signature_version</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>minhash_lsh_num_docs</code></td>
+<td style="text-align: left;"><code>bands</code></td>
+<td style="text-align: left;">Decimal number of documents of the segment; equals the row count of <code>signatures.lance</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>minhash_lsh_page_rows</code></td>
+<td style="text-align: left;"><code>bands</code></td>
+<td style="text-align: left;">Decimal number of rows per logical page; positive. Writers use <code>4096</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>minhash_lsh_page_table_buffer</code></td>
+<td style="text-align: left;"><code>bands</code></td>
+<td style="text-align: left;">Decimal index of the global buffer of <code>bands.lance</code> that holds the page table.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="page-table">Page Table<a class="headerlink" href="#page-table" title="Permanent link">&para;</a></h3>
+<p>The page table is a global buffer of <code>bands.lance</code> holding
+<code>ceil(num_rows / page_rows)</code> little-endian UInt64 values; entry <code>p</code> is the
+largest <code>band_key</code> of page <code>p</code>, that is the key of its last row. It is read
+when the segment is opened and kept in memory while the index is open. The
+bucket of key <code>K</code> lies in the pages from the first page whose entry is <code>&gt;= K</code>
+through the first page whose entry is <code>&gt; K</code> (or the last page when there is
+none); the pages strictly between hold nothing but that bucket. Both
+positions are binary searches over the table, so a bucket's page range is
+known without reading the file.</p>
+<h3 id="opening-a-segment">Opening a Segment<a class="headerlink" href="#opening-a-segment" title="Permanent link">&para;</a></h3>
+<p>A reader opens a segment in this order and treats a failed check as
+corruption of the named file, except where noted:</p>
+<ol>
+<li>Parse the index details and check the ranges of
+   <a href="#index-details">Index Details</a>.</li>
+<li>Open both files. In each, the schema must match its definition above
+   exactly in field names, types, nullability and list size, which must equal
+   <code>num_hashes</code>; <code>minhash_lsh_details</code> must be present, decode, validate and
+   equal the index details field by field; and <code>minhash_lsh_index_version</code>
+   must be present. A version greater than the one the reader implements is
+   rejected as unsupported, not as corruption.</li>
+<li>In <code>bands.lance</code>, <code>minhash_lsh_page_rows</code> must be positive and
+   <code>minhash_lsh_num_docs</code> must equal the row count of <code>signatures.lance</code>.</li>
+<li>Read the page table buffer; its length must be a multiple of 8 and its
+   entry count must be <code>ceil(num_rows / page_rows)</code> for the row count of
+   <code>bands.lance</code>.</li>
+</ol>
+<p>While answering queries, a page that does not decode to non-null <code>UInt64</code>
+and <code>UInt32</code> columns, and a <code>doc_id</code> that is not below
+<code>minhash_lsh_num_docs</code>, are corruption of <code>bands.lance</code>; a signature batch
+with a null value is corruption of <code>signatures.lance</code>.</p>
+<p>The fragments a segment covers are recorded in the index metadata of the
+dataset, never derived from the stored <code>_rowid</code> values (which do not identify
+fragments once stable row ids are enabled).</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../ngram/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">N-gram</div>
+        </a>
+        <a class="next" href="../fmindex/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">FM-Index</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#high-level-architecture">High-Level Architecture</a>
+      <a class="ld-toc__h2" href="#index-details">Index Details</a>
+      <a class="ld-toc__h2" href="#signature-generation">Signature Generation</a>
+      <a class="ld-toc__h2" href="#storage-layout">Storage Layout</a>
+      <a class="ld-toc__h2" href="#segments-appends-and-merging">Segments, Appends and Merging</a>
+      <a class="ld-toc__h2" href="#query-evaluation">Query Evaluation</a>
+      <a class="ld-toc__h2" href="#compatibility">Compatibility</a>
+      <a class="ld-toc__h2" href="#version-0-reference">Version 0 Reference</a>
+      <a class="ld-toc__h3" href="#signature-procedure">Signature Procedure</a>
+      <a class="ld-toc__h3" href="#known-answer-vectors">Known-Answer Vectors</a>
+      <a class="ld-toc__h3" href="#signature-file-schema">Signature File Schema</a>
+      <a class="ld-toc__h3" href="#bands-file-schema">Bands File Schema</a>
+      <a class="ld-toc__h3" href="#schema-metadata">Schema Metadata</a>
+      <a class="ld-toc__h3" href="#page-table">Page Table</a>
+      <a class="ld-toc__h3" href="#opening-a-segment">Opening a Segment</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../">Specification</a>
+        <a href="../../../file/">File format</a>
+        <a href="../../../table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

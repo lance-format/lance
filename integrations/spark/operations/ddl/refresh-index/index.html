@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>REFRESH INDEX — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/spark/operations/ddl/refresh-index/">
+<link rel="icon" href="../../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../../.." aria-label="Lance">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../../">Overview</a>
+    <a href="../../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../../pytorch/">PyTorch</a>
+    <a href="../../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../../duckdb/">Overview</a>
+    <a href="../../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../../huggingface/">Home</a>
+    <a href="../../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../">Welcome</a>
+    <a href="../../../install/">Install</a>
+    <a href="../../../config/">Config</a>
+    <a href="../../../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../create-namespace/">CREATE NAMESPACE</a>
+    <a href="../drop-namespace/">DROP NAMESPACE</a>
+    <a href="../show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../create-table/">CREATE TABLE</a>
+    <a href="../show-tables/">SHOW TABLES</a>
+    <a href="../describe-table/">DESCRIBE TABLE</a>
+    <a href="../alter-table/">ALTER TABLE</a>
+    <a href="../set-unenforced-primary-key/">SET UNENFORCED PRIMARY KEY</a>
+    <a href="../show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../drop-table/">DROP TABLE</a>
+    <a href="../create-index/">CREATE INDEX</a>
+    <a href="../drop-index/">DROP INDEX</a>
+    <a class="active" href="./">REFRESH INDEX</a>
+    <a href="../show-indexes/">SHOW INDEXES</a>
+    <a href="../optimize-index/">OPTIMIZE INDEX</a>
+    <a href="../create-branch/">CREATE BRANCH</a>
+    <a href="../drop-branch/">DROP BRANCH</a>
+    <a href="../show-branches/">SHOW BRANCHES</a>
+    <a href="../create-tag/">CREATE TAG</a>
+    <a href="../drop-tag/">DROP TAG</a>
+    <a href="../show-tags/">SHOW TAGS</a>
+    <a href="../optimize/">OPTIMIZE</a>
+    <a href="../vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../dql/select/">SELECT</a>
+    <a href="../../dql/fts/">Full-Text Search</a>
+    <a href="../../dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../dql/search/">SEARCH</a>
+    <a href="../../dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../dml/insert-into/">INSERT INTO</a>
+    <a href="../../dml/insert-overwrite/">INSERT OVERWRITE</a>
+    <a href="../../dml/update/">UPDATE SET</a>
+    <a href="../../dml/delete/">DELETE FROM</a>
+    <a href="../../dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../../ray/">Welcome</a>
+    <a href="../../../../ray/read/">Read</a>
+    <a href="../../../../ray/write/">Write</a>
+    <a href="../../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../../ray/compaction/">Compaction</a>
+    <a href="../../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../../trino/">Welcome</a>
+    <a href="../../../../trino/install/">Install</a>
+    <a href="../../../../trino/config/">Config</a>
+    <a href="../../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../../../context/guide/storage/">Storage backends</a>
+    <a href="../../../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Apache Spark</span>
+        <span>/</span><span>Operations</span>
+        <span>/</span><span>DDL</span>
+        <span>/</span><b>REFRESH INDEX</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="refresh-index">REFRESH INDEX<a class="headerlink" href="#refresh-index" title="Permanent link">&para;</a></h1>
+<p>Index the fragments an existing index does not yet cover, without rebuilding the ones it does.</p>
+<div class="admonition warning">
+<p class="admonition-title">Spark Extension Required</p>
+<p>This feature requires the Lance Spark SQL extension to be enabled. See <a href="../../../config/#spark-sql-extensions">Spark SQL Extensions</a> for configuration details.</p>
+</div>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>Appending to a table creates new fragments, and an existing index does not cover them until it is
+maintained. <code>REFRESH INDEX</code> builds index data only for those uncovered fragments and adds it to the
+index, so cost scales with the newly appended data rather than with the table.</p>
+<p>This is the incremental counterpart to re-running <a href="../create-index/">CREATE INDEX</a>, which rebuilds
+every fragment. Both run distributed across Spark executors.</p>
+<p><a href="../optimize-index/">OPTIMIZE INDEX</a> fills the same missing coverage but runs on the Spark driver
+rather than distributing the build, and can also merge existing segments. Use <code>REFRESH INDEX</code> to
+parallelize the build across executors; use <code>OPTIMIZE INDEX</code> for driver-side maintenance or to merge
+segments after either command.</p>
+<h2 id="syntax">Syntax<a class="headerlink" href="#syntax" title="Permanent link">&para;</a></h2>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:1"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">user_id_idx</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h2 id="options">Options<a class="headerlink" href="#options" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>num_segments</code></td>
+<td>Integer</td>
+<td>Number of parallel build tasks, and so of index segments added (clamped to the number of uncovered fragments when larger). Each task takes a contiguous run of fragments, sized to balance estimated workloads by row count. Defaults to <code>min(uncovered_fragments, spark.default.parallelism)</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>Option names are case-insensitive: <code>WITH (NUM_SEGMENTS = 8)</code> and <code>WITH (num_segments = 8)</code> are the same option.</p>
+<p>Index method options — such as <code>rows_per_zone</code> for <code>zonemap</code> or the tokenizer settings for <code>fts</code> —
+are accepted as well, and are applied to the segments this command builds. See
+<a href="#index-method-options">Index Method Options</a> for when you need to pass them.</p>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="refresh-after-appending-data">Refresh after appending data<a class="headerlink" href="#refresh-after-appending-data" title="Permanent link">&para;</a></h3>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:1"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="s1">'new row'</span><span class="p">);</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">user_id_idx</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="refresh-after-compacting">Refresh after compacting<a class="headerlink" href="#refresh-after-compacting" title="Permanent link">&para;</a></h3>
+<p><a href="../optimize/">OPTIMIZE</a> replaces compacted fragments with new ones. A <code>zonemap</code> or <code>bloomfilter</code>
+index records physical row addresses, which a rewrite invalidates, so its coverage drops and a
+refresh restores it:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="3:1"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">OPTIMIZE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="p">;</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">zone_idx</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>Whether an index needs this depends on what it stores; see <a href="#notes-and-limitations">Compaction</a> below
+for which methods keep coverage after a rewrite.</p>
+<h3 id="control-build-parallelism">Control build parallelism<a class="headerlink" href="#control-build-parallelism" title="Permanent link">&para;</a></h3>
+<div class="tabbed-set tabbed-alternate" data-tabs="4:1"><input checked="checked" id="__tabbed_4_1" name="__tabbed_4" type="radio" /><div class="tabbed-labels"><label for="__tabbed_4_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">user_id_idx</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">num_segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="populate-a-deferred-index">Populate a deferred index<a class="headerlink" href="#populate-a-deferred-index" title="Permanent link">&para;</a></h3>
+<p>An index created with <code>train = false</code> covers no fragments, so refreshing it builds it over the whole
+table through the normal distributed path:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="5:1"><input checked="checked" id="__tabbed_5_1" name="__tabbed_5" type="radio" /><div class="tabbed-labels"><label for="__tabbed_5_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">train</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">);</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>The deferred index holds no built data to inherit method options from, so pass them to the refresh
+that populates it — see <a href="#index-method-options">Index Method Options</a>.</p>
+<h3 id="check-coverage-before-and-after">Check coverage before and after<a class="headerlink" href="#check-coverage-before-and-after" title="Permanent link">&para;</a></h3>
+<p><a href="../show-indexes/">SHOW INDEXES</a> reports how much of the table each index covers:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="6:1"><input checked="checked" id="__tabbed_6_1" name="__tabbed_6" type="radio" /><div class="tabbed-labels"><label for="__tabbed_6_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">SHOW</span><span class="w"> </span><span class="n">INDEXES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>A <code>num_unindexed_fragments</code> above zero means a refresh has work to do.</p>
+<h2 id="output">Output<a class="headerlink" href="#output" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fragments_indexed</code></td>
+<td>Long</td>
+<td>Number of previously uncovered fragments the commit covers.</td>
+</tr>
+<tr>
+<td><code>segments_added</code></td>
+<td>Long</td>
+<td>Number of new physical index segments committed.</td>
+</tr>
+<tr>
+<td><code>index_name</code></td>
+<td>String</td>
+<td>Name of the refreshed index, as stored in the table metadata.</td>
+</tr>
+</tbody>
+</table>
+<p>A refresh with nothing to do returns zeros and commits no new table version.</p>
+<p><code>fragments_indexed</code> counts the fragments actually covered, not the fragments planned: if a concurrent
+operation retires one while the build runs, it is excluded and a warning names it.</p>
+<h2 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Planning</strong>: the driver resolves the named index, subtracts its fragment coverage from the
+    table's fragments, and splits the remainder into batches, each a contiguous run of fragments
+    sized to balance row counts. Contiguity keeps <a href="../optimize/">OPTIMIZE</a> able to group the
+    fragments a segment covers.</li>
+<li><strong>Distributed Build</strong>: each batch becomes a Spark task that builds one uncommitted index
+    segment. Uncommitted segments are invisible to readers, so a failed build cannot affect query
+    results.</li>
+<li><strong>Transactional Commit</strong>: the driver commits the new segments as part of the same logical index.
+    Segments covering already-indexed fragments are retained, so existing coverage is preserved and
+    the change is atomic.</li>
+</ol>
+<p>Planning and building both run against a single pinned table version, so every task sees the
+fragment set the driver planned over.</p>
+<h2 id="index-method-options">Index Method Options<a class="headerlink" href="#index-method-options" title="Permanent link">&para;</a></h2>
+<p><code>REFRESH INDEX</code> builds its segments from the options in its own <code>WITH</code> clause; options you leave out
+fall back to the index type's defaults rather than to whatever the index was built with. Lance
+records a built index's parameters inside the index itself, not as table metadata a command can read
+back, so pass the same options to the refresh that you passed to <code>CREATE INDEX</code>:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="7:1"><input checked="checked" id="__tabbed_7_1" name="__tabbed_7" type="radio" /><div class="tabbed-labels"><label for="__tabbed_7_1">SQL</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">zonemap</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">rows_per_zone</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2048</span><span class="p">);</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">db</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="n">REFRESH</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_id</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">rows_per_zone</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2048</span><span class="p">);</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p>For most methods each segment is queried on its own and records its own configuration, so a mismatch
+changes performance characteristics rather than results.</p>
+<p><code>fts</code> (or <code>inverted</code>) is the exception: a full-text index is read with one configuration for all of
+its segments, and a set that disagrees cannot be queried. <code>REFRESH INDEX</code> therefore compares what it
+built against the segments it would join and <strong>fails without committing</strong> when they differ, leaving
+the index exactly as it was.</p>
+<p>Re-run with the original options, or rebuild with <a href="../create-index/">CREATE INDEX</a>, which replaces
+every segment and so has nothing to agree with. An <code>fts</code> index built by an older Lance version can
+also record a configuration the current one does not reproduce even from the same options; a full
+rebuild is the fix there.</p>
+<h2 id="notes-and-limitations">Notes and Limitations<a class="headerlink" href="#notes-and-limitations" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Index Methods</strong>: supported for the same methods as
+  <a href="../create-index/#index-methods">CREATE INDEX</a>: <code>zonemap</code>, <code>btree</code>, <code>bitmap</code>, <code>label_list</code>,
+  <code>ngram</code>, <code>bloomfilter</code>, <code>rtree</code>, and <code>fts</code> (or <code>inverted</code>). A vector index cannot be created from
+  Spark SQL either, so refreshing one is rejected and pointed at the Lance SDK rather than at
+  <code>CREATE INDEX</code>, which could not build it.</li>
+<li><strong>Full-Build Options</strong>: <code>train</code>, <code>build_mode</code>, and <code>rows_per_range</code> are rejected. Range-mode
+  <code>btree</code> redistributes and sorts the whole table, which an incremental refresh does not do — use
+  <code>CREATE INDEX</code> to rebuild that way.</li>
+<li><strong>Method Options Are Not Inherited</strong>: see <a href="#index-method-options">Index Method Options</a>.</li>
+<li><strong>Indexes Created Before Coverage Tracking</strong>: a segment that predates fragment coverage tracking
+  has no fragment bitmap, so its coverage cannot be determined. <code>REFRESH INDEX</code> rejects such an
+  index rather than silently rebuilding the whole table; rebuild it with <code>CREATE INDEX</code>.</li>
+<li><strong>Multi-Field Indexes</strong>: an index keyed on more than one field, or carrying columns beyond its key,
+  is rejected — a refreshed segment would declare only the key. Rebuild it with <code>CREATE INDEX</code>.</li>
+<li><strong>System Indexes</strong>: Lance-maintained indexes, including fragment-reuse and MemWAL indexes, cannot
+  be refreshed.</li>
+<li><strong>Compaction</strong>: <a href="../optimize/">OPTIMIZE</a> replaces the fragments it compacts with new ones. Whether
+  that costs the index its coverage depends on what the index stores. <code>zonemap</code> and <code>bloomfilter</code>
+  record physical row addresses, which the rewrite invalidates, so they lose coverage and need a
+  refresh afterwards. <code>btree</code>, <code>bitmap</code>, <code>label_list</code>, <code>ngram</code>, <code>rtree</code> and <code>fts</code> record row ids,
+  which follow their rows, so compaction carries their coverage over and a refresh reports
+  <code>fragments_indexed = 0</code>.</li>
+<li><strong>Stale <code>zonemap</code> Coverage</strong>: a partially covered <code>zonemap</code> index falls back to scanning uncovered
+  fragments in full, so query results stay complete but filtered queries do more I/O than a fully
+  covered index. Refresh after appending or compacting to restore selective reads.</li>
+<li><strong>Concurrent Retirement</strong>: if a concurrent operation retires a fragment while a refresh is
+  building it, that fragment is left out of the commit and named in a warning, and
+  <code>fragments_indexed</code> counts only what was covered. Re-run the refresh to pick up whatever replaced
+  it. A refresh whose fragments were <em>all</em> retired commits nothing and fails instead.</li>
+<li><strong>Concurrent <code>REFRESH INDEX</code></strong>: do not run two refreshes of the same index concurrently. The second
+  will either fail with a version conflict or succeed and add duplicate segment coverage over the same
+  fragments. <code>SHOW INDEXES</code> makes duplicate coverage visible via <code>num_segments</code>; merge segments with
+  <a href="../optimize-index/">OPTIMIZE INDEX</a> or rebuild with <a href="../create-index/">CREATE INDEX</a>.</li>
+<li><strong>Concurrent <code>DROP INDEX</code></strong>: do not drop an index while a refresh of it is in flight. The refresh
+  re-resolves its target immediately before committing and fails if it is gone, but the check and the
+  commit are separate transactions and Lance does not currently treat a concurrent same-name drop as
+  a conflict. A <code>DROP INDEX</code> landing in that window is undone: the index reappears covering only the
+  fragments the refresh built. Tracked upstream in
+  <a href="https://github.com/lance-format/lance/pull/6806">lance#6806</a>.</li>
+<li><strong>Segment Growth</strong>: each refresh adds segments to the index, and Lance can only compact fragments
+  that are covered by the identical set of index segments. So accumulated refreshes progressively
+  narrow what <a href="../optimize/">OPTIMIZE</a> can group: run <code>OPTIMIZE</code> before <code>REFRESH INDEX</code> rather than
+  after, and merge segments with <a href="../optimize-index/">OPTIMIZE INDEX</a> or rebuild with
+  <a href="../create-index/">CREATE INDEX</a> when the count grows. <a href="../show-indexes/">SHOW INDEXES</a> reports
+  <code>num_segments</code>.</li>
+</ul>
+<h2 id="see-also">See Also<a class="headerlink" href="#see-also" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="../create-index/">CREATE INDEX</a></li>
+<li><a href="../optimize-index/">OPTIMIZE INDEX</a></li>
+<li><a href="../show-indexes/">SHOW INDEXES</a></li>
+<li><a href="../drop-index/">DROP INDEX</a></li>
+<li><a href="../optimize/">OPTIMIZE</a></li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../drop-index/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">DROP INDEX</div>
+        </a>
+        <a class="next" href="../show-indexes/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">SHOW INDEXES</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#syntax">Syntax</a>
+      <a class="ld-toc__h2" href="#options">Options</a>
+      <a class="ld-toc__h2" href="#examples">Examples</a>
+      <a class="ld-toc__h3" href="#refresh-after-appending-data">Refresh after appending data</a>
+      <a class="ld-toc__h3" href="#refresh-after-compacting">Refresh after compacting</a>
+      <a class="ld-toc__h3" href="#control-build-parallelism">Control build parallelism</a>
+      <a class="ld-toc__h3" href="#populate-a-deferred-index">Populate a deferred index</a>
+      <a class="ld-toc__h3" href="#check-coverage-before-and-after">Check coverage before and after</a>
+      <a class="ld-toc__h2" href="#output">Output</a>
+      <a class="ld-toc__h2" href="#how-it-works">How It Works</a>
+      <a class="ld-toc__h2" href="#index-method-options">Index Method Options</a>
+      <a class="ld-toc__h2" href="#notes-and-limitations">Notes and Limitations</a>
+      <a class="ld-toc__h2" href="#see-also">See Also</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../../format/">Specification</a>
+        <a href="../../../../../format/file/">File format</a>
+        <a href="../../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../../quickstart/">Getting started</a>
+        <a href="../../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../../..";</script>
+<script src="../../../../../assets/site.js" defer></script>
+</body>
+</html>

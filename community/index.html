@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Lance Community Governance — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/community/">
+<link rel="icon" href="../logo/logo.png">
+<link rel="stylesheet" href="../assets/tokens.css">
+<link rel="stylesheet" href="../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href=".." aria-label="Lance">
+      <img src="../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="..">Home</a>
+      <a class="ld-toptab" href="../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../format/">Specification</a>
+      <a class="ld-toptab" href="../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../integrations/">Integrations</a>
+      <a class="ld-toptab active" href="./">Community</a>
+      <a class="ld-toptab" href="../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Community
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Community</div>
+    <a class="active" href="./">Lance Community Governance</a>
+    <a href="maintainers/">Maintainers</a>
+    <a href="pmc/">PMC</a>
+    <a href="communication/">Communication</a>
+    <a href="voting/">Voting</a>
+    <a href="contributing/">Contributing</a>
+    <a href="release/">Release</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Project Specific Guidelines</div>
+    <a href="project-specific/">Project Specific Guidelines</a>
+    <a href="project-specific/namespace/">Lance Namespace</a>
+    <a href="project-specific/namespace-impls/">Lance Namespace Impls</a>
+    <a href="project-specific/ray/">Lance Ray</a>
+    <a href="project-specific/spark/">Lance Spark</a>
+    <a href="project-specific/trino/">Lance Trino</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance</div>
+    <a href="project-specific/lance/general/">General</a>
+    <a href="project-specific/lance/release/">Release</a>
+    <a href="project-specific/lance/rust/">Rust</a>
+    <a href="project-specific/lance/python/">Python</a>
+    <a href="project-specific/lance/docs/">Docs</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Community</span>
+        <span>/</span><b>Lance Community Governance</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-community-governance">Lance Community Governance<a class="headerlink" href="#lance-community-governance" title="Permanent link">&para;</a></h1>
+<p>The Lance community is run by volunteers in a collaborative and open way.
+Its governance is inspired by open source foundations and projects such as ASF, CNCF, and Substrait.</p>
+<h2 id="governance-structure">Governance Structure<a class="headerlink" href="#governance-structure" title="Permanent link">&para;</a></h2>
+<p>The Lance community recognizes three tiers of participation:</p>
+<h3 id="contributors">Contributors<a class="headerlink" href="#contributors" title="Permanent link">&para;</a></h3>
+<p>Everyone who has made a contribution to Lance is a contributor.</p>
+<p>A "contribution" is not limited to code changes.
+Adopting Lance in personal or company projects, providing bug reports and feature requests, performing code reviews,
+organizing or planning community gatherings, giving talks, creating and assisting in branding and design,
+writing documentation, and many other activities are all counted as contributions.</p>
+<p>All contributions, regardless of form, are valued and greatly appreciated.
+It is entirely possible to advance through the governance tiers without writing code.</p>
+<h3 id="maintainers">Maintainers<a class="headerlink" href="#maintainers" title="Permanent link">&para;</a></h3>
+<p>A maintainer is a contributor who has made sustained and valuable contributions to the Lance community.
+Maintainers are recognized for their work and granted various rights to support their ongoing contributions.
+For more details of the activities, rights, roster and how to become a maintainer, see <a href="maintainers/">Maintainers</a>.</p>
+<h3 id="project-management-committee-pmc">Project Management Committee (PMC)<a class="headerlink" href="#project-management-committee-pmc" title="Permanent link">&para;</a></h3>
+<p>A PMC member is a maintainer who has demonstrated leadership in the project.
+The PMC guides the long-term direction, makes decisions on governance and project changes, and protects the Lance brand.
+For more details of the activities, rights, roster and how to become a PMC member, see <a href="pmc/">PMC</a>.</p>
+<h3 id="roster-information">Roster Information<a class="headerlink" href="#roster-information" title="Permanent link">&para;</a></h3>
+<p>Maintainer and PMC rosters information follow these guidelines:</p>
+<ul>
+<li><strong>Ordering</strong>: People in the roster are listed in alphabetical order by last name</li>
+<li><strong>Self-Report</strong>: Personal information such as <em>Affiliation</em> and <em>Ecosystem Roles</em> is self-reported and updated at the individual's discretion.</li>
+<li><strong>Ecosystem Roles</strong>: This field documents the individual's involvement in other open source projects if any. It helps identify potential collaboration and integration pathways with the broader open source ecosystem.</li>
+</ul>
+<h2 id="projects">Projects<a class="headerlink" href="#projects" title="Permanent link">&para;</a></h2>
+<p>This section details the projects maintained in the Lance community.</p>
+<h3 id="core-project">Core Project<a class="headerlink" href="#core-project" title="Permanent link">&para;</a></h3>
+<p><a href="https://github.com/lance-format/lance">lance</a> is the core project of the lance-format GitHub Organization,
+which hosts most of the development on the table and file format, Rust SDK, Python and Java binding SDKs, documentation and discussions.</p>
+<p>The core project is maintained by the Lance community with strict quality and release standards.
+<a href="contributing/">Contributing Guidelines</a>, <a href="voting/">Community Voting Process</a> and <a href="release/">Release Guidelines</a>
+are all applicable to the core project.</p>
+<h3 id="subprojects">Subprojects<a class="headerlink" href="#subprojects" title="Permanent link">&para;</a></h3>
+<p>Subprojects are initiatives or repositories that extend Lance's functionality.
+They must align with Lance's overall mission and technical direction.
+New subprojects are created by graduating from incubating subprojects through a PMC vote.</p>
+<p>Subprojects have relaxed requirements compared to core projects:</p>
+<ul>
+<li>Contributors may receive write access even if not maintainers</li>
+<li>Merges may be allowed without review at maintainer discretion</li>
+<li>Release processes may be simplified compared to core projects</li>
+</ul>
+<p>Here is the list of current subprojects:</p>
+<table>
+<thead>
+<tr>
+<th>Project Name</th>
+<th>Repository</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lance-duckdb</td>
+<td><a href="https://github.com/lance-format/lance-duckdb">https://github.com/lance-format/lance-duckdb</a></td>
+<td>DuckDB extension for Lance</td>
+</tr>
+<tr>
+<td>lance-huggingface</td>
+<td><a href="https://github.com/lance-format/lance-huggingface">https://github.com/lance-format/lance-huggingface</a></td>
+<td>Hugging Face integration for Lance</td>
+</tr>
+<tr>
+<td>lance-namespace</td>
+<td><a href="https://github.com/lance-format/lance-namespace">https://github.com/lance-format/lance-namespace</a></td>
+<td>Lance namespace format specification, Rust/Python/Java Codegen SDKs</td>
+</tr>
+<tr>
+<td>lance-namespace-impls</td>
+<td><a href="https://github.com/lance-format/lance-namespace-impls">https://github.com/lance-format/lance-namespace-impls</a></td>
+<td>Lance Namespace Implementations - Apache Hive, Apache Polaris, Apache Gravitino, Unity Catalog, AWS Glue and more</td>
+</tr>
+<tr>
+<td>lance-python-doc</td>
+<td><a href="https://github.com/lance-format/lance-python-doc">https://github.com/lance-format/lance-python-doc</a></td>
+<td>Lance Python SDK generated docs and integration hook with readthedocs</td>
+</tr>
+<tr>
+<td>lance-ray</td>
+<td><a href="https://github.com/lance-format/lance-ray">https://github.com/lance-format/lance-ray</a></td>
+<td>Ray integration for Lance</td>
+</tr>
+<tr>
+<td>lance-spark</td>
+<td><a href="https://github.com/lance-format/lance-spark">https://github.com/lance-format/lance-spark</a></td>
+<td>Apache Spark connector for Lance</td>
+</tr>
+</tbody>
+</table>
+<h3 id="incubating-subprojects">Incubating Subprojects<a class="headerlink" href="#incubating-subprojects" title="Permanent link">&para;</a></h3>
+<p>Incubating subprojects are experimental or early-stage repositories in the Lance ecosystem.
+Any PMC member can create an incubating subproject without a formal vote.
+These projects provide a space for new ideas to develop before committing to full subproject standards.</p>
+<p>Incubating subprojects have the most relaxed requirements:</p>
+<ul>
+<li>Anyone can be added as a committer by the project creator or existing PMC members</li>
+<li>Merges without review are allowed</li>
+<li>No formal release process is required</li>
+</ul>
+<p><strong>Important</strong>: All incubating subprojects must include a prominent notice in their README with the following exact notice:</p>
+<blockquote>
+<p>⚠️ <strong>Incubating Subproject</strong>: This project is in incubation and is not yet an official Lance subproject.
+APIs and functionality may change without notice. Use it in production at your own risk.</p>
+</blockquote>
+<p>Here is the list of current incubating subprojects:</p>
+<table>
+<thead>
+<tr>
+<th>Project Name</th>
+<th>Repository</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lance-context</td>
+<td><a href="https://github.com/lance-format/lance-context">https://github.com/lance-format/lance-context</a></td>
+<td>Manage Multimodal Agentic Context Lifecycle with Lance</td>
+</tr>
+<tr>
+<td>lance-data-viewer</td>
+<td><a href="https://github.com/lance-format/lance-data-viewer">https://github.com/lance-format/lance-data-viewer</a></td>
+<td>Read-only web interface for browsing Lance datasets</td>
+</tr>
+<tr>
+<td>lance-flink</td>
+<td><a href="https://github.com/lance-format/lance-flink">https://github.com/lance-format/lance-flink</a></td>
+<td>Apache Flink connector for Lance</td>
+</tr>
+<tr>
+<td>lance-graph</td>
+<td><a href="https://github.com/lance-format/lance-graph">https://github.com/lance-format/lance-graph</a></td>
+<td>Cypher-capable graph query engine on top of Lance</td>
+</tr>
+<tr>
+<td>lance-trino</td>
+<td><a href="https://github.com/lance-format/lance-trino">https://github.com/lance-format/lance-trino</a></td>
+<td>Trino connector for Lance</td>
+</tr>
+<tr>
+<td>pglance</td>
+<td><a href="https://github.com/lance-format/pglance">https://github.com/lance-format/pglance</a></td>
+<td>PostgreSQL extension for Lance</td>
+</tr>
+</tbody>
+</table>
+<h3 id="graduating-from-incubating-to-subproject">Graduating from Incubating to Subproject<a class="headerlink" href="#graduating-from-incubating-to-subproject" title="Permanent link">&para;</a></h3>
+<p>The PMC can vote to promote an incubating subproject to a subproject once the project has demonstrated:</p>
+<ul>
+<li>Proper repository setup including CI, issue tracking, and contributing guide</li>
+<li>Proper code standard enforcement including lint and testing</li>
+<li>Established use cases</li>
+<li>Community adoption outside the primary contributor</li>
+<li>At least one Lance maintainer actively maintaining the project</li>
+</ul>
+<p>Contributors with write access will retain their access after graduation to subproject.</p>
+<h3 id="project-license">Project License<a class="headerlink" href="#project-license" title="Permanent link">&para;</a></h3>
+<p>All Lance projects hosted in the <a href="https://github.com/lance-format">lance-format</a> GitHub Organization
+are licensed under the <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a>.</p>
+<h3 id="external-integrations">External Integrations<a class="headerlink" href="#external-integrations" title="Permanent link">&para;</a></h3>
+<p>We welcome and encourage Lance integrations in external projects.
+These integrations are valuable contributions to the Lance community and help expand the Lance ecosystem.
+When integrations are developed in external projects,
+the integration code and licensing should follow the guidelines and license of the external project.</p>
+<h2 id="reporting-security-vulnerability">Reporting Security Vulnerability<a class="headerlink" href="#reporting-security-vulnerability" title="Permanent link">&para;</a></h2>
+<p>In case of any security vulnerability,
+please contact the PMC through the <a href="mailto:private@lance.org">Lance Private Mailing List</a>
+and refrain from public disclosure until the issue is resolved.</p>
+<h2 id="reporting-harassment">Reporting Harassment<a class="headerlink" href="#reporting-harassment" title="Permanent link">&para;</a></h2>
+<p>The Lance community follows the <a href="https://www.rust-lang.org/policies/code-of-conduct">Rust Community Code of Conduct</a>.
+We are committed to providing a welcoming and inspiring community for all.
+Harassment of participants will not be tolerated.
+For such cases, please report to the <a href="mailto:private@lance.org">Lance Private Mailing List</a>.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../integrations/context/design/using-datagen-store/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Using the datagen store</div>
+        </a>
+        <a class="next" href="maintainers/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Maintainers</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#governance-structure">Governance Structure</a>
+      <a class="ld-toc__h3" href="#contributors">Contributors</a>
+      <a class="ld-toc__h3" href="#maintainers">Maintainers</a>
+      <a class="ld-toc__h3" href="#project-management-committee-pmc">Project Management Committee (PMC)</a>
+      <a class="ld-toc__h3" href="#roster-information">Roster Information</a>
+      <a class="ld-toc__h2" href="#projects">Projects</a>
+      <a class="ld-toc__h3" href="#core-project">Core Project</a>
+      <a class="ld-toc__h3" href="#subprojects">Subprojects</a>
+      <a class="ld-toc__h3" href="#incubating-subprojects">Incubating Subprojects</a>
+      <a class="ld-toc__h3" href="#graduating-from-incubating-to-subproject">Graduating from Incubating to Subproject</a>
+      <a class="ld-toc__h3" href="#project-license">Project License</a>
+      <a class="ld-toc__h3" href="#external-integrations">External Integrations</a>
+      <a class="ld-toc__h2" href="#reporting-security-vulnerability">Reporting Security Vulnerability</a>
+      <a class="ld-toc__h2" href="#reporting-harassment">Reporting Harassment</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../format/">Specification</a>
+        <a href="../format/file/">File format</a>
+        <a href="../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../quickstart/">Getting started</a>
+        <a href="../guide/read_and_write/">User guide</a>
+        <a href="../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "..";</script>
+<script src="../assets/site.js" defer></script>
+</body>
+</html>
