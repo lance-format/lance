@@ -1259,6 +1259,7 @@ async fn raw_segment_row_addrs(dataset: &Dataset, segment: &IndexMetadata, value
         .load_index(
             Arc::new(store),
             &prost_types::Any::default(),
+            segment.index_version as u32,
             None,
             &lance_core::cache::LanceCache::no_cache(),
         )
