@@ -385,6 +385,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Result<Self> {
+        if let Some(ivf_params) = ivf_params.as_ref() {
+            // The legacy IVF_PQ writer checks these combinations in
+            // `sanity_check_ivf_params`; this path had no equivalent, so a
+            // precomputed input paired with trained centroids was accepted and
+            // produced an index whose partition ids belong to other centroids.
+            ivf_params.validate()?;
+        }
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
@@ -3570,6 +3577,48 @@ mod tests {
         (0..vectors.len())
             .map(|i| vectors.value(i).as_primitive::<Float32Type>().value(0))
             .collect()
+    }
+
+    /// The V3 builder is the current write path, so the contract the legacy
+    /// IVF_PQ writer enforces has to hold here too: precomputed partition ids
+    /// are only meaningful next to the centroids they were assigned against.
+    #[tokio::test]
+    async fn test_new_rejects_precomputed_buffers_without_centroids() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().join("idx");
+
+        let mut ivf_params = IvfBuildParams::new(1);
+        ivf_params.precomputed_shuffle_buffers =
+            Some((Path::from("buffers/data"), vec!["buffer1.lance".to_owned()]));
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "vec".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            Some(ivf_params),
+            Some(()),
+            (),
+            None,
+        );
+
+        let Err(err) = builder else {
+            panic!("expected the constructor to reject the params");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("precomputed_shuffle_buffers requires centroids"),
+            "unexpected message: {err}"
+        );
     }
 
     fn cluster_batch(
