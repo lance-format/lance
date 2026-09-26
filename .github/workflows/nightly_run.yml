@@ -45,6 +45,78 @@ jobs:
           # to avoid OOM issues (these tests use >5GiB memory each)
           cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
 
+  # AddressSanitizer over lance-linalg's tests. Its public entry points validate
+  # the lengths a caller passes, but the SIMD kernels then walk the output buffer
+  # with their own pointer arithmetic, and nothing checks that. An off-by-one in
+  # a chunk count writes past the end while every entry assert still passes, and
+  # whether the process notices depends on the allocator. This job is here to
+  # make that class fail with a file and a line.
+  #
+  # Not in rust.yml because -Zsanitizer needs a nightly toolchain, which this
+  # repo otherwise only uses on a schedule. RUSTUP_TOOLCHAIN below says why the
+  # pin is set the way it is.
+  linalg-asan:
+    if: github.repository == 'lance-format/lance'
+    name: lance-linalg AddressSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # build.rs compiles dist_table.c with whatever CC provides and only warns
+      # on failure, so CC decides whether kernel_support = "avx512_dist_table" is
+      # set, and with it whether an AVX-512 host runs the C kernel or the Rust
+      # arm. rust.yml's linux-build sets clang for the same reason.
+      #
+      # Default features, unlike linux-build's --features "${ALL_FEATURES}":
+      # turning on fp16kernels would route the f16 and bf16 dispatch into C that
+      # RUSTFLAGS cannot instrument, so leaving it off gives the sanitizer more
+      # Rust to check rather than less.
+      CC: clang
+      # Setting RUSTFLAGS replaces the per-target rustflags in
+      # .cargo/config.toml wholesale, so the baseline has to be repeated here:
+      # without it this would instrument a build no release ever ships, and the
+      # arms selected by all(target_feature = "avx2", target_feature = "fma")
+      # would not be compiled at all.
+      RUSTFLAGS: "-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c -Zsanitizer=address"
+      # This job is after memory errors. LeakSanitizer is on by default with
+      # ASan on Linux.
+      ASAN_OPTIONS: "detect_leaks=0"
+      # rust.yml sets this workflow-wide. It matters here once a Rust panic
+      # rather than a sanitizer report is the likely failure.
+      RUST_BACKTRACE: "1"
+      # rust-toolchain.toml pins 1.97.0, and a rustup override file outranks
+      # `rustup default`, so without this the sanitizer flag reaches a stable
+      # compiler and cargo stops at "the option `Z` is only accepted on the
+      # nightly compiler". daily-code-coverage.yml solves the same problem with
+      # `cargo +nightly-...`.
+      RUSTUP_TOOLCHAIN: nightly-2026-07-13
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      # Without this the report is bare hex addresses and module offsets:
+      # ubuntu-24.04 ships llvm-symbolizer only under a versioned name, and ASan
+      # looks for the unversioned one on PATH.
+      - name: Point ASan at llvm-symbolizer
+        run: |
+          set -euo pipefail
+          symbolizer=$(command -v llvm-symbolizer \
+            || ls -1 /usr/lib/llvm-*/bin/llvm-symbolizer | sort -V | tail -1)
+          "$symbolizer" --version
+          echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
+      # No protoc step: lance-linalg's dependency closure contains no
+      # prost-build or tonic-build, dev-dependencies included.
+      #
+      # --target keeps the sanitizer off build scripts and proc macros, which
+      # run on the host and do not need it.
+      - name: Run lance-linalg tests under AddressSanitizer
+        run: |
+          cargo test -p lance-linalg --tests --locked \
+            --target x86_64-unknown-linux-gnu
+
   # Cross-version index maintenance-sequence search (see python/tests/compat/compat_sequence.py).
   # Ages an index under the latest release of each of the two previous majors and exercises it
   # under this commit, searching op sequences for panics or correctness divergence. The search is
