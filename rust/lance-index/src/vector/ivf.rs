@@ -177,7 +177,11 @@ impl IvfTransformer {
 
         transforms.push(Arc::new(FlatTransformer::new(vector_column)));
 
-        Self::new(centroids, distance_type, transforms)
+        // Keep the converted metric, like the sibling constructors: the chain
+        // above normalized for cosine and assigns with L2, so the transformer's
+        // own `find_partitions` and `compute_partitions` have to measure the
+        // same way.
+        Self::new(centroids, dt, transforms)
     }
 
     /// Create a IVF_PQ struct.
@@ -358,5 +362,42 @@ impl Transformer for IvfTransformer {
             batch = transform.transform(&batch)?;
         }
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Float32Array;
+    use lance_arrow::FixedSizeListArrayExt;
+
+    /// `new_flat` normalizes the vectors for cosine and assigns partitions with
+    /// L2, like its sibling constructors, so the metric it stores has to be the
+    /// converted one too. Otherwise the transformer's own `find_partitions` and
+    /// `compute_partitions` measure with cosine while the chain measured with
+    /// L2, and the distances it hands back are on a different scale than the
+    /// ones it wrote into the batch.
+    #[test]
+    fn test_new_flat_keeps_the_converted_metric() {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0f32, 0.0, 0.0, 1.0]),
+            2,
+        )
+        .unwrap();
+        let query = Float32Array::from(vec![1.0f32, 0.0]);
+
+        let cosine =
+            IvfTransformer::new_flat(centroids.clone(), DistanceType::Cosine, "vector", None);
+        let l2 = IvfTransformer::new_flat(centroids, DistanceType::L2, "vector", None);
+
+        let (cosine_parts, cosine_dists) = cosine.find_partitions(&query, 2).unwrap();
+        let (l2_parts, l2_dists) = l2.find_partitions(&query, 2).unwrap();
+
+        assert_eq!(cosine_parts.values(), l2_parts.values());
+        assert_eq!(
+            cosine_dists.values(),
+            l2_dists.values(),
+            "the cosine flat transformer should report the L2 distances it assigns with"
+        );
     }
 }
