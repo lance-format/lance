@@ -178,7 +178,7 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 let modified_fragment_ids =
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -901,7 +901,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // A data replacement only conflicts if it is updating a field the
                     // index depends on -- whether keyed on or merely carried, since
                     // `fields` lists both (see `IndexMetadata::covering_fields`).
@@ -1021,7 +1021,7 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // These conflict if the rewrite touches any of the fragments being replaced.
                     for replacement in replacements {
                         for group in groups {
@@ -1223,14 +1223,12 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::DataReplacement { replacements } = &self.transaction.operation {
+        if let Operation::DataReplacement { replacements, .. } = &self.transaction.operation {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
-                // Both a column replacement and an overlay preserve physical row
-                // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Project { schema, .. } => {
@@ -1354,6 +1352,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::DataReplacement {
                     replacements: other_replacements,
+                    ..
                 } => {
                     // These conflict if there is overlap in fragment id && fields.
                     for replacement in replacements {
@@ -3700,6 +3699,7 @@ mod tests {
                         1,
                         DataFile::new_legacy_from_fields("r.lance", vec![0], None),
                     )],
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -4068,6 +4068,7 @@ mod tests {
                 "replacement",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, file())],
+                    replaced_offsets: None,
                 },
             ),
             (
@@ -5082,7 +5083,7 @@ mod tests {
                     .map(|f| f.id)
                     .chain(removed_fragment_ids.iter().copied()),
             ),
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
             Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
@@ -5108,9 +5109,11 @@ mod tests {
                 "Different fragments",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(1, data_file_frag1_fields01)],
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -5118,9 +5121,11 @@ mod tests {
                 "Same fragment, different fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields23)],
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -5128,9 +5133,11 @@ mod tests {
                 "Same fragment, same fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),
@@ -5138,12 +5145,14 @@ mod tests {
                 "Same fragment, overlapping fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(
                         0,
                         DataFile::new_legacy_from_fields("path0_12", vec![1, 2], None),
                     )],
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),
@@ -5151,6 +5160,7 @@ mod tests {
                 "DataReplacement vs Rewrite on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -5166,6 +5176,7 @@ mod tests {
                 "DataReplacement vs Rewrite on different fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -5184,6 +5195,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5203,6 +5215,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) with inserts on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5221,6 +5234,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) that rewrote one of our fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5239,6 +5253,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved our rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5257,6 +5272,7 @@ mod tests {
                 "DataReplacement vs Update that removed our fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![],
@@ -5275,6 +5291,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved a different fragment's rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(1)],
@@ -5293,6 +5310,7 @@ mod tests {
                 "DataReplacement vs Delete (deletion-vector only) on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![],
@@ -5305,6 +5323,7 @@ mod tests {
                 "DataReplacement vs Delete that removes the fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replaced_offsets: None,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![0],
@@ -5318,6 +5337,7 @@ mod tests {
                 "DataReplacement vs Merge",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    replaced_offsets: None,
                 },
                 Operation::Merge {
                     fragments: vec![Fragment::new(0)],
@@ -5358,6 +5378,7 @@ mod tests {
                         0,
                         DataFile::new_legacy_from_fields("path0_3", vec![3], None),
                     )],
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),

@@ -365,6 +365,14 @@ message Transaction {
   // An operation that replaces the data in a region of the table with new data.
   message DataReplacement {
     repeated DataReplacementGroup replacements = 1;
+    /* Per replaced fragment, the physical row offsets whose values changed,
+     * as portable RoaringBitmap bytes. Drives row-level last_updated_at_version
+     * stamping: only the listed offsets take the new version, the rest keep
+     * theirs. Absent, or absent for a fragment, stamps every row of it.
+     * Keys must name fragments in `replacements`; offsets must be below the
+     * fragment's physical row count.
+     */
+    map<uint64, bytes> replaced_offset_bitmaps = 2;
   }
 
   /* Overlay files to append to a single fragment, in order (the last entry is
