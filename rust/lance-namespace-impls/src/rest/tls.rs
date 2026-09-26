@@ -70,8 +70,13 @@ impl TlsConfig {
 
     fn build_client(&self, material: TlsMaterial) -> Result<reqwest::Client> {
         // Build the client WITHOUT default headers - they are applied per-request.
-        let mut client_builder =
-            reqwest::Client::builder().danger_accept_invalid_hostnames(!self.assert_hostname);
+        //
+        // `Identity::from_pem` produces a rustls identity, so the client must use rustls.
+        // reqwest prefers native-tls whenever another crate in the build enables its
+        // `default-tls` feature, and would then reject the identity.
+        let mut client_builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .danger_accept_invalid_hostnames(!self.assert_hostname);
 
         if let Some(identity) = material.identity {
             client_builder = client_builder.identity(identity);
@@ -88,8 +93,9 @@ impl TlsConfig {
 
     /// Build the initial client, dropping only the material it cannot use.
     ///
-    /// A CA certificate is parsed when the client is built rather than when it is read, so it
-    /// can still fail here, and construction has no working client to fall back to - drop it on
+    /// With rustls alone, a CA certificate is parsed when the client is built rather than when
+    /// it is read, so it can still fail here, and construction has no working client to fall
+    /// back to - drop it on
     /// its own rather than with the client identity. The digest survives only a build that used
     /// everything that loaded, so whatever was dropped is retried on the next check.
     fn build_best_effort(&self, material: TlsMaterial) -> (reqwest::Client, Option<u64>) {
@@ -517,20 +523,24 @@ vlUSTstZkV9DqFsqGgtQZsdPpD/ndAKCeILH618omGtfieRWbNEfmLnD
             Some("-----BEGIN CERTIFICATE-----\nnot a certificate\n"),
         );
 
+        // reqwest parses a CA certificate when it is read if native-tls is compiled in, and
+        // otherwise only when the client is built. Either way the identity must survive.
         let material = TlsMaterial::load_best_effort(&tls);
         let identity = material.identity.clone();
-        assert!(tls.build_client(material).is_err());
-
-        // What the retry falls back to.
         assert!(identity.is_some());
-        assert!(
-            tls.build_client(TlsMaterial {
-                identity,
-                root_cert: None,
-                digest: None,
-            })
-            .is_ok()
-        );
+        if material.root_cert.is_some() {
+            assert!(tls.build_client(material).is_err());
+
+            // What the retry falls back to.
+            assert!(
+                tls.build_client(TlsMaterial {
+                    identity,
+                    root_cert: None,
+                    digest: None,
+                })
+                .is_ok()
+            );
+        }
 
         let (_, digest) = tls.build_best_effort(TlsMaterial::load_best_effort(&tls));
         assert!(
