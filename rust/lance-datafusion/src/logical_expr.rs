@@ -105,10 +105,10 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }))
             } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
                 match right.as_ref() {
-                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    Expr::Literal(..) | Expr::Cast(_) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
-                        right: Box::new(resolve_value(right.as_ref(), &left_type)?),
+                        right: Box::new(coerce_expr(right.as_ref(), &left_type)?),
                     })),
                     // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
                     Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
@@ -124,8 +124,8 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }
             } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {
                 match left.as_ref() {
-                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(resolve_value(left.as_ref(), &right_type)?),
+                    Expr::Literal(..) | Expr::Cast(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(coerce_expr(left.as_ref(), &right_type)?),
                         op: *op,
                         right: right.clone(),
                     })),
@@ -176,8 +176,33 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
             right: Box::new(coerce_expr(right, dtype)?),
         })),
         literal_expr @ Expr::Literal(..) => Ok(resolve_value(literal_expr, dtype)?),
+        Expr::Cast(_) => Ok(narrow_double_literal(expr, dtype).unwrap_or_else(|| expr.clone())),
         _ => Ok(expr.clone()),
     }
+}
+
+/// Narrows a double literal such as `CAST(0.5 AS double)` to a `Float32` column's
+/// type when the value converts exactly, so the column is not cast and stays
+/// indexable.
+fn narrow_double_literal(expr: &Expr, dtype: &DataType) -> Option<Expr> {
+    let Expr::Cast(cast) = expr else {
+        return None;
+    };
+    let Expr::Literal(value, _) = cast.expr.as_ref() else {
+        return None;
+    };
+    if *dtype != DataType::Float32 || *cast.field.data_type() != DataType::Float64 {
+        return None;
+    }
+    let ScalarValue::Float64(value) = value.cast_to(&DataType::Float64).ok()? else {
+        return None;
+    };
+    let narrowed = value.map(|value| value as f32);
+    // `total_cmp` also tells NaN signs and signed zeros apart.
+    let is_exact = value
+        .zip(narrowed)
+        .is_none_or(|(value, narrowed)| f64::from(narrowed).total_cmp(&value).is_eq());
+    is_exact.then(|| lit(ScalarValue::Float32(narrowed)))
 }
 
 /// Coerce logical expression for filters to boolean.
@@ -388,6 +413,26 @@ mod tests {
             true,
         );
         assert_eq!(resolved, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::half("x > CAST(0.5 AS DOUBLE)", col("x").gt(lit(0.5_f32)))]
+    #[case::reversed("CAST(0.5 AS DOUBLE) < x", lit(0.5_f32).lt(col("x")))]
+    #[case::negative_infinity("x < CAST('-inf' AS DOUBLE)", col("x").lt(lit(f32::NEG_INFINITY)))]
+    #[case::null("x > CAST(NULL AS DOUBLE)", col("x").gt(lit(ScalarValue::Float32(None))))]
+    #[case::between(
+        "x BETWEEN 0.0 AND CAST(0.5 AS DOUBLE)",
+        col("x").between(lit(0.0_f32), lit(0.5_f32))
+    )]
+    #[case::in_list("x IN (CAST(0.5 AS DOUBLE))", col("x").in_list(vec![lit(0.5_f32)], false))]
+    #[case::inexact(
+        "x = CAST(0.1 AS DOUBLE)",
+        col("x").eq(cast(lit(0.1), DataType::Float64))
+    )]
+    fn test_resolve_double_literal_on_float32(#[case] sql: &str, #[case] expected: Expr) {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Float32, true)]);
+        let planner = crate::planner::Planner::new(Arc::new(schema));
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
     }
 
     #[test]
