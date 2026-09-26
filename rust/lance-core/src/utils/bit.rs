@@ -9,11 +9,12 @@
 /// assert!(is_pwr_two(1));
 /// assert!(is_pwr_two(2));
 /// assert!(is_pwr_two(1024));
+/// assert!(!is_pwr_two(0));
 /// assert!(!is_pwr_two(3));
 /// assert!(!is_pwr_two(1000));
 /// ```
 pub fn is_pwr_two(n: u64) -> bool {
-    n & (n - 1) == 0
+    n != 0 && n & (n - 1) == 0
 }
 
 /// Returns the number of padding bytes needed to align `n` to `ALIGN`.

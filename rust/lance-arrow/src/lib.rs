@@ -1562,7 +1562,7 @@ pub trait BufferExt {
 }
 
 fn is_pwr_two(n: u64) -> bool {
-    n & (n - 1) == 0
+    n != 0 && n & (n - 1) == 0
 }
 
 impl BufferExt for arrow_buffer::Buffer {
@@ -1609,6 +1609,20 @@ mod tests {
         new_null_array,
     };
     use arrow_buffer::OffsetBuffer;
+
+    /// `lance-arrow` keeps its own copy of this helper, so it needs its own
+    /// pin: `0 - 1` underflows, which panicked in a debug build and reported 0
+    /// as a power of two in release.
+    #[test]
+    fn is_pwr_two_rejects_zero() {
+        assert!(!is_pwr_two(0));
+        assert!(is_pwr_two(1));
+        assert!(is_pwr_two(2));
+        assert!(is_pwr_two(1024));
+        assert!(is_pwr_two(1u64 << 63));
+        assert!(!is_pwr_two(3));
+        assert!(!is_pwr_two(u64::MAX));
+    }
 
     #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {
