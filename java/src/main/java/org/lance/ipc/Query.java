@@ -45,6 +45,11 @@ public class Query {
         !builder.maximumNprobes.isPresent()
             || builder.maximumNprobes.get() >= builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
+    Preconditions.checkArgument(
+        !builder.ef.isPresent() || builder.ef.get() > 0, "Ef must be greater than 0");
+    Preconditions.checkArgument(
+        !builder.refineFactor.isPresent() || builder.refineFactor.get() > 0,
+        "Refine factor must be greater than 0");
     this.k = builder.k;
     this.minimumNprobes = builder.minimumNprobes;
     this.maximumNprobes = builder.maximumNprobes;
