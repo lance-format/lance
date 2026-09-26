@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod gate;
 pub mod ledger;
+pub mod lineage;
 pub mod metadata;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};

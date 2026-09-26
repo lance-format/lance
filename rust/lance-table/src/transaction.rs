@@ -19,6 +19,7 @@
 //! operation          the vocabulary of changes an operation can describe
 //! update_map         incremental edits to the manifest's string maps
 //! validate           pre-commit checks against the manifest being replaced
+//! prepare            what a commit attempt settles about the index list first
 //! manifest_build     applying an operation to produce the next manifest
 //! index_maintenance  how that narrows or drops index metadata
 //! row_version        how it assigns row ids and per-row version metadata
@@ -31,6 +32,7 @@ mod conflicts;
 mod index_maintenance;
 mod manifest_build;
 mod operation;
+mod prepare;
 mod proto;
 mod row_version;
 mod update_map;
@@ -42,9 +44,10 @@ pub(crate) mod test_support;
 pub use builder::{Transaction, TransactionBuilder};
 pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
 pub use operation::{
-    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,
-    UpdatedFragmentOffsets,
+    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
+    TaggedRewriteAssembly, UpdateMode, UpdatedFragmentOffsets, reordered_sources,
 };
+pub use prepare::{FragReuseUpdate, PreparedIndices};
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,
 };
