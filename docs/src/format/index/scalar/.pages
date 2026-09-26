@@ -10,3 +10,4 @@ nav:
   - MinHash LSH (experimental): minhash_lsh.md
   - FM-Index: fmindex.md
   - RTree: rtree.md
+  - JSON: json.md
