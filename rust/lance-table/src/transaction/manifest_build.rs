@@ -26,8 +26,8 @@ use crate::io::{
 };
 use crate::rowids::version::build_version_meta;
 use crate::rowids::{read_row_ids, write_row_ids};
-use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
+use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -584,14 +584,9 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
-        // A fragment-reuse index maps old row *addresses* to new ones, and the
-        // read path attaches it to every index it opens without checking
-        // whether the dataset uses stable row ids. Carrying it past the
-        // migration would therefore rewrite freshly issued row ids as if they
-        // were addresses, and rows whose new id happens to fall in the old
-        // address range would disappear from indexed queries. Nothing needs it
-        // afterwards either, since compaction rejects deferred index remap on
-        // a stable-row-id dataset.
+        // Release builds refuse to publish a stable-row-id dataset with a fragment
+        // reuse index, and nothing needs it: compaction rejects deferred index
+        // remap there.
         if config.migration_next_row_id.is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
@@ -923,6 +918,11 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        // Its bitmap is lineage, not coverage, and a straddling
+                        // group would fail the recalculation.
+                        if is_frag_reuse_index_entry(index) {
+                            continue;
+                        }
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if results_are_row_addrs {

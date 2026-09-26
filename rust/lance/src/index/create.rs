@@ -9,7 +9,11 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments, load_all_indices,
+        build_index_metadata_from_segments,
+        frag_reuse_with_stable_row_ids::{
+            ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
+        },
+        load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -175,6 +179,26 @@ impl<'a> CreateIndexBuilder<'a> {
                     params.index_type.eq_ignore_ascii_case("inverted")
                         || params.index_type.eq_ignore_ascii_case("fts")
                 });
+        // Load indices from the disk. Names are reserved against every index the
+        // manifest carries: one this build cannot read still owns its name, and
+        // handing that name out again commits two indices under it.
+        let indices = load_all_indices(self.dataset).await?;
+        // These always store row ids, so refuse them before training.
+        let index_kind = if self.index_type.is_vector() {
+            Some("vector")
+        } else if self.index_type == IndexType::Inverted || scalar_fts_request {
+            Some("full-text")
+        } else {
+            None
+        };
+        if let Some(index_kind) = index_kind {
+            ensure_index_kind_allowed_with_frag_reuse(
+                &self.dataset.manifest,
+                &indices,
+                index_kind,
+                column_input,
+            )?;
+        }
         let inverted_params = if self.index_type == IndexType::Inverted {
             if let Some(params) = self
                 .params
@@ -295,10 +319,6 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         }
 
-        // Load indices from the disk. Names are reserved against every index the
-        // manifest carries: one this build cannot read still owns its name, and
-        // handing that name out again commits two indices under it.
-        let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -636,7 +656,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        Ok(IndexMetadata {
+        let index_metadata = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
@@ -656,7 +676,10 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
-        })
+        };
+        // A generic scalar request only resolves to an implementation here.
+        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
+        Ok(index_metadata)
         }
         .boxed()
     }
@@ -815,6 +838,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
             };
+            ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
                 build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
@@ -872,7 +896,7 @@ impl<'a> CreateIndexBuilder<'a> {
             )
             .await?;
 
-            segment_metadatas.push(IndexMetadata {
+            let segment = IndexMetadata {
                 uuid: segment_uuid,
                 name: index_name.clone(),
                 fields: vec![field.id],
@@ -884,7 +908,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
-            });
+            };
+            ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
+            segment_metadatas.push(segment);
         }
 
         // Convert to IndexSegments and build proper transaction metadata

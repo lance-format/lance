@@ -83,6 +83,7 @@ mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
+pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -90,6 +91,10 @@ pub(crate) mod scalar_logical;
 pub mod vector;
 
 use self::append::merge_indices;
+use self::frag_reuse_with_stable_row_ids::{
+    has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
+    warn_about_indices_hidden_by_frag_reuse,
+};
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
@@ -2047,6 +2052,20 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
+        // Readers apply the fragment reuse index to every index they open.
+        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+            && indices.iter().any(is_hidden_by_frag_reuse)
+        {
+            Arc::new(
+                indices
+                    .iter()
+                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            indices
+        };
         if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
             match fri.index_version {
                 // Legacy FRI index version 0 already had its fragment coverage
@@ -3077,6 +3096,7 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
             )
             .await?;
             warn_about_unsupported_indices(&loaded);
+            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
             Ok(loaded)
         })
         .await?;
