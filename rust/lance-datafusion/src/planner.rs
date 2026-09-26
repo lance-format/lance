@@ -27,17 +27,18 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, Case, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
     ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
 };
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
-    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
+    AccessExpr, Array as SQLArray, BinaryOperator, CaseWhen, CeilFloorKind,
+    DataType as SQLDataType, DateTimeField, ExactNumberInfo, Expr as SQLExpr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Subscript,
+    TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -702,6 +703,34 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(&value.value),
+            SQLExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let operand = operand
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?
+                    .map(Box::new);
+                let when_then_expr = conditions
+                    .iter()
+                    .map(|CaseWhen { condition, result }| {
+                        Ok((
+                            Box::new(self.parse_sql_expr(condition)?),
+                            Box::new(self.parse_sql_expr(result)?),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let else_expr = else_result
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?
+                    .map(Box::new);
+
+                Ok(Expr::Case(Case::new(operand, when_then_expr, else_expr)))
+            }
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
@@ -813,6 +842,57 @@ impl Planner {
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
+            SQLExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let string = self.parse_sql_expr(expr)?;
+                let from = substring_from
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?;
+                let for_expr = substring_for
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?;
+
+                match (from, for_expr) {
+                    (Some(from), Some(for_expr)) => Ok(
+                        datafusion_functions::unicode::expr_fn::substring(string, from, for_expr),
+                    ),
+                    (Some(from), None) => {
+                        Ok(datafusion_functions::unicode::expr_fn::substr(string, from))
+                    }
+                    (None, Some(for_expr)) => {
+                        Ok(datafusion_functions::unicode::expr_fn::substring(
+                            string,
+                            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+                            for_expr,
+                        ))
+                    }
+                    (None, None) => Err(Error::invalid_input(
+                        "SUBSTRING requires a FROM or FOR clause",
+                    )),
+                }
+            }
+            SQLExpr::Floor { expr, field } => match field {
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => Ok(
+                    datafusion_functions::math::expr_fn::floor(self.parse_sql_expr(expr)?),
+                ),
+                _ => Err(Error::invalid_input(
+                    "FLOOR with datetime or scale is not supported",
+                )),
+            },
+            SQLExpr::Ceil { expr, field } => match field {
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => Ok(
+                    datafusion_functions::math::expr_fn::ceil(self.parse_sql_expr(expr)?),
+                ),
+                _ => Err(Error::invalid_input(
+                    "CEIL with datetime or scale is not supported",
+                )),
+            },
             SQLExpr::Function(_) => self.parse_function(expr.clone()),
             SQLExpr::ILike {
                 negated,
@@ -1255,6 +1335,75 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_parse_filter_scalar_and_conditional_expressions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("category", DataType::Int32, true),
+        ]));
+        let planner = Planner::new(schema.clone());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float32Array::from(vec![
+                    Some(1.2),
+                    Some(-1.2),
+                    Some(2.0),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("hello"),
+                    Some("world"),
+                    Some("lance"),
+                    None,
+                ])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(1), None])),
+            ],
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                "floor(value) = -2",
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
+                "ceil(value) = 2",
+                vec![Some(true), Some(false), Some(true), None],
+            ),
+            (
+                "CASE WHEN value > 1 THEN 'high' ELSE 'low' END = 'high'",
+                vec![Some(true), Some(false), Some(true), Some(false)],
+            ),
+            (
+                "CASE category WHEN 1 THEN 'one' ELSE 'other' END = 'one'",
+                vec![Some(true), Some(false), Some(true), Some(false)],
+            ),
+            (
+                "substring(text FROM 2 FOR 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substring(text, 2, 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+        ];
+
+        for (filter, expected) in cases {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            let physical_expr = planner.create_physical_expr(&expr).unwrap();
+            let result = physical_expr
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
+        }
     }
 
     #[test]
