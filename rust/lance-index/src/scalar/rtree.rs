@@ -212,14 +212,15 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
             .get("page_size")
             .map(|bs| bs.parse().unwrap_or(DEFAULT_RTREE_PAGE_SIZE))
             .unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
-        let num_pages = metadata
-            .get("num_pages")
-            .map(|bs| bs.parse().unwrap_or(0))
-            .unwrap_or(0);
         let num_items = metadata
             .get("num_items")
             .map(|bs| bs.parse().unwrap_or(0))
             .unwrap_or(0);
+        // `num_pages` is fully determined by `num_items` and `page_size`, so derive
+        // it rather than trusting the stored key. An absent, zero, or garbage value
+        // would otherwise make the page walk start at `num_pages - 1`, underflowing
+        // to `u64::MAX` so every query returns nothing.
+        let num_pages = Self::calculate_page_offsets(num_items, page_size).len() as u64;
         let bbox = metadata
             .get("bbox")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
@@ -1311,6 +1312,28 @@ mod tests {
         assert!(validate_stored_page_size(1, 0).is_ok());
         assert!(validate_stored_page_size(1, 2).is_err());
         assert!(validate_stored_page_size(0, 0).is_err());
+    }
+
+    /// `num_pages` is derived from `num_items` and `page_size` on load, so a
+    /// corrupt or absent stored key cannot make the page walk start at
+    /// `num_pages - 1` and underflow. 200 items at page_size 16 is a 14-page tree.
+    #[rstest::rstest]
+    #[case::absent(None)]
+    #[case::empty(Some(""))]
+    #[case::garbage(Some("abc"))]
+    #[case::zero(Some("0"))]
+    #[case::too_low(Some("13"))]
+    fn test_from_derives_num_pages_over_corrupt_stored_value(#[case] stored: Option<&str>) {
+        let mut metadata = HashMap::from([
+            ("page_size".to_owned(), "16".to_owned()),
+            ("num_items".to_owned(), "200".to_owned()),
+        ]);
+        if let Some(value) = stored {
+            metadata.insert("num_pages".to_owned(), value.to_owned());
+        }
+        let parsed = RTreeMetadata::from(&metadata);
+        assert_eq!(parsed.num_pages, 14, "stored num_pages {stored:?}");
+        assert_eq!(parsed.num_pages, parsed.page_offsets.len() as u64);
     }
 
     fn convert_bbox_rowid_batch_stream(
