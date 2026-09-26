@@ -1409,8 +1409,11 @@ impl<'a> RabitDistCalculator<'a> {
                 *max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id, dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id;
+                top.dist = dist;
+            }
             *max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -2069,8 +2072,11 @@ fn accumulate_distances_into_heap(
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id(id as u32);
+                top.dist = dist;
+            }
             max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -2105,8 +2111,11 @@ fn accumulate_filtered_distances_into_heap(
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id, dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id;
+                top.dist = dist;
+            }
             max_dist = res.peek().map(|node| node.dist);
         }
     }
