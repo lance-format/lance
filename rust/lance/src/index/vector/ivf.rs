@@ -127,7 +127,9 @@ use serde_json::json;
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    future::Future,
     ops::Range,
+    pin::Pin,
     sync::{Arc, OnceLock},
 };
 use tokio::sync::mpsc;
@@ -2063,6 +2065,35 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     Ok(tasks)
 }
 
+/// Run one builder's `remap` behind a heap pin so its state machine does not
+/// live inside `remap_index_file_v3`'s future.
+///
+/// Without this, every arm of the match below embeds its own
+/// `IvfIndexBuilder::remap` future as a stack temporary of the enclosing
+/// future, and that future is in turn embedded, unboxed, in `remap_vector_index`,
+/// `remap_index` and finally `compact_files`. The Python bindings drive
+/// `compact_files` with `block_on` on the calling thread, so the whole chain is
+/// polled on the Python thread's stack: on Windows that is the 1 MiB main-thread
+/// stack, and the dev-profile wheel (opt-level 0) keeps every temporary live.
+/// The eager compaction in `test_optimize.py::test_index_remapping*` overflowed
+/// that stack ("Windows fatal exception: stack overflow") once the remap chain
+/// grew past the threshold.
+///
+/// The return type is `impl Future` rather than `dyn Future` on purpose: the
+/// caller chain up to `DatasetIndexRemapper::remap_indices` needs the concrete
+/// future type to prove `Send`, and a `Box<dyn Future>` obligation there
+/// overflows the trait solver through the cache types (E0275 downstream).
+fn remap_boxed<S, Q>(
+    mut builder: IvfIndexBuilder<S, Q>,
+    mapping: &RowAddrRemap,
+) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>>
+where
+    S: IvfSubIndex + 'static,
+    Q: Quantization + 'static,
+{
+    Box::pin(async move { builder.remap(mapping).await })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
@@ -2077,17 +2108,21 @@ pub(crate) async fn remap_index_file_v3(
     match index.sub_index_type() {
         (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
+                remap_boxed(
+                    IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                        dataset, column, index_dir, index,
+                    )?,
+                    mapping,
+                )
                 .await
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
+                remap_boxed(
+                    IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                        dataset, column, index_dir, index,
+                    )?,
+                    mapping,
+                )
                 .await
             }
             _ => Err(Error::index(format!(
@@ -2096,65 +2131,85 @@ pub(crate) async fn remap_index_file_v3(
             ))),
         },
         (SubIndexType::Flat, QuantizationType::Product) => {
-            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
-            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
-                .remap(mapping)
-                .await
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
+            .await
         }
         (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
 
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Rabit) => {
-            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
     }
