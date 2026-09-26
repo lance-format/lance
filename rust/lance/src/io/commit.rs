@@ -657,12 +657,15 @@ async fn record_new_dataset_commit(
     manifest: &Manifest,
     location: &ManifestLocation,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -1399,13 +1402,16 @@ async fn record_successful_commit(
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    dataset
-        .metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        dataset
+            .metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
