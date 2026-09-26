@@ -45,7 +45,7 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
-    BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
+    BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
     new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
@@ -523,12 +523,10 @@ fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
 /// buffers the data volume at all.
 ///
 /// Nulls sort first because `OrderableScalarValue` orders them below every
-/// value, so [`build_index_map`]'s ascending-input `debug_assert!` rejects a
-/// stream that puts them last. Its runtime path would in fact tolerate a null
-/// run anywhere -- `finish_run` never advances the old-keys cursor for a null
-/// key -- but the assert is the contract, and null-first is also what
-/// [`remap_index_map`] emits and what the plain bitmap index's training scan
-/// produces.
+/// value. [`build_index_map`] would accept a single null run anywhere -- nulls
+/// are collected separately rather than merge-joined by value -- but null-first
+/// is also what [`remap_index_map`] emits and what the plain bitmap index's
+/// training scan produces.
 ///
 /// `mem_pool_size`, when set, overrides the session's memory pool for this
 /// sort instead of leaving it to `LANCE_MEM_POOL_SIZE`. Production callers
@@ -608,8 +606,15 @@ async fn write_label_list_index(
     list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    // `None`: LabelList does not apply the old-data filter. See `update`.
-    build_index_map(sorted_labels, old_index, None, &mut writer).await?;
+    // `filter: None`: LabelList does not apply the old-data filter. See `update`.
+    let old_segments = old_index
+        .map(|index| OldSegment {
+            index,
+            filter: None,
+        })
+        .into_iter()
+        .collect();
+    build_index_map(sorted_labels, old_segments, &mut writer).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -714,8 +719,8 @@ async fn update_label_list_index(
 /// separate `list_nulls` row set. Because distributed segments cover disjoint rows
 /// (distinct fragments), merging streams and unions the bitmap payloads by key
 /// and separately unions the `list_nulls` sets; no source-data re-scan is
-/// required. This mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but
-/// also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
+/// required. This mirrors [`crate::scalar::bitmap::BitmapIndex::merge_segments`]
+/// but also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
 /// rows from retired fragments are removed from both the value bitmaps and
 /// `list_nulls`.
 pub async fn merge_label_list_indices(

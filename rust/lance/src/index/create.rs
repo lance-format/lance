@@ -4014,6 +4014,106 @@ mod tests {
         (schema, batch)
     }
 
+    /// `merge_existing_index_segments` for Bitmap, with segments that each cover
+    /// two fragments and an old-data filter that actually removes rows.
+    ///
+    /// The other Bitmap merge tests go through `optimize_indices` and build one
+    /// segment per fragment, so this is the only coverage of the distributed-build
+    /// entry point, and of a segment whose coverage is wider than one fragment.
+    /// Stable row ids make the filter an exact row-id allow-list, so the deleted
+    /// rows reach it rather than being masked at scan time.
+    #[tokio::test]
+    async fn test_bitmap_merge_existing_index_segments_multi_fragment() {
+        async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value.to_string())));
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_ids) => row_ids.true_rows().row_addrs().unwrap().count(),
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 16 rows over four 4-row fragments; `cat` cycles A/B/C/D, so four each.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..16)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..16).map(|i| ["A", "B", "C", "D"][(i % 4) as usize]),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        // Two segments, each covering two fragments.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let mut staged = Vec::with_capacity(2);
+        for fragments in [vec![0u32, 1], vec![2, 3]] {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["cat"], IndexType::Bitmap, &params)
+                    .name("cat_idx".to_string())
+                    .fragments(fragments)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("cat_idx", "cat", staged)
+            .await
+            .unwrap();
+
+        // One B from each segment's coverage, so both filters have work to do.
+        dataset.delete("id = 1 OR id = 9").await.unwrap();
+
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref(),
+            Some(&(0..4u32).collect::<RoaringBitmap>()),
+            "the merged segment must cover every fragment the sources did"
+        );
+
+        for (value, expected) in [("A", 4), ("B", 2), ("C", 4), ("D", 4)] {
+            assert_eq!(
+                count_value(&dataset, &merged, value).await,
+                expected,
+                "wrong row count for cat = {value} after merging multi-fragment segments"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_label_list_merge_existing_index_segments_drops_retired_fragments() {
         use lance_index::scalar::{LabelListQuery, SearchResult};
