@@ -788,29 +788,66 @@ def find_duplicate_pairs(
     dataset: LanceDataset,
     column: str,
     distance_threshold: float,
+    *,
+    memory_limit: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream embedding duplicate pairs from an existing vector index.
 
     The column must have exactly one current-format vector index covering all
     dataset fragments. Segments and partitions are evaluated independently;
     cross-partition and cross-segment pairs are omitted. No search or top-k
-    truncation is performed. For quantized indices, distances are computed
-    between vectors reconstructed from index codes, not source-table vectors
-    or asymmetric query-to-code estimates. Thresholds use the index metric:
-    squared L2, cosine distance, dot distance, or Hamming distance.
+    truncation is performed. Deleted rows are excluded at this dataset
+    snapshot. This operation does not delete rows.
+
+    Distances are computed natively between the index representations ``a``
+    and ``b`` of two rows (the vectors that the index codes reconstruct; the
+    stored vectors for IVF_FLAT) without fetching or reconstructing any
+    vector. They use the index metric's definition:
+
+    =========  ==========================================================
+    metric     distance
+    =========  ==========================================================
+    l2         squared L2 ``||a - b||^2``
+    cosine     ``1 - cos(a, b)`` in ``[0, 2]``; 0 for identical codes
+    dot        ``1 - a . b``
+    hamming    number of differing bits
+    =========  ==========================================================
+
+    Quantized cosine renormalizes the reconstructions, as exact or refined
+    search does. Unrefined ANN search over a quantized cosine index reports the
+    squared L2 of normalized vectors instead, roughly twice this value. A pair
+    qualifies when its finite distance is ``<= distance_threshold``. Distances
+    are bit-identical regardless of ``memory_limit``, ``max_concurrency`` and
+    whether this function or :func:`find_duplicate_pairs_in_partition` is used.
 
     Returns a reader with non-null ``row_id_a: uint64``, ``row_id_b: uint64``
     and ``distance: float32`` columns, containing every qualifying unordered
-    pair once (distance <= threshold). Direction follows stable index traversal,
-    not numerical row-ID order. All pairs for one a occur contiguously, even
-    across Arrow batches. Deleted rows are excluded at this dataset snapshot.
-    Close the reader to cancel further work. This operation does not delete rows.
+    pair once. ``row_id_a`` is the row at the lower index storage position,
+    not the numerically smaller row ID. Close the reader to cancel further work.
 
-    Each partition's compact index codes are prepared once. Small partitions
-    are buffered in memory; larger ones are read in 8,192-row batches into
-    temporary session spill storage, reclaimed when the reader advances or
-    closes. Decoding uses 1,024-row vector batches and output remains batched.
-    This avoids rereading the source index for every anchor.
+    Output order is deterministic: segments, partitions in ascending order, then
+    tiles of the partition's vector batches (anchor batch ``I``, candidate batch
+    ``J >= I``), row-major within a tile (anchor row, then candidate row). Pairs
+    of one ``row_id_a`` are contiguous within a tile but not across tiles. Each
+    Arrow batch holds the pairs of up to 32 anchor rows against one vector
+    batch, so it contains at most ``32 * 8,192`` rows.
+
+    Each partition's index codes are staged once, in vector batches of at most
+    8,192 rows (fewer for wide codes, targeting 16 MiB per batch, at least 32
+    rows). ``memory_limit`` (default 256 MiB) bounds the staged codes of a
+    partition; larger partitions, or any with ``memory_limit=0``, are staged to
+    temporary session spill storage, read back once per tile, and reclaimed
+    when the reader advances or closes. Staging completes before emitting pairs
+    from the partition. The budget excludes quantizer models, row masks, spill
+    metadata, source reads and in-flight scoring buffers; it is not a process
+    RSS limit. ``max_concurrency`` (positive; defaults to the CPU pool size)
+    limits in-flight scoring jobs; each shares its tile's two vector batches and
+    produces one output batch. Spilled batches are read back as decoded
+    copies; those alive at once hold at most ``memory_limit`` bytes of staged
+    codes (or three batches, if larger), even when sparse row selection leaves
+    one job per tile. Completion is ordered, so output does not depend on
+    concurrency.
 
     Examples
     --------
@@ -826,7 +863,12 @@ def find_duplicate_pairs(
     --------
     find_duplicate_pairs_in_partition : Execute one segment/partition.
     """
-    return dataset._ds.find_duplicate_pairs(column, distance_threshold)
+    return dataset._ds.find_duplicate_pairs(
+        column,
+        distance_threshold,
+        memory_limit=memory_limit,
+        max_concurrency=max_concurrency,
+    )
 
 
 def find_duplicate_pairs_in_partition(
@@ -835,14 +877,21 @@ def find_duplicate_pairs_in_partition(
     segment_id: Union[str, uuid.UUID],
     partition_id: int,
     distance_threshold: float,
+    *,
+    memory_limit: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
 ) -> pa.RecordBatchReader:
     """Stream duplicate pairs from one physical index segment and partition.
 
-    Uses the same output schema, distance and ordering semantics as
-    :func:`find_duplicate_pairs`. ``segment_id`` is a physical index UUID,
+    Uses the same output schema, distances and ordering as
+    :func:`find_duplicate_pairs`, and returns exactly that function's output
+    for this segment and partition. ``segment_id`` is a physical index UUID,
     not an index name or fragment ID. ``partition_id`` is local to that segment.
-    Other dataset fragments need not be indexed for this scoped operation.
+    Other dataset fragments need not be indexed for this scoped operation; rows
+    they hold are not paired.
     Distributed callers must open the same dataset version on every worker.
+    ``memory_limit`` and ``max_concurrency`` have the same meaning and
+    defaults as in :func:`find_duplicate_pairs` and apply to this invocation.
 
     Examples
     --------
@@ -858,7 +907,12 @@ def find_duplicate_pairs_in_partition(
                 consume(batch)
     """
     return dataset._ds.find_duplicate_pairs_in_partition(
-        column, str(segment_id), partition_id, distance_threshold
+        column,
+        str(segment_id),
+        partition_id,
+        distance_threshold,
+        memory_limit=memory_limit,
+        max_concurrency=max_concurrency,
     )
 
 

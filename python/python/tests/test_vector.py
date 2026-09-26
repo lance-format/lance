@@ -54,15 +54,13 @@ def test_duplicate_pairs_flat(tmp_path, metric, index_type):
         ds, "vector", segment_id, 0, threshold
     ) as reader:
         assert reader.read_all().equals(pairs)
+    with find_duplicate_pairs(
+        ds, "vector", threshold, max_concurrency=1, memory_limit=0
+    ) as reader:
+        assert reader.read_all().equals(pairs)
     actual = {}
-    seen = set()
-    last = None
     for row in pairs.to_pylist():
         a, b = row["row_id_a"], row["row_id_b"]
-        if a != last:
-            assert a not in seen
-            seen.add(a)
-            last = a
         key = tuple(sorted((positions[a], positions[b])))
         assert key not in actual
         actual[key] = row["distance"]
@@ -95,7 +93,7 @@ def test_duplicate_pairs_quantized(tmp_path, metric, index_type, bits):
     unique = rng.normal(size=(17, 8)).astype(np.float32)
     vectors = np.repeat(unique, 2, axis=0)
     table = pa.table({"vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 8))})
-    ds = lance.write_dataset(table, tmp_path)
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=10)
     params = {"num_bits": bits}
     if "PQ" in index_type:
         params.update(
@@ -111,13 +109,26 @@ def test_duplicate_pairs_quantized(tmp_path, metric, index_type, bits):
         **params,
     )
     with find_duplicate_pairs(ds, "vector", 1e6) as reader:
-        all_pairs = reader.read_all().to_pylist()
+        expected_table = reader.read_all()
+    # Distances and order do not depend on concurrency, spilling or the
+    # scoped API.
+    with find_duplicate_pairs(
+        ds, "vector", 1e6, max_concurrency=1, memory_limit=0
+    ) as reader:
+        assert reader.read_all().equals(expected_table)
+    segment = ds.describe_indices()[0].segments[0].uuid
+    with find_duplicate_pairs_in_partition(ds, "vector", segment, 0, 1e6) as reader:
+        assert reader.read_all().equals(expected_table)
+    all_pairs = expected_table.to_pylist()
     assert len(all_pairs) == len(vectors) * (len(vectors) - 1) // 2
     keys = {tuple(sorted((r["row_id_a"], r["row_id_b"]))) for r in all_pairs}
     assert len(keys) == len(all_pairs)
     assert all(np.isfinite(r["distance"]) for r in all_pairs)
+    if metric == "cosine":
+        assert all(0 <= r["distance"] <= 2 for r in all_pairs)
     if metric != "dot":
-        expected = {(i, i + 1) for i in range(0, len(vectors), 2)}
+        row_ids = ds.to_table(columns=[], with_row_id=True)["_rowid"].to_pylist()
+        expected = {(row_ids[i], row_ids[i + 1]) for i in range(0, len(vectors), 2)}
         with find_duplicate_pairs(ds, "vector", 1e-5) as reader:
             result = reader.read_all().to_pylist()
         found = {tuple(sorted((r["row_id_a"], r["row_id_b"]))) for r in result}
@@ -161,15 +172,22 @@ def test_duplicate_pairs_validation_and_snapshot(tmp_path):
         find_duplicate_pairs(current, "vector", 0)
 
 
-def test_duplicate_pairs_cross_batch_order(tmp_path):
+@pytest.mark.parametrize("memory_limit", [0, 256 * 1024 * 1024])
+@pytest.mark.parametrize("max_concurrency", [1, 4])
+def test_duplicate_pairs_cross_batch_order(tmp_path, memory_limit, max_concurrency):
     # One anchor has matches on both sides of the vector batch boundary.
-    n = 1025
+    n = 8193
     vectors = np.column_stack((np.arange(n), np.ones(n))).astype(np.float32)
     vectors[-1] = vectors[0]
     vectors[1] = vectors[0]
     vectors[2] = vectors[0]
     ds = lance.write_dataset(
-        pa.table({"vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 2))}),
+        pa.table(
+            {
+                "id": np.arange(n),
+                "vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 2)),
+            }
+        ),
         tmp_path,
     )
     ds = ds.create_index(
@@ -178,24 +196,99 @@ def test_duplicate_pairs_cross_batch_order(tmp_path):
         num_partitions=1,
         ivf_centroids=np.ones((1, 2), dtype=np.float32),
     )
-    with find_duplicate_pairs(ds, "vector", 0) as reader:
-        # Exhaust the reader: a prefix-only test misses repeated source I/O
-        # while scanning later anchors with no matching pairs.
+    # Keep the physical index boundary while limiting the number of anchors
+    # scored by this order/spill test. Removed IDs must not appear in pairs.
+    ds.delete(f"id >= 3 AND id < {n - 1}")
+    with find_duplicate_pairs(
+        ds,
+        "vector",
+        0,
+        memory_limit=memory_limit,
+        max_concurrency=max_concurrency,
+    ) as reader:
+        # Exhaust all surviving anchors, including the physical partition tail.
         batches = list(reader)
-    assert [batch.num_rows for batch in batches] == [2, 1, 1, 1, 1]
+    # Tile order: the (batch 0, batch 0) tile, then (batch 0, batch 1), each
+    # row-major and emitted as one batch per job of up to 32 anchor rows.
+    assert [batch.num_rows for batch in batches] == [3, 3]
     pairs = pa.Table.from_batches(batches).to_pylist()
     assert [(p["row_id_a"], p["row_id_b"]) for p in pairs] == [
         (0, 1),
         (0, 2),
-        (0, n - 1),
         (1, 2),
+        (0, n - 1),
         (1, n - 1),
         (2, n - 1),
     ]
     with find_duplicate_pairs(ds, "vector", 1e10) as reader:
-        assert next(reader).num_rows <= 1024
+        assert next(reader).num_rows <= 32 * 8192
         # Closing a partially consumed reader cancels further enumeration.
-    assert ds.count_rows() == n
+    assert ds.count_rows() == 4
+
+
+@pytest.mark.parametrize("memory_limit", [0, 256 * 1024 * 1024])
+def test_duplicate_pairs_parallel_scoring_preserves_order(tmp_path, memory_limit):
+    # 4096-d vectors cut the 8K batch maximum to 512 rows, so 1027 rows give
+    # three vector batches and every 32-row job exceeds the inline threshold.
+    # Keeping three rows per batch makes each of the six tiles a single cheap
+    # CPU-pool job, and with forced spill the next batch load has to wait for
+    # earlier jobs to release their decoded batches.
+    n, batch_rows, dim = 1027, 512, 4096
+    positions = np.arange(n)
+    vectors = np.repeat((positions % 2)[:, None], dim, axis=1).astype(np.float32)
+    table = pa.table(
+        {
+            "id": positions,
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(vectors.reshape(-1)), dim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=300)
+    ds = ds.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.ones((1, dim), dtype=np.float32),
+    )
+    kept = [b * batch_rows + r for b in range(n // batch_rows + 1) for r in range(3)]
+    ds.delete(f"id NOT IN ({', '.join(map(str, kept))})")
+    row_ids = {
+        r["id"]: r["_rowid"]
+        for r in ds.to_table(columns=["id"], with_row_id=True).to_pylist()
+    }
+    # Tile order: anchor batch, candidate batch, then row-major positions.
+    expected = sorted(
+        ((a, b) for i, a in enumerate(kept) for b in kept[i + 1 :] if a % 2 == b % 2),
+        key=lambda p: (p[0] // batch_rows, p[1] // batch_rows, p[0], p[1]),
+    )
+    with find_duplicate_pairs(
+        ds, "vector", 0, max_concurrency=1, memory_limit=memory_limit
+    ) as reader:
+        batches = list(reader)
+    # One output batch per tile: 1 pair on the diagonal, 5 off it.
+    assert [batch.num_rows for batch in batches] == [1, 5, 5, 1, 5, 1]
+    serial = pa.Table.from_batches(batches)
+    assert [(p["row_id_a"], p["row_id_b"]) for p in serial.to_pylist()] == [
+        (row_ids[a], row_ids[b]) for a, b in expected
+    ]
+    with find_duplicate_pairs(
+        ds, "vector", 0, max_concurrency=8, memory_limit=memory_limit
+    ) as reader:
+        assert reader.read_all().equals(serial)
+    segment = ds.describe_indices()[0].segments[0].uuid
+    with find_duplicate_pairs_in_partition(
+        ds,
+        "vector",
+        segment,
+        0,
+        0,
+        max_concurrency=4,
+        memory_limit=memory_limit,
+    ) as reader:
+        assert reader.read_all().equals(serial)
+    with pytest.raises(ValueError, match="max_concurrency must be positive"):
+        find_duplicate_pairs(ds, "vector", 0, max_concurrency=0)
 
 
 @pytest.mark.parametrize("bits", [4, 8])
@@ -316,7 +409,7 @@ def test_duplicate_pairs_hamming(tmp_path):
 
 
 @pytest.mark.parametrize("index_type", ["IVF_PQ", "IVF_SQ"])
-def test_duplicate_pairs_reconstruction_distances(tmp_path, index_type):
+def test_duplicate_pairs_exactly_representable_codes(tmp_path, index_type):
     vectors = np.array([[0, 0, 2, 2], [3, 3, 4, 4], [8, 8, 6, 6]], dtype=np.float32)
     params = {}
     if index_type == "IVF_PQ":
@@ -393,14 +486,16 @@ def test_duplicate_pairs_after_compaction(tmp_path, stable_ids):
     ],
 )
 def test_duplicate_pairs_quantized_batch_boundary(tmp_path, index_type, bits):
-    # A 1024-row batch followed by one row exercises partial transposed PQ
-    # reads and the packed RQ tail without collecting quadratic output.
+    # A 8192-row batch followed by one row exercises partial transposed PQ
+    # reads and the packed RQ tail. Deleting the rows in between keeps the
+    # scored anchors (and the output) small while staging every row.
     rng = np.random.default_rng(83)
-    vectors = rng.normal(size=(1025, 8)).astype(np.float32)
+    vectors = rng.normal(size=(8193, 8)).astype(np.float32)
     vectors[-1] = vectors[0]
     ds = lance.write_dataset(
         pa.table(
             {
+                "id": np.arange(len(vectors)),
                 "vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 8)),
             }
         ),
@@ -419,12 +514,18 @@ def test_duplicate_pairs_quantized_batch_boundary(tmp_path, index_type, bits):
         ivf_centroids=np.ones((1, 8), dtype=np.float32),
         **params,
     )
-    with find_duplicate_pairs(ds, "vector", 1e6) as reader:
-        first, second = next(reader), next(reader)
-    assert first.num_rows == 1023
-    assert set(first["row_id_a"].to_pylist()) == {0}
-    assert set(first["row_id_b"].to_pylist()) == set(range(1, 1024))
-    assert second.to_pylist() == [{"row_id_a": 0, "row_id_b": 1024, "distance": 0.0}]
+    ds.delete("id >= 1 AND id < 8192")
+    results = []
+    for memory_limit in [0, 256 * 1024 * 1024]:
+        with find_duplicate_pairs(
+            ds, "vector", 1e6, memory_limit=memory_limit
+        ) as reader:
+            results.append(reader.read_all())
+    # Spilled and in-memory staging give bit-identical distances.
+    assert results[0].equals(results[1])
+    assert results[0].to_pylist() == [
+        {"row_id_a": 0, "row_id_b": 8192, "distance": 0.0}
+    ]
 
 
 def test_duplicate_pairs_partition_scope(tmp_path):
@@ -721,3 +822,52 @@ def test_hamming_clustering_multi_segment(tmp_path, byte_width):
         get_ivf_partition_info(dataset, index.name, index_segments=[123])
     with pytest.raises(TypeError, match="not a single"):
         get_ivf_partition_info(dataset, index.name, index_segments=first_segment.uuid)
+
+
+@pytest.mark.parametrize("index_type", ["IVF_PQ", "IVF_SQ"])
+def test_duplicate_pairs_quantized_cosine_renormalizes(tmp_path, index_type):
+    # A deliberately coarse quantizer distinguishes 1 - cos of the
+    # renormalized reconstructions from their (unbounded) squared L2.
+    vectors = np.array([[1, 0], [0, 1], [-1, 0], [1, 0]], dtype=np.float32)
+    params = {}
+    if index_type == "IVF_PQ":
+        codebook = np.tile(np.array([[2, 0], [0, 3], [-2, 0]], np.float32), (86, 1))[
+            :256
+        ]
+        params = dict(num_bits=8, num_sub_vectors=1, pq_codebook=codebook[None])
+        # Codewords [2, 0] and [0, 3] are orthogonal although 13 apart.
+        reconstructed = np.array([[2, 0], [0, 3]], np.float64)
+    else:
+        # Bounds [-1, 1]: 0 truncates to code 127, reconstructed as -1/255.
+        reconstructed = np.array([[1, -1 / 255], [-1 / 255, 1]], np.float64)
+    a, b = reconstructed
+    expected = 1 - a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+    ds = lance.write_dataset(
+        pa.table({"vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 2))}),
+        tmp_path,
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type,
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 2), np.float32),
+        **params,
+    )
+    pairs = find_duplicate_pairs(ds, "vector", 100).read_all().to_pylist()
+    distances = {
+        tuple(sorted((p["row_id_a"], p["row_id_b"]))): p["distance"] for p in pairs
+    }
+    assert len(distances) == 6
+    assert distances[(0, 1)] == pytest.approx(expected, abs=1e-6)
+    # Identical codes score exactly zero; opposite vectors reach the bound 2.
+    assert distances[(0, 3)] == 0
+    assert distances[(0, 2)] == pytest.approx(2.0, abs=1e-4)
+    assert all(0 <= d <= 2 for d in distances.values())
+    # Threshold filtering must use the same native score as enumeration.
+    selected = (
+        find_duplicate_pairs(ds, "vector", expected - 1e-3).read_all().to_pylist()
+    )
+    assert (0, 1) not in {
+        tuple(sorted((p["row_id_a"], p["row_id_b"]))) for p in selected
+    }

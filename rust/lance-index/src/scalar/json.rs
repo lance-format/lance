@@ -915,6 +915,12 @@ impl BasicTrainer for JsonIndexPlugin {
             .unwrap_or(DataType::Utf8);
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
+        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+            return Err(Error::not_supported(format!(
+                "JSON-path indexes do not support target index type '{}'; create an INVERTED index directly on the JSON column instead",
+                params.target_index_type
+            )));
+        }
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.target_index_type).into(),
@@ -1045,8 +1051,14 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        // Older JSON-wrapped inverted indexes were never routable. Current training rejects this
+        // combination, so keep legacy metadata inert instead of enabling only part of its
+        // unsupported query path.
+        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+            return None;
+        }
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
+        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
         Some(Box::new(JsonQueryParser::new(
             json_details.path.clone(),
             target_parser,
@@ -1093,6 +1105,84 @@ mod tests {
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
+
+    #[test]
+    fn test_json_index_rejects_inverted_target() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let error = trainer
+            .new_training_request(
+                r#"{"target_index_type":"inverted","path":"$.title"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .err()
+            .expect("an inverted target should be rejected");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("JSON-path indexes do not support target index type 'inverted'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_json_query_parser_forwards_target_details() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let target_details = prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails {
+            rows_per_zone: Some(128),
+            use_seeds: Some(false),
+            has_null_bitmap: Some(true),
+        })
+        .unwrap();
+        let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+        })
+        .unwrap();
+
+        let parser = plugin
+            .new_query_parser("json_value".to_string(), &index_details)
+            .expect("zone map target should provide a query parser");
+        let expression = parser
+            .visit_is_null("doc")
+            .expect("zone map target should parse IS NULL");
+        let Some(ScalarIndexExpr::Query(search)) = expression.scalar_query else {
+            panic!("JSON parser should wrap the target index query");
+        };
+        assert_eq!(search.index_type, "ZoneMap");
+        assert!(
+            !search.needs_recheck,
+            "the target's exact null-tracking detail should reach its query parser"
+        );
+    }
+
+    #[test]
+    fn test_json_query_parser_keeps_inverted_target_inert() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let target_details = prost_types::Any::from_msg(&crate::pbold::InvertedIndexDetails {
+            base_tokenizer: Some("simple".to_string()),
+            language: serde_json::to_string(&crate::scalar::inverted::Language::English).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+        })
+        .unwrap();
+
+        assert!(
+            plugin
+                .new_query_parser("json_value".to_string(), &index_details)
+                .is_none(),
+            "legacy JSON-wrapped inverted indexes must remain unroutable"
+        );
+    }
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection

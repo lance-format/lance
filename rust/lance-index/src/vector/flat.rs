@@ -17,6 +17,7 @@ use tracing::instrument;
 use super::DIST_COL;
 
 pub mod index;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 

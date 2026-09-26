@@ -89,7 +89,10 @@ use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
-use super::rowids::load_row_id_sequences;
+use super::rowids::RowVersionKind;
+use super::rowids::{
+    RowLineage, load_row_id_sequences, load_row_version_sequence, place_row_lineage,
+};
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -130,7 +133,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::format::{Fragment, IndexMetadata, RowDatasetVersionSequence};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -2626,13 +2629,7 @@ async fn rewrite_files(
         } else {
             if dataset.manifest.uses_stable_row_ids() {
                 log::info!("Compaction task {}: rechunking stable row ids", task_id);
-                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-                recalc_versions_for_rewritten_fragments(
-                    dataset.as_ref(),
-                    &mut new_fragments,
-                    &fragments,
-                )
-                .await?;
+                rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments).await?;
             }
             Ok(None)
         }
@@ -2671,7 +2668,11 @@ async fn rewrite_files(
     })
 }
 
-async fn rechunk_stable_row_ids(
+/// Carry the stable row ids and per-row versions of `old_fragments` over to
+/// `new_fragments`, which hold the same live rows in the same order, and place
+/// each new fragment's sequences inline or in a spilled column as the table's
+/// spill policy and their size call for.
+async fn rechunk_row_lineage(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
@@ -2687,146 +2688,79 @@ async fn rechunk_stable_row_ids(
             .expect("Fragment not found")
     });
 
+    // Load old per-row version sequences, defaulting the way readers do:
+    // created-at to version 1, last-updated-at to created-at.
+    let mut old_created_at_sequences = Vec::with_capacity(old_fragments.len());
+    let mut old_last_updated_sequences = Vec::with_capacity(old_fragments.len());
+    for (frag, (_, row_ids)) in old_fragments.iter().zip(old_sequences.iter()) {
+        let created_at =
+            match load_row_version_sequence(dataset, frag, RowVersionKind::CreatedAt).await? {
+                Some(sequence) => sequence.as_ref().clone(),
+                None => RowDatasetVersionSequence::from_uniform_row_count(row_ids.len(), 1),
+            };
+        let last_updated_at =
+            match load_row_version_sequence(dataset, frag, RowVersionKind::LastUpdatedAt).await? {
+                Some(sequence) => sequence.as_ref().clone(),
+                None => created_at.clone(),
+            };
+        old_created_at_sequences.push(created_at);
+        old_last_updated_sequences.push(last_updated_at);
+    }
+
     // Need to remove deleted rows
-    futures::stream::iter(old_sequences.iter_mut().zip(old_fragments.iter()))
-        .map(Ok)
-        .try_for_each(|((_, seq), frag)| async move {
-            if let Some(deletion_file) = &frag.deletion_file {
-                let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+    for (index, frag) in old_fragments.iter().enumerate() {
+        if let Some(deletion_file) = &frag.deletion_file {
+            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
 
-                let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.to_sorted_iter())?;
-                *seq = Arc::new(new_seq);
-            }
-            Ok::<(), crate::Error>(())
-        })
-        .await?;
+            let mut new_seq = old_sequences[index].1.as_ref().clone();
+            new_seq.mask(deletions.to_sorted_iter())?;
+            old_sequences[index].1 = Arc::new(new_seq);
+            old_created_at_sequences[index].mask(deletions.to_sorted_iter())?;
+            old_last_updated_sequences[index].mask(deletions.to_sorted_iter())?;
+        }
+    }
 
+    let chunk_sizes: Vec<u64> = new_fragments
+        .iter()
+        .map(|frag| frag.physical_rows.unwrap() as u64)
+        .collect();
     debug_assert_eq!(
         { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
-        {
-            new_fragments
-                .iter()
-                .map(|frag| frag.physical_rows.unwrap() as u64)
-                .sum::<u64>()
-        },
+        { chunk_sizes.iter().sum::<u64>() },
         "{:?}",
         old_sequences
     );
 
-    let new_sequences = lance_table::rowids::rechunk_sequences(
+    let new_row_ids = lance_table::rowids::rechunk_sequences(
         old_sequences
             .into_iter()
             .map(|(_, seq)| seq.as_ref().clone()),
-        new_fragments
-            .iter()
-            .map(|frag| frag.physical_rows.unwrap() as u64),
+        chunk_sizes.iter().copied(),
         false,
     )?;
-
-    for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
-        // TODO: if large enough, serialize to separate file
-        let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
-    }
-
-    Ok(())
-}
-
-/// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
-async fn recalc_versions_for_rewritten_fragments(
-    dataset: &Dataset,
-    new_fragments: &mut [Fragment],
-    old_fragments: &[Fragment],
-) -> Result<()> {
-    // Load old per-row last_updated_at version sequences
-    let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
-        Vec::with_capacity(old_fragments.len());
-    // Load old per-row created_at version sequences
-    let mut old_created_at_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
-        Vec::with_capacity(old_fragments.len());
-
-    for frag in old_fragments.iter() {
-        let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
-            match row_id_meta {
-                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                RowIdMeta::Column => frag.physical_rows.unwrap_or(0) as u64,
-            }
-        } else {
-            frag.physical_rows.unwrap_or(0) as u64
-        };
-
-        // Load created_at sequence (default to version 1 if missing)
-        let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!("Failed to load created_at version sequence: {}", e))
-            })?
-        } else {
-            // Default: treat all rows as created at version 1
-            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
-        };
-
-        // Load last_updated_at sequence (default to same as created_at sequence)
-        let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!(
-                    "Failed to load last_updated_at version sequence: {}",
-                    e
-                ))
-            })?
-        } else {
-            created_at_seq.clone()
-        };
-
-        // Apply deletion mask if present (positions are local offsets)
-        if let Some(deletion_file) = &frag.deletion_file {
-            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
-            last_updated_seq.mask(deletions.to_sorted_iter())?;
-            created_at_seq.mask(deletions.to_sorted_iter())?;
-        }
-
-        old_last_updated_sequences.push(last_updated_seq);
-        old_created_at_sequences.push(created_at_seq);
-    }
-
-    // Ensure row counts match new fragments total
-    let old_total: u64 = old_last_updated_sequences.iter().map(|s| s.len()).sum();
-    let new_total: u64 = new_fragments
-        .iter()
-        .map(|f| f.physical_rows.unwrap_or(0) as u64)
-        .sum();
-    debug_assert_eq!(old_total, new_total);
-
-    // Rechunk version runs aligned to new fragment sizes
-    let chunk_sizes: Vec<u64> = new_fragments
-        .iter()
-        .map(|f| f.physical_rows.unwrap_or(0) as u64)
-        .collect();
-
-    let new_last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
-        old_last_updated_sequences,
-        chunk_sizes.clone(),
-        false,
-    )?;
-
-    let new_created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
+    let new_created_at = lance_table::rowids::version::rechunk_version_sequences(
         old_created_at_sequences,
+        chunk_sizes.iter().copied(),
+        false,
+    )?;
+    let new_last_updated_at = lance_table::rowids::version::rechunk_version_sequences(
+        old_last_updated_sequences,
         chunk_sizes,
         false,
     )?;
 
-    // Set both version metadata on new fragments
-    for ((fragment, last_updated_seq), created_at_seq) in new_fragments
+    for (((fragment, row_ids), created_at), last_updated_at) in new_fragments
         .iter_mut()
-        .zip(new_last_updated_sequences)
-        .zip(new_created_at_sequences)
+        .zip(new_row_ids)
+        .zip(new_created_at)
+        .zip(new_last_updated_at)
     {
-        fragment.last_updated_at_version_meta = Some(
-            lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
-        );
-        fragment.created_at_version_meta = Some(
-            lance_table::format::RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
-        );
+        let lineage = RowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        };
+        place_row_lineage(dataset, &lineage).await?.apply(fragment);
     }
 
     Ok(())

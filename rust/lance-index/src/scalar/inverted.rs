@@ -3,6 +3,7 @@
 
 pub mod builder;
 mod cache_codec;
+mod combined;
 mod compound;
 mod cross_column;
 mod documents;
@@ -11,18 +12,27 @@ mod impact;
 mod index;
 mod iter;
 pub mod json;
+/// Brute-force scoring reference for tests and benches. Never built normally; see
+/// the module docs for the gating.
+#[cfg(any(test, feature = "test-oracle"))]
+pub mod oracle;
 pub mod parser;
 pub mod query;
 mod scorer;
 pub mod tokenizer;
 mod wand;
 
+use lance_index_core::remapping::BatchRowIdRemapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use combined::{
+    CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
+    validate_combined_tokenizers,
+};
 pub use compound::{
     compound_search, compound_search_prepared_match,
     compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
@@ -35,7 +45,7 @@ use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
-pub use scorer::{MemBM25Scorer, Scorer};
+pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
@@ -585,6 +595,30 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let physical_granularity = index.params().get_document_granularity();
+        if physical_granularity != expected_granularity {
+            return Err(Error::index(format!(
+                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
+            )));
+        }
+        Ok(index as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let index =
+            InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();

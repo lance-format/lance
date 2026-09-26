@@ -82,6 +82,7 @@ pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
+mod frag_reuse_remapping;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -3230,6 +3231,18 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
+/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// is resolved: only a v0 history, whose remapper is applied while the index
+/// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
+async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
+        .map(|idx| idx.uuid)
+}
+
 #[async_trait]
 impl DatasetIndexInternalExt for Dataset {
     async fn open_generic_index(
@@ -3241,7 +3254,7 @@ impl DatasetIndexInternalExt for Dataset {
         // Checking for cache existence is cheap so we just check the vector caches.
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -3323,26 +3336,33 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
+        let resolved = frag_reuse::open_row_id_remapping(self, &index_meta, metrics).await?;
+        // The index state (paths, model, quantizer metadata) and a legacy
+        // whole-index entry embed no translated rows: they live in the plain
+        // per-index namespace and stay warm across appends and unrelated
+        // rewrites. Partitions decoded through a translating remapper live in
+        // the translated namespace of `query_cache`.
+        let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
+        let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
+        let remapping = resolved.map(|(_, remapping)| remapping);
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+            let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             return entry
                 .0
                 .reconstruct(
                     object_store,
                     self.metadata_cache.as_ref(),
                     partition_cache,
-                    frag_reuse_index,
+                    remapping,
                 )
                 .await;
         }
@@ -3353,7 +3373,17 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(cached.0.clone());
         }
 
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+        // Only legacy vector file readers consume the V1 handle. A tagged
+        // history is handled by the shared remapper above, including identity.
+        let has_tagged_history = load_all_indices(self)
+            .await?
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0);
+        let frag_reuse_index = if has_tagged_history {
+            None
+        } else {
+            self.open_frag_reuse_index(metrics).await?
+        };
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()
@@ -3375,7 +3405,7 @@ impl DatasetIndexInternalExt for Dataset {
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
-        let index_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+        let index_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
 
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
@@ -3471,7 +3501,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
-                                frag_reuse_index,
+                                remapping,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
@@ -3484,7 +3514,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
-                                frag_reuse_index,
+                                remapping,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
@@ -3503,7 +3533,7 @@ impl DatasetIndexInternalExt for Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
@@ -3517,7 +3547,7 @@ impl DatasetIndexInternalExt for Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
@@ -3531,7 +3561,7 @@ impl DatasetIndexInternalExt for Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
@@ -3546,7 +3576,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
-                                frag_reuse_index,
+                                remapping,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
@@ -3559,7 +3589,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
-                                frag_reuse_index,
+                                remapping,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
@@ -3574,7 +3604,7 @@ impl DatasetIndexInternalExt for Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
@@ -3588,7 +3618,7 @@ impl DatasetIndexInternalExt for Dataset {
                             object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
-                            frag_reuse_index,
+                            remapping,
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
