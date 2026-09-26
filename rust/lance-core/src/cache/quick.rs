@@ -99,6 +99,10 @@ impl QuickCacheBackend {
 
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
+    fn uses_entry_sizes(&self) -> bool {
+        self.capacity > 0
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).map(|v| v.entry)
     }

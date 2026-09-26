@@ -231,6 +231,11 @@ impl CacheState {
     where
         T: DeepSizeOf + Send + Sync + 'static,
     {
+        if !self.backend.uses_entry_sizes() {
+            // The backend drops entries without accounting them, so a
+            // deep-size traversal per load would be discarded work.
+            return 0;
+        }
         let type_id = TypeId::of::<T>();
         let is_registered = self
             .entry_size_accessors
@@ -753,6 +758,66 @@ mod tests {
             Poll::Ready(output) => Poll::Ready(output),
         })
         .await
+    }
+
+    /// Counts its own deep-size traversals. The counter lives in the value so
+    /// that two tests using this type cannot disturb each other's count.
+    struct CountingSizeValue(Arc<AtomicUsize>);
+
+    impl DeepSizeOf for CountingSizeValue {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+
+    struct CountingSizeKey(u64);
+
+    impl CacheKey for CountingSizeKey {
+        type ValueType = CountingSizeValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "test.CountingSize"
+        }
+
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("test.counting-size", 1)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_u64(self.0);
+        }
+    }
+
+    /// A backend that discards entries without accounting them, so a deep-size
+    /// traversal per load would be charged and then thrown away. Each phase
+    /// gets its own counter; the assertion is the traversal count, not a
+    /// cumulative total.
+    #[tokio::test]
+    async fn backends_that_ignore_entry_sizes_skip_the_traversal() {
+        async fn traversals(cache: LanceCache) -> usize {
+            let counter = Arc::new(AtomicUsize::new(0));
+            cache
+                .get_or_insert_with_key_hit(CountingSizeKey(1), || async {
+                    Ok(CountingSizeValue(counter.clone()))
+                })
+                .await
+                .unwrap();
+            counter.load(Ordering::Relaxed)
+        }
+
+        assert_eq!(traversals(LanceCache::no_cache()).await, 0);
+        assert_eq!(traversals(LanceCache::with_capacity(1024)).await, 1);
+        // The session caches use the quick backend, so it needs the same gate.
+        let quick = |capacity| {
+            LanceCache::with_backend(Arc::new(quick::QuickCacheBackend::with_capacity(capacity)))
+        };
+        assert_eq!(traversals(quick(0)).await, 0);
+        assert_eq!(traversals(quick(1024)).await, 1);
     }
 
     #[derive(Clone)]

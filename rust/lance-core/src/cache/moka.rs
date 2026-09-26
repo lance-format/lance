@@ -121,6 +121,10 @@ impl CacheBackend for MokaCacheBackend {
             .await;
     }
 
+    fn uses_entry_sizes(&self) -> bool {
+        self.capacity > 0
+    }
+
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
