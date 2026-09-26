@@ -1533,6 +1533,52 @@ impl Dataset {
         CleanupOperation::new(self, policy)
     }
 
+    /// Collect every storage path still referenced by the dataset's currently-present
+    /// manifests, for use by an external orphan-cleanup driver.
+    ///
+    /// **Experimental.** Intended for external distributed orphan-cleanup; the shape
+    /// may change. It reads the dataset's manifests and unions the files each
+    /// references, without listing the (potentially huge) `data/`, `_indices/`, or
+    /// `_deletions/` trees. The caller lists storage itself and, for each file in a
+    /// managed subtree (`data/`, `_deletions/`, `_transactions/`, `_indices/`,
+    /// `_versions/*.manifest`), deletes it only if
+    /// [`ReferencedFileSet::is_referenced`](crate::dataset::cleanup::ReferencedFileSet::is_referenced)
+    /// returns `false` and it is older than a caller-enforced age threshold. Do not
+    /// hand-roll an anti-join against the raw paths — see
+    /// [`ReferencedFileSet`](crate::dataset::cleanup::ReferencedFileSet) for
+    /// the full contract (blob v2 sidecars, index prefixes, never-delete categories).
+    ///
+    /// Unlike version cleanup, this considers **all present manifests** (not just the
+    /// latest), so a file referenced only by an older-but-present version is kept.
+    ///
+    /// Returns an error for datasets with branches, detached versions, external
+    /// (multi-base) fragments, external row-id files, or external row-version
+    /// metadata, whose files this set cannot fully represent.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset, listed_paths: Vec<String>) -> Result<()> {
+    /// # let is_in_managed_subtree = |_: &str| true;
+    /// # let older_than_threshold = |_: &str| true;
+    /// let referenced = dataset.referenced_files().await?;
+    /// for path in listed_paths {
+    ///     // Only ever consider files in a managed subtree (never `_refs/`,
+    ///     // `_versions/.tmp*`, or the version hint), and only past your age
+    ///     // threshold. Then delete only what the set does not cover.
+    ///     if is_in_managed_subtree(&path)
+    ///         && older_than_threshold(&path)
+    ///         && !referenced.is_referenced(&path)
+    ///     {
+    ///         // safe to delete `path`
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn referenced_files(&self) -> Result<cleanup::ReferencedFileSet> {
+        cleanup::referenced_files(self).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
         base_uri: WriteDestination<'_>,
