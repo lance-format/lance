@@ -4155,6 +4155,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            spilled_row_lineage: Default::default(),
         }
     }
 }

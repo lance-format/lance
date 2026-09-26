@@ -750,6 +750,13 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
+    /// Row lineage sequences of the current manifest's fragments that live
+    /// outside the manifest, read ahead of the build. An update that rewrites
+    /// rows needs the existing row ids and created-at versions to carry each
+    /// row's lineage over, and a partial column rewrite needs the existing
+    /// last-updated-at versions; the build cannot read a data file itself. Only
+    /// consulted for fragments whose sequences are spilled.
+    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
