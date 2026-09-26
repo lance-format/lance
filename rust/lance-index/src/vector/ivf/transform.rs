@@ -49,12 +49,24 @@ impl PartitionTransformer {
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
     ) -> Self {
-        let index = SimpleIndex::may_train_index(
+        // The HNSW over the centroids only speeds assignment up; `None` is the
+        // supported brute-force path. Failing to build it is not a reason to
+        // fail the index build, so warn and fall back rather than unwrap.
+        let index = match SimpleIndex::may_train_index(
             centroids.values().clone(),
             centroids.value_length() as usize,
             distance_type,
-        )
-        .unwrap();
+        ) {
+            Ok(index) => index,
+            Err(err) => {
+                log::warn!(
+                    "could not train the centroid index for partition assignment, \
+                     falling back to a full scan of {} centroids: {err}",
+                    centroids.len()
+                );
+                None
+            }
+        };
 
         Self {
             centroids,
