@@ -358,7 +358,10 @@ async fn test_bm25_row_stats_for_terms_keeps_the_lazy_posting_metadata_path() {
     assert_eq!(metadata_rows, 1);
 
     assert_eq!(
-        index.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+        index
+            .bm25_row_stats_for_terms(&terms, None, None)
+            .await
+            .unwrap(),
         documents,
         "one document per row leaves the two granularities identical",
     );
@@ -427,7 +430,7 @@ async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
     let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
     let cold = LocalMetricsCollector::default();
     let cold_stats = index
-        .bm25_row_stats_for_terms(&terms, Some(&cold))
+        .bm25_row_stats_for_terms(&terms, None, Some(&cold))
         .await
         .unwrap();
     assert_eq!(cold_stats, (100, 100, vec![1, 1, 1]));
@@ -437,7 +440,7 @@ async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
     let warm = LocalMetricsCollector::default();
     assert_eq!(
         index
-            .bm25_row_stats_for_terms(&terms, Some(&warm))
+            .bm25_row_stats_for_terms(&terms, None, Some(&warm))
             .await
             .unwrap(),
         cold_stats,
