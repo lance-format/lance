@@ -7,6 +7,9 @@
 //! to track tables and nested namespaces.
 
 use super::manifest_feature_flags::{ensure_readable, ensure_writable};
+
+mod lifecycle;
+
 use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
@@ -60,6 +63,8 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
+pub use lifecycle::DELETED_METADATA_KEY;
+use lifecycle::ensure_live;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -627,6 +632,16 @@ impl DatasetConsistencyWrapper {
         // Refuse manifests written with a reader feature flag this build does
         // not understand instead of misreading them.
         ensure_readable(guard.metadata())?;
+        ensure_live(guard.metadata())?;
+        Ok(guard)
+    }
+
+    async fn get_for_lifecycle(&self) -> Result<DatasetReadGuard<'_>> {
+        self.reload().await?;
+        let guard = DatasetReadGuard {
+            guard: self.0.read().await,
+        };
+        ensure_readable(guard.metadata())?;
         Ok(guard)
     }
 
@@ -637,6 +652,7 @@ impl DatasetConsistencyWrapper {
             guard: self.0.read().await,
         };
         ensure_readable(guard.metadata())?;
+        ensure_live(guard.metadata())?;
         Ok(guard)
     }
 
@@ -648,6 +664,7 @@ impl DatasetConsistencyWrapper {
             guard: self.0.write().await,
         };
         ensure_readable(guard.metadata())?;
+        ensure_live(guard.metadata())?;
         ensure_writable(guard.metadata())?;
         Ok(guard)
     }
@@ -2539,6 +2556,7 @@ impl ManifestNamespace {
                 // Reject a manifest written with a reader feature flag this build
                 // does not understand before touching it.
                 ensure_readable(dataset.metadata())?;
+                ensure_live(dataset.metadata())?;
 
                 // Check if the object_id field has primary key metadata, migrate if not
                 let needs_pk_migration = dataset
@@ -3282,6 +3300,8 @@ impl LanceNamespace for ManifestNamespace {
             })
         })?;
 
+        self.ensure_live().await?;
+
         // Root namespace always exists
         if namespace_id.is_empty() {
             #[allow(clippy::needless_update)]
@@ -3425,6 +3445,8 @@ impl LanceNamespace for ManifestNamespace {
                 message: "Namespace ID is required".to_string(),
             })
         })?;
+
+        self.ensure_live().await?;
 
         // Root namespace always exists
         if namespace_id.is_empty() {
@@ -4155,7 +4177,7 @@ mod tests {
         set_manifest_table_metadata(
             temp_path,
             crate::dir::manifest_feature_flags::READER_FEATURE_FLAGS_KEY,
-            "1",
+            "2",
         )
         .await;
 
@@ -4178,7 +4200,7 @@ mod tests {
         set_manifest_table_metadata(
             temp_path,
             crate::dir::manifest_feature_flags::WRITER_FEATURE_FLAGS_KEY,
-            "1",
+            "2",
         )
         .await;
 

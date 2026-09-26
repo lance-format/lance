@@ -1014,6 +1014,70 @@ impl TransactionAlteration {
 }
 
 impl DirectoryNamespace {
+    /// Initialize the manifest of a database before publishing its catalog registration.
+    ///
+    /// Requires manifest-only mode. Existing deleted manifests cannot be reinitialized.
+    ///
+    /// ```
+    /// # use lance_namespace_impls::DirectoryNamespace;
+    /// # async fn initialize(namespace: &DirectoryNamespace) -> lance_core::Result<()> {
+    /// namespace.initialize_manifest().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn initialize_manifest(&self) -> Result<()> {
+        self.require_manifest_only()?;
+        self.manifest_ns_for_write().await?;
+        Ok(())
+    }
+
+    /// Read the current deleted state without initializing a missing manifest.
+    ///
+    /// A missing manifest is an error, not a live, empty database.
+    pub async fn manifest_is_deleted(&self) -> Result<bool> {
+        self.require_manifest_only()?;
+        self.load_read_manifest().await?;
+        self.existing_manifest()?.is_deleted().await
+    }
+
+    /// Permanently mark an empty root namespace as deleted.
+    ///
+    /// Every table registration, including declarations and tables in child namespaces,
+    /// prevents deletion. The marker and emptiness check commit against the same
+    /// manifest version as concurrent namespace mutations. Returns false if already
+    /// deleted. The manifest and physical directory are retained.
+    ///
+    /// ```
+    /// # use lance_namespace_impls::DirectoryNamespace;
+    /// # async fn drop_empty(namespace: &DirectoryNamespace) -> lance_core::Result<()> {
+    /// namespace.drop_root_namespace().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn drop_root_namespace(&self) -> Result<bool> {
+        self.require_manifest_only()?;
+        self.load_read_manifest().await?;
+        self.existing_manifest()?.drop_root_namespace().await
+    }
+
+    fn require_manifest_only(&self) -> Result<()> {
+        if !self.manifest_enabled || self.dir_listing_enabled {
+            return Err(NamespaceError::InvalidInput {
+                message: "Namespace lifecycle operations require manifest_enabled=true and dir_listing_enabled=false".into(),
+            }.into());
+        }
+        Ok(())
+    }
+
+    fn existing_manifest(&self) -> Result<&Arc<manifest::ManifestNamespace>> {
+        self.manifest_ns_for_read().ok_or_else(|| {
+            NamespaceError::NamespaceNotFound {
+                message: format!("Missing __manifest at '{}'", self.root),
+            }
+            .into()
+        })
+    }
+
     fn manifest_ns_for_read(&self) -> Option<&Arc<manifest::ManifestNamespace>> {
         self.write_manifest_ns
             .get()
@@ -1042,6 +1106,7 @@ impl DirectoryNamespace {
                 .map(Arc::new)
             })
             .await?;
+        manifest_ns.ensure_live().await?;
         Ok(Some(manifest_ns.clone()))
     }
 
@@ -1057,6 +1122,14 @@ impl DirectoryNamespace {
     /// once the cell is populated; unlike `manifest_ns_for_write` it never
     /// creates the manifest.
     async fn ensure_read_manifest(&self) -> Result<()> {
+        self.load_read_manifest().await?;
+        if let Some(manifest) = self.manifest_ns_for_read() {
+            manifest.ensure_live().await?;
+        }
+        Ok(())
+    }
+
+    async fn load_read_manifest(&self) -> Result<()> {
         if !self.manifest_enabled
             || self.manifest_ns.get().is_some()
             || self.write_manifest_ns.get().is_some()
