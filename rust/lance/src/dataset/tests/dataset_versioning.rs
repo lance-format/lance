@@ -25,11 +25,11 @@ use lance_file::version::LanceFileVersion;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::branch_contents_path;
+use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt as _, path::Path};
 use rstest::rstest;
 use std::cmp::Ordering;
 
@@ -1031,6 +1031,42 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
 }
 
 #[tokio::test]
+async fn test_list_hierarchical_branches() {
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset.create_branch("release", 1, None).await.unwrap();
+    dataset
+        .create_branch("features/nested", 1, None)
+        .await
+        .unwrap();
+
+    // OpenDAL-backed stores such as OSS may decode the '%2F' path part and
+    // expose the branch metadata as a nested object during listing.
+    let root_path = dataset.refs.root().unwrap().path;
+    let encoded_path = branch_contents_path(&root_path, "features/nested");
+    let nested_path = Path::parse(format!(
+        "{}/features/nested.json",
+        base_branches_contents_path(&root_path)
+    ))
+    .unwrap();
+    dataset
+        .object_store
+        .inner
+        .copy(&encoded_path, &nested_path)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&encoded_path).await.unwrap();
+
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("release"));
+    assert!(branches.contains_key("features/nested"));
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1358,7 +1394,6 @@ async fn test_branch() {
     // error loudly instead of handing back another branch's data: stage main's
     // manifest under a branch path that was never created, so resolution finds
     // a manifest belonging to main.
-    use object_store::ObjectStoreExt as _;
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",
