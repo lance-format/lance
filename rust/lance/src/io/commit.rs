@@ -838,7 +838,12 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
 
     // Apply mapping to the schema
     for (old_field_id, new_field_id) in &old_field_id_mapping {
-        let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
+        let field = manifest.schema.mut_field_by_id(*old_field_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot repair duplicate field id {} because it does not exist in the manifest schema",
+                old_field_id
+            ))
+        })?;
         field.id = *new_field_id;
     }
 
