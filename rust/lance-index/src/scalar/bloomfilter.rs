@@ -22,6 +22,7 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
@@ -555,6 +556,17 @@ impl ScalarIndex for BloomFilterIndex {
         _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "BloomFilter does not support remap".into(),
+        ))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::invalid_input_source(
             "BloomFilter does not support remap".into(),
         ))

@@ -4,7 +4,7 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
@@ -1765,7 +1765,7 @@ pub(crate) async fn remap_vector_index(
     old_uuid: &Uuid,
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
 ) -> Result<Vec<IndexFile>> {
     let old_index = dataset
         .open_vector_index(column, old_uuid, &NoOpMetricsCollector)

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::{
@@ -529,7 +530,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
+    /// Remap through an in-memory mapping (the legacy entry point). The
+    /// per-partition tasks are `'static`, so the map is shared through an
+    /// owned translator (the same clone this method always made).
     pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()))
+            .await
+    }
+
+    /// Remap through a translator whose payload may need reads, one
+    /// partition's addresses at a time.
+    pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.clone()).await
+    }
+
+    async fn remap_with(&mut self, mapping: RowAddrTranslator) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -541,7 +556,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
-        let mapping = Arc::new(mapping.clone());
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
@@ -554,6 +568,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .load_partition(part_id, false, &NoOpMetricsCollector)
                     .await?;
 
+                // One partition's addresses are the unit of translation; the
+                // partition itself is the working set it always was.
+                let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
+                let mapping = mapping.resolve(row_ids).await?;
                 let storage = part.storage.remap(&mapping)?;
                 let index = part.index.remap(&mapping, &storage)?;
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
@@ -563,9 +581,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         });
 
-        // Heap-pin the merge stage: at opt-level 0 its state machine is the bulk of
-        // this future, and this future is embedded in every caller up to
-        // `compact_files` (see `remap_boxed` in ivf.rs).
+        // `merge_partitions` is the bulk of this future; `remap_streaming`/`remap`
+        // and the 11-arm v3 dispatch (`remap_index_file_v3`) each carry a copy
+        // otherwise. The eager compaction remap polls that chain under Python's
+        // `block_on` on the calling thread, which overflowed the Windows
+        // main-thread stack in CI (dev-profile wheel, opt-level 0, where every
+        // awaited future is also a separate stack temporary of its caller).
         let files = Box::pin(
             self.merge_partitions(
                 stream::iter(build_iter)

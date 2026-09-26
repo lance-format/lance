@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use arrow_array::StringArray;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;

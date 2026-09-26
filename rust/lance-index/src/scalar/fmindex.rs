@@ -20,6 +20,7 @@
 //!   - Row IDs and doc_start_positions in metadata
 //!   - File metadata: c_table, huffman_codes, tree topology
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,9 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -1651,6 +1652,14 @@ impl ScalarIndex for FMIndexScalarIndex {
         false
     }
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+        Err(Error::not_supported("Fm does not support remap"))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _: &RowAddrTranslator,
+        _: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(

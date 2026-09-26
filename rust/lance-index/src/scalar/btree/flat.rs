@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
 use std::{ops::Bound, sync::Arc};
 
@@ -224,6 +225,18 @@ impl FlatIndex {
     /// Return every non-null row as TRUE without preserving NULL rows.
     pub fn all_non_null(&self) -> Result<NullableRowAddrSet> {
         self.all_non_null_matches()?.into_row_addr_set()
+    }
+
+    /// [`Self::remap_batch`] through a [`RowAddrTranslator`]: the page's
+    /// addresses are translated first, so a batch translator performs one
+    /// bounded translation per page.
+    pub async fn remap_batch_with(
+        batch: RecordBatch,
+        translator: &RowAddrTranslator,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
+        let resolved = translator.resolve(row_ids.values().iter().copied()).await?;
+        Self::remap_batch(batch, &resolved)
     }
 
     pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {

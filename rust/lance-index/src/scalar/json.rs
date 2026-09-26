@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::{
     ops::Bound,
     sync::{Arc, Mutex},
@@ -101,6 +102,22 @@ impl Index for JsonIndex {
     }
 }
 
+impl JsonIndex {
+    /// The JSON index over a rewritten target index.
+    fn wrap_target(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+        let json_details = crate::pb::JsonIndexDetails {
+            path: self.path.clone(),
+            target_details: Some(target_created.index_details),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&json_details)?,
+            // TODO: We should store the target index version in the details
+            index_version: JSON_INDEX_VERSION,
+            files: target_created.files,
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for JsonIndex {
     async fn search(
@@ -134,16 +151,19 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.wrap_target(target_created)
+    }
+
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let target_created = self
+            .target_index
+            .remap_streaming(translator, dest_store)
+            .await?;
+        self.wrap_target(target_created)
     }
 
     async fn update(
