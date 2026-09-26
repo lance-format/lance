@@ -1078,7 +1078,7 @@ impl Planner {
         // Running the rewrite more than once is safe because its output is a fixed
         // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
-        let expr = rewrite_signed_zero_comparisons(expr)?;
+        let expr = rewrite_signed_zero_comparisons(expr, &df_schema)?;
 
         Ok(expr)
     }
