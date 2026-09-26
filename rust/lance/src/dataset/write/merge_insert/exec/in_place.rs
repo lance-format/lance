@@ -257,7 +257,29 @@ impl InPlaceMergeInsertExec {
                         keep_rows.push(row_idx as u32);
                     }
                     // Rows the update condition rejected: the target keeps its
-                    // current values, so nothing is written for them.
+                    // current values, so nothing is written for them. They still
+                    // claim their target row, so a second source row matching the
+                    // same target is caught by `source_dedupe_behavior` even when
+                    // the condition excludes one of them.
+                    Action::MatchedNoOp => {
+                        if !row_addrs.is_null(row_idx)
+                            && !seen_row_ids.insert(row_ids.value(row_idx))
+                        {
+                            match dedupe {
+                                SourceDedupeBehavior::Fail => {
+                                    return Err(create_duplicate_row_error(
+                                        &batch,
+                                        row_idx,
+                                        &on_columns,
+                                    ));
+                                }
+                                SourceDedupeBehavior::FirstSeen => {
+                                    skipped_duplicates.add(1);
+                                }
+                            }
+                        }
+                    }
+                    // Rows that matched no target row.
                     Action::Nothing => {}
                     Action::Fail => {
                         return Err(DataFusionError::Execution(format!(
