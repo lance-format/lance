@@ -1257,6 +1257,61 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::not_equal_to_integer_expression(
+        "flag != (id > 0)",
+        [false, false, true]
+    )]
+    #[case::equal_to_float_expression("flag = (x > 1.0)", [false, false, false])]
+    #[case::expression_on_left("(id > 0) != flag", [false, false, true])]
+    #[case::literal_expression("flag != (1 > 0)", [false, true, false])]
+    #[case::boolean_literal("flag != TRUE", [false, true, false])]
+    fn test_parse_boolean_column_compared_to_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("flag", Boolean, [true, false, true]),
+            ("id", Int64, [1, 0, -1]),
+            ("x", Float64, [0.5, 2.0, 1.0])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::shift("u = (1 << 63)", [true, false, false])]
+    #[case::string_concat("s = ('a' || 'b')", [true, false, false])]
+    fn test_parse_comparison_to_same_type_literal_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("u", UInt64, [1_u64 << 63, 3, 0]),
+            ("s", LargeUtf8, ["ab", "a", "b"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
     #[test]
     fn test_parse_filter_uint64_literal_above_i64_max() {
         let value = u64::MAX - 1;
