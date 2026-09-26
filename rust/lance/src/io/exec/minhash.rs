@@ -698,6 +698,17 @@ mod tests {
         })
         .await;
         assert_eq!(prefiltered, vec![3, 1]);
+        let mut metric_scan = scan(&dataset, BASE, 2);
+        metric_scan.filter("id >= 1").unwrap().prefilter(true);
+        let analysis = metric_scan.analyze_plan().await.unwrap();
+        let minhash_line = analysis
+            .lines()
+            .find(|line| line.contains("MinHashSearch:"))
+            .unwrap();
+        assert!(
+            minhash_line.contains("prefilter_loads=1"),
+            "MinHash search is missing its prefilter metrics: {analysis}"
+        );
         // Postfiltering ranks first and filters the ranked rows afterwards
         let postfiltered = ids(&dataset, BASE, 2, |scan| {
             scan.filter("id >= 1").unwrap().prefilter(false);
