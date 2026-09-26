@@ -25,6 +25,8 @@ public class Query {
   private final String column;
   private final float[] key;
   private final int k;
+  private final Optional<Float> lowerBound;
+  private final Optional<Float> upperBound;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
@@ -46,6 +48,8 @@ public class Query {
             || builder.maximumNprobes.get() >= builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
+    this.lowerBound = builder.lowerBound;
+    this.upperBound = builder.upperBound;
     this.minimumNprobes = builder.minimumNprobes;
     this.maximumNprobes = builder.maximumNprobes;
     this.ef = builder.ef;
@@ -66,6 +70,24 @@ public class Query {
 
   public int getK() {
     return k;
+  }
+
+  /**
+   * Returns the inclusive lower distance bound.
+   *
+   * @return The lower bound, or empty if the query has no lower distance bound.
+   */
+  public Optional<Float> getLowerBound() {
+    return lowerBound;
+  }
+
+  /**
+   * Returns the exclusive upper distance bound.
+   *
+   * @return The upper bound, or empty if the query has no upper distance bound.
+   */
+  public Optional<Float> getUpperBound() {
+    return upperBound;
   }
 
   public int getMinimumNprobes() {
@@ -114,6 +136,8 @@ public class Query {
         .add("column", column)
         .add("key", key)
         .add("k", k)
+        .add("lowerBound", lowerBound.orElse(null))
+        .add("upperBound", upperBound.orElse(null))
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("ef", ef.orElse(null))
@@ -129,6 +153,8 @@ public class Query {
     private String column;
     private float[] key;
     private int k = 10;
+    private Optional<Float> lowerBound = Optional.empty();
+    private Optional<Float> upperBound = Optional.empty();
     private int minimumNprobes = 1;
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
@@ -172,6 +198,34 @@ public class Query {
      */
     public Builder setK(int k) {
       this.k = k;
+      return this;
+    }
+
+    /**
+     * Sets the inclusive lower bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setUpperBound(float)}. A query with lower bound
+     * {@code lower} retains results whose distance satisfies {@code distance >= lower}.
+     *
+     * @param lowerBound The inclusive lower distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setLowerBound(float lowerBound) {
+      this.lowerBound = Optional.of(lowerBound);
+      return this;
+    }
+
+    /**
+     * Sets the exclusive upper bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setLowerBound(float)}. A query with upper bound
+     * {@code upper} retains results whose distance satisfies {@code distance < upper}.
+     *
+     * @param upperBound The exclusive upper distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setUpperBound(float upperBound) {
+      this.upperBound = Optional.of(upperBound);
       return this;
     }
 
