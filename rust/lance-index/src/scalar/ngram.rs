@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_roaring_tree_map_async};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -17,7 +18,7 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -224,6 +225,17 @@ impl NGramPostingList {
         Ok(Self { bitmap })
     }
 
+    async fn try_from_batch_with_remapping(
+        batch: RecordBatch,
+        remapper: Arc<dyn BatchRowIdRemapper>,
+    ) -> Result<Self> {
+        let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
+        let bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
+            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
+        let bitmap = remap_row_ids_roaring_tree_map_async(remapper.as_ref(), &bitmap).await?;
+        Ok(Self { bitmap })
+    }
+
     fn intersect<'a>(lists: impl IntoIterator<Item = &'a Self>) -> RoaringTreemap {
         let mut iter = lists.into_iter();
         let mut result = iter
@@ -240,7 +252,11 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -273,7 +289,13 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
+                if let Some(remapper) = self.batch_remapper.clone() {
+                    // Tagged asynchronous path.
+                    NGramPostingList::try_from_batch_with_remapping(batch, remapper).await
+                } else {
+                    // Legacy synchronous remapping path.
+                    NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
+                }
         }).await;
         match &result {
             Ok((_, true)) => metrics.record_index_cache_hit(),
@@ -352,6 +374,7 @@ impl NGramIndex {
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
             frag_reuse_index,
+            batch_remapper: None,
             index_cache: WeakLanceCache::from(index_cache),
         });
 
@@ -403,6 +426,28 @@ impl NGramIndex {
         ))
     }
 
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let mut index = Self::from_store(store, None, index_cache).await?;
+        index.list_reader = Arc::new(NGramPostingListReader {
+            reader: index.list_reader.reader.clone(),
+            frag_reuse_index: None,
+            batch_remapper: remapping,
+            index_cache: WeakLanceCache::from(index_cache),
+        });
+        debug_assert!(
+            index.list_reader.frag_reuse_index.is_none()
+                || index.list_reader.batch_remapper.is_none()
+        );
+        Ok(Arc::new(index))
+    }
+
     /// Merge several built NGram segments (and optional new data) into a single
     /// canonical segment in `dest_store`, unioning their posting lists by token
     /// without rescanning the dataset.
@@ -412,6 +457,26 @@ impl NGramIndex {
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<CreatedIndex> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::merge_segments_with_remapper(
+            segment_stores,
+            new_data,
+            dest_store,
+            old_data_filters,
+            frag_reuse_index,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn merge_segments_with_remapper(
+        segment_stores: &[Arc<dyn IndexStore>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
@@ -852,7 +917,7 @@ impl NGramIndexSpillState {
 
     fn remap_and_filter_rows(
         self,
-        frag_reuse_index: Option<&Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<&dyn RowIdRemapper>,
         filter: Option<&super::OldIndexDataFilter>,
     ) -> Self {
         if let Some(fri) = frag_reuse_index {
@@ -868,7 +933,7 @@ impl NGramIndexSpillState {
     /// `filter`. Used only under a pending deferred-remap compaction.
     fn remap_then_keep(
         self,
-        fri: &Arc<FragReuseIndex>,
+        fri: &dyn RowIdRemapper,
         filter: Option<&super::OldIndexDataFilter>,
     ) -> Self {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
@@ -1561,14 +1626,14 @@ impl NGramIndexBuilder {
 
     async fn open_segment_stream(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         filter: Option<super::OldIndexDataFilter>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>>> {
         let reader = store.open_index_file(POSTINGS_FILENAME).await?;
         let stream =
             Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.map(move |res| {
                 res.map(|state| {
-                    state.remap_and_filter_rows(frag_reuse_index.as_ref(), filter.as_ref())
+                    state.remap_and_filter_rows(frag_reuse_index.as_deref(), filter.as_ref())
                 })
             });
         Ok(Box::pin(stream))
@@ -1581,7 +1646,7 @@ impl NGramIndexBuilder {
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         if old_data_filters.len() != segment_stores.len() {
@@ -1773,6 +1838,19 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(NGramIndex::load_with_remapping(index_store, remapping, cache).await?)
     }
 }
 
@@ -2453,7 +2531,7 @@ mod tests {
         use uuid::Uuid;
 
         use super::NGramIndexSpillState;
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
         use crate::scalar::OldIndexDataFilter;
 
         let addr = |frag: u32, local: u32| ((frag as u64) << 32) | local as u64;
@@ -2471,14 +2549,14 @@ mod tests {
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
         // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
         // map, so remap passes it through unchanged.
-        let fri = Arc::new(FragReuseIndex::new(
+        let fri = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
             Uuid::new_v4(),
             vec![HashMap::from([
                 (addr(0, 0), Some(addr(2, 0))),
                 (addr(0, 1), None),
             ])],
             FragReuseIndexDetails { versions: vec![] },
-        ));
+        )));
 
         // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
         let filter = OldIndexDataFilter::Fragments {

@@ -34,6 +34,7 @@ lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-bitpacking = { workspace = true }
+blake3 = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -117,6 +118,7 @@ all_asserts.workspace = true
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
+lance-index = { workspace = true, features = ["test-oracle"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger.workspace = true
 tempfile.workspace = true
@@ -207,6 +209,10 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "stable_row_id_limit"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
@@ -240,6 +246,10 @@ harness = false
 
 [[bench]]
 name = "distributed_vector_build"
+harness = false
+
+[[bench]]
+name = "frag_reuse"
 harness = false
 
 [[bench]]

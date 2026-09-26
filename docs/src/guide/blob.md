@@ -18,8 +18,9 @@ If you're unsure about whether you need a blob column in the first place (and wh
 This page focuses on blob workflows in Python and uses Lance file format terminology.
 
 - `data_storage_version` means the Lance **file format version** of a dataset.
-- A dataset's `data_storage_version` is fixed once the dataset is created.
-- If you need a different file format version, write a **new dataset**.
+- A dataset has a default file format version. Append and compaction can select
+  another exact `2.x` version without rewriting existing files or changing that default.
+- File format `0.1` cannot be mixed with the `2.x` family.
 
 ```python
 import lance
@@ -51,19 +52,61 @@ Blob support is tied to the dataset's file format version. Earlier file format v
 (`< 2.2`) stored blobs using the `lance-encoding:blob` metadata field, while Blob
 v2 introduces a new storage layout that requires file format `>= 2.2`.
 
-The two
-schemes are mutually exclusive: for file format `>= 2.2`, legacy blob metadata
-(`lance-encoding:blob`) is rejected on write. The table below is the single
-source of truth for which scheme is supported at each `data_storage_version`.
+The target file version selects the physical Blob encoding. For `>= 2.2`,
+dataset writers also accept legacy blob-marked binary inputs and convert them
+to Blob v2 before encoding. Older files keep their original encoding.
 
 | Dataset `data_storage_version` | Legacy blob metadata (`lance-encoding:blob`) | Blob v2 (`lance.blob.v2`) |
 |---|---|---|
 | `0.1`, `2.0`, `2.1` | Supported for write/read | Not supported |
-| `2.2+` | Not supported for write | Supported for write/read (recommended) |
+| `2.2+` | Accepted as input; written as Blob v2 | Supported for write/read (recommended) |
+
+### Mixing legacy Blob and Blob v2 files
+
+Append with `data_storage_version="2.2"` to start writing Blob v2 into an
+existing `2.0` or `2.1` dataset. Both legacy blob-marked binary inputs and
+`blob_field` / `blob_array` inputs are accepted. No separate upgrade operation
+or historical-payload rewrite is required.
+
+When the first Blob v2 file for a legacy column is committed, the snapshot uses
+the Blob v2 logical schema for that column. Descriptor scans return the v2
+`kind, position, size, blob_id, blob_uri` struct across all fragments, including
+selections containing only old files. Old payloads appear as Inline descriptors
+pointing into their original data files. `take_blobs`, `read_blobs`, and
+`blob_handling="all_binary"` continue to expose the same payloads, nulls, and
+empty values. Historical snapshots retain their previous schema.
+
+Descriptor consumers that access fields by position or compare exact Arrow
+schemas must account for the extended structure. Interpret `position` together
+with `kind` and the object reference. See [the schema-transition discussion](https://github.com/lance-format/lance/issues/9458).
+
+The dataset's default file version remains unchanged. Select `2.2` or newer
+explicitly when writing Blob v2 structs or compacting the mixed column into
+Blob v2 files. Compaction rewrites the selected fragments; it is not required
+to enable new Blob v2 writes.
 
 ## Blob v2: Write Patterns
 
 Use `blob_field` and `blob_array` to build blob v2 columns.
+
+### Logical Arrow schema
+
+A blob v2 field is tagged with `ARROW:extension:name = "lance.blob.v2"`. Writers
+accept these logical struct shapes:
+
+| Shape | Children | Use |
+|---|---|---|
+| Minimal | `data: LargeBinary?`, `uri: Utf8?` | Inline bytes or a complete external object |
+| Complete | Minimal fields plus `position: UInt64?`, `size: UInt64?` | An optional byte range within an external object |
+
+Every non-null row must set exactly one of `data` and `uri`. For the complete
+shape, `position` and `size` must either both be set or both be null, a range
+requires `uri`, and an explicit range must have `size > 0`. Use inline `b""` for
+an empty blob; a URI without range fields still represents the complete external
+object, including an empty object. Python's `blob_field` and `BlobType` use the
+complete shape. Lance preserves an accepted logical shape, including child
+fields, nullability, and metadata, across create, append, and merge-insert
+writes; descriptor scans still return the compact stored descriptor shape.
 
 ```python
 import lance
@@ -282,6 +325,10 @@ payloads = table.column("blob").to_pylist()
 
 ### Open file-like blob handles lazily
 
+Sequential reads are buffered, 512 KiB by default. Pass `buffer_size=0`
+for unbuffered reads. `read_range` and `read_ranges` do not use this
+buffer.
+
 ```python
 import lance
 
@@ -355,12 +402,15 @@ ds = lance.write_dataset(
 )
 ```
 
-As mentioned above, this write pattern is invalid for `data_storage_version >= 2.2`.
-For new datasets, it's recommended to use Lance file format 2.2, which uses blob v2 by default.
+With `data_storage_version >= 2.2`, dataset writers convert this input to Blob v2.
+For new datasets, prefer `blob_field` / `blob_array` with file format 2.2.
 
 ## Rewrite to a New Blob v2 Dataset
 
-If your current dataset consists of legacy blobs (stored in file formats <2.2) and you want to opt in to blob v2, you must rewrite it as a new dataset with `data_storage_version="2.2"`.
+To replace all historical legacy Blob encodings at once, you can rewrite them
+into a new dataset with `data_storage_version="2.2"`. This is optional for
+`2.0` / `2.1` tables, which can instead append Blob v2 files as described above.
+File format `0.1` tables still require a rewrite to move into the `2.x` family.
 
 ```python
 import lance
@@ -402,7 +452,7 @@ Not every binary column needs to be a blob column. Plain Arrow `binary`/`large_b
 - **Your values are large (roughly 1 MB or more on average).** Operations that rewrite entire rows, such as compaction or some updates, must copy the large inline payloads forward into the new version — even when those bytes never changed. The bigger the payload, the more bytes you rewrite per logical change (write amplification). A blob column keeps large payloads in separate `.blob` files that are referenced rather than re-copied, so these operations don't rewrite the heavy bytes.
 
 !!! tip
-    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads under 16 KiB inline, packs mid-sized payloads into shared `.blob` sidecars, and gives payloads over 2 MiB their own dedicated `.blob` file.
+    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads up to 64 KiB inline, packs payloads over 64 KiB and up to 4 MiB into shared `.blob` sidecars, and gives payloads over 4 MiB their own dedicated `.blob` file. These thresholds are configurable per column.
 
 ## Troubleshooting
 
@@ -413,8 +463,8 @@ This section contains commonly noticed issues or errors, and explains how to add
 **Fix**: Write to a dataset created with `data_storage_version="2.2"` (or newer).
 
 ### Legacy blob columns ... are not supported for file version >= 2.2
-**Cause**: You are using legacy blob metadata (`lance-encoding:blob`) while writing `2.2+` data.  
-**Fix**: Replace legacy metadata-based columns with blob v2 columns (`blob_field` / `blob_array`).
+**Cause**: A lower-level file writer received legacy blob metadata instead of prepared Blob v2 input.
+**Fix**: Use the dataset writer, which adapts legacy byte inputs, or prepare Blob v2 columns with the file-level Blob APIs.
 
 
 ### Exactly one of ids, indices, or addresses must be specified

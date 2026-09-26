@@ -7,7 +7,9 @@
 //! keeps that identity separate from dataset-version row addresses so scoring
 //! never has to infer which value a numeric slot represents.
 
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_async};
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -28,7 +30,7 @@ use crate::FtsPrewarmDocumentStatus;
 use crate::scalar::{IndexReader, IndexStore, RowIdRemapper};
 
 use super::index::{
-    DocSet, NUM_TOKEN_COL, dequantize_doc_length, doc_index_storage_column,
+    DocSet, NUM_TOKEN_COL, count_row_id_runs, dequantize_doc_length, doc_index_storage_column,
     document_coordinate_rank, quantize_doc_length,
 };
 
@@ -301,6 +303,18 @@ impl AddressDocIdLookup {
         left
     }
 
+    /// The positions of every live DocId whose address falls in `start..=end`.
+    fn positions_in_address_range(
+        &self,
+        projection: &ResidentAddressProjection,
+        start: u64,
+        end: u64,
+    ) -> Range<usize> {
+        let first = self.partition_point(projection, |address| address < start);
+        let after_last = self.partition_point(projection, |address| address <= end);
+        first..after_last
+    }
+
     fn insert_address_range(
         &self,
         projection: &ResidentAddressProjection,
@@ -308,9 +322,7 @@ impl AddressDocIdLookup {
         end: u64,
         selected: &mut RoaringBitmap,
     ) {
-        let first = self.partition_point(projection, |address| address < start);
-        let after_last = self.partition_point(projection, |address| address <= end);
-        for position in first..after_last {
+        for position in self.positions_in_address_range(projection, start, end) {
             selected.insert(self.doc_id_at(position));
         }
     }
@@ -744,6 +756,33 @@ impl DeepSizeOf for VersionAddressProjection {
 }
 
 impl VersionAddressProjection {
+    /// Additive sibling of [`Self::try_new`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn try_new_with_remapping(
+        raw: &UInt64Array,
+        num_docs: usize,
+        remapping: &dyn BatchRowIdRemapper,
+        path: &str,
+    ) -> Result<Arc<Self>> {
+        let mut projection = Self::try_new(raw, num_docs, None, path)?;
+        let mut addresses = Vec::with_capacity(raw.len());
+        let mut live_docs = RoaringBitmap::new();
+        for ids in raw.values().chunks(64 * 1024) {
+            for address in remap_row_ids_async(remapping, ids).await? {
+                let doc_id = addresses.len() as u32;
+                if let Some(address) = address {
+                    live_docs.insert(doc_id);
+                    addresses.push(address);
+                } else {
+                    addresses.push(0);
+                }
+            }
+        }
+        projection.addresses = AddressValues::Owned(Arc::new(addresses));
+        projection.live_docs = Some(live_docs);
+        Ok(Arc::new(projection))
+    }
+
     fn try_new(
         raw: &UInt64Array,
         expected_num_docs: usize,
@@ -971,6 +1010,28 @@ impl ResidentAddressProjection {
             .unwrap_or_else(|| (0..self.len() as u32).collect())
     }
 
+    /// True iff every slot is live and addresses ascend strictly with DocId.
+    ///
+    /// DocId order then equals address order and no two documents share a row,
+    /// so a contiguous DocId range spans a contiguous address interval. Row
+    /// granularity relies on the second half: cross-field statistics count
+    /// distinct rows, so an ascending partition can answer
+    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it.
+    ///
+    /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
+    /// projection already caches for the cross-column scorer. Density is the
+    /// extra condition: an ordered projection may still hold dead slots, and
+    /// those report [`RowAddress::TOMBSTONE_ROW`], which the block-skip cursor
+    /// cannot tell from an exhausted cursor. A remapper is attached whenever the
+    /// dataset carries a fragment reuse index, even when it retains every
+    /// document, so liveness has to be decided on cardinality.
+    fn dense_and_strictly_ascending(&self) -> bool {
+        match self.try_ordered_row_addresses() {
+            Ok(ordered) => !ordered.has_sparse_live_docs(),
+            Err(_) => false,
+        }
+    }
+
     async fn doc_ids_by_address(&self) -> Result<Arc<AddressDocIdLookup>> {
         self.projection
             .doc_ids_by_address
@@ -1091,11 +1152,15 @@ pub(super) struct PartitionDocuments {
     coordinate_rank: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     remapper: Option<Arc<dyn RowIdRemapper>>,
-    lengths: OnceCell<Arc<DocLengths>>,
-    projection: OnceCell<Arc<VersionAddressProjection>>,
-    shared_addresses: ArcSwapWeak<UInt64Array>,
-    prewarm_complete: OnceCell<()>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    lengths: Arc<OnceCell<Arc<DocLengths>>>,
+    projection: Arc<OnceCell<Arc<VersionAddressProjection>>>,
+    shared_addresses: Arc<ArcSwapWeak<UInt64Array>>,
+    prewarm_complete: Arc<OnceCell<()>>,
 }
 
 /// Load-boundary discriminator between the read-only legacy representation and
@@ -1186,6 +1251,7 @@ impl PartitionDocumentStore {
                 prewarm_complete: true,
                 scoring_ready: true,
                 reverse_lookup_ready: true,
+                ascending_addresses_ready: true,
                 projection_resident: true,
             },
             Self::Modern(docs) => docs.prewarm_status(),
@@ -1196,6 +1262,128 @@ impl PartitionDocumentStore {
         match self {
             Self::Legacy(docs) => Ok((**docs).clone()),
             Self::Modern(docs) => docs.load_build_docset().await,
+        }
+    }
+
+    /// This partition's documents keyed by row address; see
+    /// [`AddressKeyedDocuments`].
+    pub(crate) async fn address_keyed(&self) -> Result<AddressKeyedDocuments> {
+        match self {
+            Self::Legacy(docs) => Ok(AddressKeyedDocuments::from_docset(docs.clone())),
+            Self::Modern(docs) => docs.address_keyed().await,
+        }
+    }
+}
+
+/// One partition's documents keyed by row address instead of [`DocId`].
+///
+/// A scan that spans several columns can only join them on the row address:
+/// each column has its own index, its own partitioning and its own DocId space.
+/// Such a scan needs both directions: `DocId -> address` to place a posting,
+/// and `address -> length` to read a candidate row's contribution from a column
+/// it may hold no posting for at all, which rules out carrying a DocId through
+/// the merge instead.
+///
+/// The modern variant materializes nothing per query: it clones the partition's
+/// cached lengths, its resident address projection and the address-sorted DocId
+/// lookup, all of which are per-partition state that [`PartitionDocuments::prewarm`]
+/// fills and that outlives the query. It does keep the whole address column
+/// resident, unlike the single-column path which resolves addresses only for the
+/// final top-k, because every candidate row needs a length from every column.
+#[derive(Debug, Clone)]
+pub(super) struct AddressKeyedDocuments(AddressKeyedSource);
+
+#[derive(Debug, Clone)]
+enum AddressKeyedSource {
+    /// Legacy partitions already own a complete row-address-keyed [`DocSet`].
+    Legacy(Arc<DocSet>),
+    Modern {
+        projection: ResidentAddressProjection,
+        doc_ids_by_address: Arc<AddressDocIdLookup>,
+        lengths: Arc<DocLengths>,
+        /// Memoized per partition; see
+        /// [`ResidentAddressProjection::dense_and_strictly_ascending`].
+        strictly_ascending: bool,
+    },
+}
+
+impl AddressKeyedDocuments {
+    /// View a legacy partition's complete [`DocSet`], which is already keyed by
+    /// row address.
+    pub(crate) fn from_docset(docs: Arc<DocSet>) -> Self {
+        Self(AddressKeyedSource::Legacy(docs))
+    }
+
+    /// Number of documents, counting the dead slots a remapped partition keeps
+    /// so its DocIds stay aligned with the posting lists.
+    pub(crate) fn len(&self) -> usize {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.len(),
+            AddressKeyedSource::Modern { lengths, .. } => lengths.len(),
+        }
+    }
+
+    /// Row address of `doc_id`, or [`RowAddress::TOMBSTONE_ROW`] when the slot is
+    /// not live.
+    #[inline]
+    pub(crate) fn row_address(&self, doc_id: u32) -> u64 {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.row_id(doc_id),
+            AddressKeyedSource::Modern { projection, .. } => projection
+                .address(DocId::new(doc_id))
+                .unwrap_or(RowAddress::TOMBSTONE_ROW),
+        }
+    }
+
+    /// Total length of the row at `address`: the sum over every document the row
+    /// owns in this partition, or 0 when the partition holds none (an empty or
+    /// null field, a row outside the partition, or a dead slot).
+    ///
+    /// Released V1/V2 list indexes indexed each `List<String>` element as its own
+    /// document, so one row can own a whole run of documents and every one of
+    /// them contributes.
+    #[inline]
+    pub(crate) fn doc_length_at(&self, address: u64) -> u64 {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.doc_length_by_row_id(address),
+            AddressKeyedSource::Modern {
+                projection,
+                doc_ids_by_address,
+                lengths,
+                ..
+            } => doc_ids_by_address
+                .positions_in_address_range(projection, address, address)
+                .map(|position| {
+                    u64::from(lengths.exact(DocId::new(doc_ids_by_address.doc_id_at(position))))
+                })
+                .sum(),
+        }
+    }
+
+    /// Number of distinct row addresses the live documents cover.
+    ///
+    /// Equal to [`Self::len`] whenever each row owns a single live document.
+    /// Row-granularity corpus statistics need this count; see
+    /// [`Self::doc_length_at`] for why the two can differ.
+    pub(crate) fn num_distinct_rows(&self) -> usize {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.num_distinct_rows(),
+            AddressKeyedSource::Modern {
+                projection,
+                doc_ids_by_address,
+                strictly_ascending,
+                ..
+            } => {
+                if *strictly_ascending {
+                    return self.len();
+                }
+                // The lookup lists the live DocIds in address order, so the
+                // documents of one row form a contiguous run.
+                count_row_id_runs(
+                    (0..doc_ids_by_address.len(projection))
+                        .map(|position| doc_ids_by_address.address_at(projection, position)),
+                )
+            }
         }
     }
 }
@@ -1269,11 +1457,64 @@ impl PartitionDocuments {
             persisted_total_tokens,
             quantized_scoring,
             remapper,
-            lengths: OnceCell::new(),
-            projection: OnceCell::new(),
-            shared_addresses: ArcSwapWeak::from(Weak::new()),
-            prewarm_complete: OnceCell::new(),
+            batch_remapper: None,
+            lengths: Arc::new(OnceCell::new()),
+            projection: Arc::new(OnceCell::new()),
+            shared_addresses: Arc::new(ArcSwapWeak::from(Weak::new())),
+            prewarm_complete: Arc::new(OnceCell::new()),
         })
+    }
+
+    /// Additive sibling of [`Self::try_new`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) fn try_new_with_remapping(
+        store: Arc<dyn IndexStore>,
+        path: String,
+        partition_id: u64,
+        index_cache: WeakLanceCache,
+        reader: &dyn IndexReader,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        quantized_scoring: bool,
+    ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let mut docs = Self::try_new(
+            store,
+            path,
+            partition_id,
+            index_cache,
+            reader,
+            None,
+            quantized_scoring,
+        )?;
+        docs.batch_remapper = remapping;
+        debug_assert!(docs.remapper.is_none() || docs.batch_remapper.is_none());
+        Ok(docs)
+    }
+
+    /// Share reader-free state within the same index and fragment-reuse namespace.
+    /// Cache misses use the current store and remapper; no previous request's
+    /// readers or storage credentials are retained by the shared cells.
+    pub(crate) fn with_store(
+        &self,
+        store: Arc<dyn IndexStore>,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Self {
+        Self {
+            store,
+            path: self.path.clone(),
+            partition_id: self.partition_id,
+            index_cache: self.index_cache.clone(),
+            num_docs: self.num_docs,
+            coordinate_rank: self.coordinate_rank,
+            persisted_total_tokens: self.persisted_total_tokens,
+            quantized_scoring: self.quantized_scoring,
+            remapper,
+            batch_remapper: None,
+            lengths: self.lengths.clone(),
+            projection: self.projection.clone(),
+            shared_addresses: self.shared_addresses.clone(),
+            prewarm_complete: self.prewarm_complete.clone(),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1319,6 +1560,11 @@ impl PartitionDocuments {
                 .projection
                 .get()
                 .is_some_and(|projection| projection.doc_ids_by_address.initialized()),
+            ascending_addresses_ready: self.projection.get().is_some_and(|projection| {
+                CachedRowAddressOrder::from_raw(
+                    projection.ordered_validation.load(AtomicOrdering::Acquire),
+                ) != CachedRowAddressOrder::Unknown
+            }),
             projection_resident: self.projection_resident(),
         }
     }
@@ -1440,12 +1686,24 @@ impl PartitionDocuments {
         let projection = self
             .projection
             .get_or_try_init(|| async {
-                Result::Ok(Arc::new(VersionAddressProjection::try_new(
-                    row_ids.as_ref(),
-                    self.num_docs,
-                    self.remapper.as_deref(),
-                    &self.path,
-                )?))
+                if let Some(remapping) = &self.batch_remapper {
+                    // Tagged asynchronous path.
+                    VersionAddressProjection::try_new_with_remapping(
+                        row_ids.as_ref(),
+                        self.num_docs,
+                        remapping.as_ref(),
+                        &self.path,
+                    )
+                    .await
+                } else {
+                    // Legacy synchronous remapping path.
+                    Result::Ok(Arc::new(VersionAddressProjection::try_new(
+                        row_ids.as_ref(),
+                        self.num_docs,
+                        self.remapper.as_deref(),
+                        &self.path,
+                    )?))
+                }
             })
             .await
             .cloned()?;
@@ -1486,7 +1744,7 @@ impl PartitionDocuments {
         if mask.max_len() == Some(0) {
             return Some(DocVisibility::Selected(RoaringBitmap::new()));
         }
-        if mask.is_select_all() && self.remapper.is_none() {
+        if mask.is_select_all() && self.remapper.is_none() && self.batch_remapper.is_none() {
             return Some(DocVisibility::All);
         }
 
@@ -1510,7 +1768,7 @@ impl PartitionDocuments {
         if let Some(projection) = self.resident_address_projection() {
             return self.resolve_projected_addresses(&projection, doc_ids);
         }
-        if self.remapper.is_some() {
+        if self.remapper.is_some() || self.batch_remapper.is_some() {
             let projection = self.address_projection().await?;
             return self.resolve_projected_addresses(&projection, doc_ids);
         }
@@ -1602,6 +1860,7 @@ impl PartitionDocuments {
 
         let addresses_need_sparse_read = self.resident_address_projection().is_none()
             && self.remapper.is_none()
+            && self.batch_remapper.is_none()
             && self.shared_addresses.load().upgrade().is_none()
             && self.prefer_sparse_document_read(doc_ids.len());
         let lengths_need_sparse_read =
@@ -1807,9 +2066,48 @@ impl PartitionDocuments {
         self.num_docs.saturating_mul(std::mem::size_of::<u64>())
     }
 
+    /// This partition's documents keyed by row address; see
+    /// [`AddressKeyedDocuments`].
+    ///
+    /// Every part is a per-partition cache, so a warm partition answers with
+    /// four `Arc` clones and no IO, CPU-pool work or per-query allocation. A cold
+    /// partition reads the two columns concurrently, since it needs both whatever
+    /// the outcome.
+    pub(crate) async fn address_keyed(&self) -> Result<AddressKeyedDocuments> {
+        let (lengths, projection) = futures::try_join!(self.lengths(), self.address_projection())?;
+        let doc_ids_by_address = projection.doc_ids_by_address().await?;
+        let strictly_ascending = self.strictly_ascending_addresses(&projection).await?;
+        Ok(AddressKeyedDocuments(AddressKeyedSource::Modern {
+            projection,
+            doc_ids_by_address,
+            lengths,
+            strictly_ascending,
+        }))
+    }
+
+    /// Answer to [`ResidentAddressProjection::dense_and_strictly_ascending`],
+    /// memoized by the projection's own ordering cache. The validation scan is
+    /// O(num_docs), so it belongs to prewarmed partition state.
+    async fn strictly_ascending_addresses(
+        &self,
+        projection: &ResidentAddressProjection,
+    ) -> Result<bool> {
+        if projection.cached_row_address_order() != CachedRowAddressOrder::Unknown {
+            return Ok(projection.dense_and_strictly_ascending());
+        }
+        let projection = projection.clone();
+        spawn_cpu(move || Result::Ok(projection.dense_and_strictly_ascending())).await
+    }
+
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
-        DocSet::load(self.reader().await?, false, self.remapper.clone()).await
+        if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            DocSet::load_with_remapping(self.reader().await?, false, Some(remapping.clone())).await
+        } else {
+            // Legacy synchronous remapping path.
+            DocSet::load(self.reader().await?, false, self.remapper.clone()).await
+        }
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
@@ -1829,12 +2127,24 @@ impl PartitionDocuments {
                             format!("{ROW_ID} contains null values"),
                         ));
                     }
-                    let projection = Arc::new(VersionAddressProjection::try_new(
-                        row_ids.as_ref(),
-                        self.num_docs,
-                        self.remapper.as_deref(),
-                        &self.path,
-                    )?);
+                    let projection = if let Some(remapping) = &self.batch_remapper {
+                        // Tagged asynchronous path.
+                        VersionAddressProjection::try_new_with_remapping(
+                            row_ids.as_ref(),
+                            self.num_docs,
+                            remapping.as_ref(),
+                            &self.path,
+                        )
+                        .await?
+                    } else {
+                        // Legacy synchronous remapping path.
+                        Arc::new(VersionAddressProjection::try_new(
+                            row_ids.as_ref(),
+                            self.num_docs,
+                            self.remapper.as_deref(),
+                            &self.path,
+                        )?)
+                    };
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });
@@ -1861,10 +2171,9 @@ impl PartitionDocuments {
                     Result::Ok(())
                 })
                 .await?;
-                self.address_projection()
-                    .await?
-                    .doc_ids_by_address()
-                    .await?;
+                let projection = self.address_projection().await?;
+                projection.doc_ids_by_address().await?;
+                self.strictly_ascending_addresses(&projection).await?;
                 Result::Ok(())
             })
             .await?;
@@ -2721,6 +3030,46 @@ mod tests {
         assert!(!projection.doc_ids_by_address.initialized());
     }
 
+    /// A remapped partition that kept every document must still pass the gate.
+    /// That is the common case: a fragment reuse index attaches a remapper on
+    /// every index load, whether or not it removes anything.
+    ///
+    /// A dead slot stores address 0, so `dead_first_slot` keeps the stored
+    /// addresses ascending and is rejected by the liveness half alone.
+    #[rstest::rstest]
+    #[case::no_remapper_ascending(vec![10, 20, 30], None, true)]
+    #[case::no_remapper_ties(vec![10, 20, 20], None, false)]
+    #[case::remapper_retains_every_document(vec![10, 20, 30], Some(vec![]), true)]
+    #[case::remapper_rewrites_in_order(vec![10, 20, 30], Some(vec![(20, Some(25))]), true)]
+    #[case::remapper_ties_addresses(vec![10, 20, 30], Some(vec![(20, Some(10))]), false)]
+    #[case::remapper_reverses_addresses(vec![10, 20, 30], Some(vec![(30, Some(5))]), false)]
+    #[case::dead_first_slot(vec![10, 20, 30], Some(vec![(10, None)]), false)]
+    #[case::dead_middle_slot(vec![10, 20, 30], Some(vec![(20, None)]), false)]
+    fn ascending_address_gate_requires_live_slots_and_strict_order(
+        #[case] raw: Vec<u64>,
+        #[case] remapping: Option<Vec<(u64, Option<u64>)>>,
+        #[case] expected: bool,
+    ) {
+        let raw = Arc::new(UInt64Array::from(raw));
+        let remapper = remapping.map(|entries| TestRemapper {
+            mapping: entries.into_iter().collect(),
+        });
+        let projection = Arc::new(
+            VersionAddressProjection::try_new(
+                raw.as_ref(),
+                raw.len(),
+                remapper
+                    .as_ref()
+                    .map(|remapper| remapper as &dyn RowIdRemapper),
+                "docs",
+            )
+            .expect("valid projection"),
+        );
+        let projection = projection.resident(Some(raw)).unwrap();
+
+        assert_eq!(projection.dense_and_strictly_ascending(), expected);
+    }
+
     #[test]
     fn doc_lengths_validate_shape_total_and_memory() {
         let mismatch = DocLengths::try_new(ScalarBuffer::from(vec![2, 3]), 3, None, false, "docs")
@@ -2871,6 +3220,104 @@ mod tests {
                 .await
                 .is_some()
         );
+        assert_eq!(
+            CachedRowAddressOrder::from_raw(
+                documents
+                    .projection
+                    .get()
+                    .unwrap()
+                    .ordered_validation
+                    .load(AtomicOrdering::Acquire)
+            ),
+            CachedRowAddressOrder::Ordered
+        );
+    }
+
+    /// Prewarm owns the O(num_docs) address scan, so the first cross-field query
+    /// against a prewarmed partition spends no CPU deciding the fast path.
+    #[rstest::rstest]
+    #[case::retains_every_document(vec![], true)]
+    #[case::deletes_a_document(vec![(20, None)], false)]
+    #[tokio::test]
+    async fn prewarm_answers_the_ascending_gate_for_a_remapped_partition(
+        #[case] remapping: Vec<(u64, Option<u64>)>,
+        #[case] strictly_ascending: bool,
+    ) {
+        let (_directory, store, cache) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let remapper: Arc<dyn RowIdRemapper> = Arc::new(TestRemapper {
+            mapping: remapping.into_iter().collect(),
+        });
+        let documents = open_documents(store, path, cache.as_ref(), Some(remapper))
+            .await
+            .unwrap();
+
+        documents.prewarm().await.unwrap();
+
+        assert!(documents.query_ready());
+        assert_ne!(
+            CachedRowAddressOrder::from_raw(
+                documents
+                    .projection
+                    .get()
+                    .unwrap()
+                    .ordered_validation
+                    .load(AtomicOrdering::Acquire)
+            ),
+            CachedRowAddressOrder::Unknown,
+            "prewarm must leave the projection's ordering verdict cached"
+        );
+        let keyed = documents.address_keyed().await.unwrap();
+        assert_eq!(keyed.row_address(0), 10);
+        assert_eq!(keyed.doc_length_at(30), 5);
+        if strictly_ascending {
+            assert_eq!(keyed.num_distinct_rows(), 3);
+            assert_eq!(keyed.row_address(1), 20);
+            assert_eq!(keyed.doc_length_at(20), 3);
+        } else {
+            assert_eq!(keyed.num_distinct_rows(), 2);
+            assert_eq!(keyed.row_address(1), RowAddress::TOMBSTONE_ROW);
+            assert_eq!(keyed.doc_length_at(20), 0);
+        }
+    }
+
+    /// A partition holding no documents satisfies the cross-field fast-path gate
+    /// vacuously, and both document representations must say so: the gate is a
+    /// per-partition decision, so disagreeing here would make an empty legacy
+    /// partition alone force a whole query onto the full-read fallback.
+    #[tokio::test]
+    async fn the_ascending_gate_agrees_on_an_empty_partition() {
+        let (_directory, store, cache) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(Vec::<u64>::new()),
+            UInt32Array::from(Vec::<u32>::new()),
+            Some("0"),
+        )
+        .await;
+        let modern = open_documents(store, path, cache.as_ref(), None)
+            .await
+            .unwrap()
+            .address_keyed()
+            .await
+            .unwrap();
+
+        let legacy = AddressKeyedDocuments::from_docset(Arc::new(DocSet::default()));
+
+        for (label, keyed) in [("modern", &modern), ("legacy", &legacy)] {
+            assert_eq!(keyed.len(), 0, "{label}");
+            assert_eq!(keyed.num_distinct_rows(), 0, "{label}");
+        }
     }
 
     #[tokio::test]

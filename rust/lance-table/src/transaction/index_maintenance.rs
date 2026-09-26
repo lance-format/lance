@@ -257,6 +257,16 @@ impl Transaction {
             .collect::<RoaringBitmap>();
 
         for (_, same_name_indices) in indices_by_name {
+            // Unknown coverage is not empty coverage: a segment whose bitmap is
+            // missing has never been measured, and dropping it deletes an index
+            // that migration could not open yet.
+            let (unknown_coverage, same_name_indices): (Vec<_>, Vec<_>) = same_name_indices
+                .into_iter()
+                .partition(|index| index.fragment_bitmap.is_none());
+            for index in unknown_coverage {
+                uuids_to_keep.insert(index.uuid);
+            }
+
             if same_name_indices.len() > 1 {
                 let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
                     same_name_indices.iter().partition(|index| {
@@ -626,10 +636,29 @@ mod tests {
         Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
         Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
 
-        // Both kept: a None bitmap counts as empty coverage, and empty
-        // definitions are retained regardless of index type.
+        // Both kept: a None bitmap is unknown coverage, not empty coverage, and
+        // an unmeasured segment is retained regardless of index type.
         assert_eq!(scalar_indices.len(), 1);
         assert_eq!(vector_indices.len(), 1);
+    }
+
+    #[test]
+    fn test_retain_unknown_coverage_alongside_nonempty_sibling() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1), Fragment::new(2)];
+
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, None, false), // Coverage never measured
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::from_iter([2])), false),
+        ];
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        // The unmeasured segment must survive its non-empty sibling: its bitmap
+        // is missing because migration could not open the index, and deleting
+        // the segment would take the only record of it with it.
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().any(|idx| idx.fragment_bitmap.is_none()));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
+pub mod pairwise;
 pub mod pq;
 pub mod quantizer;
 pub mod residual;
@@ -355,6 +356,54 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         )))
     }
 
+    /// Whether this index can search multiple query vectors in a single pass
+    /// via [`VectorIndex::search_partitions_batch`], reading each partition's
+    /// storage once and scoring every query that probes it.
+    ///
+    /// Defaults to `false`; callers should fall back to repeated single-query
+    /// search for indices that return `false`.
+    fn supports_batch_partition_search(&self) -> bool {
+        false
+    }
+
+    /// Search a batch of query vectors against a shared set of partitions.
+    ///
+    /// `query.key` holds all query vectors concatenated (length
+    /// `query_count * dim`, where `query_count == partitions_per_query.len()`).
+    /// `partitions_per_query[i]` / `q_c_dists_per_query[i]` are the ranked
+    /// partition ids and query-to-centroid distances for query `i`.
+    ///
+    /// Returns one [RecordBatch] per query (in query order) with the
+    /// [`VECTOR_RESULT_SCHEMA`] (`_distance`, `_rowid`) and at most `query.k`
+    /// rows each. Implementations should read each distinct partition's storage
+    /// only once and score every query assigned to it against the loaded data.
+    ///
+    /// The default implementation returns an error; callers must gate on
+    /// [`VectorIndex::supports_batch_partition_search`].
+    #[allow(clippy::too_many_arguments)]
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        Self: 'static,
+    {
+        let _ = (
+            query,
+            partitions_per_query,
+            q_c_dists_per_query,
+            pre_filter,
+            metrics,
+        );
+        Err(Error::not_supported(
+            "batch partition search is not supported for this index",
+        ))
+    }
+
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
@@ -392,6 +441,27 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
+    }
+
+    /// Whether bounded native code-to-code scoring is available (current format).
+    fn supports_pairwise_vectors(&self) -> bool {
+        false
+    }
+
+    /// Stage a partition's codes once, in storage order, for native
+    /// code-to-code tile scoring (see [`pairwise`] for the distance
+    /// definitions). `batch_size` is the maximum rows per staged batch.
+    /// Partitions staged beyond `memory_limit` bytes use the caller's spill store.
+    async fn prepare_pairwise_partition(
+        &self,
+        _partition_id: usize,
+        _batch_size: usize,
+        _memory_limit: usize,
+        _spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<pairwise::PairwisePartition> {
+        Err(lance_core::Error::not_supported(
+            "pair enumeration requires a current-format vector index; rebuild this index",
+        ))
     }
 
     // for SubIndex only

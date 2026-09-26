@@ -327,6 +327,11 @@ impl FragmentScanner {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
+        let batch_size_bytes = self
+            .config
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
 
         let scanner = Arc::new(self);
 
@@ -362,6 +367,21 @@ impl FragmentScanner {
                 .buffer_unordered(batch_readahead)
                 .try_filter_map(|res| futures::future::ready(Ok(res)))
                 .boxed()
+        };
+
+        let stream = if let Some(budget) = batch_size_bytes {
+            stream
+                .and_then(move |batch| {
+                    futures::future::ready(
+                        crate::dataset::blob::split_batch_by_bytes(batch, (budget * 2) as usize)
+                            .map_err(DataFusionError::from),
+                    )
+                })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
+                .boxed()
+        } else {
+            stream
         };
 
         Ok(stream)
@@ -731,7 +751,6 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::io::exec::{LanceScanConfig, LanceScanExec};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 
@@ -1154,9 +1173,9 @@ mod test {
         let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4], true));
 
         let predicate = col("x")
-            .field_newstyle("a")
+            .field("a")
             .lt(lit(8))
-            .and(col("y").field_newstyle("b").gt(lit(3)));
+            .and(col("y").field("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -1394,7 +1413,7 @@ mod test {
         let dataset = Arc::new(test_dataset().await);
 
         let predicate = col("struct")
-            .field_newstyle("int")
+            .field("int")
             .gt(lit(4))
             .and(col(Column::from_name("str")).is_not_null());
 

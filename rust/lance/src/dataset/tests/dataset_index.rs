@@ -50,6 +50,7 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::registry::StoreBoundScalarIndexCacheEntry;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
@@ -61,7 +62,7 @@ use datafusion::common::{assert_contains, assert_not_contains};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::json::ARROW_JSON_EXT_NAME;
-use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery, MultiMatchQuery};
 use lance_table::format::BasePath;
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
@@ -85,7 +86,7 @@ async fn test_create_index(
         false,
     )]));
 
-    let float_arr = generate_random_array(512 * dimension as usize);
+    let float_arr = generate_random_array(2560 * dimension as usize);
     let vectors = Arc::new(
         <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
             float_arr, dimension,
@@ -666,7 +667,7 @@ async fn test_create_int8_index(
         false,
     )]));
 
-    let int8_arr = generate_random_int8_array(512 * dimension as usize);
+    let int8_arr = generate_random_int8_array(2560 * dimension as usize);
     let vectors = Arc::new(
         <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
             int8_arr, dimension,
@@ -1284,8 +1285,69 @@ async fn create_fragmented_fts_index_with_groups(
     assert_eq!(segments.len(), expected_segments);
 }
 
+/// Three fragments over two indexed text columns, each column indexed as one
+/// segment per fragment.
+///
+/// Rows 3 and 4 carry the same text in both columns, so any query that scores
+/// them symmetrically produces an exact score tie and exposes tie ordering.
+async fn compound_fts_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    dataset
+}
+
 fn compound_multimatch_query() -> FtsQuery {
     MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_combined_fields_query() -> FtsQuery {
+    CombinedFieldsQuery::try_new(
         "common".to_owned(),
         vec!["title".to_owned(), "body".to_owned()],
     )
@@ -1451,6 +1513,12 @@ fn independent_compound_fts_oracle<'a>(
                     }
                 }
                 result
+            }
+            // This oracle scores each leaf against its own column's statistics,
+            // which is exactly what BM25F does not do. combined_fields never
+            // reaches the cross-column compound path.
+            FtsQuery::CombinedFields(_) => {
+                unreachable!("combined_fields is not a cross-column compound leaf")
             }
         }
     })
@@ -2201,6 +2269,157 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
     }
 }
 
+#[rstest]
+#[case::empty(0)]
+#[case::underfilled(5)]
+#[case::high_hits(544)]
+#[tokio::test]
+async fn test_root_match_and_modern_bulk(
+    #[values(4, 16)] num_terms: usize,
+    #[case] expected_matches: usize,
+) {
+    const NUM_DOCS: usize = 544;
+    const ROWS_PER_FRAGMENT: usize = NUM_DOCS / 2;
+    const DOC_LENGTH: usize = 64;
+    const LIMIT: usize = 10;
+    const TERMS: [&str; 16] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+    ];
+    let terms = &TERMS[..num_terms];
+    let is_high_hits = expected_matches == NUM_DOCS;
+    let matching_rows = [
+        0,
+        ROWS_PER_FRAGMENT - 1,
+        ROWS_PER_FRAGMENT,
+        NUM_DOCS - 2,
+        NUM_DOCS - 1,
+    ];
+    let frequencies = (0..NUM_DOCS)
+        .map(|row| {
+            let is_match = is_high_hits || (expected_matches == 5 && matching_rows.contains(&row));
+            (0..num_terms)
+                .map(|term| {
+                    if !is_match && row % num_terms == term {
+                        0_usize
+                    } else if is_high_hits && row >= NUM_DOCS - LIMIT {
+                        2
+                    } else {
+                        1
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let documents = frequencies
+        .iter()
+        .map(|frequencies| {
+            let mut tokens = terms
+                .iter()
+                .zip(frequencies)
+                .flat_map(|(&term, &frequency)| std::iter::repeat_n(term, frequency))
+                .collect::<Vec<_>>();
+            assert!(tokens.len() <= DOC_LENGTH);
+            tokens.resize(DOC_LENGTH, "padding");
+            tokens.join(" ")
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, documents),
+        ("id", UInt64, (0..NUM_DOCS as u64).collect::<Vec<_>>())
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let params = InvertedIndexParams::default()
+        .with_position(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .block_size(256)
+        .unwrap()
+        .format_version(InvertedListFormatVersion::V3);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let row_mapping = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = row_mapping["id"].as_primitive::<UInt64Type>();
+    let row_ids = row_mapping[ROW_ID].as_primitive::<UInt64Type>();
+
+    // Every document has the same exactly representable byte-norm length.
+    // Compute BM25 independently from the fixture's corpus-wide term counts.
+    let weights = (0..num_terms)
+        .map(|term| {
+            let document_frequency = frequencies.iter().filter(|row| row[term] > 0).count() as f32;
+            ((NUM_DOCS as f32 - document_frequency + 0.5) / (document_frequency + 0.5) + 1.0).ln()
+        })
+        .collect::<Vec<_>>();
+    let mut expected = ids
+        .values()
+        .iter()
+        .zip(row_ids.values())
+        .filter_map(|(&id, &row_id)| {
+            let frequencies = &frequencies[id as usize];
+            if frequencies.contains(&0) {
+                return None;
+            }
+            let score = weights
+                .iter()
+                .zip(frequencies)
+                .fold(0.0_f32, |sum, (&weight, &freq)| {
+                    let freq = freq as f32;
+                    sum + weight * ((1.2_f32 + 1.0) * freq / (freq + 1.2))
+                });
+            Some((row_id, score))
+        })
+        .collect::<Vec<_>>();
+    let rank = |left: &(u64, f32), right: &(u64, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    expected.sort_unstable_by(rank);
+    assert_eq!(expected.len(), expected_matches);
+    if is_high_hits {
+        assert!(expected[LIMIT - 1].1 > expected[LIMIT].1);
+    }
+    expected.truncate(LIMIT);
+
+    let query: FtsQuery = MatchQuery::new(terms.join(" "))
+        .with_column(Some("text".to_owned()))
+        .with_operator(Operator::And)
+        .with_fuzziness(Some(0))
+        .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), LIMIT).await;
+    assert!(plan.contains("MatchQuery: column=text"), "{plan}");
+    assert!(
+        !plan.contains("FlatMatchQuery") && !plan.contains("CompoundFtsScorer"),
+        "{plan}"
+    );
+    let mut actual = compound_fts_results(&dataset, query, Some(LIMIT as i64)).await;
+    actual.sort_unstable_by(rank);
+    assert_eq!(scored_row_bits(&actual), scored_row_bits(&expected));
+}
+
 #[tokio::test]
 async fn test_field_local_match_wand_exactness_certificates() {
     let mut dataset = write_cross_column_compound_dataset().await;
@@ -2804,7 +3023,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -3206,47 +3425,7 @@ async fn test_boolean_must_scores_sum_across_execution_paths() {
 
 #[tokio::test]
 async fn test_nested_multimatch_limit_propagation() {
-    let batch = arrow_array::record_batch!(
-        (
-            "title",
-            Utf8,
-            [
-                "common",
-                "common filler filler filler filler filler filler filler",
-                "irrelevant",
-                "common tie",
-                "common tie",
-                "irrelevant"
-            ]
-        ),
-        (
-            "body",
-            Utf8,
-            [
-                "penalty",
-                "special",
-                "common",
-                "neutral",
-                "neutral",
-                "common filler filler filler penalty"
-            ]
-        )
-    )
-    .unwrap();
-    let schema = batch.schema();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 2,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 3);
-    create_fragmented_fts_index(&mut dataset, "title", false).await;
-    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    let dataset = compound_fts_dataset().await;
 
     let must_query: FtsQuery = BooleanQuery::new([
         (Occur::Must, compound_multimatch_query()),
@@ -3326,6 +3505,54 @@ async fn test_nested_multimatch_limit_propagation() {
         1,
     )
     .await;
+}
+
+/// `combined_fields` is planned recursively like every other FTS node, so it owes
+/// a compound parent the same contract a nested `MultiMatch` does (see
+/// `test_nested_multimatch_limit_propagation`): `FtsSearchParams::limit` decides
+/// completeness, and the ambient scanner limit must not reach the child. A child
+/// that applied the scanner limit itself would drop candidates before the parent
+/// finished composing scores.
+#[tokio::test]
+async fn test_nested_combined_fields_limit_propagation() {
+    let dataset = compound_fts_dataset().await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query, 2).await;
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_combined_fields_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_combined_fields_query(), 1).await;
 }
 
 #[tokio::test]
@@ -3601,7 +3828,7 @@ async fn test_compound_tie_uses_resolved_row_id() {
     assert_eq!(exhaustive.len(), 384);
 }
 
-fn nested_fts_batch(
+pub(super) fn nested_fts_batch(
     ids: Vec<u64>,
     a_values: Vec<Option<&str>>,
     b_values: Vec<Option<&str>>,
@@ -5310,7 +5537,11 @@ impl SingleScalarContainerCacheBackend {
     }
 
     fn rejects_scalar_container(entry: &CacheEntry, codec: Option<&CacheCodec>) -> bool {
-        codec.is_none() && entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+        // Whole-container entries are stored as Arc<dyn ScalarIndex> by custom plugin
+        // paths and as StoreBoundScalarIndexCacheEntry by the default cache path.
+        codec.is_none()
+            && (entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+                || entry.as_ref().is::<Arc<StoreBoundScalarIndexCacheEntry>>())
     }
 }
 
@@ -6408,6 +6639,81 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
 
     assert_eq!(baseline.num_rows(), 1);
     assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
+/// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
+/// index stores decoded native values (`click`, `9`). The index must decline these
+/// predicates instead of answering them against a different representation.
+///
+/// The cases run sequentially rather than as separate `rstest` cases because each
+/// index build reserves a fixed slice of the shared DataFusion memory pool, and
+/// several concurrent builds exhaust it.
+///
+/// Regression test for https://github.com/lance-format/lance/issues/8806.
+#[tokio::test]
+async fn test_json_extract_matches_unindexed_results() {
+    let cases = [
+        (
+            vec![
+                r#"{"val": "click"}"#,
+                r#"{"val": "view"}"#,
+                r#"{"val": "click"}"#,
+            ],
+            r#"json_extract(json, 'val') = '"click"'"#,
+        ),
+        (
+            vec![r#"{"val": "a"}"#, r#"{"val": "m"}"#, r#"{"val": "z"}"#],
+            r#"json_extract(json, 'val') > '"m"'"#,
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 9}"#],
+            "json_extract(json, 'val') = '9'",
+        ),
+        (
+            vec![r#"{"val": 9}"#, r#"{"val": 10}"#, r#"{"val": 100}"#],
+            "json_extract(json, 'val') < '100'",
+        ),
+    ];
+
+    fn sorted_matches(batch: &RecordBatch) -> Vec<String> {
+        let mut rows = batch
+            .column_by_name("json")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.unwrap().to_string())
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    for (values, predicate) in cases {
+        let dataset = json_btree_dataset(values).await;
+
+        let indexed = dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        // Guard against both scans matching nothing, which would pass vacuously.
+        assert!(baseline.num_rows() > 0, "no rows matched {predicate}");
+        assert_eq!(
+            sorted_matches(&indexed),
+            sorted_matches(&baseline),
+            "index changed results for {predicate}"
+        );
+    }
 }
 
 async fn prepare_json_dataset() -> (Dataset, String) {

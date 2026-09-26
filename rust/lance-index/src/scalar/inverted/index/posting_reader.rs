@@ -3,8 +3,85 @@
 
 use super::*;
 
+pub(super) struct PostingFileMetadata {
+    schema: lance_core::datatypes::Schema,
+    num_rows: usize,
+    file_size: Option<u64>,
+}
+
+/// A request's reader is opened only when decoded posting data is missing.
+/// Shared metadata never retains the reader or store that supplied it.
+pub(super) enum PostingReader {
+    Opened {
+        reader: Arc<dyn IndexReader>,
+        metadata: OnceLock<Arc<PostingFileMetadata>>,
+    },
+    Deferred {
+        metadata: Arc<PostingFileMetadata>,
+        store: Arc<dyn IndexStore>,
+        path: String,
+        reader: OnceCell<Arc<dyn IndexReader>>,
+    },
+}
+
+impl PostingReader {
+    fn with_store(&self, store: Arc<dyn IndexStore>, path: String) -> Self {
+        let metadata = match self {
+            Self::Opened { reader, metadata } => metadata
+                .get_or_init(|| {
+                    Arc::new(PostingFileMetadata {
+                        schema: reader.schema().clone(),
+                        num_rows: reader.num_rows(),
+                        file_size: reader.file_size_bytes(),
+                    })
+                })
+                .clone(),
+            Self::Deferred { metadata, .. } => metadata.clone(),
+        };
+        Self::Deferred {
+            metadata,
+            store,
+            path,
+            reader: OnceCell::new(),
+        }
+    }
+
+    pub(super) async fn get(&self) -> Result<&Arc<dyn IndexReader>> {
+        match self {
+            Self::Opened { reader, .. } => Ok(reader),
+            Self::Deferred { metadata, store, path, reader } => reader.get_or_try_init(|| async {
+                let opened = store.open_index_file(path).await?;
+                if opened.num_rows() != metadata.num_rows
+                    || opened.schema() != &metadata.schema
+                    || opened.schema().metadata != metadata.schema.metadata
+                {
+                    return Err(Error::index(format!(
+                        "FTS posting file {path} changed while reopening an immutable index: expected {} rows, got {}",
+                        metadata.num_rows, opened.num_rows()
+                    )));
+                }
+                Ok(opened)
+            }).await,
+        }
+    }
+
+    pub(super) fn num_rows(&self) -> usize {
+        match self {
+            Self::Opened { reader, .. } => reader.num_rows(),
+            Self::Deferred { metadata, .. } => metadata.num_rows,
+        }
+    }
+
+    pub(super) fn file_size_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Opened { reader, .. } => reader.file_size_bytes(),
+            Self::Deferred { metadata, .. } => metadata.file_size,
+        }
+    }
+}
+
 pub struct PostingListReader {
-    pub(super) reader: Arc<dyn IndexReader>,
+    pub(super) reader: PostingReader,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -25,9 +102,12 @@ pub struct PostingListReader {
     /// Modern postings contain dense DocIds into the partition document table.
     /// Cache successful boundary validation per immutable token so repeated
     /// queries do not decode the final posting block again.
-    pub(super) modern_doc_id_validations: Option<Arc<[OnceCell<()>]>>,
+    /// One byte per token: a synchronizing cell here costs 56 bytes per token,
+    /// which dominates memory when every partition is opened at once (segment
+    /// merge). Validation is a pure check, so a racing duplicate is harmless.
+    pub(super) modern_doc_id_validations: Option<Arc<[AtomicBool]>>,
     /// Skips per-token readiness checks once the whole immutable table is validated.
-    pub(super) modern_postings_validated: AtomicBool,
+    pub(super) modern_postings_validated: Arc<AtomicBool>,
     pub(super) modern_num_docs: Option<usize>,
 
     pub(super) index_cache: WeakLanceCache,
@@ -50,7 +130,7 @@ pub(super) enum PostingMetadata {
     /// `ensure_metadata_loaded`, and the stats path can also fetch a single
     /// token via `posting_len_for_token` without forcing the bulk load.
     V2 {
-        metadata: OnceCell<LoadedPostingMetadata>,
+        metadata: Arc<OnceCell<LoadedPostingMetadata>>,
     },
 }
 
@@ -117,7 +197,7 @@ impl DeepSizeOf for PostingListReader {
             .map(|validations| {
                 validations
                     .len()
-                    .saturating_mul(std::mem::size_of::<OnceCell<()>>())
+                    .saturating_mul(std::mem::size_of::<AtomicBool>())
             })
             .unwrap_or(0);
         metadata_size + self.grouping.deep_size_of_children(context) + validation_size
@@ -148,7 +228,7 @@ impl PostingListReader {
             }
         } else {
             PostingMetadata::V2 {
-                metadata: OnceCell::new(),
+                metadata: Arc::new(OnceCell::new()),
             }
         };
 
@@ -156,13 +236,16 @@ impl PostingListReader {
         let grouping = PostingGrouping::for_reader(is_legacy_layout, reader.num_rows());
         let modern_doc_id_validations = (!is_legacy_layout).then(|| {
             (0..reader.num_rows())
-                .map(|_| OnceCell::new())
+                .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
                 .into()
         });
 
         Ok(Self {
-            reader,
+            reader: PostingReader::Opened {
+                reader,
+                metadata: OnceLock::new(),
+            },
             metadata,
             has_position,
             has_impacts,
@@ -171,9 +254,36 @@ impl PostingListReader {
             positions_layout,
             grouping,
             modern_doc_id_validations,
-            modern_postings_validated: AtomicBool::new(false),
+            modern_postings_validated: Arc::new(AtomicBool::new(false)),
             modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
+        })
+    }
+
+    /// Reuse immutable posting state with deferred I/O through the current store.
+    /// The caller must preserve the index cache namespace: these cells describe
+    /// one immutable posting file, not an arbitrary reader with the same schema.
+    pub(super) fn with_store(&self, store: Arc<dyn IndexStore>, path: String) -> Result<Self> {
+        let PostingMetadata::V2 { metadata } = &self.metadata else {
+            return Err(Error::not_supported(
+                "rebinding legacy FTS posting readers requires a full index load",
+            ));
+        };
+        Ok(Self {
+            reader: self.reader.with_store(store, path),
+            metadata: PostingMetadata::V2 {
+                metadata: metadata.clone(),
+            },
+            has_position: self.has_position,
+            has_impacts: self.has_impacts,
+            posting_tail_codec: self.posting_tail_codec,
+            block_size: self.block_size,
+            positions_layout: self.positions_layout,
+            grouping: self.grouping.clone(),
+            modern_doc_id_validations: self.modern_doc_id_validations.clone(),
+            modern_postings_validated: self.modern_postings_validated.clone(),
+            modern_num_docs: self.modern_num_docs,
+            index_cache: self.index_cache.clone(),
         })
     }
 
@@ -247,6 +357,39 @@ impl PostingListReader {
         }
     }
 
+    /// Return a posting-list length only when its metadata is already resident.
+    ///
+    /// Legacy offsets are loaded with the schema. Modern lengths remain absent
+    /// until an explicit bulk metadata load, so this probe never starts I/O or
+    /// relies on the scoring path's stronger [`Self::posting_len`] contract.
+    pub(crate) fn loaded_posting_len(&self, token_id: u32) -> Option<usize> {
+        let token_id = token_id as usize;
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { offsets, .. } => {
+                let offset = offsets.get(token_id).copied()?;
+                let next_offset = offsets
+                    .get(token_id.checked_add(1)?)
+                    .copied()
+                    .unwrap_or(self.reader.num_rows());
+                next_offset.checked_sub(offset)
+            }
+            PostingMetadata::V2 { metadata } => metadata
+                .get()?
+                .lengths
+                .get(token_id)
+                .copied()
+                .map(|length| length as usize),
+        }
+    }
+
+    /// Whether every posting length can be read synchronously without I/O.
+    pub(crate) fn posting_lengths_loaded(&self) -> bool {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { .. } => true,
+            PostingMetadata::V2 { metadata } => self.is_empty() || metadata.get().is_some(),
+        }
+    }
+
     /// Async access to a single token's posting list length. For v2
     /// indexes this reads one row of posting metadata if the bulk metadata has
     /// not been loaded yet, and never triggers the bulk load itself. The stats
@@ -299,6 +442,8 @@ impl PostingListReader {
                         let token_id = token_id as usize;
                         let batch = self
                             .reader
+                            .get()
+                            .await?
                             .read_range(token_id..token_id + 1, Some(&[MAX_SCORE_COL, LENGTH_COL]))
                             .await?;
                         let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
@@ -329,6 +474,8 @@ impl PostingListReader {
             .get_or_try_init(|| async {
                 let batch = self
                     .reader
+                    .get()
+                    .await?
                     .read_range(
                         0..self.reader.num_rows(),
                         Some(&[MAX_SCORE_COL, LENGTH_COL]),
@@ -380,6 +527,8 @@ impl PostingListReader {
             }
             let batch = self
                 .reader
+                .get()
+                .await?
                 .read_range(token_id..token_id + 1, Some(&columns))
                 .await?;
             Ok(batch)
@@ -404,6 +553,8 @@ impl PostingListReader {
         let offset = offsets[token_id];
         let batch = self
             .reader
+            .get()
+            .await?
             .read_range(offset..offset + length, Some(&columns))
             .await?;
         Ok(batch)
@@ -572,12 +723,12 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async {
-                Self::validate_modern_posting(token_id, posting, num_docs)
-            })
-            .await
-            .map(|_| ())
+        if validation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Self::validate_modern_posting(token_id, posting, num_docs)?;
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[inline]
@@ -595,7 +746,7 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        Ok(validation.get().is_some())
+        Ok(validation.load(Ordering::Acquire))
     }
 
     pub(super) fn validate_modern_posting(
@@ -616,10 +767,8 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async { Result::Ok(()) })
-            .await
-            .map(|_| ())
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn modern_posting_validation_ready(&self) -> bool {
@@ -629,7 +778,11 @@ impl PostingListReader {
         let ready = self
             .modern_doc_id_validations
             .as_ref()
-            .is_none_or(|validations| validations.iter().all(|state| state.get().is_some()));
+            .is_none_or(|validations| {
+                validations
+                    .iter()
+                    .all(|state| state.load(Ordering::Acquire))
+            });
         if ready {
             self.modern_postings_validated
                 .store(true, Ordering::Release);
@@ -655,6 +808,8 @@ impl PostingListReader {
         }
         let batch = self
             .reader
+            .get()
+            .await?
             .read_range(start as usize..end as usize, Some(&columns))
             .await?;
         PostingListGroup::new_packed_with_block_size(

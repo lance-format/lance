@@ -783,6 +783,19 @@ fn segment_ids<'a>(
             let (base, start) = (range.start, next_value.max(range.start));
             Box::new((start..range.end).filter(move |&v| bitmap.get((v - base) as usize)))
         }
+        U64Segment::Ranges { range, runs } => {
+            let (base, start) = (range.start, next_value.max(range.start));
+            // Walk the present ranges, clipping the one the resume point falls in.
+            Box::new(
+                runs.present_ranges()
+                    .filter_map(move |present| {
+                        let first = (base + present.start as u64).max(start);
+                        let end = base + present.end as u64;
+                        (first < end).then_some(first..end)
+                    })
+                    .flatten(),
+            )
+        }
         U64Segment::SortedArray(array) | U64Segment::Array(array) => {
             Box::new((consumed..array.len()).filter_map(move |i| array.get(i)))
         }

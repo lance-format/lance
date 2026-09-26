@@ -331,6 +331,50 @@ async fn test_bm25_stats_for_terms_reuses_posting_metadata_cache() {
     );
 }
 
+/// Row-granularity statistics must not cost the posting file any extra IO
+/// when a partition's documents already map one-to-one onto rows, which is
+/// every V3 index and every V1/V2 index that is not a legacy list index. The
+/// deduplicating branch reads posting lists, so it has to stay behind the
+/// duplicate-row-id check rather than run for every legacy-format index.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_keeps_the_lazy_posting_metadata_path() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+    // A V3 index would take the delegating early return, which proves nothing
+    // about the legacy branch this test exists for.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string()];
+    let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(documents, (100, 100, vec![1]));
+    let metadata_rows = counter.metadata_rows_read();
+    let rows = counter.rows_read();
+    assert_eq!(metadata_rows, 1);
+
+    assert_eq!(
+        index.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+        documents,
+        "one document per row leaves the two granularities identical",
+    );
+    assert_eq!(
+        counter.metadata_rows_read() - metadata_rows,
+        1,
+        "row statistics should read one metadata row per (term, partition)",
+    );
+    assert_eq!(
+        counter.rows_read() - rows,
+        1,
+        "row statistics must not read the posting list itself (got {} extra rows)",
+        counter.rows_read() - rows,
+    );
+}
+
 #[tokio::test]
 async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     let cache = LanceCache::with_capacity(1024 * 1024);
@@ -360,6 +404,48 @@ async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     assert_eq!(warm.index_cache_hits(), terms.len());
 }
 
+/// Row-granularity statistics go through `InvertedPartition::row_stats_for_terms`
+/// on a V1/V2 index, and its posting-metadata lookups must reach the caller's
+/// collector too: the cross-field scorer build is the only consumer, and it
+/// runs under an `ExecutionPlan` whose cache counters would otherwise miss
+/// them entirely.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (index, _counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
+    // A V3 index would delegate to the document-granularity path, which
+    // already has its own coverage.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
+    let cold = LocalMetricsCollector::default();
+    let cold_stats = index
+        .bm25_row_stats_for_terms(&terms, Some(&cold))
+        .await
+        .unwrap();
+    assert_eq!(cold_stats, (100, 100, vec![1, 1, 1]));
+    assert_eq!(cold.index_cache_misses(), terms.len());
+    assert_eq!(cold.index_cache_hits(), 0);
+
+    let warm = LocalMetricsCollector::default();
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, Some(&warm))
+            .await
+            .unwrap(),
+        cold_stats,
+    );
+    assert_eq!(warm.index_cache_misses(), 0);
+    assert_eq!(warm.index_cache_hits(), terms.len());
+}
+
 #[tokio::test]
 async fn test_aggregate_corpus_stats_reuses_cached_value() {
     let (index, _counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
@@ -371,6 +457,92 @@ async fn test_aggregate_corpus_stats_reuses_cached_value() {
 
     let second = index.aggregate_corpus_stats().await.unwrap();
     assert_eq!(second, first);
+}
+
+#[tokio::test]
+async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(10, LanceCache::no_cache()).await;
+    let posting_reader = &index.partitions[0].inverted_list;
+    let terms = ["t0".to_string(), "missing".to_string(), "t9".to_string()];
+
+    assert!(!posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), None);
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "absent corpus statistics must reject the synchronous path"
+    );
+
+    assert_eq!(index.aggregate_corpus_stats().await.unwrap(), (10, 10));
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "an OOV term must not hide an unloaded modern length table"
+    );
+    assert_eq!(counter.metadata_rows_read(), 0);
+
+    posting_reader.ensure_metadata_loaded().await.unwrap();
+    assert!(posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(9), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(10), None);
+
+    let loaded = index
+        .bm25_stats_for_terms_if_loaded(&terms)
+        .unwrap()
+        .unwrap();
+    let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(loaded, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded, asynchronous);
+}
+
+#[tokio::test]
+async fn test_loaded_bm25_stats_reports_invalid_loaded_token_id() {
+    let (mut index, _counter, _tmpdir) = load_counted_v2_index(1, LanceCache::no_cache()).await;
+    index.aggregate_corpus_stats().await.unwrap();
+    index.partitions[0]
+        .inverted_list
+        .ensure_metadata_loaded()
+        .await
+        .unwrap();
+
+    {
+        let index = Arc::get_mut(&mut index).expect("test index should have one owner");
+        let partition =
+            Arc::get_mut(&mut index.partitions[0]).expect("test partition should have one owner");
+        let posting_reader = Arc::get_mut(&mut partition.inverted_list)
+            .expect("test posting reader should have one owner");
+        let PostingMetadata::V2 { metadata } = &mut posting_reader.metadata else {
+            panic!("test requires modern posting metadata");
+        };
+        Arc::get_mut(metadata)
+            .expect("test metadata should have one owner")
+            .get_mut()
+            .expect("metadata was loaded above")
+            .lengths
+            .clear();
+    }
+
+    let terms = ["t0".to_string()];
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(
+            std::slice::from_ref(&index),
+            &terms,
+            false,
+        )
+        .unwrap()
+        .is_none(),
+        "the kill switch must short-circuit before loaded-metadata validation"
+    );
+
+    let error = index.bm25_stats_for_terms_if_loaded(&terms).unwrap_err();
+    assert!(matches!(error, Error::Index { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("token 't0' maps to invalid posting token id 0 in partition 0"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -444,6 +616,30 @@ async fn test_no_hit_partition_does_not_load_document_columns() {
     assert!(row_ids.is_empty());
     assert!(scores.is_empty());
     assert!(!documents.lengths_loaded());
+    assert!(!documents.projection_loaded());
+
+    let tokens = Arc::new(Tokens::new(
+        vec!["t0".to_owned(), "missing-token".to_owned()],
+        DocType::Text,
+    ));
+    let (row_ids, scores) = index
+        .bm25_search(
+            tokens,
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(row_ids.is_empty());
+    assert!(scores.is_empty());
+    assert!(
+        !documents.lengths_loaded(),
+        "a missing required token must gate the full document-length read"
+    );
     assert!(!documents.projection_loaded());
 }
 

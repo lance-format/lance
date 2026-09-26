@@ -412,12 +412,15 @@ async fn test_fts_filter_vector_search() {
     let dataset = prepare_query_filter_dataset().await;
     let schema: ArrowSchema = dataset.schema().into();
 
+    // Assert filtering and exact distance order without depending on PQ's
+    // approximate distances, which can tie for adjacent vectors.
     // Case 1: search with prefilter=true, query_filter=match("text")
     let query_vector = Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]);
     let mut scanner = dataset.scan();
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -441,6 +444,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter("category='geography'")
         .unwrap()
@@ -466,6 +470,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -489,6 +494,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter("category='geography'")
         .unwrap()

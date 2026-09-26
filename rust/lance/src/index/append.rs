@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
-    frag_reuse::FragReuseIndex,
+    frag_reuse::CompactFragReuseIndex,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
@@ -29,10 +29,10 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    VectorSegmentCompatibility, index_type_for_segmented_optimize, optimize_vector_indices,
-    select_segment_for_single_rebalance, vector_segment_compatibility,
+    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
+    optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
-use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
+use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
@@ -162,7 +162,7 @@ pub fn split_segment_coverage<'a>(
 }
 
 pub fn fragment_reuse_affects_segments<'a>(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
 ) -> bool {
     segments.into_iter().any(|segment| {
@@ -174,7 +174,7 @@ pub fn fragment_reuse_affects_segments<'a>(
 }
 
 pub fn fragment_reuse_affects_segment(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     coverage: &RoaringBitmap,
     dataset_version: u64,
 ) -> bool {
@@ -614,6 +614,12 @@ async fn merge_scalar_indices<'a>(
 }
 
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
+    // Declared type first: an index awaiting training declares itself a vector
+    // index and has no file to find it by.
+    if index.index_details.is_some() {
+        return Ok(crate::index::segment_has_vector_details(index));
+    }
+
     if let Some(files) = &index.files {
         return Ok(files.iter().any(|file| file.path == INDEX_FILE_NAME));
     }
@@ -658,33 +664,50 @@ pub async fn merge_indices<'a>(
     .await
 }
 
-async fn build_fresh_vector_segment(
+/// Whether a rebuild of `params` should expect the definition alone, because
+/// the column does not hold the vectors its quantizer needs.
+async fn expects_definition_only(
     dataset: &Dataset,
-    logical_index: &LogicalVectorIndex,
+    field_path: &str,
+    params: &VectorIndexParams,
+) -> Result<bool> {
+    let Some(minimum) = super::vector::vector_quantizer_minimum_rows(&params.stages) else {
+        return Ok(false);
+    };
+    Ok(!super::vector::has_vectors_to_train(dataset, field_path, minimum).await?)
+}
+
+/// Retrain a whole segment over `fragment_bitmap` from index parameters alone.
+async fn rebuild_vector_segment(
+    dataset: &Dataset,
+    name: &str,
+    params: &VectorIndexParams,
     field_path: &str,
     fragment_bitmap: &RoaringBitmap,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexMetadata> {
-    let (reference_metadata, reference_index) = logical_index.iter().last().ok_or_else(|| {
-        Error::index(format!(
-            "Optimize vector index: logical index '{}' has no physical segments",
-            logical_index.name()
-        ))
-    })?;
-    let params = fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
     let mut build_dataset = dataset.clone();
-    CreateIndexBuilder::new(
-        &mut build_dataset,
-        &[field_path],
-        IndexType::Vector,
-        &params,
-    )
-    .name(logical_index.name().to_string())
-    .replace(true)
-    .fragments(fragment_bitmap.iter().collect())
-    .progress(progress)
-    .execute_uncommitted()
-    .await
+    CreateIndexBuilder::new(&mut build_dataset, &[field_path], IndexType::Vector, params)
+        .name(name.to_string())
+        .replace(true)
+        .fragments(fragment_bitmap.iter().collect())
+        .progress(progress)
+        .execute_uncommitted()
+        .await
+}
+
+/// True when a segment carries only its definition: nothing to open, nothing
+/// to append to, so training is what it is waiting for.
+///
+/// Happens when an index is created against an empty table, or one without
+/// enough rows to justify training it.
+fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
+    let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
+    let covers_nothing = metadata
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(RoaringBitmap::is_empty);
+    no_files_recorded && covers_nothing
 }
 
 async fn scan_vector_fragments(
@@ -705,16 +728,85 @@ async fn scan_vector_fragments(
     scanner.try_into_stream().await
 }
 
+/// Train a column whose index is still only a definition, from the parameters
+/// that definition carries.
+///
+/// The result supersedes every segment the index had: they hold no data, and
+/// what this writes covers the whole column.
+async fn train_from_definition<'a>(
+    dataset: &Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    field_path: &str,
+    options: &OptimizeOptions,
+) -> Result<IndexMergeResults<'a>> {
+    let params = old_indices
+        .last()
+        .and_then(|metadata| metadata.index_details.as_deref())
+        .and_then(details::vector_params_from_details)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "Optimize vector index: index '{}' awaits training but carries no parameters",
+                old_indices[0].name
+            ))
+        })?;
+    let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
+    let segment = rebuild_vector_segment(
+        dataset.as_ref(),
+        &old_indices[0].name,
+        &params,
+        field_path,
+        &fragment_bitmap,
+        options.progress.clone(),
+    )
+    .await?;
+    // Only a result that looks degraded is worth confirming; a rebuild that
+    // covered rows needs no count to justify it.
+    let definition_expected = is_definition_only_segment(&segment)
+        && expects_definition_only(dataset.as_ref(), field_path, &params).await?;
+    fresh_vector_segment_result(
+        segment,
+        &fragment_bitmap,
+        old_indices.to_vec(),
+        definition_expected,
+    )
+}
+
 fn fresh_vector_segment_result<'a>(
     segment: IndexMetadata,
     expected_fragment_bitmap: &RoaringBitmap,
     removed_indices: Vec<&'a IndexMetadata>,
+    definition_expected: bool,
 ) -> Result<IndexMergeResults<'a>> {
     let fragment_bitmap = segment.fragment_bitmap.ok_or_else(|| {
         Error::index(
             "Optimize vector index: newly built segment has no fragment bitmap".to_string(),
         )
     })?;
+    // A column with too few vectors to train the quantizer yields the
+    // definition alone: its rows return to unindexed, which is the state a
+    // table below the threshold belongs in. Accepted only when the caller
+    // established that beforehand and the segment wrote no files to match, so
+    // coverage lost for any other reason still fails below.
+    let wrote_no_files = segment.files.as_ref().is_some_and(|files| files.is_empty());
+    if definition_expected && wrote_no_files && fragment_bitmap.is_empty() {
+        return Ok(IndexMergeResults {
+            new_uuid: segment.uuid,
+            removed_indices,
+            new_fragment_bitmap: fragment_bitmap,
+            new_dataset_version: segment.dataset_version,
+            new_index_version: segment.index_version,
+            new_index_details: segment
+                .index_details
+                .map(|details| details.as_ref().clone())
+                .ok_or_else(|| {
+                    Error::index(
+                        "Optimize vector index: rebuilt definition has no index details"
+                            .to_string(),
+                    )
+                })?,
+            files: Vec::new(),
+        });
+    }
     if fragment_bitmap != *expected_fragment_bitmap {
         return Err(Error::index(format!(
             "Optimize vector index: newly built segment covers fragments {:?}, expected {:?}",
@@ -839,8 +931,25 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(merged);
             }
             let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
-            if rebuild_dormant && unindexed.is_empty() {
+            // A deferred build leaves a segment with no file to open, so the
+            // column is trained from its definition rather than appended to.
+            // Opening the index by name opens every segment, so any one of
+            // them settles it.
+            let awaits_training = old_indices
+                .iter()
+                .any(|idx| is_definition_only_segment(idx));
+
+            // Rebuilding and first training both read the whole column, so
+            // neither has anything to do until a fragment sits outside the
+            // index.
+            if unindexed.is_empty() && (rebuild_dormant || awaits_training) {
                 return Ok(None);
+            }
+
+            if awaits_training {
+                return train_from_definition(&dataset, old_indices, &field_path, options)
+                    .await
+                    .map(Some);
             }
 
             let full_logical_index = dataset
@@ -872,19 +981,34 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             )?;
 
             if options.retrain || rebuild_dormant {
+                let (reference_metadata, reference_index) =
+                    logical_index.iter().last().ok_or_else(|| {
+                        Error::index(format!(
+                            "Optimize vector index: logical index '{}' has no physical segments",
+                            logical_index.name()
+                        ))
+                    })?;
+                let params =
+                    fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
                 let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
-                let segment = build_fresh_vector_segment(
+                let segment = rebuild_vector_segment(
                     dataset.as_ref(),
-                    &logical_index,
+                    logical_index.name(),
+                    &params,
                     &field_path,
                     &fragment_bitmap,
                     options.progress.clone(),
                 )
                 .await?;
+                // Only a result that looks degraded is worth confirming; a
+                // rebuild that covered rows needs no count to justify it.
+                let definition_expected = is_definition_only_segment(&segment)
+                    && expects_definition_only(dataset.as_ref(), &field_path, &params).await?;
                 return fresh_vector_segment_result(
                     segment,
                     &fragment_bitmap,
                     old_indices.to_vec(),
+                    definition_expected,
                 )
                 .map(Some);
             }
@@ -960,22 +1084,20 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             if unindexed.is_empty() && options.num_indices_to_merge == Some(0) {
                 return Ok(None);
             }
-            if unindexed.is_empty()
-                && options.num_indices_to_merge.is_none()
-                && select_segment_for_single_rebalance(&ivf_view)?.is_none()
-            {
-                return Ok(None);
-            }
-
-            let use_single_segment_rebalance = logical_index.num_segments() > 1
-                && options.num_indices_to_merge.is_none()
-                && unindexed.is_empty();
-
-            if use_single_segment_rebalance {
-                let Some(selected_segment_id) = select_segment_for_single_rebalance(&ivf_view)?
-                else {
-                    return Ok(None);
+            let steady_state_rebalance =
+                if unindexed.is_empty() && options.num_indices_to_merge.is_none() {
+                    let Some(rebalance) = select_steady_state_rebalance(&ivf_view, compatibility)?
+                    else {
+                        return Ok(None);
+                    };
+                    Some(rebalance)
+                } else {
+                    None
                 };
+
+            if let Some(SteadyStateRebalance::Segment(selected_segment_id)) = steady_state_rebalance
+                && logical_index.num_segments() > 1
+            {
                 let removed_segment = old_indices
                 .iter()
                 .copied()
@@ -1418,10 +1540,10 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let frag_reuse_index = FragReuseIndex {
-            uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
-            details: FragReuseIndexDetails {
+        let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
+            Uuid::new_v4(),
+            vec![],
+            FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
                     groups: vec![FragReuseGroup {
@@ -1439,7 +1561,7 @@ mod tests {
                     }],
                 }],
             },
-        };
+        );
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,
@@ -1564,7 +1686,10 @@ mod tests {
 
         let initial_fragments = dataset.get_fragments();
         assert_eq!(initial_fragments.len(), 2);
-        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        // Two partitions per segment: summed over the segments they are under
+        // the join threshold, which must not tempt a steady-state merge of
+        // segments whose centroids differ.
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
         let mut initial_segments = Vec::with_capacity(initial_fragments.len());
         for fragment in &initial_fragments {
             initial_segments.push(
@@ -2284,7 +2409,7 @@ mod tests {
     /// vector index used to fall through to `optimize_vector_indices` and write
     /// a new UUID directory + manifest even though nothing had changed. The
     /// no-op gate inside `merge_indices_with_unindexed_frags` should bail out
-    /// once `select_segment_for_single_rebalance` returns `None`.
+    /// once `select_steady_state_rebalance` returns `None`.
     #[tokio::test]
     async fn test_optimize_indices_append_is_noop_on_steady_state() {
         const DIM: usize = 64;
@@ -2742,6 +2867,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_filters_stable_row_id_replacements() {
+        const DIMENSION: usize = 4;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMENSION as i32,
+                ),
+                false,
+            ),
+        ]));
+        let initial_values = (0..40)
+            .flat_map(|row| [if row < 20 { 1.0 } else { 0.0 }; DIMENSION])
+            .collect::<Vec<_>>();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(initial_values),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let replacements = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(20..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(vec![10.0; 20 * DIMENSION]),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, stats) = merge_job
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(replacements)],
+                schema,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 20);
+
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(logical_index.num_segments(), 1);
+        assert_eq!(
+            logical_index
+                .num_rows_per_segment()
+                .into_iter()
+                .map(|(_, rows)| rows)
+                .sum::<u64>(),
+            40,
+            "the merged index must contain one current copy of every stable row id"
+        );
+
+        let query = arrow_array::Float32Array::from(vec![0.0; DIMENSION]);
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .nprobes(1)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["id"].as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(
+            ids.values().iter().all(|id| *id < 20),
+            "stale pre-update vectors must not survive the optimize merge: {ids:?}"
+        );
     }
 
     #[tokio::test]

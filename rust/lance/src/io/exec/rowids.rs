@@ -136,7 +136,9 @@ impl AddRowAddrExec {
                 let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
                 for rowid in row_id_values.iter() {
                     if let Some(rowid) = rowid {
-                        if let Some(row_addr) = row_id_index.get(rowid) {
+                        if let Some(row_addr) =
+                            row_id_index.get(rowid).map_err(DataFusionError::from)?
+                        {
                             builder.append_value(row_addr.into());
                         } else {
                             return Err(DataFusionError::Internal(format!(
@@ -153,7 +155,9 @@ impl AddRowAddrExec {
                 // Fast path - no branching for null values
                 let mut rowaddrs: Vec<u64> = Vec::with_capacity(row_id_values.len());
                 for rowid in row_id_values.values() {
-                    if let Some(row_addr) = row_id_index.get(*rowid) {
+                    if let Some(row_addr) =
+                        row_id_index.get(*rowid).map_err(DataFusionError::from)?
+                    {
                         rowaddrs.push(row_addr.into());
                     } else {
                         return Err(DataFusionError::Internal(format!(

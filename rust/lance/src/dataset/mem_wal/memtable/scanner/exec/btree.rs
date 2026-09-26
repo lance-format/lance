@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::ScalarPredicate;
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// ExecutionPlan node that queries BTree index with visibility filtering.
@@ -256,9 +257,16 @@ impl BTreeIndexExec {
                 let columns = columns?;
 
                 // Apply projection
+                let source_schema = stored.data.schema();
                 let mut final_columns: Vec<Arc<dyn arrow_array::Array>> =
                     if let Some(ref proj_indices) = self.projection {
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect()
+                        take_projected_columns(
+                            &columns,
+                            source_schema.fields(),
+                            proj_indices,
+                            self.output_schema.as_ref(),
+                            row_positions.len(),
+                        )?
                     } else {
                         columns
                     };

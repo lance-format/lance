@@ -13,7 +13,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
+use crate::io::commit::default_commit_retry_timeout;
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -45,7 +45,6 @@ pub struct CommitBuilder<'a> {
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
     source_store: Option<Arc<ObjectStore>>,
-    source_commit_handler: Option<Arc<dyn CommitHandler>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -71,11 +70,10 @@ impl<'a> CommitBuilder<'a> {
             store_params: None,
             object_store: None,
             source_store: None,
-            source_commit_handler: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
-            retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
+            retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
@@ -97,11 +95,14 @@ impl<'a> CommitBuilder<'a> {
 
     /// Pass the storage format to use for the dataset.
     ///
-    /// This is only needed when creating a new empty table. If any data files are
-    /// passed, the storage format will be inferred from the data files.
+    /// On creation, this sets the default storage version. If omitted, the version
+    /// is inferred from homogeneous data files, or uses the stable version for an
+    /// empty table. Creating from mixed prewritten files requires an explicit default.
     ///
-    /// All data files must use the same storage format as the existing dataset.
-    /// If a different format is passed, an error will be returned.
+    /// For an existing dataset, this only sets the manifest default on overwrite;
+    /// other operations preserve the existing default. If
+    /// prewritten fragments introduce another exact V2 version, the commit
+    /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
         self.storage_format = Some(storage_format.resolve());
 
@@ -131,15 +132,12 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Pass the dataset being cloned from.
+    /// Pass the object store of the dataset being cloned from.
     ///
-    /// Only used by `Operation::Clone`: the source manifest is resolved through
-    /// the dataset's commit handler and read through its object store. This is
-    /// required when the source and destination use different manifest stores.
-    pub fn with_source_dataset(mut self, source: &Dataset) -> Self {
-        self.source_store = Some(source.object_store.clone());
-        self.source_commit_handler = Some(source.commit_handler.clone());
-        self
+    /// The source dataset's commit handler is not used.
+    #[deprecated(since = "12.0.0-beta.12", note = "use with_source_store instead")]
+    pub fn with_source_dataset(self, source: &Dataset) -> Self {
+        self.with_source_store(source.object_store.clone())
     }
 
     /// Pass a commit handler to use for the dataset.
@@ -311,9 +309,8 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
-        // Store and handler used to read the source manifest for a clone.
+        // Store used to read the source manifest for a clone (see with_source_store).
         let source_store = self.source_store.clone();
-        let source_commit_handler = self.source_commit_handler.clone();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -423,21 +420,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-        // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset()
-            && let Some(storage_format) = self.storage_format
-        {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
-            if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
-            {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
-            }
-        }
 
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
@@ -486,7 +468,6 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
-                source_commit_handler.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -620,9 +601,7 @@ mod tests {
     use lance_table::format::{
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
-    use lance_table::io::commit::{
-        CommitError, ConditionalPutCommitHandler, ManifestLocation, ManifestWriter,
-    };
+    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -691,90 +670,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Err(CommitError::CommitConflict)
         }
-    }
-
-    #[derive(Debug)]
-    struct DestinationOnlyCommitHandler;
-
-    #[async_trait::async_trait]
-    impl CommitHandler for DestinationOnlyCommitHandler {
-        async fn resolve_version_location(
-            &self,
-            _base_path: &object_store::path::Path,
-            _version: u64,
-            _object_store: &dyn object_store::ObjectStore,
-        ) -> Result<ManifestLocation> {
-            Err(Error::invalid_input(
-                "destination commit handler cannot resolve source versions",
-            ))
-        }
-
-        async fn commit(
-            &self,
-            manifest: &mut Manifest,
-            indices: Option<Vec<IndexMetadata>>,
-            base_path: &object_store::path::Path,
-            object_store: &ObjectStore,
-            manifest_writer: ManifestWriter,
-            naming_scheme: ManifestNamingScheme,
-            transaction: Option<TableTransaction>,
-        ) -> std::result::Result<ManifestLocation, CommitError> {
-            ConditionalPutCommitHandler
-                .commit(
-                    manifest,
-                    indices,
-                    base_path,
-                    object_store,
-                    manifest_writer,
-                    naming_scheme,
-                    transaction,
-                )
-                .await
-        }
-    }
-
-    #[tokio::test]
-    async fn test_clone_uses_source_dataset_commit_handler() {
-        let session = Arc::new(Session::default());
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
-        .unwrap();
-        let source = InsertBuilder::new("memory://clone-source-handler/source")
-            .with_params(&WriteParams {
-                session: Some(session.clone()),
-                ..Default::default()
-            })
-            .execute(vec![batch])
-            .await
-            .unwrap();
-        let version = source.version().version;
-        let transaction = Transaction::new(
-            version,
-            Operation::Clone {
-                is_shallow: true,
-                ref_name: None,
-                ref_version: version,
-                ref_path: source.uri().to_string(),
-                branch_name: None,
-            },
-            None,
-        );
-
-        let cloned = CommitBuilder::new("memory://clone-source-handler/target")
-            .with_session(session)
-            .with_commit_handler(Arc::new(DestinationOnlyCommitHandler))
-            .with_source_dataset(&source)
-            .execute(transaction)
-            .await
-            .unwrap();
-
-        assert_eq!(cloned.count_rows(None).await.unwrap(), 10);
     }
 
     #[tokio::test]
@@ -994,8 +889,11 @@ mod tests {
     #[test]
     fn test_commit_retry_timeout_default_is_thirty_seconds() {
         let builder = CommitBuilder::new("memory://default-retry-timeout");
-        assert_eq!(builder.retry_timeout, DEFAULT_COMMIT_RETRY_TIMEOUT);
-        assert_eq!(DEFAULT_COMMIT_RETRY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(builder.retry_timeout, default_commit_retry_timeout());
+        assert_eq!(
+            crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT,
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]

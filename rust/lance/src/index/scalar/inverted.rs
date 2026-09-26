@@ -582,6 +582,53 @@ pub(crate) async fn indexed_fts_document_granularities(
     Ok(by_name.into_iter().collect())
 }
 
+/// The effective [`InvertedIndexParams`] of every persisted FTS index on
+/// `column`, paired with the document granularity it was built for.
+///
+/// The analyzer and positional settings are part of the query contract, not an
+/// implementation detail: a phrase query needs positions, and a stemming or
+/// n-gram tokenizer changes which terms a document produces. Anything that
+/// evaluates the same query over rows an index does not cover — an unindexed
+/// fragment, or a MemWAL active memtable — has to analyze them the same way or
+/// the two disagree about what matches.
+///
+/// Keyed by granularity rather than flattened, because row and list-element
+/// indexes may coexist on one column with *different* settings, and
+/// `load_segments` selects between them by the query's resolved granularity.
+/// Picking the first match instead would rebuild against the wrong contract —
+/// a list-element phrase query could be analyzed with the row index's
+/// positionless settings and silently match nothing.
+pub(crate) async fn indexed_fts_index_params(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Vec<(DocumentGranularity, InvertedIndexParams)>> {
+    let resolved = resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    let mut found = Vec::new();
+    for index in dataset.load_indices().await?.iter() {
+        if index.keyed_field() != Some(resolved.final_field_id) {
+            continue;
+        }
+        let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
+        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+            continue;
+        }
+        let details =
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                Error::corrupt_file(
+                    dataset.indices_dir().join(index.uuid.to_string()),
+                    format!(
+                        "failed to decode InvertedIndexDetails for FTS index '{}': {error}",
+                        index.name
+                    ),
+                )
+            })?;
+        let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+        found.push((document_granularity, params));
+    }
+    Ok(found)
+}
+
 /// Resolve an optional query granularity against persisted FTS index metadata.
 ///
 /// A unique indexed granularity is authoritative and also controls flat search
@@ -634,6 +681,45 @@ pub(crate) async fn resolve_query_document_granularity(
 
     resolve_fts_field(dataset.schema(), column, resolved)?;
     Ok(resolved)
+}
+
+/// Check that one `combined_fields` target column can take part in a BM25F
+/// blend, and resolve its path.
+///
+/// Cross-field scoring joins the target columns on the row address and sums their
+/// per-row term frequencies and document lengths, so it needs row documents. A
+/// column indexed only at list-element granularity cannot supply them: that index
+/// stores several documents per row, identified by element coordinates a
+/// cross-column scan cannot pair up between columns and the combined result schema
+/// cannot report. A column carrying both granularities is fine; the row index is
+/// the one used.
+///
+/// Any field shape a row-document index accepts is allowed, list nesting included:
+/// the flat sibling scan reaches such a leaf through
+/// [`flatten_fts_document_column`], which uses the same traversal a single-column
+/// match drives through [`FtsDocument`].
+pub(crate) async fn validate_combined_fields_target_column(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<()> {
+    let indices = indexed_fts_document_granularities(dataset, column).await?;
+    if !indices.is_empty()
+        && indices
+            .iter()
+            .all(|(_, granularity)| granularity.is_list_element())
+    {
+        let indexed = indices
+            .iter()
+            .map(|(name, granularity)| format!("'{name}' ({granularity:?})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::not_supported(format!(
+            "combined_fields (BM25F) scores whole rows and needs a Row document granularity FTS \
+             index on every target column, but '{column}' only has: {indexed}"
+        )));
+    }
+    resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    Ok(())
 }
 
 pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {

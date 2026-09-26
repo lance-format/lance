@@ -23,6 +23,7 @@ use lance_index::scalar::inverted::query::{
     BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
 };
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
@@ -487,17 +488,10 @@ fn vec_query() -> Vec<f32> {
     vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
-/// 64-row two-fragment vector dataset with a single-partition IVF_FLAT index, then an overlay
-/// on fragment 1 that moves id=35 (offset 3) onto `far` (away from the query) and id=40
-/// (offset 8) onto the query. Built before the overlay, the index still believes id=35 is the
-/// query and has never seen id=40 near it. Every other base vector is orthogonal to the query.
-///
-/// Overlaying fragment 1 (ids 32..64) is deliberate: a physical address diverges from the
-/// stable row id there, so both the ANN prefilter block and the flat re-score take must operate
-/// in the row-id domain when `stable_row_ids` is enabled.
-async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
+/// 64-row two-fragment vector dataset with a single-partition IVF_FLAT index and no overlay.
+/// id=35 equals the query; every other base vector is orthogonal to and far from the query.
+async fn create_vector_index_dataset(stable_row_ids: bool) -> Dataset {
     let query = vec_query();
-    let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(64);
     for i in 0..64 {
@@ -545,6 +539,20 @@ async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
         .create_index(&["vec"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
+    dataset
+}
+
+/// [`create_vector_index_dataset`] plus an overlay on fragment 1 that moves id=35 (offset 3)
+/// onto `far` (away from the query) and id=40 (offset 8) onto the query. Built before the
+/// overlay, the index still believes id=35 is the query and has never seen id=40 near it.
+///
+/// Overlaying fragment 1 (ids 32..64) is deliberate: a physical address diverges from the
+/// stable row id there, so both the ANN prefilter block and the flat re-score take must operate
+/// in the row-id domain when `stable_row_ids` is enabled.
+async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
+    let query = vec_query();
+    let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let dataset = create_vector_index_dataset(stable_row_ids).await;
 
     commit_overlay(
         dataset,
@@ -622,6 +630,74 @@ async fn test_vector_overlay_stale_dropped_under_fast_search() {
     assert!(
         !ids.contains(&40),
         "fast_search skips re-score, so id=40 should be absent, got {ids:?}"
+    );
+}
+
+/// A batch (multi-vector) nearest query must fall back to the per-query indexed loop when a
+/// data overlay makes indexed vector rows stale. The shared-scan batch node (`ANNIvfBatch`)
+/// does not apply the overlay block or re-score moved rows, so `batch_index_search_supported`
+/// returns false and the per-query loop — which reconciles the overlay exactly as single-query
+/// search does — runs instead.
+///
+/// The no-overlay control confirms the shared-scan node *is* chosen otherwise (nprobes is
+/// pinned so no other gate fires), so the fallback is attributable to the overlay alone.
+#[rstest]
+#[tokio::test]
+async fn test_vector_batch_falls_back_on_overlay(#[values(false, true)] stable_row_ids: bool) {
+    // Two copies of the standard query, packed as a batch (multi-vector) nearest input.
+    let queries = fsl(vec![vec_query(), vec_query()], VEC_DIM);
+
+    // Control: without an overlay the shared-scan batch node handles the batch query.
+    let base = create_vector_index_dataset(stable_row_ids).await;
+    let mut scanner = base.scan();
+    scanner
+        .nearest("vec", queries.as_ref(), 3)
+        .unwrap()
+        .nprobes(1)
+        .project(&["id"])
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNIvfBatch"),
+        "without an overlay the batch query should use the shared-scan node, got:\n{plan}"
+    );
+
+    // With an overlay on indexed vector rows the gate must fall back to the per-query loop.
+    let dataset = create_vector_overlay_dataset(stable_row_ids).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", queries.as_ref(), 3)
+        .unwrap()
+        .nprobes(1)
+        .project(&["id"])
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ANNIvfBatch"),
+        "an overlay on indexed rows must disable the shared-scan node, got:\n{plan}"
+    );
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "the batch query should fall back to the per-query indexed loop, got:\n{plan}"
+    );
+
+    // Correctness: the fallback reconciles the overlay for the batch — id=40 (moved onto the
+    // query) is found and id=35 (moved away) is dropped, just like single-query search.
+    let results = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let ids = ids_from_batches(&results);
+    assert!(
+        ids.contains(&40),
+        "overlay-moved id=40 should be found via the fallback path, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&35),
+        "stale id=35 should be dropped via the fallback path, got {ids:?}"
     );
 }
 
@@ -2268,5 +2344,65 @@ async fn test_optimize_preserves_vector_overlay_masking() {
     assert!(
         after.contains(&40),
         "overlaid vector for id=40 dropped after optimize: {after:?}"
+    );
+}
+
+/// Ids returned by a MinHash search for `text`, or the error it raises.
+async fn minhash_ids(dataset: &Dataset, text: &str, fast_search: bool) -> crate::Result<Vec<i32>> {
+    let mut scan = dataset.scan();
+    scan.minhash_search(MinHashQuery::new(text, "text"))?
+        .limit(Some(12), None)?
+        .project(&["id"])?;
+    if fast_search {
+        scan.fast_search();
+    }
+    let batch = scan.try_into_batch().await?;
+    Ok(ids_from_batches(std::slice::from_ref(&batch)))
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh)
+        .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 1}));
+    dataset
+        .create_index(&["text"], IndexType::MinHashLsh, None, &params, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        minhash_ids(&dataset, "apple banana", false).await.unwrap()[0],
+        1
+    );
+
+    let dataset = commit_overlay(
+        dataset,
+        "minhash_row_level",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // The overlaid row is scored from its current value, not its stale signature
+    let ids = minhash_ids(&dataset, "apple banana", false).await.unwrap();
+    assert!(!ids.contains(&1), "{ids:?}");
+    assert_eq!(
+        minhash_ids(&dataset, "cherry mango", false).await.unwrap()[0],
+        1
+    );
+
+    // fast_search skips the stale row entirely
+    let ids = minhash_ids(&dataset, "apple banana", true).await.unwrap();
+    assert!(!ids.contains(&1), "{ids:?}");
+    let ids = minhash_ids(&dataset, "cherry mango", true).await.unwrap();
+    assert!(!ids.contains(&1), "{ids:?}");
+    // Rows in fragments without overlays are unaffected
+    assert_eq!(
+        minhash_ids(&dataset, "mango sorbet", true).await.unwrap()[0],
+        6
     );
 }

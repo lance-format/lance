@@ -657,7 +657,7 @@ pub struct InvertedPartition {
     // 0 for legacy format
     pub(super) id: u64,
     pub(super) store: Arc<dyn IndexStore>,
-    pub(crate) tokens: TokenSet,
+    pub(crate) tokens: Arc<TokenSet>,
     pub(crate) inverted_list: Arc<PostingListReader>,
     /// Legacy documents stay in their original complete `DocSet`; modern
     /// documents use typed, independently-loaded lengths and addresses.
@@ -692,6 +692,56 @@ impl InvertedPartition {
         self.inverted_list.is_legacy_layout()
     }
 
+    /// This partition's `(num_rows, per_term_row_freq)` counted over distinct
+    /// row ids rather than documents. See
+    /// [`InvertedIndex::bm25_row_stats_for_terms`] for why the distinction
+    /// exists and when this runs.
+    ///
+    /// A partition whose documents map one-to-one onto rows takes the same
+    /// single-metadata-row `posting_len_for_token` lookup the document-granularity
+    /// statistics use, so only a partition that really indexed one document per
+    /// list element pays for reading posting lists.
+    pub(super) async fn row_stats_for_terms(
+        &self,
+        terms: &[String],
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(usize, Vec<usize>)> {
+        let docs = self.docs.address_keyed().await?;
+        let num_rows = docs.num_distinct_rows();
+        let one_document_per_row = num_rows == docs.len();
+        let is_legacy = self.is_legacy();
+        let mut row_freqs = Vec::with_capacity(terms.len());
+        for term in terms {
+            let Some(token_id) = self.tokens.get(term) else {
+                row_freqs.push(0);
+                continue;
+            };
+            if one_document_per_row {
+                row_freqs.push(
+                    self.inverted_list
+                        .posting_len_for_token(token_id, metrics)
+                        .await?,
+                );
+                continue;
+            }
+            // Deduplicating needs the postings themselves; `posting_len_for_token`
+            // only knows how many documents there are. The read is cached, and a
+            // partition that reaches this branch forces the full-read fallback in
+            // `combined_fields_search` anyway (legacy layout or non-ascending
+            // row_ids), so nothing that would otherwise have been pruned is read.
+            let posting = self
+                .inverted_list
+                .posting_list(token_id, false, metrics.unwrap_or(&NoOpMetricsCollector))
+                .await?;
+            let mut rows = RoaringTreemap::new();
+            for (row_id, _) in live_posting_rows(&posting, &docs, is_legacy) {
+                rows.insert(row_id);
+            }
+            row_freqs.push(rows.len() as usize);
+        }
+        Ok((num_rows, row_freqs))
+    }
+
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
@@ -720,7 +770,45 @@ impl InvertedPartition {
         Ok(Self {
             id,
             store,
-            tokens,
+            tokens: Arc::new(tokens),
+            inverted_list: Arc::new(inverted_list),
+            docs: PartitionDocumentStore::Modern(Arc::new(docs)),
+            token_set_format,
+        })
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        let tokens = TokenSet::load(token_file, token_set_format).await?;
+        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let docs_path = doc_file_path(id);
+        let docs_reader = store.open_index_file(&docs_path).await?;
+        let docs = PartitionDocuments::try_new_with_remapping(
+            store.clone(),
+            docs_path,
+            id,
+            WeakLanceCache::from(index_cache),
+            docs_reader.as_ref(),
+            remapping,
+            // 256-document blocks score with quantized document lengths.
+            inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
+        )?;
+        inverted_list.modern_num_docs = Some(docs.len());
+
+        Ok(Self {
+            id,
+            store,
+            tokens: tokens.into(),
             inverted_list: Arc::new(inverted_list),
             docs: PartitionDocumentStore::Modern(Arc::new(docs)),
             token_set_format,
@@ -1495,6 +1583,15 @@ impl InvertedPartition {
         chunk_tokens_override: Option<usize>,
         max_list_children_override: Option<u64>,
     ) -> Result<(InnerBuilder, usize)> {
+        // Legacy per-document positions require singleton reads to protect Arrow's
+        // List<i32> offsets. Cap overlap so remote latency is hidden without
+        // multiplying retained decoded posting buffers by the store's full limit.
+        const MAX_LEGACY_POSITION_MERGE_CONCURRENCY: usize = 8;
+
+        let legacy_position_concurrency = self
+            .store
+            .io_parallelism()
+            .clamp(1, MAX_LEGACY_POSITION_MERGE_CONCURRENCY);
         let mut builder = InnerBuilder::new_with_posting_tail_codec_and_block_size(
             self.id,
             self.inverted_list.has_positions(),
@@ -1502,7 +1599,7 @@ impl InvertedPartition {
             self.inverted_list.posting_tail_codec(),
             self.inverted_list.block_size(),
         );
-        builder.tokens = self.tokens.into_mutable();
+        builder.tokens = Arc::unwrap_or_clone(self.tokens).into_mutable();
         builder.docs = self.docs.load_build_docset().await?;
 
         builder
@@ -1514,6 +1611,7 @@ impl InvertedPartition {
                 self.inverted_list.has_positions(),
                 chunk_tokens_override,
                 max_list_children_override,
+                legacy_position_concurrency,
                 |posting_list| {
                     builder
                         .posting_lists

@@ -21,6 +21,7 @@ use std::iter::once;
 
 use roaring::RoaringBitmap;
 
+use lance::dataset::NewColumnTransform;
 use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
@@ -111,6 +112,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
@@ -135,6 +137,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -162,6 +165,7 @@ fn inner_create_with_ffi_array<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -195,6 +199,7 @@ fn inner_create_with_ffi_array<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -221,6 +226,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
@@ -244,6 +250,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -270,6 +277,7 @@ fn inner_create_with_ffi_stream<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -293,6 +301,7 @@ fn inner_create_with_ffi_stream<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -317,6 +326,7 @@ fn create_fragment<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
@@ -338,6 +348,7 @@ fn create_fragment<'a>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     write_params.session = session_from_handle(session_handle);
@@ -683,6 +694,72 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
     Ok(json)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Fragment_nativeAddColumnsByReader<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,              // Java DataSet
+    fragment_id: jlong,             // FragmentID
+    arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
+    batch_size: JObject,            // Optional<Long>
+) -> JObject<'a> {
+    ok_or_throw_with_return!(
+        env,
+        inner_add_columns_by_reader(
+            &mut env,
+            jdataset,
+            fragment_id,
+            arrow_array_stream_addr,
+            batch_size
+        ),
+        JObject::null()
+    )
+}
+
+fn inner_add_columns_by_reader<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jlong,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject,
+) -> Result<JObject<'local>> {
+    let fragment_opt = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.get_fragment(fragment_id as usize)
+    };
+    let fragment = match fragment_opt {
+        Some(fragment) => fragment,
+        None => {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        }
+    };
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error(format!("Invalid batch size: {value}")))?,
+        ),
+        None => None,
+    };
+
+    let (new_frag, new_schema) = block_on(fragment.add_columns(
+        NewColumnTransform::Reader(Box::new(reader)),
+        None,
+        batch_size,
+    ))?;
+    let result = FragmentMergeResult {
+        fragment: new_frag,
+        schema: new_schema,
+    };
+    result.into_java(env)
+}
+
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
@@ -691,7 +768,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -829,6 +906,11 @@ impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
         let files = export_vec::<DataFile>(env, &files)?;
+        let referenced_data_files = self
+            .referenced_lance_files()
+            .cloned()
+            .collect::<Vec<DataFile>>();
+        let referenced_data_files = export_vec::<DataFile>(env, &referenced_data_files)?;
         let deletion_file = match &self.deletion_file {
             Some(f) => f.into_java(env)?,
             None => JObject::null(),
@@ -858,6 +940,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&referenced_data_files),
             ],
         )
         .map_err(|e| {
