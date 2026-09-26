@@ -58,6 +58,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
@@ -515,6 +516,9 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -541,6 +545,7 @@ impl LsmFtsSearchPlanner {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
             session: None,
             store_params: None,
@@ -564,6 +569,16 @@ impl LsmFtsSearchPlanner {
     /// `1.0` are rejected by [`Self::plan_search`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
+        self
+    }
+
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
         self
     }
 
@@ -872,16 +887,20 @@ impl LsmFtsSearchPlanner {
                 (source, is_active, blocked, fetch_limit)
             })
             .collect();
+        // Type-erased for the reason the vector planner's arm gives.
         let built =
             futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
-                Box::pin(self.build_source_plan(
-                    source,
-                    columns,
-                    &query,
-                    *fetch_limit,
-                    projection,
-                    &index_params,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_source_plan(
+                        source,
+                        columns,
+                        &query,
+                        *fetch_limit,
+                        projection,
+                        &index_params,
+                        &target_schema,
+                    ));
+                arm
             }))
             .await?;
 
@@ -966,14 +985,30 @@ impl LsmFtsSearchPlanner {
                         self.warmer.as_ref(),
                     )
                     .await?;
-                    if index_params.is_empty() {
-                        index_params = indexed_fts_index_params(&dataset, column).await?;
+                    // The index is on this generation's own column, under the
+                    // name it had when the generation was sealed. A generation
+                    // sealed before the column existed has no index on it and
+                    // offers no granularity.
+                    let generation = GenerationRead::new(
+                        dataset.schema(),
+                        &self.identity_schema,
+                        &self.pk_columns,
+                        Vec::new(),
+                    );
+                    match generation.stored_name(column) {
+                        None => Vec::new(),
+                        Some(stored_column) => {
+                            if index_params.is_empty() {
+                                index_params =
+                                    indexed_fts_index_params(&dataset, stored_column).await?;
+                            }
+                            indexed_fts_document_granularities(&dataset, stored_column)
+                                .await?
+                                .into_iter()
+                                .map(|(_, document_granularity)| document_granularity)
+                                .collect::<Vec<_>>()
+                        }
                     }
-                    indexed_fts_document_granularities(&dataset, column)
-                        .await?
-                        .into_iter()
-                        .map(|(_, document_granularity)| document_granularity)
-                        .collect::<Vec<_>>()
                 }
                 LsmDataSource::ActiveMemTable { index_store, .. } => {
                     index_store.fts_document_granularities_by_column(column)
@@ -1043,6 +1078,9 @@ impl LsmFtsSearchPlanner {
         limit: Option<usize>,
         projection: Option<&[String]>,
         index_params: &HashMap<&str, InvertedIndexParams>,
+        // What every arm is normalized to, so an arm with nothing to offer can
+        // stand in for itself.
+        target_schema: &SchemaRef,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // One column: bind every leaf to it, which is what lets a tree built
         // from bare terms reach the right field. Several: the leaves already
@@ -1090,19 +1128,95 @@ impl LsmFtsSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one.
+                let asked_for = self.fts_scanner_projection(projection);
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
+                );
+                // Every queried column has to be resolved: a rename moved the
+                // table's name while the file still holds the old one.
+                let mut stored_columns = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let Some(stored) = generation.stored_name(column) else {
+                        // Sealed before the column existed, so it has nothing to
+                        // match -- and nothing to give a predicate spanning it.
+                        return self.empty_plan(target_schema);
+                    };
+                    stored_columns.push((column.clone(), stored.to_string()));
+                }
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
-                if let Some(ref filter) = self.filter {
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
+                if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                scanner.full_text_search(bind(query)?)?;
-                scanner.create_plan().await
+                // Bound here, limited below: this arm's limit rule is not the
+                // one `bind` applies, so only the column binding is taken from
+                // the shape of the set.
+                let bound_query = match stored_columns.as_slice() {
+                    // Every queried column is stored under the name the table
+                    // still uses, so the tree reaches the scanner as the other
+                    // arms get it -- a cross-column predicate keeps its own leaf
+                    // bindings, which rebinding would collapse onto one field.
+                    _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => {
+                        match columns {
+                            [column] => query.clone().with_column(column.clone())?,
+                            _ => query.clone(),
+                        }
+                    }
+                    // One column, moved: bind the whole tree to the name this
+                    // generation stores it under.
+                    [(_, stored)] => query.clone().with_column(stored.clone())?,
+                    // Several columns, at least one of them renamed. Each leaf
+                    // would need its own name and `with_column` rebinds the
+                    // whole tree, collapsing a cross-column predicate onto one
+                    // field -- which answers a different question. Refuse rather
+                    // than rank on the wrong column silently.
+                    moved => {
+                        let renamed: Vec<String> = moved
+                            .iter()
+                            .filter(|(asked, stored)| asked != stored)
+                            .map(|(asked, stored)| format!("{asked} (stored as {stored})"))
+                            .collect();
+                        return Err(Error::invalid_input(format!(
+                            "a full-text search over several columns cannot read a sealed \
+                             generation in which one of them was renamed: {}. Compact the table \
+                             so the generation merges into base, or search the columns separately",
+                            renamed.join(", ")
+                        )));
+                    }
+                };
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has taken its top-k
+                // by score. Cutting first would drop rows that pass the
+                // predicate behind rows that do not, so a generation with a
+                // deferred predicate does not cut.
+                let bound_query = match limit.filter(|_| above.is_none()) {
+                    Some(limit) => bound_query.limit(Some(limit as i64)),
+                    None => bound_query.limit(None),
+                };
+                scanner.full_text_search(bound_query)?;
+                // Boxed for the reason the scan planner's arm gives: a
+                // generation resolves its own schema before scanning, and
+                // the inlined future is too deep for the `Send` proof.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -2084,6 +2198,119 @@ mod tests {
             "prefilter must keep only id>=2 across base (id=2) and active (id=3), \
             dropping base id=1 and active id=0; got {ids:?}"
         );
+    }
+
+    /// Refused rather than ranked on the wrong column: rebinding the tree to
+    /// one name would answer a different question.
+    #[tokio::test]
+    async fn a_cross_column_predicate_over_a_renamed_generation_is_refused() {
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use lance_core::datatypes::LANCE_FIELD_ID_KEY;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::{BooleanQuery, MatchQuery, Occur};
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let stored_schema = two_column_fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // The generation holds `title` and `body`, indexed under those names.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = write_dataset(
+            &gen1_uri,
+            vec![make_two_column_batch(
+                &stored_schema,
+                &[(1, "alpha", "beta")],
+            )],
+        )
+        .await;
+        for column in ["title", "body"] {
+            gen1.create_index(
+                &[column],
+                IndexType::Inverted,
+                Some(format!("{column}_fts")),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The table has since renamed `title` to `heading`. The id stays, which
+        // is what lets the generation be recognised as holding the same column.
+        let stamp = |name: &str, id: i32, nullable: bool| {
+            Field::new(name, DataType::Utf8, nullable).with_metadata(HashMap::from([(
+                LANCE_FIELD_ID_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let mut pk_meta = HashMap::from([(LANCE_FIELD_ID_KEY.to_string(), "0".to_string())]);
+        pk_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let table_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(pk_meta),
+            stamp("heading", 1, true),
+            stamp("body", 2, true),
+        ]));
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]);
+        let planner =
+            LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema.clone())
+                .with_identity_schema(Arc::clone(&table_schema));
+
+        // One predicate over both fields, under the names the table uses now.
+        let query = |first: &str| {
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    MatchQuery::new("alpha".to_string())
+                        .with_column(Some(first.to_string()))
+                        .into(),
+                ),
+                (
+                    Occur::Must,
+                    MatchQuery::new("beta".to_string())
+                        .with_column(Some("body".to_string()))
+                        .into(),
+                ),
+            ])))
+        };
+
+        let error = planner
+            .plan_search(query("heading"), Some(10), None)
+            .await
+            .expect_err("a renamed column in a cross-column predicate must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("renamed") && message.contains("heading"),
+            "the refusal should name the column that moved, got: {message}"
+        );
+
+        // The control: the same generation, the same predicate, but the table
+        // still calls the column what the generation does. Nothing to rebind,
+        // so the tree reaches the scanner and the arm plans.
+        let unmoved = Arc::new(ArrowSchema::new(vec![
+            table_schema.field(0).clone(),
+            stamp("title", 1, true),
+            stamp("body", 2, true),
+        ]));
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
+        LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], unmoved.clone())
+            .with_identity_schema(unmoved)
+            .plan_search(query("title"), Some(10), None)
+            .await
+            .expect("an unmoved cross-column predicate still plans over the generation");
     }
 
     /// The SSTable arm must apply the filter as a true FTS prefilter, and that

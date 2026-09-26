@@ -1,0 +1,455 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+/* A DataFragment is a set of files which represent the different columns of the same
+ * rows. If column exists in the schema of a dataset, but the file for that column does
+ * not exist within a DataFragment of that dataset, that column consists entirely of
+ * nulls.
+ */
+message DataFragment {
+  // The ID of a DataFragment is unique within a dataset.
+  uint64 id = 1;
+
+  repeated DataFile files = 2;
+
+  /* Optional overlay files for this fragment, which supply new values for a
+   * subset of cells without rewriting the base data files. This MUST be empty
+   * if the data overlay files feature flag (64) is not set in the manifest.
+   *
+   * Order is significant: a later entry is newer than an earlier one. When two
+   * overlays cover the same (offset, field) and share a `committed_version`, the
+   * later entry wins. See DataOverlayFile for the full resolution rules.
+   */
+  repeated DataOverlayFile overlays = 11;
+
+  // File that indicates which rows, if any, should be considered deleted.
+  DeletionFile deletion_file = 3;
+
+  // TODO: What's the simplest way we can allow an inline tombstone bitmap?
+
+  /* A serialized RowIdSequence message (see rowids.proto).
+   *
+   * These are the row ids for the fragment, in order of the rows as they appear.
+   * That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the
+   * first row is row 1, the second row is row 42, and the third row is row 3.
+   */
+  oneof row_id_sequence {
+    // Current Lance writers store row ids inline regardless of encoded size.
+    bytes inline_row_ids = 5;
+    /* The row ids are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -3. See RowLineageColumn.
+     *
+     * A writer MUST set the spilled row lineage feature flag (2048) when any
+     * fragment uses this arm or either of the other column arms below. A
+     * reader that does not understand the flag would see an unset oneof and
+     * treat the fragment as having no row ids at all.
+     */
+    RowLineageColumn column_row_ids = 12;
+  } // row_id_sequence
+
+  oneof last_updated_at_version_sequence {
+    // Current Lance writers store last-updated versions inline regardless of encoded size.
+    bytes inline_last_updated_at_versions = 7;
+    /* The versions are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -5. Gated like
+     * `column_row_ids`.
+     */
+    RowLineageColumn column_last_updated_at_versions = 13;
+  } // last_updated_at_version_sequence
+
+  oneof created_at_version_sequence {
+    // Current Lance writers store created-at versions inline regardless of encoded size.
+    bytes inline_created_at_versions = 9;
+    /* The versions are a hidden column of one of this fragment's `files`: the
+     * entry whose `fields` carries the reserved id -4. Gated like
+     * `column_row_ids`.
+     */
+    RowLineageColumn column_created_at_versions = 14;
+  } // created_at_version_sequence
+
+  /* The `external_*` arms of the three sequence oneofs above: an opaque byte
+   * range in a file, holding the same encoding as the inline arm. No Lance
+   * writer ever emitted them; the column arms replace that design. Reserved so
+   * a reader never has to interpret them.
+   */
+  reserved 6, 8, 10;
+  reserved "external_row_ids", "external_last_updated_at_versions",
+      "external_created_at_versions";
+
+  /* Number of original rows in the fragment, this includes rows that are now marked with
+   * deletion tombstones. To compute the current number of rows, subtract
+   * `deletion_file.num_deleted_rows` from this value.
+   */
+  uint64 physical_rows = 4;
+}
+
+message DataFile {
+  // Path to the root relative to the dataset's URI.
+  string path = 1;
+  /* The ids of the fields/columns in this file.
+   *
+   * When a DataFile object is created in memory, every value in fields is assigned -1 by
+   * default. An object with a value in fields of -1 must not be stored to disk. -2 is
+   * used for "tombstoned", meaning a field that is no longer in use. This is often
+   * because the original field id was reassigned to a different data file.
+   *
+   * Every negative value is reserved for system use and never names a field of the
+   * dataset schema. -3, -4 and -5 are the hidden row lineage columns (see
+   * RowLineageColumn); a reader projecting the dataset schema onto a file skips
+   * them, and any other negative value, rather than reject the file.
+   *
+   * In Lance v1 IDs are assigned based on position in the file, offset by the max
+   * existing field id in the table (if any already). So when a fragment is first created
+   * with one file of N columns, the field ids will be 1, 2, ..., N. If a second fragment
+   * is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+   *
+   * In Lance v1 there is one field for each field in the input schema, this includes
+   * nested fields (both struct and list).  Fixed size list fields have only a single
+   * field id (these are not considered nested fields in Lance v1).
+   *
+   * This allows column indices to be calculated from field IDs and the input schema.
+   *
+   * In Lance v2 the field IDs generally follow the same pattern but there is no
+   * way to calculate the column index from the field ID.  This is because a given
+   * field could be encoded in many different ways, some of which occupy a different
+   * number of columns.  For example, a struct field could be encoded into N + 1 columns
+   * or it could be encoded into a single packed column.  To determine column indices
+   * the column_indices property should be used instead.
+   *
+   * In Lance v1 these ids must be sorted but might not always be contiguous.
+   */
+  repeated int32 fields = 2;
+  /* The top-level column indices for each field in the file.
+   *
+   * If the data file is version 1 then this property will be empty
+   *
+   * Otherwise there must be one entry for each field in `fields`.
+   *
+   * Some fields may not correspond to a top-level column in the file.  In these cases
+   * the index will -1.
+   *
+   * For example, consider the schema:
+   *
+   * - dimension: packed-struct (0):
+   *   - x: u32 (1)
+   *   - y: u32 (2)
+   * - path: `list<u32>` (3)
+   * - embedding: `fsl<768>` (4)
+   *   - fp64
+   * - borders: `fsl<4>` (5)
+   *   - simple-struct (6)
+   *     - margin: fp64 (7)
+   *     - padding: fp64 (8)
+   *
+   * One possible column indices array could be:
+   * [0, -1, -1, 1, 3, 4, 5, 6, 7]
+   *
+   * This reflects quite a few phenomenon:
+   * - The packed struct is encoded into a single column and there is no top-level column
+   *   for the x or y fields
+   * - The variable sized list is encoded into two columns
+   * - The embedding is encoded into a single column (common for FSL of primitive) and there
+   *   is not "FSL column"
+   * - The borders field actually does have an "FSL column"
+   *
+   * The column indices table may not have duplicates (other than -1)
+   */
+  repeated int32 column_indices = 3;
+  // The major file version used to create the file
+  uint32 file_major_version = 4;
+  /* The minor file version used to create the file
+   *
+   * If both `file_major_version` and `file_minor_version` are set to 0,
+   * then this is a version 0.1 or version 0.2 file.
+   */
+  uint32 file_minor_version = 5;
+
+  /* The known size of the file on disk in bytes.
+   *
+   * This is used to quickly find the footer of the file.
+   *
+   * When this is zero, it should be interpreted as "unknown".
+   */
+  uint64 file_size_bytes = 6;
+
+  /* The base path index of the data file. Used when the file is imported or referred from another dataset.
+   * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+   */
+  optional uint32 base_id = 7;
+} // DataFile
+
+/* An overlay file supplies new values for a subset of (row offset, field) cells
+ * within a fragment, without rewriting the fragment's base data files. It is
+ * used for efficient updates when only a small fraction of rows and/or columns
+ * change.
+ *
+ * On read, a cell is resolved by consulting the fragment's overlays from newest
+ * to oldest: the first overlay that covers that (offset, field) wins; if none
+ * cover it, the value falls through to the base data file. Because deletions
+ * take precedence over overlays, an overlay value for an offset that is also
+ * marked deleted is dead and is ignored.
+ *
+ * The overlay's data file does NOT store a row-offset key column. Within a value
+ * column, the position of a covered offset's value is the rank (0-based count of
+ * set bits below it) of that offset within the field's coverage bitmap. Because
+ * fields may cover different offset sets, the value columns of a single overlay
+ * data file may have different lengths (which the Lance file format permits).
+ */
+message DataOverlayFile {
+  /* The data file storing the overlay's new cell values, one value column per
+   * field in `data_file.fields`. No row-offset key column is stored.
+   */
+  DataFile data_file = 1;
+
+  // Which (offset, field) cells this overlay provides values for.
+  oneof coverage {
+    /* A single 32-bit Roaring bitmap of physical row offsets that applies to
+     * every field in `data_file.fields` (a "dense" / rectangular overlay).
+     * Every covered offset has a value for every field. This is the common case
+     * for a plain UPDATE, where one SET list is applied to one set of rows.
+     */
+    bytes shared_offset_bitmap = 2;
+    /* Per-field coverage for a "sparse" overlay, used when different fields cover
+     * different offset sets (e.g. a MERGE with multiple WHEN MATCHED branches).
+     */
+    FieldCoverage field_coverage = 4;
+  }
+
+  /* The dataset version at which this overlay became effective: the version of
+   * the commit that introduced it, NOT the version it was read from. It is
+   * stamped at commit time and re-stamped if the commit is retried, in the same
+   * way as the created-at / last-updated-at version sequences.
+   *
+   * This drives two orderings:
+   *  * Versus index builds: an index whose `dataset_version` >= this value
+   *    already incorporates this overlay. Otherwise the overlay's covered cells
+   *    are excluded from index results for the affected fields and re-evaluated
+   *    against their current values (see the Data Overlay Files specification).
+   *  * Versus other overlays: when two overlays cover the same (offset, field),
+   *    the one with the higher `committed_version` wins. Overlays that share a
+   *    `committed_version` are ordered by their position in
+   *    `DataFragment.overlays`, where a later entry is newer and wins.
+   */
+  uint64 committed_version = 3;
+}
+
+// Per-field coverage for a sparse overlay.
+message FieldCoverage {
+  /* One entry per field in the overlay's `data_file.fields`, in the same order.
+   * Each is a 32-bit Roaring bitmap of the physical row offsets covered for that
+   * field. An offset present in a field's bitmap but mapped to a NULL value
+   * means the cell is overridden to NULL (distinct from an offset that is absent,
+   * which falls through to the base data file).
+   */
+  repeated bytes offset_bitmaps = 1;
+}
+
+/* Deletion File
+ *
+ * The path of the deletion file is constructed as:
+ *   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
+ * where {extension} depends on DeletionFileType.
+ */
+message DeletionFile {
+  /* Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
+   * offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there
+   * are densely deleted rows, then BITMAP is the most efficient.
+   */
+  enum DeletionFileType {
+    /* A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
+     * one column. Has a .arrow extension.
+     */
+    ARROW_ARRAY = 0;
+    // A Roaring Bitmap of deleted row offsets. Has a .bin extension.
+    BITMAP = 1;
+  }
+
+  // Type of deletion file.
+  DeletionFileType file_type = 1;
+  // The version of the dataset this deletion file was built from.
+  uint64 read_version = 2;
+  /* An opaque id used to differentiate this file from others written by concurrent
+   * writers.
+   */
+  uint64 id = 3;
+  // The number of rows that are marked as deleted.
+  uint64 num_deleted_rows = 4;
+  /* The base path index of the deletion file. Used when the file is imported or referred from another
+   * dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
+   * path of the deletion file.
+   */
+  optional uint32 base_id = 7;
+} // DeletionFile
+
+/* Marks a row lineage sequence that is stored as a hidden column of one of the
+ * fragment's `files` rather than inline: `_rowid` under the reserved field id
+ * -3, `_row_created_at_version` under -4, `_row_last_updated_at_version` under
+ * -5. Exactly one entry of `DataFragment.files` carries that id in its
+ * `fields`, and its `column_indices` locates the column the way it does for a
+ * user column, so the column may share a file with the user columns or with the
+ * other lineage columns, or sit in a file that holds nothing else. The column is
+ * a non-nullable uint64 with exactly `physical_rows` values, in physical row
+ * order; see the table format documentation for the schema.
+ *
+ * Carries no fields: the file is found by its field id, so the file's metadata
+ * lives in `files` alone.
+ *
+ * Valid only in a fragment whose data files are Lance v2 files. A legacy v1
+ * data file has no `column_indices` to locate the column by, so a writer on a
+ * dataset that stores v1 files leaves every sequence inline.
+ */
+message RowLineageColumn {}
+
+// A byte range of a file. Used by the fragment reuse index details.
+message ExternalFile {
+  // Path to the file, relative to the root of the table.
+  string path = 1;
+  // The byte offset in the file where the data starts.
+  uint64 offset = 2;
+  // The size of the data in the file, in bytes.
+  uint64 size = 3;
+}
+
+// Fragment storage layout for this version.
+message FragmentTreeMetadata {
+  oneof layout {
+    FragmentTree tree = 1;
+  }
+}
+
+// Fragment state for one Version Manifest.
+message FragmentTree {
+  oneof root {
+    FragmentTreeRoot inline_root = 1;
+    /* Exactly 16 UUID bytes in display order. Resolves under this dataset as
+     * _bt/root/{lowercase hyphenated UUID}.root.
+     */
+    bytes root_uuid = 2;
+  }
+
+  // Mutations not represented by the selected root.
+  repeated FragmentTreeMutation mutations_since_root = 3;
+
+  // Next unused action sequence for this version.
+  uint64 next_action_sequence = 4;
+}
+
+// Inline or external root state.
+message FragmentTreeRoot {
+  repeated FragmentTreeChild children = 1;
+  repeated FragmentTreeMutation buffer = 2;
+
+  // First action sequence not represented by this root.
+  uint64 next_action_sequence = 3;
+}
+
+/* Children are ordered by min_key. A child owns [min_key, next min_key);
+ * the last child inherits its parent's upper bound.
+ */
+message FragmentTreeChild {
+  // Tree object path relative to its resolved dataset.
+  string path = 1;
+
+  /* Absent inherits the containing object's dataset. Otherwise matches BasePath.id
+   * in Manifest.base_paths; zero is a valid ID.
+   */
+  optional uint32 base_id = 2;
+
+  /* Inclusive lower bound of this child's fragment-ID range. It need not
+   * equal an ID currently stored in the child.
+   */
+  uint64 min_key = 3;
+
+  // Fragment count in this subtree, including this object's buffer.
+  uint64 num_keys = 4;
+
+  // Edges from this object to its leaves. Zero for a leaf.
+  uint32 height = 5;
+
+  // Direct child count. Zero for a leaf.
+  uint32 num_children = 6;
+
+  // Physical rows in this subtree, including this object's buffer.
+  uint64 total_rows = 7;
+
+  // Stored byte length of the child object.
+  uint64 object_size = 8;
+
+  /* Every mutation for this leaf's range at or below this value has been
+   * applied, and none remain buffered above it. Zero means none. Must be 0
+   * for interiors.
+   */
+  uint64 materialized_through_action_sequence = 9;
+
+  // Visible rows in this subtree, including this object's buffer.
+  uint64 visible_rows = 10;
+}
+
+// Interior routing node.
+message FragmentTreeNode {
+  repeated FragmentTreeChild children = 1;
+  repeated FragmentTreeMutation buffer = 2;
+}
+
+// Validated mutation with exact after-minus-before aggregate deltas.
+message FragmentTreeMutation {
+  uint64 action_sequence = 1;
+  FragmentAction action = 2;
+  sint64 fragment_count_delta = 3;
+  sint64 total_rows_delta = 4;
+  sint64 visible_rows_delta = 5;
+}
+
+/* upsert_fragment replaces the complete record. Use it for changes that other
+ * actions cannot express, including overlays, version sequences, and row IDs.
+ */
+message FragmentAction {
+  oneof action {
+    DataFragment upsert_fragment = 1;
+    uint64 remove_fragment = 2;
+    AddDataFile add_data_file = 3;
+    RemoveDataFile remove_data_file = 4;
+    AddDeletionFile add_deletion_file = 5;
+    ClearDeletionFile clear_deletion_file = 6;
+    ReplaceDataFile replace_data_file = 7;
+  }
+}
+
+// Append to the ordered file list.
+message AddDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+}
+
+// Remove every matching path, preserving order.
+message RemoveDataFile {
+  uint64 frag_id = 1;
+  string path = 2;
+}
+
+message AddDeletionFile {
+  uint64 frag_id = 1;
+  DeletionFile deletion_file = 2;
+}
+
+message ClearDeletionFile {
+  uint64 frag_id = 1;
+}
+
+/* On the first expected_path match, replace path, file_size_bytes, and base_id.
+ * Preserve its column mapping and file version.
+ */
+message ReplaceDataFile {
+  uint64 frag_id = 1;
+  string expected_path = 2;
+  string path = 3;
+  uint64 file_size_bytes = 4;
+  /* Absent inherits the resolved dataset of the tree object or Version Manifest
+   * containing this mutation. Otherwise matches BasePath.id in Manifest.base_paths.
+   */
+  optional uint32 base_id = 5;
+}
