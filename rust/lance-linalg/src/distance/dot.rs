@@ -77,6 +77,10 @@ fn dot_scalar<
 }
 
 /// Dot product.
+///
+/// # Panics
+///
+/// Panics under the conditions [`Dot::dot`] documents.
 #[inline]
 pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
@@ -85,12 +89,20 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// Dot product between two f32 slices, dispatched to the widest SIMD backend
 /// available at runtime. See [`crate::distance::l2::l2_f32`] for why this is
 /// needed on top of the generic [`dot`].
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different lengths.
 #[inline]
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::dot(x, y)
 }
 
 /// Negative [Dot] distance.
+///
+/// # Panics
+///
+/// Panics under the conditions [`Dot::dot`] documents.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
     1.0 - T::dot(from, to)
@@ -99,6 +111,12 @@ pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// Dot product
 pub trait Dot: Num {
     /// Dot product.
+    ///
+    /// # Panics
+    ///
+    /// `x` and `y` must have the same length. An implementation is required to
+    /// reject a mismatch rather than read past the shorter slice; the five in
+    /// this crate do it by panicking.
     fn dot(x: &[Self], y: &[Self]) -> f32;
 
     /// Dot product of `x` against each `dimension`-sized vector in `batch`.
@@ -111,6 +129,11 @@ pub trait Dot: Num {
     /// Returns `impl Iterator` rather than a trait object: hot consumers drive
     /// this one element at a time, so a `Box<dyn Iterator>` would cost a
     /// virtual call per element and an allocation per batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `dimension` is non-zero, `x.len()` equals `dimension`, and
+    /// `batch.len()` is a multiple of `dimension`.
     fn dot_batch<'a>(
         x: &'a [Self],
         batch: &'a [Self],
@@ -773,6 +796,10 @@ impl Dot for u8 {
 }
 
 /// Negative dot product, to present the relative order of dot distance.
+///
+/// # Panics
+///
+/// Panics under the conditions [`Dot::dot_batch`] documents.
 pub fn dot_distance_batch<'a, T: Dot>(
     from: &'a [T],
     to: &'a [T],
