@@ -82,20 +82,6 @@ pub enum WriteOverlayError {
     ))]
     BlobField { fragment_id: u64, name: String },
 
-    /// Overlay resolution is per *atomic field*: a struct is recursed through
-    /// and only its leaves are replaced, so the merge rebuilds the base struct
-    /// with the base's own validity (`splice_by_ids` in the parent module).
-    /// A nullable struct's cell could therefore be covered without its NULL-ness
-    /// changing, in either direction, which is the opposite of what coverage
-    /// means. Refused until the read path can carry ancestor validity; see
-    /// <https://github.com/lance-format/lance/issues/9077>.
-    #[snafu(display(
-        "cannot overlay fragment {fragment_id} through nullable struct '{name}': replacing a \
-         struct cell's NULL-ness is not supported yet \
-         (https://github.com/lance-format/lance/issues/9077)"
-    ))]
-    NullableStructAncestor { fragment_id: u64, name: String },
-
     /// A batch arrived without the `_rowaddr` column naming the cells its values
     /// apply to.
     #[snafu(display("overlay batch for fragment {fragment_id} has no '{ROW_ADDR}' column"))]
@@ -206,9 +192,7 @@ impl From<WriteOverlayError> for Error {
             // and restate what the message already carries.
             WriteOverlayError::Other { source } => source,
             WriteOverlayError::SchemaMismatch { source, .. } => source,
-            WriteOverlayError::LegacyFileFormat { .. }
-            | WriteOverlayError::BlobField { .. }
-            | WriteOverlayError::NullableStructAncestor { .. } => {
+            WriteOverlayError::LegacyFileFormat { .. } | WriteOverlayError::BlobField { .. } => {
                 Self::not_supported(error.to_string())
             }
             caller_error => Self::invalid_input(caller_error.to_string()),
@@ -286,20 +270,6 @@ impl OverlayWriter {
                 name: blob.name.clone(),
             });
         }
-        // Only structs are recursed into by resolution, so only they can end up
-        // with a covered leaf under an un-covered parent. A list or map -- even
-        // of structs -- is an atomic field, replaced whole with its own
-        // validity, and a non-nullable struct has no validity to replace.
-        if let Some(parent) = schema
-            .fields_pre_order()
-            .find(|field| field.logical_type.is_struct() && field.nullable)
-        {
-            return Err(WriteOverlayError::NullableStructAncestor {
-                fragment_id,
-                name: parent.name.clone(),
-            });
-        }
-
         let physical_rows = fragment.physical_rows().await? as u64;
         // Blob v2 is rejected above, so no external base resolution is needed.
         let writer =
@@ -636,6 +606,7 @@ mod tests {
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatchIterator, StructArray, UInt64Array, record_batch,
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::Field as ArrowField;
     use lance_file::version::LanceFileVersion;
     use rstest::rstest;
@@ -1306,66 +1277,107 @@ mod tests {
         assert_eq!(rows[5], (5, Some(-6), Some(500)));
     }
 
-    fn nested_array(a: Vec<i32>, b: Vec<i32>) -> ArrayRef {
+    fn nested_array_with_validity(a: Vec<i32>, b: Vec<i32>, nulls: Option<NullBuffer>) -> ArrayRef {
         let field = |name| Arc::new(ArrowField::new(name, DataType::Int32, true));
-        Arc::new(StructArray::from(vec![
-            (field("a"), Arc::new(Int32Array::from(a)) as ArrayRef),
-            (field("b"), Arc::new(Int32Array::from(b)) as ArrayRef),
-        ]))
+        Arc::new(StructArray::new(
+            vec![field("a"), field("b")].into(),
+            vec![
+                Arc::new(Int32Array::from(a)) as ArrayRef,
+                Arc::new(Int32Array::from(b)) as ArrayRef,
+            ],
+            nulls,
+        ))
+    }
+
+    fn nested_array(a: Vec<i32>, b: Vec<i32>) -> ArrayRef {
+        nested_array_with_validity(a, b, None)
     }
 
     /// One four-row fragment of `val` = 0..4 and `nested: struct<a: i32, b: i32>`
     /// with `a` = 0..4 and `b` = a * 10.
     ///
-    /// `nested` is non-nullable: an overlay through a *nullable* struct is
-    /// refused at open (see `test_nullable_struct_ancestor_is_rejected`), so a
-    /// nullable fixture could not reach the behavior these tests are about.
+    /// `nested` is non-nullable because these tests do not exercise struct
+    /// validity replacement.
     async fn nested_dataset() -> (TempDir, Arc<Dataset>) {
-        nested_dataset_with_nullable_struct(false).await
+        nested_dataset_with_nullable_struct(false, None).await
     }
 
-    async fn nested_dataset_with_nullable_struct(nullable: bool) -> (TempDir, Arc<Dataset>) {
+    async fn nested_dataset_with_nullable_struct(
+        nullable: bool,
+        data_storage_version: Option<LanceFileVersion>,
+    ) -> (TempDir, Arc<Dataset>) {
         let test_dir = tempdir().unwrap();
         let uri = test_dir.path().to_str().unwrap().to_string();
         let base = RecordBatch::try_from_iter_with_nullable(vec![
             ("val", int32((0..4).map(Some).collect()), true),
             (
                 "nested",
-                nested_array((0..4).collect(), (0..4).map(|v| v * 10).collect()),
+                nested_array_with_validity(
+                    (0..4).collect(),
+                    (0..4).map(|v| v * 10).collect(),
+                    nullable.then(|| NullBuffer::from(vec![false, true, true, true])),
+                ),
                 nullable,
             ),
         ])
         .unwrap();
         let arrow_schema = base.schema();
         let reader = RecordBatchIterator::new(vec![Ok(base)], arrow_schema);
-        let dataset = Arc::new(Dataset::write(reader, &uri, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &uri,
+                Some(WriteParams {
+                    data_storage_version,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
         (test_dir, dataset)
     }
 
-    /// Resolution rebuilds a struct with the *base's* validity, so a covered
-    /// nullable struct cell would keep its old NULL-ness. Refused at open until
-    /// https://github.com/lance-format/lance/issues/9077 lands, rather than
-    /// silently writing an overlay the read path will not honor.
+    #[rstest]
+    #[case::v2_1(LanceFileVersion::V2_1)]
+    #[case::v2_2(LanceFileVersion::V2_2)]
+    #[case::v2_3(LanceFileVersion::V2_3)]
     #[tokio::test]
-    async fn test_nullable_struct_ancestor_is_rejected() {
-        let (_test_dir, dataset) = nested_dataset_with_nullable_struct(true).await;
-        let schema = overlay_schema(&dataset, &[field_id(&dataset, "nested")]);
-        let Err(error) = dataset
-            .get_fragment(0)
-            .unwrap()
-            .write_overlay(&schema)
+    async fn test_nullable_struct_validity_is_replaced(#[case] version: LanceFileVersion) {
+        let (_test_dir, dataset) = nested_dataset_with_nullable_struct(true, Some(version)).await;
+        let nested_id = field_id(&dataset, "nested");
+        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
+        writer
+            .write_batch(&batch(
+                0,
+                &[0, 1],
+                vec![(
+                    "nested",
+                    nested_array_with_validity(
+                        vec![-7, -8],
+                        vec![-70, -80],
+                        Some(NullBuffer::from(vec![true, false])),
+                    ),
+                )],
+            ))
             .await
-        else {
-            panic!("expected opening the overlay to fail");
-        };
-        let display = error.to_string();
-        assert!(display.contains("nullable struct 'nested'"), "{display}");
-        assert!(display.contains("issues/9077"), "{display}");
-        assert!(
-            matches!(error, WriteOverlayError::NullableStructAncestor { .. }),
-            "unexpected variant: {display}"
-        );
-        assert!(matches!(Error::from(error), Error::NotSupported { .. }));
+            .unwrap();
+        let dataset = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
+
+        let batch = dataset
+            .scan()
+            .project(&["nested"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let nested = batch["nested"].as_struct();
+        assert!(nested.is_valid(0));
+        assert!(nested.is_null(1));
+        assert!(nested.is_valid(2));
+        let a = nested.column(0).as_primitive::<Int32Type>();
+        let b = nested.column(1).as_primitive::<Int32Type>();
+        assert_eq!((a.value(0), b.value(0)), (-7, -70));
     }
 
     #[tokio::test]
