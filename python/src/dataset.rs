@@ -5162,6 +5162,10 @@ fn prepare_vector_index_params(
             ivf_params.target_partition_size = Some(n.extract()?)
         };
 
+        if let Some(n) = kwargs.get_item("shuffle_partition_batches")? {
+            ivf_params.shuffle_partition_batches = n.extract()?;
+        };
+
         if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
             ivf_params.shuffle_partition_concurrency = n.extract()?
         };
