@@ -666,16 +666,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.quantizer.is_some() {
             return Ok(self.quantizer.clone().unwrap());
         }
+        // Bind the params up front: the sampling and residual work below is
+        // wasted if there is nothing to build with. Reaching here with no
+        // params means the builder was given neither params nor a quantizer.
+        let Some(quantizer_params) = self.quantizer_params.as_ref() else {
+            return Err(Error::invalid_input("quantizer build params not set"));
+        };
 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before loading or building quantizer",
             ));
         };
-        let sample_size_hint = match &self.quantizer_params {
-            Some(params) => params.try_sample_size()?,
-            None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
-        };
+        let sample_size_hint = quantizer_params.try_sample_size()?;
 
         let start = std::time::Instant::now();
         info!(
@@ -720,16 +723,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = match &self.quantizer {
-            Some(q) => q.clone(),
-            None => {
-                let quantizer_params = self
-                    .quantizer_params
-                    .as_ref()
-                    .ok_or(Error::invalid_input("quantizer build params not set"))?;
-                Q::build(&training_data, DistanceType::L2, quantizer_params)?
-            }
-        };
+        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
@@ -3570,6 +3564,41 @@ mod tests {
         (0..vectors.len())
             .map(|i| vectors.value(i).as_primitive::<Float32Type>().value(0))
             .collect()
+    }
+
+    /// The params check has to run before the sampling work, not after it.
+    /// Both orders end in the same error for a builder with no quantizer
+    /// params, so the discriminator is *which* error comes first: this builder
+    /// points at a column the dataset does not have, so sampling fails with
+    /// its own message, and only a check that runs ahead of it still reports
+    /// the missing params.
+    #[tokio::test]
+    async fn test_load_or_build_quantizer_checks_params_before_sampling() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().join("idx");
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "no_such_column".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            None,
+            None,
+            (),
+            None,
+        )
+        .unwrap();
+
+        let err = builder.load_or_build_quantizer().await.unwrap_err();
+        assert!(
+            err.to_string().contains("quantizer build params not set"),
+            "expected the params error before any sampling, got: {err}"
+        );
     }
 
     fn cluster_batch(
