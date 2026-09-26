@@ -571,6 +571,61 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_preserved_dictionary_not_flagged() {
+        // The manifest schema stores a dictionary as offset/length with no
+        // attached values, so an unchanged dictionary must not count as a field
+        // change (which would demand a full rewrite). The moved-offset half
+        // passes under the old comparison too, where every dictionary looked
+        // changed; it is here to pin that offset stays part of the identity.
+        let dictionary = lance_core::datatypes::Dictionary {
+            offset: 100,
+            length: 5,
+            values: None,
+        };
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]))
+        .unwrap();
+        let mut prior_schema = schema.clone();
+        prior_schema.fields[0].dictionary = Some(dictionary.clone());
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![fragment_with_file_fields(0, "old.lance", vec![0])]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let mut unchanged = schema.clone();
+        unchanged.fields[0].dictionary = Some(dictionary);
+        let retained = vec![fragment_with_file_fields(0, "old.lance", vec![0])];
+        assert_eq!(
+            shared_field_binding_changes(&manifest.schema.fields[0], &unchanged.fields[0]),
+            None
+        );
+        merge_schema_valid(&manifest, &unchanged, &retained).unwrap();
+
+        let mut moved = schema;
+        moved.fields[0].dictionary = Some(lance_core::datatypes::Dictionary {
+            offset: 200,
+            length: 5,
+            values: None,
+        });
+        assert_eq!(
+            shared_field_binding_changes(&manifest.schema.fields[0], &moved.fields[0]),
+            Some("dictionary".to_string())
+        );
+        let err = merge_schema_valid(&manifest, &moved, &retained).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains(r#"changes field id 0 ("d") without rewriting it in every existing fragment: dictionary."#),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_merge_shared_id_change_rejects_retained_overlay() {
         let schema = one_field_schema();
         let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);

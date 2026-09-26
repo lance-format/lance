@@ -570,8 +570,15 @@ impl DeepSizeOf for Dictionary {
 
 impl PartialEq for Dictionary {
     fn eq(&self, other: &Self) -> bool {
+        // Compare the values when both sides have them: the write path leaves
+        // offset/length at 0 until the dictionary is persisted, so one append
+        // can legitimately hold the same dictionary at two positions.
+        // `From<&pb::Dictionary>` yields no values at all, and comparing only
+        // the values made that case non-reflexive, so there offset and length
+        // stand in for the content.
         match (&self.values, &other.values) {
             (Some(a), Some(b)) => a == b,
+            (None, None) => self.offset == other.offset && self.length == other.length,
             _ => false,
         }
     }
@@ -619,6 +626,67 @@ mod tests {
     use super::*;
     use arrow_schema::Schema as ArrowSchema;
     use rstest::rstest;
+
+    fn dict(offset: usize, length: usize, values: Option<Vec<&str>>) -> Dictionary {
+        Dictionary {
+            offset,
+            length,
+            values: values.map(|v| Arc::new(arrow_array::StringArray::from(v)) as ArrayRef),
+        }
+    }
+
+    /// The manifest schema stores a dictionary as offset/length with no attached
+    /// values, so equality has to be reflexive over value-less dictionaries and
+    /// still separate different positions. `set_dictionary_values` leaves
+    /// offset/length at 0 until the dictionary is persisted, so for an in-memory
+    /// pair the values array is all there is to compare.
+    #[rstest]
+    #[case::reflexive_default(Dictionary::default(), Dictionary::default(), true)]
+    #[case::same_position_no_values(dict(4, 2, None), dict(4, 2, None), true)]
+    #[case::different_offset(dict(4, 2, None), dict(8, 2, None), false)]
+    #[case::different_length(dict(4, 2, None), dict(4, 3, None), false)]
+    #[case::same_values(dict(0, 0, Some(vec!["a", "b"])), dict(0, 0, Some(vec!["a", "b"])), true)]
+    #[case::different_values(dict(0, 0, Some(vec!["a", "b"])), dict(0, 0, Some(vec!["a", "c"])), false)]
+    #[case::values_on_one_side_only(dict(4, 2, Some(vec!["a", "b"])), dict(4, 2, None), false)]
+    // One side of a V1 append holds the incoming dictionary at 0/0 and the other
+    // holds the persisted one at its real position, so equal values must win
+    // over the differing offsets.
+    #[case::same_values_different_offset(
+        dict(0, 0, Some(vec!["a", "b"])),
+        dict(8, 2, Some(vec!["a", "b"])),
+        true
+    )]
+    fn test_dictionary_partial_eq_contract(
+        #[case] left: Dictionary,
+        #[case] right: Dictionary,
+        #[case] is_equal: bool,
+    ) {
+        assert_eq!(left == right, is_equal, "{left:?} vs {right:?}");
+        assert_eq!(right == left, is_equal, "equality must be symmetric");
+    }
+
+    /// `From<&pb::Dictionary>` restores offset and length with no values, so two
+    /// schemas read back from a manifest have to compare equal. Otherwise merge
+    /// validation reports a phantom dictionary change for every such field.
+    #[test]
+    fn test_manifest_derived_dictionary_schemas_compare_equal() {
+        let arrow = ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]);
+        let mut left = Schema::try_from(&arrow).unwrap();
+        left.fields[0].dictionary = Some(dict(12, 2, None));
+        let right = left.clone();
+
+        assert_eq!(left, right);
+        let compare_dictionary = SchemaCompareOptions {
+            compare_dictionary: true,
+            ..Default::default()
+        };
+        assert!(left.compare_with_options(&right, &compare_dictionary));
+        assert_eq!(left.explain_difference(&right, &compare_dictionary), None);
+    }
 
     #[test]
     fn test_classify_blob_v2_layouts() {
