@@ -37,7 +37,7 @@ half.workspace = true
 hex.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
-jsonb.workspace = true
+lance-jsonb.workspace = true
 lance-arrow.workspace = true
 lance-arrow-stats.workspace = true
 lance-core.workspace = true
