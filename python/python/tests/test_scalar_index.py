@@ -6237,7 +6237,9 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        # `$.x` is absent from every document, so the target type was inferred
+        # as utf8, the fallback for an all-null path.
+        '{"path":"x","target_data_type":"utf8","target_details":{}}',
         "{}",
         "{}",
     ]
