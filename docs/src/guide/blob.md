@@ -452,7 +452,7 @@ Not every binary column needs to be a blob column. Plain Arrow `binary`/`large_b
 - **Your values are large (roughly 1 MB or more on average).** Operations that rewrite entire rows, such as compaction or some updates, must copy the large inline payloads forward into the new version — even when those bytes never changed. The bigger the payload, the more bytes you rewrite per logical change (write amplification). A blob column keeps large payloads in separate `.blob` files that are referenced rather than re-copied, so these operations don't rewrite the heavy bytes.
 
 !!! tip
-    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads under 16 KiB inline, packs mid-sized payloads into shared `.blob` sidecars, and gives payloads over 2 MiB their own dedicated `.blob` file.
+    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads up to 64 KiB inline, packs payloads over 64 KiB and up to 4 MiB into shared `.blob` sidecars, and gives payloads over 4 MiB their own dedicated `.blob` file. These thresholds are configurable per column.
 
 ## Troubleshooting
 
