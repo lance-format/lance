@@ -41,7 +41,7 @@ use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            WriteParams, cleanup_data_fragments,
+            WriteParams, blob_v2_external_base_resolver, cleanup_data_fragments,
             merge_insert::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
@@ -227,6 +227,7 @@ pub struct FullSchemaMergeInsertExec {
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
     source_skipped_duplicates: Arc<AtomicU64>,
+    source_blob_columns: Vec<String>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -238,6 +239,7 @@ impl FullSchemaMergeInsertExec {
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
+        source_blob_columns: Vec<String>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -272,6 +274,7 @@ impl FullSchemaMergeInsertExec {
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
             source_skipped_duplicates,
+            source_blob_columns,
             is_primary_key,
         })
     }
@@ -880,6 +883,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
+            source_blob_columns: self.source_blob_columns.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -981,6 +985,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
+        let source_blob_columns = self.source_blob_columns.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -992,6 +997,45 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
+            let write_params = WriteParams {
+                allow_external_blob_outside_bases: has_blob_v2_columns,
+                ..Default::default()
+            };
+            // Existing target references may be outside the current bases. Check
+            // only source-provided blob columns before allowing them through.
+            let write_data_stream = if source_blob_columns.is_empty() {
+                write_data_stream
+            } else {
+                let resolver =
+                    blob_v2_external_base_resolver(Some(&dataset), &write_params, dataset.schema())
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal("Source has blob v2 columns but target does not")
+                        })?;
+                let schema = write_data_stream.schema();
+                let source_blob_column_indices = source_blob_columns
+                    .iter()
+                    .map(|name| schema.index_of(name).map_err(Error::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let validated = write_data_stream.then(move |batch_result| {
+                    let resolver = resolver.clone();
+                    let source_blob_column_indices = source_blob_column_indices.clone();
+                    async move {
+                        let batch = batch_result?;
+                        let source_blob_batch = batch.project(&source_blob_column_indices)?;
+                        crate::dataset::blob::validate_external_blob_references(
+                            &resolver,
+                            &source_blob_batch,
+                            &vec![true; batch.num_rows()],
+                        )
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                        Ok(batch)
+                    }
+                });
+                Box::pin(RecordBatchStreamAdapter::new(schema, validated))
+                    as SendableRecordBatchStream
+            };
             let (mut new_fragments, _) = write_fragments_internal(
                 params.write_version(&dataset),
                 Some(&dataset),
@@ -999,7 +1043,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 &dataset.base,
                 dataset.schema().clone(),
                 write_data_stream,
-                WriteParams::default(),
+                write_params,
                 target_bases_info,
             )
             .await?;
@@ -1197,6 +1241,7 @@ mod tests {
             Arc::new(dataset),
             job.params.clone(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Vec::new(),
         )
         .unwrap();
 
